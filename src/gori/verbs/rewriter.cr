@@ -49,7 +49,8 @@ module Gori
         Verb::Scope::Rewriter, available: has_rule, mnemonic: 'x', section: :rules) { |ctx| ctx.rewriter_toggle; nil }
       r.register Verb::Definition.new(
         "rewriter.delete", "Delete rule", "Delete the selected rule (confirms first)",
-        Verb::Scope::Rewriter, [Verb::Chord.new("d")], available: has_rule, mnemonic: 'd', section: :rules) { |ctx| ctx.rewriter_delete; nil }
+        Verb::Scope::Rewriter, [Verb::Chord.new("d")], available: has_rule, mnemonic: 'd', section: :rules,
+        group: :danger) { |ctx| ctx.rewriter_delete; nil }
       r.register Verb::Definition.new(
         "rewriter.move-up", "Move up", "Move the selected rule earlier in apply order",
         Verb::Scope::Rewriter, [Verb::Chord.new("k", shift: true)], available: has_rule, mnemonic: 'u', section: :rules) { |ctx| ctx.rewriter_move(-1); nil }
@@ -69,9 +70,16 @@ module Gori
       # `s` keeps the mnemonic the save half had, now meaning "which scope".
       #
       # The default-flip is offered only for a global rule, because a project rule has no
-      # default to flip: `x` IS its state. Both gate on a selected rule for the reason
-      # `rewriter_rule_selected?` documents — the menu must not act on a row the operator
-      # cannot see from the `extract` / `bindings` sub-tabs.
+      # default to flip: `x` IS its state, and its ⇧X reads as "…everywhere". In the clear-all
+      # scopes ⇧X is the wipe chord instead — every verb in the registry's `:wipe` band
+      # (`history.clear`, `probe.clear`, `authorize.clear`, `activity.clear`, `issues.clear`) —
+      # deliberate cross-scope reuse, and invisible to
+      # `Conflicts.overlap?`, which is `a == b` on the scope. This tab has no clear-all verb
+      # for it to be confused with.
+      #
+      # Both gate on a selected rule for the reason `rewriter_rule_selected?` documents — the
+      # menu must not act on a row the operator cannot see from the `extract` / `bindings`
+      # sub-tabs.
       global_rule = ->(ctx : Verb::ExecContext) do
         ctx.current_tab == :rewriter && ctx.rewriter_rule_list_focused? && ctx.rewriter_global_rule_selected?
       end

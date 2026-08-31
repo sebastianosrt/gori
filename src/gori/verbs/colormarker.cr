@@ -31,7 +31,8 @@ module Gori
         Verb::Scope::Colormarker, [Verb::Chord.new("x")], available: on_rule, mnemonic: 'x', section: :rules) { |ctx| ctx.colormarker_toggle; nil }
       r.register Verb::Definition.new(
         "colormarker.delete", "Delete rule", "Delete the selected rule (confirms first)",
-        Verb::Scope::Colormarker, [Verb::Chord.new("d")], available: on_rule, mnemonic: 'd', section: :rules) { |ctx| ctx.colormarker_delete; nil }
+        Verb::Scope::Colormarker, [Verb::Chord.new("d")], available: on_rule, mnemonic: 'd', section: :rules,
+        group: :danger) { |ctx| ctx.colormarker_delete; nil }
       # "Move up/down" reads like cosmetics on the Rewriter, where rules compose and order is a
       # tiebreak. Here the FIRST enabled match paints the row and the rest are never consulted,
       # so a move changes which rule wins — the descriptions say so.
@@ -51,6 +52,12 @@ module Gori
       # The scope half, the same shape the Rewriter's carries: a rule lives EITHER in this
       # project or in the global library every project reads. The default-flip is offered only
       # for a global rule, because a project rule has no default to flip — `x` IS its state.
+      # Its ⇧X reads as "…everywhere": the shifted form of the `x` that flips the same rule in
+      # THIS project (`colormarker.toggle`, above). In the clear-all scopes ⇧X is the wipe chord
+      # instead — the registry's `:wipe` band (`history.clear`, `probe.clear`, `authorize.clear`,
+      # `activity.clear`, `issues.clear`) —
+      # deliberate cross-scope reuse, and invisible to `Conflicts.overlap?`, which is `a == b`
+      # on the scope. This tab has no clear-all verb for it to be confused with.
       on_global_rule = ->(ctx : Verb::ExecContext) do
         ctx.current_tab == :colormarker && ctx.colormarker_rule_list_focused? && ctx.colormarker_global_rule_selected?
       end
@@ -74,7 +81,8 @@ module Gori
         Verb::Scope::Colormarker, available: on_color, mnemonic: 'e', section: :colors) { |ctx| ctx.colormarker_color_edit; nil }
       r.register Verb::Definition.new(
         "colormarker.color-delete", "Delete colour", "Delete the selected custom colour (confirms first)",
-        Verb::Scope::Colormarker, available: on_color, mnemonic: 'd', section: :colors) { |ctx| ctx.colormarker_color_delete; nil }
+        Verb::Scope::Colormarker, available: on_color, mnemonic: 'd', section: :colors,
+        group: :danger) { |ctx| ctx.colormarker_color_delete; nil }
     end
   end
 end

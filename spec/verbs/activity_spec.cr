@@ -19,24 +19,73 @@ describe "Gori::Verbs.register_activity" do
     end
   end
 
-  # The one that matters. `c` is `capture.toggle` in Global scope, and a scoped chord beats the
-  # Global fallback — so binding the feed wipe to bare `c` would silently replace "stop capture"
-  # with "destroy the audit trail" on this one pane, for the key an operator hits by reflex.
-  # The other five Project panes pass `c` straight through, and this one must not be the
-  # exception that costs a record.
-  it "keeps the destructive clear off the capture-toggle key" do
+  # The one that matters, and it is now about BOTH letters. `c` is `capture.toggle` in Global
+  # scope and a scoped chord beats the Global fallback, so binding the feed wipe to bare `c`
+  # would silently replace "stop capture" with "destroy the audit trail" on this one pane, for
+  # the key an operator hits by reflex. ⇧C cleared that bar and still left the wipe one shift
+  # above it; ⇧X clears it with room, because bare `x` is bound in none of the clear-all scopes
+  # at all — there is no unmodified neighbour for the shift to slip off.
+  it "keeps the destructive clear off the capture-toggle key, and off its shift" do
     r["capture.toggle"].scope.should eq(Gori::Verb::Scope::Global)
     r["capture.toggle"].chords.should eq([Gori::Verb::Chord.new("c")])
 
-    # Round-tripped through `Keybind.from_event`, NOT compared to a hand-written chord: a
-    # capital spelling (`Chord.new("C")`) satisfies an equality assertion perfectly and still
+    # `shift_chord` round-trips through `Keybind.from_event`, NOT a hand-written chord: a
+    # capital spelling (`Chord.new("X")`) satisfies an equality assertion perfectly and still
     # never fires, because from_event normalises a typed capital to shift+lowercase. Asserting
-    # the DECLARATION against itself is what let that dead binding ship.
-    shift_c = Gori::Tui::Keybind.from_event(
-      Termisu::Event::Key.new(Termisu::Input::Key::LowerC, Termisu::Input::Modifier::Shift, char: 'C'))
-    r["activity.clear"].chords.should eq([shift_c])
+    # the DECLARATION against a twin of itself is what let that dead binding ship.
+    r["activity.clear"].chords.should eq([shift_chord('X')])
     r["activity.clear"].chords.should_not contain(Gori::Verb::Chord.new("c"))
-    r["activity.clear"].group.should eq(:danger)
+    r["activity.clear"].chords.should_not contain(shift_chord('C'))
+    r["activity.clear"].chords.should_not contain(Gori::Verb::Chord.new("x"))
+    r["activity.clear"].menu_key.should eq('X')
+    r["activity.clear"].group.should eq(:wipe)
+  end
+
+  # One chord, five scopes — History, Probe, Authorize, the Issues list and this pane all spell
+  # the wipe the same way, and all five hang the space menu off `X`.
+  #
+  # Enumerated from the `:wipe` BAND, not from a list of ids restated here. The four-id literal
+  # this replaces claimed a sixth member picking its own letter would fail here, and it could
+  # not: a hand-written list only ever checks itself. The Issues tab was the proof — it had no
+  # clear verb at all while the family was advertised app-wide as "one chord clears a tab", so
+  # ⇧X there did nothing and no spec in the suite could notice. Membership is pinned below so
+  # a verb dropping OUT of the band is a failure rather than a silently shorter loop.
+  it "spells the wipe the way every other clear-all verb does" do
+    wipes = r.select(&.group.==(:wipe))
+    wipes.map(&.id).sort!.should eq(
+      %w[activity.clear authorize.clear history.clear issues.clear probe.clear])
+    wipes.each do |v|
+      v.chords.should eq([shift_chord('X')]), v.id
+      v.menu_key.should eq('X'), v.id
+      # The letter under the shift is free in each of those scopes — that is the property that
+      # made ⇧X the right key, and it is the one a later bare-`x` binding would quietly break.
+      r.select { |o| o.scope == v.scope && o.chords.includes?(Gori::Verb::Chord.new("x")) }
+        .map(&.id).should be_empty, "bare `x` is bound in #{v.scope}, under #{v.id}'s shift"
+    end
+  end
+
+  # The declaration says ⇧X; this says the DISPATCH agrees. `Keymap#lookup` is what the runner
+  # asks on a keypress, so a chord spelled in a way `Keybind.from_event` never produces —
+  # `Chord.new("X")` — is dead here and nowhere else: every assertion above would still pass.
+  # Bare `c` rides along because it is the reason the letter is ⇧X and not ⇧C: it is LIVE in
+  # every one of those scopes — `capture.toggle` by Global fallback in four, and
+  # `probe.dismiss-selected` shadowing it on the Probe list — so ⇧C would have put a project
+  # wipe one shift above a key that does something harmless and frequent. Asserted as "resolves, and never to the wipe"
+  # rather than to one id, because which harmless verb answers it is not the point.
+  it "dispatches ⇧X to the right wipe in every scope that has one" do
+    km = Gori::Verb::Keymap.build(Gori::Verbs.registry)
+    x = shift_chord('X')
+    r.select(&.group.==(:wipe)).each do |v|
+      km.lookup(x, v.scope).should eq(v.id)
+      under_c = km.lookup(Gori::Verb::Chord.new("c"), v.scope)
+      under_c.should_not be_nil, "bare `c` is unbound in #{v.scope}"
+      under_c.should_not eq(v.id)
+    end
+
+    # And the two scopes that spend ⇧X on "Enable/disable everywhere" keep it: the reuse is
+    # cross-scope, which `Conflicts.overlap?` (`a == b`) permits by design.
+    km.lookup(x, Gori::Verb::Scope::Rewriter).should eq("rewriter.toggle-default")
+    km.lookup(x, Gori::Verb::Scope::Colormarker).should eq("colormarker.toggle-default")
   end
 
   # ↵ is the second chord on `open` rather than a hard-coded twin in the key handler, so the
@@ -46,10 +95,18 @@ describe "Gori::Verbs.register_activity" do
   end
 
   # Each chip cycles back to "all" where it was set, so releasing all three at once does not
-  # need a top-level key — which is what freed the letter for the verb above.
-  it "leaves clear-filters to the space menu" do
+  # need a top-level key.
+  #
+  # 'N' and NOT the 'x' it used to hold: `activity.clear` owns the house `X`, and `x Clear
+  # filters` directly above `X Clear activity` would put "reset a narrowing" and "permanently
+  # delete the agent audit trail" in adjacent menu rows separated by nothing but the shift.
+  # The pair is asserted together, because the defect is the RELATIONSHIP, not either letter.
+  it "keeps the filter reset a full letter away from the feed wipe in the menu" do
     r["activity.clear-filters"].chords.should be_empty
-    r["activity.clear-filters"].menu_key.should eq('x')
+    r["activity.clear-filters"].menu_key.should eq('N')
+    r["activity.clear-filters"].menu_key.try(&.upcase).should_not eq(r["activity.clear"].menu_key)
+    # 'N' is what `history.mark-clear` already spends on the same word.
+    r["history.mark-clear"].menu_key.should eq('N')
   end
 
   it "routes the pane's verbs through the context" do
