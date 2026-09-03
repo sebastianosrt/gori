@@ -115,6 +115,8 @@ module Gori
         if target.unanswered?
           ajob.unanswered += 1
           ajob.unanswered_reason ||= target.trials.each.compact_map(&.summary.error).first?
+        elsif target.baseline_denied?
+          ajob.baseline_denied += 1
         end
         ajob.bypasses += target.same_count
         ajob.reviews += target.trials.count { |t| !t.baseline? && t.verdict.review? }
@@ -262,6 +264,10 @@ module Gori
         # them, so a caller that read `authorize_results` alone had no field at all saying
         # part of its selection produced nothing.
         j.field "unanswered_count", ajob.unanswered
+        # Beside it, and for the same reason: a request whose baseline was refused compared
+        # nothing either, and its rows are `review` with no stated cause. See
+        # `Authorize::Target#baseline_denied?`.
+        j.field "baseline_denied_count", ajob.baseline_denied
         # In the HEADLINE for the same reason `unanswered_count` is, and it is the stronger
         # claim of the two: an identity whose `$SESSION` never resolved was sent
         # UNAUTHENTICATED, so a `verdict` of `enforced` over it is a statement about anonymous
@@ -303,8 +309,19 @@ module Gori
           "matched the baseline response — a non-baseline identity was served the same resource. " \
           "Confirm the identity is genuinely lower-privilege, then raise it."
         when "review"
+          # WHICH review, because the two have opposite next actions. A denied baseline is not
+          # an ambiguous body — it is a run anchored on a request that was itself refused, and
+          # "look at the bodies" sends the caller the wrong way.
+          anchored =
+            if (n = ajob.baseline_denied) > 0
+              " · #{n} of them had a DENIED baseline (4xx/5xx), so nothing on those could be " \
+              "judged — refresh the baseline identity's credential and re-run"
+            else
+              ""
+            end
           "no identity matched the baseline outright, but #{ajob.reviews} result#{ajob.reviews == 1 ? "" : "s"} " \
-          "need review (same status class, divergent body — a tailored denial and a per-user page look alike)"
+          "need review (same status class, divergent body — a tailored denial and a per-user page " \
+          "look alike)#{anchored}"
         else
           # The requests that answered NOTHING are named right here rather than left to a
           # count further down the payload: "enforced" is a claim about what a target did,
@@ -363,6 +380,9 @@ module Gori
           j.field "url", Serialize.text(t.url)
           j.field "bypass", t.same_count > 0
           j.field "bypass_count", t.same_count
+          # Why this row can never be a bypass: the baseline was refused, so every comparison
+          # on it is `review` by construction (`Authorize::Target#baseline_denied?`).
+          j.field "baseline_denied", t.baseline_denied?
           # Sends this target's gate refused before the socket. `fully_blocked` means NOTHING
           # in this row reached the origin, so its verdicts describe no traffic at all.
           j.field "blocked", t.blocked
@@ -559,21 +579,11 @@ module Gori
         end
       end
 
-      # The flow ids to replay, in the order given. Accepts a real array, a JSON-encoded array
-      # (LLM clients stringify), a bare id, and a comma list — the shapes a caller reaches for
-      # — but a non-integer entry is NAMED rather than dropped: silently skipping one would
-      # replay a smaller selection than the one asked for and report it as complete.
+      # The flow ids to replay, in the order given — through the shared `id_list_arg`, which
+      # is this reader lifted into `tools.cr` so the repeater bulk tools cannot grow a second
+      # grammar for the same shape.
       private def authorize_flow_ids(h) : Array(Int64)
-        ids = [] of Int64
-        str_list(h, "flow_ids").each do |entry|
-          entry.split(',').each do |tok|
-            t = tok.strip
-            next if t.empty?
-            ids << (t.to_i64? || raise Gori::Error.new(
-              "invalid 'flow_ids' entry #{t.inspect} (expected an integer flow id)"))
-          end
-        end
-        ids
+        id_list_arg(h, "flow_ids")
       end
 
       # The explicit identity set as the JSON text `Authorize.parse_json` reads — the SAME
@@ -656,7 +666,7 @@ module Gori
           "Counts + state of an authorize job (running|done|stopped|error): the access_control " \
           "verdict so far (BYPASS|enforced|review|error|nothing_sent — the last two mean NOTHING " \
           "was compared and are never a clean bill of health), bypass_count, unanswered_count, " \
-          "requests replayed, " \
+          "baseline_denied_count, requests replayed, " \
           "sends, errors, sends refused before the socket, the flows that were SKIPPED with the " \
           "reason for each, and the ones that could not be replayed at all (`failed_count` / " \
           "`failed[]` — a stored head gori cannot put on the wire; the run continues past them). " \
@@ -672,7 +682,10 @@ module Gori
           "`skipped` names every selected flow that was not replayed, and `failed[]` the ones " \
           "that could not be replayed at all. `unanswered_count` is the requests whose every " \
           "send failed at the socket: they compared nothing, so they are evidence of neither " \
-          "a bypass nor enforcement." do |s|
+          "a bypass nor enforcement. `baseline_denied_count` is the requests whose BASELINE was " \
+          "itself refused (4xx/5xx): the privileged request the run is anchored on never got the " \
+          "resource either, so a matching denial is not a bypass and every row on them is " \
+          "`review` — usually one stale baseline credential, not N quiet endpoints." do |s|
           s.field "job_id", strprop("id from authorize_start"), required: true
           s.field "offset", intprop("start row (default 0)")
           s.field "limit", intprop("max requests per page (default 50, max 500)")
@@ -686,15 +699,12 @@ module Gori
         end
       end
 
-      # The `flow_ids` schema. An array of integers is the shape to reach for; a single id and
-      # a comma-list string are accepted because a caller with one flow writes one flow (the
-      # same leniency `str_list` gives every other list argument on this surface).
+      # The `flow_ids` schema, through the shared `id_list_prop` — the same `oneOf` every
+      # list-of-ids argument advertises, kept beside the reader that honours it.
       private def authorize_flow_ids_prop : JSON::Any
-        desc = "captured flow ids to replay, in the order given (ids come from list_history). " \
-               "An array of integers, a single integer, or a comma list. Combined with 'query' " \
-               "when both are passed; at least one of the two is required."
-        JSON.parse(%({"description":#{desc.to_json},"oneOf":) +
-                   %([{"type":"array","items":{"type":"integer"}},{"type":"integer"},{"type":"string"}]}))
+        id_list_prop("captured flow ids to replay, in the order given (ids come from list_history). " \
+                     "An array of integers, a single integer, or a comma list. Combined with 'query' " \
+                     "when both are passed; at least one of the two is required.")
       end
 
       # The `identities` schema: an array of identity objects, or the same array as a JSON

@@ -556,13 +556,18 @@ module Gori::Tui
     private def handle_confirm(ev : Termisu::Event::Key) : Project | Symbol?
       @preedit = ""
       dlg = @confirm
-      key = ev.key
-      case
-      when key.escape?, key.n?, ev.ctrl_c?                then cancel_confirm
-      when ConfirmDialog.affirmative?(ev)                 then commit_confirmed
-      when key.left?, key.right?, key.tab?, key.back_tab? then dlg.try(&.move)
-      when key.enter?
-        dlg.try(&.confirm_selected?) ? commit_confirmed : cancel_confirm
+      return nil if dlg.nil?
+      # ctrl-c is the picker's global abort; ConfirmDialog does not answer it. Everything else —
+      # the y/⇧Y with its ctrl-guard, the arrow/tab button moves, ↵-on-the-selection AND the
+      # `drawn?` gate that refuses to COMMIT a card a short window is hiding — is
+      # ConfirmDialog#handle_key's own ladder. Delegate to it rather than re-spelling it here: the
+      # gate (#912) lived only in handle_key, and this second copy of the ladder never got it, so
+      # a resize below MIN_H after arming let `y` run `rm_rf` on a project with nothing on screen.
+      # One ladder, both call sites — the way `affirmative?` is already shared.
+      return cancel_confirm if ev.ctrl_c?
+      case dlg.handle_key(ev)
+      when :commit then commit_confirmed
+      when :cancel then cancel_confirm
       end
       nil
     end
@@ -1801,11 +1806,11 @@ module Gori::Tui
 
     private def render_busy(screen : Screen, w : Int32, h : Int32) : Nil
       msg = BUSY_LABELS[@mode]? || " Working … "
-      bw = {msg.size + 4, 22}.max
+      bw = {Screen.draw_width(msg) + 4, 22}.max
       bh = 3
       box = Rect.new({(w - bw) // 2, 0}.max, {(h - bh) // 2, 0}.max, bw, bh)
       Frame.card(screen, box, border: Theme.border_focus)
-      screen.text(box.x + (box.w - msg.size) // 2, box.y + 1, msg, Theme.text_bright, Theme.panel, Attribute::Bold)
+      screen.text(box.x + (box.w - Screen.draw_width(msg)) // 2, box.y + 1, msg, Theme.text_bright, Theme.panel, Attribute::Bold)
     end
 
     private def render_rename(screen : Screen, cx : Int32, cw : Int32, w : Int32, h : Int32) : Nil
@@ -1903,7 +1908,7 @@ module Gori::Tui
     # x=0 and run off the right edge into the hint row.
     private def centered(screen : Screen, y : Int32, text : String, fg : Color, w : Int32,
                          attr : Attribute = Attribute::None, width : Int32? = nil) : Nil
-      screen.text({(w - text.size) // 2, 0}.max, y, text, fg, Theme.bg, attr: attr, width: width)
+      screen.text({(w - Screen.draw_width(text)) // 2, 0}.max, y, text, fg, Theme.bg, attr: attr, width: width)
     end
 
     # Draw BRAND_ART as one centered block: every line starts at the same left

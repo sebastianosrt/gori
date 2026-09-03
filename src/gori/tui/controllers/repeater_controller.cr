@@ -161,7 +161,7 @@ module Gori::Tui
     end
 
     def filter_fields : Array(String)
-      %w[tag name host method]
+      %w[tag name host method status]
     end
 
     # The filter bar occupies a body row whenever the strip is up (from the first session),
@@ -172,7 +172,8 @@ module Gori::Tui
 
     # The searchable projection of a session for the in-memory matcher (TUI-free).
     private def filter_subject(v : RepeaterView) : Repeater::SubtabFilter::Subject
-      Repeater::SubtabFilter::Subject.new(v.name, v.summary(200), v.target, v.request_method, v.tags)
+      Repeater::SubtabFilter::Subject.new(v.name, v.summary(200), v.target, v.request_method,
+        v.tags, v.status_token)
     end
 
     # One Subject per open session, in chip order (the base's filter projection hook).
@@ -1223,7 +1224,11 @@ module Gori::Tui
           probe_scan_repeater(id, result.head, result.body, result.duration_us, tab.flow_id, view)
         end
         note = record_note ? " · #{record_note}" : ""
-        @host.status(result.ok? ? "sent → #{result.response.try(&.status)} in #{result.duration_us // 1000}ms#{result.incomplete? ? " (incomplete)" : ""}#{evidence_literal_note(view)}#{note}" : "repeater error: #{result.error}#{note}")
+        if result.ok?
+          @host.status("sent → #{result.response.try(&.status)} in #{result.duration_us // 1000}ms#{result.incomplete? ? " (incomplete)" : ""}#{evidence_literal_note(view)}#{note}", :done)
+        else
+          @host.status("repeater error: #{result.error}#{note}", :error)
+        end
         applied = true
       end
       while pair = nonblocking_ws_result
@@ -1240,11 +1245,11 @@ module Gori::Tui
         end
         if result.ok?
           recv = result.messages.count(&.direction.==("in"))
-          @host.status("ws sent: #{recv} received#{result.close_code ? " · closed #{result.close_code}" : ""}")
+          @host.status("ws sent: #{recv} received#{result.close_code ? " · closed #{result.close_code}" : ""}", :done)
           # Feed the handshake + captured frames into Probe (WS payload secrets, tech).
           probe_scan_ws_repeater(id, result, tab.flow_id, view) if id
         else
-          @host.status("ws repeater error: #{result.error}")
+          @host.status("ws repeater error: #{result.error}", :error)
         end
         applied = true
       end
@@ -1827,7 +1832,7 @@ module Gori::Tui
       end
       view.inflight = true
       sni = plan.sni # custom TLS SNI host (nil → present the dialed host)
-      @host.status("sending#{sending_as} → #{plan.host}:#{plan.port}#{sni ? " (SNI #{sni})" : ""}…")
+      @host.status("sending#{sending_as} → #{plan.host}:#{plan.port}#{sni ? " (SNI #{sni})" : ""}…", :busy)
       # The bytes the socket gets, taken ONCE and sent as-is. `view.request_bytes` above is the
       # assembled DRAFT; this is the message, with the send seam's two passes applied (the
       # `$NAME` binding pass and the active session slot's header overlay). The History
@@ -2004,7 +2009,7 @@ module Gori::Tui
       # WebSocket sends are not written to History, and the CLI draws the same line
       # (`--record-history is HTTP-only`): a socket's evidence is its frame transcript, which
       # the repeater session already keeps, and a flow row would hold a handshake and nothing else.
-      @host.status("ws sending → #{plan.host}:#{plan.port} (#{messages.size} msg#{messages.size == 1 ? "" : "s"})…#{unrecorded_note("WebSocket")}")
+      @host.status("ws sending → #{plan.host}:#{plan.port} (#{messages.size} msg#{messages.size == 1 ? "" : "s"})…#{unrecorded_note("WebSocket")}", :busy)
       spawn(name: "gori-ws-repeater") do
         result = plan.send_ws(messages, Repeater::WsEngine::DEFAULT_IDLE, keep_key)
         select
@@ -2535,18 +2540,18 @@ module Gori::Tui
       c = ev.char || key.to_char
       selecting = ev.shift?
       case
-      when key.enter?     then view.enter_request_insert!
-      when c == 'i'       then view.enter_request_insert!
-      when word_step?(ev) then view.request_read_move(0, key.left? ? -1 : 1, selecting: selecting)
-      when key.up?        then view.at_top? ? view.focus_first : view.request_read_move(-1, 0, selecting: selecting)
-      when key.down?      then view.request_read_move(1, 0, selecting: selecting)
-      when key.left?      then view.request_read_move(0, -1, selecting: selecting)
-      when key.right?     then view.request_read_move(0, 1, selecting: selecting)
-      when key.page_up?   then view.request_read_page(-1, selecting: selecting)
-      when key.page_down? then view.request_read_page(1, selecting: selecting)
-      when key.home?      then view.edit_home(selecting)
-      when key.end?       then view.edit_end(selecting)
-      when c == 'x'       then view.pane_select_line
+      when key.enter?               then view.enter_request_insert!
+      when c == 'i'                 then view.enter_request_insert!
+      when word_step?(ev)           then view.request_read_move(0, key.left? ? -1 : 1, selecting: selecting)
+      when key.up?, key.lower_k?    then view.at_top? ? view.focus_first : view.request_read_move(-1, 0, selecting: selecting)
+      when key.down?, key.lower_j?  then view.request_read_move(1, 0, selecting: selecting)
+      when key.left?, key.lower_h?  then view.request_read_move(0, -1, selecting: selecting)
+      when key.right?, key.lower_l? then view.request_read_move(0, 1, selecting: selecting)
+      when key.page_up?             then view.request_read_page(-1, selecting: selecting)
+      when key.page_down?           then view.request_read_page(1, selecting: selecting)
+      when key.home?                then view.edit_home(selecting)
+      when key.end?                 then view.edit_end(selecting)
+      when c == 'x'                 then view.pane_select_line
       when c && !ev.ctrl? && !ev.alt? && !c.control?
         return false # y copy, Global c/i/s, …
       end
@@ -2559,15 +2564,15 @@ module Gori::Tui
       c = ev.char || key.to_char
       selecting = ev.shift?
       case
-      when key.enter? then view.enter_target_insert!
-      when c == 'i'   then view.enter_target_insert!
-      when key.up?    then @host.request_focus(subtab_strip_shown? ? :subtabs : :menu)
-      when key.down?  then view.pane_advance(1)
-      when key.left?  then view.target_read_move(-1, selecting: selecting)
-      when key.right? then view.target_read_move(1, selecting: selecting)
-      when key.home?  then view.target_home(selecting)
-      when key.end?   then view.target_end(selecting)
-      when c == 'x'   then view.pane_select_line
+      when key.enter?               then view.enter_target_insert!
+      when c == 'i'                 then view.enter_target_insert!
+      when key.up?, key.lower_k?    then @host.request_focus(subtab_strip_shown? ? :subtabs : :menu)
+      when key.down?, key.lower_j?  then view.pane_advance(1)
+      when key.left?, key.lower_h?  then view.target_read_move(-1, selecting: selecting)
+      when key.right?, key.lower_l? then view.target_read_move(1, selecting: selecting)
+      when key.home?                then view.target_home(selecting)
+      when key.end?                 then view.target_end(selecting)
+      when c == 'x'                 then view.pane_select_line
       when c && !ev.ctrl? && !ev.alt? && !c.control?
         return false
       end
@@ -2622,11 +2627,11 @@ module Gori::Tui
       # was transcript-specific: `resp_drawn_source` reports a decoration offset of 0 for a
       # transcript (only DIFF has one), so the caret columns are the row's own columns.
       case
-      when key.enter?              then repeater_send
-      when key.up?, key.lower_k?   then view.at_top? ? view.focus_first : resp_nav_step(view, -1, 0, selecting, nav)
-      when key.down?, key.lower_j? then resp_nav_step(view, 1, 0, selecting, nav)
-      when key.left?               then resp_nav_step(view, 0, -1, selecting, nav)
-      when key.right?              then resp_nav_step(view, 0, 1, selecting, nav)
+      when key.enter?               then repeater_send
+      when key.up?, key.lower_k?    then view.at_top? ? view.focus_first : resp_nav_step(view, -1, 0, selecting, nav)
+      when key.down?, key.lower_j?  then resp_nav_step(view, 1, 0, selecting, nav)
+      when key.left?, key.lower_h?  then resp_nav_step(view, 0, -1, selecting, nav)
+      when key.right?, key.lower_l? then resp_nav_step(view, 0, 1, selecting, nav)
         # Page/line-edge keys, ⇧ extending — the set every other read pane in the tree has
         # (`ReadPane#motion_key`, `HistoryView#detail_line_edge`/`#detail_page_rows`, and the
         # request editor beside this one). They sat in NO arm before, so the trailing `true`

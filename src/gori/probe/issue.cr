@@ -46,7 +46,7 @@ module Gori
     # them "needs OAST" and to keep their (currently-unpayable) request cost out of the enabled
     # total. One list so the catalog, the estimate, and the badge cannot drift on which rules
     # these are.
-    OOB_RULE_IDS = Set{"ssrf_oast"}
+    OOB_RULE_IDS = Set{"ssrf_oast", "cmd_injection_oast"}
 
     # Whether the analyzer/scan must SKIP rule `id`, given the project's stored disabled-id set.
     def self.rule_disabled?(id : String, stored : Set(String)) : Bool
@@ -153,6 +153,7 @@ module Gori
       "url_rewrite_bypass"             => "A probe reached a denied resource by requesting / with an X-Original-URL / X-Rewrite-URL header naming the gated path, and got different (served) content than the plain root. Don't let application URL-rewrite headers override the routed path for authorization; strip X-Original-URL / X-Rewrite-URL at the edge and enforce access control on the actual request path. Single-shot; confirm manually.",
       "ssti"                           => "A probe injected template expressions in this parameter and the server returned their evaluated results (7*7→49 and 7*8→56), indicating server-side template injection — frequently a path to remote code execution. Never build templates from user input; pass user data as template variables/context, use a sandboxed or logic-less engine, and validate input. Confirm the engine and impact manually.",
       "ssrf_oast"                      => "An out-of-band probe pointed this URL parameter at a gori-controlled OAST payload and the server called back to it — confirming the endpoint fetches an attacker-supplied URL (server-side request forgery). Validate the target against a strict allowlist of hosts/schemes, resolve and pin the destination IP (rejecting private/link-local/metadata ranges and DNS-rebinding), and never let a request parameter choose an arbitrary host to connect to. Blind SSRF reaches internal services, cloud metadata (169.254.169.254), and localhost admin panels.",
+      "cmd_injection_oast"             => "An out-of-band probe appended a shell-breakout payload to this command/diagnostic parameter and the server's shell called the OAST listener back — confirming the value is concatenated into an OS command (command injection, typically remote code execution). Do not exec user input: pass arguments to a parameterized/safe API (no shell), or map the parameter to an allowlisted operation. Reject shell metacharacters and never build a command string from a request value.",
       "nextjs_action_no_auth"          => "A probe re-sent this Next.js server action (Next-Action) with the session Cookie / Authorization removed and still received a comparable 2xx response. Next.js does not authenticate or authorize server actions for you — enforce authentication and per-user authorization INSIDE every 'use server' function (and treat each action as a public, unauthenticated endpoint until it does). Single-shot; confirm the unauthenticated response actually contains privileged data.",
       "request_smuggling_clte"         => "A timing probe hung on a CL.TE framing conflict: the front-end framed this request by Content-Length while the back-end honoured Transfer-Encoding, so one tier blocked on a body the other had already ended — a request-smuggling / desync primitive. The front-end and back-end MUST agree on framing: reject any request carrying BOTH Content-Length and Transfer-Encoding (RFC 7230 §3.3.3), normalize/strip conflicting framing at the edge, and prefer HTTP/2 end-to-end (its length-prefixed framing removes the ambiguity). Confirm manually with the Repeater 'send group' (a complete smuggled prefix + a benign follow-up on one connection).",
       "request_smuggling_tecl"         => "A timing probe hung on a TE.CL framing conflict: the front-end honoured Transfer-Encoding (the request ended at the terminating chunk) while the back-end waited for Content-Length bytes that never arrived — a request-smuggling / desync primitive. The front-end and back-end MUST agree on framing: reject requests carrying BOTH Content-Length and Transfer-Encoding, have the edge re-chunk or strip conflicting framing, and prefer HTTP/2 end-to-end. Confirm manually with the Repeater 'send group'.",
@@ -167,6 +168,12 @@ module Gori
       "exposed_config"                 => "A server-side configuration or diagnostic artifact is being served to clients (the evidence names which). Remove it from the web root or block it at the edge, then treat every credential it contained as compromised and rotate it: a readable .env / wp-config / .htpasswd hands over live secrets outright, a .git/config lets the whole repository be reconstructed, and phpinfo() / Spring actuator env expose paths, versions, and environment variables that make every other attack cheaper. Deny dotfiles and VCS directories at the reverse proxy rather than relying on the application not to route them.",
       "directory_listing"              => "The server auto-generated a directory index, enumerating every file in it (backups, editor leftovers, old releases). Turn the listing off (Apache `Options -Indexes`, nginx `autoindex off;`) and add an index file where a directory must stay browsable.",
       "serialized_object"              => "A native-serialization blob is carried in client-controllable data (the evidence names which format and where). Deserializing an attacker-supplied Java/.NET/PHP object graph is a direct path to remote code execution (ysoserial, ViewState gadget chains, PHP POP chains). Do not deserialize native formats across a trust boundary — use a data-only format (JSON) instead. Where native serialization is unavoidable, sign and encrypt the blob and verify its integrity BEFORE deserializing: for ASP.NET ViewState, ensure both ViewStateMac and ViewState encryption are enabled and the machine key is secret.",
+      "subdomain_takeover"             => "The host resolves to a cloud provider that says nothing is registered under this name — the dangling-DNS shape. Confirm the DNS record (a CNAME/ALIAS at the provider), then either re-create the resource under the account that owns the name or delete the record; leaving it live lets anyone who can register that resource name serve content, cookies and TLS under your subdomain.",
+      "cleartext_credentials"          => "The password crossed the network in cleartext. Serve the endpoint over HTTPS only, redirect http:// to https:// with HSTS, and treat any credential submitted here as compromised — rotate it.",
+      "cleartext_password_form"        => "The login page itself was delivered over http://, so an on-path attacker can rewrite the form (and its action) before the user types. Serve the page over HTTPS and redirect http:// to https://; a form that posts to an https:// action from an http:// page is not enough.",
+      "cacheable_set_cookie"           => "A shared cache may store this response and hand the same Set-Cookie to the next client. Send Cache-Control: private, no-store on any response that sets a session or CSRF cookie, or stop setting the cookie on the cacheable route.",
+      "cors_no_vary_origin"            => "The Access-Control-Allow-Origin echoes the request Origin but the response is cacheable and does not vary on it, so a cache can serve one origin's policy to another. Add Vary: Origin to every response with a request-dependent ACAO, or make the response uncacheable.",
+      "internal_host_leak"             => "A response header names an internal address or hostname. Strip or rewrite the header at the edge (Via, X-Backend-Server, X-Served-By, and any internal Location) so the estate behind the proxy is not published.",
       "debug_mode_exposed"             => "A framework debug mode, interactive debugger, or profiler is reachable in this environment (the evidence names which). Debug pages leak source, stack traces, configuration, and environment; an interactive console (Werkzeug, Rails web-console) is remote code execution outright. Disable debug in production: Django `DEBUG = False`, Laravel `APP_DEBUG=false`, Rails `config.consider_all_requests_local = false` and remove web-console from the production group, ASP.NET `<customErrors mode=\"On\">` / `<deployment retail=\"true\">`, and disable the Symfony profiler outside dev. Return generic error pages and log details server-side only.",
       "dom_xss"                        => "A DOM taint source reaches an execution sink in one statement — review and sanitize: assign text via textContent, build nodes with the DOM API, or run untrusted HTML through a sanitizer (DOMPurify) before it touches innerHTML/write/eval. Heuristic; confirm the data path in a browser.",
       "dom_clobbering"                 => "Don't trust globals that HTML id/name attributes can define: declare variables with let/const, look elements up defensively, and avoid the window.X = window.X || … fallback. A strict CSP and sanitizing injected markup (dropping id/name) also mitigate clobbering.",
@@ -215,6 +222,8 @@ module Gori
       "mixed_content"                  => {319, "Cleartext Transmission of Sensitive Information"},
       "mixed_passive"                  => {319, "Cleartext Transmission of Sensitive Information"},
       "insecure_form_action"           => {319, "Cleartext Transmission of Sensitive Information"},
+      "cleartext_credentials"          => {319, "Cleartext Transmission of Sensitive Information"},
+      "cleartext_password_form"        => {319, "Cleartext Transmission of Sensitive Information"},
       "missing_csp"                    => {693, "Protection Mechanism Failure"},
       "csp_report_only"                => {693, "Protection Mechanism Failure"},
       "weak_csp"                       => {693, "Protection Mechanism Failure"},
@@ -227,6 +236,7 @@ module Gori
       "missing_referrer_policy"        => {200, "Exposure of Sensitive Information to an Unauthorized Actor"},
       "weak_referrer_policy"           => {200, "Exposure of Sensitive Information to an Unauthorized Actor"},
       "cacheable_json"                 => {524, "Use of Cache Containing Sensitive Information"},
+      "cacheable_set_cookie"           => {524, "Use of Cache Containing Sensitive Information"},
       # --- cookies -----------------------------------------------------------------------
       "cookie_no_secure"              => {614, "Sensitive Cookie in HTTPS Session Without 'Secure' Attribute"},
       "cookie_no_httponly"            => {1004, "Sensitive Cookie Without 'HttpOnly' Flag"},
@@ -237,6 +247,7 @@ module Gori
       "cors_wildcard"         => {942, "Permissive Cross-domain Policy with Untrusted Domains"},
       "cors_null_origin"      => {942, "Permissive Cross-domain Policy with Untrusted Domains"},
       "cors_reflected_origin" => {942, "Permissive Cross-domain Policy with Untrusted Domains"},
+      "cors_no_vary_origin"   => {942, "Permissive Cross-domain Policy with Untrusted Domains"},
       "cors_arbitrary_origin" => {942, "Permissive Cross-domain Policy with Untrusted Domains"},
       "postmessage_no_origin" => {346, "Origin Validation Error"},
       "document_domain_set"   => {346, "Origin Validation Error"},
@@ -254,6 +265,8 @@ module Gori
       "exposed_config"        => {538, "Insertion of Sensitive Information into Externally-Accessible File or Directory"},
       "serialized_object"     => {502, "Deserialization of Untrusted Data"},
       "debug_mode_exposed"    => {489, "Active Debug Code"},
+      "internal_host_leak"    => {200, "Exposure of Sensitive Information to an Unauthorized Actor"},
+      "subdomain_takeover"    => {284, "Improper Access Control"},
       # --- client-side execution ---------------------------------------------------------
       "reflected_param"           => {79, "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"},
       "dom_xss"                   => {79, "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"},
@@ -283,6 +296,7 @@ module Gori
       "url_rewrite_bypass"        => {288, "Authentication Bypass Using an Alternate Path or Channel"},
       "nextjs_action_no_auth"     => {306, "Missing Authentication for Critical Function"},
       "ssrf_oast"                 => {918, "Server-Side Request Forgery (SSRF)"},
+      "cmd_injection_oast"        => {78, "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"},
       "jwt_alg_none"              => {347, "Improper Verification of Cryptographic Signature"},
       "jwt_key_injection_header"  => {347, "Improper Verification of Cryptographic Signature"},
       "jwt_weak_alg"              => {327, "Use of a Broken or Risky Cryptographic Algorithm"},
