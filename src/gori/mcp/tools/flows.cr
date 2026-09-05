@@ -8,6 +8,7 @@ module Gori
     class Tools
       # --- read tools ---------------------------------------------------------
 
+      @[Tool("list_history")]
       private def list_history(h) : Result
         limit = clamp(optional_int_arg(h, "limit"), 50, 500)
         before_id = optional_int_arg(h, "before_id")
@@ -113,6 +114,7 @@ module Gori
       # max id SCANNED this page (NOT the max matched id), so source/kind filters never make
       # the agent re-scan or skip; on an empty page it echoes the input `since` (never 0,
       # never max-of-empty) so a no-new-events poll keeps the caller's place.
+      @[Tool("list_events")]
       private def list_events(h) : Result
         since = optional_int_arg(h, "since") || 0_i64
         limit = clamp(optional_int_arg(h, "limit"), 100, 500)
@@ -147,6 +149,7 @@ module Gori
         end)
       end
 
+      @[Tool("get_flow")]
       private def get_flow(h) : Result
         id = int(h, "id")
         return Result.new(id_error(h, "id"), is_error: true) unless id
@@ -170,6 +173,7 @@ module Gori
         Result.new(Serialize.flow_detail_json(detail, ws_msgs, include_sensitive, cap, omit))
       end
 
+      @[Tool("get_response_body_chunk")]
       private def get_response_body_chunk(h) : Result
         options = body_chunk_options(h)
 
@@ -302,6 +306,7 @@ module Gori
 
       # Hard-delete ONE captured flow (the TUI History tab's delete). Single and explicit,
       # so no extra confirmation — unlike clear_history.
+      @[Tool("delete_flow", gated: true, agent_action: true)]
       private def delete_flow(h) : Result
         id = int(h, "id")
         return Result.new(id_error(h, "id"), is_error: true) unless id
@@ -315,8 +320,10 @@ module Gori
       # Wipe EVERY captured flow. The TUI puts a danger confirm in front of this; here
       # confirm:true is that gate. Without it we report the count and refuse, so a
       # mis-issued call cannot silently empty a capture session.
+      @[Tool("clear_history", gated: true, agent_action: true)]
       private def clear_history(h) : Result
-        n = store.count
+        n = store.count?
+        return busy("history NOT cleared (store busy); every flow is still there") unless n
         unless bool_arg(h, "confirm", false)
           return err("refusing to delete #{n} flow#{n == 1 ? "" : "s"} without confirm:true — this cannot be undone",
             "CONFIRM_REQUIRED", field: "confirm",
@@ -363,6 +370,7 @@ module Gori
           s.field "view", strprop("apply a saved History view by name (list_views) — its query is ANDed OVER `query`, never replacing it, the same way the TUI's `v` picker layers over the filter bar. Built-ins: All, History (src:proxy), 'History + Repeater'. An unknown name is refused rather than ignored")
           s.field "in_scope", boolprop("only flows in the project's configured scope (the TUI ⇧S lens; capture still records everything). Empty result when no scope rules exist. Default false. For finer control use the QL terms `scope:in` / `scope:out` in `query`, which negate and group like any other term (ql_explain reports whether the project has scope rules at all)")
           s.field "strict", boolprop("reject the query if any term is unrecognized/invalid instead of silently dropping it (default false; use ql_explain to see which terms would drop)")
+          s.field "lenient", boolprop("search a `field:` QL does not implement as literal TEXT instead of refusing the query (default false). A typo like `methd:GET` free-texts its whole token and therefore matches nothing, which is indistinguishable from an empty project — so it is refused by default, the way `gori run history --lenient` spells the same escape hatch. `strict` is the other half and covers dropped terms, not unknown fields")
           s.field "columns", strarrprop("extract a value out of each returned flow and carry it on the row under `columns` — what QL can FILTER on but never shows. Each spec is [LABEL=][req|res:]kind:selector, kind being cookie|header|regex|position|jsonpath: e.g. \"header:x-request-id\", \"req:header:authorization\", \"RID=jsonpath:data.id\", \"regex:token=(\\w+)\", \"position:0:32\". Side defaults to the RESPONSE; a label defaults to the selector. A descriptor that matches nothing yields \"\" — an empty string is a MISS, not an empty value. Costs one extra read per row (and, for the three body-scoped kinds, up to 512 KiB of body each), so ask only for what you will read")
         end
 

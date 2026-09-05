@@ -72,6 +72,12 @@ module Gori::Tui
       (0 <= idx < @sessions.size) ? @sessions[idx].view : nil
     end
 
+    # The object that IS sub-tab `idx`, for the strip's mark set (#683). The view, not the
+    # index: a reconcile can reorder or drop chips under a standing mark.
+    def subtab_ref(idx : Int32) : SubtabRef?
+      view_at(idx)
+    end
+
     def body_badge : Symbol
       :body # read-only display + navigable tables — never an editor
     end
@@ -80,10 +86,10 @@ module Gori::Tui
       v = current_view
       return "↹/esc tabs · send a request here (space → Send to Sequencer) or a selection" unless v
       case v.focus
-      when :samples  then "↑/↓ select · → analysis · ↵ detail · ^X stop · c config · space cmds · ↹ pane · esc tabs"
-      when :analysis then "↑/↓ scroll · ← samples · ^R run · c config · ↹ pane · esc tabs"
+      when :samples  then keys("↑/↓ select · → analysis · ↵ detail · {sequence.stop} stop · {sequence.configure} config · space cmds · ↹ pane · esc tabs")
+      when :analysis then keys("↑/↓ scroll · ← samples · {sequence.run} run · {sequence.configure} config · ↹ pane · esc tabs")
       when :detail   then "↑/↓ scroll · esc back"
-      else                "^R run · c config · space cmds · ↹ pane · esc tabs"
+      else                keys("{sequence.run} run · {sequence.configure} config · space cmds · ↹ pane · esc tabs")
       end
     end
 
@@ -93,7 +99,7 @@ module Gori::Tui
       labels = subtab_strip_shown? ? subtab_labels : nil
       shell = BodyChrome.shell_focused(focus, multi_pane: !current_view.nil?)
       subtabs_focused = focus == :subtabs
-      @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused, labels, @current_idx, @subtab_start, subtab_hidden, strip_divider: subtab_strip_divider?, find: subtab_find_shown?, find_lit: @host.subtab_find_focused?) do |content|
+      @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused, labels, @current_idx, @subtab_start, subtab_hidden, strip_divider: subtab_strip_divider?, find: subtab_find_shown?, find_lit: @host.subtab_find_focused?, marked: marked_chip_set) do |content|
         render_with_filter(screen, content, subtabs_focused) do |body|
           if v = current_view
             v.render(screen, body, body_focused)
@@ -109,7 +115,7 @@ module Gori::Tui
       v = current_view
       if v.nil?
         key = ev.key
-        if key.escape? || key.up? || key.lower_k?
+        if key.escape? || nav_up?(ev) # `k` only BARE — see TabController#nav_up?
           @host.request_focus(:menu)
           return true
         end
@@ -422,13 +428,25 @@ module Gori::Tui
 
     def handle_wheel(step : Int32) : Bool
       if v = current_view
-        case v.focus
-        when :samples  then v.samples_move(step)
-        when :analysis then v.analysis_wheel(step) # viewport only — ↑/↓ are the cursor
-        when :detail   then v.detail_wheel(step)   # viewport only — ↑/↓ are the cursor
-        end
+        wheel_pane(v, v.focus, step)
       end
       true
+    end
+
+    # Pointer-aware: the pane under the cursor scrolls, keyboard focus stays put.
+    def handle_wheel_at(step : Int32, mx : Int32, my : Int32, rect : Rect) : Bool
+      return true unless v = current_view
+      pane = v.pane_at(body_rect_below_filter(rect), mx, my)
+      wheel_pane(v, pane || v.focus, step)
+      true
+    end
+
+    private def wheel_pane(v : SequencerView, pane : Symbol, step : Int32) : Nil
+      case pane
+      when :samples  then v.samples_move(step)
+      when :analysis then v.analysis_wheel(step) # viewport only — ↑/↓ are the cursor
+      when :detail   then v.detail_wheel(step)   # viewport only — ↑/↓ are the cursor
+      end
     end
 
     def commit : Nil
@@ -815,21 +833,48 @@ module Gori::Tui
     end
 
     # --- close / persist ---
+    # ^W closes the MARKED sub-tabs when the strip carries marks, the active one otherwise
+    # (`target_subtab_indices` — the one target rule).
     def request_close : Nil
       return unless tab = current_tab_obj
+      if refs = batch_subtab_refs
+        @host.confirm("CLOSE SEQUENCERS", "Close #{marked_subtab_phrase(refs.size)}?\nEach config and its collected tokens are discarded.",
+          confirm_label: "close", danger: true) { close_marked_sessions(refs) }
+        return
+      end
       @host.confirm("CLOSE SEQUENCER", "Close sequencing session “#{tab.view.summary}”?\nIts config and collected tokens are discarded.",
         confirm_label: "close", danger: true) { close_tab }
     end
 
+    private def close_marked_sessions(refs : Array(SubtabRef)) : Nil
+      @host.status(close_marked_subtabs(refs))
+      @host.resolve_subtab_focus
+    end
+
+    protected def close_subtab_at(idx : Int32) : Bool
+      close_at(idx)
+    end
+
     def close_tab : Nil
       return if @current_idx < 0 || @current_idx >= @sessions.size
-      tab = @sessions[@current_idx]
+      orphaned = close_at(@current_idx)
+      @host.status(TabClose.message(@sessions.empty? ? "closed — none open" : "closed (#{@sessions.size} open)", orphaned))
+    end
+
+    # Close sub-tab `idx` and report whether the store rolled its DELETE back. Toast-free and
+    # index-taking, so the batch driver can loop it.
+    private def close_at(idx : Int32) : Bool
+      return false if idx < 0 || idx >= @sessions.size
+      tab = @sessions[idx]
       tab.view.request_stop
       @host.jobs.finish(tab.view.job_id, :stopped, "closed") if tab.view.running?
       orphaned = (id = tab.db_id) ? !@host.session.store.delete_sequencer_session(id) : false
-      @sessions.delete_at(@current_idx)
+      @sessions.delete_at(idx)
+      # Closing a tab to the LEFT slides the active one down; a bare clamp would read that as
+      # "stay put" and land the operator on its neighbour.
+      @current_idx -= 1 if idx < @current_idx
       @current_idx = @sessions.empty? ? -1 : @current_idx.clamp(0, @sessions.size - 1)
-      @host.status(TabClose.message(@sessions.empty? ? "closed — none open" : "closed (#{@sessions.size} open)", orphaned))
+      orphaned
     end
 
     # Halt EVERY running collection on a project-level exit (leave project / quit) — the

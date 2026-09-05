@@ -60,6 +60,10 @@ private class FakeContext < ExecContext
     @calls << :open_help_shortcuts
   end
 
+  def open_tutorial : Nil
+    @calls << :open_tutorial
+  end
+
   def open_help_query(surface : Symbol) : Nil
     @calls << :open_help_query
   end
@@ -232,6 +236,18 @@ private class FakeContext < ExecContext
     @calls << :subtab_filter_open
   end
 
+  def subtab_mark_all : Nil
+    @calls << :subtab_mark_all
+  end
+
+  def subtab_mark_clear : Nil
+    @calls << :subtab_mark_clear
+  end
+
+  def subtab_marked_count : Int32
+    0
+  end
+
   def subtab_search_count : Int32
     0
   end
@@ -360,6 +376,18 @@ private class FakeContext < ExecContext
     @calls << :fuzz_stop
   end
 
+  def fuzz_cycle_sort : Nil
+    @calls << :fuzz_cycle_sort
+  end
+
+  def fuzz_toggle_matched : Nil
+    @calls << :fuzz_toggle_matched
+  end
+
+  def fuzz_toggle_dist : Nil
+    @calls << :fuzz_toggle_dist
+  end
+
   def fuzz_save_results : Nil
     @calls << :fuzz_save_results
   end
@@ -450,6 +478,10 @@ private class FakeContext < ExecContext
 
   def mine_stop : Nil
     @calls << :mine_stop
+  end
+
+  def mine_filter : Nil
+    @calls << :mine_filter
   end
 
   def sequence_selected : Nil
@@ -604,8 +636,20 @@ private class FakeContext < ExecContext
     @calls << :discover_toggle_pause
   end
 
+  def discover_prev_run : Nil
+    @calls << :discover_prev_run
+  end
+
+  def discover_next_run : Nil
+    @calls << :discover_next_run
+  end
+
   def discover_dismiss : Nil
     @calls << :discover_dismiss
+  end
+
+  def discover_filter : Nil
+    @calls << :discover_filter
   end
 
   def discover_open_flow : Nil
@@ -1119,6 +1163,10 @@ private class FakeContext < ExecContext
 
   def authorize_remove : Nil
     @calls << :authorize_remove
+  end
+
+  def authorize_filter : Nil
+    @calls << :authorize_filter
   end
 
   def authorize_toggle_passive : Nil

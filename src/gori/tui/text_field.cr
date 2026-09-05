@@ -242,6 +242,10 @@ module Gori::Tui
       when key.backspace?           then backspace
       when key.delete?              then delete
       else
+        # ⇥/⇧⇥ are never text here: `Key::Tab.to_char` is '\t', so a name prompt that handed
+        # every printable to this field typed a tab into a project name. Refused (false), so
+        # the owning card gets to move focus with it — or leave it a no-op.
+        return false if key.tab? || key.back_tab?
         ch = ev.char || key.to_char
         return false unless ch && !ev.ctrl? && !ev.alt?
         insert(ch)
@@ -333,13 +337,22 @@ module Gori::Tui
     # is also what the loop below is: it steps `start` back one CHARACTER at a time, which
     # is the unit @caret and @value[start..] are indexed in.
     private def window_start(width : Int32) : Int32
-      c = @caret.clamp(0, @value.size)
-      used = Screen.draw_width(@value[0, c]) + Screen.draw_width(@preedit) + 1
+      TextField.window_start(@value, @caret, @preedit, width)
+    end
+
+    # The same window over ANY single-line field that draws through `Screen#input_line` —
+    # the Decoder's CHAIN spec keeps its own value + caret rather than a TextField, and
+    # had no window at all: a spec wider than the card (an `exec:` argv, a long library
+    # chain) was typed blind past the right border. Class-level so that field, and its
+    # click handler (which must rebase by the same offset), share one measure.
+    def self.window_start(value : String, caret : Int32, preedit : String, width : Int32) : Int32
+      c = caret.clamp(0, value.size)
+      used = Screen.draw_width(value[0, c]) + Screen.draw_width(preedit) + 1
       return 0 if used <= width
-      used = Screen.draw_width(@preedit) + 1 # the caret cell always stays visible
+      used = Screen.draw_width(preedit) + 1 # the caret cell always stays visible
       start = c
       while start > 0
-        w = Screen.draw_width(@value[start - 1].to_s)
+        w = Screen.draw_width(value[start - 1].to_s)
         break if used + w > width
         used += w
         start -= 1

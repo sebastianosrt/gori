@@ -49,8 +49,8 @@ private def start_tls_origin(advertise_h2 : Bool) : Int32
   origin = TCPServer.new("127.0.0.1", 0)
   port = origin.local_address.port
   spawn do
-    while conn = origin.accept?
-      spawn do
+    while accepted = origin.accept?
+      spawn_with(accepted) do |conn|
         ssl = OpenSSL::SSL::Socket::Server.new(conn, ctx, sync_close: true)
         # Longer than any example's own timeout. At 2s a second connection on a loaded runner
         # could start its handshake after this fiber had closed, and the example then compared
@@ -1181,6 +1181,19 @@ describe Gori::Repeater::H2Engine do
   # EXACTLY" and changed nothing this encoder does, so an operator was told the bytes were
   # exact when the names had been folded. An uppercase name is malformed h2 a conformant peer
   # must reject — which is the point of typing one.
+  # A header NAME carrying a non-UTF-8 byte is expressible over h2 (HPACK strings are
+  # length-prefixed octets). `String#downcase` emits U+FFFD for such a byte, silently altering
+  # the operator's bytes (P7); the fold must touch ASCII A–Z alone.
+  it "folds only ASCII A–Z in a header name, keeping a non-UTF-8 byte byte-exact" do
+    req = IO::Memory.new
+    req << "GET / HTTP/1.1\r\nHost: h\r\n"
+    req.write(Bytes[0x58, 0x2D, 0x46, 0xFF, 0x4F]) # "X-F", 0xFF, "O"
+    req << ": v\r\n\r\n"
+    headers, _ = Gori::Repeater::H2Engine.parse_request(req.to_slice, "http", "h", 80, false, false)
+    want = Bytes[0x78, 0x2D, 0x66, 0xFF, 0x6F] # "x-f", 0xFF, "o" — only the letters folded
+    headers.any? { |(n, v)| n.to_slice == want && v == "v" }.should be_true
+  end
+
   it "preserves field-name case under preserve_field_case" do
     seen = Channel({Array({String, String}), Array({String, Int32})}).new(1)
     port = start_h2_origin_recording(seen)

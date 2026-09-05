@@ -45,6 +45,10 @@ module Gori::Tui
       @active_sub == 0
     end
 
+    def discover_active? : Bool
+      @active_sub == 1
+    end
+
     # Indexed rather than a ternary chain: a third sub-tab is exactly where an
     # `@active_sub == 0 ? … : …` starts answering "Discover" for Diff.
     private def active_child : TabController
@@ -105,7 +109,7 @@ module Gori::Tui
       subtabs_focused = focus == :subtabs
       @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused,
         subtab_labels, @active_sub, @subtab_start,
-        find: subtab_find_shown?, find_lit: @host.subtab_find_focused?) do |content|
+        find: subtab_find_shown?, find_lit: @host.subtab_find_focused?, marked: marked_chip_set) do |content|
         case @active_sub
         when 0 then @sitemap.render_content(screen, content, focus)
         when 1 then @discover.render_content(screen, content, focus)
@@ -120,6 +124,25 @@ module Gori::Tui
       when 0 then @sitemap.handle_click_content(content, mx, my)
       when 1 then @discover.handle_click_content(content, mx, my)
       else        @diff.handle_click_content(content, mx, my)
+      end
+    end
+
+    # Same rect derivation as `handle_click`, so a pair of clicks hit-tests once. Only the
+    # Sitemap answers today (fold/unfold a folder, open a leaf); the other two keep the base.
+    def handle_double_click(rect : Rect, mx : Int32, my : Int32) : Bool
+      content = BodyChrome.content_rect(rect, strip: true)
+      case @active_sub
+      when 0 then @sitemap.handle_double_click_content(content, mx, my)
+      else        false
+      end
+    end
+
+    # `y` — the cursor row (or the marks) of whichever sub-tab is up, as text.
+    def copy_row : Nil
+      case @active_sub
+      when 0 then @sitemap.copy_row
+      when 1 then @discover.copy_row
+      else        @diff.copy_row
       end
     end
 
@@ -138,6 +161,10 @@ module Gori::Tui
 
     def body_scroll(delta : Int32) : Bool
       active_child.body_scroll(delta)
+    end
+
+    def page_rows : Int32?
+      active_child.page_rows
     end
 
     def set_preedit(text : String) : Bool
@@ -166,6 +193,10 @@ module Gori::Tui
 
     def focus_last : Nil
       active_child.focus_last
+    end
+
+    def focus_resume : Nil
+      active_child.focus_resume
     end
 
     def on_enter : Nil

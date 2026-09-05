@@ -413,14 +413,14 @@ module Gori::Tui
     def self.render_menu(screen : Screen, rect : Rect, *, active_tab : Symbol, focused : Bool,
                          tabs : Array({Symbol, String}) = TABS,
                          intercept_count : Int32 = 0, hidden_count : Int32 = 0,
-                         more_focused : Bool = false) : Nil
+                         more_focused : Bool = false, numbered : Bool = false) : Nil
       return if rect.empty?
 
       # Carve the rightmost cells out for the "more" dropdown button (when tabs are
       # hidden) so the segment layout never packs a tab over it. A one-col gutter sits
       # between the last tab and the button.
       more = more_button_rect(rect, hidden_count)
-      segs, start = menu_layout(tabs_area(rect, hidden_count), active_tab, tabs, intercept_count)
+      segs, start = menu_layout(tabs_area(rect, hidden_count), active_tab, tabs, intercept_count, numbered)
       screen.cell(rect.x, rect.y, '‹', Theme.muted, Theme.bg) if start > 0 # earlier tabs hidden
       segs.each do |(sym, label, seg)|
         if sym == active_tab
@@ -429,7 +429,12 @@ module Gori::Tui
           screen.fill(seg, bg)
           screen.text(seg.x + 1, seg.y, label, fg, bg, Attribute::Bold)
         else
-          screen.text(seg.x + 1, seg.y, label, Theme.muted, Theme.bg)
+          # A numbered label wears its `N:` dimmer than the name, as the sub-tab strip's chips do
+          # (`chip_zones` is the one definition of that run). Widths are untouched: the number is
+          # part of the label, so the click hit-test sees the same cells the paint does.
+          num_end = numbered ? chip_zones(label)[0] : 0
+          screen.text(seg.x + 1, seg.y, label[0, num_end], menu_number_ink, Theme.bg) if num_end > 0
+          screen.text(seg.x + 1 + num_end, seg.y, label[num_end..], Theme.muted, Theme.bg)
         end
       end
 
@@ -455,9 +460,10 @@ module Gori::Tui
     # can never drift from what was drawn. Coords are 0-based cells.
     def self.menu_segments(rect : Rect, active_tab : Symbol, *,
                            tabs : Array({Symbol, String}) = TABS,
-                           intercept_count : Int32 = 0, hidden_count : Int32 = 0) : Array({Symbol, Rect})
+                           intercept_count : Int32 = 0, hidden_count : Int32 = 0,
+                           numbered : Bool = false) : Array({Symbol, Rect})
       return [] of {Symbol, Rect} if rect.empty?
-      menu_layout(tabs_area(rect, hidden_count), active_tab, tabs, intercept_count)[0]
+      menu_layout(tabs_area(rect, hidden_count), active_tab, tabs, intercept_count, numbered)[0]
         .map { |(sym, _, seg)| {sym, seg} }
     end
 
@@ -474,10 +480,25 @@ module Gori::Tui
     # rect} plus the window `start` (so render can flag the `‹` overflow marker).
     # Mirrors the old inline render_menu loop exactly — windowing via scroll_start,
     # segments laid " label " with a 1-col gap, the same `> rect.right + 1` break.
+    # The `N:` run's ink on an inactive tab: a step below the name's `Theme.muted`, since the
+    # bar's names are already muted and the number must read as the lesser half.
+    MENU_NUMBER_DIM = 0.55
+
+    def self.menu_number_ink : Color
+      Theme.blend(Theme.muted, Theme.bg, MENU_NUMBER_DIM)
+    end
+
+    # `numbered` prefixes the first nine labels with `N:` — the sub-tab strip's convention,
+    # and the number `nav.posN` answers to: the Nth VISIBLE tab, an absolute position, so a
+    # scrolled bar showing `5:History` first still sends `5` there. Off by default
+    # (`Settings.tab_numbers?`); Chrome reads no Settings itself, the caller passes it.
     private def self.menu_layout(rect : Rect, active_tab : Symbol, tabs : Array({Symbol, String}),
-                                 intercept_count : Int32) : {Array({Symbol, String, Rect}), Int32}
+                                 intercept_count : Int32, numbered : Bool = false) : {Array({Symbol, String, Rect}), Int32}
       segs = [] of {Symbol, String, Rect}
-      labels = tabs.map { |(sym, label)| "#{label}#{menu_badge(sym, intercept_count)}" }
+      labels = tabs.map_with_index do |(sym, label), i|
+        num = numbered && i < 9 ? "#{i + 1}:" : ""
+        "#{num}#{label}#{menu_badge(sym, intercept_count)}"
+      end
       # Columns, like strip_layout's sibling line. The catalog TABS are fixed ASCII, where
       # display_width takes its bytesize fast path and this is a no-op — but `tabs` comes from
       # the caller, and the two layout helpers share scroll_start, so they must not measure a
@@ -523,9 +544,20 @@ module Gori::Tui
     # " #tag" run tinted (SYN_HEADER) so the eye lands on the label. `‹` / `›` flag overflow.
     # `hidden` (Repeater's tag filter) drops those absolute chip indices from the strip —
     # they keep their absolute number, so the visible chips read with gaps (2, 5, 7).
+    # `marked` chips wear the `▌` bar below (and, when inactive, a SELECTION_DIM band).
+    # `▌` on a marked chip (#683) — the same glyph History, Issues, Intercept, the Sitemap
+    # and the project picker paint in their own left gutter, against the thinner `▎` those
+    # lists use for the cursor. It goes in the chip's LEADING PAD COLUMN, which every chip
+    # already has and no ink ever reaches (widths are `display_width + 2` and the label
+    # starts at `seg.x + 1`), so a mark costs no columns and `strip_layout` — and with it
+    # every click hit-test — is untouched. That it changes the chip's SHAPE rather than only
+    # its colour is what makes a mark catchable at the edge of vision on a wide strip.
+    MARK = '▌'
+
     def self.render_tab_strip(screen : Screen, rect : Rect, labels : Array(String),
                               active : Int32, focused : Bool, prev_start : Int32 = 0,
-                              hidden : Set(Int32)? = nil) : Int32
+                              hidden : Set(Int32)? = nil, *,
+                              marked : Set(Int32)? = nil) : Int32
       return prev_start if rect.empty? || labels.empty?
       active = active.clamp(0, labels.size - 1)
       segs, start, last, vis_last = strip_layout(rect, labels, active, prev_start, hidden)
@@ -536,30 +568,52 @@ module Gori::Tui
         # neighbour silently. Binding the ink to `seg` makes render structurally unable to
         # paint outside the rect the hit-test hands back.
         ink_end = seg.right - 1 # exclusive: the trailing pad column, which ink never reaches
+        mark = marked.try(&.includes?(i)) || false
         if i == active
-          if focused
-            bg = Theme.focus_gold
-            screen.fill(seg, bg)
-            screen.text(seg.x + 1, seg.y, label, Theme.ink_on(bg), bg, Attribute::Bold, width: ink_end - (seg.x + 1))
-          else
-            # Unfocused: a calmer, receded gold (FOCUS_GOLD 70% over the canvas) — still
-            # unmistakably a gold chip, a step below the bright focus pill, never the
-            # near-invisible ACCENT_BG grey band.
-            bg = Theme.blend(Theme.focus_gold, Theme.bg, SUBTAB_DIM_GOLD)
-            screen.fill(seg, bg)
-            screen.text(seg.x + 1, seg.y, label, Theme.text_bright, bg, Attribute::Bold, width: ink_end - (seg.x + 1))
-          end
+          paint_active_chip(screen, seg, label, ink_end, focused, mark)
         else
-          num_end, tag_start = chip_zones(label)
-          x = seg.x + 1
-          x = screen.text(x, seg.y, label[0, num_end], Theme.muted, Theme.bg, width: ink_end - x) if num_end > 0
-          x = screen.text(x, seg.y, label[num_end...tag_start], Theme.text, Theme.bg, width: ink_end - x)
-          screen.text(x, seg.y, label[tag_start..], Theme.syn_header, Theme.bg, width: ink_end - x) if tag_start < label.size
+          paint_inactive_chip(screen, seg, label, ink_end, mark)
         end
       end
       screen.cell(rect.x, rect.y, '‹', Theme.muted, Theme.bg) if start > 0
       screen.cell(rect.right - 1, rect.y, '›', Theme.muted, Theme.bg) if last < vis_last
       start
+    end
+
+    # The active chip: a filled pill — bright FOCUS_GOLD with auto-contrast ink while the strip
+    # holds focus, else a calmer receded gold (FOCUS_GOLD 70% over the canvas) with TEXT_BRIGHT
+    # ink: still unmistakably a gold chip, a step below the focus pill, never the near-invisible
+    # ACCENT_BG grey band. ACTIVE wins the band; a mark rides it in the pill's own ink — the
+    # `Theme.accent` the inactive arm uses would be a second colour sitting in a filled gold
+    # pill, reading as a gap in it.
+    private def self.paint_active_chip(screen : Screen, seg : Rect, label : String, ink_end : Int32,
+                                       focused : Bool, mark : Bool) : Nil
+      if focused
+        bg = Theme.focus_gold
+        ink = Theme.ink_on(bg)
+      else
+        bg = Theme.blend(Theme.focus_gold, Theme.bg, SUBTAB_DIM_GOLD)
+        ink = Theme.text_bright
+      end
+      screen.fill(seg, bg)
+      screen.cell(seg.x, seg.y, MARK, ink, bg) if mark
+      screen.text(seg.x + 1, seg.y, label, ink, bg, Attribute::Bold, width: ink_end - (seg.x + 1))
+    end
+
+    # An inactive chip: unfilled, its three label zones tinted (`chip_zones`). The bg is a
+    # LOCAL rather than `Theme.bg` spelled four times: a marked chip fills the selection band
+    # first, and text painted on a hardcoded canvas colour would erase the band it was just
+    # given — the shape #442's row renderers already avoid.
+    private def self.paint_inactive_chip(screen : Screen, seg : Rect, label : String, ink_end : Int32,
+                                         mark : Bool) : Nil
+      bg = mark ? Theme.selection_dim : Theme.bg
+      screen.fill(seg, bg) if mark
+      screen.cell(seg.x, seg.y, MARK, Theme.accent, bg) if mark
+      num_end, tag_start = chip_zones(label)
+      x = seg.x + 1
+      x = screen.text(x, seg.y, label[0, num_end], Theme.muted, bg, width: ink_end - x) if num_end > 0
+      x = screen.text(x, seg.y, label[num_end...tag_start], mark ? Theme.text_bright : Theme.text, bg, width: ink_end - x)
+      screen.text(x, seg.y, label[tag_start..], Theme.syn_header, bg, width: ink_end - x) if tag_start < label.size
     end
 
     # Split a chip label into its coloured zones — {num_end, tag_start}:

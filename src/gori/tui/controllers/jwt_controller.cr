@@ -203,34 +203,87 @@ module Gori::Tui
       @host.status("sent selection to JWT (#{text.bytesize}b)")
     end
 
+    # Duplicates the MARKED sub-tabs when the strip carries marks, the active one otherwise
+    # (`target_subtab_indices` — the one target rule).
     def jwt_duplicate : Nil
-      s = cur
-      name = SubtabClone.copy_name(s.view.name)
-      dup = make_session(s.input.text, name)
-      dup.header.set_text(s.header.text)
-      dup.payload.set_text(s.payload.text)
-      dup.secret = s.secret
-      dup.alg = s.alg
+      msg = nil.as(String?)
+      if refs = batch_subtab_refs
+        msg = duplicate_marked_subtabs(refs, "session") { |i| duplicate_at(i) }
+        unless msg
+          @host.status("#{refs.size} sub-tabs marked — duplicate is capped at #{Runner::BATCH_SUBTAB_CAP}")
+          return
+        end
+      else
+        duplicate_at(@idx)
+      end
+      @host.request_focus(:body)
+      @host.status(msg ? "#{msg} (#{@sessions.size} open)" : "duplicated JWT session (#{@sessions.size} open)")
+    end
+
+    # Clone sub-tab `idx` onto the end of the strip. Toast-free — the arm above says it.
+    private def duplicate_at(idx : Int32) : Nil
+      return unless src = @sessions[idx]?
+      dup = make_session(src.input.text, SubtabClone.copy_name(src.view.name))
+      dup.header.set_text(src.header.text)
+      dup.payload.set_text(src.payload.text)
+      dup.secret = src.secret
+      dup.alg = src.alg
       recompute_encode(dup)
       @sessions << dup
       @idx = @sessions.size - 1
-      @host.request_focus(:body)
-      @host.status("duplicated JWT session (#{@sessions.size} open)")
     end
 
+    # ^W closes the MARKED sub-tabs when the strip carries marks, the active one otherwise
+    # (`target_subtab_indices` — the one target rule). The single close stays confirm-free as
+    # it has always been; a plural one asks, because it discards more than the operator can
+    # see at the moment they press the key.
     def jwt_close : Nil
+      if refs = batch_subtab_refs
+        @host.confirm("CLOSE JWT SESSIONS", "Close #{marked_subtab_phrase(refs.size)}?\nEach token and its edits are discarded.",
+          confirm_label: "close", danger: true) { close_marked_sessions(refs) }
+        return
+      end
+      close_at(@idx)
+      @host.status(@sessions.size == 1 ? "session closed" : "session closed (#{@sessions.size} open)")
+    end
+
+    private def close_marked_sessions(refs : Array(SubtabRef)) : Nil
+      msg = close_marked_subtabs(refs)
+      @host.status(msg)
+      @host.resolve_subtab_focus
+    end
+
+    # Nothing here is persisted, so a close can never leave a saved session behind.
+    protected def close_subtab_at(idx : Int32) : Bool
+      close_at(idx)
+      false
+    end
+
+    # Close sub-tab `idx`, keeping at least one session: the last one is REPLACED by a blank
+    # rather than removed, so the tab always has something to type into. That replacement
+    # also retires the old view object, which is what drops its mark.
+    private def close_at(idx : Int32) : Nil
+      return if idx < 0 || idx >= @sessions.size
       if @sessions.size <= 1
         @sessions[0] = make_session("", nil)
         @idx = 0
       else
-        @sessions.delete_at(@idx)
+        @sessions.delete_at(idx)
+        # Closing a session to the LEFT slides the active one down; a bare clamp would read
+        # that as "stay put" and land the operator on its neighbour.
+        @idx -= 1 if idx < @idx
         @idx = @idx.clamp(0, @sessions.size - 1)
       end
-      @host.status(@sessions.size == 1 ? "session closed" : "session closed (#{@sessions.size} open)")
     end
 
     def view_at(idx : Int32) : JwtView?
       (0 <= idx < @sessions.size) ? @sessions[idx].view : nil
+    end
+
+    # The object that IS sub-tab `idx`, for the strip's mark set (#683). The view, not the
+    # index: a reconcile can reorder or drop chips under a standing mark.
+    def subtab_ref(idx : Int32) : SubtabRef?
+      view_at(idx)
     end
 
     def apply_rename(view : JwtView, name : String) : Nil
@@ -245,7 +298,7 @@ module Gori::Tui
       s = cur
       shell = BodyChrome.shell_focused(focus, multi_pane: true)
       subtabs_focused = focus == :subtabs
-      @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused, labels, @idx, @subtab_start, subtab_hidden, strip_divider: subtab_strip_divider?, find: subtab_find_shown?, find_lit: @host.subtab_find_focused?) do |content|
+      @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused, labels, @idx, @subtab_start, subtab_hidden, strip_divider: subtab_strip_divider?, find: subtab_find_shown?, find_lit: @host.subtab_find_focused?, marked: marked_chip_set) do |content|
         render_with_filter(screen, content, subtabs_focused) do |body|
           if s.mode == :decode
             s.view.render_decode(screen, body,
@@ -370,9 +423,9 @@ module Gori::Tui
       selecting = ev.shift?
       case
       when key.enter?, c == 'i' then s.input_mode = InputMode::Insert
-      when key.up?
+      when nav_up?(ev)
         s.input.at_top? ? cross_pane(s, -1) : s.input_read.move(s.input, -1, 0, selecting: selecting)
-      when key.down?
+      when nav_down?(ev)
         s.input.at_bottom? ? cross_pane(s, 1) : s.input_read.move(s.input, 1, 0, selecting: selecting)
       when key.left?  then s.input_read.move(s.input, 0, -1, selecting: selecting)
       when key.right? then s.input_read.move(s.input, 0, 1, selecting: selecting)
@@ -523,6 +576,11 @@ module Gori::Tui
       true
     end
 
+    def insert_key_refusal : String?
+      return nil unless {:decoded, :attacks, :output}.includes?(cur.pane)
+      "this pane is read-only — i edits the INPUT (↹ up); intercept toggles from the tab bar"
+    end
+
     def focus_first : Nil
       enter_pane(cur, panes(cur).first)
     end
@@ -656,13 +714,46 @@ module Gori::Tui
     # scrolling in both modes, and the wheel is a reading gesture in either.
     def handle_wheel(step : Int32) : Bool
       s = cur
-      case s.pane
+      wheel_pane(s, s.pane, step)
+      true
+    end
+
+    # Pointer-aware: the card under the cursor scrolls, keyboard focus stays put. The same
+    # lens layouts `handle_click` hit-tests with.
+    def handle_wheel_at(step : Int32, mx : Int32, my : Int32, rect : Rect) : Bool
+      s = cur
+      body = body_rect_below_filter(rect)
+      pane =
+        if s.mode == :decode
+          input_c, dec_c, atk_c = s.view.decode_layout(body)
+          case
+          when input_c.contains?(mx, my) then :input
+          when dec_c.contains?(mx, my)   then :decoded
+          when atk_c.contains?(mx, my)   then :attacks
+          else                                s.pane
+          end
+        else
+          hdr_c, pay_c, _, out_c = s.view.encode_layout(body)
+          case
+          when hdr_c.contains?(mx, my) then :header
+          when pay_c.contains?(mx, my) then :payload
+          when out_c.contains?(mx, my) then :output
+          else                              s.pane
+          end
+        end
+      wheel_pane(s, pane, step)
+      true
+    end
+
+    private def wheel_pane(s : JwtSession, pane : Symbol, step : Int32) : Nil
+      case pane
       when :decoded then s.view.scroll_decoded(step)
       when :output  then s.view.scroll_output(step)
       when :attacks then s.view.attacks_move(step)
       when :input   then s.input.scroll_view(step)
+      when :header  then s.header.scroll_view(step)
+      when :payload then s.payload.scroll_view(step)
       end
-      true
     end
 
     def set_preedit(text : String) : Bool
@@ -672,7 +763,6 @@ module Gori::Tui
       when :header  then s.header.set_preedit(text)
       when :payload then s.payload.set_preedit(text)
       when :secret  then s.secret_pre = text
-      else               nil
       end
       true
     end
@@ -833,10 +923,20 @@ module Gori::Tui
 
     # The INPUT pane's two selection models, one per mode — see RepeaterView#pane_selection?.
     # This pair changes together with `jwt_selection_text`'s :input arm.
+    #
+    # HEADER and PAYLOAD too: they are always-typing `TextArea`s whose band `jwt_copy_text`
+    # already copies, and a drag over them paints one (`editor_at` hands the drag to
+    # `s.header`/`s.payload`). Answering false for them made Drag release = `select + copy`
+    # silently do nothing on the two panes where `^Y` is the ONLY copy — no clipboard write,
+    # no toast — while the keyboard path copied the same band fine.
     def jwt_selection_active? : Bool
       s = cur
-      return false unless s.pane == :input
-      s.input_mode == InputMode::Insert ? s.input.selection? : s.input_read.selection?
+      case s.pane
+      when :input   then s.input_mode == InputMode::Insert ? s.input.selection? : s.input_read.selection?
+      when :header  then s.header.selection?
+      when :payload then s.payload.selection?
+      else               false
+      end
     end
 
     def jwt_selection_text : String
@@ -890,7 +990,7 @@ module Gori::Tui
           # The READ arm below advertises the band and `y`; INSERT kept the band and named
           # neither it nor the key that copies it. `y` is a literal character while typing —
           # and typing it over the band REPLACES it — so `^Y` is the copy this mode has.
-          "type a JWT · ⇧arrows select · ^Y copy · esc read · ↓ decoded · #{lens} encode · ^L clear · ^N new · ↑ sub-tabs"
+          keys("type a JWT · ⇧arrows select · ^Y copy · esc read · ↓ decoded · #{lens} encode · {jwt.clear} clear · ^N new · ↑ sub-tabs")
         else
           "i/↵ edit · ⇧arrows select · #{y} copy · space cmds · ↓ decoded · #{lens} encode · ^N new · esc sub-tabs"
         end
@@ -904,14 +1004,14 @@ module Gori::Tui
         # `edit_json`/`edit_secret` insert a literal space (`handle_body_key` only defers
         # ctrl/alt chords). Naming a menu that types a space instead of opening cost these
         # strips the one token that had room to say which key copies.
-        "type JSON · ⇧arrows select · ^Y copy · ↑/↓ move+cross · ^A alg · #{lens} decode · esc sub-tabs"
+        keys("type JSON · ⇧arrows select · ^Y copy · ↑/↓ move+cross · {jwt.cycle-alg} alg · #{lens} decode · esc sub-tabs")
       when :secret
         # Same trade as HEADER/PAYLOAD above, minus `⇧arrows select`: SECRET is a plain String
         # + caret index (JwtSession#secret_cx), not a TextArea, so it has no band to grow.
         # `^Y` still copies the whole field.
-        "type secret · ^Y copy · ^A alg (#{s.alg}) · ↑/↓ cross · #{lens} decode · esc sub-tabs"
+        keys("type secret · ^Y copy · {jwt.cycle-alg} alg (#{s.alg}) · ↑/↓ cross · #{lens} decode · esc sub-tabs")
       when :output
-        "↑/↓ scroll · #{y} copy token · space cmds · ^A alg · #{lens} decode · esc sub-tabs"
+        keys("↑/↓ scroll · #{y} copy token · space cmds · {jwt.cycle-alg} alg · #{lens} decode · esc sub-tabs")
       else
         ""
       end

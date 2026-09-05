@@ -79,17 +79,24 @@ module Gori::Tui
       (0 <= idx < @miners.size) ? @miners[idx].view : nil
     end
 
+    # The object that IS sub-tab `idx`, for the strip's mark set (#683). The view, not the
+    # index: a reconcile can reorder or drop chips under a standing mark.
+    def subtab_ref(idx : Int32) : SubtabRef?
+      view_at(idx)
+    end
+
     def body_badge : Symbol
-      :body # read-only display + a navigable findings table — never an editor
+      querying? ? :editor : :body # read-only display + a navigable findings table; the `/` bar is the one text field
     end
 
     def body_hint(focus : Symbol) : String
       v = current_view
       return "↹/esc tabs · mine from History/Repeater (space → Mine parameters)" unless v
+      return v.filter_hint if v.filter_editing?
       case v.focus
-      when :results then "↑/↓ select · ↵ detail · ^X stop · space cmds · ↹ pane · esc tabs"
+      when :results then keys("↑/↓ select · ↵ detail · {mine.filter} filter · {mine.stop} stop · space cmds · ↹ pane · esc tabs")
       when :detail  then "↑/↓ scroll · esc back"
-      else               "↓ findings · ^X stop · space cmds · ↹ pane · esc tabs"
+      else               keys("↓ findings · {mine.stop} stop · space cmds · ↹ pane · esc tabs")
       end
     end
 
@@ -99,7 +106,7 @@ module Gori::Tui
       labels = subtab_strip_shown? ? subtab_labels : nil
       shell = BodyChrome.shell_focused(focus, multi_pane: !current_view.nil?)
       subtabs_focused = focus == :subtabs
-      @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused, labels, @current_idx, @subtab_start, subtab_hidden, strip_divider: subtab_strip_divider?, find: subtab_find_shown?, find_lit: @host.subtab_find_focused?) do |content|
+      @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused, labels, @current_idx, @subtab_start, subtab_hidden, strip_divider: subtab_strip_divider?, find: subtab_find_shown?, find_lit: @host.subtab_find_focused?, marked: marked_chip_set) do |content|
         render_with_filter(screen, content, subtabs_focused) do |body|
           if v = current_view
             v.render(screen, body, body_focused)
@@ -116,7 +123,7 @@ module Gori::Tui
       if v.nil?
         key = ev.key
         # Empty placeholder: esc / ↑ pop to the tab bar (mirrors other empty multi-session tabs).
-        if key.escape? || key.up? || key.lower_k?
+        if key.escape? || nav_up?(ev) # `k` only BARE — see TabController#nav_up?
           @host.request_focus(:menu)
           return true
         end
@@ -129,8 +136,34 @@ module Gori::Tui
       c = ev.char || ev.key.to_char
       return true if dispatch_chord(chord_action(ev, c), v, c)
       return false if (ev.ctrl? || ev.alt?) && !ev.key.escape? # ^X stop etc. → keymap verb
-      ev.key.escape? ? handle_escape(v) : handle_pane_key(ev, v)
-      true
+      if ev.key.escape?
+        handle_escape(v)
+        return true
+      end
+      # Only a key a pane took is consumed. This used to answer true for EVERY bare key, so
+      # `/` (the filter), `x`/`y` in the detail and the Global breath keys never reached the
+      # keymap from here.
+      handle_pane_key(ev, v)
+    end
+
+    # --- the FINDINGS `/` filter (a text sub-mode the shell claims ahead of the focus ring) ---
+    def querying? : Bool
+      current_view.try(&.filter_editing?) || false
+    end
+
+    def handle_query_key(ev : Termisu::Event::Key) : Bool
+      current_view.try(&.handle_filter_key(ev)) || false
+    end
+
+    def set_preedit(text : String) : Bool
+      current_view.try(&.set_filter_preedit(text)) || false
+    end
+
+    # `/` — narrow the FINDINGS table by parameter / location / evidence. Refused with no
+    # session; lands on the RESULTS pane (closing an open detail) so the rows are on screen.
+    def mine_filter : Nil
+      return @host.status("no miner session — mine from History/Repeater (space → Mine parameters)") unless v = current_view
+      v.filter_start
     end
 
     private def dispatch_chord(action : Symbol?, v : MinerView, c : Char?) : Bool
@@ -173,41 +206,48 @@ module Gori::Tui
       @current_idx = idx if idx < @miners.size
     end
 
-    private def handle_pane_key(ev : Termisu::Event::Key, v : MinerView) : Nil
+    private def handle_pane_key(ev : Termisu::Event::Key, v : MinerView) : Bool
       case v.focus
       when :summary then handle_summary(ev, v)
       when :results then handle_results(ev, v)
       when :detail  then handle_detail(ev, v)
+      else               false
       end
     end
 
-    private def handle_summary(ev : Termisu::Event::Key, v : MinerView) : Nil
+    private def handle_summary(ev : Termisu::Event::Key, v : MinerView) : Bool
       key = ev.key
       if key.down? || key.lower_j?
         v.focus_pane(:results)
       elsif key.up? || key.lower_k?
         @host.request_focus(subtab_strip_shown? ? :subtabs : :menu)
+      else
+        return false
       end
+      true
     end
 
-    private def handle_results(ev : Termisu::Event::Key, v : MinerView) : Nil
+    private def handle_results(ev : Termisu::Event::Key, v : MinerView) : Bool
       key = ev.key
       case
       when key.enter?              then v.open_detail
       when key.down?, key.lower_j? then v.results_move(1)
       when key.up?, key.lower_k?   then v.results_at_top? ? v.focus_pane(:summary) : v.results_move(-1)
+      else                              return false
       end
+      true
     end
 
-    private def handle_detail(ev : Termisu::Event::Key, v : MinerView) : Nil
+    private def handle_detail(ev : Termisu::Event::Key, v : MinerView) : Bool
       key = ev.key
       if key.up? || key.lower_k?
         v.detail_move(-1, ev.shift?)
       elsif key.down? || key.lower_j?
         v.detail_move(1, ev.shift?)
       else
-        v.detail_motion_key(ev) # Home / End / PgUp / PgDn, ⇧ extending
+        return v.detail_motion_key(ev) # Home / End / PgUp / PgDn, ⇧ extending
       end
+      true
     end
 
     def handle_click(rect : Rect, mx : Int32, my : Int32) : Bool
@@ -307,12 +347,24 @@ module Gori::Tui
 
     def handle_wheel(step : Int32) : Bool
       if v = current_view
-        case v.focus
-        when :results then v.results_move(step)
-        when :detail  then v.detail_wheel(step) # viewport only — ↑/↓ are the cursor
-        end
+        wheel_pane(v, v.focus, step)
       end
       true
+    end
+
+    # Pointer-aware: the pane under the cursor scrolls, keyboard focus stays put.
+    def handle_wheel_at(step : Int32, mx : Int32, my : Int32, rect : Rect) : Bool
+      return true unless v = current_view
+      pane = v.pane_at(body_rect_below_filter(rect), mx, my)
+      wheel_pane(v, pane || v.focus, step)
+      true
+    end
+
+    private def wheel_pane(v : MinerView, pane : Symbol, step : Int32) : Nil
+      case pane
+      when :results then v.results_move(step)
+      when :detail  then v.detail_wheel(step) # viewport only — ↑/↓ are the cursor
+      end
     end
 
     def commit : Nil
@@ -486,13 +538,32 @@ module Gori::Tui
     end
 
     # Content-only clone of the active miner session (request + config; no findings/links).
+    # Duplicates the MARKED sub-tabs when the strip carries marks, the active one otherwise
+    # (`target_subtab_indices` — the one target rule).
     def miner_duplicate : Nil
-      return @host.status("no miner session open to duplicate") unless src = current_view
+      if refs = batch_subtab_refs
+        msg = duplicate_marked_subtabs(refs, "miner session") { |i| duplicate_at(i) }
+        unless msg
+          @host.status("#{refs.size} sub-tabs marked — duplicate is capped at #{Runner::BATCH_SUBTAB_CAP}")
+          return
+        end
+        @host.goto_tab(:miner)
+        @host.status("#{msg} (#{@miners.size} open)")
+        return
+      end
+      return @host.status("no miner session open to duplicate") unless current_view
+      duplicate_at(@current_idx)
+      @host.goto_tab(:miner)
+      @host.status("duplicated miner session (#{@miners.size} open)")
+    end
+
+    # Clone sub-tab `idx` into a new session at the end of the strip. Toast-free, so the
+    # single and batch arms above can each own their sentence.
+    private def duplicate_at(idx : Int32) : Nil
+      return unless src = view_at(idx)
       view = MinerView.new
       view.duplicate_from(src)
       open_session(view, nil)
-      @host.goto_tab(:miner)
-      @host.status("duplicated miner session (#{@miners.size} open)")
     end
 
     # Seed handed to RepeaterController for "Send to Repeater" (Miner finding → injected request).
@@ -711,24 +782,51 @@ module Gori::Tui
     end
 
     # --- close / persist ---
+    # ^W closes the MARKED sub-tabs when the strip carries marks, the active one otherwise
+    # (`target_subtab_indices` — the one target rule).
     def request_close : Nil
       return unless tab = current_tab_obj
+      if refs = batch_subtab_refs
+        @host.confirm("CLOSE MINERS", "Close #{marked_subtab_phrase(refs.size)}?\nEach config and its results are discarded.",
+          confirm_label: "close", danger: true) { close_marked_sessions(refs) }
+        return
+      end
       @host.confirm("CLOSE MINER", "Close mining session “#{tab.view.summary}”?\nIts config and results are discarded.",
         confirm_label: "close", danger: true) { close_tab }
     end
 
+    private def close_marked_sessions(refs : Array(SubtabRef)) : Nil
+      @host.status(close_marked_subtabs(refs))
+      @host.resolve_subtab_focus
+    end
+
+    protected def close_subtab_at(idx : Int32) : Bool
+      close_at(idx)
+    end
+
     def close_tab : Nil
       return if @current_idx < 0 || @current_idx >= @miners.size
-      tab = @miners[@current_idx]
+      orphaned = close_at(@current_idx)
+      @host.status(TabClose.message(@miners.empty? ? "closed — none open" : "closed (#{@miners.size} open)", orphaned))
+    end
+
+    # Close sub-tab `idx` and report whether the store rolled its DELETE back. Toast-free and
+    # index-taking, so the batch driver can loop it.
+    private def close_at(idx : Int32) : Bool
+      return false if idx < 0 || idx >= @miners.size
+      tab = @miners[idx]
       tab.view.request_stop # halt a running mine before detaching (the run fiber polls this)
       # Finish the job NOW: once the view leaves @miners, drain_events drops its remaining
       # events (incl. Done), so jobs.finish would never run and the bottom-bar spinner would
       # animate forever. The background fiber still unwinds on its own via request_stop.
       @host.jobs.finish(tab.view.job_id, :stopped, "closed") if tab.view.running?
       orphaned = (id = tab.db_id) ? !@host.session.store.delete_miner_session(id) : false
-      @miners.delete_at(@current_idx)
+      @miners.delete_at(idx)
+      # Closing a tab to the LEFT slides the active one down; a bare clamp would read that as
+      # "stay put" and land the operator on its neighbour.
+      @current_idx -= 1 if idx < @current_idx
       @current_idx = @miners.empty? ? -1 : @current_idx.clamp(0, @miners.size - 1)
-      @host.status(TabClose.message(@miners.empty? ? "closed — none open" : "closed (#{@miners.size} open)", orphaned))
+      orphaned
     end
 
     # Halt EVERY running mine on a project-level exit (leave project / quit) — the same

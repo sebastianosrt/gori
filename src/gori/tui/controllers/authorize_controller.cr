@@ -684,6 +684,21 @@ module Gori::Tui
       @host.status("authorize: stopping…")
     end
 
+    # Project-level halt (`Runner#stop_all_jobs`): the engine fiber owns its own sockets and
+    # kept sending after the operator was back at the picker, with the job pinned at
+    # `running` and nothing that could stop it — the exact gap the other six job-owning
+    # controllers had already closed. Same `request_stop` + `jobs.finish(:stopped, …)` pair
+    # `finish_batch` applies; the fiber's next poll sees the flag and its outcomes are then
+    # dropped by the generation check.
+    def stop_all : Nil
+      return unless running?
+      @view.request_stop
+      if id = @job_id
+        @host.jobs.finish(id, :stopped, "project closed")
+        @job_id = nil
+      end
+    end
+
     # Drop the cursor request from the queue. Refused while it is mid-run — its outcome is
     # still on the way.
     def remove_selected : Nil
@@ -880,14 +895,6 @@ module Gori::Tui
       when key.down?, key.lower_j?
         @view.move_row(1)
         true
-      when key.tab?
-        @view.move_trial(1)
-        true
-      when key.back_tab?
-        # The pair, not just ⇥: the sub-cursor wraps, so with eight identities stepping BACK one
-        # row meant seven forward presses and eight response panes redrawn on the way.
-        @view.move_trial(-1)
-        true
       when key.page_up?
         @view.scroll_detail(-10)
         true
@@ -907,18 +914,66 @@ module Gori::Tui
       true
     end
 
+    # --- the request-list `/` filter (a text sub-mode the shell claims ahead of the focus ring) ---
+    def querying? : Bool
+      @view.filter_editing?
+    end
+
+    def handle_query_key(ev : Termisu::Event::Key) : Bool
+      @view.handle_filter_key(ev)
+    end
+
+    def set_preedit(text : String) : Bool
+      @view.set_filter_preedit(text)
+    end
+
+    def body_badge : Symbol
+      querying? ? :editor : :body
+    end
+
+    # `/` — narrow the queue by method / host / path / verdict. Refused with nothing queued.
+    def authorize_filter : Nil
+      return @host.status("nothing to filter — Send to Authorize from History to begin") unless @view.any_requests?
+      @view.filter_start
+    end
+
+    # `y`: the selected request as `METHOD host/path`.
+    def authorize_copy : Nil
+      e = @view.selected_entry
+      copy_text(e ? "#{e.method} #{e.host_path}" : "")
+    end
+
+    # ⇥ / ⇧⇥ step the identity sub-cursor — the focus-ring hook, not a `key.tab?` arm: the
+    # Runner claims ⇥ for the ring BEFORE the body sees a key, so the arms that used to sit
+    # in `handle_body_key` never ran and the `⇥ identity` the hint promised went to the tab
+    # bar instead. The pair, not just ⇥: the sub-cursor wraps, so with eight identities
+    # stepping BACK one row meant seven forward presses. Always true — the identities are a
+    # ring of their own, and esc is the way out to the tab bar.
+    def pane_advance(dir : Int32) : Bool
+      return false unless @view.any_requests?
+      @view.move_trial(dir)
+      true
+    end
+
+    # Home/End jump the response detail to its ends (PgUp/PgDn page it from the body arms).
+    def body_scroll(delta : Int32) : Bool
+      return false unless delta.abs >= Runner::JUMP_ROWS
+      @view.scroll_detail(delta)
+      true
+    end
+
     def body_hint(focus : Symbol) : String
       passive = @passive ? " · PASSIVE on" : ""
       unless @view.any_requests?
-        return "i identities · p passive · Send to Authorize from History to begin#{passive}"
+        return keys("{authorize.identities} identities · {authorize.passive} passive · Send to Authorize from History to begin#{passive}")
       end
-      return "↑/↓ request · ⇥ identity · ^X stop#{passive} · space cmds" if running?
+      return @view.filter_hint if querying?
+      return keys("↑/↓ request · ⇥ identity · {authorize.stop} stop#{passive} · space cmds") if running?
       # `⇧X clear` is named here and NOT in the running branch above: that one is deliberately
       # the two keys a run leaves meaningful, and "empty the queue" is not the thing to put in
       # front of an operator watching one go out. Resolved through the keymap so a rebind
       # reaches the hint; the rest of this line is still literal, as its siblings are.
-      clear = Hotkeys.binding_label(@host.session.registry, "authorize.clear", "⇧X")
-      "↑/↓ request · ⇥ identity · ^R run · ⇧R all · i identities · p passive#{passive} · #{clear} clear · space cmds"
+      keys("↑/↓ request · ⇥ identity · {authorize.run} run · {authorize.run-all} all · {authorize.identities} identities · {authorize.passive} passive#{passive} · {authorize.filter} filter · {authorize.copy} copy · {authorize.clear} clear · space cmds")
     end
   end
 end

@@ -35,6 +35,10 @@ module Gori::Tui
       true
     end
 
+    def page_rows : Int32?
+      @sitemap.list_page_rows
+    end
+
     # esc clears the marks. Runs BEFORE the Sitemap keymap, so this shadows sitemap.to-menu
     # ONLY while marks are set — with none set, esc still pops to the sub-tab strip. (The QL
     # bar and the tag editor claim every key ahead of this while either is up, so their own
@@ -66,6 +70,41 @@ module Gori::Tui
 
     def handle_click(rect : Rect, mx : Int32, my : Int32) : Bool
       handle_click_content(rect.inset(1, 1), mx, my)
+    end
+
+    def handle_double_click(rect : Rect, mx : Int32, my : Int32) : Bool
+      handle_double_click_content(rect.inset(1, 1), mx, my)
+    end
+
+    # `y`: every marked row as `host/path`, one per line — or the cursor row's seed, which is
+    # the host for a host row and `host/path` below it (the string `a` would scope). The tree
+    # carries no scheme, so this is the URL minus its scheme, the way the rows read.
+    def copy_row : Nil
+      keys = @sitemap.marked_keys
+      text = if keys.empty?
+               @sitemap.selected_scope_seed.try(&.[:pattern]) || ""
+             else
+               keys.map { |(host, path)| "#{host}#{path}" }.join("\n")
+             end
+      copy_text(text, keys.size > 1 ? "#{keys.size} paths" : nil)
+    end
+
+    # The universal tree gesture: a double-click on a row's LABEL folds or unfolds a folder
+    # and opens a leaf's flow (what `o` does). Expand/collapse used to answer only on the
+    # one-column ▾/▸ marker, and a double-click there was a net no-op — the first press of
+    # the pair had already toggled, the second toggled back. So the marker column is
+    # swallowed here (true, nothing done): the pair reads as one toggle. Off every row it
+    # answers false and the shell delivers the second press as an ordinary click.
+    def handle_double_click_content(content : Rect, mx : Int32, my : Int32) : Bool
+      return false unless ri = @sitemap.row_at(content, mx, my)
+      return true if @sitemap.marker_hit?(content, mx, ri)
+      @sitemap.select_index(ri)
+      if @sitemap.leaf_at?(ri)
+        @host.sitemap_open_flow
+      else
+        @sitemap.toggle_at(ri)
+      end
+      true
     end
 
     # Click hit-test against the content rect directly (TargetController passes the rect
@@ -125,10 +164,10 @@ module Gori::Tui
       # Marks survive a filter change, so the `/` affordance stays up while they're set.
       # `space tag`, not `⇧T`: tagging is menu-only now — ⇧T meant "mark all" in every other
       # marked list, so a hand that learnt `t`/⇧T there opened a text prompt here.
-      return "↑/↓ move · / filter · t mark · space tag · space cmds · esc clears marks" if @sitemap.mark_count > 0
+      return keys("↑/↓ move · {sitemap.query} filter · {sitemap.mark-toggle} mark · {sitemap.copy} copy · space cmds (tag) · esc clears marks") if @sitemap.mark_count > 0
       # `space cmds` on BOTH branches. The mark-set branch above named it and this one did not,
       # so the same tab advertised the space menu only while marks happened to be set.
-      "↑/↓ move · / filter · t mark · g fold · ↵/→ expand · space cmds · esc sub-tabs"
+      keys("↑/↓ move · {sitemap.query} filter · {sitemap.mark-toggle} mark · {sitemap.toggle-grouping} fold · ↵/→ expand · {sitemap.copy} copy · space cmds · esc sub-tabs")
     end
 
     # Live IME composition flows to whichever text field is open (the QL filter bar or
@@ -164,7 +203,7 @@ module Gori::Tui
       key = ev.key
       c = ev.char || key.to_char
       store = @host.session.store
-      return true if query_nav(key)
+      return true if query_nav(ev)
       case
       when key.enter?  then query_enter
       when key.escape? then query_escape(store)
@@ -189,8 +228,12 @@ module Gori::Tui
     # gate CI runs, and "move something" is a different question from "what does this key do".
     # `↓`/`↑` were dead in this bar before the dropdown — a one-line field has no second row to
     # move a caret to — which is why they could be claimed without displacing anything.
-    private def query_nav(key) : Bool
+    private def query_nav(ev : Termisu::Event::Key) : Bool
+      key = ev.key
       case
+      when act = LineEdit.action(ev) # ⌃/⌥←→, Home/End, Delete, ⌥⌫ — before the bare arrows
+        @sitemap.query_edit(act)
+        schedule_query_reload if LineEdit.mutating?(act)
       when key.down?  then @sitemap.popup_down
       when key.up?    then @sitemap.popup_up
       when key.left?  then @sitemap.query_move(-1)

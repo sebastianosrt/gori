@@ -6,6 +6,7 @@ require "../serialize"
 module Gori
   module MCP
     class Tools
+      @[Tool("list_sitemap")]
       private def list_sitemap(h) : Result
         limit = clamp(optional_int_arg(h, "limit"), 200, 5000)
         query = str(h, "query")
@@ -53,11 +54,15 @@ module Gori
                 j.field "last_seen_iso", Serialize.unix_micros_iso(e.last_seen)
                 # The operator's free-text memo for this endpoint, when one is pinned. The key
                 # is the tree's node path, which includes any query string.
-                # On a folded row this is the tag on the PATH, if one is pinned there: the
-                # tags on its variants are keyed by the path WITH the query, exactly as a
-                # `{uuid}` fold's children keep their own. list_sitemap_tags (or
-                # fold_query:false) is where those show.
-                if tag = tags[{e.host, sitemap_tag_path(e.target)}]?
+                # NOT on a folded row, which is synthetic: `Sitemap.stamp_tags!` bars a tag on
+                # a `grouped` node ("the tag key is the path WITH the query", fold_queries_node!),
+                # so the TUI tree and `gori run sitemap` both leave it bare — and this stamped
+                # one anyway, which made set_sitemap_tag's "will not show in list_sitemap or
+                # the TUI" warning a lie about half of itself. The tags on a fold's variants
+                # are keyed by the path WITH the query and ride `variant_tags` above, exactly
+                # as a `{uuid}` fold's children keep their own; list_sitemap_tags (or
+                # fold_query:false) is where the rest show.
+                if e.query_variants == 0 && (tag = tags[{e.host, sitemap_tag_path(e.target)}]?)
                   j.field "tag", Serialize.text(tag)
                 end
               end
@@ -67,6 +72,7 @@ module Gori
       end
 
       # Pin (or clear) a free-text memo on one sitemap endpoint — the TUI Sitemap tab's `t`.
+      @[Tool("set_sitemap_tag", gated: true, agent_action: true)]
       private def set_sitemap_tag(h) : Result
         host = str(h, "host").try(&.strip).presence
         return err("missing required 'host'", "INVALID_ARGUMENT", field: "host") unless host
@@ -98,6 +104,7 @@ module Gori
         end)
       end
 
+      @[Tool("list_sitemap_tags")]
       private def list_sitemap_tags(h) : Result
         host = str(h, "host").try(&.strip).presence
         tags = store.sitemap_tags
@@ -319,6 +326,7 @@ module Gori
           s.field "fold_query", boolprop("fold the query-string variants of one path into a single entry (default true); false lists one entry per query string")
           s.field "collapse_transport", boolprop("collapse to distinct host/method/target only (legacy shape), dropping scheme/port/version + counts (default false)")
           s.field "strict", boolprop("reject the query if any term is unrecognized/invalid instead of silently dropping it (default false)")
+          s.field "lenient", boolprop("search a `field:` QL does not implement as literal TEXT instead of refusing the query (default false). A typo like `methd:GET` free-texts its whole token and therefore matches nothing, which is indistinguishable from an empty project — so it is refused by default, the way `gori run history --lenient` spells the same escape hatch. `strict` is the other half and covers dropped terms, not unknown fields")
         end
 
         tool j, "list_sitemap_tags",

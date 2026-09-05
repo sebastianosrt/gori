@@ -42,7 +42,6 @@ module Gori::Tui
     # Registry sidecar facts, nil off the canonical registry db (see `overview_groups`).
     @proj_id : String?
     @workspace : String?
-    @last_activity : Time?
     @probe_count : Int32
     # Live capture state. NOT snapshotted by `reload`: capture starts and stops while this tab
     # sits open, so the controller re-supplies it on every render instead.
@@ -65,7 +64,6 @@ module Gori::Tui
       @sev_tally = StaticArray(Int64, 5).new(0_i64)
       @proj_id = nil
       @workspace = nil
-      @last_activity = nil
       @probe_count = 0
       @capturing = false
       @desc_area = TextArea.new
@@ -153,9 +151,11 @@ module Gori::Tui
       @flow_count = store.count
       @issues_count = store.count_issues
       @probe_tech = scoped_tech(store.probe_tech_rows)
-      @db_size = project.db_size
+      # `db_size_with_wal`, not `db_size`: in WAL mode the flows just captured are still in
+      # `<db>-wal` and the main file has not grown, so the plain size reads 4 KB for a project
+      # holding megabytes. MCP/CLI keep reporting the narrow `db_size` under that name.
+      @db_size = project.db_size_with_wal
       @total_captured = store.total_size
-      @last_activity = project.last_modified
       # AT A GLANCE aggregates: traffic status mix + Issues severity (human-confirmed
       # `issues` table only — Probe hits stay on the Probe tab, not here). That still holds for
       # the CHART; the OVERVIEW band beside it does carry a Probe *count* — see `issues_value`.
@@ -297,12 +297,8 @@ module Gori::Tui
     end
 
     private def project_proxy_protocol_label(kind : String) : String
-      case kind
-      when "http"    then "HTTP"
-      when "socks5"  then "SOCKS5"
-      when "socks5h" then "SOCKS5H"
-      else                "None"
-      end
+      label = kind.upcase
+      SETTINGS_PROTOCOL_CHOICES.includes?(label) ? label : "None"
     end
 
     private def current_set_value : String
@@ -480,7 +476,11 @@ module Gori::Tui
     SETTINGS_PASSWORD_INDEX    = SETTINGS_PASSWORD_ROW - SETTINGS_FIELD_BASE
     SETTINGS_PROTOS_FIELD      = 12
     SETTINGS_LABEL_W           = 16 # value column starts past the widest label ("Connect timeout")
-    SETTINGS_PROTOCOL_CHOICES  = ["None", "HTTP", "SOCKS5", "SOCKS5H"]
+    # LABELS, not stored codes — this card round-trips them through `downcase` (see
+    # `settings_upstream_proxy`), so each one must be the setting's own spelling in caps.
+    # `HTTP+TLS` is Settings::UPSTREAM_TLS_KIND: an HTTP CONNECT proxy reached over TLS, as
+    # opposed to the legacy `https://` scalar, which means the PLAINTEXT one.
+    SETTINGS_PROTOCOL_CHOICES = ["None", "HTTP", "HTTP+TLS", "SOCKS5", "SOCKS5H"]
     # Fields with no global counterpart to inherit — their unset marker is "· default", not
     # "· global" (see render_settings_field).
     SETTINGS_PROJECT_ONLY_INDICES = [SETTINGS_DESTINATION_INDEX, SETTINGS_USERNAME_INDEX,
@@ -542,9 +542,17 @@ module Gori::Tui
     # (see `overview_plan`) needs fewer of them, and every row it gives back goes to the card
     # underneath. Still a PURE function of `rect`, which is what keeps it the single source of
     # truth `strip_rect` / `active_card` / `strip_chip_at` / `pane_at` all route through.
+    #
+    # `rect.h` is in the min for the case none of the other three bound: `overview_budget`
+    # floors its inner rows at 3, deliberately (a band that folds to nothing says nothing), so
+    # on a TWO-row body every other term stayed at 3 and the band was painted a row past the
+    # bottom — `Frame.card`'s fill landed on the shell's status line. That is the whole body a
+    # 40x8 terminal has (`Layout.usable?`'s floor, and `Layout.compute` spends four rows on
+    # chrome). Inert above two rows: at `rect.h == 3` the budget term is already 3.
+    # Contract: `spec/tui/contract_render_bounds_spec.cr`.
     private def overview_h(rect : Rect) : Int32
       plan = overview_plan(rect)
-      {plan.rows + (plan.signpost ? 1 : 0) + 2, overview_budget(rect) + 2, OVERVIEW_CAP}.min
+      {plan.rows + (plan.signpost ? 1 : 0) + 2, overview_budget(rect) + 2, OVERVIEW_CAP, rect.h}.min
     end
 
     # Width carved off the RIGHT of the OVERVIEW band for the AT A GLANCE viz pane, or 0
@@ -777,12 +785,12 @@ module Gori::Tui
       @set_preedit = ""
     end
 
+    # Through `Settings.upstream_default_port`, the one place a kind's default port is
+    # decided — a local table here is how this card comes to pre-fill a port the dialer,
+    # the rule validator and the global editor do not agree with.
     private def project_proxy_default_port(label : String) : String
-      case label
-      when "HTTP"              then Settings::DEFAULT_HTTP_PROXY_PORT.to_s
-      when "SOCKS5", "SOCKS5H" then Settings::DEFAULT_SOCKS_PORT.to_s
-      else                          ""
-      end
+      return "" if label == "None" || label.starts_with?("Invalid ·")
+      Settings.upstream_default_port(label.downcase).to_s
     end
 
     private def settings_proxy_field_disabled? : Bool
@@ -1588,6 +1596,11 @@ module Gori::Tui
       current_override.try(&.host)
     end
 
+    # The selected override as a hosts-file line (`ip host`) — what `y` copies.
+    def selected_override_line : String?
+      current_override.try { |e| "#{e.ip} #{e.host}" }
+    end
+
     # Removes the selected override, returning its host (for the toast) — or nil when there
     # was nothing selected OR the delete did not COMMIT. `HostOverrides#remove` answers that
     # (its doc: "false = store busy/locked/closing") and this discarded it, so a dropped
@@ -1751,6 +1764,12 @@ module Gori::Tui
       @env_items[@env_sel]?.try { |(key, _)| key }
     end
 
+    # The selected variable as `KEY=VALUE` — what `y` copies. The value is included: the pane
+    # draws it in full, so the clipboard gets no more than the screen already shows.
+    def selected_env_line : String?
+      @env_items[@env_sel]?.try { |(key, val)| "#{key}=#{val}" }
+    end
+
     def env_delete : String?
       entry = @env_items[@env_sel]?
       return nil unless entry
@@ -1767,7 +1786,7 @@ module Gori::Tui
     # Replace the description (e.g. from the external editor); marks dirty so save
     # persists it on the next tab-exit.
     def replace_desc(text : String) : Nil
-      @desc_area.set_text(text)
+      @desc_area.replace_from_outside(text)
       @desc_dirty = true
     end
 
@@ -1801,14 +1820,26 @@ module Gori::Tui
       @desc_dirty = true
     end
 
+    # ⌃Z on an empty undo stack and ⌫ at the buffer start are NO-OPS — `TextArea` returns
+    # early without bumping `#edits` — and dirtying the description there was not harmless.
+    # `@desc_dirty` is what makes `reload` refuse to re-seed the buffer from the store (see
+    # the note there), so an idle keystroke over a clean description silenced every later
+    # refresh of the pane, including a peer's write, until something else saved. The same
+    # guard `desc_motion_key` and `replace_matches` already apply, and the same one the
+    # Notes, Repeater, Fuzzer and Intercept editors carry. Contract:
+    # `spec/tui/contract_editor_noop_spec.cr`.
     def undo : Nil
-      @desc_area.undo
-      @desc_dirty = true
+      desc_edit_if_changed(&.undo)
     end
 
     def backspace : Nil
-      @desc_area.backspace
-      @desc_dirty = true
+      desc_edit_if_changed(&.backspace)
+    end
+
+    private def desc_edit_if_changed(& : TextArea -> Nil) : Nil
+      before = @desc_area.edits
+      yield @desc_area
+      @desc_dirty = true if @desc_area.edits != before
     end
 
     def move(dr : Int32, dc : Int32) : Nil
@@ -1989,10 +2020,7 @@ module Gori::Tui
           OvRow.new("Issues", issues_value),
           OvRow.new("DB Size", human_size(@db_size)),
         ], fold_volume),
-        OvGroup.new([
-          OvRow.new("Created", created_value),
-          OvRow.new("Activity", activity_value),
-        ], fold_provenance),
+        OvGroup.new([OvRow.new("Created", created_value)], fold_provenance),
         OvGroup.new([OvRow.new("Technologies", tech_value)], "tech #{tech_value}"),
       ]
     end
@@ -2013,8 +2041,7 @@ module Gori::Tui
     end
 
     private def fold_provenance : String
-      c = (t = @created) ? "created #{Fmt.ago(t)} ago" : "created —"
-      (a = @last_activity) ? "#{c} · active #{Fmt.ago(a)} ago" : c
+      (t = @created) ? "created #{Fmt.ago(t)} ago" : "created —"
     end
 
     # The address an operator points a client at, plus whether the proxy is actually on it.
@@ -2034,10 +2061,6 @@ module Gori::Tui
     # the project's own home page should answer. The chart beside it is still `issues` only.
     private def issues_value : String
       @probe_count > 0 ? "#{@issues_count} · probe #{@probe_count}" : @issues_count.to_s
-    end
-
-    private def activity_value : String
-      (t = @last_activity) ? "#{Fmt.ago(t)} ago" : "—"
     end
 
     private def created_value : String

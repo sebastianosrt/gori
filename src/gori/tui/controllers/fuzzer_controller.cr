@@ -154,6 +154,12 @@ module Gori::Tui
       (0 <= idx < @fuzzers.size) ? @fuzzers[idx].view : nil
     end
 
+    # The object that IS sub-tab `idx`, for the strip's mark set (#683). The view, not the
+    # index: a reconcile can reorder or drop chips under a standing mark.
+    def subtab_ref(idx : Int32) : SubtabRef?
+      view_at(idx)
+    end
+
     # ^G/^F name the focused pane — the TEMPLATE editor and the RESULT detail, the tab's two
     # multi-line surfaces. TARGET is one line, CONFIG is a form and RESULTS is a table the
     # tab filters with its own `matched-only` + sort rather than a text find, so none of the
@@ -223,7 +229,7 @@ module Gori::Tui
         # "fuzz results already saved as run #N" refusal unreachable through the binding.
         # Named off the same predicate the gate reads, not a second copy of its conditions.
         save = v.results_saveable? ? " · #{save_key} save" : ""
-        "↑/↓ select · ↵ detail · o sort · m matched · v dist#{save} · " \
+        "↑/↓ select · ↵ detail · #{keys("{fuzz.sort} sort · {fuzz.matched} matched · {fuzz.dist} dist")}#{save} · " \
         "#{run} run · #{stop} stop · space cmds · ↹ pane"
       when :detail then "↑/↓ move · #{read_common} · ←/→ pane · ^F find · esc back"
       else              "↹/esc tabs"
@@ -233,7 +239,7 @@ module Gori::Tui
     private def config_hint(v : FuzzerView, run : String) : String
       case v.config_row
       when :set  then "↑/↓ row · ↵ edit set · Del remove · #{run} run · ↹ pane"
-      when :add  then "↵ add a payload set · ^L quick List · ↑/↓ row · #{run} run · ↹ pane"
+      when :add  then keys("↵ add a payload set · {fuzz.list-paste} quick List · ↑/↓ row · #{run} run · ↹ pane")
       when :mode then "←/→ mode · ↵ open editor · ↑/↓ row · #{run} run · ↹ pane"
       else            "↵ open Advanced · ↑/↓ row · #{run} run · ↹ pane"
       end
@@ -245,7 +251,7 @@ module Gori::Tui
       labels = subtab_strip_shown? ? subtab_labels : nil
       shell = BodyChrome.shell_focused(focus, multi_pane: !current_view.nil?)
       subtabs_focused = focus == :subtabs
-      @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused, labels, @current_idx, @subtab_start, subtab_hidden, strip_divider: subtab_strip_divider?, find: subtab_find_shown?, find_lit: @host.subtab_find_focused?) do |content|
+      @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused, labels, @current_idx, @subtab_start, subtab_hidden, strip_divider: subtab_strip_divider?, find: subtab_find_shown?, find_lit: @host.subtab_find_focused?, marked: marked_chip_set) do |content|
         render_with_filter(screen, content, subtabs_focused) do |body|
           if v = current_view
             v.render(screen, body, focused: body_focused)
@@ -262,8 +268,7 @@ module Gori::Tui
     def handle_body_key(ev : Termisu::Event::Key) : Bool
       v = current_view
       if v.nil?
-        key = ev.key
-        if key.up? || key.lower_k?
+        if nav_up?(ev) # `k` only BARE — see TabController#nav_up?
           @host.request_focus(:menu)
           return true
         end
@@ -713,9 +718,7 @@ module Gori::Tui
       when key.enter?              then v.open_detail
       when key.up?, key.lower_k?   then v.results_at_top? ? v.pane_advance(-1) : v.results_move(-1)
       when key.down?, key.lower_j? then v.results_move(1)
-      when key.lower_o?            then @host.status(v.cycle_sort)
-      when key.lower_m?            then @host.status(v.toggle_matched_only)
-      when key.lower_v?            then @host.status(v.toggle_dist)
+        # `o` sort / `m` matched / `v` dist are verbs (`fuzz.sort` …) — they fall through.
       when (c = ev.char || key.to_char) && !ev.ctrl? && !ev.alt? && !c.control?
         return false # Global breath
       end
@@ -840,13 +843,27 @@ module Gori::Tui
 
     def handle_wheel(step : Int32) : Bool
       if v = current_view
-        case v.focus
-        when :results  then v.results_move(step)
-        when :detail   then v.detail_scroll_view(step)
-        when :template then v.template_scroll_view(step)
-        end
+        wheel_pane(v, v.focus, step)
       end
       true
+    end
+
+    # The wheel scrolls the pane UNDER THE POINTER and leaves keyboard focus where it is —
+    # `pane_at` is the hit-test `handle_click` uses, over the same rect. Off every pane
+    # (chrome, the DIST sidebar) it falls back to the focused pane, as the base does.
+    def handle_wheel_at(step : Int32, mx : Int32, my : Int32, rect : Rect) : Bool
+      return true unless v = current_view
+      pane = v.pane_at(body_rect_below_filter(rect), mx, my)
+      wheel_pane(v, pane || v.focus, step)
+      true
+    end
+
+    private def wheel_pane(v : FuzzerView, pane : Symbol, step : Int32) : Nil
+      case pane
+      when :results  then v.results_move(step)
+      when :detail   then v.detail_scroll_view(step)
+      when :template then v.template_scroll_view(step)
+      end
     end
 
     def set_preedit(text : String) : Bool
@@ -959,6 +976,15 @@ module Gori::Tui
 
     def focus_last : Nil
       current_view.try(&.focus_last)
+    end
+
+    def focus_resume : Nil
+      current_view.try(&.focus_resume)
+    end
+
+    def insert_key_refusal : String?
+      return nil unless (v = current_view) && (v.focus == :results || v.focus == :detail)
+      "results are read-only — i edits the TEMPLATE (↹ up); intercept toggles from the tab bar"
     end
 
     # --- sub-tab nav (filter-aware: ←/→ skip hidden chips; ^1-9 escapes the filter) ---
@@ -1131,7 +1157,11 @@ module Gori::Tui
         spool_run = @spool_runs[v]?
         archive_ready = !!spool_run && !spool_run.failed? && spool_run.finished?
         v.finish_run(terminal, archive_ready: archive_ready)
-        finish_job(v, ev, terminal)
+        # A view being CLOSED (`close_at`, `stop_all`) drains its own Done while it is still
+        # in `@fuzzers`; its job was already finished `:stopped` by the close, and a "Fuzzer:
+        # N hits (stopped)" toast with a jump to a session that no longer exists is not a
+        # completion — it is the close, reported a second time as a result.
+        finish_job(v, ev, terminal) unless @cancelled_views.includes?(v)
       when Fuzz::ErrorEvent
         # Generation/worker errors can be followed by many queued Result events and then Done.
         # Keep the view running (and therefore unsaveable) until that terminal event drains.
@@ -1266,7 +1296,7 @@ module Gori::Tui
     # Focus a fuzz sub-tab by persisted id (notification "jump to result").
     def reveal_session(id : Int64) : Nil
       if idx = @fuzzers.index { |t| t.db_id == id }
-        select_subtab(idx, save: false)
+        select_subtab(idx) # saving the tab it leaves, as every other switch does
         @host.focus_body
       end
     end
@@ -1411,6 +1441,25 @@ module Gori::Tui
       else
         ""
       end
+    end
+
+    # The three RESULTS-pane views, as verbs: sort column, matched-only lens, distribution
+    # sidebar. Each answers with the view's own one-line report. They act on the session in
+    # front whatever pane holds focus — a sort is a property of the results, not of the
+    # cursor — and say so when there is nothing to sort yet.
+    def fuzz_cycle_sort : Nil
+      return @host.status("no fuzz session") unless v = current_view
+      @host.status(v.cycle_sort)
+    end
+
+    def fuzz_toggle_matched : Nil
+      return @host.status("no fuzz session") unless v = current_view
+      @host.status(v.toggle_matched_only)
+    end
+
+    def fuzz_toggle_dist : Nil
+      return @host.status("no fuzz session") unless v = current_view
+      @host.status(v.toggle_dist)
     end
 
     def fuzz_stop : Nil
@@ -1625,12 +1674,30 @@ module Gori::Tui
     end
 
     # Content-only clone of the active fuzz session (template + config; no results/links).
+    # Duplicates the MARKED sub-tabs when the strip carries marks, the active one otherwise
+    # (`target_subtab_indices` — the one target rule).
     def fuzz_duplicate : Nil
-      return @host.status("no fuzz session open to duplicate") unless src = current_view
+      if refs = batch_subtab_refs
+        msg = duplicate_marked_subtabs(refs, "fuzz session") { |i| duplicate_at(i) }
+        unless msg
+          @host.status("#{refs.size} sub-tabs marked — duplicate is capped at #{Runner::BATCH_SUBTAB_CAP}")
+          return
+        end
+        @host.status("#{msg} (#{@fuzzers.size} open)")
+        return
+      end
+      return @host.status("no fuzz session open to duplicate") unless current_view
+      duplicate_at(@current_idx)
+      @host.status("duplicated fuzz session (#{@fuzzers.size} open)")
+    end
+
+    # Clone sub-tab `idx` into a new session at the end of the strip. Toast-free, so the
+    # single and batch arms above can each own their sentence.
+    private def duplicate_at(idx : Int32) : Nil
+      return unless src = view_at(idx)
       view = FuzzerView.new
       view.duplicate_from(src)
       open_session(view, nil)
-      @host.status("duplicated fuzz session (#{@fuzzers.size} open)")
     end
 
     # Seed handed to RepeaterController for "Send to Repeater" (a fuzz result row → the
@@ -1736,6 +1803,10 @@ module Gori::Tui
     end
 
     private def open_session(view : FuzzerView, flow_id : Int64?) : Nil
+      # The OUTGOING tab first. `goto_tab` below flushes "the current fuzz tab", and by then
+      # that is the new one — so a dirty session the operator left with ^N / Duplicate / a
+      # notification jump was never written and vanished at quit.
+      save_current
       tab = FuzzerTab.new(view, flow_id, persist_new(view, flow_id))
       @fuzzers << tab
       # A session created in this controller lifetime has no prior saved run to restore.
@@ -1752,30 +1823,69 @@ module Gori::Tui
       id == 0 ? nil : id
     end
 
+    # ^W closes the MARKED sub-tabs when the strip carries marks, the active one otherwise
+    # (`target_subtab_indices` — the one target rule). Refusals are per-tab and are reported
+    # by the batch rather than aborting it, so one session mid-write can't strand the other
+    # four the operator asked to close.
     def request_close : Nil
       return unless tab = current_tab_obj
-      if tab.view.saving_results? || tab.view.loading_results?
-        @host.status("result I/O in progress — wait before closing this fuzz session")
+      if refs = batch_subtab_refs
+        @host.confirm("CLOSE FUZZERS", "Close #{marked_subtab_phrase(refs.size)}?\nEach template/config, its private temporary spool, and every saved run are deleted.",
+          confirm_label: "close", danger: true) { close_marked_fuzzers(refs) }
         return
       end
-      if (session_id = tab.db_id) &&
-         (active = @host.session.store.fuzz_runs(session_id).find(&.status.in?("running", "saving")))
-        @host.status("saved run ##{active.id} is still #{active.status} in another writer — " \
-                     "wait before closing (or remove a crashed row with CLI --force-stale)")
+      if reason = close_subtab_refusal(@current_idx)
+        @host.status(reason)
         return
       end
       @host.confirm("CLOSE FUZZER", "Close fuzz session “#{tab.view.summary}”?\nIts template/config, private temporary spool, and every saved run are deleted.",
         confirm_label: "close", danger: true) { close_tab }
     end
 
+    private def close_marked_fuzzers(refs : Array(SubtabRef)) : Nil
+      msg = close_marked_subtabs(refs)
+      auto_load_current_saved_run # once for the batch, not once per close
+      @host.status(msg)
+      @host.resolve_subtab_focus
+    end
+
+    # Why this fuzz session cannot close right now. Three conditions, and they were spread
+    # across `request_close` and `close_tab` before: the batch driver has to ask ONE question
+    # per sub-tab (it never opens that tab's own confirm), so they live here and both arms
+    # read them.
+    def close_subtab_refusal(idx : Int32) : String?
+      return nil unless tab = @fuzzers[idx]?
+      if tab.view.saving_results? || tab.view.loading_results?
+        return "result I/O in progress — wait before closing this fuzz session"
+      end
+      if (session_id = tab.db_id) &&
+         (active = @host.session.store.fuzz_runs(session_id).find(&.status.in?("running", "saving")))
+        return "saved run ##{active.id} is still #{active.status} in another writer — " \
+               "wait before closing (or remove a crashed row with CLI --force-stale)"
+      end
+      nil
+    end
+
+    protected def close_subtab_at(idx : Int32) : Bool
+      close_at(idx)
+    end
+
     def close_tab : Nil
       return if @current_idx < 0 || @current_idx >= @fuzzers.size
-      tab = @fuzzers[@current_idx]
-      if (session_id = tab.db_id) &&
-         @host.session.store.fuzz_runs(session_id).any?(&.status.in?("running", "saving"))
-        @host.status("fuzz session NOT closed — a saved run started writing; wait for it to finish")
+      if reason = close_subtab_refusal(@current_idx)
+        @host.status(reason)
         return
       end
+      orphaned = close_at(@current_idx)
+      auto_load_current_saved_run
+      @host.status(TabClose.message(@fuzzers.empty? ? "closed — none open (^N new · ⇧I from History)" : "closed (#{@fuzzers.size} open)", orphaned))
+    end
+
+    # Close sub-tab `idx` and report whether the store rolled its DELETE back. Toast-free and
+    # index-taking, so a batch can loop it; the caller checks `close_subtab_refusal` first.
+    private def close_at(idx : Int32) : Bool
+      return false if idx < 0 || idx >= @fuzzers.size
+      tab = @fuzzers[idx]
       was_running = tab.view.running?
       release_view_resources(tab.view, cancel: true)
       # Finish the job NOW: once the view leaves @fuzzers, no later event may own its spinner.
@@ -1785,10 +1895,12 @@ module Gori::Tui
       # disk, so it reappears on the next project open. Saying so is the difference between a
       # transient failure and one that looks like the close simply did not work.
       orphaned = (id = tab.db_id) ? !@host.session.store.delete_fuzz_session(id) : false
-      @fuzzers.delete_at(@current_idx)
+      @fuzzers.delete_at(idx)
+      # Closing a tab to the LEFT slides the active one down; a bare clamp would read that as
+      # "stay put" and land the operator on its neighbour.
+      @current_idx -= 1 if idx < @current_idx
       @current_idx = @fuzzers.empty? ? -1 : @current_idx.clamp(0, @fuzzers.size - 1)
-      auto_load_current_saved_run
-      @host.status(TabClose.message(@fuzzers.empty? ? "closed — none open (^N new · ⇧I from History)" : "closed (#{@fuzzers.size} open)", orphaned))
+      orphaned
     end
 
     # Halt EVERY running sweep, not just the current tab's — the project-level exits
@@ -1827,7 +1939,16 @@ module Gori::Tui
 
     # --- persistence ---
     def save_current : Nil
-      return unless tab = current_tab_obj
+      current_tab_obj.try { |tab| save_tab(tab) }
+    end
+
+    # EVERY dirty tab, for the exits that close the whole Runner (quit, leave project): only
+    # the current tab used to be flushed there, so an edit left on any other sub-tab was lost.
+    def save_all : Nil
+      @fuzzers.each { |tab| save_tab(tab) }
+    end
+
+    private def save_tab(tab : FuzzerTab) : Nil
       return unless (id = tab.db_id) && tab.view.dirty?
       v = tab.view
       cfg = v.config_json

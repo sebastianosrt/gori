@@ -1,4 +1,5 @@
 require "./screen"
+require "./line_edit"
 require "./theme"
 require "./frame"
 require "./query_suggest"
@@ -18,6 +19,7 @@ module Gori::Tui
   # WRAPPING their children rather than rewriting any path. Helps answer "what does this
   # app do". Navigate with ↑/↓, expand/collapse with →/←/Enter.
   class SitemapView
+    include QueryBarEdit # ⌃/⌥←→ word motion, Home/End, Delete, ⌥⌫ on the `/` bar
     # The tree node + pure builder live in `Gori::Sitemap` (shared with the headless
     # `gori run sitemap`); this view layers scope markers, path-tag editing, and
     # rendering on top. The alias keeps the rest of this file reading as `Node`.
@@ -922,6 +924,13 @@ module Gori::Tui
     # the body below returns early on several paths (no endpoints, the empty-state card), and a
     # dropdown that vanished exactly when the filter matched nothing would be missing from the
     # one moment an operator is most likely to be fixing a query. Mirrors HistoryView.
+    @list_last_h = 0 # rows the last tree frame drew — the PgUp/PgDn step (list_page_rows)
+
+    # One screenful of the tree, for PgUp/PgDn: last drawn rows minus two of overlap.
+    def list_page_rows : Int32
+      {@list_last_h - 2, 1}.max
+    end
+
     def render(screen : Screen, rect : Rect, focused : Bool = true, *,
                listen : {String, Int32}? = nil, capturing : Bool = true) : Nil
       return if rect.empty?
@@ -980,6 +989,7 @@ module Gori::Tui
       rows = visible_rows
       # Reserve the bottom row for the tag prompt while editing (the tree scrolls above it).
       list_h = @tagging ? {rect.h - 1, 0}.max : rect.h
+      @list_last_h = list_h
       ensure_visible(rows.size, list_h)
       (0...list_h).each do |i|
         ri = @scroll + i
@@ -1270,7 +1280,7 @@ module Gori::Tui
       chips = [] of {Symbol, String, Color}
       chips << {:count, "#{@hosts.size}h", Theme.muted} if filtering?
       scope_on = @scope.try(&.active?) == true
-      chips << (scope_on ? {:scope, "⇧S scope:#{@scope.try(&.size) || 0}", Theme.accent} : {:scope, "⇧S scope:off", Theme.muted})
+      chips << (scope_on ? {:scope, "s scope:#{@scope.try(&.size) || 0}", Theme.accent} : {:scope, "s scope:off", Theme.muted})
       chips << {:fold, "g:fold", @grouping ? Theme.accent : Theme.muted}
       chips << {:mark, mark_chip_text.not_nil!, Theme.accent} if mark_chip_text
       chips
@@ -1359,6 +1369,14 @@ module Gori::Tui
     end
 
     # Inverts render's marker column `rect.x + 1 + depth*2` for visible_rows[ri].
+    # Whether row `idx` is an endpoint (nothing to expand) rather than a folder. A grouped
+    # fold reads as a folder: it has children to show, even when its own path is synthetic.
+    def leaf_at?(idx : Int32) : Bool
+      row = visible_rows[idx]?
+      return false unless row
+      row.node.leaf?
+    end
+
     def marker_hit?(rect : Rect, mx : Int32, ri : Int32) : Bool
       row = visible_rows[ri]?
       return false unless row

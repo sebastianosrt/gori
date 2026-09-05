@@ -10,6 +10,7 @@ require "../store"
 require "../notes"
 require "../settings"
 require "./subtab_clone"
+require "./subtab_marks"
 
 module Gori::Tui
   # The Notes tab (DESIGN.md §6: notes/report — the running scratchpad/report).
@@ -29,6 +30,8 @@ module Gori::Tui
     # One note document: a title is derived from its first non-blank line, so
     # there's no separate rename mode — the tab label tracks what you type.
     class Note
+      include SubtabRef # a sub-tab strip may hold a mark on this note (#683)
+
       getter id : Int64
       getter area : TextArea
 
@@ -155,6 +158,14 @@ module Gori::Tui
       @current
     end
 
+    # The `Note` behind chip `idx` — the sub-tab strip's mark set keys on this object
+    # (TabController#subtab_ref). Identity is the right handle here: `soft_merge_from`
+    # keeps the SAME Note whenever a peer's text is unchanged, so a mark survives the
+    # reconcile that reorders the strip around it.
+    def note_at(idx : Int32) : Note?
+      (0 <= idx < @notes.size) ? @notes[idx] : nil
+    end
+
     # The current note's sub-tab label (first non-blank line, or "note N") — used
     # by the Runner's close-confirmation message.
     def current_label : String
@@ -178,7 +189,7 @@ module Gori::Tui
     # Replace the current note's text (e.g. from the external editor); marks dirty
     # so it persists + the cross-session reconcile won't clobber it.
     def replace_current(text : String) : Nil
-      current.area.set_text(text)
+      current.area.replace_from_outside(text)
       @dirty = true
     end
 
@@ -252,14 +263,26 @@ module Gori::Tui
       @dirty = true
     end
 
+    # ⌫, ⌦ and ⌃Z dirty the note only on a REAL buffer change. Each is a no-op somewhere — ⌫
+    # at the buffer start, ⌦ at its end, ⌃Z on an empty undo stack — and marking the note
+    # dirty there was not harmless: `dirty?` is the lock that keeps a peer's commit from
+    # reloading this note (`locked?`), and it is what makes the next esc / sub-tab switch
+    # rewrite the whole document. An idle ⌃Z in a clean note held off every peer refresh until
+    # something else saved. The Repeater's request pane and the Fuzzer's template already gate
+    # the same three keys on `TextArea#edits`.
     def backspace : Nil
-      current.area.backspace
-      @dirty = true
+      edit_if_changed(&.backspace)
     end
 
     def undo : Nil
-      current.area.undo
-      @dirty = true
+      edit_if_changed(&.undo)
+    end
+
+    private def edit_if_changed(& : TextArea -> Nil) : Nil
+      ed = current.area
+      before = ed.edits
+      yield ed
+      @dirty = true if ed.edits != before
     end
 
     def move(dr : Int32, dc : Int32) : Nil
@@ -316,10 +339,23 @@ module Gori::Tui
       current.area.end_of_line
     end
 
-    # Forward-delete the char under the caret — a content edit.
+    # Forward-delete the char under the caret — a content edit (see `backspace` for the gate).
     def delete : Nil
-      current.area.delete
+      edit_if_changed(&.delete)
+    end
+
+    # Splice a whole bracketed paste in as ONE edit — one undo step, one `edits` bump — instead
+    # of the N keystrokes it used to arrive as (see `TextArea#insert_text`, and the Repeater's
+    # `edit_paste`, whose measurements this shares: per-keystroke delivery is quadratic in the
+    # paste). A note is where a captured response, a tool's output or a whole writeup gets
+    # pasted, so this was the tab most often paying that cost. INSERT only: READ has no caret
+    # to paste at, and the Runner already refuses a paste there rather than running it as
+    # commands. Returns false when refused, so the Runner replays it keystroke by keystroke.
+    def paste(text : String) : Bool
+      return false unless insert_mode?
+      current.area.insert_text(text)
       @dirty = true
+      true
     end
 
     # Mouse: place the cursor at a click. `rect` is the framed interior the runner
@@ -392,8 +428,14 @@ module Gori::Tui
 
     # Content-only clone of the active note into a new sibling (new id; no entity_links).
     def duplicate_current : Nil
-      text = current.area.text
-      @notes << Note.new(alloc_note_id, text)
+      duplicate_at(@current)
+    end
+
+    # Clone note `idx` onto the end of the strip — the index-taking form a batch duplicate
+    # (#683) walks. The clone lands last and becomes current, as the single form always has.
+    def duplicate_at(idx : Int32) : Nil
+      return unless src = @notes[idx]?
+      @notes << Note.new(alloc_note_id, src.area.text)
       @current = @notes.size - 1
       @dirty = true
     end
@@ -401,12 +443,22 @@ module Gori::Tui
     # Close the current note. Returns the closed note's id (for link cleanup), or nil
     # when nothing was removed. Always keeps at least one note open.
     def close_note : Int64?
-      closed_id = @notes[@current]?.try(&.id)
-      @notes.delete_at(@current) if @current < @notes.size
+      close_note_at(@current)
+    end
+
+    # Close note `idx` — the index-taking form, so a batch close (#683) can walk the marked
+    # chips instead of switching the active note to each one first. Always keeps ≥1 note.
+    def close_note_at(idx : Int32) : Int64?
+      return nil unless 0 <= idx < @notes.size
+      closed_id = @notes[idx].id
+      @notes.delete_at(idx)
       @deleted_ids << closed_id if closed_id # so merge-on-save doesn't resurrect it from a peer's copy
       if @notes.empty?
         @notes << Note.new(alloc_note_id)
       end
+      # Closing a note to the LEFT slides the active one down; a bare clamp would read that
+      # as "stay put" and land the operator on its neighbour.
+      @current -= 1 if idx < @current
       @current = @current.clamp(0, @notes.size - 1)
       @dirty = true
       closed_id

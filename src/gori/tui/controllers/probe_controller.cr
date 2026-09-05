@@ -89,6 +89,20 @@ module Gori::Tui
       true
     end
 
+    # ⇥ / ⇧⇥ between the findings list and its preview; off either end the ring returns to
+    # the tab bar. The focus-ring hook — a `key.tab?` arm in `handle_body_key` never ran (the
+    # Runner claims ⇥ for the ring first), so the `↹ preview` the hint promised was mouse-only.
+    def pane_advance(dir : Int32) : Bool
+      return false if rules_tab? || @probe.detail_open? || !@probe.preview_enabled?
+      @probe.step_preview_focus(dir)
+    end
+
+    def page_rows : Int32?
+      return @rules.list_page_rows if rules_tab?
+      return nil if @probe.detail_open? || (@probe.preview_enabled? && @probe.preview_focus == :preview)
+      @probe.list_page_rows
+    end
+
     def body_badge : Symbol
       :body # read-only/navigable list + detail (no inline text editor)
     end
@@ -116,13 +130,13 @@ module Gori::Tui
         #
         # `esc sub-tabs`, not `esc tabs`: escape goes to the strip (handle_body_key), and the
         # strip is always shown here, so `focus_pane` never downgrades it to the tab bar.
-        edits = rules_custom_selected? ? " · ↵/e edit · d delete" : ""
-        return "↑/↓ select · x on/off · a add#{edits} · space cmds · ↑ sub-tabs · esc sub-tabs"
+        edits = rules_custom_selected? ? " · ↵/e edit · {probe-rules.delete} delete" : ""
+        return keys("↑/↓ select · {probe-rules.toggle} on/off · {probe-rules.add} add#{edits} · space cmds · ↑ sub-tabs · esc sub-tabs")
       elsif @probe.detail_open?
         # `↵ open` and `o flow` are two different destinations and both belong here — the
         # caret's own affected URL, and the issue's sample evidence. The Issues detail names
         # the same pair for the same reason (`↵ open` over its related links, `o flow`).
-        "↑/↓ URL · ↵ open · ⇧arrows select · y copy · o flow · r repeater · p promote · space cmds · ←/esc back"
+        keys("↑/↓ URL · ↵ open · ⇧arrows select · {probe.copy} copy · {probe.open-flow} flow · {probe.repeater-flow} repeater · {probe.promote} promote · space cmds · ←/esc back")
       elsif @probe.querying?
         "type to filter · ↹ complete · ↵ apply · esc clear"
       elsif @probe.mode.off?
@@ -132,7 +146,7 @@ module Gori::Tui
       elsif @probe.preview_enabled?
         "↑/↓ move · ↵ open · ↹ preview · #{clear} clear · #{mode} mode · #{filt} filter · space cmds"
       else
-        "↑/↓ move · ↵ open · o flow · r repeater · p promote · c dismiss · d delete · #{clear} clear · #{mode} mode · #{filt} filter · space cmds"
+        keys("↑/↓ move · ↵ open · {probe.open-evidence} flow · {probe.repeater-evidence} repeater · {probe.promote-selected} promote · {probe.dismiss-selected} dismiss · {probe.delete-selected} delete · #{clear} clear · #{mode} mode · #{filt} filter · space cmds")
       end
     end
 
@@ -140,7 +154,7 @@ module Gori::Tui
       focused = focus == :body
       shell = BodyChrome.shell_focused(focus, multi_pane: false)
       @subtab_start = BodyChrome.framed_body(screen, rect, shell, focus == :subtabs, SUBTABS, @sub_idx, @subtab_start,
-        find: subtab_find_shown?, find_lit: @host.subtab_find_focused?) do |content|
+        find: subtab_find_shown?, find_lit: @host.subtab_find_focused?, marked: marked_chip_set) do |content|
         if rules_tab?
           @rules.render(screen, content, focused)
         else
@@ -204,6 +218,19 @@ module Gori::Tui
       true
     end
 
+    # Pointer-aware: the preview under the cursor scrolls without taking focus from the list.
+    # Same `content` rect `handle_click` hit-tests with.
+    def handle_wheel_at(step : Int32, mx : Int32, my : Int32, rect : Rect) : Bool
+      return handle_wheel(step) if rules_tab? || @probe.detail_open?
+      content = BodyChrome.content_rect(rect, strip: true)
+      if @probe.preview_enabled? && @probe.preview_at?(content, mx, my)
+        @probe.wheel_preview(step)
+      else
+        @probe.move(step)
+      end
+      true
+    end
+
     def handle_wheel(step : Int32) : Bool
       if rules_tab?
         @rules.move(step)
@@ -241,10 +268,6 @@ module Gori::Tui
         end
         return true
       end
-      if @probe.preview_enabled? && key.tab?
-        @probe.cycle_preview_focus
-        return true
-      end
       false
     end
 
@@ -254,12 +277,13 @@ module Gori::Tui
       key = ev.key
       c = ev.char || key.to_char
       case
-      when key.enter?     then @probe.stop_query
-      when key.escape?    then @probe.cancel_query
-      when key.tab?       then @probe.query_complete
-      when key.backspace? then @probe.query_backspace
-      when key.left?      then @probe.query_move(-1)
-      when key.right?     then @probe.query_move(1)
+      when key.enter?                  then @probe.stop_query
+      when key.escape?                 then @probe.cancel_query
+      when key.tab?                    then @probe.query_complete
+      when (act = LineEdit.action(ev)) then @probe.query_edit(act) # ⌃/⌥←→, Home/End, Delete, ⌥⌫ — before plain ⌫, which would swallow ⌥⌫
+      when key.backspace?              then @probe.query_backspace
+      when key.left?                   then @probe.query_move(-1)
+      when key.right?                  then @probe.query_move(1)
       else
         if c && !ev.ctrl? && !ev.alt?
           @probe.query_insert(c)

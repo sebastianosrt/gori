@@ -6,6 +6,11 @@ module Gori
       # `delete`/`clear`/`show` are reserved as the first positional (same convention as
       # `gori run probe`); a QL query starting with one goes through --query. `history show
       # <id>` is the top-level `gori run show <id>`, spelled the way the History tab reads.
+      @[Subcommand("history", "ls", help: [
+        {"history (ls)", "List / QL-query captured flows"},
+        {"history delete", "Hard-delete one captured flow by id, or every match of -q QL (needs --yes)"},
+        {"history clear", "Delete ALL captured flows in the project (needs --yes)"},
+      ])]
       private def self.cmd_history(args : Array(String)) : Nil
         case args.first?
         when "delete", "rm" then cmd_history_delete(args[1..])
@@ -335,7 +340,8 @@ module Gori
 
         store = open_store(resolve_read_project(project_name, db_path))
         begin
-          n = store.count
+          n = store.count?
+          abort "gori run history clear: could not count the flows (project busy) — nothing deleted" unless n
           unless yes
             abort "gori run history clear: refusing to delete #{n} flow#{n == 1 ? "" : "s"} without --yes"
           end
@@ -666,6 +672,9 @@ module Gori
 
       # --- show --------------------------------------------------------------
 
+      @[Subcommand("show", help: [
+        {"show <id>", "Print a flow's request/response (text, json, raw bytes, HAR, curl/python/fetch/go/httpie, or a CSRF PoC)"},
+      ])]
       private def self.cmd_show(args : Array(String)) : Nil
         db_path : String? = nil
         project_name : String? = nil
@@ -772,6 +781,15 @@ module Gori
                when :csrf   then Export::CsrfPoc.text(wire, target)
                end
         unless code
+          # `from_wire` refuses for TWO reasons and this used to name only one of them, so a
+          # flow whose request line gori cannot frame was reported as having an EMPTY head —
+          # a diagnosis that sends the operator after the wrong thing. Ask the same predicate
+          # the serializers did, so the sentence matches the refusal.
+          request_line = Export::Curl.split_lines(
+            Export::Curl.split_message(wire)[0]).first? || ""
+          if refusal = Export::Curl.request_line_refusal(request_line)
+            abort "gori run show: flow ##{row.id} has no runnable #{format} snippet: #{refusal}"
+          end
           abort "gori run show: flow ##{row.id} has no request line to build a URL from — " \
                 "its captured head is empty (use --format raw to see the bytes)"
         end

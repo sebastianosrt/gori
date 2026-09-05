@@ -1,4 +1,5 @@
 require "./screen"
+require "./line_edit"
 require "./theme"
 require "./frame"
 require "./query_suggest"
@@ -27,6 +28,7 @@ module Gori::Tui
   # Pure view: it reads the shared Interceptor snapshot; the Runner performs the
   # actual forward/drop. No diff (that's Repeater's job).
   class InterceptView
+    include QueryBarEdit # ⌃/⌥←→ word motion, Home/End, Delete, ⌥⌫ on the `/` bar
     # Height of the top filter bar (catch direction + condition), reserved above the
     # queue|detail split — the Intercept tab's analogue of History's QL bar. While the
     # condition is being edited a second row carries Tab suggestions (see bar_h).
@@ -792,7 +794,7 @@ module Gori::Tui
     # for a file the editor left alone.
     def replace_editor(text : String) : Nil
       return unless text_editing?
-      @editor.set_text(text)
+      @editor.replace_from_outside(text)
       mark_editor_edit
     end
 
@@ -1104,11 +1106,18 @@ module Gori::Tui
       end
     end
 
+    @list_last_h = 0 # rows the QUEUE card drew last frame — the PgUp/PgDn step
+
+    def list_page_rows : Int32
+      {@list_last_h - 2, 1}.max
+    end
+
     private def render_list(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.w < 2 || rect.h < 2
       Frame.card(screen, rect, "QUEUE", bg: Theme.bg, border: Frame.pane_border(focused))
       Frame.border_meta(screen, rect, "QUEUE", @items.size.to_s)
       inner = rect.inset(1, 1)
+      @list_last_h = inner.h
       ensure_visible(inner.h)
       (0...inner.h).each do |i|
         idx = @scroll + i

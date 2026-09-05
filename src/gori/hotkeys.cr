@@ -118,8 +118,18 @@ module Gori
     # navigation aliases (e.g. body.open = enter/right/l) that a single-chord rebind
     # would silently collapse, and their structural primary (enter/arrows) isn't a
     # meaningful shortcut to remap. Keyless verbs (0 chords) stay assignable.
+    #
+    # The count is taken over the chords a rebind would actually MOVE, so a verb whose only
+    # extra chord is PINNED still qualifies. That exemption exists for one shape — the `y` +
+    # `^Y` Copy pairs (`Verb::Keymap.pinned_chords` states the rule). Counting raw `chords`
+    # swept all eight of them up as if `^Y` were a navigation alias: Repeater, Fuzzer, Notes,
+    # Decoder, JWT, Cookie, Rewriter and the Issues detail each had NO Copy row in the editor
+    # at all, while History, Miner, Sequencer, Probe and Comparer — single-chord Copy verbs,
+    # same action — were rebindable. Half the app's Copy keys movable and half not, with
+    # nothing on screen saying which.
     def self.rebindable?(verb : Verb::Definition) : Bool
-      !verb.hidden? && !FIXED_IDS.includes?(verb.id) && verb.chords.size <= 1
+      return false if verb.hidden? || FIXED_IDS.includes?(verb.id)
+      (verb.chords.size - Verb::Keymap.pinned_chords(verb).size) <= 1
     end
 
     # A human reason if `chord` is unbindable — terminal-/structurally reserved, or claimed
@@ -230,6 +240,37 @@ module Gori
         display_label(chord)
       else
         fallback
+      end
+    end
+
+    # A `{verb.id}` token in hint/Help PROSE — the spelling a status strip or a Help row uses
+    # to name a chord it does not own. Ids are lowercase words joined by `.` and `-`
+    # (`repeater.toggle-hex`); the leading-letter rule keeps a literal `{}` in a QL example or
+    # a JSON body out of it.
+    VERB_TOKEN_RE = /\{([a-z][a-z0-9_.-]*)\}/
+
+    # Resolve every `{verb.id}` in `template` to the verb's EFFECTIVE chord (#binding_label),
+    # so one string carries both the prose and the keys, and a rebind reaches every surface
+    # that spells its hint this way — the status strips' body_hint, Help's composite rows
+    # ("{fuzz.run} · {fuzz.stop}"), the empty-state cards. The alternative was one local
+    # per chord per strip (`run = binding_label(reg, "fuzz.run", "^R")` × seven) and the
+    # forty-odd strips that never got them.
+    #
+    # Fallback for an UNBOUND or unknown id is the verb's DEFAULT chord under `profile`
+    # (the same answer #binding_label's callers hand it as a literal), and a token naming a
+    # verb with no default at all is left as written — visibly wrong rather than silently
+    # blank, which is what `spec/hotkeys_spec.cr` / the Help spec check for.
+    def self.expand(registry : Verb::Registry, template : String,
+                    overrides : Hash(String, Array(Verb::Chord)) = rebindable_overrides(registry),
+                    profile : String = Settings.keymap_os) : String
+      return template unless template.includes?('{')
+      template.gsub(VERB_TOKEN_RE) do |token|
+        id = $1
+        if chord = binding_for(registry, id, overrides, profile) || default_for(registry, id, profile)
+          display_label(chord)
+        else
+          token
+        end
       end
     end
 

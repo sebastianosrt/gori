@@ -1,8 +1,13 @@
 require "termisu"
 require "../verb"
 require "../session"
+require "../hotkeys"
+require "./keybind"
 require "../repeater/subtab_filter"
+require "./subtab_marks"
+require "./controllers/tab_close"
 require "./screen"
+require "./line_edit"
 require "./geometry"
 require "./frame"
 require "./chrome"
@@ -21,14 +26,28 @@ module Gori::Tui
     abstract def request_overlay(kind : Symbol) : Nil # set @overlay (controllers can't write it directly)
     abstract def request_focus(pane : Symbol) : Nil   # drive the focus model via focus_pane (:menu | :subtabs | :body)
     abstract def focus_body : Nil                     # raw: focus the body WITHOUT resetting the pane (for clicks)
-    abstract def switch_tab(tab : Symbol) : Nil       # change the active tab (with save-on-leave + on_enter)
-    abstract def goto_tab(tab : Symbol) : Nil         # raw: set active tab + body focus, no on_enter/view_focus_first (e.g. ^R → Repeater)
-    abstract def open_palette : Nil                   # open the command palette overlay
-    abstract def open_space_menu : Nil                # open the space action menu (bottom-right)
+    # Re-resolve focus after sub-tabs CLOSED — the strip may have dropped below its
+    # threshold or vanished. Called from inside the close (the confirm's action, when there
+    # is one), because a caller that ran it beside `request_close` would be reading the
+    # pre-close strip: `Runner#confirm` defers its action to `on_close`.
+    abstract def resolve_subtab_focus : Nil
+    abstract def switch_tab(tab : Symbol) : Nil # change the active tab (with save-on-leave + on_enter)
+    abstract def goto_tab(tab : Symbol) : Nil   # raw: set active tab + body focus, no on_enter/view_focus_first (e.g. ^R → Repeater)
+    abstract def open_palette : Nil             # open the command palette overlay
+    abstract def open_space_menu : Nil          # open the space action menu (bottom-right)
     # The QL reference popup. Reached from a filter bar (see `ql_help_key?`), where the
     # question "what fields are there?" actually occurs — a controller cannot open an
     # overlay itself, so it asks here.
     abstract def open_help_query(surface : Symbol) : Nil
+
+    # Open the Sitemap cursor row's representative flow in the History detail — the `o`
+    # verb's body, on the Runner because it crosses tabs. A double-click on a leaf row asks
+    # for the same thing the key does, and the controller has no other way to reach it. A
+    # default rather than an abstract: some thirty spec doubles implement this module by
+    # hand for one pane each, and a seam only the Sitemap reaches should not tax them all.
+    def sitemap_open_flow : Nil
+    end
+
     # Open the Fuzzer's payload-set editor overlay (nil = add a new set, else edit that
     # index) / the advanced-settings overlay. The Runner builds them from the current view.
     abstract def open_fuzz_set_editor(edit_index : Int32?) : Nil
@@ -165,13 +184,13 @@ module Gori::Tui
                     subtabs_focused : Bool, labels : Array(String)?, active : Int32,
                     prev_start : Int32 = 0, hidden : Set(Int32)? = nil, *,
                     strip_divider : Bool = true, find : Bool = false,
-                    find_lit : Bool = false, & : Rect ->) : Int32
+                    find_lit : Bool = false, marked : Set(Int32)? = nil, & : Rect ->) : Int32
       new_start = prev_start
       framed(screen, rect, shell_focused) do |inner|
         if labels
           sub_rect, content = carve_subtab_row(inner, divider: strip_divider)
           new_start = render_subtab_strip(screen, sub_rect, labels, active, subtabs_focused,
-            prev_start, hidden, find: find, find_lit: find_lit)
+            prev_start, hidden, find: find, find_lit: find_lit, marked: marked)
           yield content
         else
           yield inner
@@ -297,19 +316,22 @@ module Gori::Tui
     # the strip itself holds focus (←/→ switch) → active chip lights FOCUS_GOLD and the
     # divider hairline matches (when the strip owns that hairline, i.e. rect.h ≥ 2).
     # `find` = this strip gets the ⌕ affordance, `find_lit` whether it is the strip's
-    # current stop. Keyword-only: the positional tail here is already `prev_start, hidden`
+    # current stop. `marked` = the chips wearing a multi-select mark (#683); nil both when
+    # the strip does not mark at all and when nothing on it is marked.
+    # Keyword-only: the positional tail here is already `prev_start, hidden`
     # at a dozen call sites, and a new positional would bind silently to the wrong one.
     def render_subtab_strip(screen : Screen, rect : Rect, labels : Array(String),
                             active : Int32, focused : Bool, prev_start : Int32 = 0,
                             hidden : Set(Int32)? = nil, *,
-                            find : Bool = false, find_lit : Bool = false) : Int32
+                            find : Bool = false, find_lit : Bool = false,
+                            marked : Set(Int32)? = nil) : Int32
       return prev_start if rect.empty?
       icon, chips = find_icon_split(tab_row(rect), labels, hidden, show: find)
       # `lit` is false whenever the pill was dropped for width, so a narrow terminal leaves
       # the bright pill on the active chip rather than on nothing at all.
       lit = focused && find_lit && !icon.nil?
       render_find_icon(screen, icon, lit) if icon
-      new_start = Chrome.render_tab_strip(screen, chips, labels, active, focused && !lit, prev_start, hidden)
+      new_start = Chrome.render_tab_strip(screen, chips, labels, active, focused && !lit, prev_start, hidden, marked: marked)
       return prev_start if rect.h < 2
       # The hairline reads the UNMODIFIED focus: the affordance is a stop on the strip, so
       # the strip still owns the row even while the active chip is dimmed.
@@ -335,6 +357,12 @@ module Gori::Tui
     @subtab_filter_editing = false # the `/` bar is capturing keystrokes
     @filter_cx = 0                 # caret index within @subtab_filter
     @filter_preedit = ""           # live IME composition in the bar
+
+    # --- sub-tab multi-select (issue #683; the #442 mark model on the strip) ---
+    # Keyed on the sub-tab's view object, never its chip index — see SubtabMarks. A tab
+    # opts in by overriding `subtab_ref`; everything else here is derived, so a strip that
+    # cannot name its sub-tabs' identity simply has no marks.
+    @subtab_marks = SubtabMarks.new
 
     def initialize(@host : Host)
     end
@@ -381,6 +409,45 @@ module Gori::Tui
       return true if key.backspace?
       c = ev.char
       !!c && (c == '\u{7F}' || c == '\b')
+    end
+
+    # An arrow OR its vim twin — and the twin only when the press carries NO command
+    # modifier. That second half is the whole point of these living here.
+    #
+    # A `key.lower_k?` arm looks modifier-free and is not: the parser decodes 0x01..0x1A as
+    # `(LowerA..LowerZ, Modifier::Ctrl)`, so `^K` IS `Key::LowerK`, and an ⌥ event carries the
+    # letter the same way. `^K`, `^L` and every ⌥+letter are chords the hotkey editor offers
+    # (neither `Hotkeys.claimed?` nor `Verb::Reserved.reserved?`), so a pane matching the bare
+    # key alone silently ate whatever the operator had bound there — the `Event::Key#key` half
+    # of the trap `ctrl_letter_guard_spec` pins for `Event::Key#char`.
+    #
+    # Most panes are already safe because their ladder opens with a
+    # `return false if ev.ctrl? || ev.alt?` defer; these exist for the arms that run BEFORE
+    # such a defer or in a pane that has none — the four empty-state handlers and the
+    # Comparer. `h`/`j` are covered for symmetry, though only `k`/`l` were reachable in the
+    # Ctrl form: `^H`/`^I`/`^J`/`^M` arrive as Backspace/Tab/Enter and never as Ctrl+letter,
+    # which is exactly why `Verb::Reserved` refuses to bind them. The ⌥ forms of all four are
+    # reachable. Contract: `spec/tui/contract_body_key_spec.cr`.
+    def nav_up?(ev : Termisu::Event::Key) : Bool
+      ev.key.up? || (ev.key.lower_k? && bare_chord?(ev))
+    end
+
+    def nav_down?(ev : Termisu::Event::Key) : Bool
+      ev.key.down? || (ev.key.lower_j? && bare_chord?(ev))
+    end
+
+    def nav_left?(ev : Termisu::Event::Key) : Bool
+      ev.key.left? || (ev.key.lower_h? && bare_chord?(ev))
+    end
+
+    def nav_right?(ev : Termisu::Event::Key) : Bool
+      ev.key.right? || (ev.key.lower_l? && bare_chord?(ev))
+    end
+
+    # No command modifier — the shape a pane-local letter must be matched in, since anything
+    # carrying ⌃/⌥ belongs to the central keymap.
+    def bare_chord?(ev : Termisu::Event::Key) : Bool
+      !ev.ctrl? && !ev.alt?
     end
 
     # Say so when a keystroke just destroyed a MULTI-character selection (replace-on-type:
@@ -443,6 +510,15 @@ module Gori::Tui
     # navigable — editors leave this false so the physical keys fall through untouched.
     def body_scroll(delta : Int32) : Bool
       false
+    end
+
+    # The PgUp/PgDn step for the pane `body_scroll` will move: the rows that pane drew LAST
+    # FRAME minus two of overlap (the `HistoryView#list_page_rows` convention), or nil to
+    # take the Runner's whole-body fallback. A body-height page skipped the rows a frame,
+    # a header and a preview split had taken off the list — four to ten a press, never
+    # seen. Read after a render; a pane that has not drawn yet answers 1.
+    def page_rows : Int32?
+      nil
     end
 
     # Same notch, but with the pointer position + body rect — lets a multi-pane tab
@@ -592,6 +668,220 @@ module Gori::Tui
       (0...subtab_count).reject { |i| h.includes?(i) }
     end
 
+    # ===== sub-tab multi-select (issue #683) ==================================
+    # The one opt-in: the object that IS sub-tab `idx`. nil (the default) means this strip
+    # has no marks. Eight session tabs answer it with their existing `view_at`; Notes with
+    # `NotesView#note_at`. Fixed strips (Help/Probe/Target/OAST) and the self-drawn Project
+    # strip never override it, so they are excluded STRUCTURALLY rather than by a flag they
+    # would each have to remember to set false — the same shape `subtab_find_shown?` uses.
+    def subtab_ref(idx : Int32) : SubtabRef?
+      nil
+    end
+
+    # Whether this strip marks at all. Derived from the opt-in above (plus the two strip
+    # kinds that must never mark), so there is no second predicate to keep in sync.
+    def subtab_marks_enabled? : Bool
+      return false if subtabs_fixed? || subtab_strip_self_drawn?
+      subtab_count > 0 && !subtab_ref(0).nil?
+    end
+
+    # Every open sub-tab's ref, in chip order (the live set the marks are measured against).
+    private def subtab_refs : Array(SubtabRef)
+      collect_subtab_refs(0...subtab_count)
+    end
+
+    # `compact_map` would infer the CONCRETE view type here (Array(RepeaterView)), which no
+    # longer satisfies the declared Array(SubtabRef); build the array at the declared type.
+    private def collect_subtab_refs(idxs : Enumerable(Int32)) : Array(SubtabRef)
+      refs = [] of SubtabRef
+      idxs.each do |i|
+        if r = subtab_ref(i)
+          refs << r
+        end
+      end
+      refs
+    end
+
+    # Marked chips, as ABSOLUTE indices in chip order. Everything user-facing is derived
+    # from this rather than from the mark set's own size: a session another instance closed
+    # is gone from the strip the same frame, and a count that still included it would put a
+    # number in the space menu that no chip on screen backs up.
+    def marked_subtab_indices : Array(Int32)
+      return [] of Int32 if @subtab_marks.empty?
+      @subtab_marks.retain(subtab_refs) # housekeeping: drop closed sessions, release their pins
+      (0...subtab_count).select { |i| (r = subtab_ref(i)) && @subtab_marks.marked?(r) }
+    end
+
+    def subtab_mark_count : Int32
+      marked_subtab_indices.size
+    end
+
+    # Marked chips as a set, for the strip renderer's per-chip test. nil = none marked,
+    # matching `subtab_hidden` beside it — the render path is per-frame, and the common
+    # case (no marks) should not allocate a set to say so.
+    def marked_chip_set : Set(Int32)?
+      idxs = marked_subtab_indices
+      idxs.empty? ? nil : idxs.to_set
+    end
+
+    # Marks the `/` filter is currently hiding. A batch confirm has to say this out loud:
+    # "close 5 sub-tabs" over a filtered strip can reach two chips that are not on screen,
+    # which is exactly the split ProjectPicker's delete confirm spells out for its own marks.
+    def hidden_marked_count : Int32
+      return 0 if @subtab_marks.empty?
+      marked = marked_subtab_indices
+      return 0 if marked.empty?
+      vis = visible_indices.to_set
+      marked.count { |i| !vis.includes?(i) }
+    end
+
+    # THE target rule, and the only one: the marks if any are set, else the active chip.
+    # Every sub-tab-level action reads this — close, send, duplicate, tag — so marks widen
+    # what the existing verbs TARGET instead of growing a second set of batch verbs beside
+    # them (the shape spec/verbs/registry_sweep_spec.cr pins). A handler that opens a
+    # confirm takes `batch_subtab_refs` below instead — the same marks, as objects.
+    def target_subtab_indices : Array(Int32)
+      marked = marked_subtab_indices
+      marked.empty? ? [subtab_index] : marked
+    end
+
+    # `t` on the strip — flip the chip's mark. No-op on a strip without identity.
+    def toggle_subtab_mark(idx : Int32) : Nil
+      return unless ref = subtab_ref(idx)
+      @subtab_marks.toggle(ref)
+    end
+
+    # `⇧T` — mark every chip the filter leaves on screen (see SubtabMarks#mark_all for why
+    # this accumulates across two different queries rather than replacing).
+    def mark_all_subtabs : Nil
+      return unless subtab_marks_enabled?
+      @subtab_marks.mark_all(collect_subtab_refs(visible_indices))
+    end
+
+    def clear_subtab_marks : Nil
+      @subtab_marks.clear
+    end
+
+    # Hand back the marks a batch just acted on. Called with the refs the handler captured
+    # BEFORE it ran, because some closes keep their view object alive (Comparer resets its
+    # last session in place), and `retain` cannot tell that apart from a session still open.
+    def unmark_subtab_refs(refs : Enumerable(SubtabRef)) : Nil
+      @subtab_marks.unmark(refs)
+    end
+
+    # The chips a BATCH arm acts on, as view objects captured NOW — or nil when nothing is
+    # marked and the gesture takes its single-target path on the active chip. Every close /
+    # send / duplicate handler branches on this and nothing else.
+    #
+    # Refs and not indices, because a handler holds them across a confirm: `Runner#confirm`
+    # runs the action from `on_close`, one event-loop turn later at the earliest, and the
+    # data_version poll has no modal guard — a peer (MCP, `gori run`, a second TUI) can
+    # reorder or delete a session behind the dialog, and `reconcile` re-sorts the strip. An
+    # index captured before the dialog then names a different session after it; a view object
+    # cannot. `close_marked_subtabs` resolves them back to indices at the moment it closes.
+    #
+    # ONE mark is a batch too. Testing `targets.size > 1` (the old shape) fell through to the
+    # active chip whenever exactly one chip was marked, and that is the default state after a
+    # single `t`: it marks the chip and steps RIGHT, so the mark and the cursor sit on
+    # different chips. `^W` then confirmed "Close repeater 4", the unmarked one, while the
+    # strip said `1 marked` and the space menu said `Close 1 sub-tab` — and `space ▸ d`, which
+    # read `target_views`, duplicated the marked chip. Same tab, same marks, two targets.
+    def batch_subtab_refs : Array(SubtabRef)?
+      idxs = marked_subtab_indices
+      idxs.empty? ? nil : collect_subtab_refs(idxs)
+    end
+
+    # The chip `ref` sits on RIGHT NOW, or nil when a peer closed it. Identity, never `==`:
+    # the mark set keys on `object_id` for the reason `SubtabMarks` states.
+    def subtab_index_of(ref : SubtabRef) : Int32?
+      (0...subtab_count).find { |i| (r = subtab_ref(i)) && r.same?(ref) }
+    end
+
+    # The refs still on the strip, as the indices they hold now (chip order).
+    private def resolve_subtab_refs(refs : Enumerable(SubtabRef)) : Array(Int32)
+      idxs = [] of Int32
+      refs.each do |ref|
+        if i = subtab_index_of(ref)
+          idxs << i
+        end
+      end
+      idxs.sort!
+    end
+
+    # The count phrase a bulk sub-tab confirm uses. The filter split is not decoration: `⇧T`
+    # marks what the `/` query shows, then narrowing the query again leaves those marks in
+    # place, so "close 5 sub-tabs" can reach two chips that are not on screen. The project
+    # picker's delete confirm spells the same split out for the same reason.
+    protected def marked_subtab_phrase(n : Int32) : String
+      base = "#{n} sub-tab#{n == 1 ? "" : "s"}"
+      hidden = hidden_marked_count
+      hidden > 0 ? "#{base} (#{hidden} not on screen — the filter is hiding them)" : base
+    end
+
+    # The batch half of a DUPLICATE gesture: clone every marked chip and say one thing.
+    # Capped (it opens a sub-tab per item, which is what `BATCH_SUBTAB_CAP` exists for) but
+    # deliberately not confirm-gated — the confirms on these strips guard what is destructive
+    # or outbound, and a duplicate only opens tabs the same `^W` closes again. Ascending, so
+    # the clones land in the order their originals sit in.
+    #
+    # Returns the sentence, or nil when the batch was refused (the caller says why).
+    protected def duplicate_marked_subtabs(refs : Array(SubtabRef), noun : String, & : Int32 -> Nil) : String?
+      idxs = resolve_subtab_refs(refs)
+      return nil if idxs.size > Tui::Runner::BATCH_SUBTAB_CAP
+      idxs.each { |i| yield i }
+      "duplicated #{idxs.size} #{noun}#{idxs.size == 1 ? "" : "s"}"
+    end
+
+    # Why sub-tab `idx` cannot be closed right now, or nil. Only the Fuzzer has one today (a
+    # run or a result spool still writing); every other strip always closes.
+    def close_subtab_refusal(idx : Int32) : String?
+      nil
+    end
+
+    # Close sub-tab `idx` and say NOTHING — the batch driver below owns the sentence, and a
+    # loop of per-tab toasts would leave only the last one on screen anyway. Returns true
+    # when the store rolled the DELETE back and the saved session will reappear.
+    protected def close_subtab_at(idx : Int32) : Bool
+      false
+    end
+
+    # The batch half of a close gesture (#683). Three rules, each one a defect if dropped:
+    #
+    #   * HIGH index → low, so a `delete_at` can never shift a target not yet reached.
+    #   * a refusal is reported and the loop CONTINUES (#442 Q4: a partial failure reports,
+    #     it never aborts the rest) — and a refused sub-tab keeps its mark, so the retry is
+    #     still assembled.
+    #   * the marks that DID close are handed back explicitly. `SubtabMarks#retain` cannot
+    #     do it: `ComparerController#comparer_close` resets its last session in place rather
+    #     than deleting it, so that view — and its mark — outlives the close the operator
+    #     just watched.
+    #
+    # Takes the refs the handler captured before its confirm (`batch_subtab_refs`) and maps
+    # them to indices HERE, after the dialog: a chip a peer closed in the meantime simply
+    # resolves to nothing, and a reordered one to where it is now.
+    protected def close_marked_subtabs(refs : Array(SubtabRef)) : String
+      gone = [] of SubtabRef
+      orphaned = 0
+      refusal = nil.as(String?)
+      refused = 0
+      resolve_subtab_refs(refs).reverse_each do |i|
+        if reason = close_subtab_refusal(i)
+          refusal ||= reason
+          refused += 1
+          next
+        end
+        ref = subtab_ref(i)
+        orphaned += 1 if close_subtab_at(i)
+        gone << ref if ref
+      end
+      unmark_subtab_refs(gone)
+      msg = "closed #{gone.size} sub-tab#{gone.size == 1 ? "" : "s"}"
+      msg += " · #{refused} kept (#{refusal})" if refusal
+      TabClose.message(msg, orphaned > 0)
+    end
+
+    # ===== end sub-tab multi-select ==========================================
+
     # The sub-tab strip always carves its own hairline under the chip row. When a filter
     # bar is also shown it draws a SECOND hairline below itself, so the chrome reads
     # chips › ─── › filter › ─── › body (matching Target/Sitemap) instead of gluing the
@@ -681,6 +971,9 @@ module Gori::Tui
           @subtab_filter = @subtab_filter[0, @filter_cx - 1] + @subtab_filter[@filter_cx..]
           @filter_cx -= 1
         end
+        @filter_preedit = ""
+      elsif act = LineEdit.action(ev) # ⌃/⌥←→, Home/End, Delete, ⌥⌫ — before the bare arrows
+        @subtab_filter, @filter_cx = LineEdit.apply(act, @subtab_filter, @filter_cx)
         @filter_preedit = ""
       elsif key.left?
         @filter_cx = {@filter_cx - 1, 0}.max
@@ -870,6 +1163,37 @@ module Gori::Tui
       ""
     end
 
+    # A hint with its chords spelled as `{verb.id}` tokens, resolved through the effective
+    # keymap (Hotkeys.expand) — the strip names the verb and the keymap says which key, so a
+    # rebind reaches every strip written this way. Keys that are NOT verbs (↑/↓, esc, the
+    # claimed ^P/^N/^W family, a pane-local `x`) stay literal.
+    protected def keys(template : String) : String
+      Hotkeys.expand(@host.session.registry, template)
+    end
+
+    # Whether `ev` is a chord the effective keymap binds to verb `id` — for a pane that
+    # dispatches a key ITSELF, with no verb of its own, while its hint strip names another
+    # verb's chord for it. The Rewriter's extract sub-tab says `{rewriter.add} add` and the
+    # Colormarker's colours pane says `{colormarker.add} add`: both strips followed a rebind
+    # the moment `keys` did, and both handlers kept matching the literal `'a'`, so after
+    # binding "Add rule" to `n` the strip said `n add` and `n` did nothing there while `a`,
+    # which the strip no longer named, still did.
+    #
+    # Resolved the way `Hotkeys.expand` resolves the token the strip prints: the user's
+    # override, else the OS profile, else the verb's declared chords — and, for an id the
+    # operator has UNBOUND, the declared default, because that is what the strip falls back
+    # to naming. The event goes through `Keybind.from_event`, the same encoding the keymap
+    # dispatch uses, so a typed uppercase letter and ⇧+letter agree here as they do there.
+    protected def chord_of?(ev : Termisu::Event::Key, id : String) : Bool
+      return false unless chord = Keybind.from_event(ev)
+      registry = @host.session.registry
+      return false unless verb = registry[id]?
+      os = Verb::OsProfile.resolve(Settings.keymap_os)
+      chords = Verb::Keymap.effective_chords(verb, os, Hotkeys.rebindable_overrides(registry))
+      chords = Verb::Keymap.effective_chords(verb, os) if chords.empty?
+      chords.includes?(chord)
+    end
+
     # --- orthogonal ^G/^F prompts: the symbol naming the currently-focused
     # searchable pane (e.g. :repeater_request, :notes), or nil if none. The shell's
     # goto/search prompt dispatches on this symbol. A future cleanup could return a
@@ -903,6 +1227,20 @@ module Gori::Tui
       false
     end
 
+    # Put `text` on the clipboard and say so — the one toast shape every copy verb uses
+    # (`copied Nb to clipboard`, plus `Clipboard.note`'s caveat when the write was clipped or
+    # the clipboard is off). `what` names the thing for a list row, where "Nb" alone tells
+    # the operator nothing about WHICH row went. An empty text is refused with a toast.
+    protected def copy_text(text : String, what : String? = nil) : Nil
+      if text.empty?
+        @host.status("nothing to copy")
+        return
+      end
+      written = Clipboard.copy(text)
+      label = what ? "copied #{what} (#{written}b)" : "copied #{written}b to clipboard"
+      @host.status("#{label}#{Clipboard.note(written, text)}")
+    end
+
     # --- focus ring (Tab/Shift-Tab across panes); false = no further pane ---
     def pane_advance(dir : Int32) : Bool
       false
@@ -912,6 +1250,25 @@ module Gori::Tui
     end
 
     def focus_last : Nil
+    end
+
+    # The body is re-entered from OUTSIDE the focus ring — ↓/↵ off the tab bar, a "Go to …"
+    # jump, a [ ] cycle while already in the body, the sub-tab strip's ↓. Keep the pane the
+    # view already holds: `focus_first`/`focus_last` stay the Tab-ring entries (they name an
+    # END of the ring), and this is the "come back to where I was" entry. The default is a
+    # no-op because every multi-pane view initialises its pane to the first one, so a first
+    # visit lands there with no help. Override only for a side effect that must ALSO run on
+    # a resume — a popup to close, a sub-field to exit — never to move the pane.
+    def focus_resume : Nil
+    end
+
+    # Why a bare `i` does nothing on the FOCUSED pane, or nil when it should reach the keymap.
+    # `i` enters INSERT in every editor pane; on the read-only pane beside one — the Repeater
+    # RESPONSE, the Fuzzer RESULTS, the Decoder OUTPUT — the same reflex fell through to the
+    # Global `intercept.toggle` and started holding every request on the proxy. A tab with
+    # such a pane answers with a line naming both facts; the Runner toasts it and stops.
+    def insert_key_refusal : String?
+      nil
     end
 
     # --- lifecycle ---

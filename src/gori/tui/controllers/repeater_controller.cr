@@ -42,7 +42,7 @@ module Gori::Tui
         view = RepeaterView.new
         ws_msgs = nil.as(Array(Store::WsOutMessage)?)
         request_text = String.new(r.request)
-        if Repeater::WsEngine.upgrade_request?(request_text)
+        if Repeater::WsEngine.replayable?(request_text)
           # A `[gori]` advisory row is gori talking ABOUT the socket; replaying one would
           # put its own sentence on the wire as a client frame (CLI::Run.ws_seed_rows).
           ws_msgs = CLI::Run.ws_seed_rows(@host.session.store.ws_messages_for_repeater(r.id))[0]
@@ -71,10 +71,20 @@ module Gori::Tui
       # `@host.status` because the recording happens on the send fiber (see `repeater_send`), and
       # a status line written from there would race the run loop's own.
       @unrecorded_notice = false
-      @repeater_results = Channel({RepeaterView, Repeater::Result, String?}).new(8)
+      # Sized to the largest batch one `^R` can start (a marked-set send, capped at
+      # `Runner::BATCH_SUBTAB_CAP`) rather than to 8. The hand-off at the foot of a send
+      # fiber is a non-blocking `select … else`, and its documented job is to DROP a result
+      # whose project the operator already left — not to absorb backpressure. At eight slots
+      # a twenty-tab send against a fast origin routinely filled it inside one `poll_event`
+      # window and threw responses away silently: the pane simply kept showing the previous
+      # one. Sizing the buffer to the gesture puts the `else` branch back to meaning only
+      # what it says it means.
+      @repeater_results = Channel({RepeaterView, Repeater::Result, String?}).new(Runner::BATCH_SUBTAB_CAP)
       # WebSocket repeater transcripts arrive on their own channel (a distinct result
       # type from HTTP) and are applied by the same drain on a later tick.
-      @ws_results = Channel({RepeaterView, Repeater::WsEngine::Result}).new(8)
+      # Same size, same reason: `repeater_send` routes a WS sub-tab here, and a marked set
+      # can be all WebSocket tabs.
+      @ws_results = Channel({RepeaterView, Repeater::WsEngine::Result}).new(Runner::BATCH_SUBTAB_CAP)
       # "Send group" pipelines several requests on one connection and delivers the
       # labelled per-request results here (distinct type again — an ordered array).
       @group_results = Channel({RepeaterView, Array({String, Repeater::Result})}).new(8)
@@ -287,7 +297,7 @@ module Gori::Tui
         else
           # The way back on an overridden handshake tab: the MESSAGES pane is hidden there, so
           # `^T` — the key that would otherwise reveal it — is not drawn to point at it.
-          back = v.ws_http_only? ? " · ^V websocket" : ""
+          back = v.ws_http_only? ? keys(" · {repeater.toggle-http2} websocket") : ""
           "i/↵ edit · #{read_common} · #{marks} · ^G goto · ^F find · #{hex} hex#{back} · ↹ pane · esc tabs"
         end
       else
@@ -297,11 +307,11 @@ module Gori::Tui
 
     private def grpc_hint(v : RepeaterView) : String
       if v.grpc_fields_editing?
-        "type the value · ↵ apply · esc cancel · ^R send"
+        keys("type the value · ↵ apply · esc cancel · {repeater.send} send")
       elsif v.grpc_fields?
-        "↑/↓ pick a field · i/↵ edit · ␣E/esc head · ^X hex · ^R send"
+        keys("↑/↓ pick a field · i/↵ edit · ␣E/esc head · {repeater.toggle-hex} hex · {repeater.send} send")
       elsif v.request_hex?
-        "gRPC payload hex — overtype 0-9a-f · Ins/Del length · ^X/esc exit · ^R send"
+        keys("gRPC payload hex — overtype 0-9a-f · Ins/Del length · {repeater.toggle-hex}/esc exit · {repeater.send} send")
       elsif v.request_insert?
         # `⇧arrows select · ^Y copy` for the same reason the plain-HTTP request footer names
         # them (see #body_hint's `:request` arm): the band is buildable in INSERT and the `y` that
@@ -312,9 +322,9 @@ module Gori::Tui
         # head/metadata. The old token promised a focus move and silently corrupted a header.
         "type head/metadata · ⇧arrows select · ^Y copy · esc read · ↹ text"
       else
-        msg = v.grpc_reframable? ? "^X hex-edit payload · " : ""
+        msg = v.grpc_reframable? ? "{repeater.toggle-hex} hex-edit payload · " : ""
         fields = v.grpc_fields_available? ? "␣E fields · " : ""
-        "i/↵ edit head · #{msg}#{fields}⇧arrows select · y copy · space cmds · ↹ pane"
+        keys("i/↵ edit head · #{msg}#{fields}⇧arrows select · {repeater.copy} copy · space cmds · ↹ pane")
       end
     end
 
@@ -330,6 +340,21 @@ module Gori::Tui
       (0 <= idx < @repeaters.size) ? @repeaters[idx].view : nil
     end
 
+    # The object that IS sub-tab `idx`, for the strip's mark set (#683). The view, not the
+    # index: a reconcile can reorder or drop chips under a standing mark.
+    def subtab_ref(idx : Int32) : SubtabRef?
+      view_at(idx)
+    end
+
+    # The views a sub-tab-level action applies to: the marked ones, else the active one
+    # (`target_subtab_indices`). Views rather than indices, because callers hold them across
+    # a prompt or a confirm that a reconcile can reorder underneath.
+    def target_views : Array(RepeaterView)
+      views = [] of RepeaterView
+      target_subtab_indices.each { |i| (v = view_at(i)) && views << v }
+      views
+    end
+
     # --- rendering ---
     def render_body(screen : Screen, rect : Rect, focus : Symbol) : Nil
       body_focused = focus == :body
@@ -337,7 +362,7 @@ module Gori::Tui
       labels = subtab_strip_shown? ? subtab_labels : nil
       shell = BodyChrome.shell_focused(focus, multi_pane: !current_view.nil?)
       subtabs_focused = focus == :subtabs
-      @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused, labels, @current_repeater_idx, @subtab_start, subtab_hidden, strip_divider: subtab_strip_divider?, find: subtab_find_shown?, find_lit: @host.subtab_find_focused?) do |content|
+      @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused, labels, @current_repeater_idx, @subtab_start, subtab_hidden, strip_divider: subtab_strip_divider?, find: subtab_find_shown?, find_lit: @host.subtab_find_focused?, marked: marked_chip_set) do |content|
         render_with_filter(screen, content, subtabs_focused) do |body|
           if v = current_view
             v.render(screen, body, focused: body_focused)
@@ -421,16 +446,16 @@ module Gori::Tui
             else
               "GraphQL query/vars"
             end
-      mode = v.request_insert? ? "type to edit · ⇧arrows select · ^Y copy" : "i/↵ edit · ⇧arrows select · y copy · space cmds"
-      "#{mode} #{sub} · ^T switch · ^G goto · ^F find · esc read · #{tab_token(v)}"
+      mode = v.request_insert? ? "type to edit · ⇧arrows select · ^Y copy" : "i/↵ edit · ⇧arrows select · {repeater.copy} copy · space cmds"
+      keys("#{mode} #{sub} · {repeater.toggle-decoded} switch · ^G goto · ^F find · esc read · #{tab_token(v)}")
     end
 
     private def ws_hint(v : RepeaterView) : String
       sub = v.req_pane == :envelope ? "handshake request" : "messages"
-      mode = v.request_insert? ? "type to edit · ⇧arrows select · ^Y copy" : "i/↵ edit · ⇧arrows select · y copy · space cmds"
+      mode = v.request_insert? ? "type to edit · ⇧arrows select · ^Y copy" : "i/↵ edit · ⇧arrows select · {repeater.copy} copy · space cmds"
       # `^V http` is listed because this key used to REFUSE here ("transport is fixed"), so
       # nothing in the tab suggested a handshake could be sent as an ordinary request.
-      "#{mode} #{sub} · ^T switch · ^V http · ^G goto · ^F find · esc read · #{tab_token(v)}"
+      keys("#{mode} #{sub} · {repeater.toggle-decoded} switch · {repeater.toggle-http2} http · ^G goto · ^F find · esc read · #{tab_token(v)}")
     end
 
     # What Tab actually does on the REQUEST column right now. In INSERT it types a TAB
@@ -448,7 +473,7 @@ module Gori::Tui
     # reachable and nothing said so.
     private def ws_resp_hint(v : RepeaterView, read_common : String, send : String) : String
       card = v.resp_pane == :handshake ? "handshake response" : "transcript"
-      "↑/↓ move #{card} · #{read_common} · ←/→ char · ^T switch · ^F find · #{send} send · ↹ pane · esc tabs"
+      keys("↑/↓ move #{card} · #{read_common} · ←/→ char · {repeater.toggle-decoded} switch · ^F find · #{send} send · ↹ pane · esc tabs")
     end
 
     # --- request-pane toggles (keymap-driven verbs; carry the pane-gating + status) ---
@@ -1146,6 +1171,15 @@ module Gori::Tui
       current_view.try(&.focus_last)
     end
 
+    def focus_resume : Nil
+      current_view.try(&.focus_resume)
+    end
+
+    def insert_key_refusal : String?
+      return nil unless (v = current_view) && v.focus == :response
+      "the response is read-only — i edits the REQUEST (↹ up); intercept toggles from the tab bar"
+    end
+
     # --- sub-tab nav (the shell's shared strip machinery drives these for Repeater) ---
     # Move the active sub-tab by ±1 (strip ←/→) among the VISIBLE (filtered) chips, so
     # h/l walks exactly the chips shown; clamped, no wrap, saving the outgoing tab first.
@@ -1192,14 +1226,18 @@ module Gori::Tui
     # Apply the typed tags to the captured tab + persist. Re-find by VIEW identity (a
     # reconcile may have reordered/removed it) — gone → no-op. Mirrors apply_rename;
     # blank clears every tag. The raw string is normalized (ws/comma split, dedupe).
-    def apply_tags(view : RepeaterView, raw : String) : Nil
-      return unless tab = @repeaters.find(&.view.same?(view))
+    #
+    # Returns false when `view` is no longer on the strip — a peer closed it while the prompt
+    # was open — so the batch toast can count what was tagged rather than what was aimed at.
+    def apply_tags(view : RepeaterView, raw : String) : Bool
+      return false unless tab = @repeaters.find(&.view.same?(view))
       view.tags = Repeater::Tags.parse(raw)
       if id = tab.db_id
         unless @host.session.store.set_repeater_tags(id, Repeater::Tags.serialize(view.tags))
           @host.status("tags NOT saved (project busy) — the chip reads the new tags until the tab reloads")
         end
       end
+      true
     end
 
     # --- async (run loop) ---
@@ -1245,7 +1283,7 @@ module Gori::Tui
         end
         if result.ok?
           recv = result.messages.count(&.direction.==("in"))
-          @host.status("ws sent: #{recv} received#{result.close_code ? " · closed #{result.close_code}" : ""}", :done)
+          @host.status("ws sent: #{recv} received#{result.close_code ? " · closed #{result.close_code}" : ""}#{ws_evidence_literal_note(view)}", :done)
           # Feed the handshake + captured frames into Probe (WS payload secrets, tech).
           probe_scan_ws_repeater(id, result, tab.flow_id, view) if id
         else
@@ -1318,9 +1356,16 @@ module Gori::Tui
       # `save_current_repeater`. Minimize is gated off WS tabs, so the two WS flags are
       # normally false here; passing them keeps this call from being the one that clears a
       # flag the OTHER surfaces preserve.
-      @host.session.store.update_repeater(id, v.target, v.request_text.to_slice, v.http2?, v.auto_content_length?,
-        v.sni_override, ws_keep_key: v.ws_keep_key?, ws_http_only: v.ws_http_only?,
-        tls_preset: v.tls_preset)
+      # Checked before `clear_dirty`, exactly like the WS-frames write in `save_repeater_tab`:
+      # a rolled-back UPDATE (a busy store, a peer holding the writer) leaves the row on its
+      # PREVIOUS bytes, and marking the tab clean over that lets the next reconcile poll paint
+      # the stale row back over the operator's edit. Leave it dirty so a later save retries.
+      unless @host.session.store.update_repeater(id, v.target, v.request_text.to_slice, v.http2?, v.auto_content_length?,
+               v.sni_override, ws_keep_key: v.ws_keep_key?, ws_http_only: v.ws_http_only?,
+               tls_preset: v.tls_preset)
+        @host.status("request NOT saved (project busy) — leaving the tab dirty so the next save retries")
+        return
+      end
       v.clear_dirty
     end
 
@@ -1443,7 +1488,7 @@ module Gori::Tui
         # "send then response vanishes / focus jumps to Target" bug.
         ws_msgs = nil.as(Array(Store::WsOutMessage)?)
         row_request_text = String.new(row.request)
-        if Repeater::WsEngine.upgrade_request?(row_request_text)
+        if Repeater::WsEngine.replayable?(row_request_text)
           ws_msgs = CLI::Run.ws_seed_rows(@host.session.store.ws_messages_for_repeater(row.id))[0]
             .map { |m| Store::WsOutMessage.new(m.opcode, m.payload, m.shape) } # see above
         end
@@ -1459,7 +1504,7 @@ module Gori::Tui
         view = RepeaterView.new
         ws_msgs = nil.as(Array(Store::WsOutMessage)?)
         row_request_text = String.new(row.request)
-        if Repeater::WsEngine.upgrade_request?(row_request_text)
+        if Repeater::WsEngine.replayable?(row_request_text)
           ws_msgs = CLI::Run.ws_seed_rows(@host.session.store.ws_messages_for_repeater(row.id))[0]
             .map { |m| Store::WsOutMessage.new(m.opcode, m.payload, m.shape) } # see above
         end
@@ -1494,6 +1539,14 @@ module Gori::Tui
         end
     end
 
+    # Which handshake a WS tab holds, for the status line that announces the seed. The two
+    # transports need different things of the operator — an h1 upgrade has a
+    # `Sec-WebSocket-Key` (`␣K`) and an h2 one has none — so a line that named neither left
+    # `^V`'s two-vs-three stops unexplained.
+    private def transport_word(view : RepeaterView) : String
+      view.http2? ? "RFC 8441 extended CONNECT over h2" : "RFC 6455 upgrade over h1"
+    end
+
     # --- lifecycle / verbs ---
     # Open flow `id` as a new Repeater tab. Shared by History's ^R and the Issues tab's
     # "send evidence to Repeater". No-op if the flow is gone (pruned).
@@ -1502,17 +1555,17 @@ module Gori::Tui
       view = RepeaterView.new
       # A seed asks a NARROWER question than a display surface does (#742). History's MESSAGES
       # pane shows a transcript because one was captured; this has to hand the operator a tab
-      # whose `^R` actually re-opens the socket, and `Repeater::WsEngine` opens one exactly one
-      # way — an HTTP/1.1 `Upgrade:` handshake, accepting nothing but a 101 back. So the gate
-      # is "does this capture carry a handshake gori can re-send", which is
-      # `WsEngine.upgrade_request?` — the Repeater's own predicate, the one `Repeater::Plan`
-      # already derives WS-ness from. The `row.status == 101` that used to stand here was the
-      # h1 handshake's status wearing that question's clothes.
+      # whose `^R` actually re-opens the socket. So the gate is "does this capture carry a
+      # handshake gori can re-send", which is `WsEngine.replayable?` — the Repeater's own
+      # predicate, the one `Repeater::Plan` also derives WS-ness from. The `row.status == 101`
+      # that used to stand here was the h1 handshake's status wearing that question's clothes.
       #
-      # The case that forced the distinction is a WebSocket captured over RFC 8441 extended
-      # CONNECT (#733): real RFC 6455 frames, no `Upgrade:` header, and no h2 WebSocket send
-      # path anywhere in the Repeater to replay them over. See the `websocket?` branch below.
-      if Repeater::WsEngine.upgrade_request?(String.new(detail.request_head))
+      # BOTH handshakes now answer yes: an RFC 6455 `Upgrade:` head and an RFC 8441 extended
+      # CONNECT (#733). The second used to land on the plain-HTTP branch below with a status
+      # line explaining that its frames were not seeded, because there was no h2 WebSocket send
+      # path; `WsEngine` reads the transport off the handshake bytes now, so the branch that
+      # said so is gone and the seed is the same seed.
+      if Repeater::WsEngine.replayable?(String.new(detail.request_head))
         # WebSocket: seed the editor with the recorded client→server messages. The tab is
         # session-only (db_id nil) — WS transcripts aren't persisted/synced.
         # A `[gori]` advisory is a diagnostic gori wrote ABOUT the socket, never a frame the
@@ -1530,32 +1583,8 @@ module Gori::Tui
         unshown = view.ws_unshown_seed
         note = unshown.empty? ? "" : " — #{unshown.size} frame#{unshown.size == 1 ? "" : "s"} not shown (#{unshown.join(", ")}); #{unshown.size == 1 ? "it replays" : "they replay"} unless you edit the list"
         note += " · #{CLI::Run.ws_notice_dropped_note(notice_dropped)}" if notice_dropped > 0
-        @host.status("ws repeater: #{view.summary} — edit messages (one per line)#{note} · ^R send · esc back")
-      elsif detail.websocket?
-        # A WebSocket gori captured but cannot re-open: an RFC 8441 extended CONNECT over
-        # HTTP/2 (#733). The frames are real RFC 6455 frames and replaying them is not the
-        # problem — the HANDSHAKE is. This capture holds `CONNECT /path HTTP/2` and a
-        # `:protocol` pseudo-header; `WsEngine` writes an h1 upgrade and waits for a 101, so
-        # seeding a WS tab from it would hand over a `^R` that cannot connect. Making it
-        # connect would mean gori inventing a `GET … Upgrade: websocket` handshake with a
-        # `Sec-WebSocket-Key` the client never sent and presenting it as the capture's — the
-        # fabrication this repo refuses everywhere else it comes up.
-        #
-        # `^V` does not cover this either. That seam (`cycle_ws_transport`) moves a tab
-        # between the WS engine and a plain h1/h2 send of the SAME handshake bytes; it says so
-        # in its own last branch, "h2 is not a WebSocket transport here — RFC 8441 is out of
-        # scope", and `Sender#send_ws` never consults `http2` at all.
-        #
-        # So: the ordinary HTTP tab, which is honest — the CONNECT request really is an h2
-        # request and `^R` really will send it — plus a status line that names the frames it
-        # is NOT carrying and where they can be read. A silent HTTP tab was the bug.
-        view.load(detail)
-        @repeaters << RepeaterTab.new(view, id, persist_new_repeater(view, id))
-        frames = @host.session.store.count_ws_messages(id)
-        @host.status("repeater: #{view.summary} — WebSocket over HTTP/2 (RFC 8441): the #{frames} captured " \
-                     "frame#{frames == 1 ? "" : "s"} #{frames == 1 ? "is" : "are"} NOT seeded — gori replays a socket " \
-                     "only from an HTTP/1.1 Upgrade handshake, and this capture has none. Read them in History's " \
-                     "MESSAGES pane · ^R sends the CONNECT request · esc back")
+        @host.status("ws repeater: #{view.summary} (#{transport_word(view)}) — edit messages " \
+                     "(one per line)#{note} · ^R send · esc back")
       elsif grpc_flow?(detail)
         # gRPC: head editable as text; a unary call's message payload is hex-editable (^X)
         # and reframed on send. Session-only (db_id nil) — the binary body can't round-trip
@@ -1622,8 +1651,41 @@ module Gori::Tui
 
     # Content-only clone of the active sub-tab (Space → Duplicate). No flow_id / links.
     # gRPC and split-decode tabs stay session-only (db_id nil), matching open-from-History.
+    # Duplicates the MARKED sub-tabs when the strip carries marks, the active one otherwise
+    # (`target_subtab_indices` — the one target rule). Capped, but NOT confirm-gated: the
+    # confirms in this tab guard what is destructive (close) or outbound (send), and a
+    # duplicate only opens tabs the operator can close again with the key they just used.
     def repeater_duplicate : Nil
-      return @host.status("no repeater open to duplicate") unless src = current_view
+      srcs = target_views
+      if srcs.size > 1
+        if srcs.size > Runner::BATCH_SUBTAB_CAP
+          @host.status("#{srcs.size} sub-tabs marked — duplicate is capped at #{Runner::BATCH_SUBTAB_CAP}")
+          return
+        end
+        duplicate_views(srcs)
+        return
+      end
+      duplicate_one(srcs.first? || return @host.status("no repeater open to duplicate"))
+    end
+
+    private def duplicate_views(srcs : Array(RepeaterView)) : Nil
+      lost = srcs.count { |v| duplicate_view(v) }
+      msg = "duplicated #{srcs.size} sub-tab#{srcs.size == 1 ? "" : "s"} (#{@repeaters.size} open)"
+      msg += " — #{lost} without their ws frames (project busy); those tabs stay dirty so a later save retries" if lost > 0
+      @host.status(msg)
+    end
+
+    private def duplicate_one(src : RepeaterView) : Nil
+      if duplicate_view(src)
+        @host.status("duplicated repeater (#{@repeaters.size} open) — ws frames NOT saved (project busy), the tab stays dirty so a later save retries")
+      else
+        @host.status("duplicated repeater (#{@repeaters.size} open)")
+      end
+    end
+
+    # Clone one session into a new sub-tab. Toast-free (the callers own the sentence);
+    # returns whether the clone's WebSocket frames failed to persist.
+    private def duplicate_view(src : RepeaterView) : Bool
       src.flush_decoded_edits if src.decode_mode?
       view = RepeaterView.new
       view.duplicate_from(src)
@@ -1646,18 +1708,20 @@ module Gori::Tui
       end
       @repeaters << RepeaterTab.new(view, nil, db_id)
       @current_repeater_idx = @repeaters.size - 1
-      if frames_lost
-        @host.status("duplicated repeater (#{@repeaters.size} open) — ws frames NOT saved (project busy), the tab stays dirty so a later save retries")
-      else
-        @host.status("duplicated repeater (#{@repeaters.size} open)")
-      end
+      frames_lost
     end
 
     # Insert a freshly-opened repeater tab into the store so it has a stable row id (the
     # reconcile key). A closing store returns 0 → nil, leaving the tab unsaved.
     private def persist_new_repeater(view : RepeaterView, flow_id : Int64?) : Int64?
+      # The NEXT position in the saved order, not `@repeaters.size`: the two agree only while
+      # the position space is dense, and every close leaves a hole. A workbench at {0,1,2,5,6}
+      # handed a new tab position 5, and `reconcile`'s `{position, id}` sort then dropped it
+      # into the MIDDLE of the strip — which a batch duplicate (#683) made visible three tabs
+      # at a time. MCP and the CLI already ask the store (#904); this was the last caller
+      # passing the count.
       id = @host.session.store.insert_repeater(view.target, view.request_text.to_slice, view.http2?,
-        view.auto_content_length?, flow_id, @repeaters.size, view.sni_override,
+        view.auto_content_length?, flow_id, @host.session.store.next_repeater_position, view.sni_override,
         ws_keep_key: view.ws_keep_key?, ws_http_only: view.ws_http_only?,
         # …and the fingerprint (#844). `duplicate_from` deliberately copies it ("a send knob,
         # so the clone sends the handshake its source would"), and leaving it out of the INSERT
@@ -1670,17 +1734,66 @@ module Gori::Tui
 
     # Confirm before closing a repeater sub-tab (^W) — the edited request + last response
     # are discarded. No-op when no repeater is open.
+    #
+    # Reads `target_subtab_indices`, so ^W closes the MARKED sub-tabs when the strip carries
+    # marks and the active one otherwise — the one target rule, not a second gesture. The
+    # indices are resolved to views before the confirm opens: the dialog's action runs from
+    # `on_close`, after the overlay is restored, and a reconcile landing in that gap would
+    # make an index name a different session.
     def request_close : Nil
       return unless tab = current_repeater_tab
+      if refs = batch_subtab_refs
+        @host.confirm("CLOSE REPEATERS", "Close #{marked_subtab_phrase(refs.size)}?\nEach edited request and its response are discarded.",
+          confirm_label: "close", danger: true) { close_marked_repeaters(refs) }
+        return
+      end
+      # Capture the VIEW, not the index: the confirm's action runs from `on_close` a reconcile
+      # poll later, and a peer that deleted or reordered this session in that gap would leave
+      # `@current_repeater_idx` naming a DIFFERENT tab — the batch arm resolves to views before
+      # the dialog for exactly this reason, and the single arm has to as well.
+      v = tab.view
       @host.confirm("CLOSE REPEATER", "Close repeater “#{tab.view.summary}”?\nThe edited request and response are discarded.",
-        confirm_label: "close", danger: true) { close_repeater_tab }
+        confirm_label: "close", danger: true) { close_repeater_view(v) }
+    end
+
+    # Close the sub-tab holding `view` by IDENTITY, or say it is already gone. The index the
+    # single ^W confirm captured can name another session by the time the dialog resolves
+    # (a peer delete/reorder in the gap), so `close_repeater_tab`'s index path is unsafe from
+    # a deferred action — this re-finds the tab from the view every time.
+    private def close_repeater_view(view : RepeaterView) : Nil
+      idx = @repeaters.index(&.view.same?(view))
+      return @host.status("repeater already closed") unless idx
+      orphaned = close_repeater_at(idx)
+      @host.status(TabClose.message(@repeaters.empty? ? "closed repeater — none open (^N new · ^R from History)" : "closed repeater (#{@repeaters.size} open)", orphaned))
+    end
+
+    # The batch arm of ^W: the shared driver loops the same per-tab teardown high index →
+    # low, hands the marks back and says one sentence, then re-resolves focus (the strip may
+    # be gone entirely once five chips close at once).
+    private def close_marked_repeaters(refs : Array(SubtabRef)) : Nil
+      @host.status(close_marked_subtabs(refs))
+      @host.resolve_subtab_focus
     end
 
     # Close the current repeater sub-tab. Clamps the active index; when the last one
     # closes the Repeater tab shows its empty hint.
     def close_repeater_tab : Nil
       return if @current_repeater_idx < 0 || @current_repeater_idx >= @repeaters.size
-      closing = @repeaters[@current_repeater_idx].view
+      orphaned = close_repeater_at(@current_repeater_idx)
+      @host.status(TabClose.message(@repeaters.empty? ? "closed repeater — none open (^N new · ^R from History)" : "closed repeater (#{@repeaters.size} open)", orphaned))
+    end
+
+    # The mark set's teardown hook: close sub-tab `idx` saying nothing, so a batch can loop
+    # it and own the one sentence at the end.
+    protected def close_subtab_at(idx : Int32) : Bool
+      close_repeater_at(idx)
+    end
+
+    # Close sub-tab `idx` and report whether the store rolled its DELETE back. Toast-free —
+    # both the single ^W and the batch build their own sentence from it.
+    private def close_repeater_at(idx : Int32) : Bool
+      return false if idx < 0 || idx >= @repeaters.size
+      closing = @repeaters[idx].view
       # Finish a running minimize job NOW: once the view leaves @repeaters the drain drops
       # its remaining events (incl. the terminal Report), so jobs.finish would never run and
       # the bottom-bar spinner would animate forever.
@@ -1697,10 +1810,14 @@ module Gori::Tui
       end
       # `delete_repeater` has always reported whether the DELETE committed (it is `exec_task_ok`)
       # and this was the last caller ignoring it; MCP's `delete_repeater` already surfaces it.
-      orphaned = (id = @repeaters[@current_repeater_idx].db_id) ? !@host.session.store.delete_repeater(id) : false # also propagates the close to peer sessions
-      @repeaters.delete_at(@current_repeater_idx)
+      orphaned = (id = @repeaters[idx].db_id) ? !@host.session.store.delete_repeater(id) : false # also propagates the close to peer sessions
+      @repeaters.delete_at(idx)
+      # The active chip follows the removal rather than being clamped blindly: closing a tab
+      # to the LEFT of it slides it down one, which a bare clamp would read as "stay put" and
+      # land the operator on the neighbour of the session they were editing.
+      @current_repeater_idx -= 1 if idx < @current_repeater_idx
       @current_repeater_idx = @repeaters.empty? ? -1 : @current_repeater_idx.clamp(0, @repeaters.size - 1)
-      @host.status(TabClose.message(@repeaters.empty? ? "closed repeater — none open (^N new · ^R from History)" : "closed repeater (#{@repeaters.size} open)", orphaned))
+      orphaned
     end
 
     # Stop the one running minimize on a project-level exit (leave project / quit), for the
@@ -1799,18 +1916,56 @@ module Gori::Tui
       " · not recorded (#{what})"
     end
 
+    # ^R sends the MARKED sub-tabs when the strip carries marks, the active one otherwise
+    # (`target_subtab_indices` — the one target rule). A plural send asks first: this is the
+    # only gesture in the TUI outside the rate-limited Fuzzer/Miner engines that puts N live
+    # requests on the wire from one keypress, and the confirm is the same shape "Send to
+    # Repeater" already uses for a batch that does not even send.
     def repeater_send : Nil
-      return unless (tab = current_repeater_tab) && (view = tab.view).loaded?
+      if refs = batch_subtab_refs
+        # Resolved to TABS before the confirm: its action runs from `on_close`, after the
+        # overlay is restored, and a reconcile in that gap would make an index name another
+        # session (the same reason the rename prompt captures its view).
+        tabs = refs.compact_map { |r| @repeaters.find(&.view.same?(r)) }
+        return if tabs.empty?
+        # Capped like every other batch that fans out per marked item. Close is uncapped —
+        # closing thirty tabs is housekeeping — but this one dials thirty origins at once.
+        if tabs.size > Runner::BATCH_SUBTAB_CAP
+          @host.status("#{tabs.size} sub-tabs marked — a batch send is capped at #{Runner::BATCH_SUBTAB_CAP}")
+          return
+        end
+        @host.confirm("SEND REPEATERS", "Send #{marked_subtab_phrase(tabs.size)}?\nEach goes out on its own connection.",
+          confirm_label: "send", danger: false) { send_repeater_tabs(tabs) }
+        return
+      end
+      return unless tab = current_repeater_tab
+      send_repeater_tab(tab)
+    end
+
+    # The batch arm of ^R. Continue-and-report, like every other batch here: a tab already in
+    # flight or refused by scope is counted and the rest still go. The per-send status lines
+    # the drain writes then take over — this one says what was actually started.
+    private def send_repeater_tabs(tabs : Array(RepeaterTab)) : Nil
+      sent = 0
+      tabs.each { |t| sent += 1 if send_repeater_tab(t, quiet: true) }
+      @host.status(sent == tabs.size ? "sending#{sending_as} → #{sent} sub-tabs…" : "sending#{sending_as} → #{sent} of #{tabs.size} sub-tabs (the rest were in flight or refused)", :busy)
+    end
+
+    # Send ONE session. Returns whether a round-trip was actually started, so the batch can
+    # count. `quiet` suppresses the per-send "sending…" line, which in a batch would be N
+    # toasts of which only the last survives.
+    private def send_repeater_tab(tab : RepeaterTab, quiet : Bool = false) : Bool
+      return false unless (view = tab.view).loaded?
       view.commit_chain_pane                        # flush an in-progress CHAIN-pane edit so ^R can't send stale bytes (matches the SEND-chip click)
       view.sync_host_to_target_once                 # ^R defers past exit_target_insert!, so mirror a fresh ^N tab's target into Host here too (one-shot)
       view.downgrade_h2_request_lines(group: false) # a request line pasted from an h2 view can't ride this h1 socket (origins answer 400)
       if view.inflight?                             # one outstanding round-trip per view — don't pile up fibers on ^R mashing
-        @host.status("repeater already in flight…")
-        return
+        @host.status("repeater already in flight…") unless quiet
+        return false
       end
       if view.ws_mode?
-        ws_repeater_send(view)
-        return
+        ws_repeater_send(tab)
+        return true
       end
       results = @repeater_results
       # A §…§ marker's `¦chain` that can't run refuses the send here rather than putting the
@@ -1821,18 +1976,18 @@ module Gori::Tui
         wire = view.request_bytes
       rescue ex : Fuzz::ChainError
         @host.status("repeater: #{ex.message}")
-        return
+        return false
       end
-      return unless plan = repeater_plan(view, [wire], http2: view.http2?)
-      save_current_repeater # persist the request we're about to send (before it goes inflight)
+      return false unless plan = repeater_plan(view, [wire], http2: view.http2?)
+      save_repeater_tab(tab) # persist the request we're about to send (before it goes inflight)
       if reason = plan.refusal
         apply_refusal { view.apply(Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, reason)) }
         @host.status("repeater: #{reason}")
-        return
+        return false
       end
       view.inflight = true
       sni = plan.sni # custom TLS SNI host (nil → present the dialed host)
-      @host.status("sending#{sending_as} → #{plan.host}:#{plan.port}#{sni ? " (SNI #{sni})" : ""}…", :busy)
+      @host.status("sending#{sending_as} → #{plan.host}:#{plan.port}#{sni ? " (SNI #{sni})" : ""}…", :busy) unless quiet
       # The bytes the socket gets, taken ONCE and sent as-is. `view.request_bytes` above is the
       # assembled DRAFT; this is the message, with the send seam's two passes applied (the
       # `$NAME` binding pass and the active session slot's header overlay). The History
@@ -1848,6 +2003,17 @@ module Gori::Tui
       # Off the UI fiber: a round-trip can block up to 30s. The fiber touches only these
       # captured locals + the inflight flag — and hands the Result back through the
       # channel; the run loop applies it (see #drain_results).
+      launch_send_fiber(view, plan, sent_wire, results, record_store, record_ref, sent_at)
+      true
+    end
+
+    # The flight half of a send, split from the decide half above so each reads as one
+    # thing. Every argument is a captured local: the fiber must never read a controller ivar
+    # (the same rule the minimize and ws fibers follow), and `results` in particular is
+    # passed in so a channel replaced by a project switch cannot be picked up mid-flight.
+    private def launch_send_fiber(view : RepeaterView, plan : Repeater::Plan, sent_wire : Bytes,
+                                  results : Channel({RepeaterView, Repeater::Result, String?}),
+                                  record_store : Store?, record_ref : String?, sent_at : Int64) : Nil
       started = Time.instant
       spawn(name: "gori-repeater") do
         result = begin
@@ -1869,7 +2035,9 @@ module Gori::Tui
           RepeaterController.record_send(st, plan, result, sent_at, sent_wire, record_ref)
         end
         # Non-blocking hand-off: if the user already left the project the channel is
-        # orphaned, so drop the late result instead of blocking this fiber forever.
+        # orphaned, so drop the late result instead of blocking this fiber forever. Sized to
+        # the largest batch one ^R can start (see the channel's construction), so a full
+        # buffer can only mean that, never backpressure from a marked-set send.
         select
         when results.send({view, result, record_note})
         else
@@ -1994,7 +2162,8 @@ module Gori::Tui
     # WebSocket repeater: re-do the handshake and fire the editor's messages off the UI
     # fiber (a round-trip can block on the drain idle-timeout), handing the transcript
     # back through @ws_results. Mirrors repeater_send's fiber/inflight discipline.
-    private def ws_repeater_send(view : RepeaterView) : Nil
+    private def ws_repeater_send(tab : RepeaterTab) : Nil
+      view = tab.view
       results = @ws_results
       return unless plan = repeater_plan(view, [view.ws_upgrade_bytes])
       if reason = plan.refusal
@@ -2005,6 +2174,13 @@ module Gori::Tui
       end
       messages = view.ws_out_messages
       keep_key = view.ws_keep_key?
+      # Persist the edited handshake + frames BEFORE the send goes inflight, exactly as the
+      # HTTP arm does: the drain writes this send's response onto the row afterward
+      # (`update_repeater_response`), so without a save first the row keeps the OLD handshake
+      # and frames beside the NEW response — the mismatched pair `get_repeater` /
+      # `gori run repeater send <id>` then read back until some later save-on-leave, and a
+      # crash before that loses the edit.
+      save_repeater_tab(tab)
       view.inflight = true
       # WebSocket sends are not written to History, and the CLI draws the same line
       # (`--record-history is HTTP-only`): a socket's evidence is its frame transcript, which
@@ -2113,6 +2289,27 @@ module Gori::Tui
     # holds for the SUBSTITUTION. It does not hold for the REPORT: `✓ sent → 200` with no
     # further word is gori claiming a clean send of bytes whose `$CTOK` the tab's OWN binding
     # hint shows a value for. So the expansion stays suppressed and the fact is stated.
+    # The WebSocket twin, and it exists because the HTTP half of this sentence was the only
+    # half wired. `Sender#send_ws` used to expand `$NAME` in the handshake UNCONDITIONALLY —
+    # it carried its own copy of `wire`'s two passes — so an evidence WS tab was substituting
+    # where the very same tab's HTTP send had stopped. Routing it through `wire` closed that,
+    # and closing it makes this pane owe the operator the same sentence: `✓ ws sent: 3
+    # received` alone is gori claiming a clean exchange over bytes whose `$CTOK` was withheld.
+    #
+    # Scans the HANDSHAKE and the out-frames together because on an evidence tab both are
+    # withheld — `ws_out_messages` stamps every frame with the tab's own `@evidence`, so one
+    # boolean is the honest answer here (the per-FRAME provenance the Sender reads matters
+    # where the two populations mix, which in this pane they do not).
+    private def ws_evidence_literal_note(view : RepeaterView) : String
+      text = String.build do |io|
+        io << view.request_text << '\n'
+        view.ws_out_messages_raw.each { |m| io.write(m.payload); io << '\n' }
+      end
+      names = RepeaterController.literal_bindings(view.evidence?, text)
+      return "" if names.empty?
+      " · #{Env.token_list(names)} sent literally (evidence tab — not substituted)"
+    end
+
     private def evidence_literal_note(view : RepeaterView) : String
       names = RepeaterController.literal_bindings(view.evidence?, view.request_text)
       return "" if names.empty?
@@ -2250,6 +2447,16 @@ module Gori::Tui
     # every path that leaves the editor — like Notes save-on-leave.
     def save_current_repeater : Nil
       return unless tab = current_repeater_tab
+      save_repeater_tab(tab)
+    end
+
+    # Persist ONE session's request side. Parametrized rather than reading the active tab,
+    # because a bulk `^R` sends several: `repeater_send` saves the tab it is about to put on
+    # the wire, and `drain_results` later writes that tab's response onto the same row. With
+    # a current-tab-only save the batch wrote four responses onto rows still holding their
+    # PREVIOUS request bytes — a stored pair that never happened, and one every other surface
+    # reads back as fact.
+    def save_repeater_tab(tab : RepeaterTab) : Nil
       return unless (id = tab.db_id) && tab.view.dirty?
       v = tab.view
       # `ws_content?`, NOT `ws_mode?`: this asks whether there are frames to write, and a tab
@@ -2260,9 +2467,14 @@ module Gori::Tui
         # Persist the RAW handshake text (request_text = the editor's `$KEY` tokens, in the
         # line endings the editor holds), NOT ws_upgrade_bytes (env-expanded): baking the
         # expanded form in would write secrets to the DB and defeat the reconcile guard.
-        @host.session.store.update_repeater(id, v.target, v.request_text.to_slice, v.http2?, v.auto_content_length?,
-          v.sni_override, ws_keep_key: v.ws_keep_key?, ws_http_only: v.ws_http_only?,
-          tls_preset: v.tls_preset)
+        # Checked like the frames write below: a rolled-back request UPDATE that then marks the
+        # tab clean lets reconcile repaint the stale row over the edit.
+        unless @host.session.store.update_repeater(id, v.target, v.request_text.to_slice, v.http2?, v.auto_content_length?,
+                 v.sni_override, ws_keep_key: v.ws_keep_key?, ws_http_only: v.ws_http_only?,
+                 tls_preset: v.tls_preset)
+          @host.status("request NOT saved (project busy) — leaving the tab dirty so the next save retries")
+          return
+        end
         # Raw message lines too — the store masks secrets; env tokens re-expand on send.
         # Checked, and BEFORE `ws_out_persisted`/`clear_dirty`: that write opens with
         # `DELETE FROM ws_messages`, so a rolled-back batch (a busy store, a live capture
@@ -2284,9 +2496,14 @@ module Gori::Tui
         # is the third column this hazard now covers. (`ws_http_only` is genuinely false on this
         # branch — the view forces it false for a non-upgrade request — so it is passed for
         # symmetry with the branch above rather than to preserve anything.)
-        @host.session.store.update_repeater(id, v.target, v.request_text.to_slice, v.http2?, v.auto_content_length?,
-          v.sni_override, ws_keep_key: v.ws_keep_key?, ws_http_only: v.ws_http_only?,
-          tls_preset: v.tls_preset)
+        # Checked before the shared `clear_dirty` below, for the reason `persist_repeater_tab`
+        # states: a discarded rollback marks the tab clean and reconcile repaints the old row.
+        unless @host.session.store.update_repeater(id, v.target, v.request_text.to_slice, v.http2?, v.auto_content_length?,
+                 v.sni_override, ws_keep_key: v.ws_keep_key?, ws_http_only: v.ws_http_only?,
+                 tls_preset: v.tls_preset)
+          @host.status("request NOT saved (project busy) — leaving the tab dirty so the next save retries")
+          return
+        end
       end
       v.clear_dirty
     end

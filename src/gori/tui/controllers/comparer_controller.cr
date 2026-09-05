@@ -82,27 +82,80 @@ module Gori::Tui
     end
 
     # Close active session. Last session is reset to blank (always keep ≥1).
+    # ^W closes the MARKED sub-tabs when the strip carries marks, the active one otherwise
+    # (`target_subtab_indices` — the one target rule).
     def comparer_close : Nil
+      if refs = batch_subtab_refs
+        @host.confirm("CLOSE COMPARISONS", "Close #{marked_subtab_phrase(refs.size)}?\nEach pair of slots is discarded.",
+          confirm_label: "close", danger: true) { close_marked_sessions(refs) }
+        return
+      end
+      close_at(@idx)
+      @host.status(@sessions.size == 1 ? "comparison cleared" : "comparison closed (#{@sessions.size} open)")
+    end
+
+    private def close_marked_sessions(refs : Array(SubtabRef)) : Nil
+      @host.status(close_marked_subtabs(refs))
+      @host.resolve_subtab_focus
+    end
+
+    # Nothing here is persisted, so a close can never leave a saved session behind.
+    protected def close_subtab_at(idx : Int32) : Bool
+      close_at(idx)
+      false
+    end
+
+    # Close sub-tab `idx`, keeping at least one comparison. The last one is RESET IN PLACE
+    # rather than replaced — which is exactly why the batch driver hands its marks back
+    # explicitly instead of leaning on `SubtabMarks#retain`: this view object survives the
+    # close, so "still open" and "still marked" would otherwise both stay true.
+    private def close_at(idx : Int32) : Nil
+      return if idx < 0 || idx >= @sessions.size
       if @sessions.size <= 1
         @sessions[0].reset!
         @idx = 0
-        @host.status("comparison cleared")
       else
-        @sessions.delete_at(@idx)
+        @sessions.delete_at(idx)
+        # Closing a session to the LEFT slides the active one down; a bare clamp would read
+        # that as "stay put" and land the operator on its neighbour.
+        @idx -= 1 if idx < @idx
         @idx = @idx.clamp(0, @sessions.size - 1)
-        @host.status("comparison closed (#{@sessions.size} open)")
       end
     end
 
+    # Duplicates the MARKED sub-tabs when the strip carries marks, the active one otherwise
+    # (`target_subtab_indices` — the one target rule).
     def comparer_duplicate : Nil
-      @sessions << view.duplicate
-      @idx = @sessions.size - 1
+      if refs = batch_subtab_refs
+        msg = duplicate_marked_subtabs(refs, "comparison") { |i| duplicate_at(i) }
+        unless msg
+          @host.status("#{refs.size} sub-tabs marked — duplicate is capped at #{Runner::BATCH_SUBTAB_CAP}")
+          return
+        end
+        @host.request_focus(:body)
+        @host.status("#{msg} (#{@sessions.size} open)")
+        return
+      end
+      duplicate_at(@idx)
       @host.request_focus(:body)
       @host.status("duplicated comparison (#{@sessions.size} open)")
     end
 
+    # Clone sub-tab `idx` onto the end of the strip. Toast-free — the arms above say it.
+    private def duplicate_at(idx : Int32) : Nil
+      return unless src = @sessions[idx]?
+      @sessions << src.duplicate
+      @idx = @sessions.size - 1
+    end
+
     def view_at(idx : Int32) : ComparerView?
       (0 <= idx < @sessions.size) ? @sessions[idx] : nil
+    end
+
+    # The object that IS sub-tab `idx`, for the strip's mark set (#683). The view, not the
+    # index: a reconcile can reorder or drop chips under a standing mark.
+    def subtab_ref(idx : Int32) : SubtabRef?
+      view_at(idx)
     end
 
     def apply_rename(v : ComparerView, name : String) : Nil
@@ -118,7 +171,7 @@ module Gori::Tui
       labels = subtab_strip_shown? ? subtab_labels : nil
       shell = BodyChrome.shell_focused(focus, multi_pane: false)
       subtabs_focused = focus == :subtabs
-      @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused, labels, @idx, @subtab_start, subtab_hidden, strip_divider: subtab_strip_divider?, find: subtab_find_shown?, find_lit: @host.subtab_find_focused?) do |content|
+      @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused, labels, @idx, @subtab_start, subtab_hidden, strip_divider: subtab_strip_divider?, find: subtab_find_shown?, find_lit: @host.subtab_find_focused?, marked: marked_chip_set) do |content|
         render_with_filter(screen, content, subtabs_focused) do |body|
           view.render(screen, body, focused: body_focused)
         end
@@ -129,16 +182,26 @@ module Gori::Tui
     def handle_body_key(ev : Termisu::Event::Key) : Bool
       key = ev.key
       return true if handle_body_hscroll(ev)
+      # ^N / ^W from the body, as the Decoder/JWT/Cookie bodies take them — they answered
+      # only from the sub-tab strip here.
+      if ev.ctrl? && key.lower_n?
+        comparer_new
+        return true
+      elsif ev.ctrl? && key.lower_w?
+        comparer_close # confirm-gated in the controller; the shell re-seats focus after
+        @host.resolve_subtab_focus
+        return true
+      end
       case
-      when key.up?, key.lower_k?
+      when nav_up?(ev)
         # The cursor moves and drags the viewport with it; ⇧ grows a row selection. At the top
         # the ↑ still leaves for the sub-tab strip, as it always did.
         view.at_top? ? @host.request_focus(:subtabs) : view.move_rows(-1, ev.shift?)
         true
-      when key.down?, key.lower_j?
+      when nav_down?(ev)
         view.move_rows(1, ev.shift?)
         true
-      when key.left?, key.right?, key.lower_h?, key.lower_l?
+      when nav_left?(ev), nav_right?(ev)
         view.toggle_pane
         true
       when key.escape?
@@ -169,6 +232,15 @@ module Gori::Tui
     # gesture, not a cursor one. ↑/↓ are the cursor.
     def handle_wheel(step : Int32) : Bool
       view.wheel(step)
+      true
+    end
+
+    # Pointer-aware: only the diff BODY scrolls; a notch on the chip row / header is inert
+    # rather than scrolling a body the pointer is not over. Same rects `handle_click` uses.
+    def handle_wheel_at(step : Int32, mx : Int32, my : Int32, rect : Rect) : Bool
+      inner = body_rect_below_filter(rect)
+      body = view.body_rect(inner)
+      view.wheel(step) if body.contains?(mx, my) || !inner.contains?(mx, my)
       true
     end
 
@@ -233,13 +305,9 @@ module Gori::Tui
     end
 
     def body_hint(focus : Symbol) : String
-      reg = @host.session.registry
-      a = Hotkeys.binding_label(reg, "comparer.pick-a", "a")
-      b = Hotkeys.binding_label(reg, "comparer.pick-b", "b")
-      s = Hotkeys.binding_label(reg, "comparer.swap", "s")
-      n = Hotkeys.binding_label(reg, "comparer.next-change", "n")
-      f = Hotkeys.binding_label(reg, "comparer.toggle-fold", "f")
-      "←/→ req|res · ↑/↓ row · #{n}/⇧#{n} change · #{f} fold · y copy · ⇧←/→ h-scroll · #{a}/#{b} pick · #{s} swap · space cmds"
+      # prev-change is its OWN verb (⇧N), not "shift + whatever next-change is bound to": the
+      # old `⇧#{n}` spelling followed a rebind of `n` to a key ⇧ never reached.
+      keys("←/→ req|res · ↑/↓ row · {comparer.next-change}/{comparer.prev-change} change · {comparer.toggle-fold} fold · {comparer.copy} copy · ⇧←/→ h-scroll · {comparer.pick-a}/{comparer.pick-b} pick · {comparer.swap} swap · space cmds")
     end
   end
 end

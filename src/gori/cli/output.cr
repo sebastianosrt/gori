@@ -266,7 +266,7 @@ module Gori
         loc = term_safe(flow_location(row))
         dur = row.duration_us.try { |us| " #{human_us(us)}" } || ""
         String.build do |io|
-          io << '#' << row.id.to_s.ljust(6)
+          io << '#' << pad_cell(row.id.to_s, 6) # a 6+-digit id keeps its separator (see pad_cell)
           io << pad_cell(term_safe(row.method), 7)
           io << term_safe(row.scheme).ljust(6)
           io << loc
@@ -474,11 +474,16 @@ module Gori
       # jwt_* tools stay byte-identical; the text formatter below is CLI-only.
 
       # "[none]     alg=none            unsigned; accepted if …"
+      # The `✓` marks the row that is no longer a probe: its dictionary key reproduces the
+      # INPUT token's own signature, so the server's HMAC key is that one (`Jwt::Attack#verified`).
+      # In the category column, where a reader scanning the left edge for a family meets it,
+      # and ASCII-safe on a terminal that cannot draw it is not a concern the rest of this file
+      # has either.
       def self.jwt_attack_text(a : Jwt::Attack) : String
         String.build do |io|
           io << "[" << a.category << "]"
           io << " " * {12 - a.category.size - 2, 1}.max
-          io << a.name.ljust(24) << "  " << a.note << "\n"
+          io << a.name.ljust(24) << "  " << (a.verified ? "✓ " : "") << a.note << "\n"
           io << "  " << a.token
         end
       end

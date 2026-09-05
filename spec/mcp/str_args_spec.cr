@@ -22,21 +22,8 @@ require "socket"
 # than vanish"), `ws_out_messages_arg` (`compact_map` used to store 2 of 4 frames) — and
 # the string readers were what was left.
 
-private def with_store(&)
-  path = File.tempname("gori-mcp-strs", ".db")
-  store = Gori::Store.open(path)
-  begin
-    yield store
-  ensure
-    store.close
-    File.delete?(path)
-    File.delete?("#{path}-wal")
-    File.delete?("#{path}-shm")
-  end
-end
-
 private def str_tools(store) : Gori::MCP::Tools
-  Gori::MCP::Tools.new(store, allow_actions: true, verify_upstream: false)
+  tools_for(store)
 end
 
 private def str_json(tools : Gori::MCP::Tools, name : String, args : String) : JSON::Any
@@ -150,6 +137,21 @@ describe "MCP string arguments — the wire fields of send_request" do
       r = tools.call("send_request", JSON.parse(%({"url":8080,"allow_unscoped":true})))
       r.is_error.should be_true
       r.text.should contain("'url'")
+    end
+  end
+
+  it "returns a clean INVALID for an over-long port instead of an internal overflow" do
+    with_store do |store|
+      tools = str_tools(store)
+      # `URI.parse` overflows Int32 on a port this long — an `OverflowError`, not a
+      # `URI::Error`, so it escaped the builder's rescue and reached the agent as the generic
+      # INTERNAL "tool error: Arithmetic overflow".
+      r = tools.call("send_request", JSON.parse(
+        %({"url":"http://127.0.0.1:99999999999/","allow_unscoped":true})))
+      r.is_error.should be_true
+      r.text.should contain("invalid url")
+      r.text.should contain("port is out of range")
+      r.text.should_not contain("Arithmetic overflow") # not the raw overflow, and not INTERNAL
     end
   end
 

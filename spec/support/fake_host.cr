@@ -44,6 +44,9 @@ class FakeHost
   def focus_body : Nil
   end
 
+  def resolve_subtab_focus : Nil
+  end
+
   def switch_tab(tab : Symbol) : Nil
   end
 
@@ -54,6 +57,12 @@ class FakeHost
   end
 
   def open_help_query(surface : Symbol) : Nil
+  end
+
+  getter sitemap_opens = 0
+
+  def sitemap_open_flow : Nil
+    @sitemap_opens += 1
   end
 
   def open_space_menu : Nil

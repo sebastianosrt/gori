@@ -73,6 +73,34 @@ module Gori::Repeater
     # token): the TUI editor's hex / gRPC / decode / §…§ modes each own their byte semantics,
     # and MCP's `RequestBuilder` expands while it builds.
     property? expand_request : Bool
+    # Resolve a DECLARED session binding (`$NAME` → the value an extract rule observed) at the
+    # SEND seam, `Repeater::Sender#wire`. Default ON, because that seam is where `Plan` says a
+    # declared binding belongs: `expand_requests` below deliberately leaves one for it so that
+    # a Repeater tab carrying `Authorization: Bearer $SESSION` picks up the LIVE identity on
+    # every send rather than freezing whichever value was held when the tab was built.
+    #
+    # A surface sets it OFF for `--verbatim` / `verbatim:true`, and that flag is the reason
+    # this field exists. `verbatim` promises "no `$VAR` expansion"; it delivered that for
+    # project env vars — `expand_request: false` above switches the BUILDER pass off — and the
+    # send seam substituted a declared binding anyway, so a stored `GET /api?$TOKEN=1` reached
+    # the origin as `GET /api?SECRETTOKEN123=1` under the flag that says it will not. The two
+    # intentions genuinely collide (a tab's `$SESSION` wants the live value; verbatim says
+    # these bytes are the message) and the collision was being resolved silently in favour of
+    # the binding, in the direction that puts a real credential in a position the operator
+    # chose as a PAYLOAD, and in the target's access log.
+    #
+    # A SEPARATE field rather than `evidence: verbatim`, which reaches the same seam and would
+    # have worked: `evidence?` is PROVENANCE, and a `--verbatim` send is the operator's own
+    # draft — using the provenance word for literalness would make every later reader of
+    # `evidence?` wrong about who wrote the bytes. `Sender` ANDs the two (`resolve_bindings?`);
+    # nothing else has to know there are two.
+    #
+    # It does NOT switch off the session-slot overlay, which answers a different question —
+    # see `Sender#wire`. It is also INERT on the field-native h2 path, which forces it false
+    # whatever a surface passes (`build_field_native` says why), the way that path already
+    # drops `preserve_field_case`, `evidence` and `reframe_grpc`: a field list is the message
+    # and nothing there expands.
+    property? expand_bindings : Bool
     # Recompute Content-Length over the (possibly expanded) body. Off keeps a deliberately
     # hand-set CL — `repeater create --no-auto-cl`, and `gori run repeater -H "Content-Length: N"`,
     # both of which exist for CL-mismatch / request-smuggling testing.
@@ -83,7 +111,9 @@ module Gori::Repeater
     property target : String?
     # The origin the seeding flow or saved session implies, when there is one.
     property default_target : String?
-    # Dial over HTTP/2. Ignored on the WebSocket path (`WsEngine` is h1-only by RFC 6455).
+    # Dial over HTTP/2. Ignored on the WebSocket path: `WsEngine` reads the transport off the
+    # handshake bytes themselves (an `Upgrade:` head is h1, an extended CONNECT is h2), because
+    # a flag beside the bytes could disagree with them.
     property? http2 : Bool
     # TLS SNI override, BEFORE `Env.expand` — the builder owns the expansion so it happens
     # on every surface (MCP's flow path and the TUI both used to skip it).
@@ -182,6 +212,7 @@ module Gori::Repeater
     def initialize(@requests : Array(Bytes) = [] of Bytes,
                    *,
                    @expand_request : Bool = true,
+                   @expand_bindings : Bool = true,
                    @auto_content_length : Bool = true,
                    @resync_cl_after_expansion : Bool = false,
                    @evidence : Bool = false,
@@ -227,8 +258,9 @@ module Gori::Repeater
     getter host : String
     getter port : Int32
     getter? http2 : Bool
-    # The request is an RFC 6455 upgrade, so it must go out through `send_ws` (a plain
-    # one-shot would re-issue the handshake and report the 101 having exchanged no frames).
+    # The request is a WebSocket handshake — an RFC 6455 upgrade or an RFC 8441 extended
+    # CONNECT — so it must go out through `send_ws` (a plain one-shot would re-issue the
+    # handshake and report its 101/2xx having exchanged no frames).
     getter? websocket : Bool
     # The expanded SNI host, or nil to present the dialed host.
     getter sni : String?
@@ -332,8 +364,9 @@ module Gori::Repeater
     #
     # Reusing the SAME `Sender` is the point: the scope verdict was taken against this
     # origin, and a rewrite must not be able to move the dial target out from under it.
-    # `websocket?` IS re-derived, because a rule that adds or strips `Upgrade: websocket`
-    # would otherwise leave the plan classified against bytes it no longer carries.
+    # `websocket?` IS re-derived, because a rule that adds or strips `Upgrade: websocket` (or
+    # the `X-Gori-Protocol` marker an RFC 8441 handshake carries) would otherwise leave the
+    # plan classified against bytes it no longer carries.
     #
     # EVERY OTHER FIELD IS COPIED, and that is a rule rather than a list: this is a
     # copy-with-new-bytes, so a field the copy forgets is one the SEND still applies (it
@@ -353,7 +386,7 @@ module Gori::Repeater
       raise PlanError.new(PlanError::Reason::NoRequest, "no request to send") if requests.empty?
       Plan.new(sender: @sender, requests: requests, scheme: @scheme, host: @host,
         port: @port, http2: @http2,
-        websocket: WsEngine.upgrade_request?(String.new(requests.first)), sni: @sni,
+        websocket: WsEngine.replayable?(String.new(requests.first)), sni: @sni,
         preserve_field_case: @preserve_field_case, h2_fields: @h2_fields, h2_body: @h2_body,
         reframe_grpc: @reframe_grpc, tls_preset: @tls_preset)
     end
@@ -381,10 +414,15 @@ module Gori::Repeater
       draft = !options.evidence?
       wires = expand_requests(options, draft)
 
-      # Detect the upgrade on the FINAL wire, not the stored text: the bytes that decide
+      # Detect the handshake on the FINAL wire, not the stored text: the bytes that decide
       # which engine runs must be the bytes that go out, or a `$KEY` expanding into the
       # `Upgrade: websocket` header would pick the h1 engine and silently exchange nothing.
-      websocket = WsEngine.upgrade_request?(String.new(wires.first))
+      #
+      # `replayable?` and not `upgrade_request?`: an RFC 8441 extended CONNECT (#733) is the
+      # OTHER handshake for the same protocol, and `WsEngine.send` reads the transport off
+      # these same bytes. So this stays one question — "must this go out through `send_ws`?" —
+      # and the engine, not the plan, decides how the socket is opened.
+      websocket = WsEngine.replayable?(String.new(wires.first))
       # A handshake carries no body, and all three surfaces have always sent it verbatim —
       # `resync_content_length` never touches a bodyless request either way (no ADD, and an
       # existing header still gets rewritten), but a captured upgrade that happened to carry
@@ -415,7 +453,13 @@ module Gori::Repeater
       # `raw`, and `gori run repeater send --verbatim`. Every other normalization on this path
       # is already behind it, and a version line is the operator's to get wrong when they asked
       # for verbatim.
-      wires = wires.map { |b| FlowRequest.downgrade_request_line(b) } if options.expand_request? && !options.http2?
+      # …and NOT on a WebSocket handshake, whichever transport it belongs to. `downgrade_version_line`
+      # exists to correct an `HTTP/2` line about to ride an h1 socket, and a handshake never
+      # does: an RFC 8441 extended CONNECT reads `CONNECT /chat HTTP/2` and IS sent over h2, so
+      # rewriting its version token would edit the capture's own request line on the way to a
+      # send that never looks at it. A no-op for an RFC 6455 upgrade head either way (only the
+      # h2/h3 spellings are touched), which is why the clause can be added without changing it.
+      wires = wires.map { |b| FlowRequest.downgrade_request_line(b) } if options.expand_request? && !options.http2? && !websocket
 
       unless scheme.in?("http", "https")
         raise PlanError.new(PlanError::Reason::UnsupportedScheme,
@@ -439,11 +483,19 @@ module Gori::Repeater
       # `Env.expand_bindings` at the send seam — and that seam ran unconditionally, so
       # everything `evidence?` turns off here was turned back on one layer down for any
       # extract rule whose name collides with a token in the capture. See `Sender#evidence?`.
+      #
+      # `expand_bindings` rides down for the same reason with a different word on it: a
+      # `--verbatim` send is a DRAFT (so `evidence?` is rightly false) whose operator said the
+      # bytes are the message, and the seam substituted into it anyway. Both are `PlanOptions`
+      # fields and both are read HERE rather than at each surface, because that is the drift
+      # this builder exists to end — the layering note on `expand_requests` records the two
+      # headless surfaces disagreeing about exactly this flag once already.
       tls_preset = resolve_tls_preset(options)
       sender = Sender.new(outbound, scheme: scheme, host: host, port: port,
         verify: options.verify?, http2: options.http2?, sni: sni,
         timeout: options.timeout, overrides: options.overrides,
         preserve_field_case: options.preserve_field_case?, evidence: options.evidence?,
+        expand_bindings: options.expand_bindings?,
         reframe_grpc: options.reframe_grpc?, tls_preset: tls_preset)
       new(sender: sender, requests: wires, scheme: scheme, host: host, port: port,
         http2: options.http2?, websocket: websocket, sni: sni,
@@ -454,6 +506,11 @@ module Gori::Repeater
     # The request wires with `$KEY` expansion applied, or the originals when the surface says
     # it already expanded (`expand_request: false` — MCP's pre-expanded `raw`, the TUI's byte
     # modes, `--verbatim`) — or when the bytes are EVIDENCE, which is never expanded at all.
+    #
+    # This is the PROJECT ENV VAR pass only. A DECLARED session binding is deliberately left
+    # for `Env.expand_bindings` at the send seam (see the sentence below), which means turning
+    # THIS off is not by itself a promise of literal bytes: `--verbatim` sets
+    # `expand_bindings: false` alongside it to make the promise reach that seam too.
     #
     # `expand_wire` is the DRAFT pass and there is no evidence pass: a stored head is full of
     # `$` nobody typed (OData `$filter`/`$top`, Mongo `$where`, `$IFS`, `$user.name`), and
@@ -487,8 +544,13 @@ module Gori::Repeater
       options.sni.try { |s| refuse_unresolved(Env.unresolved(s, deferred: nil)) }
       sni = options.sni.try { |s| Env.expand(s).presence }
       tls_preset = resolve_tls_preset(options)
+      # `expand_bindings: false` UNCONDITIONALLY, and not `options.expand_bindings?`: nothing on
+      # the field-native path expands, so the only thing the flag could still reach is the scope
+      # gate's view of the synthetic request line — which is built from the operator's `:path`
+      # and can hold a `$NAME` like any other. Expanding there would take the verdict against a
+      # URL this send cannot produce. See `Sender#send_fields`.
       sender = Sender.new(outbound, scheme: scheme, host: host, port: port,
-        verify: options.verify?, http2: true, sni: sni,
+        verify: options.verify?, http2: true, sni: sni, expand_bindings: false,
         timeout: options.timeout, overrides: options.overrides, tls_preset: tls_preset)
       new(sender: sender, requests: [H2Engine.field_scope_line(fields)], scheme: scheme,
         host: host, port: port, http2: true, websocket: false, sni: sni,

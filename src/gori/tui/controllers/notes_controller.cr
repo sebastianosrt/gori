@@ -36,7 +36,7 @@ module Gori::Tui
       labels = subtab_strip_shown? ? @notes.subtab_labels : nil
       shell = BodyChrome.shell_focused(focus, multi_pane: false)
       subtabs_focused = focus == :subtabs
-      @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused, labels, @notes.current_index, @subtab_start, subtab_hidden, strip_divider: subtab_strip_divider?, find: subtab_find_shown?, find_lit: @host.subtab_find_focused?) do |content|
+      @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused, labels, @notes.current_index, @subtab_start, subtab_hidden, strip_divider: subtab_strip_divider?, find: subtab_find_shown?, find_lit: @host.subtab_find_focused?, marked: marked_chip_set) do |content|
         render_with_filter(screen, content, subtabs_focused) do |body|
           editor_rect = body
           if links_row_shown?(body)
@@ -119,14 +119,14 @@ module Gori::Tui
       case
       when key.enter? then @notes.enter_insert!
       when c == 'i'   then @notes.enter_insert!
-      when key.up?
+      when nav_up?(ev)
         if @notes.at_top?
           save_notes
           @host.request_focus(:subtabs)
         else
           @notes.read_move(-1, 0, selecting: selecting)
         end
-      when key.down?                  then @notes.read_move(1, 0, selecting: selecting)
+      when nav_down?(ev)              then @notes.read_move(1, 0, selecting: selecting)
       when key.left?                  then @notes.read_move(0, -1, selecting: selecting)
       when key.right?                 then @notes.read_move(0, 1, selecting: selecting)
       when @notes.read_motion_key(ev) then nil # Page keys + ⇧Home/⇧End — the shared editor set
@@ -213,6 +213,24 @@ module Gori::Tui
       true
     end
 
+    # --- bracketed paste, in bulk (see TabController#accepts_bulk_paste?) ---
+    # The note editor in INSERT mode — the one state with a caret to paste at. Notes was the
+    # one multi-line editor still taking a paste as N keystrokes (Repeater and Fuzzer opted in
+    # when the bulk path landed), and it is the tab a whole response body or writeup gets
+    # pasted INTO, so a 200-line paste cost 200 undo snapshots, 200 highlight rebuilds and
+    # 200 frames, and `⌃Z` then took it back one character at a time. No content-level
+    # refusal here, unlike those two: a note has no `§` marker to guard, so whatever the
+    # clipboard holds is legal text.
+    def accepts_bulk_paste? : Bool
+      @notes.insert_mode?
+    end
+
+    def paste_text(text : String) : Bool
+      return false unless @notes.paste(text)
+      report_replaced(@notes.last_replaced) # a paste over a selection REPLACES it, like a typed char
+      true
+    end
+
     def set_preedit(text : String) : Bool
       return false unless @notes.insert_mode?
       @notes.set_preedit(text)
@@ -255,6 +273,14 @@ module Gori::Tui
 
     def subtab_index : Int32
       @notes.current_index
+    end
+
+    # The object that IS sub-tab `idx`, for the strip's mark set (#683). Notes has no
+    # `view_at` — one NotesView holds every note — so the `Note` itself is the handle;
+    # `soft_merge_from` keeps the same object across a peer reconcile, which is what a
+    # mark needs.
+    def subtab_ref(idx : Int32) : SubtabRef?
+      @notes.note_at(idx)
     end
 
     # Show the strip from the FIRST note (not ≥2), like Repeater/Fuzzer: a lone note
@@ -398,20 +424,40 @@ module Gori::Tui
     end
 
     # Content-only clone of the active note (new id; entity_links not copied).
+    # Duplicates the MARKED sub-tabs when the strip carries marks, the active one otherwise
+    # (`target_subtab_indices` — the one target rule).
     def notes_duplicate : Nil
       # The clone happens either way — it is in-memory, and the source note keeps its text and
       # its dirty flag — but a "duplicated note" line would paint over the refusal `save_notes`
       # just posted, which is the one thing the operator needs to see.
       saved = save_notes
-      @notes.duplicate_current
+      msg = "duplicated note"
+      if refs = batch_subtab_refs
+        batch = duplicate_marked_subtabs(refs, "note") { |i| @notes.duplicate_at(i) }
+        unless batch
+          @host.status("#{refs.size} sub-tabs marked — duplicate is capped at #{Runner::BATCH_SUBTAB_CAP}")
+          return
+        end
+        msg = batch
+      else
+        @notes.duplicate_current
+      end
       refresh_link_preview
       @host.focus_body
-      @host.status("duplicated note (#{@notes.count} open)") if saved
+      @host.status("#{msg} (#{@notes.count} open)") if saved
     end
 
     # Close the current note (^W) — after a confirm, since the text is discarded. A
     # blank note has nothing to lose, so it closes immediately. NotesView keeps ≥1.
+    # ^W closes the MARKED sub-tabs when the strip carries marks, the active one otherwise
+    # (`target_subtab_indices` — the one target rule). A lone blank note still closes without
+    # asking; a batch always asks, because it can discard notes that are not on screen.
     def notes_close : Nil
+      if refs = batch_subtab_refs
+        @host.confirm("CLOSE NOTES", "Close #{marked_subtab_phrase(refs.size)}?\nTheir text will be discarded.",
+          confirm_label: "close", danger: true) { close_marked_notes(refs) }
+        return
+      end
       if @notes.current_blank?
         do_notes_close
         return
@@ -420,12 +466,32 @@ module Gori::Tui
         confirm_label: "close", danger: true) { do_notes_close }
     end
 
+    private def close_marked_notes(refs : Array(SubtabRef)) : Nil
+      msg = close_marked_subtabs(refs)
+      refresh_link_preview
+      @host.status(msg)
+      @host.resolve_subtab_focus
+    end
+
+    # Notes rows are persisted through the notes doc, not a per-row DELETE, so a close here
+    # can never leave a saved session behind the way a repeater/fuzz row can.
+    protected def close_subtab_at(idx : Int32) : Bool
+      close_note_at(idx)
+      false
+    end
+
     private def do_notes_close : Nil
-      if closed_id = @notes.close_note
-        @host.session.store.delete_links_for_owner(Store::LinkOwnerKind::Note, closed_id)
-      end
+      close_note_at(@notes.current_index)
       refresh_link_preview
       @host.status("closed note (#{@notes.count} open)")
+    end
+
+    # Close note `idx` and drop its links. Notes keeps ≥1 — closing the last one leaves a
+    # fresh blank note behind (NotesView#close_note_at).
+    private def close_note_at(idx : Int32) : Nil
+      if closed_id = @notes.close_note_at(idx)
+        @host.session.store.delete_links_for_owner(Store::LinkOwnerKind::Note, closed_id)
+      end
     end
 
     # Copy selection (or current line) in READ mode.

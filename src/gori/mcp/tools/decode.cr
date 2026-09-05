@@ -32,6 +32,7 @@ module Gori
           "are gated writes the operator can see.", is_error: true)
       end
 
+      @[Tool("decode", unbound: true)]
       private def decoder(h) : Result
         spec = str(h, "spec")
         return Result.new("missing required 'spec'", is_error: true) if spec.nil? || spec.strip.empty?
@@ -48,8 +49,11 @@ module Gori
         input =
           if bool_arg(h, "input_base64", false)
             begin
-              Base64.decode(raw)
-            rescue
+              # The converter's own decoder, so the two agree: raw `Base64.decode` refused a
+              # value with a leading space or a wrapped line that `spec: "base64-decode"` one
+              # argument over would have taken.
+              Decoder::Codecs.base64_decode(raw)
+            rescue Decoder::DecoderError
               return Result.new("invalid 'input': input_base64 is set but the value is not valid base64", is_error: true)
             end
           else
@@ -72,7 +76,14 @@ module Gori
         # inline. Truncate on a byte budget and scrub so a split multibyte char can't
         # emit invalid UTF-8 into the JSON string; `output_bytes` keeps the true size.
         truncated = text.bytesize > DECODER_MAX_OUTPUT
-        text = text.byte_slice(0, DECODER_MAX_OUTPUT).scrub if truncated
+        if truncated
+          text = text.byte_slice(0, DECODER_MAX_OUTPUT).scrub
+          # A split multibyte char scrubs to a 3-byte U+FFFD, which could put the cut up to
+          # two bytes PAST the budget the field name promises. Drop it rather than exceed it.
+          while text.bytesize > DECODER_MAX_OUTPUT
+            text = text.rchop
+          end
+        end
 
         Result.new(JSON.build do |j|
           j.object do
@@ -99,6 +110,7 @@ module Gori
       # Shapes come from Jwt.decode_json / Jwt.attacks_json (jwt/present.cr) so they match
       # `gori run jwt --format json` byte-for-byte.
 
+      @[Tool("jwt_decode", unbound: true)]
       private def jwt_decode_tool(h) : Result
         token = str(h, "token")
         return Result.new("missing required 'token'", is_error: true) if token.nil? || token.strip.empty?
@@ -109,6 +121,7 @@ module Gori
         Result.new(Jwt.decode_json(t))
       end
 
+      @[Tool("jwt_encode", unbound: true)]
       private def jwt_encode_tool(h) : Result
         token = str(h, "token")
         raw_header = str(h, "header").try(&.presence)
@@ -142,6 +155,7 @@ module Gori
         Result.new(JSON.build { |j| j.object { j.field "token", signed; j.field "alg", alg } })
       end
 
+      @[Tool("jwt_attacks", unbound: true)]
       private def jwt_attacks_tool(h) : Result
         token = str(h, "token")
         return Result.new("missing required 'token'", is_error: true) if token.nil? || token.strip.empty?

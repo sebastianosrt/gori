@@ -256,16 +256,23 @@ module Gori::Tui
     # gone rather than kept as a no-op. (⇧↑/⇧↓ had already left for the mark-range gesture;
     # vertical reading is PgUp/PgDn/Home/End — see `#body_scroll`.)
 
-    # PageUp/PageDown/Home/End page the read-only held-message preview (the Runner routes
-    # these here when handle_body_key declines them). The preview, not the queue: a hold
-    # queue is a handful of rows that j/k covers, while a held body runs to thousands of
-    # lines and this is now its only scroll path short of opening the editor. No editing?
-    # guard is needed — handle_body_key swallows every key while the editor is up, so these
-    # never reach here then (and vscroll_detail self-guards regardless).
+    # PageUp/PageDown/Home/End page the QUEUE (the Runner routes these here when
+    # handle_body_key declines them), the same list ↑/↓ walk — as every other list tab's page
+    # keys do. They used to page the read-only held-message PREVIEW instead, on the argument
+    # that a queue is short and a body is long; but the keys a hand learns on History/Issues
+    # then did something else on the one tab whose list can be the longest under a flood,
+    # and Home/End could not reach its ends at all. The preview keeps two scroll paths: the
+    # wheel over it (`handle_wheel_at`), and opening the editor (↵), where the same keys
+    # page the text. No editing? guard is needed — handle_body_key swallows every key while
+    # the editor is up, and `move` self-guards regardless.
     def body_scroll(delta : Int32) : Bool
       return false if @intercept.empty?
-      @intercept.vscroll_detail(delta)
+      @intercept.move(delta)
       true
+    end
+
+    def page_rows : Int32?
+      @intercept.editing? ? nil : @intercept.list_page_rows
     end
 
     # --- catch-condition filter bar (a text sub-mode; the shell claims it before the
@@ -281,8 +288,12 @@ module Gori::Tui
     # gate CI runs, and "move something" is a different question from "what does this key do".
     # `↓`/`↑` were dead in this bar before the dropdown — a one-line field has no second row to
     # move a caret to — which is why they could be claimed without displacing anything.
-    private def query_nav(key) : Bool
+    private def query_nav(ev : Termisu::Event::Key) : Bool
+      key = ev.key
       case
+      when act = LineEdit.action(ev) # ⌃/⌥←→, Home/End, Delete, ⌥⌫ — before the bare arrows
+        @intercept.query_edit(act)
+        @host.session.interceptor.set_filter(@intercept.query) if LineEdit.mutating?(act)
       when key.down?  then @intercept.popup_down
       when key.up?    then @intercept.popup_up
       when key.left?  then @intercept.query_move(-1)
@@ -313,7 +324,7 @@ module Gori::Tui
       key = ev.key
       c = ev.char || key.to_char
       ic = @host.session.interceptor
-      return true if query_nav(key)
+      return true if query_nav(ev)
       case
       when key.enter?  then query_enter(ic)
       when key.escape? then query_escape(ic)
