@@ -29,6 +29,10 @@ module Gori::Tui
 
     QUERY_FIELDS = Probe::Filter::FIELDS
 
+    # The bar's field vocabulary — see `IssuesView::QUERY_KNOWN`, the sibling bar over the
+    # sibling backend.
+    QUERY_KNOWN = ->(f : String, op : Char) { Probe::Filter.known_field?(f, regex: op == '~') }
+
     getter query : String
     getter mode : Probe::Mode
 
@@ -189,6 +193,11 @@ module Gori::Tui
       @selected = idx.clamp(0, @issues.size - 1)
       @preview_scroll = 0
       @preview_focus = :list
+    end
+
+    # The issue under the cursor, or nil on an empty (or fully filtered) list.
+    def selected_issue : Store::ProbeIssue?
+      @issues[@selected]?
     end
 
     def selected_index : Int32
@@ -724,7 +733,8 @@ module Gori::Tui
         screen.text(rect.x + 1, y, prefix, Theme.accent)
         base = rect.x + 1 + prefix.size
         screen.input_line(base, y, @query, @qcx, @preedit_q, Theme.text_bright, width: {rect.w - prefix.size - 2, 0}.max,
-          colors: Highlight.filter_query(@query, Theme.text_bright, FilterAst::SEPS_FIELD))
+          colors: Highlight.filter_query(@query, Theme.text_bright, FilterAst::SEPS_FIELD,
+            known: QUERY_KNOWN))
         return
       end
       # Right cluster: a scope-lens chip (always shown so the ⇧S toggle is discoverable,

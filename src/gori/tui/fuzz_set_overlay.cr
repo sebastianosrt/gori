@@ -426,7 +426,7 @@ module Gori::Tui
     def render(screen : Screen, area : Rect) : Nil
       box = overlay_box(area)
       unless box
-        screen.text(area.x + 1, area.y, "payload set editor needs a larger window · esc to close", Theme.muted, Theme.bg) unless area.empty?
+        Overlay.too_small(screen, area, "payload set editor needs a larger window")
         return
       end
       # Not `title` — that is now the Overlay chrome method, and a local of the same name
@@ -605,10 +605,10 @@ module Gori::Tui
       @values.click_to_cursor(values_rect(box), mx, my, selecting: true)
     end
 
-    def handle_double_click(area : Rect, mx : Int32, my : Int32) : Bool
+    def handle_double_click(area : Rect, mx : Int32, my : Int32) : Symbol
       return super unless @ptype == :list
-      return false unless box = overlay_box(area)
-      @values.select_word_at(values_rect(box), mx, my)
+      return :pass unless box = overlay_box(area)
+      @values.select_word_at(values_rect(box), mx, my) ? :stay : :pass
     end
 
     def move(d : Int32) : Nil

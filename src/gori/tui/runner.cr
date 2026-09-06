@@ -188,16 +188,19 @@ module Gori::Tui
       # ↑/↓ keep stepping in BOTH modes — that's why Tab, not an arrow, is the toggle.
       @search_open = false
       @search_buffer = ""
+      @search_cx = 0 # caret into @search_buffer (the prompts edit through `prompt_edit`)
       @search_preedit = ""
       @search_target = :none
       @search_hits = [] of Int32
       @search_idx = 0
       @search_replace = false
       @search_replace_buffer = ""
+      @search_replace_cx = 0
       # The sub-tab rename prompt (Repeater + Fuzzer + Decoder + Miner) — orthogonal to
       # @overlay (floats over the bottom status row, like ^G/^F).
       @rename_open = false
       @rename_buffer = ""
+      @rename_cx = 0
       @rename_preedit = ""
       # The target is held by VIEW identity (not a positional index): the cross-session
       # reconcile can reorder/remove repeater tabs while the prompt is open, so the
@@ -207,6 +210,12 @@ module Gori::Tui
       # space-separated tags. Held by VIEW identity for the same reconcile-race reason.
       @tag_edit_open = false
       @tag_buffer = ""
+      @tag_cx = 0
+      # A running import: its job id, the worker's events (drained on the tick), and the
+      # cancel flag the worker polls between chunks. See `apply_import`.
+      @import_job = nil.as(Int32?)
+      @import_cancel = false
+      @import_events = Channel(ImportEvent).new(16)
       @tag_preedit = ""
       @tag_views = [] of RepeaterView # the sub-tabs the prompt will tag (marks, else the active one)
       # Whitespace reveal (·→␍␊) toggle for the req/res views — global view pref,
@@ -299,14 +308,20 @@ module Gori::Tui
       # was the bug; see `Runner.port_fallback`) — read only by `apply_settings`, to tell "the
       # operator moved the pin" apart from "the environment moved us".
       @bind_fallback = nil.as(Tuple(Int32, Int32)?)
-      @quit_armed = false           # first ^D/^C arms quit; second confirms (avoids accidental exit)
-      @resized = false              # set on a Resize event → next frame full-repaints
-      @body_h = 24                  # last body rect height (captured at render); drives PageUp/Down step size
-      @title_text = nil.as(String?) # last string emitted as the terminal-window title (memo; see sync_terminal_title)
-      @title_written = false        # have we ever written a title? gates the neutral restore on leave when the pref is "off"
-      # Timestamps of raises absorbed by the run loop, trimmed to TICK_ERROR_WINDOW — the
-      # circuit breaker behind `absorb_tick_error`.
-      @tick_errors = [] of Time::Instant
+      @quit_armed = false                                 # first ^D/^C arms quit; second confirms (avoids accidental exit)
+      @resized = false                                    # set on a Resize event → next frame full-repaints
+      @body_h = 24                                        # last body rect height (captured at render); drives PageUp/Down step size
+      @title_text = nil.as(String?)                       # last string emitted as the terminal-window title (memo; see sync_terminal_title)
+      @title_key = nil.as(Tuple(String, Symbol, String)?) # the inputs that title was built from
+      @title_written = false                              # have we ever written a title? gates the neutral restore on leave when the pref is "off"
+      # The circuit breaker behind `absorb_tick_error`: strikes inside TICK_ERROR_WINDOW.
+      @breaker = TickBreaker.new(TICK_ERROR_LIMIT, TICK_ERROR_WINDOW)
+      # The exception a full render last raised, while the reduced frame stands in for it —
+      # nil once a key asks for the real frame again. See `absorb_tick_error`.
+      @safe_frame = nil.as(Exception?)
+      # A frame owed to the operator by something that could not set the tick's own `dirty`
+      # (the error path runs in the tick's rescue, after that local has gone out of scope).
+      @render_pending = false
 
       # Per-tab controllers (strangler-fig: tabs migrate into this registry one at a
       # time; an unmigrated tab is absent and still runs through the case ladders
@@ -489,10 +504,12 @@ module Gori::Tui
       last_dv_poll = Time.instant
       last_probe_gen = @session.store.probe_generation # committed probe_issues mutations
       last_spin = Time.instant                         # advances the background-job spinner frame
-      last_clock = clock_label                         # top-bar wall clock; re-render only when the minute rolls over
+      last_clock = clock_minute                        # status-row wall clock; re-render only when the minute rolls over
+      last_hold_tick = Time.instant                    # advances the Intercept queue's waiting-age column
       last_ui_ident = nil.as(UiIdentity?)              # last-written ui-state identity (see UI_STATE_THROTTLE)
       last_ui_write = Time.instant
       last_pub_rev = -1                                                     # #123: last interceptor revision mirrored to the store (-1 = publish on first tick)
+      last_pub_edit_id = nil.as(Int64?)                                     # #123: held item the mirrored snapshot last reported an operator edit on
       last_bridge_pub = Time.instant                                        # #123: last bridge-heartbeat write (throttled so idle never churns the WAL)
       @intercept_cmd_watermark = @session.store.latest_intercept_command_id # tail agent commands from now
       begin
@@ -507,6 +524,7 @@ module Gori::Tui
           # Wrapped in place rather than extracted so the `last_*` cursors above survive the
           # error: a recovered tick carries on from where it was instead of re-running every
           # poll and reload from scratch.
+          phase = :input # which half of the tick a raise came from — see `absorb_tick_error`
           begin
             ev = @term.poll_event(50)
             dirty = false
@@ -612,16 +630,34 @@ module Gori::Tui
                 # command triggers the snapshot republish below in the same tick.
                 dirty = true if drain_intercept_commands
                 dirty = true if reap_stale_holds
-                if (prev = ic.revision) != last_pub_rev
+                # The held item the operator has unsaved edits for rides the snapshot as
+                # `edited`, so an agent can leave a hold alone while a human is part-way
+                # through rewriting it. It moves nil→id→nil at most a couple of times per
+                # hold (the FIRST edit lands, then the editor closes), and nothing else in
+                # this window bumps the interceptor's revision, so it needs its own trigger
+                # or the flag would be published once and never corrected.
+                edit_id = intercept_controller.held_edit_id
+                if (prev = ic.revision) != last_pub_rev || edit_id != last_pub_edit_id
                   last_pub_rev = prev
-                  publish_intercept_snapshot(ic) # queue changed → re-mirror held rows
-                  publish_intercept_bridge(ic)   # and refresh config/heartbeat immediately
+                  last_pub_edit_id = edit_id
+                  publish_intercept_snapshot(ic, edit_id) # queue changed → re-mirror held rows
+                  publish_intercept_bridge(ic)            # and refresh config/heartbeat immediately
                   last_bridge_pub = now
                 elsif now - last_bridge_pub >= INTERCEPT_HEARTBEAT_INTERVAL
                   publish_intercept_bridge(ic) # periodic liveness heartbeat (throttled)
                   last_bridge_pub = now
                 end
               end
+            end
+            # Advance the Intercept queue's waiting-age column. A held message blocks a real
+            # client and the #123 reaper releases one on a deadline, so the age has to move on
+            # its own — nothing else bumps the interceptor's revision while a queue sits still.
+            # Gated on the tab being UP and something actually held, so the idle loop keeps its
+            # once-a-minute clock wake rather than a once-a-second one.
+            if @active_tab == :intercept && now - last_hold_tick >= HOLD_AGE_INTERVAL &&
+               @session.interceptor.pending_count > 0
+              last_hold_tick = now
+              dirty = true
             end
             # Animate the bottom-bar background-job spinner: while any job runs, advance the
             # frame on a fixed cadence and force a redraw. The any_active? guard keeps idle
@@ -642,6 +678,8 @@ module Gori::Tui
             # TLS passthrough: announce hosts bypassed since the last tick. Before the Companion, so
             # a bypass notice reaches her on the same frame it is pushed.
             dirty = true if drain_passthrough_notices
+            # …and what intercept could not hold. Same placement, same reason.
+            dirty = true if drain_intercept_notices
             # Miss Ring: advance the animation beat and pick up new notifications. Like the
             # resource meter above she reports dirty ONLY when the drawn sprite/bubble
             # changes, and stops reporting at all once she dozes off (Companion::SLEEP_AFTER).
@@ -665,9 +703,11 @@ module Gori::Tui
             # Debounced QL filter: fire the deferred search once typing has paused.
             dirty = true if history_controller.flush_query_reload_if_due(now)
             dirty = true if sitemap_controller.flush_query_reload_if_due(now)
+            dirty = true if sitemap_controller.drain_search
+            dirty = true if drain_import_events
             # Tick the top-bar clock: dirty only when the displayed minute changes, so the
             # idle loop wakes once a minute to repaint rather than every second.
-            if (clock = clock_label) != last_clock
+            if (clock = clock_minute) != last_clock
               last_clock = clock
               dirty = true
             end
@@ -699,13 +739,20 @@ module Gori::Tui
               last_ui_ident = ident
               last_ui_write = now
             end
+            # A frame the error path owes (its toast, or the reduced frame) — that path runs in
+            # the rescue below, after this tick's `dirty` is gone, so it leaves a note instead.
+            if @render_pending
+              @render_pending = false
+              dirty = true
+            end
+            phase = :render
             render if dirty
           rescue ex : Gori::Error
             # gori's own errors keep their designed exit: `CLI.run` rescues these and aborts
             # with the operator-facing message, which is a deliberate answer, not a crash.
             raise ex
           rescue ex
-            raise ex unless absorb_tick_error(ex)
+            raise ex unless absorb_tick_error(ex, phase)
           end
           break unless @outcome == :running
         end
@@ -722,12 +769,19 @@ module Gori::Tui
         #
         # Wind down the statusline worker fiber so it doesn't outlive this project's Runner.
         @statusline.stop
+        @import_cancel = true
+        history_controller.cancel_searches
         # Drop the per-tab window title back to a neutral "𝓰𝓸𝓻𝓲" on leave — the shared term
         # outlives this Runner (project picker + the next session reuse it), so a stale
         # "𝓰𝓸𝓻𝓲 - acme - Notes" mustn't linger. The shell's prompt overwrites it again after
         # quit. Skipped when we never wrote a title (pref "off"), so gori leaves the
         # terminal's own title alone end to end.
-        @term.title = "𝓰𝓸𝓻𝓲" if @title_written
+        # `rescue`d: on a tty that has gone away this write is the second raise in the same
+        # unwind, and it would replace the one that says why the session ended.
+        begin
+          @term.title = "𝓰𝓸𝓻𝓲" if @title_written
+        rescue IO::Error
+        end
       end
       @outcome
     end
@@ -757,6 +811,11 @@ module Gori::Tui
     # How fast the bottom-bar background-job spinner advances (only while a job runs).
     SPINNER_INTERVAL = 120.milliseconds
 
+    # How often the Intercept queue's waiting-age column repaints while the tab is up and
+    # something is held. One second because the column's own unit is seconds — a slower tick
+    # would show a number that is visibly behind the clock the operator is reading it against.
+    HOLD_AGE_INTERVAL = 1.second
+
     # Per-tick cap on coalesced printable-char events (a paste). Large enough that a
     # typical paste applies in one render tick; still bounds a pathological stream.
     CHAR_DRAIN_CAP = 65_536
@@ -777,20 +836,41 @@ module Gori::Tui
     #
     # The trace goes to <GORI_HOME>/gori.log, which `App#run_tui` binds before entering the
     # alt screen, so logging here cannot garble the display it is reporting about.
-    private def absorb_tick_error(ex : Exception) : Bool
+    #
+    # `phase` is which half of the tick raised. A raise from the INPUT half (a key handler, a
+    # channel drain, a timer) is one hostile event going past: it counts as a strike, the
+    # toast says so, and the next frame draws as usual. A raise from the RENDER half is a
+    # different animal — the same frame is asked for again 50ms later, so with a deterministic
+    # bug three strikes were ~150ms, and the recovery toast was drawn by the very render that
+    # kept failing: the operator saw a backtrace, never the toast. So a full render's failure
+    # does not strike. It puts the REDUCED frame up instead (`render_safe_frame`: chrome and
+    # status row, the error where the body was), which stays until a key asks for the real
+    # frame again — every retry is the operator's, not the clock's, and the tab bar still works
+    # so they can leave the tab that cannot draw. Only the reduced frame failing too (the
+    # chrome itself is broken, nothing left to fall back to) strikes like an input raise.
+    private def absorb_tick_error(ex : Exception, phase : Symbol) : Bool
       now = Time.instant
-      @tick_errors.reject! { |t| now - t > TICK_ERROR_WINDOW }
-      @tick_errors << now
-      ::Log.error(exception: ex) { "TUI tick raised (#{@tick_errors.size}/#{TICK_ERROR_LIMIT} in #{TICK_ERROR_WINDOW})" }
-      return false if @tick_errors.size >= TICK_ERROR_LIMIT
+      # The frame that raised is half-drawn, so force a full repaint rather than a cell diff
+      # against a screen state no complete render ever produced. And ask for that frame: this
+      # runs in the tick's rescue, where the tick's own `dirty` is out of reach.
+      @resized = true
+      @render_pending = true
+      if phase == :render && @safe_frame.nil?
+        ::Log.error(exception: ex) { "TUI render raised — showing the reduced frame" }
+        @safe_frame = ex
+        status("#{@active_tab} failed to draw — any key retries · details in gori.log (#{ex.class}: #{ex.message})", :error)
+        return true
+      end
+      count = @breaker.record(now)
+      ::Log.error(exception: ex) { "TUI #{phase} tick raised (#{count}/#{TICK_ERROR_LIMIT} in #{TICK_ERROR_WINDOW})" }
+      return false if @breaker.tripped?(now)
       # `status`, not a bare `@toast =`: `status_line` only prefers a toast over the
       # companion's bubble when `@toast_at` is fresher than `@companion.bubble_at`, so
       # assigning the message without its timestamp lost the race to any bubble Miss Ring
       # happened to be holding — and the breaker's one operator-visible signal never showed.
-      status("recovered from an internal error — details in gori.log (#{ex.class}: #{ex.message})")
-      # The frame that raised is half-drawn, so force a full repaint rather than a cell diff
-      # against a screen state no complete render ever produced.
-      @resized = true
+      # `:error`, so it reaches the notification centre as well (#960): the toast is gone on
+      # the next keypress, and this is the one message an operator should be able to re-read.
+      status("recovered from an internal error — details in gori.log (#{ex.class}: #{ex.message})", :error)
       true
     end
 
@@ -1108,6 +1188,11 @@ module Gori::Tui
     @paste_stall = PasteStall.new
 
     private def handle(ev : Termisu::Event::Any) : Nil
+      # A key retires the reduced frame (see `absorb_tick_error`): the next render is the
+      # real one, and if it fails again the reduced frame simply comes back. Keys only —
+      # xterm mode 1002 reports pointer motion continuously, and a drag would otherwise retry
+      # (and log) the broken render at the mouse's rate.
+      @safe_frame = nil if ev.is_a?(Termisu::Event::Key)
       # A PasteStart arriving while a paste is ALREADY open means the previous one was abandoned
       # (its marker lost) and a new one is beginning. Close the old one first, or there is no
       # start transition for the new one and it silently inherits the abandoned paste's
@@ -1602,7 +1687,13 @@ module Gori::Tui
     PASTE_MODAL_REFUSED = "paste stopped at the line break — ↵ here means commit; press it yourself"
 
     private def dispatch_overlay_click(ov : Overlay, area : Rect, mx : Int32, my : Int32) : Nil
-      case ov.handle_click(area, mx, my)
+      apply_overlay_outcome(ov, ov.handle_click(area, mx, my))
+    end
+
+    # The pointer's outcome rule, shared by a click and a double-click: :cancel closes,
+    # :commit runs the closure and closes iff it returns true, anything else stays.
+    private def apply_overlay_outcome(ov : Overlay, outcome : Symbol) : Nil
+      case outcome
       when :cancel then close_active_overlay(ov)
       when :commit then close_active_overlay(ov) if ov.commit
       end
@@ -2116,6 +2207,7 @@ module Gori::Tui
           msg = attached > 0 ? "issue ##{new_id} filed with its capture attached" : "issue ##{new_id} filed"
           @toast = notes_lost ? "#{msg} — but its notes did not save (store busy)" : msg
         else
+          history_controller.cancel_searches if @active_tab == :history
           @active_tab = :issues
           @focus = :body
           issues_controller.view.reload(@session.store)
@@ -2136,10 +2228,7 @@ module Gori::Tui
           close_overlay
           @toast = verb.call(self) || @toast
         end
-      elsif key.up?
-        @palette.move(-1)
-      elsif key.down?
-        @palette.move(1)
+      elsif @palette.edit(ev, self) # ↑/↓, ⌃/⌥←→, Home/End, Delete, ⌥⌫, ←/→ — before ⌫ and the printables
       elsif key.backspace?
         @palette.backspace(self)
       elsif c && !ev.ctrl? && !ev.alt?
@@ -2299,8 +2388,15 @@ module Gori::Tui
     # Switching to "off" mid-session is the one exception: a title we put there would
     # otherwise freeze on whatever tab was active, so we release it to the neutral "𝓰𝓸𝓻𝓲"
     # once and go quiet from there.
+    #
+    # The three inputs are compared BEFORE the title is built: this runs at the top of every
+    # render, and building it is two interpolations plus `title_safe`'s per-char walk over the
+    # project name, all to be compared against the same string and dropped.
     private def sync_terminal_title : Nil
-      title = case Settings.terminal_title
+      key = {Settings.terminal_title, @active_tab, @session.project.name}
+      return if @title_key == key
+      @title_key = key
+      title = case key[0]
               when "off" then @title_text.nil? ? return : "𝓰𝓸𝓻𝓲"
               when "tab" then "𝓰𝓸𝓻𝓲 - #{Chrome.tab_label(@active_tab)}"
               else            "𝓰𝓸𝓻𝓲 - #{title_safe(@session.project.name)} - #{Chrome.tab_label(@active_tab)}"
@@ -2333,6 +2429,10 @@ module Gori::Tui
       end
 
       layout = Layout.compute(w, h, statusline_active?)
+      if failed = @safe_frame
+        render_safe_frame(screen, layout, failed)
+        return
+      end
       Chrome.render_top_bar(screen, layout.topbar, project: @session.project.name,
         listen: listen_chip_label,
         scope: scope_label, probe: probe_label, rules: rules_label, intercept: intercept_label,
@@ -2383,6 +2483,54 @@ module Gori::Tui
       flush_screen
     end
 
+    # The frame drawn while a full render is failing (see `absorb_tick_error`): the top bar,
+    # the tab menu and the status row exactly as `render` draws them, and the error where the
+    # body would be. Nothing pane-owned is asked to draw — the body, the companion, overlays,
+    # the prompts and the controllers' hint strips are all suspects — so this frame can only
+    # fail if the chrome itself is broken. The tab menu is kept LIVE (focus, active tab) so
+    # 1-9 / ←→ still read as what they do: the way out of a tab that cannot draw.
+    private def render_safe_frame(screen : Screen, layout : Layout, ex : Exception) : Nil
+      Chrome.render_top_bar(screen, layout.topbar, project: @session.project.name,
+        listen: listen_chip_label,
+        scope: scope_label, probe: probe_label, rules: rules_label, intercept: intercept_label,
+        sandbox: sandbox_label,
+        unread: @notifications.unread, capturing: @session.capturing?,
+        write_failures: @session.store.write_failures, bypass: Settings.passthrough_count,
+        listeners: listener_chip_count, listener_errors: @session.listener_errors.size,
+        authorize: authorize_chip_label, session: session_slot_chip, agents: agent_chip)
+      Chrome.render_rule(screen, layout.rule)
+      vis_tabs, hid_tabs = Chrome.split_tabs(Settings.tab_prefs, force: @active_tab)
+      Chrome.render_menu(screen, layout.menu, active_tab: @active_tab,
+        focused: @focus == :menu && !@menu_more,
+        tabs: vis_tabs, intercept_count: @session.interceptor.pending_count,
+        hidden_count: hid_tabs.size, more_focused: @focus == :menu && @menu_more,
+        numbered: Settings.tab_numbers?)
+      body = layout.body
+      # A message may carry wire bytes or newlines (an IndexError's does not, a parser's may):
+      # one line, valid UTF-8, or the frame meant to report the crash would be the next one.
+      detail = "#{ex.class}: #{ex.message}".scrub.gsub(/\s+/, " ")
+      lines = [
+        "the #{@active_tab} tab failed to draw",
+        detail,
+        "",
+        "any key retries · 1-9 or ←/→ switch tab · the trace is in gori.log",
+      ]
+      y = body.y + {(body.h - lines.size) // 2, 0}.max
+      lines.each_with_index do |line, i|
+        break if y + i >= body.bottom
+        color = i == 0 ? Theme.red : (i == 1 ? Theme.text : Theme.muted)
+        screen.text(body.x + 2, y + i, line, color, Theme.bg, width: {body.w - 4, 0}.max)
+      end
+      Chrome.render_status(screen, layout.status, focus: focus_label,
+        hints: Hotkeys.retag(status_line || SAFE_FRAME_HINT),
+        activity: activity_chip, resource: @resource.label, time: clock_label,
+        companion: nil)
+      @term.hide_cursor
+      flush_screen
+    end
+
+    SAFE_FRAME_HINT = "any key retries · 1-9 switch tab · ^D quit"
+
     # The space menu (bottom-right popup) + the copy-as picker (centered) + the
     # bottom-anchored input prompts, all drawn last and orthogonal to @overlay so
     # they float over whatever's underneath (a tab body or the History detail).
@@ -2404,6 +2552,14 @@ module Gori::Tui
       # forces a full repaint since the diff would otherwise leave stale cells.
       @backend.flush(sync: @resized)
       @resized = false
+    rescue ex : IO::Error
+      # The tty went away (the terminal closed, the ssh session dropped). Absorbing this
+      # would spend the tick breaker on three writes to a dead fd and then end the process
+      # with a backtrace; a `Gori::Error` takes the designed exit instead — `run`'s ensure
+      # unwinds, `CLI.run` prints the one line. Narrow on purpose: only the flush is inside,
+      # so a `File::Error` (also an `IO::Error`) from a pane's own file write elsewhere in the
+      # tick is still that pane's to report, not a "terminal closed".
+      raise Gori::Error.new("terminal closed: #{ex.message}")
     end
 
     private def scope_label : String
@@ -2448,6 +2604,14 @@ module Gori::Tui
     # lowercase "pm" and `%P` the uppercase "PM" (GNU date has them the other way round).
     private def clock_label : String
       Time.local.to_s("%I:%M %P")
+    end
+
+    # The clock as the loop compares it — a tuple, so the 20-a-second check is two integer
+    # compares rather than a strftime and a String it throws away (the same reason
+    # `ui_state_identity` is a tuple and not the JSON it stands for).
+    private def clock_minute : {Int32, Int32}
+      t = Time.local
+      {t.hour, t.minute}
     end
 
     private def rules_label : String
@@ -2774,6 +2938,7 @@ module Gori::Tui
     # listed: the ones that call `@host.jobs.start` are discover / fuzzer / miner /
     # sequencer / repeater(minimize) / oast / authorize.
     private def stop_all_jobs : Nil
+      @import_cancel = true # the worker stops after its chunk; the store outlives this tick
       discover_controller.stop_all
       fuzzer_controller.stop_all
       miner_controller.stop_all
@@ -3327,6 +3492,20 @@ module Gori::Tui
       true
     end
 
+    # Say on screen what a gate declined to hold while catch was on — an h1 body over the hold
+    # ceiling, an h2 stream released past the buffer ceiling. Both fail OPEN by design, and both
+    # recorded it with `::Log.warn` alone, which under `gori tui` lands in `~/.gori/gori.log` and
+    # nowhere the operator watching a hold queue would meet it: a message went to the origin with
+    # catch armed and the only sign was a queue row that never appeared. See
+    # `Interceptor#note_unheld`; `Jobs::Goto.new(:intercept)` because the queue is where the
+    # operator was waiting for it.
+    private def drain_intercept_notices : Bool
+      notices = @session.interceptor.drain_notices
+      return false if notices.empty?
+      notices.each { |n| @notifications.push(:warn, n, Jobs::Goto.new(:intercept), source: "app") }
+      true
+    end
+
     private def run_goto(g : Jobs::Goto?) : Nil
       return unless g
       switch_tab(g.tab)
@@ -3391,16 +3570,13 @@ module Gori::Tui
 
     private def handle_rename_key(ev : Termisu::Event::Key) : Nil
       key = ev.key
-      c = ev.char || key.to_char
       if key.escape?
         close_rename
       elsif key.enter?
         apply_rename(@rename_buffer)
         close_rename
-      elsif key.backspace?
-        @rename_buffer = @rename_buffer[0, {@rename_buffer.size - 1, 0}.max]
-      elsif c && !ev.ctrl? && !ev.alt?
-        @rename_buffer += c
+      elsif edited = prompt_edit(ev, @rename_buffer, @rename_cx)
+        @rename_buffer, @rename_cx = edited
         @rename_preedit = "" # commit any IME preedit
       end
     end
@@ -3437,6 +3613,7 @@ module Gori::Tui
       return unless view
       @rename_view = view
       @rename_buffer = view.name || ""
+      @rename_cx = @rename_buffer.size
       @rename_preedit = ""
       @rename_open = true
     end
@@ -3472,7 +3649,7 @@ module Gori::Tui
       hint = "↵ save · esc cancel · empty: auto"
       x = rect.x + prefix.size
       iw = {rect.right - x - hint.size - 2, 4}.max
-      screen.input_line(x, rect.y, @rename_buffer, @rename_buffer.size, @rename_preedit, Theme.text_bright, Theme.panel, width: iw)
+      screen.input_line(x, rect.y, @rename_buffer, @rename_cx, @rename_preedit, Theme.text_bright, Theme.panel, width: iw)
       screen.text({rect.right - hint.size - 1, x + iw}.max, rect.y, hint, Theme.muted, Theme.panel)
     end
 
@@ -3494,6 +3671,7 @@ module Gori::Tui
       targets = repeater_controller.target_views
       @tag_views = targets.empty? ? [view] : targets
       @tag_buffer = view.tags.join(" ")
+      @tag_cx = @tag_buffer.size
       @tag_preedit = ""
       @tag_edit_open = true
     end
@@ -3506,16 +3684,13 @@ module Gori::Tui
 
     private def handle_tag_edit_key(ev : Termisu::Event::Key) : Nil
       key = ev.key
-      c = ev.char || key.to_char
       if key.escape?
         close_tag_edit
       elsif key.enter?
         apply_tag_edit(@tag_buffer)
         close_tag_edit
-      elsif key.backspace?
-        @tag_buffer = @tag_buffer[0, {@tag_buffer.size - 1, 0}.max]
-      elsif c && !ev.ctrl? && !ev.alt?
-        @tag_buffer += c
+      elsif edited = prompt_edit(ev, @tag_buffer, @tag_cx)
+        @tag_buffer, @tag_cx = edited
         @tag_preedit = "" # commit any IME preedit
       end
     end
@@ -3540,7 +3715,7 @@ module Gori::Tui
       hint = "↵ save · esc cancel · #tags space-separated"
       x = rect.x + prefix.size
       iw = {rect.right - x - hint.size - 2, 4}.max
-      screen.input_line(x, rect.y, @tag_buffer, @tag_buffer.size, @tag_preedit, Theme.text_bright, Theme.panel, width: iw)
+      screen.input_line(x, rect.y, @tag_buffer, @tag_cx, @tag_preedit, Theme.text_bright, Theme.panel, width: iw)
       screen.text({rect.right - hint.size - 1, x + iw}.max, rect.y, hint, Theme.muted, Theme.panel)
     end
 
@@ -3565,17 +3740,89 @@ module Gori::Tui
       true
     end
 
+    # What the import worker reports back, drained on the tick (`drain_import_events`).
+    private record ImportProgress, job : Int32, done : Int32, total : Int32?
+    private record ImportDone, job : Int32, label : String, path : String, result : Import::Result?, error : String?
+    private alias ImportEvent = ImportProgress | ImportDone
+
+    # The import runs as a background JOB — on the activity chip, with progress, and with a
+    # palette cancel — instead of on the tick, where a large file froze every key and every
+    # frame until it was done. The shape is `FuzzerController#fuzz_save_results`: the worker
+    # fiber writes to the store and sends events; the shell applies them on its own fiber.
+    #
+    # A HAR — the one import that gets big — is read and written as a stream (`Har.each_flow`
+    # paces itself, and `Import.import_har_stream` writes a chunk at a time), so the frame keeps
+    # drawing for the whole of it and the count on the chip is live. The other formats are
+    # small by nature and still parse in one call before their chunks go in.
     private def apply_import(kind : Symbol, label : String, path : String) : Nil
-      result = Import.import_file(@session.store, kind, path, Gori::FlowSource::Surface::Tui)
+      if @import_job
+        @toast = "an import is already running — cancel it from the palette (Import: cancel) or wait"
+        return
+      end
+      job = @jobs.start(:import, "import #{label} · #{File.basename(path)}")
+      @import_job = job
+      @import_cancel = false
+      store = @session.store
+      events = @import_events
+      status("importing #{label} — #{File.basename(path)}…", :busy)
+      spawn(name: "gori-import") do
+        begin
+          result = Import.import_file(store, kind, path, Gori::FlowSource::Surface::Tui,
+            cancelled: -> { @import_cancel },
+            progress: ->(done : Int32, total : Int32?) { events.send(ImportProgress.new(job, done, total)) })
+          events.send(ImportDone.new(job, label, path, result, nil))
+        rescue ex
+          events.send(ImportDone.new(job, label, path, nil, ex.message || ex.class.name))
+        end
+      end
+    end
+
+    # Land the import worker's events. True when anything arrived (→ a frame).
+    private def drain_import_events : Bool
+      any = false
+      loop do
+        select
+        when ev = @import_events.receive
+          any = true
+          case ev
+          in ImportProgress
+            @jobs.progress(ev.job, ev.done, ev.total, Runner.import_progress_note(ev.done, ev.total))
+          in ImportDone
+            finish_import(ev)
+          end
+        else
+          break
+        end
+      end
+      any
+    end
+
+    # The activity note: "1200/5000 flows" when the total is known, "1200 flows" for a stream.
+    def self.import_progress_note(done : Int32, total : Int32?) : String
+      total ? "#{done}/#{total} flows" : "#{done} flows"
+    end
+
+    private def finish_import(ev : ImportDone) : Nil
+      @import_job = nil
+      if error = ev.error
+        @jobs.finish(ev.job, :error, error)
+        status("import failed: #{error}", :error)
+        return
+      end
+      result = ev.result || return
       sitemap_controller.reload
-      msg = "imported #{result.count} flow#{result.count == 1 ? "" : "s"} from #{label} · #{path}"
+      count = result.count
+      msg = if @import_cancel
+              "import cancelled — #{count} flow#{count == 1 ? "" : "s"} from #{ev.label} were written before the stop"
+            else
+              "imported #{count} flow#{count == 1 ? "" : "s"} from #{ev.label} · #{ev.path}"
+            end
       msg += " (#{result.skipped} entries skipped)" if result.skipped > 0
       # The import is chunked, so a partial write is possible — say so rather than letting a
       # short count read as a successful import of a smaller file (see Import::Result).
-      result.shortfall_note.try { |note| msg += " — #{note}" }
-      @toast = msg
-    rescue ex
-      @toast = "import failed: #{ex.message}"
+      result.shortfall_note.try { |note| msg += " — #{note}" } unless @import_cancel
+      @jobs.finish(ev.job, @import_cancel ? :stopped : :done, "#{count} flows")
+      status(msg, :done)
     end
 
     # --- Export path popup (Notes → Export note, Issues → Export issues) -----
@@ -3610,7 +3857,7 @@ module Gori::Tui
       suffix = hint_with_count(replace_target? ? "↵/↑↓ step · tab replace · esc done" : "↵/↑↓ step · esc done")
       sx = {rect.right - suffix.size, x}.max
       iw = {sx - x - 1, 0}.max
-      screen.input_line(x, rect.y, @search_buffer, @search_buffer.size, @search_preedit, Theme.text_bright, Theme.panel, width: iw)
+      screen.input_line(x, rect.y, @search_buffer, @search_cx, @search_preedit, Theme.text_bright, Theme.panel, width: iw)
       screen.text(sx, rect.y, suffix, no_matches? ? Theme.yellow : Theme.muted, Theme.panel)
     end
 
@@ -3633,7 +3880,7 @@ module Gori::Tui
       # Bottom row: the focused field — input_line syncs the hardware cursor here.
       rsuffix = "↵ replace all · esc done"
       rsx = {rect.right - rsuffix.size, x}.max
-      screen.input_line(x, rect.y, @search_replace_buffer, @search_replace_buffer.size, @search_preedit, Theme.text_bright, Theme.panel, width: {rsx - x - 1, 0}.max)
+      screen.input_line(x, rect.y, @search_replace_buffer, @search_replace_cx, @search_preedit, Theme.text_bright, Theme.panel, width: {rsx - x - 1, 0}.max)
       screen.text(rsx, rect.y, rsuffix, Theme.muted, Theme.panel)
     end
 
@@ -3698,6 +3945,7 @@ module Gori::Tui
     # tab jump/cycle/select never leaves a dirty buffer unpersisted (invisible to peers /
     # lost on an abnormal exit). Every dirty-holding tab is dirty-guarded in its own commit.
     private def flush_active_tab_edits : Nil
+      history_controller.cancel_searches if @active_tab == :history
       project_controller.commit if @active_tab == :project
       repeater_controller.save_current_repeater if @active_tab == :repeater
       fuzzer_controller.save_current if @active_tab == :fuzzer
@@ -4113,7 +4361,7 @@ module Gori::Tui
         return false
       end
       notify = ov.notify_mode
-      Settings.save_probe_active_notify(notify.token)
+      status("notify choice applied — could not save to #{Settings.path}", :error) unless Settings.save_probe_active_notify(notify.token)
       # One run per flow (already background), so each target keeps its own scope decision at
       # the Outbound chokepoint — the batch changed the count, not the gate.
       ov.details.each do |d|
@@ -4285,7 +4533,7 @@ module Gori::Tui
       # its header names the flow count, so N sessions are never a surprise (P4).
       ov.on_commit = -> {
         if ov.any_checked?
-          ov.save_prefs
+          status("mine prefs applied — could not save to #{Settings.path}", :error) unless ov.save_prefs
           miner_controller.start_session(ov.seed, ov.build_config)
           started = 1
           ov.extra_seeds.each do |s|
@@ -4365,7 +4613,7 @@ module Gori::Tui
         @toast = "enable spider or bruteforce"
         return false
       end
-      ov.save_prefs
+      status("discover prefs applied — could not save to #{Settings.path}", :error) unless ov.save_prefs
       discover_controller.start_session(ov.selected_target, ov.build_config)
       switch_tab(:target)
       target_controller.select_discover
@@ -5002,7 +5250,7 @@ module Gori::Tui
       when :comparer  then comparer_controller.comparer_copy
       when :intercept then intercept_controller.intercept_preview_copy
       when :oast      then oast_controller.oast_detail_copy
-      when :probe     then probe_controller.probe_detail_copy
+      when :probe     then probe_controller.probe_copy
       when :sequencer then sequencer_controller.sequencer_copy
       when :miner     then miner_controller.miner_copy
         # List-row copies (#C12): the row under the cursor — or every marked row — as text.
@@ -5184,6 +5432,16 @@ module Gori::Tui
 
     def import_burp : Nil
       open_import(:burp)
+    end
+
+    def import_running? : Bool
+      !@import_job.nil?
+    end
+
+    def import_cancel : Nil
+      return @toast = "no import is running" unless @import_job
+      @import_cancel = true
+      status("cancelling the import after its current chunk…", :busy)
     end
 
     def import_wsdl : Nil
