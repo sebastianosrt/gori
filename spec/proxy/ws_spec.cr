@@ -24,8 +24,9 @@ end
 private class IntegSink < Gori::Proxy::FlowSink
   getter ws = [] of {String, String}
   getter heads = [] of String
+  getter tunnel_completions = [] of Int64
 
-  def initialize(@ws_chan : Channel(Nil))
+  def initialize(@ws_chan : Channel(Nil), @tunnel_chan : Channel(Int64)? = nil)
     @next = 0_i64
   end
 
@@ -41,6 +42,11 @@ private class IntegSink < Gori::Proxy::FlowSink
                     shape : Gori::Proxy::WS::Shape = Gori::Proxy::WS::Shape::DEFAULT) : Nil
     @ws << {direction, String.new(payload)}
     @ws_chan.send(nil)
+  end
+
+  def on_tunnel_complete(flow_id : Int64) : Nil
+    @tunnel_completions << flow_id
+    @tunnel_chan.try(&.send(flow_id))
   end
 end
 
@@ -410,8 +416,8 @@ describe Gori::Proxy::WS do
 
       # Real (evented) socket pairs, not IO.pipe: kernel buffering + truly
       # independent directions, so a 16 MiB stream doesn't deadlock the fibers.
-      client_side, relay_client = UNIXSocket.pair
-      origin_side, relay_upstream = UNIXSocket.pair
+      client_side, relay_client = stream_pair
+      origin_side, relay_upstream = stream_pair
 
       # Drain forwarded-to-client bytes concurrently (the ~16 MiB write would block).
       # The relay closes its end when both pumps finish, so the read sees EOF then.
@@ -464,8 +470,8 @@ describe Gori::Proxy::WS do
       f2_hdr = hdr.to_slice
       payload = Bytes.new(big, 0x41_u8)
 
-      client_side, relay_client = UNIXSocket.pair
-      origin_side, relay_upstream = UNIXSocket.pair
+      client_side, relay_client = stream_pair
+      origin_side, relay_upstream = stream_pair
 
       drain = Channel(Nil).new
       spawn do
@@ -1207,18 +1213,24 @@ describe "WebSocket through the proxy (end-to-end)" do
     port = origin.local_address.port
     spawn do
       conn = origin.accept
-      Gori::Proxy::Codec::Http1.read_head(conn) # the upgrade GET
-      conn << "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
-      conn.flush
-      frame = Gori::Proxy::WS.read_frame(conn).not_nil!    # client's (masked) frame
-      conn.write(Bytes[0x81_u8, frame.payload.size.to_u8]) # unmasked echo
-      conn.write(frame.payload)
-      conn.flush
-    rescue
+      begin
+        Gori::Proxy::Codec::Http1.read_head(conn) # the upgrade GET
+        conn << "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        conn.flush
+        frame = Gori::Proxy::WS.read_frame(conn).not_nil!    # client's (masked) frame
+        conn.write(Bytes[0x81_u8, frame.payload.size.to_u8]) # unmasked echo
+        conn.write(frame.payload)
+        conn.flush
+        conn.read(Bytes.new(1)) # keep the server leg open until the client closes the tunnel
+      rescue
+      ensure
+        conn.close rescue nil
+      end
     end
 
     ws_chan = Channel(Nil).new(4)
-    sink = IntegSink.new(ws_chan)
+    tunnel_chan = Channel(Int64).new(1)
+    sink = IntegSink.new(ws_chan, tunnel_chan)
     proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
     proxy.start
 
@@ -1238,11 +1250,19 @@ describe "WebSocket through the proxy (end-to-end)" do
 
     receive_within(ws_chan) # out
     receive_within(ws_chan) # in
+    select
+    when tunnel_chan.receive
+      fail "the upgrade was marked complete while the client tunnel was still open"
+    else
+    end
     client.close
+    receive_within(tunnel_chan, 5, "the upgrade tunnel to finish after its transcript").should eq(1_i64)
     proxy.stop
+    origin.close rescue nil
 
     sink.ws.should contain({"out", "ping"})
     sink.ws.should contain({"in", "ping"})
+    sink.tunnel_completions.should eq([1_i64])
   end
 
   it "relays client frames when the 101 also carries Content-Type: text/event-stream" do
@@ -1746,6 +1766,56 @@ describe "Gori::Proxy::WS::Relay frame shape capture (V7)" do
     rows.size.should eq(1)
     rows[0][2].should eq("has-NEW")
     rows[0][3].rsv.should eq(0) # not the sender's 4 — gori re-framed it
+  end
+end
+
+# Keeps each captured payload BY REFERENCE, so a buffer the relay reused or mutated after
+# handing it over would show up as a changed row.
+private class RefSink < Gori::Proxy::FlowSink
+  getter rows = [] of {Int32, Bytes}
+
+  def on_request(req : Gori::Store::CapturedRequest) : Int64
+    1_i64
+  end
+
+  def on_response(resp : Gori::Store::CapturedResponse) : Nil
+  end
+
+  def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes,
+                    shape : Gori::Proxy::WS::Shape = Gori::Proxy::WS::Shape::DEFAULT) : Nil
+    @rows << {opcode, payload}
+  end
+end
+
+describe "Gori::Proxy::WS::Relay single-frame capture" do
+  # A single FIN frame with nothing assembled ahead of it is handed to the sink without the
+  # reassembly buffer. Its row must be the exact payload, masked or not, and must stay that
+  # payload after later frames (fragmented ones included) have gone through the same pump.
+  it "captures each single-frame message byte-exact, and later frames never disturb it" do
+    all = Bytes.new(256, &.to_u8)
+    rev = all.dup.reverse!
+    wire = client_frame(Gori::Proxy::WS::OP_BIN, all) +
+           client_frame(Gori::Proxy::WS::OP_BIN, rev, mask: nil) +
+           client_frame(Gori::Proxy::WS::OP_TEXT, "frag1|".to_slice, fin: false) +
+           client_frame(Gori::Proxy::WS::OP_CONT, "frag2".to_slice) +
+           client_frame(Gori::Proxy::WS::OP_TEXT, "after".to_slice) +
+           client_frame(Gori::Proxy::WS::OP_BIN, Bytes.empty)
+    want = [{2, all}, {2, rev}, {1, "frag1|frag2".to_slice}, {1, "after".to_slice},
+            {2, Bytes.empty}]
+    [nil, WsRewriter.new(to_server: {"absent", "x"})].each do |rewriter|
+      cs_r, cs_w = IO.pipe
+      ts_r, ts_w = IO.pipe
+      ss_r, ss_w = IO.pipe
+      tc_r, tc_w = IO.pipe
+      cs_w.write(wire); cs_w.close
+      ss_w.close
+      sink = RefSink.new
+      Gori::Proxy::WS::Relay.run(IO::Stapled.new(cs_r, tc_w), IO::Stapled.new(ss_r, ts_w), 7_i64,
+        sink, rewriter, rewriter ? WS_CTX : Gori::Proxy::WS::Context::NONE)
+      ts_w.close
+      _ = {ts_r, tc_r}
+      sink.rows.should eq(want)
+    end
   end
 end
 

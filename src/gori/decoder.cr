@@ -2,6 +2,8 @@ require "base64"
 require "./process_hook"
 require "./decoder/converter"
 require "./decoder/registry"
+require "./decoder/serialized"
+require "./decoder/bestfit_data"
 require "./decoder/codecs"
 require "./decoder/catalog"
 require "./decoder/chain"
@@ -112,10 +114,6 @@ module Gori::Decoder
   def self.display_utf8(data : Bytes, prefer : RenderAs? = nil) : {String, RenderAs}
     out = display(data, prefer)
     out[0].valid_encoding? ? out : display(data, nil)
-  end
-
-  def self.binary?(data : Bytes) : Bool
-    !String.new(data).valid_encoding?
   end
 
   # A process-wide registry built once and reused. The catalog is pure, read-only

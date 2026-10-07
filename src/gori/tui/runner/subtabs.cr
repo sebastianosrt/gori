@@ -20,11 +20,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   # Whether the strip carve includes its hairline (must match framed_body). Repeater
   # returns false so clicks on the filter/divider rows fall through to the body.
   private def subtab_strip_divider? : Bool
-    if t = @tabs[@active_tab]?
-      t.subtab_strip_divider?
-    else
-      true
-    end
+    (t = @tabs[@active_tab]?) ? t.subtab_strip_divider? : true
   end
 
   # The focusable sub-tab strip for Repeater/Fuzzer/Notes/Decoder (@focus == :subtabs). Mirrors the
@@ -86,7 +82,8 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     when key.space?
       open_space_menu # the active tab's command menu, reachable from the strip
     else
-      # swallow everything else — no type-through on the strip
+      # Strip-local keys stay claimed; only an actual Global chord may pass through.
+      dispatch_global_chord(ev)
     end
   end
 
@@ -102,8 +99,8 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     when :repeater then repeater_controller.repeater_new
     when :fuzzer   then fuzzer_controller.fuzz_new
     when :decoder  then decoder_controller.decoder_new
-    when :jwt      then jwt_controller.jwt_new
-    when :cookie   then cookie_controller.cookie_new
+    when :jwt      then jwt_controller.new_session
+    when :cookie   then cookie_controller.new_session
     when :notes    then notes_controller.notes_new
     when :comparer then comparer_controller.comparer_new
     end
@@ -118,6 +115,16 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     end
   end
 
+  # The strips where ^W closes a sub-tab (mirrors subtab_close's cases) — all nine, which is
+  # why this is spelled as the complement of "has no strip" rather than a second list to keep
+  # in step with the one below.
+  private def subtab_close_supported? : Bool
+    case @active_tab
+    when :repeater, :fuzzer, :miner, :sequencer, :decoder, :jwt, :cookie, :notes, :comparer then true
+    else                                                                                         false
+    end
+  end
+
   private def subtab_close : Nil
     case @active_tab
     when :repeater  then repeater_controller.request_close
@@ -125,8 +132,8 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     when :miner     then miner_controller.request_close
     when :sequencer then sequencer_controller.request_close
     when :decoder   then decoder_controller.decoder_close
-    when :jwt       then jwt_controller.jwt_close
-    when :cookie    then cookie_controller.cookie_close
+    when :jwt       then jwt_controller.close_session
+    when :cookie    then cookie_controller.close_session
     when :notes     then notes_controller.notes_close
     when :comparer  then comparer_controller.comparer_close
     end
@@ -215,6 +222,18 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     @tabs[@active_tab]?.try(&.jump_subtab(idx))
   end
 
+  # `subtab.posN` (⇧1-⇧9): jump to the Nth sub-tab of the ACTIVE tab, 1-based, from wherever
+  # the digit family reaches — the strip, the body, a read-only pane — not just the strip the
+  # `^1-9` alias is bound to. Focus is left where it is on purpose: ⇧3 while editing session 1
+  # means "show me session 3", not "and put me back on the chip row".
+  #
+  # ONE implementation for the seven strips, like `subtab_search_open`: the controller the
+  # shell is already routing to owns `jump_subtab`, which clamps and saves the outgoing
+  # session itself, so an out-of-range N is a safe no-op rather than nine guards.
+  def subtab_jump(n : Int32) : Nil
+    jump_subtab(n - 1)
+  end
+
   # ===== multi-select on the strip (issue #683) ==============================
   # `t` marks, exactly as it does in History, Issues, the Intercept queue and the Sitemap —
   # mutt's tag key, and the same many-times-per-minute gesture that earns it a bare letter
@@ -262,8 +281,15 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     move_subtab(1)
   end
 
-  # The two menu-reachable halves of the gesture (the toggle stays strip-only: a menu row
-  # that marks ONE chip and then closes the menu is a gesture nobody would use twice).
+  # The menu's Mark sub-tab row (#1274): the strip's `t` on the active chip, WITHOUT the step
+  # right. From the strip the step is what makes `t t t` mark a run; from a pane it would
+  # switch the sub-tab you are editing out from under you.
+  def subtab_mark_toggle : Nil
+    return unless t = @tabs[@active_tab]?
+    t.toggle_subtab_mark(current_subtab_index)
+  end
+
+  # The rest of the menu-reachable gesture: mark every chip, clear the marks.
   def subtab_mark_all : Nil
     @tabs[@active_tab]?.try(&.mark_all_subtabs)
   end

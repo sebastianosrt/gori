@@ -106,6 +106,13 @@ describe "MCP ql_explain verdict" do
     end
   end
 
+  it "names the colon form of a comparison typed without one" do
+    with_store do |store|
+      w = explain(store, "status>=400")["warnings"].as_a.map(&.as_s)
+      w.should contain("`status>=400` is searched as text — did you mean `status:>=400`?")
+    end
+  end
+
   it "leaves did_you_mean null when nothing is close enough to name" do
     with_store do |store|
       explain(store, "xyzzy:foo")["unknown_fields"][0]["did_you_mean"].raw.should be_nil
@@ -117,6 +124,17 @@ describe "MCP ql_explain verdict" do
       {"http://acme.test/x", "acme.test:8443", "login", "host:example.com"}.each do |q|
         explain(store, q)["unknown_fields"].as_a.should be_empty
       end
+    end
+  end
+
+  it "reports id:1 in unknown_fields and refused_by_query_tools with ids hint" do
+    with_store do |store|
+      j = explain(store, "id:1")
+      j["unknown_fields"].as_a.size.should eq(1)
+      j["unknown_fields"][0]["name"].as_s.should eq("id")
+      j["refused_by_query_tools"].as_bool.should be_true
+      w = j["warnings"].as_a.map(&.as_s)
+      w.find(&.includes?("no such field")).not_nil!.should contain("use the 'ids' argument")
     end
   end
 end

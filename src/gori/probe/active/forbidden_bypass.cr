@@ -162,22 +162,7 @@ module Gori
         private def key_string(detail : Store::FlowDetail, method_upcase : String, target : String,
                                aggressive : Bool) : String
           tag = aggressive ? "aggr" : "base"
-          "forbidden_bypass|#{detail.row.host}:#{detail.row.port}|#{method_upcase}|#{path_key(target)}|#{tag}"
-        end
-
-        private def path_key(target : String) : String
-          t = Active.origin_form(target)
-          qi = t.index('?')
-          qi ? t[0...qi] : t
-        end
-
-        private def probe_status(result : Repeater::Result) : Int32
-          if r = result.response
-            return r.status
-          end
-          Proxy::Codec::Http1.parse_response_head(result.head).status
-        rescue
-          0
+          endpoint_key(detail, method_upcase, path_only(Active.origin_form(target)), tag: tag)
         end
 
         # Rebuild the request with the full IP-spoofing header set inserted right after the request

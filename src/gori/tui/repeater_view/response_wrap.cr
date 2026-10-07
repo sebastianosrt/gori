@@ -52,11 +52,11 @@ class Gori::Tui::RepeaterView
       return
     end
     line = drawn_at.call(@resp_cursor.cy.clamp(0, size - 1))
-    if Screen.draw_width_upto(line, cw + 1) <= cw
+    if Wrap.draw_width_upto(line, cw + 1, @reveal) <= cw
       @resp_xscroll = 0 # the line fits whole — never hold an offset for it
       return
     end
-    curx = Wrap.row_col(line, nil, 0, (@resp_cursor.cx + off).clamp(0, line.size))
+    curx = Wrap.row_col(line, nil, 0, (@resp_cursor.cx + off).clamp(0, line.size), reveal: @reveal)
     @resp_xscroll = curx if curx < @resp_xscroll
     @resp_xscroll = curx - cw + 1 if curx >= @resp_xscroll + cw
     @resp_xscroll = 0 if @resp_xscroll < 0
@@ -127,7 +127,7 @@ class Gori::Tui::RepeaterView
       return hit
     end
     @resp_wrap.clear if @resp_wrap.size >= RESP_WRAP_CACHE_CAP
-    @resp_wrap[li] = Wrap.layout(line_at.call(li), cw)
+    @resp_wrap[li] = Wrap.layout(line_at.call(li), cw, reveal: @reveal)
   end
 
   private def resp_layout_fn(cw : Int32, line_at : Int32 -> String) : Int32 -> Wrap::Layout
@@ -169,17 +169,28 @@ class Gori::Tui::RepeaterView
   private def resp_drawn_source : {Int32, Proc(Int32, String), Int32}
     if transcript_rows?.nil? && !@reveal && @resp_mode == :diff
       data = diff_lines
-      return {data.size, ->(i : Int32) do
-        d = data[i]
-        prefix = case d.kind
-                 when .add? then '+'
-                 when .del? then '-'
-                 else            ' '
-                 end
-        "#{prefix} #{d.text}"
-      end, DIFF_PREFIX_COLS}
+      return {data.size, ->(i : Int32) { diff_decorated(data[i]) }, DIFF_PREFIX_COLS}
     end
     size, line_at = resp_line_source
     {size, line_at, 0}
+  end
+
+  # `d` as the diff pane draws it: the "+ "/"- "/"  " decoration, then the text. Memoised on
+  # the last line asked for, because every drawn row asks — `render_diff` slices the row out
+  # of it, and under wrap one minified body line is the whole viewport. Built per call, each
+  # of those rows copied the line and walked it for its char count before slicing: 19-26 ms a
+  # keystroke on a 1.7 MB body. The key is the line's own String and kind, which are all the
+  # result is made of, so a rebuilt `diff_lines` holding the same text still hits.
+  private def diff_decorated(d : Repeater::DiffLine) : String
+    text = d.text
+    return @diff_deco if text.same?(@diff_deco_text) && d.kind == @diff_deco_kind
+    prefix = case d.kind
+             when .add? then '+'
+             when .del? then '-'
+             else            ' '
+             end
+    @diff_deco_text = text
+    @diff_deco_kind = d.kind
+    @diff_deco = "#{prefix} #{text}"
   end
 end

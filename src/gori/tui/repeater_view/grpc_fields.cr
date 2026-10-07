@@ -95,7 +95,7 @@ class Gori::Tui::RepeaterView
     @grpc_mode && @grpc_reframable && !@grpc_compressed && !grpc_field_binding.nil?
   end
 
-  # `␣E` / `repeater.toggle-grpc-fields`. Returns the new state; the controller owns the
+  # `␣Pf` / `repeater.toggle-grpc-fields`. Returns the new state; the controller owns the
   # refusal sentences, because "no descriptor set" and "not a unary call" are different
   # problems with different fixes and the view cannot phrase either better than it can.
   def toggle_grpc_fields : Bool
@@ -209,8 +209,15 @@ class Gori::Tui::RepeaterView
     rebuilt = Protobuf::Encoder.replace(@grpc_payload, row.path, encoded)
     return refuse_grpc_field(rebuilt) if rebuilt.is_a?(String)
     # Only NOW is anything mutated — a refusal above leaves the payload exactly as captured.
-    @grpc_payload = rebuilt
-    @dirty = true
+    # And an untouched value mutates nothing either (P7), the same `text == seed` skip the
+    # Fuzzer's field positions make: text is not a faithful spelling of every wire form — a
+    # padded tag or length, a 5-byte negative int32, a bool of 2, a NaN's payload bits — so
+    # splicing the re-encoded seed normalised bytes the operator never edited. It is checked
+    # AFTER the splice so a payload that changed under the editor is still refused.
+    unless text == row.seed
+      @grpc_payload = rebuilt
+      @dirty = true
+    end
     close_grpc_field_input
     invalidate_grpc_fields
     # `@grpc_lines_cache` is deliberately NOT dropped — the same rule `toggle_grpc_reframe`
@@ -488,7 +495,8 @@ class Gori::Tui::RepeaterView
            elsif note = row.note
              "⚠ #{note}"
            elsif row.editable?
-             focused ? "↵ edit this field · ␣E back to the head" : "␣E back to the head"
+             back = "#{menu_chip("repeater.toggle-grpc-fields")} back to the head"
+             focused ? "↵ edit this field · #{back}" : back
            else
              ""
            end

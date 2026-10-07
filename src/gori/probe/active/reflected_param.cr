@@ -133,10 +133,8 @@ module Gori
           # `return out unless …` parses as the keyword, not the local.
           return found unless result.ok?
           head = String.new(result.head).scrub
-          # Canary search only reads the first BODY_CAP bytes, so cap the inflate to match.
-          decoded, _ = Proxy::Codec::ContentDecode.decode(result.head, result.body, BODY_CAP)
-          bytes = decoded || result.body
-          body = (bytes && !bytes.empty?) ? String.new(bytes[0, {bytes.size, BODY_CAP}.min]).scrub : ""
+          # Canary search only reads the first BODY_CAP bytes; `decoded_text` caps the inflate to match.
+          body = decoded_text(result)
           params.each do |p|
             # Search head and body separately: concatenating them allocated a full copy of both
             # (up to BODY_CAP + head) on every probe just to run one substring scan per param.
@@ -172,15 +170,6 @@ module Gori
             from = tail
           end
           best
-        end
-
-        private def response_content_type(result : Repeater::Result) : String
-          if r = result.response
-            return (r.headers.get?("Content-Type") || "").downcase
-          end
-          (Proxy::Codec::Http1.parse_response_head(result.head).headers.get?("Content-Type") || "").downcase
-        rescue
-          ""
         end
       end
     end

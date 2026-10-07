@@ -117,6 +117,80 @@ describe Gori::MCP::Server do
       end
     end
 
+    # #1076 — the MCP half of the CLI's `--notes` / `--notes-file` / `--notes-stdin`. `notes`
+    # lived on `update_issue` only, so filing a finding over MCP cost two writes and left an
+    # issue that was bodiless in between; filing 39 of them cost 78 calls. The body is written
+    # by the insert itself, which is what makes the pair atomic.
+    it "writes the notes body in the create itself, not in a follow-up write" do
+      with_store do |store|
+        body = "## Repro\n\n1. `POST /login`\n2. 302 carrying another user's cookie\n"
+        create = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":) +
+                 %({"title":"Auth bypass","severity":"high","notes":#{body.to_json}}}})
+        new_id = mcp_tool_payload(mcp_drive(store, create)[0])["id"].as_i64
+        # Read the row, not a second tool call: the claim is that ONE write ran and the body
+        # was already in it — an issue this store never held bodiless.
+        store.get_issue(new_id).not_nil!.notes.should eq(body)
+
+        get = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_issue","arguments":{"id":#{new_id}}}})
+        mcp_tool_payload(mcp_drive(store, get)[0])["notes"].as_s.should eq(body)
+      end
+    end
+
+    # The absent case is the overwhelmingly common call and must be unchanged: `""` is the
+    # column's own default, not a value this argument introduced.
+    it "still creates a bodiless issue when notes is absent" do
+      with_store do |store|
+        create = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"title":"x"}}})
+        new_id = mcp_tool_payload(mcp_drive(store, create)[0])["id"].as_i64
+        store.get_issue(new_id).not_nil!.notes.should eq("")
+      end
+    end
+
+    # Masked like the title and host written beside it, and like `update_issue`'s own `notes`:
+    # an agent pasting a captured request into a write-up would otherwise persist a value gori
+    # recognises as a secret into a column every export and report prints.
+    it "masks a recognised secret in the notes it persists" do
+      with_store_env do |store|
+        secret = "MCPNOTESECRET4242"
+        set_var = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"set_env_var","arguments":) +
+                  %({"key":"CTOK","value":"#{secret}"}}})
+        body = "Authorization: Bearer #{secret}\n"
+        create = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_issue","arguments":) +
+                 %({"title":"leak","notes":#{body.to_json}}}})
+        new_id = mcp_tool_payload(mcp_drive(store, set_var, create)[1])["id"].as_i64
+        # The WHOLE string, against the spelling gori itself would write: `contain("CTOK")`
+        # would also pass for the retired bare `$CTOK`, for `$BIND.CTOK` (a different
+        # namespace is a different secret — the collision `Env.masking_table` exists to
+        # prevent), and for a body that merely says the word while the value leaked elsewhere.
+        token = Gori::Env.spell("CTOK", Gori::Env::Namespace::Env)
+        store.get_issue(new_id).not_nil!.notes.should eq("Authorization: Bearer #{token}\n")
+      end
+    end
+
+    # `notes` is read LAST, one line above the insert, so its refusal is the one most easily
+    # turned into a write-then-raise — the shape #724 is about. The error alone is not the
+    # claim; "nothing was filed" is. (`refuses_container` in str_args_spec covers the sentence.)
+    it "files nothing when notes is a container, not a titled issue with no body" do
+      with_store do |store|
+        create = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":) +
+                 %({"title":"x","notes":{"a":1}}}})
+        resp = mcp_drive(store, create)[0]
+        resp["result"]["isError"].as_bool.should be_true
+        resp["result"]["content"][0]["text"].as_s.should contain("'notes'")
+        store.count_issues.should eq(0)
+      end
+    end
+
+    it "declares notes on create_issue in tools/list, beside update_issue's" do
+      with_store do |store|
+        tools = mcp_drive(store, %({"jsonrpc":"2.0","id":1,"method":"tools/list"}))[0]["result"]["tools"].as_a
+        schema = tools.find { |t| t["name"].as_s == "create_issue" }.not_nil!["inputSchema"]
+        schema["properties"].as_h.has_key?("notes").should be_true
+        # …and it stays OPTIONAL: a create with only a title is the call every existing agent makes.
+        schema["required"].as_a.map(&.as_s).should eq(["title"])
+      end
+    end
+
     it "rejects a present-but-invalid flow_id instead of silently unlinking" do
       with_store do |store|
         create = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_issue","arguments":{"title":"x","flow_id":1.9}}})
@@ -240,6 +314,55 @@ describe "MCP delete_issue" do
   end
 end
 
+# `get_issue` / `list_issues` answer "what backs this issue" with ONE array. The flow the
+# issue was filed from leads it and appears exactly once; `flow_id` stays beside it as the
+# compat spelling of that first entry, which is what the tool descriptions promise.
+describe "MCP issue links" do
+  it "leads an issue's links with the primary flow, once, and keeps flow_id agreeing" do
+    with_store do |store|
+      primary = mcp_seed_flow(store, "/login")
+      extra = mcp_seed_flow(store, "/admin")
+      iid = store.insert_issue("SQLi", Gori::Store::Severity::High, "acme.test", primary)
+      store.add_link(Gori::Store::LinkOwnerKind::Issue, iid, Gori::Store::LinkRefKind::Flow, extra)
+      tools = tools_for(store)
+
+      got = mcp_ok_json(tools, "get_issue", %({"id":#{iid}}))
+      links = got["links"].as_a
+      links.size.should eq(2)
+      links[0]["kind"].as_s.should eq("flow")
+      links[0]["ref_id"].as_i64.should eq(primary)
+      links[1]["ref_id"].as_i64.should eq(extra)
+      got["flow_id"].as_i64.should eq(primary)
+      links.count { |l| l["ref_id"].as_i64 == primary }.should eq(1)
+
+      # The listing serialises through the same builder, so it agrees row for row.
+      listed = mcp_ok_json(tools, "list_issues", "{}")["issues"].as_a
+      listed[0]["links"].as_a[0]["ref_id"].as_i64.should eq(primary)
+    end
+  end
+
+  # An issue filed before the entity_links migration (or imported): `flow_id` set, no link
+  # row. The primary is rebuilt from the column so an agent reading `links` is not told the
+  # issue is backed by nothing.
+  it "synthesises the primary entry when the link row is missing" do
+    with_store do |store|
+      primary = mcp_seed_flow(store, "/legacy")
+      iid = store.insert_issue("old", Gori::Store::Severity::Low, "acme.test", primary)
+      link = store.list_links(Gori::Store::LinkOwnerKind::Issue, iid)[0]
+      store.remove_link(link.owner_kind, link.owner_id, link.ref_kind, link.ref_id).should be_true
+
+      got = mcp_ok_json(tools_for(store), "get_issue", %({"id":#{iid}}))
+      links = got["links"].as_a
+      links.size.should eq(1)
+      links[0]["ref_id"].as_i64.should eq(primary)
+      links[0]["stale"].as_bool.should be_false
+      # …while `list_links`, which lists the TABLE, still reports what the table holds.
+      mcp_ok_json(tools_for(store), "list_links",
+        %({"owner_kind":"issue","owner_id":#{iid}}))["total"].as_i.should eq(0)
+    end
+  end
+end
+
 describe "MCP entity links" do
   it "lists an issue's evidence resolved to labels, and round-trips add/remove" do
     with_store do |store|
@@ -270,6 +393,16 @@ describe "MCP entity links" do
     end
   end
 
+  it "removes a link whose flow is gone (retention leaves it dangling on purpose)" do
+    with_store do |store|
+      iid = store.insert_issue("x", Gori::Store::Severity::Info, nil, nil)
+      store.add_link(Gori::Store::LinkOwnerKind::Issue, iid, Gori::Store::LinkRefKind::Flow, 9_999_i64)
+      mcp_ok_json(tools_for(store), "remove_link",
+        %({"owner_kind":"issue","owner_id":#{iid},"ref_kind":"flow","ref_id":9999}))["removed"].as_bool.should be_true
+      store.list_links(Gori::Store::LinkOwnerKind::Issue, iid).should be_empty
+    end
+  end
+
   it "reports a re-link as already_linked rather than duplicating" do
     with_store do |store|
       fid = mcp_seed_flow(store)
@@ -290,7 +423,8 @@ describe "MCP entity links" do
   # counter resets and the very next tab takes the dead id. The link then resolved
   # `stale: false` to an unrelated request — an issue's evidence pointer naming a different
   # URL. A pointer that starts lying is worse than either honest answer, so this one cascades.
-  it "drops a repeater link when the repeater is deleted, because its id can be reused" do
+  # V40 stopped handing the id out again; a successor planted at it pins the cascade anyway.
+  it "drops a repeater link when the repeater is deleted, so no tab at its id inherits it" do
     with_store do |store|
       rid = store.insert_repeater("https://victim.test/a", "GET /a HTTP/1.1\r\nHost: victim.test\r\n\r\n".to_slice,
         false, true, nil, 0)
@@ -301,10 +435,8 @@ describe "MCP entity links" do
       store.delete_repeater(rid)
       mcp_ok_json(tools, "list_links", %({"owner_kind":"issue","owner_id":#{iid}}))["total"].as_i.should eq(0)
 
-      # The id comes straight back — which is exactly why the link could not be left behind.
-      again = store.insert_repeater("https://unrelated.test/z", "GET /z HTTP/1.1\r\nHost: unrelated.test\r\n\r\n".to_slice,
-        false, true, nil, 0)
-      again.should eq(rid)
+      # A tab at the same id — what the counter handed out before V40.
+      plant_repeater_at(store, rid, "https://unrelated.test/z", "GET /z HTTP/1.1\r\nHost: unrelated.test\r\n\r\n")
       mcp_ok_json(tools, "list_links", %({"owner_kind":"issue","owner_id":#{iid}}))["total"].as_i.should eq(0)
     end
   end

@@ -23,14 +23,6 @@ describe Gori::Tui::ConfirmDialog do
     dlg.confirm_selected?.should be_false
   end
 
-  it "select_confirm / select_cancel set the choice explicitly" do
-    dlg = ConfirmDialog.new("DELETE", "Sure?")
-    dlg.select_confirm
-    dlg.confirm_selected?.should be_true
-    dlg.select_cancel
-    dlg.confirm_selected?.should be_false
-  end
-
   it "renders the heading, every message line, and both buttons" do
     dlg = ConfirmDialog.new("DELETE PROJECT", %(Delete "demo"?\nIrreversible.), confirm_label: "delete")
     backend = render_dialog(dlg)
@@ -81,6 +73,16 @@ describe Gori::Tui::ConfirmDialog do
     # Every drawn message row sits inside the card, above the button row.
     drawn = (box.y + 2...box.bottom - 3).count { |y| !backend.row(y)[box.x + 3, box.w - 6].blank? }
     drawn.should be >= 2
+  end
+
+  it "reports whether a message is fully visible before a confirmation can proceed" do
+    disclosure = ConfirmDialog.new("EXPORT PROJECT",
+      "Contains captured requests, session values, environment values, and upstream proxy credentials. " \
+      "The archive copies the complete database as stored and is not redacted.",
+      confirm_label: "export", danger: false)
+    disclosure.message_fits?(Rect.new(0, 0, 100, 30)).should be_true
+    disclosure.message_fits?(Rect.new(0, 0, 100, 8)).should be_false
+    disclosure.message_fits?(Rect.new(0, 0, 17, 30)).should be_false
   end
 
   # Measured in terminal COLUMNS, not characters. A Hangul syllable is two cells, so 40 of
@@ -278,18 +280,18 @@ describe "ConfirmDialog on a short pane" do
     dlg = ConfirmDialog.new("CLEAR HISTORY", "Delete ALL 143 History flows?", confirm_label: "clear")
     short = Rect.new(0, 0, 76, ConfirmDialog::MIN_H - 1)
     dlg.render(Screen.new(MemoryBackend.new(76, 8)), short)
-    dlg.drawn?.should be_false
+    dlg.@drawn.should be_false
 
     y = Termisu::Event::Key.new(Termisu::Input::Key::LowerY)
     dlg.handle_key(y).should eq(:stay)
-    dlg.select_confirm
+    dlg.move # lights confirm (a danger card opens on cancel)
     dlg.handle_key(Termisu::Event::Key.new(Termisu::Input::Key::Enter)).should eq(:cancel)
     # esc still gets the operator out of a modal they cannot read.
     dlg.handle_key(Termisu::Event::Key.new(Termisu::Input::Key::Escape)).should eq(:cancel)
 
     # A taller window puts the card back, and the same key is then a real answer.
     dlg.render(Screen.new(MemoryBackend.new(76, 24)), Rect.new(0, 0, 76, 18))
-    dlg.drawn?.should be_true
+    dlg.@drawn.should be_true
     dlg.handle_key(y).should eq(:commit)
   end
 

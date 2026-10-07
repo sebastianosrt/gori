@@ -26,9 +26,12 @@ module Gori::Tui
     # not. Collapsing them onto the terse pair loses the only place that tells the user
     # z is fuzz and m is miner.
     CARD_ADD_HINT    = "add: f flow · r repeater · z fuzz · m miner · esc back"
-    CARD_BROWSE_HINT = "↑/↓ select · ↵/o open · a add · d remove · esc close"
+    CARD_BROWSE_HINT = "↑/↓ select · ↵/o open · a add · f freeze · d remove · esc close"
     ADD_HINT         = "f/r/z/m pick type · esc back"
-    BROWSE_HINT      = "↑/↓ · ↵/o open · a add · d remove · esc close"
+    BROWSE_HINT      = "↑/↓ · ↵/o open · a add · f freeze · d remove · esc close"
+    # A NOTE owns no frozen evidence (#1038), so its card neither advertises `f` nor arms it.
+    NOTE_CARD_BROWSE_HINT = "↑/↓ select · ↵/o open · a add · d remove · esc close"
+    NOTE_BROWSE_HINT      = "↑/↓ · ↵/o open · a add · d remove · esc close"
     # The link sources, as the keys the adding-mode hint advertises.
     ADD_KEYS = "frzm"
 
@@ -39,6 +42,11 @@ module Gori::Tui
     # this card. nil for every other exit, which is what keeps `on_close` inert when the
     # user merely opened a link or pressed esc.
     getter pending_add : Char?
+    # `f` in browse mode (#1038): freeze the highlighted link's current exchange as issue
+    # evidence. Read by `on_close` like `pending_add`, and for the same reason — the
+    # freeze may raise a confirm (a large copy shows its byte cost first), and a modal
+    # opened from inside this card's key handler would be torn straight back down.
+    getter? pending_freeze : Bool
 
     # Deletes the highlighted link and reloads. Stays open — removing is a repeatable
     # edit, not a dismissal.
@@ -48,21 +56,23 @@ module Gori::Tui
       @resolved = [] of Links::Resolved
       @adding = false
       @pending_add = nil
+      @pending_freeze = false
     end
 
     def reload(store : Store) : Nil
       links = store.list_links(@owner_kind, @owner_id)
       if @owner_kind.issue?
         if f = store.get_issue(@owner_id)
+          # The primary flow stays OUT of this card even though it now leads the RELATED list
+          # (`Links.issue_links`): this card removes links, and the primary is `issues.flow_id`
+          # — a column, not a pointer the operator owns. Removing its row here would delete an
+          # `entity_links` row and change nothing on screen, because the column would still be
+          # there for RELATED to synthesise the row from. See `Links.dedupe_issue_flow`.
           links = Links.dedupe_issue_flow(links, f.flow_id)
         end
       end
       @resolved = Links.resolve_all(store, links)
       @selected = @selected.clamp(0, {@resolved.size - 1, 0}.max)
-    end
-
-    def empty? : Bool
-      @resolved.empty?
     end
 
     def count : Int32
@@ -100,10 +110,16 @@ module Gori::Tui
     end
 
     def hint : String
-      adding? ? ADD_HINT : BROWSE_HINT
+      return ADD_HINT if adding?
+      @owner_kind.issue? ? BROWSE_HINT : NOTE_BROWSE_HINT
     end
 
-    # Browse: ↑/↓ (or k/j) select · ↵/o open · a arms add · d removes · esc closes.
+    # Whether `f` means anything on this card — an issue's does, a note's does not.
+    def freezable_owner? : Bool
+      @owner_kind.issue?
+    end
+
+    # Browse: ↑/↓ (or k/j) select · ↵/o open · a arms add · f freezes · d removes · esc closes.
     # Adding: f/r/z/m choose the source, which hands off through on_close.
     def handle_key(ev : Termisu::Event::Key) : Symbol
       key = ev.key
@@ -116,12 +132,20 @@ module Gori::Tui
       when key.escape?             then return :cancel
       when key.up?, key.lower_k?   then move(-1)
       when key.down?, key.lower_j? then move(1)
-      when key.enter?              then return :commit
-      when ch == 'o'               then return :commit
+      when key.enter?, ch == 'o'   then return :commit
       when ch == 'd'               then on_remove.try(&.call)
       when ch == 'a'               then start_add
+      when ch == 'f'               then return arm_freeze
       end
       :stay
+    end
+
+    # `f`: arm the freeze and drop the card so `on_close` can do the work (#1038) — only
+    # with a row to freeze, so an empty card does not close itself on a stray key.
+    private def arm_freeze : Symbol
+      return :stay if @resolved.empty? || !freezable_owner?
+      @pending_freeze = true
+      :cancel
     end
 
     # Adding is a MODE, and the mouse has to respect it. `handle_key` forks to
@@ -146,12 +170,7 @@ module Gori::Tui
     end
 
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 88}.min
-      h = area.h - 2
-      return nil if w < 30 || h < 8
-      x = area.x + (area.w - w) // 2
-      y = area.y + (area.h - h) // 2
-      Rect.new(x, y, w, h)
+      area.card?(88, area.h - 2, 30, 8)
     end
 
     # Still mode-aware even though `handle_click` no longer reaches it while adding: this is
@@ -176,7 +195,7 @@ module Gori::Tui
       end
       Frame.card(screen, box, title, border: Theme.border_focus)
 
-      card_hint = adding? ? CARD_ADD_HINT : CARD_BROWSE_HINT
+      card_hint = adding? ? CARD_ADD_HINT : (freezable_owner? ? CARD_BROWSE_HINT : NOTE_CARD_BROWSE_HINT)
       screen.text(box.x + 2, box.y + 1, card_hint, Theme.muted, Theme.panel, width: box.w - 4)
       Frame.tee_divider(screen, box, box.y + 2)
 

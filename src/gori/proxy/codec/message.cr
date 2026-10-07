@@ -1,3 +1,5 @@
+require "../../ascii_bytes"
+
 module Gori::Proxy::Codec
   # A single header as it appeared on the wire (original case preserved).
   # Truth lives in the owning message's `raw_head`; this is a parsed projection
@@ -80,7 +82,10 @@ module Gori::Proxy::Codec
 
     # Is `token` one of `value`'s comma-separated members, with OWS trimmed? Byte-wise over the
     # value so a long `Connection`/`Upgrade` field costs no Array and no per-member String.
-    protected def self.list_member?(value : String, token : String) : Bool
+    # Public for classifiers that hold a raw head rather than a parsed `HeaderList` (notably
+    # the stored/replay WebSocket handshake predicate). Keeping the member grammar here makes
+    # a live parsed handshake and a raw stored one answer the same token question.
+    def self.list_member?(value : String, token : String) : Bool
       bytes = value.to_slice
       start = 0
       pos = 0
@@ -105,13 +110,10 @@ module Gori::Proxy::Codec
       return false unless to - from == token.bytesize
       needle = token.to_slice
       (to - from).times do |i|
-        return false unless lower(bytes.unsafe_fetch(from + i)) == lower(needle.unsafe_fetch(i))
+        a = AsciiBytes.downcase(bytes.unsafe_fetch(from + i))
+        return false unless a == AsciiBytes.downcase(needle.unsafe_fetch(i))
       end
       true
-    end
-
-    private def self.lower(b : UInt8) : UInt8
-      b >= 0x41_u8 && b <= 0x5a_u8 ? b | 0x20_u8 : b # ASCII 'A'..'Z'
     end
 
     private def self.ows?(b : UInt8) : Bool

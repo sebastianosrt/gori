@@ -46,7 +46,11 @@ module Gori
         abort "gori run fuzz: --brute MIN (#{min}) is greater than MAX (#{max})" if min > max
         # `BruteForce` floors MIN at 1 silently; `abc:0-2` then sent 12 payloads under a banner
         # that counted them, minus the empty string the operator asked for. Refused by name.
-        abort "gori run fuzz: --brute MIN must be at least 1 (got #{min}); use --null-payloads for an empty payload" if min < 1
+        abort "gori run fuzz: --brute MIN must be at least 1 (got #{min}); use --null N for empty payloads" if min < 1
+        # The length MCP clamps to: past it, one flag allocated gigabytes before any send.
+        if max > Fuzz::BruteForce::MAX_LEN
+          abort "gori run fuzz: --brute MAX (#{max}) exceeds the longest payload length, #{Fuzz::BruteForce::MAX_LEN}"
+        end
         Fuzz::BruteForce.new(charset, min, max)
       end
 
@@ -85,14 +89,42 @@ module Gori
 
       private def self.parse_rate(v : String) : Float64?
         n = v.to_f?
-        abort "gori run fuzz: invalid --rate '#{v}' (a non-negative number)" unless n && n >= 0
+        if msg = fuzz_rate_error(v, n)
+          abort msg
+        end
         n == 0 ? nil : n
+      end
+
+      # The decision is separate from `abort` so the invalid boundary is regression-testable.
+      # Crystal accepts Infinity as a Float64; treating it as an RPS cap makes the reciprocal
+      # pacing interval zero and silently turns the requested limiter off. MCP already refuses
+      # the same value at its argument boundary.
+      def self.fuzz_rate_error(v : String, n : Float64? = v.to_f?) : String?
+        return nil if n && n.finite? && n >= 0
+        "gori run: invalid --rate '#{v}' (a finite non-negative number)"
       end
 
       private def self.parse_nonneg(v : String, flag : String? = nil) : Int32
         n = v.to_i?
         abort "gori run: invalid #{flag || "count"} '#{v}' (expected a non-negative integer)" unless n && n >= 0
         n
+      end
+
+      # `--keep all|interesting` (issue #1240). Refused by name on a typo rather than degraded
+      # to a default — the same contract every other enum flag here holds.
+      private def self.parse_keep(v : String) : Fuzz::Keep
+        Fuzz::Keep.parse?(v) || abort "gori run fuzz: invalid --keep '#{v}' (all|interesting)"
+      end
+
+      # One `--stop-on DIM:SPEC` term, folded into the run's stop-condition matcher `m`. The
+      # grammar's one home is `Fuzz.apply_stop_term` (shared with the TUI Advanced row); this
+      # only turns its error sentence into the command's `abort`. A repeated dimension is refused
+      # there (the terms AND, so a second `status:` would silently replace the first); a
+      # value-level typo flows through `Matcher#spec_error` with every other dimension.
+      private def self.parse_stop_on(spec : String, m : Fuzz::Matcher) : Nil
+        if err = Fuzz.apply_stop_term(spec, m)
+          abort "gori run fuzz: #{err}"
+        end
       end
 
       private def self.parse_regex_replace(v : String) : Fuzz::RegexReplace

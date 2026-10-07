@@ -5,6 +5,7 @@ require "../proxy/h2/head_codec"
 require "../proxy/h2/grpc"
 require "../proxy/codec/http1"
 require "./engine"
+require "../url"
 
 module Gori
   module Repeater
@@ -291,13 +292,14 @@ module Gori
       # failure, so nothing is lost but the earlier report.
       def self.dial(scheme : String, host : String, port : Int32, verify : Bool,
                     sni : String?, timeout : Time::Span?, overrides : Gori::HostOverrides?,
-                    tls_preset : String?) : {Conn?, String?}
-        upstream, dial_failure = open(scheme, host, port, verify, sni, timeout, overrides, tls_preset)
+                    tls_preset : String?, cancel : Proc(Bool)? = nil) : {Conn?, String?}
+        upstream, dial_failure = open(scheme, host, port, verify, sni, timeout, overrides,
+          tls_preset, cancel)
         unless upstream
           return {nil, connect_error(scheme, host, port, verify, dial_failure)}
         end
         begin
-          {Conn.new(upstream), nil}
+          {Proxy::Upstream.with_cancel(upstream, cancel) { Conn.new(upstream) }, nil}
         rescue ex
           upstream.close rescue nil
           {nil, ex.message || "h2 connect failed"}
@@ -328,15 +330,19 @@ module Gori
                     overrides : Gori::HostOverrides? = nil,
                     preserve_field_case : Bool = false,
                     reframe_grpc : Bool = false,
-                    tls_preset : String? = nil) : Result
+                    tls_preset : String? = nil,
+                    cancel : Proc(Bool)? = nil) : Result
         started = Time.instant
-        upstream, dial_failure = open(scheme, host, port, verify_upstream, sni, timeout, overrides, tls_preset)
+        upstream, dial_failure = open(scheme, host, port, verify_upstream, sni, timeout,
+          overrides, tls_preset, cancel)
         unless upstream
           return failure(connect_error(scheme, host, port, verify_upstream, dial_failure), started)
         end
         begin
           headers, body = parse_request(request, scheme, host, port, preserve_field_case, reframe_grpc)
-          exchange(Conn.new(upstream), headers, body, host, port, started, timeout)
+          Proxy::Upstream.with_cancel(upstream, cancel) do
+            exchange(Conn.new(upstream), headers, body, host, port, started, timeout)
+          end
         rescue ex
           failure(ex.message || "h2 repeater error", started)
         ensure
@@ -363,14 +369,18 @@ module Gori
       def self.send_fields(fields : Array({String, String}), body : Bytes?, *, scheme : String,
                            host : String, port : Int32, verify_upstream : Bool, sni : String? = nil,
                            timeout : Time::Span? = nil, overrides : Gori::HostOverrides? = nil,
-                           tls_preset : String? = nil) : Result
+                           tls_preset : String? = nil,
+                           cancel : Proc(Bool)? = nil) : Result
         started = Time.instant
-        upstream, dial_failure = open(scheme, host, port, verify_upstream, sni, timeout, overrides, tls_preset)
+        upstream, dial_failure = open(scheme, host, port, verify_upstream, sni, timeout,
+          overrides, tls_preset, cancel)
         unless upstream
           return failure(connect_error(scheme, host, port, verify_upstream, dial_failure), started)
         end
         begin
-          exchange(Conn.new(upstream), fields, body, host, port, started, timeout)
+          Proxy::Upstream.with_cancel(upstream, cancel) do
+            exchange(Conn.new(upstream), fields, body, host, port, started, timeout)
+          end
         rescue ex
           failure(ex.message || "h2 repeater error", started)
         ensure
@@ -421,7 +431,7 @@ module Gori
         # thrown away. A 1xx also means the origin already has the whole request (gori writes it
         # up front), so this failure is DELIVERED: re-sending would double a side effect.
         unless reply.final_seen
-          return Result.new(Bytes.new(0), nil, nil, elapsed(started),
+          return Result.new(Bytes.new(0), nil, nil, Engine.elapsed(started),
             no_response(reply, flow, host, port),
             delivered: reply.status != 0, timed_out: reply.timed_out)
         end
@@ -434,7 +444,7 @@ module Gori
         # event entirely. The head and body stay on the Result; the reason rides alongside —
         # and so does the send-side accounting, because a 413 that the origin returned WHILE
         # the body was still going out is a real response to a request gori did not finish.
-        Result.new(head, reply.body, resp, elapsed(started),
+        Result.new(head, reply.body, resp, Engine.elapsed(started),
           error: send_side_reason(reply, flow, host, port),
           incomplete: !reply.clean_eos, delivered: true, timed_out: reply.timed_out)
       end
@@ -592,13 +602,14 @@ module Gori
       private def self.open(scheme : String, host : String, port : Int32, verify : Bool,
                             sni : String? = nil, timeout : Time::Span? = nil,
                             overrides : Gori::HostOverrides? = nil,
-                            tls_preset : String? = nil) : {IO?, DialFailure?}
+                            tls_preset : String? = nil,
+                            cancel : Proc(Bool)? = nil) : {IO?, DialFailure?}
         ct = timeout || Settings.connect_timeout
         it = timeout || Settings.io_timeout
         if scheme == "https"
           ssl, err = Proxy::Upstream.dial_tls_result(host, port, verify: verify, alpn: "h2",
             sni: sni, connect_timeout: ct, io_timeout: it, overrides: overrides,
-            tls_preset: tls_preset)
+            tls_preset: tls_preset, cancel: cancel)
           unless ssl
             return {nil, DialFailure.new(dial_error: err || Proxy::Upstream::DialError::ORIGIN_UNREACHABLE)}
           end
@@ -1177,11 +1188,13 @@ module Gori
       # same wire, so the two surfaces answered differently about one response. `absorb` now
       # hands back THIS BLOCK's status instead of folding it into the running one, which is
       # what makes "a trailing block may not restate the status" expressible at all.
-      private def self.merge_block(header_buf : IO::Memory, decoder : HPACK::Decoder,
-                                   headers : Array({String, String}), status : Int32,
-                                   final_seen : Bool, trailers : Array(String)?,
-                                   late_interim : Int32?, trailer_pseudo : Array(String)?,
-                                   end_stream_pending : Bool) : {Int32, Bool, Array(String)?, Int32?, Array(String)?}
+      # PUBLIC for the single-packet reader's `PacketStream` (`h2_race.cr`), which reassembles
+      # one stream out of N interleaved on a single connection and needs the same block-folding.
+      def self.merge_block(header_buf : IO::Memory, decoder : HPACK::Decoder,
+                           headers : Array({String, String}), status : Int32,
+                           final_seen : Bool, trailers : Array(String)?,
+                           late_interim : Int32?, trailer_pseudo : Array(String)?,
+                           end_stream_pending : Bool) : {Int32, Bool, Array(String)?, Int32?, Array(String)?}
         count_before = headers.size
         block_status, names, pseudo = absorb(header_buf, decoder, headers)
         if final_seen
@@ -1384,11 +1397,7 @@ module Gori
         head_bytes, body = split_head_body(request)
         lines = String.new(head_bytes).split('\n').map(&.rstrip('\r'))
         line = lines[0]? || "GET / HTTP/2"
-        parsed_method, parsed_path = HeadCodec.request_line(line)
-        # No space at all is not a request line; keep the whole token as the method rather
-        # than inventing one, which is what a `:method` probe (`GET\r\n…`) would want to see.
-        method = parsed_method || line
-        path = parsed_path || "/"
+        method, path = HeadCodec.request_pseudo(line)
 
         # An explicit `Host:` header maps to `:authority` (RFC 9113 §8.3.1 — h2 has no
         # Host field). Honor its value so editing the request's host (a vhost /
@@ -1444,7 +1453,7 @@ module Gori
         end
 
         headers = [{":method", method}, {":path", path}, {":scheme", scheme},
-                   {":authority", authority_override || authority(host, port, scheme)}]
+                   {":authority", authority_override || Gori::Url.authority(scheme, host, port)}]
         # RFC 8441 §4: `:protocol` is a pseudo-header, so it belongs in this block and never
         # among the regular fields (§8.3 requires every pseudo to precede them).
         protocol.try { |p| headers << {":protocol", p} }
@@ -1595,19 +1604,6 @@ module Gori
         end
       end
 
-      # PUBLIC: `send_fields` injects no pseudo-headers (that is its whole point), so a
-      # caller that BUILDS a field list — `Protobuf::Reflection` — has to write `:authority`
-      # itself, and the IPv6 bracketing / default-port rule below is exactly the one it must
-      # not re-derive differently.
-      def self.authority(host : String, port : Int32, scheme : String) : String
-        default = scheme == "https" ? 443 : 80
-        # An IPv6 literal host must be bracketed in the :authority pseudo-header, else the
-        # colons collide with the port separator and a strict server rejects the stream
-        # (mirrors FlowRequest.build_target's h1 bracketing).
-        h = host.includes?(':') && !host.starts_with?('[') ? "[#{host}]" : host
-        port == default ? h : "#{h}:#{port}"
-      end
-
       # Split at the first CRLFCRLF (head/body boundary); the editor always joins
       # lines with CRLF, so the blank line is exact.
       private def self.split_head_body(bytes : Bytes) : {Bytes, Bytes?}
@@ -1666,7 +1662,7 @@ module Gori
       end
 
       private def self.failure(message : String, started : Time::Instant) : Result
-        Result.new(Bytes.new(0), nil, nil, elapsed(started), message)
+        Result.new(Bytes.new(0), nil, nil, Engine.elapsed(started), message)
       end
 
       # Why an h2 send has no connection.
@@ -1702,10 +1698,6 @@ module Gori
                  "HTTP/1.1 instead, or use h2c (http://) if the origin takes prior-knowledge h2"
         end
         Engine.connect_error(scheme, host, port, verify, failure.try(&.dial_error))
-      end
-
-      private def self.elapsed(started : Time::Instant) : Int64
-        (Time.instant - started).total_microseconds.to_i64
       end
     end
   end

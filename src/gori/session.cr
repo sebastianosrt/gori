@@ -10,6 +10,7 @@ require "./saved_views"
 require "./scope"
 require "./host_overrides"
 require "./env"
+require "./session_refresh"
 require "./interceptor"
 require "./probe"
 require "./proxy/server"
@@ -49,6 +50,11 @@ module Gori
     # as" has to be one answer across the Authorize tab, a Repeater send and the proxy's
     # intercept forward, not one per surface.
     getter slots : SessionSlots
+    # The slots' REFRESH runner (#1233): replays a slot's Repeater steps on ^R in the slot
+    # picker, and before a send when the slot's policy says its token is about to expire.
+    # Installed as `SessionRefresh.hook` for the life of this session, beside `Env.layer`, and
+    # gated through `Outbound.interactive` — the TUI's own Layer 1, Sandbox still applying.
+    getter refresher : SessionRefresh::Runner
     getter scope : Scope
     getter host_overrides : HostOverrides
     getter interceptor : Interceptor
@@ -61,6 +67,13 @@ module Gori
     # `build_listener`: a colour rule never touches a byte on the wire, so a listener has no
     # business naming it.
     getter colormarker : Colormarker
+    # What the open-time token-grammar reconcile did to this project's stored tokens, or nil when
+    # it had nothing to do (the marker already agreed with `Settings.env_syntax`). Reported by the
+    # surface that opened the session — the TUI on its status line and in the notification ring,
+    # `gori run capture` through `Log` — because only they know which channel the operator is
+    # watching. See `EnvMigration.reconcile`.
+    property env_syntax_migration : EnvMigration::StoreReport? = nil
+
     # Why the live proxy isn't listening (e.g. "port in use"), or nil when capture
     # is up. The project still opens for History/Repeater/Sitemap/etc. — only live
     # capture needs the bind — so a bind failure is non-fatal.
@@ -76,6 +89,14 @@ module Gori
         authorize_events: authorize_events)
       probe = nil.as(Probe::Analyzer?)
       begin
+        # THE token-grammar reconcile, and it runs FIRST — before the rule sets, the slots, the
+        # binding table and the project env layer are read out of this store. Those objects are what
+        # this session sends with, so re-spelling the rows after they were loaded would leave a live
+        # session sending the old spelling until something reloaded it. `Store.open` is not the seam
+        # for this (half its callers open read-only, to compare or to count), so each of the three
+        # surfaces that opens a project to WORK in it asks here; the marker in the database is what
+        # makes the second of them a no-op. See `EnvMigration.reconcile`.
+        syntax_migration = EnvMigration.reconcile(store, project.db_path, project.name)
         # Per-project network overrides: pull this project's pinned bind/upstream (if any) into
         # the Settings runtime layer BEFORE binding, so the proxy listens on the project's address
         # and Upstream.dial (reads Settings.upstream_route) tunnels through its upstream.
@@ -178,7 +199,7 @@ module Gori
               "another gori instance already holds this database's capture lock"
             end
           rescue ex
-            # CaptureLock.try itself failed (can't create/open the lock file) — not a
+            # CaptureLock.try_at itself failed (can't create/open the lock file) — not a
             # bind issue; release anything we opened and report it.
             lock.try(&.close) rescue nil
             lock = nil
@@ -201,6 +222,10 @@ module Gori
           store.pause_background_index
         end
         session = new(config, ca, registry, project, store, proxy, tunnel, events, probe, rules, bindings, slots, scope, host_overrides, interceptor, sink, authorize_events, bind_error, lock, extra, listener_errs)
+        # Carried rather than emitted: `Session.open` has no channel to speak on (the TUI's
+        # notification ring does not exist yet, and `gori run capture` writes to `Log`), so the
+        # surface that opened the project reads it off the session and says it its own way.
+        session.env_syntax_migration = syntax_migration
         session.sync_capture_status!
         session
       rescue ex
@@ -210,6 +235,7 @@ module Gori
         # The binding layer is cleared with them: a half-opened project must not leave a
         # dangling table whose `$KEY`s the next surface would happily resolve.
         Env.layer = nil
+        SessionRefresh.hook = nil
         lock.try(&.close) rescue nil
         probe.try(&.stop) rescue nil
         store.close rescue nil
@@ -264,6 +290,9 @@ module Gori
       @intercept_token = Random::Secure.hex(8)
       @listeners_applied = Settings.listeners.dup
       @colormarker = Colormarker.load(@store)
+      scope = @scope
+      @refresher = SessionRefresh::Runner.new(@store, @bindings, -> { Outbound.interactive(scope) },
+        overrides: @host_overrides, verify: !@config.insecure_upstream?).install
     end
 
     # True when the `listeners` section on disk no longer matches the one these sockets were
@@ -478,11 +507,12 @@ module Gori
       @config.insecure_upstream = !verify
       @tunnel.verify_upstream = verify
       @probe.verify_upstream = verify
+      @refresher.verify = verify
     end
 
     # Flip the direct-access info page live (settings:network toggle). Pushed to the
-    # capture proxy's TLS tunnel, which ClientConn reads per request via the TlsMitm
-    # seam — so the next direct hit picks it up with no restart. Global; the persisted
+    # capture proxy's TLS tunnel, which ClientConn reads per request via `Tls::Tunnel`
+    # — so the next direct hit picks it up with no restart. Global; the persisted
     # Settings.serve_landing is the source of truth across restarts.
     def set_serve_landing(enabled : Bool) : Nil
       @tunnel.serve_landing = enabled
@@ -527,7 +557,8 @@ module Gori
     # live bind address. No-op when this session doesn't hold the capture lock.
     def sync_capture_status! : Nil
       return unless capturing_lock_held?
-      CaptureStatus.write_at(@project.capture_status_path, @proxy.host, @proxy.port, capturing?)
+      CaptureStatus.write_at(@project.capture_status_path, @proxy.host, @proxy.port, capturing?,
+        @ca.ca_cert_path)
     rescue
       # The capture-status file is a purely informational sidecar; a write failure
       # (disk full, dir vanished) must not abort session open / capture toggle / settings.
@@ -539,6 +570,7 @@ module Gori
       # against a closed project's table would be the worst kind of cross-project leak.
       # The values themselves die with the object — nothing wrote them anywhere.
       Env.layer = nil if Env.layer.same?(@bindings)
+      @refresher.uninstall
       @interceptor.release_all # unblock held fibers FIRST so they can write final rows
       @proxy.stop
       stop_extra_listeners
@@ -546,7 +578,7 @@ module Gori
       # Best-effort: a delete failure here must not skip the lock/probe/store teardown below
       # (which would leak the flock + writer fiber + fibers) or, via a caller's `ensure`,
       # replace the real exception being unwound.
-      (CaptureStatus.clear_at(@project.capture_status_path) if capturing_lock_held?) rescue nil
+      (File.delete?(@project.capture_status_path) if capturing_lock_held?) rescue nil
       # Stop Probe FIRST so its active workers wind down and its passive fiber stops issuing
       # get_flow against a live DB; this also closes the probe_events channel it consumes.
       @probe.stop

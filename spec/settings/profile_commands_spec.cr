@@ -47,8 +47,9 @@ describe Gori::Settings::RewriterRule do
     pipe_rule("./resign.sh").command.should eq("./resign.sh")
     pipe_rule("x").copy_with(op: "replace").executes?.should be_false
     pipe_rule("x").copy_with(op: "replace").command.should be_nil
-    # from_label is total — an unrecognised label reads as `replace`, never raises.
-    pipe_rule("x").copy_with(op: "not-an-op").executes?.should be_false
+    # An unknown op counts as might-execute for the command gate so profile import cannot bypass --allow-commands
+    pipe_rule("x").copy_with(op: "not-an-op").executes?.should be_true
+    pipe_rule("x").copy_with(op: "not-an-op").command.should eq("x")
   end
 end
 
@@ -109,8 +110,8 @@ describe "Settings.command_rules — a rewriter pipe rule" do
     # `clamp_field` downcases, so `PIPE` becomes a live pipe rule on import — reporting it as
     # anything else would be a second description of the parse.
     rules_in(%({"rewriter":{"rules":[{"id":1,"enabled":true,"pattern":"a","replacement":"/bin/echo","op":"PIPE"}]}})).size.should eq(1)
-    # An unrecognised op clamps to `replace`, which runs nothing.
-    rules_in(%({"rewriter":{"rules":[{"id":1,"enabled":true,"pattern":"a","replacement":"/bin/echo","op":"nope"}]}})).should be_empty
+    # An unrecognised op counts as might-execute for the command gate (to avoid bypassing --allow-commands)
+    rules_in(%({"rewriter":{"rules":[{"id":1,"enabled":true,"pattern":"a","replacement":"/bin/echo","op":"nope"}]}})).size.should eq(1)
   end
 
   it "does not report an entry the parse would DROP" do
@@ -128,16 +129,6 @@ describe "Settings.command_rules — a rewriter pipe rule" do
     rules_in(%({"decoder":{"chains":[{"name":"c","spec":"base64-decode > exec:"}]}})).should be_empty
   end
 
-  it "reports a pre-upgrade `presets` block, which imports DISABLED" do
-    found = rules_in(<<-JSON)
-      { "rewriter": { "presets": [
-        { "name": "legacy", "pattern": "a", "replacement": "/bin/echo", "op": "pipe" } ] } }
-      JSON
-    found.size.should eq(1)
-    found[0].name.should eq("legacy")
-    found[0].enabled.should be_false
-  end
-
   it "does not report THIS INSTALL'S rules for a node of the wrong shape" do
     with_global_rules do
       Gori::Settings.rewriter_rules = [pipe_rule("/usr/local/bin/mine")]
@@ -145,7 +136,6 @@ describe "Settings.command_rules — a rewriter pipe rule" do
       # report the operator's own hook as though the profile carried it — and refuse the import
       # over a rule already on their disk.
       rules_in(%({"rewriter":{"rules":"nonsense"}})).should be_empty
-      rules_in(%({"rewriter":{"presets":42}})).should be_empty
       rules_in(%({"rewriter":[]})).should be_empty
       rules_in(%({"rewriter":{}})).should be_empty
     end
@@ -305,17 +295,29 @@ end
 #
 # Counts, not just filenames, so a SECOND spawn added to an already-classified file is caught
 # too. Comment lines are skipped: `process_hook.cr`'s own doc block quotes the call it makes.
+#
+# `ProcessHook.run` counts as a spawn site as well, and that is not pedantry: it IS the fork,
+# one indirection down, and a guard keyed only on the two `Process.*` spellings had already
+# stopped asking its question — the Codex delivery route reached `lsof` and `codex queue`
+# through the hook and never appeared here at all. Whether the program is settings-derived is
+# the same question either way; only the spelling differed.
 private SPAWN_SITES = {
   # settings-derived — every one of these sections MUST be in COMMAND_SECTIONS
   "src/gori/process_hook.cr"                          => {1, "rewriter/scan_rules/decoder"},
+  "src/gori/rules.cr"                                 => {1, "rewriter"},
+  "src/gori/decoder/chain.cr"                         => {1, "decoder"},
+  "src/gori/probe/custom_rule.cr"                     => {1, "scan_rules"},
   "src/gori/cli/settings.cr"                          => {1, "editor"},
-  "src/gori/tui/runner.cr"                            => {1, "editor"},
-  "src/gori/tui/controllers/statusline_controller.cr" => {1, "statusline"},
+  "src/gori/tui/runner.cr"                            => {2, "editor"},     # + Open shell's `gori run shell` (#1238)
+  "src/gori/tui/controllers/statusline_controller.cr" => {2, "statusline"}, # /bin/sh, or cmd.exe on Windows
   # NOT settings-derived: the program is discovered, hardcoded, or comes off the wire
   "src/gori/browser.cr"                  => {2, nil}, # a detected browser; certutil
   "src/gori/tui/runner/external_open.cr" => {1, nil}, # hardcoded open/xdg-open
   "src/gori/update.cr"                   => {3, nil}, # tar, and the release manifest's own step
   "src/gori/update/channel.cr"           => {1, nil}, # the platform package manager
+  "src/gori/miner/inject.cr"             => {1, nil}, # a mine RUN's own `hook` argument
+  "src/gori/mcp/codex_queue.cr"          => {2, nil}, # lsof, and the codex CLI found on PATH
+  "src/gori/cli/run/shell.cr"            => {1, nil}, # Windows: $SHELL/%COMSPEC% or the operator's -- CMD
 }
 
 describe "Settings::COMMAND_SECTIONS" do
@@ -335,16 +337,17 @@ describe "Settings::COMMAND_SECTIONS" do
   end
 
   it "has a spawn-site table that still matches the tree" do
-    # Fails on a NEW `Process.new`/`Process.run` anywhere under src/, and on one added to a
-    # file already listed. The fix is to classify it above — and if it reads a setting, to put
+    # Fails on a NEW `Process.new`/`Process.run`/`ProcessHook.run` anywhere under src/, and on
+    # one added to a file already listed. The fix is to classify it above — and if it reads a setting, to put
     # that section in COMMAND_SECTIONS so both ends of a profile report it.
     root = File.expand_path(File.join(__DIR__, "..", ".."))
     actual = Hash(String, Int32).new(0)
-    Dir.glob(File.join(root, "src", "**", "*.cr")).sort.each do |path|
-      rel = path.sub("#{root}/", "")
+    glob_files(root, "src", "**", "*.cr").sort.each do |path|
+      rel = Path[path].relative_to(root).to_posix.to_s
       File.read_lines(path).each do |line|
         next if line.lstrip.starts_with?('#')
-        actual[rel] += 1 if line.includes?("Process.new(") || line.includes?("Process.run(")
+        actual[rel] += 1 if line.includes?("Process.new(") || line.includes?("Process.run(") ||
+                            line.includes?("ProcessHook.run(")
       end
     end
     expected = SPAWN_SITES.transform_values { |(count, _)| count }

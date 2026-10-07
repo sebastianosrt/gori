@@ -19,9 +19,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     history_controller.move_selection(delta)
   end
 
-  def open_detail : Nil
-    history_controller.open_detail
-  end
+  forward open_detail : Nil, to: history_controller
 
   # Pins the flow on screen for the rest of this event (`@detail_pin`, runner.cr): the verbs
   # that close the detail and then jump resolve their target AFTER this returns, when the
@@ -31,34 +29,27 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     history_controller.close_detail
   end
 
-  def toggle_follow : Nil
-    history_controller.toggle_follow
+  # `⇧N`/`⇧P` in the drill-in — the next/previous flow, in place. `@detail_pin` is deliberately
+  # NOT set: unlike `close_detail`, this stays in the detail, and the pin exists for verbs
+  # that leave it and then resolve a target.
+  def detail_step_item(delta : Int32) : Nil
+    history_controller.detail_step_item(delta)
   end
 
-  def selected_flow_id : Int64?
-    history_controller.selected_flow_id
-  end
+  forward toggle_follow : Nil,
+    selected_flow_id : Int64?,
+    to: history_controller
 
   # --- multi-select marks (#442) ---
   def selected_flow_ids : Array(Int64)
     history_target_flow_ids
   end
 
-  def marked_flow_count : Int32
-    history_controller.marked_flow_count
-  end
-
-  def history_mark_toggle : Nil
-    history_controller.history_mark_toggle
-  end
-
-  def history_mark_all : Nil
-    history_controller.history_mark_all
-  end
-
-  def history_mark_clear : Nil
-    history_controller.history_mark_clear
-  end
+  forward marked_flow_count : Int32,
+    history_mark_toggle : Nil,
+    history_mark_all : Nil,
+    history_mark_clear : Nil,
+    to: history_controller
 
   def history_mark_extend(delta : Int32) : Nil
     history_controller.history_mark_extend(delta)
@@ -72,9 +63,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     ids.size > 1 ? history_controller.copy_urls(ids) : history_controller.copy_selection(ids.first?)
   end
 
-  def history_query : Nil
-    history_controller.history_query
-  end
+  forward history_query : Nil, to: history_controller
 
   # `v` — see runner/views.cr for the picker and the whole view-editing surface.
   def history_view_pick : Nil
@@ -92,13 +81,9 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     history_controller.grpc_reflect
   end
 
-  def history_delete : Nil
-    history_controller.history_delete
-  end
-
-  def history_clear : Nil
-    history_controller.history_clear
-  end
+  forward history_delete : Nil,
+    history_clear : Nil,
+    to: history_controller
 
   def scroll_detail(delta : Int32) : Nil
     # The two-level detail (HistoryController#handle_detail_body_key/strip_key) now owns
@@ -109,19 +94,17 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     history_controller.scroll_detail(delta)
   end
 
-  def detail_copy : Nil
-    history_controller.detail_copy
-  end
-
-  def toggle_detail_pane : Nil
-    history_controller.toggle_detail_pane
-  end
+  forward detail_copy : Nil,
+    toggle_detail_pane : Nil,
+    to: history_controller
 
   def move_detail_pane(dir : Int32) : Nil
     history_controller.move_detail_pane(dir)
   end
 
-  def toggle_detail_hex : Nil
-    history_controller.toggle_detail_hex
+  forward toggle_detail_hex : Nil, to: history_controller
+
+  def toggle_unicode_escapes : Nil
+    history_controller.toggle_unicode_decoding
   end
 end

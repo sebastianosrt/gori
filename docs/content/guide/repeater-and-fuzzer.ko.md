@@ -5,6 +5,7 @@ weight = 20
 
 [extra]
 group = "핵심"
+shot = "repeater"
 +++
 
 흥미로운 플로우를 캡처했다면, **Repeater**와 **Fuzzer**가 그 플로우를 테스트하는 곳입니다.
@@ -13,16 +14,24 @@ group = "핵심"
 
 Repeater는 요청 워크벤치입니다. 플로우를 보내고, 요청의 어느 부분이든 편집한 뒤, 다시 보냅니다. 응답, 소요 시간, 이전 응답과의 diff가 나란히 표시됩니다. 세션은 프로젝트와 함께 유지되므로 나중에 다시 돌아올 수 있습니다.
 
-세션이 수십 개 쌓이면 칩 스트립이 스크롤되기 시작하고, `←`/`→`로 훑어 찾는 건 더 이상 현실적이지 않습니다. 스트립 위 어느 칩에서든 **`f`**를 누르면 전체 세션 목록이 뜹니다. 타이핑하면 이름·메서드·경로·대상 호스트·`#태그`로 걸러지고, `Enter`로 고른 세션으로 점프합니다. 같은 목록이 스트립 왼쪽 끝의 **`⌕`** 뒤에도 있습니다. 클릭하거나, 첫 칩에서 `←`로 이동하면 됩니다. Fuzzer, Notes, Decoder, JWT, Comparer, Miner, Sequencer 등 모든 워크벤치 스트립에 동일하게 있습니다.
+**curl 명령을 붙여넣어** 시작할 수도 있습니다. Space → **Paste cURL**(`U`)이나 팔레트에서 붙여넣기 상자를 열고 붙여넣은 뒤 `Enter`를 누르면 요청마다 새 서브탭이 열립니다. 모든 플래그를 curl 자신의 의미로 읽고(`-b`는 쿠키, `-d`는 본문, `-u`는 basic 인증, `-G`는 데이터를 쿼리로 옮김), `-H` 줄은 입력한 그대로 순서도 유지하며, curl 자체의 `User-Agent`/`Accept`는 넣지 않습니다. 그래서 **Copy as → cURL**로 내보낸 요청이 바이트 그대로 돌아옵니다. 셸처럼 `\`로 끝나거나 따옴표가 열린 명령에서는 `Enter`가 다음 줄로 이어집니다. 전송 플래그(`-k`, `-x`, `-L`, `--resolve`, 타임아웃)는 gori가 자체 네트워크 설정으로 보내므로 무시하고 상태줄에 이름을 밝히며, 로컬 파일을 읽는 플래그(`-d @body.json`, `-F f=@a.png`, `-T`)는 이유와 함께 거부합니다. gori는 명령을 해석할 뿐 실행하지 않습니다.
+
+**GraphQL 엔드포인트에 스키마를 물어보는** 쿼리도 직접 칠 필요가 없습니다. 그 엔드포인트로 가는 요청이 담긴 탭에서 `Ctrl-P` → **GraphQL: insert introspection query**를 고르면, 요청이 같은 경로로 표준 introspection 쿼리(GraphiQL이 보내는 그 쿼리)를 `POST`하는 요청으로 바뀝니다. 대상, 활성 세션 슬롯, 그 밖의 모든 헤더는 각자의 줄 끝까지 그대로 남으므로, 쿼리는 지금 테스트 중인 세션으로 나갑니다. 바뀌는 것은 `Content-Type`과 `Content-Length`뿐이고, GET 바인딩의 `query`/`variables`/`operationName` 파라미터는 요청 줄에서 빠집니다. **GraphQL: insert legacy introspection query**는 모르는 필드 하나 때문에 쿼리 전체를 실패시키는 구형 서버를 위해 `subscriptionType`과 directives 블록을 뺍니다. 어느 쪽이든 되돌릴 수 있는 편집 한 번(`Ctrl-Z`)이고, `Ctrl-R`을 누르기 전에는 아무것도 보내지 않습니다. hex·WebSocket·gRPC·SAML 탭이나 `%%%` 그룹을 담은 탭에서는 이유와 함께 거부합니다.
+
+세션이 수십 개 쌓이면 칩 스트립이 스크롤되기 시작하고, `←`/`→`로 훑어 찾는 건 더 이상 현실적이지 않습니다. 스트립 위 어느 칩에서든 **`f`**를 누르면 전체 세션 목록이 뜹니다. 타이핑하면 이름·메서드·경로·대상 호스트·`#태그`로 걸러지고, `Enter`로 고른 세션으로 점프합니다. 같은 목록이 스트립 왼쪽 끝의 **`⌕`** 뒤에도 있습니다. 클릭하거나, 첫 칩에서 `←`로 이동하면 됩니다. Fuzzer, Notes, Decoder, JWT, Cookie, Comparer, Miner, Sequencer 등 모든 워크벤치 스트립에 동일하게 있습니다.
 
 서브탭은 일괄 처리를 위해 **마크**할 수도 있습니다. 스트립에서 `t`는 서 있는 칩을 마크하고 오른쪽으로 한 칸 이동하며, `Shift-T`는 `/` 필터가 보여주는 칩을 전부 마크하고, `Esc`는 스트립을 떠나기 전에 먼저 마크를 지웁니다. 마크된 칩에는 `▌` 막대가 붙습니다. 마크는 **서브탭 동작이 무엇에 작용하는지**를 바꾸는 것이지 동작 자체를 늘리는 게 아닙니다. History 목록이 이미 따르는 규칙과 같습니다.
 
 > 대상은 **마크가 있으면 마크 전부, 없으면 활성 칩**
 
-그래서 `Shift-T` → `Ctrl-W`는 열린 세션 전부를 confirm 한 번으로 닫고, `Ctrl-R`은 마크된 세션을 함께 보내며(각각 자기 연결로, 최대 20개, confirm 후), `Space` → `d`는 전부 복제하고, `Space` → `t`는 입력한 태그를 전부에 붙입니다. 스트립에서 연 space 메뉴는 `SPACE · 3 MARKED`로 읽히고 항목 이름이 스스로 바뀝니다(`Close 3 sub-tabs`, `Send 3 sub-tabs`). 단일 대상으로 남는 동작은 `(cursor)`라고 말합니다. 필터가 가리고 있는 마크는 조용히 닫히지 않고 confirm에 드러납니다. Fuzzer, Notes, Decoder, JWT, Cookie, Comparer, Miner, Sequencer 등 모든 워크벤치 스트립이 같은 방식으로 마크·닫기·복제하며, 전송은 Repeater의 것입니다.
+그래서 `Shift-T` → `Ctrl-W`는 열린 세션 전부를 confirm 한 번으로 닫고, `Ctrl-R`은 마크된 세션을 함께 보내며(각각 자기 연결로, 최대 20개, confirm 후), `Space` → `d`는 전부 복제하고, `Space` → `g`는 입력한 태그를 전부에 붙입니다(스트립의 `t`도, 메뉴의 `t`도 마크이므로 태그는 자기 글자를 따로 씁니다). 본문 패널에서는 같은 행들이 `Space` → `T`(**Sub-tabs…**) 아래 한 단계에 있습니다. 스트립에서 연 space 메뉴는 `SPACE · 3 MARKED`로 읽히고 항목 이름이 스스로 바뀝니다(`Close 3 sub-tabs`, `Send 3 sub-tabs`). 단일 대상으로 남는 동작은 `(cursor)`라고 말합니다. 필터가 가리고 있는 마크는 조용히 닫히지 않고 confirm에 드러납니다. Fuzzer, Notes, Decoder, JWT, Cookie, Comparer, Miner, Sequencer 등 모든 워크벤치 스트립이 같은 방식으로 마크·닫기를 하고, Sequencer를 뺀 나머지는 복제도 합니다. 전송은 Repeater의 것입니다.
+
+요청 패널에는 요청을 한 번에 여러 개 보내는 동작이 세 가지 있습니다. `Space` → `G`(**Race marked sub-tabs**)는 마크한 서브탭(최소 2개, 최대 20개)을 하나의 동기화된 레이스로 보냅니다. HTTP/1.1에서는 요청마다 자기 연결로 보내고 마지막 바이트를 함께 풀며, HTTP/2에서는 single-packet으로 보냅니다. 마크한 탭은 모두 같은 오리진과 전송을 써야 하고, 응답마다 타이밍이 함께 표시됩니다. 헤드리스에서는 `gori run repeater race <id> <id>…`([CLI Reference](/ko/reference/cli/#run-repeater)), MCP에서는 `race_requests`입니다. `Space` → `g`(**Send group (one connection)**)는 패널의 요청들을 단독 `%%%` 줄로 나눠 keep-alive 연결 하나로 파이프라이닝하고 각 응답을 보여 주며, HTTP/1.1 일반 텍스트 모드에서만 동작합니다.
+
+`Space` → `B`(**Timing analysis (A vs B)**)는 마크한 서브탭 정확히 두 개를 비교하는 **차등 타이밍** 테스트입니다. 스트립에서 앞쪽 칩이 A, 뒤쪽 칩이 B입니다. 보낼 쌍의 개수를 묻고(기본 30, 최대 500), 워밍업 쌍 3개를 버린 뒤, 매번 레이스처럼 A와 B를 함께 풀어 보냅니다(HTTP/2는 연결 하나로 single-packet, HTTP/1.1은 연결 둘로 last-byte sync). 그래서 네트워크와 서버 부하의 흔들림이 양쪽에 똑같이 걸립니다. 판정은 지연 시간이 아니라 **응답 순서**로 내립니다. A가 B보다 늦게 도착한 쌍이 몇 개인지를 세고, 양측 부호 검정이 p < 0.01을 넘어야 느린 쪽을 지목합니다. 카드는 `A consistently slower`, `B consistently slower`, `no measurable difference`, 또는 양쪽 응답이 모두 온 쌍이 20개 미만이면 `inconclusive`를 보여 주고, 그 옆에 변형별 최솟값·사분위수·최댓값과 분포를 함께 보여 줍니다. 숫자 하나로 끝나는 법은 없습니다. 어느 한쪽이 오류를 낸 쌍은 빠르거나 느린 것으로 세지 않고 버립니다. 레이스와 마찬가지로 두 탭은 같은 오리진과 전송을 써야 하고, 실행 중에는 `Esc`로 취소합니다. 헤드리스에서는 `gori run repeater timing <idA> <idB>`(`--count`, `--warmup`, 레이스 대신 A와 B를 번갈아 순서를 바꿔 가며 차례로 보내는 `--interleaved`, `--format json`), MCP에서는 `timing_requests`입니다.
 
 <figure class="tui-shot">
-  <img src="/images/tui/repeater.svg" alt="편집 가능한 HTTP/2 요청 패널, 헤더와 JSON 본문을 보여주는 응답 패널, 그리고 1152ms 만에 재전송된 200 상태 줄을 갖춘 gori Repeater 탭">
+  <img src="/images/tui/repeater.svg" alt="편집 가능한 HTTP/2 요청 패널, 헤더와 JSON 본문을 보여주는 응답 패널, 그리고 sent → 200 상태 줄을 갖춘 gori Repeater 탭">
   <figcaption><strong>Repeater</strong>: 왼쪽에 편집 가능한 요청, 오른쪽에 실시간 응답과 소요 시간, 이전 전송과의 diff.</figcaption>
 </figure>
 
@@ -30,8 +39,8 @@ Repeater는 HTTP/1 이상을 다룹니다.
 
 - **HTTP/2** 요청은 실제 h2 연결로 재전송됩니다.
 - **WebSocket** 리피터는 세션이 담고 있는 핸드셰이크(HTTP/1.1 위의 RFC 6455 `Upgrade:` 요청이든, HTTP/2 위의 RFC 8441 확장 `CONNECT`든)로 소켓을 연 뒤 메시지를 **한 번에 하나씩** 재생합니다. 하나를 보내고, 서버의 응답이 잠잠해질 때까지 받아낸 다음에야 그다음 메시지가 나갑니다.
-- **gRPC** 리피터는 프레이밍된 메시지를 위해 HTTP/2 엔진을 재사용합니다. 단항(unary) 호출(정확히 하나의 프레이밍된 메시지)은 `^X`로 페이로드를 헥스 편집할 수 있고, 디스크립터 셋이 그 rpc를 선언하고 있다면 `␣E`로 **필드 단위** 편집도 됩니다. 스키마가 아는 필드를 골라 값을 입력하면 그 필드만 다시 인코딩되고 나머지 바이트는 캡처에서 그대로 복사됩니다([`.proto`를 렌즈로](/ko/guide/proxy/#proto-schema)). 메시지가 0개이거나 여러 개인 본문은 그대로 재전송됩니다. 메시지 앞의 5바이트 길이 접두사는 요청 카드의 `␣F:FRAME` 토글이 결정합니다. 이 탭에서는 기본값이 **켜짐**이라, 편집한 단항 메시지가 올바른 형식으로 나가고 원본 서버가 호출을 받아들입니다. **끄면** 편집한 페이로드 앞에 캡처된 접두사가 그대로 붙습니다. 페이로드와 어긋나는 접두사 자체가 표준적인 gRPC 파서 테스트이기 때문입니다. 헤드리스에서는 기본값이 반대입니다. `gori run repeater send`(MCP `send_request`)는 `--reframe-grpc` / `reframe_grpc: true`를 주지 않는 한 접두사를 캡처된 그대로 보냅니다.
-- **decode** 모드는 편집된 SAML / GraphQL 페이로드를 전송 시 다시 인코드합니다. (JWT를 디코드하거나 편집하려면 [Decoder](/ko/guide/decoder/) 탭의 `jwt-decode`를 사용하세요.)
+- **gRPC** 리피터는 프레이밍된 메시지를 위해 HTTP/2 엔진을 재사용합니다. 단항(unary) 호출(정확히 하나의 프레이밍된 메시지)은 `^X`로 페이로드를 헥스 편집할 수 있고, 디스크립터 셋이 그 rpc를 선언하고 있다면 `␣Pf`로 **필드 단위** 편집도 됩니다. 스키마가 아는 필드를 골라 값을 입력하면 그 필드만 다시 인코딩되고 나머지 바이트는 캡처에서 그대로 복사됩니다([`.proto`를 렌즈로](/ko/guide/proxy/#proto-schema)). 메시지가 0개이거나 여러 개인 본문은 그대로 재전송됩니다. 메시지 앞의 5바이트 길이 접두사는 요청 카드의 `␣Pr:FRAME` 토글이 결정합니다. 이 탭에서는 기본값이 **켜짐**이라, 편집한 단항 메시지가 올바른 형식으로 나가고 원본 서버가 호출을 받아들입니다. **끄면** 편집한 페이로드 앞에 캡처된 접두사가 그대로 붙습니다. 페이로드와 어긋나는 접두사 자체가 표준적인 gRPC 파서 테스트이기 때문입니다. 헤드리스에서는 기본값이 반대입니다. `gori run repeater send`(MCP `send_request`)는 `--reframe-grpc` / `reframe_grpc: true`를 주지 않는 한 접두사를 캡처된 그대로 보냅니다.
+- **decode** 모드는 편집된 SAML / GraphQL 페이로드를 전송 시 다시 인코드합니다. (JWT를 디코드하거나 편집하려면 [JWT](/ko/guide/jwt/) 탭으로 보내세요. Decoder의 `jwt-decode`는 읽기만 합니다.)
 
 WebSocket에서는 이 "하나씩" 순서가 핵심입니다. 소켓은 대화를 실어 나르므로, 세 번째 메시지가 두 번째의 응답에 의존하는 스크립트는 gori가 그 사이에 기다려 줄 때만 충실하게 재생됩니다. 그리고 그때 트랜스크립트는 보낸 것 전부를 받은 것 전부보다 앞에 나열하는 대신 실제 전선 순서대로 읽힙니다. 여기서 세 가지가 따라옵니다.
 
@@ -49,26 +58,78 @@ gori run repeater <flow-id> --target https://staging.example.com --diff
 
 ## 환경 변수 {#environment-variables}
 
-아웃바운드 요청은 `$KEY` 스타일 치환을 지원합니다. 토큰은 에디터에서 리터럴 텍스트로 남아 있다가, Repeater, Fuzzer, Miner, Intercept 포워드, `gori run`, MCP `send_request`에서 전송 시점에만 확장됩니다.
+아웃바운드 요청은 네임스페이스로 구분되는 세 종류의 토큰을 실어 나릅니다.
 
-변수는 두 곳에서 정의합니다(키 충돌 시 프로젝트가 우선).
+| 토큰 | 해석 대상 | 시점 |
+|------|-----------|------|
+| `$ENV.KEY` | 전역 또는 프로젝트 환경 변수 | 빌드 시점, 요청을 구성하기 전 |
+| `$BIND.NAME` | extract 규칙이 채운 [세션 바인딩](/ko/guide/proxy/#session-bindings) | 전송 시점, 활성 신원의 테이블에서 |
+| `$GEN.NAME` | 내장 값 생성기 | 전송 시점, 아웃바운드 요청마다 한 번 |
+
+토큰은 에디터에서 리터럴 텍스트로 남아 있다가 나가는 길에서만 확장됩니다. Repeater, Fuzzer, Miner, Intercept 포워드, `gori run`, MCP `send_request`가 그 지점입니다. 캡처에서 연 Repeater 요청이나 Intercept에 잡힌 메시지에서는 캡처된 바이트에 원래 있던 토큰은 그대로 나가고, 직접 입력한 토큰만 확장됩니다.
+
+`GEN`은 Decoder 체인이나 저장된 시크릿 없이 보안 테스트에서 자주 쓰는 값을 만듭니다.
+
+| 토큰 | 출력 |
+|------|------|
+| `$GEN.UUID` | UUID v4 |
+| `$GEN.RANDOM` | 암호학적으로 안전한 unsigned 64비트 정수의 10진수 표현 |
+| `$GEN.RANDOM_HEX` | 암호학적으로 안전한 128비트 난수의 소문자 16진수 표현(32자) |
+| `$GEN.TIMESTAMP` | Unix 초 |
+| `$GEN.TIMESTAMP_MS` | Unix 밀리초 |
+| `$GEN.ISO8601` | 밀리초를 포함한 현재 UTC 시각의 RFC 3339 표현 |
+| `$GEN.USER_AGENT` | gori에 내장된 목록에서 무작위로 고른 실제 데스크톱 브라우저 User-Agent(Chrome, Edge, Firefox, Safari)입니다. 연속한 두 요청이 같은 값을 받을 수 있습니다. `https`/`wss` 요청의 TLS 프리셋(송신 자체의 것, 또는 목적지의 `outbound_tls` 규칙)이 `chrome`, `firefox`, `safari`면 그 브라우저의 값만 골라 헤더가 핸드셰이크와 어긋나지 않게 합니다. 공백이 들어 있으므로 요청 줄이 아니라 헤더에 넣어야 합니다 |
+| `$GEN.USER_AGENT_CHROME` | 위와 같되 Chrome·Edge로 좁힌 값으로, `chrome` TLS 프리셋과 짝을 이룹니다 |
+| `$GEN.USER_AGENT_FIREFOX` | 위와 같되 Firefox로 좁힌 값으로, `firefox` TLS 프리셋과 짝을 이룹니다 |
+| `$GEN.USER_AGENT_SAFARI` | 위와 같되 Safari로 좁힌 값으로, `safari` TLS 프리셋과 짝을 이룹니다 |
+
+직접 만든 목록에서 고르게 하려면 **Settings → Editor & Keys → User-Agents**(또는 `Ctrl-P` → **Settings: User-Agents**)를 열어 한 줄에 하나씩 User-Agent를 입력하거나, `gori settings user-agents --set FILE`을 실행합니다(`-`는 stdin에서 읽고, `--reset`은 내장 목록으로 되돌립니다). 직접 만든 목록은 내장 목록을 대체합니다. 해당 계열의 줄이 목록에 없는 패밀리 이름(예: Safari 줄이 없을 때의 `$GEN.USER_AGENT_SAFARI`)은 내장 패밀리를 그대로 씁니다. 브라우저 TLS 프리셋 아래에서 이름 그대로의 `$GEN.USER_AGENT`는 목록에서 그 브라우저의 줄을 쓰고, 그런 줄이 없으면 목록 전체를 씁니다. `gori settings user-agents`는 현재 쓰는 목록을 출력하고, MCP `list_env`는 그것이 직접 만든 목록인지 알려 줍니다.
+
+한 요청 안에서 같은 생성기 이름을 여러 번 쓰면 같은 값이 들어갑니다. 다음 요청에서는 다시 생성합니다. 생성기는 최종 전송 지점에서 운영자가 작성한 요청 텍스트에만 적용되며, 캡처 증거와 Fuzzer 페이로드 바이트는 리터럴로 유지됩니다.
+
+환경 변수는 두 곳에서 정의합니다(키 충돌 시 프로젝트가 우선).
 
 | 레이어 | 위치 |
 |-------|-------|
 | **Global** | Preferences(`Ctrl-,`) → **Editor & Keys** → **Env**, `Ctrl-P` → **Settings: Env**, 또는 `settings.json`의 `env` 섹션 |
 | **Project** | **Project** 탭 → **ENV** 패널 (`a` 추가, `e` 편집, `d` 삭제) |
 
-기본 접두사는 `$`입니다(ENV space 메뉴의 **Change prefix**나 설정의 `env.prefix`로 변경 가능). 키는 `A-Z a-z _`로 시작해 `A-Z a-z 0-9 _`가 이어집니다.
+네임스페이스는 대문자이며 대소문자를 구분합니다. 점 뒤의 이름은 `A-Z a-z _`로 시작해 `A-Z a-z 0-9 _`가 이어집니다. 시길은 기본값이 `$`이고(ENV 패널에서 팔레트로 찾는 **Change prefix**나 설정의 `env.prefix`로 변경 가능), 네임스페이스 표기는 바꿀 수 없습니다.
+
+시길로 시작하는 그 밖의 모든 것은 바이트입니다. GraphQL 변수(`$id`), MongoDB 연산자(`$ne`), OData 옵션(`$filter`), JSON Schema 키워드(`$ref`)는 참조가 아니므로 **이스케이프가 필요하지 않습니다**. 그런 바디는 붙여넣은 그대로 보내면 됩니다. 토큰의 텍스트 자체를 보내려면 시길을 두 번 씁니다. `$$ENV.KEY`는 `$ENV.KEY`를, `$$BIND.NAME`은 `$BIND.NAME`을 보내고, `$$`만 있으면 리터럴 두 바이트입니다. 각 패스는 자기 이스케이프만 소비하므로 `$$BIND.NAME`은 환경 변수 확장을, `$$ENV.KEY`는 바인딩 패스를 그대로 통과합니다.
+
+"bare `$NAME`은 그냥 바이트"라는 규칙은 **요청 텍스트**(바디, 헤더, 붙여넣은 페이로드)에 대한 것입니다. [Match & Replace](/ko/guide/proxy/#match-replace)의 **치환 텍스트**에서는 그렇지 않습니다. 그 칼럼은 값을 주입하는 것만이 목적이므로, 알려진 환경 변수·extract 규칙·세션 슬롯이 주장하는 이름을 bare `$NAME`으로 적어 두었다면 그건 문법이 바뀐 뒤 남은 규칙입니다. gori는 **그 규칙을 적용하지 않고** 다시 적어야 할 철자를 알려주는 이벤트를 남깁니다. `$ENV.NAME` / `$BIND.NAME`으로 고치거나, 정말 리터럴 텍스트를 의도했다면 `$$NAME`으로 적으세요.
 
 알 수 없는 토큰은 요청이 *표시*되는 곳에서는 리터럴 텍스트로 그대로 남습니다. 에디터는 입력한 그대로를 유지하고, 하이라이터가 미등록 토큰을 등록된 토큰과 다르게 칠합니다. 다만 전송되지는 않습니다. Repeater, Fuzzer, Miner, Sequencer, Discover는 요청 라인, 헤더, 타깃에 아무것으로도 해석되지 않는 변수가 남아 있으면 그 이름을 대며 실행을 거부합니다. minimize, 편집한 intercept forward, WebSocket 메시지도 마찬가지입니다. 변수를 설정하거나 토큰을 지우세요. 검사 범위는 요청 head뿐입니다. 바디 안의 `$`는 바이트로 취급하므로 바이너리 업로드는 그대로 재전송됩니다. WebSocket **텍스트** 메시지는 head가 없으므로 페이로드 전체를 검사하고, **바이너리** 메시지는 검사하지도 확장하지도 않습니다.
 
 ```http
 GET /api/me HTTP/1.1
 Host: api.example.com
-Authorization: Bearer $TOKEN
+Authorization: Bearer $BIND.SESSION
+X-Api-Key: $ENV.API_KEY
 ```
 
-캡처된 트래픽에 나타나는 값은 복사하거나 표시할 때 다시 `$KEY`로 마스킹할 수 있어, 비밀 값이 원시 문자열이 아니라 토큰으로 유지됩니다.
+캡처된 트래픽에 나타나는 값은 복사하거나 표시할 때 다시 토큰으로 마스킹할 수 있어, 비밀 값이 원시 문자열이 아니라 토큰으로 유지됩니다.
+
+### bare 문법과 자동 업그레이드 {#bare-syntax-and-the-automatic-upgrade}
+
+문법은 namespaced입니다. 네임스페이스가 생기기 전에 쓰인 프로젝트는 **처음 열릴 때 자동으로 다시 적힙니다.** TUI든 `gori run …`이든 `gori mcp` 서버든, 먼저 연 쪽이 합니다.
+
+- Repeater 초안과 그 WebSocket 프레임, Fuzzer 템플릿, Miner·Sequencer 요청, 재작성 규칙의 치환 텍스트, 세션 슬롯 헤더, 마스킹이 이슈 제목·노트에 넣어 둔 토큰.
+- **캡처된 증거는 그대로 둡니다.** 캡처는 아무것도 확장하지 않으므로 그 안의 `$id`는 원본이 보낸 바이트입니다.
+- 먼저 데이터베이스 백업을 옆에 씁니다(`gori.db.pre-namespaced-<타임스탬프>`). 그리고 작업을 한 실행이 프로젝트마다 한 줄로 토큰 몇 개가 옮겨졌고 백업이 어디 있는지 알려줍니다. 전역 재작성 규칙은 `settings.json`에 있고 같은 시작에서 다시 적히며, `settings.json.pre-namespaced-<타임스탬프>` 복사본이 남습니다. 다만 *프로젝트* 변수나 extract 규칙 이름을 쓴 규칙은 직접 고치도록 이름만 알려 줍니다. 모든 프로젝트를 재작성하는 규칙을 한 프로젝트 안에서 다시 적을 수는 없기 때문입니다.
+
+```bash
+gori settings env-syntax        # 지금 적용된 문법과 그 출처를 출력
+gori settings env-syntax bare   # 옵트아웃
+```
+
+전환은 이 명령뿐입니다. TUI에는 문법을 바꾸는 키가 없습니다. 전환은 저장된 토큰을 다시 적는
+일까지 해야 하고, 설정값만으로는 그것을 할 수 없기 때문입니다. 이미 실행 중인 TUI 세션이나
+`gori mcp` 서버는 이 전환을 스스로 **따라갑니다**. 새 문법을 받아들이고, 열어 둔 프로젝트를
+다시 적고, 무엇을 했는지 알려줍니다(TUI는 알림과 ACTIVITY 행, MCP는 로그 한 줄).
+
+`env.syntax = bare`가 옵트아웃입니다. 환경 변수는 bare `$KEY`, 바인딩은 bare `$NAME`, 리터럴 `$`는 `$$`입니다. 각 프로젝트는 다음에 열릴 때 **되돌려** 다시 적히고, 그대로 두면 해석되기 시작할 리터럴 `$NAME`은 이스케이프됩니다. 다만 bare는 모호한 문법입니다. 바디의 GraphQL `$id`가 `id`라는 환경 변수와 실제로 충돌하며, 이스케이프와 `--verbatim`이 있는 이유가 그것입니다. 생성기는 bare 표기가 없으므로 bare 문법에서 `$GEN.UUID`는 리터럴로 남습니다. 이 문서의 나머지 부분은 토큰을 namespaced 문법으로 적습니다. bare 설치에서는 ENV와 BIND 토큰만 네임스페이스를 뺀 형태(`$KEY`, `$NAME`)로 읽으세요.
 
 ## Fuzzer {#fuzzer}
 
@@ -88,25 +149,82 @@ Fuzzer는 Intruder 스타일 엔진입니다. 요청에서 위치를 표시하�
 | `pitchfork` | 병렬 세트: 각 세트의 *n* 번째 페이로드를 함께 |
 | `clusterbomb` | 모든 세트에 걸친 모든 조합 |
 
+앞의 둘은 페이로드 세트를 **하나만**, 뒤의 둘은 표시된 위치마다 하나씩 사용합니다. 모드가 쓰는 것보다 많은 세트를 넘기면 실행 전에 쓰이지 않을 세트가 몇 개인지와 그것을 쓰는 방법을 알려 줍니다 — 기본값 `sniper`에 워드리스트를 둘 주면 첫 번째 것만 모든 위치에 들어갑니다.
+
 ### 위치와 페이로드 {#positions-and-payloads}
 
-요청에서 `§…§` 마커로 위치를 표시하거나, gori가 자동으로 배치하게 하세요. 페이로드 세트는 내장 프리셋(`sqli`, `xss`, `traversal`, `format-string`, `bad-strings`, `command-injection`. 파일 없이 바로 시작), 워드리스트, 명시적 목록, 숫자 범위, N개의 빈(null) 페이로드, 또는 무차별 대입 문자 세트가 될 수 있습니다. 프리셋은 추가 파일을 병합(내장 우선, 중복 제거)할 수 있고 다른 세트와 조합됩니다. 프로세서를 사용하면 나가는 각 페이로드를 변환할 수 있습니다: prefix/suffix, URL/base64/hex 인코딩, 대소문자 변환, 해싱, 정규식 치환.
+요청에서 `§…§` 마커로 위치를 표시하거나, gori가 자동으로 배치하게 하세요. 페이로드 세트는 내장 프리셋(`sqli`, `xss`, `traversal`, `format-string`, `bad-strings`, `command-injection`, `cache-delimiters`. 파일 없이 바로 시작), 워드리스트(파일, 또는 [카탈로그](#wordlist-catalog)에 있는 목록의 이름), 명시적 목록, 숫자 범위, N개의 빈(null) 페이로드, 또는 무차별 대입 문자 세트가 될 수 있습니다. 프리셋은 추가 파일을 병합(내장 우선, 중복 제거)할 수 있고 다른 세트와 조합됩니다. 프로세서를 사용하면 나가는 각 페이로드를 변환할 수 있습니다: prefix/suffix, URL/base64/hex 인코딩, 대소문자 변환, 해싱, 정규식 치환.
 
-마커 하나에 자체 Decoder 체인을 붙일 수도 있습니다. 커서를 마커 안에 두고 `Ctrl-Y`를 누르면 체인 편집기가 열리고, 보내기 전에 값이 각 단계를 거치는 모습을 미리 보여 줍니다. [Decoder 라이브러리에 저장해 둔 체인](/ko/guide/decoder/#building-a-chain)은 여기서 이름으로 부를 수 있어서, 한 번 만들어 둔 체인이 마커 안에서는 단어 하나가 됩니다: `§admin¦myenc > url-encode§`. Repeater 마커도 동일합니다.
+마커 하나에 자체 Decoder 체인을 붙일 수도 있습니다. 커서를 마커 안에 두고 `Ctrl-Q`를 누르면 체인 편집기가 열리고, 보내기 전에 마커의 값이 각 단계를 거치는 모습을 미리 보여 줍니다(`exec:` 단계는 미리보기에서 빠지고 전송할 때만 실행됩니다). [Decoder 라이브러리에 저장해 둔 체인](/ko/guide/decoder/#building-a-chain)은 여기서 이름으로 부를 수 있어서, 한 번 만들어 둔 체인이 마커 안에서는 단어 하나가 됩니다: `§admin¦myenc > url-encode§`. Repeater 마커도 TUI 탭에서는 동일하게 동작합니다. 마커는 탭이 전송할 때 렌더링하는 초안 언어이므로 헤드리스 표면은 렌더링하지 않습니다. `gori run repeater send`, MCP `send_request`, 재테스트 단계는 탭이라면 렌더링했을 `§…§`가 든 세션을 리터럴 `§` 바이트로 내보내지 않고 **거부**합니다. 거기서 보내려면 마커를 지우거나, 마크된 요청을 Fuzzer 템플릿으로 스윕하거나(`gori run fuzz --request=FILE`, `fuzz_start{template}`), `--verbatim` / `verbatim:true`로 저장된 바이트가 곧 메시지라고 밝히세요. 캡처 자체에 들어 있던 `§`는 건드리지 않습니다. gori는 그것을 직접 입력한 것과 구분할 수 없으므로 탭은 그대로 두고, 모든 표면이 바이트 그대로 재생합니다.
 
 gRPC 메시지는 마커가 유용하게 쓰이지 않는 유일한 곳입니다. 위치가 바이트 범위가 아니라 스키마가 아는 필드인 [gRPC 필드 스윕](#sweeping-a-grpc-field)을 보세요.
 
+### Wordlist 카탈로그 {#wordlist-catalog}
+
+다시 쓰는 목록은 `GORI_HOME` 아래 `wordlists/`(기본값 `~/.gori/wordlists`) 한 곳에 둡니다. 그곳의 파일은 하나하나가 **이름 붙은 목록**이고, 이름은 wordlist 경로를 받는 어디에서나 어느 작업 디렉터리에서든 쓸 수 있습니다: `gori run fuzz -w common.txt`, `gori run mine --wordlist common.txt`, `discover --wordlist`, `cookie --crack --wordlist`, Fuzzer의 Wordlist 페이로드 세트, 그리고 MCP `fuzz_start`, `mine_start`, `discover_start`, `cookie_crack`의 `wordlist` 인자.
+
+- **해석 규칙.** 값에 `/`가 있으면 경로이고 주어진 그대로 엽니다. 이름만 있으면 **현재 디렉터리를 먼저**, 그다음 카탈로그를 찾습니다. 지금 이 디렉터리에 있는 파일이 같은 이름의 저장 목록보다 우선합니다. 어느 쪽에도 없는 이름은 찾을 수 없다는 오류로 거부되고, `fuzz -w`와 Cookie 크래킹은 찾아본 두 곳도 함께 알려 줍니다.
+- **이름.** 어느 문자든 글자와 숫자, `_`, `.`, `+`, `-`, 안쪽 공백. 최대 200바이트이고 `.`이나 `-`로 시작할 수 없습니다. 이름은 파일 이름이지 경로가 아닙니다. 디렉터리를 벗어날 수 있는 값은 받지 않고, 그 안에 둔 심볼릭 링크를 통과하거나 덮어쓰지도 않습니다.
+- **바이트는 절대 정규화하지 않습니다.** 목록은 원본 파일입니다. 빈 줄과 `#`로 시작하는 줄은 Fuzzer에서는 페이로드이고, Miner와 Discover는 경로를 줄 때와 똑같이 그 두 형태를 서식으로 읽습니다. 저장은 모든 줄을 준 그대로 유지합니다.
+- **목록 관리.** `gori run wordlist`로 나열·보기·저장·이름 변경·삭제를 합니다([CLI 레퍼런스](/ko/reference/cli/#run-wordlist)). TUI에서는 List 페이로드 편집기의 `Ctrl-S`가 값들을 목록으로 저장하고, Wordlist 타입의 빈 필드 드롭다운이 즐겨찾기·최근 항목·카탈로그를 이름으로 보여 주며, Target → Params 서브탭의 `w`가 나열된 파라미터 이름을 카탈로그에 저장합니다. 에이전트는 `list_wordlists`, `get_wordlist`, `save_wordlist`, `rename_wordlist`, `delete_wordlist`를 씁니다([MCP 가이드](/ko/guide/mcp/)에 나열).
+- **기본값이 안전합니다.** 목록 조회와 `show`는 값을 절대 출력하지 않습니다(목록은 자격 증명 목록일 수 있습니다). `gori run wordlist show NAME --head N`과 MCP `get_wordlist{include_values:true}`가 명시적 요청이고 둘 다 상한이 있습니다. 저장한 목록은 소유자 전용(`0700` 디렉터리 안의 `0600`)이며 원자적으로 쓰고, 명시하지 않으면 기존 목록을 덮어쓰지 않습니다(`--overwrite`, `overwrite:true`, TUI에서는 `Enter` 한 번 더). 수 GB 목록을 나열하는 비용은 `stat` 한 번이고, 줄 수 세기는 최대 32 MiB만 읽습니다.
+- **프로젝트 기능이 아닙니다.** 카탈로그는 전역이며, 프로젝트가 목록을 조용히 물려받는 일은 없습니다. 이름은 직접 입력한 것입니다. 내용은 줄바꿈으로 구분한 텍스트이고 설명이나 태그는 없습니다.
+
+```bash
+# 한 번 저장한 목록을 어디서든 사용
+gori run sitemap params --host api.example.com --format names | gori run wordlist save api-params.txt
+gori run mine 42 --wordlist api-params.txt
+```
+
+### 프로젝트에서 가져오는 페이로드 {#payloads-from-the-project}
+
+프로젝트에는 이미 대상 자신의 어휘가 들어 있습니다. 엔드포인트가 받는 파라미터 이름, 클라이언트가 보내는 값, 서비스하는 경로, JavaScript가 가리키는 엔드포인트, extract 규칙이 뽑아내는 토큰입니다. **프로젝트 페이로드 소스**는 그 일부를 wordlist 파일을 먼저 만들지 않고도 세트로 바꿔 줍니다. 두 부분으로 되어 있습니다. flow를 고르는 [QL 쿼리](/ko/reference/query-language/)와, 그 flow를 값으로 바꾸는 **프로젝션**입니다.
+
+```bash
+gori run fuzz 42 --auto --payload-from 'host:api.example.com param-values'
+gori run mine 42 --payload-from 'host:api.example.com param-names'
+```
+
+| 프로젝션 | 값 |
+| -------- | -- |
+| `param-names` | 선택한 요청의 파라미터 이름(JSON 멤버는 마지막 키 이름) |
+| `param-values` | 한 번 디코딩한 파라미터 값(`hello%20world`는 `hello world`)이라 query·form 위치가 정확히 한 번만 인코딩합니다 |
+| `path-segments` | 캡처된 그대로의 요청 경로 세그먼트(percent-encoded, 경로 위치는 이를 raw로 받습니다) |
+| `js-endpoints` | 선택한 flow의 JavaScript에서 찾은 엔드포인트 경로. `gori run sitemap js --scan`이 저장해 둔 것을 읽을 뿐 스캔하지 않습니다 |
+| `extracted` | 저장된 [extract 규칙](/ko/guide/proxy/#session-bindings)이 선택한 flow의 저장된 응답에서 뽑아내는 값(`extracted:NAME`은 규칙 하나). 규칙의 호스트 glob과 조건은 라이브와 똑같이 적용됩니다. 민감 값 opt-in이 필요합니다 |
+
+디스크립터는 `<QL> <projection>`입니다. **마지막 단어**가 프로젝션이고 그 앞은 전부 쿼리입니다(공백이 든 값은 QL 규칙대로 따옴표로 묶으세요). 프로젝션만 있으면 모든 flow를 읽습니다. 프로젝트를 읽기만 하고 **아무것도 보내지 않습니다**. 소스는 아무것도 해석하지 않은 채 만들어지고, plan builder가 모든 표면에서 똑같이 프로젝트를 한 번 읽으므로 preflight와 확인창의 요청 수는 해석된 크기입니다.
+
+- **선택은 엄격합니다.** QL에 없는 필드(`methd:GET`), QL이 조용히 버릴 항(`status:>=oops`. 그대로면 호스트 전체가 선택됩니다), 컴파일되지 않는 정규식은 해당 항을 밝히며 거부합니다. 소스는 눈으로 확인하는 검색이 아니라 정확한 선택입니다.
+- **한도가 있고 재현됩니다.** 최근 flow 2000개를 읽고, 서로 다른 값을 최대 10,000개, 8 MiB 예산 안에서 보관하며, 4096바이트가 넘는 값은 건너뛰고 셉니다. 순서는 최신 flow가 먼저이고 처음 본 것이 자리를 지키므로, 같은 프로젝트와 옵션이면 같은 목록이 나옵니다. 읽기를 멈춘 원인은 조용히 넘어가지 않고 알려 줍니다. `--payload-from-max-flows`와 `--payload-from-max-values`로 앞의 두 한도를 올립니다. `js-endpoints`는 저장된 참조를 한 번에 읽으므로 `--payload-from-max-flows`가 적용되지 않고, 값 한도는 50,000개 바로 아래까지만 올라갑니다(리포트에 실제로 적용한 한도가 나옵니다).
+- **비밀은 기본적으로 빠집니다.** 요청 자체의 입력(query, form, multipart, JSON)만 읽고, 쿠키와 헤더는 `--payload-from-locations`가 필요합니다. 프로젝트의 redaction 정책이 가릴 값(자격 증명 이름의 필드, JWT나 키 형태, 경로에 토큰이 들어 있는 JavaScript 엔드포인트)은 제외하고 **셉니다**. 파라미터 *이름*은 값이 아니므로 절대 제외하지 않습니다. `--payload-from-sensitive`(MCP `include_sensitive`)가 명시적 opt-in이고, 실행에 보고되며, `extracted`는 이것 없이는 실행을 거부합니다. 라이브 세션 바인딩 테이블은 읽지 않습니다. `extracted`는 저장된 규칙을 저장된 응답에 다시 적용할 뿐 아무것도 저장하지 않습니다.
+- **값은 캡처된 그대로 유지됩니다.** 다듬거나 거르지 않습니다. CR, LF, NUL이 든 값은 남겨 두고 보고서(`framing_values`)에 세며, 그 값을 위치가 어떻게 다루는지는 그 위치 자신의 규칙입니다. query·form 위치는 percent-encode하고 경로 위치는 raw로 받습니다.
+- **빈 소스는 거부합니다.** 요청 0개짜리 정상 실행이 아닙니다. 이유(맞는 flow가 없음, 그 종류의 값이 없음, 전부 민감하다고 제외됨)를 알려 줍니다.
+- **쓸 수 있는 곳.** `gori run fuzz`와 `mine`(반복 가능한 `--payload-from`, 모든 소스에 적용되는 `--payload-from-sensitive`, `--payload-from-locations`, 두 한도. `--flow`/`--project`/`--db`가 없는 실행은 읽을 프로젝트가 없다고 말합니다), MCP `fuzz_start`(`payloads` 안의 `{"payload_from": "<QL> <projection>"}`과 그 옆의 `include_sensitive`, `locations`, `max_flows`, `max_values`)와 `mine_start`(`payload_from`과 `payload_from_*`), Fuzzer의 **Project** 페이로드 타입(쿼리, 프로젝션, opt-in(꺼짐)을 묻고 실행이 시작될 때 프로젝트를 읽습니다). 실행은 각 소스가 무엇을 읽었는지 알려 주되 값은 돌려주지 않습니다. MCP 응답의 `payload_sources`, stderr의 `payload-from:` 한 줄, TUI의 실행 시작 줄이 그것입니다.
+- **Miner에서는** 소스가 `param-names`여야 하고, 이름은 정해진 순서로 시험합니다. 명시한 `--name`, 프로젝트의 이름, 내장 목록, `--wordlist` 순이며 각 이름은 처음 나온 자리에서 한 번만 시험합니다. TUI Miner 팝업에는 텍스트 필드가 없어서 계속 호스트의 다른 엔드포인트 이름을 자동으로 시드합니다. `--payload-from`은 그 조각을 직접 고르는 헤드리스 방식입니다.
+- **나중을 위해 보관.** `gori run wordlist save NAME --payload-from '<QL> <projection>' --project NAME`(MCP `save_wordlist{payload_from}`)은 결과를 [카탈로그](#wordlist-catalog)의 목록으로 저장합니다. 프로젝트를 지정해야 하는 명시적 행위이며, 줄바꿈이 든 값(파일은 한 줄에 값 하나)은 빼고 셉니다.
+
+이 첫 버전은 출처를 값 단위가 아니라 소스 단위(어떤 쿼리와 프로젝션, flow와 값이 몇 개)로 보고합니다.
+
 ### 매칭 {#matching}
 
-ffuf 스타일 matcher와 filter로 status, size, words, lines, 왕복 시간(`--mt`/`--ft`, ms 단위. 시간 기반 블라인드 페이로드의 유일한 증거가 되는 차원), 본문 정규식에 대해 결과를 필터링합니다. 여기에 시끄러운 기준선을 걸러내는 자동 보정까지 더해집니다. 자동 보정은 스윕 전에 대상을 여러 번 샘플링한 뒤, 각 응답을 모든 샘플 형태와 비교하되 그 샘플들이 스스로 보여 준 흔들림만큼 폭을 넓혀서 비교합니다. 그래서 요청마다 달라지는 id나 타임스탬프를 품은 페이지는 걸러지고, 샘플이 전부 동일했던 대상은 여전히 정확히 비교됩니다. 매칭된 응답은 강조되며 캡처 정규식으로 추출할 수 있습니다.
+ffuf 스타일 matcher와 filter로 status, size, words, 왕복 시간(`--mt`/`--ft`, ms 단위. 시간 기반 블라인드 페이로드의 유일한 증거가 되는 차원), 본문 정규식에 대해 결과를 필터링합니다(헤드리스에서는 `--ml`/`--fl`로 줄 수, `--mh`/`--fh`로 응답 헤드 부분 문자열, `--mg`/`--fg`로 gRPC status도). 여기에 시끄러운 기준선을 걸러내는 자동 보정까지 더해집니다. 자동 보정은 스윕 전에 대상을 여러 번 샘플링한 뒤, 각 응답을 모든 샘플 형태와 비교하되 그 샘플들이 스스로 보여 준 흔들림만큼 폭을 넓혀서 비교합니다. 그래서 요청마다 달라지는 id나 타임스탬프를 품은 페이지는 걸러지고, 샘플이 전부 동일했던 대상은 여전히 정확히 비교됩니다. 매칭된 응답은 강조되며, 헤드리스에서는 캡처 정규식으로 각 응답에서 값을 추출할 수 있습니다(`--extract`, MCP `extract`).
+
+ADVANCED 카드에는 실행을 다듬는 행도 있습니다. **Stop after N hits**와 **Stop on (DIM:SPEC)**은 matcher가 N번 히트했거나 응답이 조건 하나를 만족하면 스윕을 일찍 끝내며, 이렇게 멈춘 실행은 `stopped`가 아니라 `condition_met`으로 끝납니다. **Keep interesting only**는 저장한 실행에 매칭된 행과, 문제가 있었던 행(전송 오류, 실패한 마커 체인, 재전송, 잘린 응답), 그리고 실행을 멈춘 행만 남깁니다. **Race (N conns)**는 페이로드 스윕 대신 요청 복사본 N개를 함께 풀어 보내고(last-byte sync), **Max requests**는 실제 와이어 요청 수에 상한을 둡니다. 헤드리스에서는 `--stop-after-matches`, `--stop-on`, `--keep`, `--race`, `--max-requests`입니다. [CLI Reference](/ko/reference/cli/#run-fuzz)를 참고하세요.
+
+### 응답 모양으로 결과 묶기 {#grouping-results-by-response-shape}
+
+1만 행짜리 스윕도 대개는 서로 다른 응답 몇 가지로 이루어져 있습니다. **Group by shape**(`Space` → `Z` **Display…**, 그다음 **Group by shape**)는 RESULTS 목록을 응답마다 한 행으로 바꿉니다. 묶음 크기(`▸×1204`)와 대표 결과(인덱스가 가장 작은 것)를 상태와 지표와 함께 보여 줍니다. 어떤 페이로드가 만들었든 같은 응답이면 같은 모양입니다. 반사된 페이로드(보낸 그대로, 흔한 따옴표 표기를 모두 포함한 HTML 이스케이프, 퍼센트 인코딩, JSON 이스케이프), 숫자, id, 해시, 타임스탬프, 공백은 정규화해 무시하고, 응답마다 바뀌는 헤더(`Date`, `ETag`, 요청 id, `Content-Length`)도 무시합니다. 상태, gRPC 상태, WebSocket 종료 코드, 잘리거나 시간 초과된 캡처, 설정된 쿠키, 리다이렉트 대상, 본문의 단어는 무시하지 않으므로 길이가 같아도 본문이 다른 두 `200`은 따로 남고, 시간 초과가 짧은 `200`과 묶이는 일도 없습니다. 실패한 전송은 종류(거부, 시간 초과, TLS, 리셋, 스코프 차단)별로 묶입니다. `→`는 묶음을 펼쳐 구성원을 보여 주고, `←`는 (구성원 위에서도) 접으며, **Cycle sort**(`Space` → `o`)는 묶음을 드문 것부터, 큰 것부터, 처음 나온 순서로 정렬합니다. 매치 전용 렌즈를 켜면 히트가 있는 묶음만 남습니다. 서로 다른 모양이 4,096개를 넘으면 새 모양은 묶이지 않고, RESULTS 테두리에 그 수(와 그중 히트 수)가 표시됩니다. 개수는 표시 창 밖의 행과 다시 연 실행의 저장된 모든 행을 포함한 실행 전체 기준입니다. 묶기는 행이나 그 인덱스, 매치 판정을 절대 바꾸지 않습니다.
+
+헤드리스 쪽에서도 같은 묶음을 씁니다. 저장된 실행은 `gori run fuzz show RUN_ID --clusters`(묶음 하나의 결과는 `--cluster ID`), MCP는 `fuzz_results{clusters: true}` / `get_fuzz_run{clusters: true}`입니다. 묶음 id는 같은 버전의 gori라면 실행이 달라도 유지되므로, 같은 응답은 어느 실행에서나 같은 id를 가집니다.
 
 ### 실행 저장과 다시 열기 {#saving-and-reopening-runs}
 
 TUI 실행 중 gori는 모든 결과를 비공개 임시 SQLite 스풀에 기록하고, 화면 창은 최대 5,000행 / 동적 결과 데이터 64 MiB로 제한합니다. 최신 행은 계속 조작할 수 있고, 혼자서 지나치게 큰 행은 지표만 표시됩니다. 페이로드/오류 텍스트마저 이 창을 넘으면 해당 필드를 잘라 표시하고 그렇게 표시했음을 알린 뒤, 자리표시자로 요청을 재구성하는 대신 Repeater/Comparer로 보내기를 비활성화합니다. 스풀에는 여전히 완전한 행이 남아 있습니다. 스풀은 소유자 전용이고, 실행을 버리면 작은 백그라운드 트랜잭션으로 정리되며, 프로젝트를 닫으면 통째로 제거됩니다. 스풀 실패는 나가는 트래픽을 결코 멈추지 않으며, 그 실행을 영구 저장할 수 없게 만들 뿐입니다.
 
-비어 있지 않은 실행이 끝나고 스풀이 완전하면, **READ 모드에서 `Shift-S`**를 눌러 스풀된 모든 행을 프로젝트에 영구 저장합니다. 편집 중에는 대문자 `S`가 평소대로 입력됩니다. 저장은 행 수와 바이트 수가 제한된 백그라운드 배치로 이뤄지고, 상태 줄과 Jobs 패널이 성공 또는 실패를 알립니다. 단축키를 다시 눌러도 사본이 생기지 않으며, 프로젝트 복사가 실패하면 재시도를 위해 임시 스풀이 남습니다.
+비어 있지 않은 실행이 끝나고 스풀이 완전하면, **READ 모드에서 `Shift-E`**를 눌러 스풀된 모든 행을 프로젝트에 영구 저장합니다. 편집 중에는 대문자 `E`가 평소대로 입력됩니다. 저장은 행 수와 바이트 수가 제한된 백그라운드 배치로 이뤄지고, 상태 줄과 Jobs 패널이 성공 또는 실패를 알립니다. 단축키를 다시 눌러도 사본이 생기지 않으며, 프로젝트 복사가 실패하면 재시도를 위해 임시 스풀이 남습니다.
 
-프로젝트를 다시 열면 처음 선택된 Fuzzer 세션에 대해 마지막으로 성공한 저장 실행이 복원됩니다. 다른 Fuzzer 세션은 처음 선택할 때 지연 복원됩니다. 복원은 가장 최근 5,000행 / 64 MiB만 창에 읽어 들이고 `showing N`으로 표시합니다. 아카이브 전체는 페이지 단위 CLI/MCP 리더로 계속 읽을 수 있습니다. 진행 중이거나, 일부 실패했거나, 현재 형식 이전의 불완전한 스냅숏은 자동 복원되지 않습니다. **Space → Run history**를 열면 더 오래된 현재 형식 실행을 고를 수 있고, `Enter`가 불러오고 `d`가 지웁니다. Fuzzer 세션을 닫으면 그 세션의 저장 실행 기록도 함께 삭제되며, 닫기 확인 창이 그 사실을 말해 줍니다.
+프로젝트를 다시 열면 처음 선택된 Fuzzer 세션에 대해 마지막으로 성공한 저장 실행이 복원됩니다. 다른 Fuzzer 세션은 처음 선택할 때 지연 복원됩니다. 복원은 가장 최근 5,000행 / 64 MiB만 창에 읽어 들이고 `showing N`으로 표시합니다. 아카이브 전체는 페이지 단위 CLI/MCP 리더로 계속 읽을 수 있습니다. 진행 중이거나, 일부 실패했거나, 현재 형식 이전의 불완전한 스냅숏은 자동 복원되지 않습니다. `Ctrl-P`에서 **Run history**를 열면 더 오래된 현재 형식 실행을 고를 수 있고, `Enter`가 불러오고 `d`가 지웁니다. Fuzzer 세션을 닫으면 그 세션의 저장 실행 기록도 함께 삭제되며, 닫기 확인 창이 그 사실을 말해 줍니다.
 
 헤드리스와 에이전트 표면도 같은 영구 저장소를 씁니다:
 
@@ -119,26 +237,6 @@ gori run fuzz delete RUN_ID --yes
 ```
 
 평범한 `gori run fuzz …`는 계속 일회성입니다. MCP에서는 `fuzz_start`에 `save_results: true`를 넘긴 뒤 `list_fuzz_runs`, `get_fuzz_run`, `delete_fuzz_run`을 쓰세요. 영구 실행은 History 플로우와 별개입니다. 개별 전송이 History에도 나타날지는 `--record-history` / `record_history`가 계속 결정합니다.
-
-### 실행 저장과 다시 열기 {#saving-and-reopening-runs}
-
-TUI 실행 중 gori는 모든 결과를 비공개 임시 SQLite 스풀에 기록하고, 화면 창은 최대 5,000행 / 동적 결과 데이터 64 MiB로 제한합니다. 최신 행은 계속 조작할 수 있고, 혼자서 지나치게 큰 행은 지표만 표시됩니다. 페이로드/오류 텍스트마저 이 창을 넘으면 해당 필드를 잘라 표시하고 그렇게 표시했음을 알린 뒤, 자리표시자로 요청을 재구성하는 대신 Repeater/Comparer로 보내기를 비활성화합니다. 스풀에는 여전히 완전한 행이 남아 있습니다. 스풀은 소유자 전용이고, 실행을 버리면 작은 백그라운드 트랜잭션으로 정리되며, 프로젝트를 닫으면 통째로 제거됩니다. 스풀 실패는 나가는 트래픽을 결코 멈추지 않으며, 그 실행을 영구 저장할 수 없게 만들 뿐입니다.
-
-비어 있지 않은 실행이 끝나고 스풀이 완전하면, **READ 모드에서 `Shift-S`** 를 눌러 스풀된 모든 행을 프로젝트에 영구 저장합니다. 편집 중에는 대문자 `S`가 평소대로 입력됩니다. 저장은 행 수와 바이트 수가 제한된 백그라운드 배치로 이뤄지고, 상태 줄과 Jobs 패널이 성공 또는 실패를 알립니다. 단축키를 다시 눌러도 사본이 생기지 않으며, 프로젝트 복사가 실패하면 재시도를 위해 임시 스풀이 남습니다.
-
-프로젝트를 다시 열면 처음 선택된 Fuzzer 세션에 대해 마지막으로 성공한 저장 실행이 복원됩니다. 다른 Fuzzer 세션은 처음 선택할 때 지연 복원됩니다. 복원은 가장 최근 5,000행 / 64 MiB만 창에 읽어 들이고 `showing N`으로 표시합니다 — 아카이브 전체는 페이지 단위 CLI/MCP 리더로 계속 읽을 수 있습니다. 진행 중이거나, 일부 실패했거나, 현재 형식 이전의 불완전한 스냅숏은 자동 복원되지 않습니다. **Space → Run history** 를 열면 더 오래된 현재 형식 실행을 고를 수 있고, `Enter`가 불러오고 `d`가 지웁니다. Fuzzer 세션을 닫으면 그 세션의 저장 실행 기록도 함께 삭제되며, 닫기 확인 창이 그 사실을 말해 줍니다.
-
-헤드리스와 에이전트 표면도 같은 영구 저장소를 씁니다:
-
-```bash
-gori run fuzz save 42 --auto --preset sqli
-gori run fuzz list
-gori run fuzz show RUN_ID
-gori run fuzz show RUN_ID RESULT_INDEX --format json
-gori run fuzz delete RUN_ID --yes
-```
-
-평범한 `gori run fuzz …`는 계속 일회성입니다. MCP에서는 `fuzz_start`에 `save_results: true`를 넘긴 뒤 `list_fuzz_runs`, `get_fuzz_run`, `delete_fuzz_run`을 쓰세요. 영구 실행은 History 플로우와 별개입니다 — 개별 전송이 History에도 나타날지는 `--record-history` / `record_history`가 계속 결정합니다.
 
 ### 스윕의 프레이밍 {#framing-a-sweep}
 
@@ -162,7 +260,7 @@ gori run fuzz --flow 42 --field role --payloads ROLE_ADMIN,ROLE_USER,99
 `SPEC`은 필드 이름, 중첩 메시지 경로(`profile.age`), 필드 번호, 또는 반복 필드의 특정
 occurrence(`tags[1]`)입니다. 해당 rpc를 해석할 descriptor set이 필요합니다.
 `protoc --descriptor_set_out` 파일이든 `gori run grpc reflect`로 받아온 것이든. 필드 이름은
-같은 플로우에서 Repeater의 `␣E:FIELDS` 폼과 History의 protobuf 트리가 이미 보여 주는 그 이름입니다.
+같은 플로우에서 Repeater의 `␣Pf:FIELDS` 폼과 History의 protobuf 트리가 이미 보여 주는 그 이름입니다.
 
 스플라이스가 할 수 있는 일에서 두 가지가 따라옵니다. 필드는 **캡처된 메시지에 실제로 있어야**
 합니다. gori는 occurrence를 교체할 뿐 추가하지 않으므로, 기본값으로 남아 와이어에 없는 proto3
@@ -200,7 +298,7 @@ WebSocket 세션도 다른 대상과 똑같이 스윕하지만, 프로토콜에�
 ```bash
 gori run fuzz --repeater 7 \
   --message '{"op":"login","user":"§admin§"}' \
-  --payloads-preset sqli
+  --preset sqli
 ```
 
 WebSocket 세션에 대한 `--repeater N`은 핸드셰이크와 **세션에 저장된 프레임**을 함께 시드하므로, 캡처된 교환을 기록된 그대로 스윕합니다. `--flow N`도 캡처된 소켓에 대해 같은 일을 합니다. 직접 프레임을 작성하려면 `--message` / `--message-frame`으로 대체하면 됩니다. `--message-frame`은 `gori run repeater send`와 동일한 `opcode=…,fin=…,rsv=…,mask=…,len=…,hex=|b64=|text=` 문법을 쓰므로 PING, 코드를 지정한 CLOSE, 마스킹하지 않은 클라이언트 프레임, 페이로드와 어긋나는 길이 필드까지 모두 만들 수 있습니다. `--idle-ms`는 세션별 침묵 대기 시간을, `--ws-keep-key`는 템플릿 자체의 `Sec-WebSocket-Key`를 보내도록 해서 키가 없거나 잘못된 경우 자체를 시험할 수 있게 합니다(RFC 8441 핸드셰이크에는 그런 키가 없으며, 플래그를 무시하는 대신 그 사실을 알려 줍니다).
@@ -216,7 +314,41 @@ WebSocket 세션에 대한 `--repeater N`은 핸드셰이크와 **세션에 저�
 
 `ws_close_code`와 `ws_frames_in`은 `--format json`과 MCP `fuzz_results`에도 같은 방식으로, WebSocket 행에만 나타납니다.
 
-적용되지 않는 옵션이 넷 있습니다. `--race`는 거부됩니다. 레이스 그룹은 바이트가 동일한 요청 복사본들이어서 프레임 교환 형태가 없기 때문입니다. `--http2`는 `Upgrade: websocket` 템플릿에서만 거부됩니다. HTTP/2에는 업그레이드 메커니즘이 없으므로(RFC 9113 §8.1) h2 위의 WebSocket은 RFC 8441 확장 `CONNECT`로 열리며, 시드 자체가 그 형태라면 플래그 없이도 HTTP/2로 스윕합니다. 핸드셰이크 바이트가 그렇게 말하기 때문입니다. `--record-history`도 거부됩니다. 프레임 교환은 요청/응답 플로우가 아니어서, 기록하면 전사가 비어 있는 WebSocket인 척하는 History 항목이 남기 때문입니다. `--follow-redirects`, `--timeout`, `--ac`는 여기서 그냥 무의미하며, 실행 시작 시 한 번 그렇게 알려 줍니다. 각 거부 메시지는 원하는 동작을 얻는 방법이 `--ws-http-only`일 때 그 사실을 함께 알려 줍니다. 그 플래그를 쓰면 평범한 HTTP 스윕이므로 셋 다 동작하며 History 기록도 됩니다. 송신 프레임이 없는 WebSocket 시드 역시 평범한 HTTP로 스윕합니다. 핸드셰이크만 있는 “프레임” 실행은 페이로드마다 소켓을 열어 아무것도 보내지 않을 뿐이기 때문입니다.
+적용되지 않는 옵션이 여섯 있습니다. 셋은 거부되고 셋은 무의미합니다. `--race`는 거부됩니다. 레이스 그룹은 바이트가 동일한 요청 복사본들이어서 프레임 교환 형태가 없기 때문입니다. `--http2`는 `Upgrade: websocket` 템플릿에서만 거부됩니다. HTTP/2에는 업그레이드 메커니즘이 없으므로(RFC 9113 §8.1) h2 위의 WebSocket은 RFC 8441 확장 `CONNECT`로 열리며, 시드 자체가 그 형태라면 플래그 없이도 HTTP/2로 스윕합니다. 핸드셰이크 바이트가 그렇게 말하기 때문입니다. `--record-history`도 거부됩니다. 프레임 교환은 요청/응답 플로우가 아니어서, 기록하면 전사가 비어 있는 WebSocket인 척하는 History 항목이 남기 때문입니다. `--follow-redirects`, `--timeout`, `--ac`는 여기서 그냥 무의미하며, 실행 시작 시 한 번 그렇게 알려 줍니다. 각 거부 메시지는 원하는 동작을 얻는 방법이 `--ws-http-only`일 때 그 사실을 함께 알려 줍니다. 그 플래그를 쓰면 평범한 HTTP 스윕이므로 셋 다 동작하며 History 기록도 됩니다. 송신 프레임이 없는 WebSocket 시드 역시 평범한 HTTP로 스윕합니다. 핸드셰이크만 있는 “프레임” 실행은 페이로드마다 소켓을 열어 아무것도 보내지 않을 뿐이기 때문입니다.
+
+### 매크로로 회전하는 토큰 다루기 {#rotating-tokens-with-a-macro}
+
+어떤 애플리케이션은 페이지를 열 때마다, 혹은 API를 호출할 때마다 새 폼 토큰이나 nonce를 내줍니다. 그러면 스윕은 첫 후보에서 `200`을 받고 그다음부터는 모두 `403`을 받습니다. 후보가 전부 실행 전에 잡아 둔 값을 그대로 들고 나가기 때문입니다. 세션이 만료되기를 기다려도 소용없습니다. 그 값은 세션보다 훨씬 먼저 죽습니다. **매크로**가 이 문제를 풉니다. 후보 **앞에** 저장된 Repeater 세션 몇 개를 실행해서, 그 추출 규칙이 [세션 바인딩](/ko/guide/proxy/#session-bindings)에 남기는 값이 후보가 `$BIND.NAME`을 풀 때 항상 새 값이 되게 합니다. Fuzzer와 Param Miner 모두 매크로를 갖습니다.
+
+추출이나 주입에 새로 배울 것은 없습니다. 단계는 Repeater의 전송 경로를 그대로 타므로 토큰용으로 작성해 둔 [추출 규칙](/ko/guide/proxy/#session-bindings)이 그대로 동작하고, 후보는 템플릿이나 [활성 세션 슬롯](/ko/guide/authorize/#session-slots-one-list-two-readers)의 헤더에 `$BIND.NAME`으로 값이 들어갈 자리를 적습니다. 매크로가 정하는 것은 단계가 **언제** 실행되느냐뿐입니다.
+
+| 주기 | 동작 |
+| --- | --- |
+| `request` (기본) | 후보마다 그 앞에서 단계를 실행합니다. 일회용 값은 절대 공유되지 않으므로 스윕은 **후보를 한 번에 하나씩** 보냅니다. 계획이 첫 요청 전에 그렇게 알려 줍니다 |
+| `N` | 첫 후보 앞에서 실행하고, 이후 N개마다 다시 실행합니다. 그 N개는 값을 공유하며 동시에 나갈 수 있습니다. 다음 값은 N개가 모두 끝난 뒤에 받으므로, 어떤 후보도 다음 값을 집어 갈 수 없습니다 |
+| `off` | 단계는 설정된 채로 두고 아무것도 실행하지 않습니다 |
+
+후보는 매크로에 도착한 순서로 셉니다. 워커 하나면 생성 순서이고, 여럿이면 실제로는 디스패치 순서입니다. 보정 샘플도 같은 템플릿을 싣고 나가므로 후보 하나로 셉니다. `--race` 실행은 한 덩어리입니다. 그룹을 다이얼하기 전에 단계를 한 번 실행하고, 모든 멤버가 그 값 하나를 들고 나갑니다. "일회용 토큰 하나를 N개 연결에서 동시에 사용해 보기"가 바로 이 실험입니다. 그래서 주기는 그룹 크기 이상이어야 하고, 더 짧으면 조용히 공유하는 대신 거부합니다.
+
+매크로가 실패해도 낡은 값이나 빈 값을 보내는 일은 없습니다. 단계 중 하나가 오류이거나 `4xx`/`5xx`로 답하거나 스코프에서 거부되면 실패이고, 모두 답했는데 어떤 추출 규칙도 아무것도 다시 바인딩하지 못했을 때(`--macro-expect NAME`을 쓰면 지정한 바인딩이 그렇지 못했을 때)도 실패입니다. 그러면 후보는 **전송되지 않습니다**. 그 행은 `macro:`로 시작하는 오류 행이고, 실행의 오류 수에 잡히며, 재시도하지 않습니다. 같은 엔드포인트에 단계를 다시 보내 봐야 또 실패하기 때문입니다. `--macro-on-failure skip`(기본)은 연속 세 번 실패하면 실행을 끝내므로 망가진 로그인이 페이로드마다 호출되지 않고, `stop`은 첫 실패에서 끝냅니다. "마지막 값으로 그냥 보내기"는 일부러 두지 않았습니다. 그 행의 판정은 낡은 토큰에 대한 것이 되기 때문입니다. 매크로가 끝낸 실행은 모든 표면에서 오류로 마칩니다.
+
+단계가 보내는 모든 것은 기록에 남고, 실행의 나머지와 같은 한도 안에 있습니다.
+
+- 각 단계는 History에 source `macro`(`src:macro`, SRC `MACRO`, `source_ref` `macro step N`)로 남고 실패마다 이벤트가 하나 기록됩니다. 실행 상태는 실행 횟수, 요청 수, 실패 수를 알려 줄 뿐 값은 알려 주지 않습니다.
+- 단계는 활성 세션 슬롯으로, 오버레이 포함해서 전송됩니다. 그래서 세션 쿠키가 필요한 페이지는 그 쿠키를 받습니다.
+- 실행을 만들 때, 그리고 단계를 실행할 때마다 표면의 스코프 검사를 통과해야 하며, Sandbox와 명시적 exclude는 후보에게와 똑같이 단계에도 적용됩니다.
+- `--max-requests`에 합산되고 `--rate`에 묶이며, 중지는 두 단계 사이에서 받습니다.
+
+단계가 아직 `§…§` 마커를 가진 세션이거나 WebSocket 핸드셰이크일 때, 프로젝트에 단계가 다시 바인딩할 추출 규칙이 없을 때, 값을 실을 후보가 없을 때는 아무것도 보내기 전에 거부합니다. **캡처된 플로우**의 템플릿은 캡처된 그대로 전송되고 아무것도 치환하지 않으므로, Repeater 세션이나 초안으로 실행을 시작하거나 토큰을 활성 슬롯의 헤더에 두세요.
+
+| 표면 | 방법 |
+| --- | --- |
+| TUI, Fuzzer | **ADVANCED**: *Macro steps*(세션 id 또는 탭 이름, 쉼표 구분), *Macro cadence*, *Macro must rebind*, *Macro on failure* |
+| TUI, Miner | **MINE PARAMETERS** 팝업에서 저장된 세션 하나(*macro step*)와 주기, 실패 정책을 고릅니다 |
+| `gori run` | `fuzz` / `mine`의 `--macro=STEPS [--macro-every=request\|N\|off] [--macro-expect=NAME] [--macro-on-failure=skip\|stop]`. 이름을 지정한 프로젝트(`--project`, `--db`, `--flow`, `--repeater`)가 필요합니다 |
+| MCP | `fuzz_start` / `mine_start`의 `macro_steps`, `macro_every`, `macro_expect`, `macro_on_failure`. 응답의 `request_macro`가 계획을 설명하고 `fuzz_status` / `mine_status`가 실행 결과를 알려 줍니다 |
+
+Miner의 매크로는 보정 기준선을 포함해 **보내는 모든 요청 앞에서** 실행됩니다. 요청마다 토큰을 바꾸는 애플리케이션은 토큰 없는 보정 프로브에도 후보와 똑같이 `403`으로 답하고, `403`뿐인 기준선에서는 모든 정상 응답이 발견으로 보입니다. TUI 팝업은 세션 하나만 받고, 여러 단계와 `--macro-expect`는 CLI와 MCP에서 씁니다.
 
 ### 연결 재사용 {#connection-reuse}
 
@@ -239,9 +371,9 @@ gori run fuzz <flow-id> \
   --fs 0
 ```
 
-소스는 캡처된 플로우(`--flow`), 저장된 HTTP 리피터 세션(`--repeater`), 원시 요청 파일(`--request`), 또는 stdin이 될 수 있습니다. 출력은 `text`, `json`, `jsonl`입니다.
+소스는 캡처된 플로우(`--flow`), 저장된 리피터 세션(`--repeater`, HTTP 또는 WebSocket), 원시 요청 파일(`--request`), 또는 stdin이 될 수 있습니다. 출력은 `text`, `json`, `jsonl`입니다. 이 형태는 일회성이며 이전과 호환됩니다. 정확히 같은 인자를 `gori run fuzz save` 뒤에 붙이면 모든 행이 영구 저장됩니다. 저장된 실행은 `fuzz list`, `fuzz show`, `fuzz delete`로 관리합니다.
 
-**TUI의 Repeater 전송은 History에 기록됩니다.** 손으로 요청을 다루는 테스터야말로 증거가 사라지던 쪽이었고, 플로우를 남기지 않는 전송은 비교도 내보내기도 인계도 할 수 없습니다. 상태줄이 방금 쓴 id를 알려 줍니다(`sent → 200 in 391ms · History #84`). Settings → General → *Record Repeater sends*에서 끌 수 있습니다. WebSocket 전송과 send-group은 기록되지 않으며(소켓의 증거는 프레임 트랜스크립트이고 세션이 이미 갖고 있습니다) 상태줄이 한 번 그렇게 알려 줍니다.
+**TUI의 Repeater 전송은 History에 기록됩니다.** 손으로 요청을 다루는 테스터야말로 증거가 사라지던 쪽이었고, 플로우를 남기지 않는 전송은 비교도 내보내기도 인계도 할 수 없습니다. 상태줄이 방금 쓴 id를 알려 줍니다(`sent → 200 in 391ms · History #84`). Settings → General → *Record Repeater sends*에서 끌 수 있습니다. WebSocket 전송(소켓의 증거는 프레임 트랜스크립트이고 세션이 이미 갖고 있습니다), send-group, 레이스, 타이밍 분석은 기록되지 않으며 상태줄이 한 번 그렇게 알려 줍니다.
 
 나머지는 그대로 opt-in이고, 헤드리스 표면은 각자의 호출별 인자를 유지하므로 이 설정 때문에 스크립트 동작이 바뀌지 않습니다. `gori run repeater send --record-history`는 전송을 플로우로 기록하고 그 id를 출력하며(기본 off), `gori run fuzz --record-history=none|matched|all`은 전송한 각 요청+응답을 기록하고(`matched`는 매칭된 행만, `all`은 매 전송, 5000개 상한), MCP `send_request`는 `record_history:false`를 넘기지 않는 한 기록합니다.
 
@@ -249,7 +381,7 @@ gori run fuzz <flow-id> \
 `src:fuzzer` / `src:gori`). 그래서 재전송이 대상 클라이언트가 만든 트래픽으로 잘못 읽히지
 않습니다. [이 플로우는 어디서 왔나](/ko/guide/proxy/#flow-source)를 보세요.
 
-두 도구 모두, 기록된 플로우는 **와이어에 나간 그대로의 요청**입니다. 활성 세션 슬롯의 헤더 오버레이와 전송 시점에 치환된 `$NAME` 값이 그 안에 들어 있으므로, 그 플로우를 재전송·비교·스캔하면 조립 전 초안이나 템플릿이 아니라 실제 전송을 재현합니다. (Fuzzer의 결과 *행*은 여전히 렌더된 템플릿을 보여줍니다. "Repeater로 보내기"가 그 바이트로 탭을 시드하고, 슬롯은 전송할 때마다 적용되기 때문입니다.)
+두 도구 모두, 기록된 플로우는 **와이어에 나간 그대로의 요청**입니다. 활성 세션 슬롯의 헤더 오버레이와 전송 시점에 치환된 `$BIND.NAME` 값이 그 안에 들어 있으므로, 그 플로우를 재전송·비교·스캔하면 조립 전 초안이나 템플릿이 아니라 실제 전송을 재현합니다. (Fuzzer의 결과 *행*은 여전히 렌더된 템플릿을 보여줍니다. "Repeater로 보내기"가 그 바이트로 탭을 시드하고, 슬롯은 전송할 때마다 적용되기 때문입니다.)
 
 ## 다음 단계 {#next-steps}
 

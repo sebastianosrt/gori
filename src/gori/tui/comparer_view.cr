@@ -3,7 +3,7 @@ require "./theme"
 require "./frame"
 require "./read_pane"
 require "./highlight"
-require "./url"
+require "../url"
 require "./subtab_clone"
 require "./comparer_slot"
 require "./traffic_empty_state"
@@ -51,10 +51,6 @@ module Gori::Tui
     # syntax overlay maps by index instead of replaying SideBySide's advance rule. `src` is
     # the row's index in the un-folded rows, which is how the cursor survives a fold toggle.
     record DisplayRow, row : Repeater::SideBySide::Row?, a_index : Int32, src : Int32, hidden : Int32 do
-      def fold? : Bool
-        @row.nil?
-      end
-
       def changed? : Bool
         (r = @row) ? !r.kind.same? : false
       end
@@ -96,6 +92,7 @@ module Gori::Tui
       @word_cache = {} of Int32 => {Highlight::Line, Highlight::Line}
       @word_rev = 0_u32
       @truncated = false
+      @source_cut = false
       @change_count = 0 # cached with @rows_cache so the footer doesn't recount each frame
     end
 
@@ -126,11 +123,6 @@ module Gori::Tui
     # warms the very cache render is about to read.
     def search_text : String
       [@slot_a, @slot_b].compact.flat_map(&.lines(:request)).join('\n')
-    end
-
-    # Identity for rename/apply (view object, not content) — mirrors MinerView/RepeaterView.
-    def same?(other : ComparerView) : Bool
-      object_id == other.object_id
     end
 
     # Content-only clone: same slots/pane/fill ring + " copy" name. Shared FlowDetail
@@ -293,6 +285,14 @@ module Gori::Tui
       display.rindex { |d| d.src <= src } || 0
     end
 
+    # Whether the diff covers only part of the two messages — cut at `Diff::MAX_LINES`, or a
+    # body the capture cap already cut — so "no changed row" is not "identical". Builds the
+    # rows if they are not built yet.
+    def truncated? : Bool
+      rows
+      @truncated || @source_cut
+    end
+
     # Move the row cursor to the next (`dir` 1) or previous (−1) CHANGED row, wrapping at
     # the ends. Returns false when the diff has no changed row at all, which is the one case
     # where the caller has something different to say ("identical").
@@ -375,14 +375,6 @@ module Gori::Tui
     # The row cursor, for the controller + the verbs.
     def rowsel : ReadPane
       @rowsel
-    end
-
-    # ↑/↓ (and the wheel, and ⇧ for a selection) move the CURSOR, which drags the viewport with
-    # it — selection-follow, like every list in the tree. The pane used to scroll a viewport with
-    # no cursor in it at all.
-    def scroll(delta : Int32) : Nil
-      sync_rowsel
-      @rowsel.move(delta, 0)
     end
 
     def move_rows(delta : Int32, selecting : Bool) : Nil
@@ -494,6 +486,7 @@ module Gori::Tui
       al = lines_a
       bl = lines_b
       @truncated = Repeater::Diff.truncated?(al, bl)
+      @source_cut = @slot_a.try(&.cut?(@pane)) || @slot_b.try(&.cut?(@pane)) || false
       result = Repeater::SideBySide.rows(Repeater::Diff.lines(al, bl))
       @change_count = Repeater::SideBySide.change_count(result)
       result
@@ -795,14 +788,23 @@ module Gori::Tui
     private def draw_footer(screen : Screen, rect : Rect, y : Int32) : Nil
       return if y <= rect.y + 1 # no room: header + divider already fill the frame
       changed = @change_count
-      note = changed == 0 ? "identical" : "#{changed} changed line#{changed == 1 ? "" : "s"}"
-      # Which change the cursor is on, so n/N reads as progress through the diff rather than
+      # Past the line cap nothing was compared, so zero changes there is "none in the compared
+      # part", not "identical" (#1162) — the cap note below says where the cut is.
+      note = if changed > 0
+               "#{changed} changed line#{changed == 1 ? "" : "s"}"
+             elsif @truncated || @source_cut
+               "no changes in the compared part"
+             else
+               "identical"
+             end
+      # Which change the cursor is on, so ⇧N/⇧P reads as progress through the diff rather than
       # as an unanchored jump.
       if changed > 0 && (pos = change_position)
         note += " · #{pos}/#{changed}"
       end
       note += " · folded" if @fold
       note += " · truncated to #{Repeater::Diff::MAX_LINES}/side" if @truncated
+      note += " · body cut at capture" if @source_cut
       note += " · col #{@xscroll}" if @xscroll > 0                              # only when scrolled: otherwise it's noise
       screen.text(rect.x + 1, y, note, Theme.muted, width: {rect.w - 2, 1}.max) # pane + ←/→ moved to the divider selector
     end

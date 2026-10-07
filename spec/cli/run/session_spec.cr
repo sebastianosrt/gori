@@ -155,7 +155,10 @@ describe "gori run — --slot ordering" do
   # `--slot admin` announced itself on stderr and then put no overlay on the wire at all.
   it "re-applies the selection every time open_store installs a fresh layer" do
     src = File.read(File.join(__DIR__, "..", "..", "..", "src", "gori", "cli", "run.cr"))
-    body = src[/private def self\.open_store.*?\n      end/m]
+    # The layer install lives in `hydrate_cli_store`, the hydration half of `open_store`
+    # (split so a raise in it closes the store); `open_store` must still call it.
+    src[/private def self\.open_store.*?\n      end/m].should contain("hydrate_cli_store(store, project, busy_ms)")
+    body = src[/private def self\.hydrate_cli_store.*?\n      end/m]
     lines = body.lines.reject(&.lstrip.starts_with?('#'))
     install = lines.index(&.includes?("Env.layer = Bindings.load"))
     reapply = lines.index(&.includes?("reapply_active_slot"))
@@ -212,5 +215,122 @@ describe "gori run session from-flow" do
     src = File.read(File.join(__DIR__, "..", "..", "..", "src", "gori", "cli", "run", "session.cr"))
     src.should contain("--from-flow=ID")
     src.should contain("--from-flow is its own subcommand")
+  end
+end
+
+# `gori run session from-request` copies an operator-selected subset of the captured request
+# into a literal slot. The engine owns header lookup/provenance; this surface owns argument
+# parsing, redacted presentation, and the transactional slot write.
+describe "gori run session from-request" do
+  it "is registered and requires a repeatable --copy-header selection" do
+    src = File.read(File.join(__DIR__, "..", "..", "..", "src", "gori", "cli", "run", "session.cr"))
+    src.should contain(%(when "from-request" then cmd_session_from_request))
+    src[/Usage: gori run session \[list\].*/].should contain("from-request")
+    body = src[/private def self\.cmd_session_from_request.*?\n      end\n/m]
+    body.should contain("p.on(\"--copy-header=NAME\", \"Copy this request header")
+    body.should contain("copy_headers << v.strip")
+    body.should contain("copy at least one request header")
+    body.should contain("if copy_headers.empty?")
+    body.should_not contain("copy_headers.reject!")
+  end
+
+  it "calls the shared request reader, saves atomically, and keeps values out of provenance" do
+    src = File.read(File.join(__DIR__, "..", "..", "..", "src", "gori", "cli", "run", "session.cr"))
+    body = src[/private def self\.cmd_session_from_request.*?\n      end\n/m]
+    body.should contain("Gori::SessionFromFlow.draft_request(detail, copy_headers)")
+    body.should contain("slots.add(slot)")
+    body.should contain("session_slot_row(slot, show_values)")
+    body.should contain("draft.sources.each")
+    body.should contain("from-request: \#{line}")
+  end
+
+  it "documents literal snapshots, redaction, and the rotating-token alternative in help" do
+    src = File.read(File.join(__DIR__, "..", "..", "..", "src", "gori", "cli", "run", "session.cr"))
+    banner = src[/Usage: gori run session from-request.*?"\n          p\.on\("--name/m]
+    banner.should contain("--copy-header")
+    banner.should contain("[REDACTED]")
+    banner.should contain("does not re-authenticate")
+    banner.should contain("rotating")
+    banner.should contain("rewriter extract")
+    banner.should contain("--bind-from")
+  end
+end
+
+describe "gori run session — refresh steps (#1233)" do
+  it "summarises the steps and the policy on the row, and says nothing for a slot without them" do
+    slot = Slot.new("admin", rules: ["SESSION"], refresh: [3_i64, 4_i64],
+      refresh_before: Gori::SessionSlot::RefreshBefore.parse?("jwt-exp").not_nil!)
+    Gori::CLI::Run.session_slot_row(slot, false).should contain("refresh 2 steps · before jwt-exp")
+    Gori::CLI::Run.session_slot_row(Slot.new("user"), false).should_not contain("refresh")
+  end
+
+  it "emits the step ids (a detached one negative) and the policy in JSON" do
+    slot = Slot.new("admin", refresh: [3_i64, -4_i64])
+    j = JSON.parse(JSON.build { |b| Gori::CLI::Run.session_slot_json(b, slot, false) })
+    j["refresh"].as_a.map(&.as_i64).should eq([3_i64, -4_i64])
+    j["refresh_before"].as_s.should eq("off")
+    j["refresh_steps"].as_a.last.as_s.should contain("(deleted)")
+  end
+
+  it "reports a refresh outcome with names and never a value" do
+    o = Gori::SessionRefresh::Outcome.new("admin", false, true, 2, 2, "login", 403, "the step answered 403")
+    j = JSON.parse(JSON.build { |b| Gori::CLI::Run.session_refresh_json(b, o) })
+    j["ok"].as_bool.should be_false
+    j["failed_step"].as_i.should eq(2)
+    j["status"].as_i.should eq(403)
+    j["message"].as_s.should contain("refresh admin failed at step 2 (login → 403)")
+  end
+end
+
+module Gori::CLI::Run
+  def self.refresh_verify_upstream_for_spec(verify : Bool) : Nil
+    refresh_verify_upstream(verify)
+  end
+
+  def self.open_store_for_refresh_spec(project : Project) : Store
+    open_store(project)
+  end
+end
+
+# A command's `-k` reaches the self-signed lab target with the send; the slot's login steps
+# have to reach it too, or every automatic refresh fails TLS and switches itself off.
+describe "gori run — a refresh step verifies upstream TLS as the command's -k says" do
+  it "hands -k to the runner open_store installs, and to one already installed" do
+    path = File.tempname("gori-clirun-refresh-verify", ".db")
+    Gori::Store.open(path).close
+    prev_hook = Gori::SessionRefresh.hook
+    prev_layer = Gori::Env.layer
+    begin
+      Gori::CLI::Run.refresh_verify_upstream_for_spec(false)
+      store = Gori::CLI::Run.open_store_for_refresh_spec(Gori::Project.new("verify", path))
+      begin
+        Gori::SessionRefresh.hook.as(Gori::SessionRefresh::Runner).verify?.should be_false
+        Gori::CLI::Run.refresh_verify_upstream_for_spec(true)
+        Gori::SessionRefresh.hook.as(Gori::SessionRefresh::Runner).verify?.should be_true
+      ensure
+        store.close
+      end
+    ensure
+      Gori::CLI::Run.refresh_verify_upstream_for_spec(true)
+      Gori::SessionRefresh.hook = prev_hook
+      Gori::Env.layer = prev_layer
+      {path, "#{path}-wal", "#{path}-shm"}.each { |f| File.delete?(f) }
+    end
+  end
+
+  # Every command that takes `-k` and can send as a slot says so before it sends. `capture`
+  # is the exception: it runs a proxy through `Session.open`, whose runner reads the flag itself.
+  it "is called by every command that parses -k" do
+    dir = File.join(__DIR__, "..", "..", "..", "src", "gori", "cli", "run")
+    missing = [] of String
+    glob_files(dir, "*.cr").each do |file|
+      File.read(file).split(/^\s*(?:private )?def self\./m).each do |body|
+        next unless body.includes?("p.on(\"-k\"")
+        name = body[/\A\w+/]
+        next if name == "cmd_capture"
+        missing << "#{File.basename(file)}:#{name}" unless body.includes?("refresh_verify_upstream(!insecure)")
+      end
+    end
+    missing.should eq([] of String)
   end
 end

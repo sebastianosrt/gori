@@ -31,4 +31,33 @@ describe "MCP decode" do
       doc["output"].as_s.bytesize.should be <= cap
     end
   end
+
+  # The "a bare name ENCODED" note can only warn about a converter it can name the inverse of,
+  # and it derives that inverse from a name SUFFIX — which is right for seventeen of the
+  # catalog's nineteen encoders and reaches neither of the two named for what they DO
+  # (`raw-deflate`, `url-encode-all`). That is what `INVERSE_NAME` is for, and this is the
+  # sweep that makes the pair of them a closed set: an encoder added later with a real inverse
+  # and no rule for it fails HERE, rather than going quiet in the note.
+  it "can name the inverse of every ENCODE converter the catalog has one for" do
+    # The genuinely one-way transforms: nothing in the catalog undoes them, so the note has
+    # nothing to offer and correctly stays silent.
+    one_way = %w[
+      shell-escape powershell-escape homoglyph typo
+      nfc nfd nfkc nfkd codepoint-overflow
+      windows-bestfit-874 windows-bestfit-932 windows-bestfit-936 windows-bestfit-949 windows-bestfit-950
+      windows-bestfit-1250 windows-bestfit-1251 windows-bestfit-1252 windows-bestfit-1253 windows-bestfit-1254
+      windows-bestfit-1255 windows-bestfit-1256 windows-bestfit-1257 windows-bestfit-1258
+    ]
+    reg = Gori::Decoder.default_registry
+    missing = [] of String
+    reg.each do |c|
+      next unless c.direction.encode?
+      next if one_way.includes?(c.name)
+      missing << c.name unless Gori::MCP::Tools.inverse_of(reg, c.name)
+    end
+    missing.should be_empty
+    # ...and each one-way name really has no inverse, so the list above cannot rot into a way
+    # of hiding a converter whose counterpart was added later.
+    one_way.each { |n| Gori::MCP::Tools.inverse_of(reg, n).should be_nil, n }
+  end
 end

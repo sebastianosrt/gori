@@ -19,7 +19,7 @@ module Gori
       # tree (or a file-loaded lens) until it asks for this, which is P4 in the one place an
       # agent could most easily be surprised by an outbound request.
 
-      @[Tool("grpc_reflect", gated: true, agent_action: true)]
+      @[Tool("grpc_reflect", gated: true, agent_action: true, permission: "send")]
       private def grpc_reflect(h) : Result
         raw = str(h, "url")
         return err("missing required 'url'", "INVALID_ARGUMENT", field: "url") if raw.nil? || raw.empty?
@@ -94,7 +94,7 @@ module Gori
       # No network, no gate — a file path and a cache row.
       @[Tool("grpc_schema")]
       private def grpc_schema(h) : Result
-        reflections = store.grpc_reflections
+        reflections = Gori::Protobuf::Schemas.reflections(store)
         Result.new(JSON.build do |j|
           j.object do
             j.field "spec", Gori::Protobuf::Schemas.spec
@@ -102,27 +102,27 @@ module Gori
             j.field "sources" do
               j.array do
                 Gori::Protobuf::Schemas.sources.each do |src|
-                  j.object do
-                    j.field "origin", src.origin.to_s.downcase
-                    j.field "path", src.path
-                    j.field "messages", src.messages
-                    j.field "methods", src.methods
-                    j.field "error", src.error
-                  end
+                  {
+                    origin:   src.origin.to_s.downcase,
+                    path:     src.path,
+                    messages: src.messages,
+                    methods:  src.methods,
+                    error:    src.error,
+                  }.to_json(j)
                 end
               end
             end
             j.field "reflections" do
               j.array do
                 reflections.each do |r|
-                  j.object do
-                    j.field "target", r.target
-                    j.field "service", r.service
-                    j.field "fetched_at", r.fetched_at
-                    j.field "services", r.services
-                    j.field "files", r.files
-                    j.field "bytes", r.descriptor.size
-                  end
+                  {
+                    target:     r.target,
+                    service:    r.service,
+                    fetched_at: r.fetched_at,
+                    services:   r.services,
+                    files:      r.files,
+                    bytes:      r.descriptor.size,
+                  }.to_json(j)
                 end
               end
             end
@@ -132,7 +132,7 @@ module Gori
 
       # Drop one cached reflection target (or all of them). The operator's/agent's exit from
       # a schema fetched earlier — nothing here expires on its own.
-      @[Tool("grpc_forget", gated: true, agent_action: true)]
+      @[Tool("grpc_forget", gated: true, agent_action: true, permission: "write")]
       private def grpc_forget(h) : Result
         target = str(h, "target")
         all = bool_arg(h, "all", false)
@@ -141,18 +141,16 @@ module Gori
         else
           return err("missing required 'target' (or all:true)", "INVALID_ARGUMENT", field: "target") if target.nil? || target.empty?
         end
-        known = store.grpc_reflections.map(&.target)
+        known = Gori::Protobuf::Schemas.reflections(store).map(&.target)
         if (t = target) && !all && !known.includes?(t)
           return not_found("no cached reflection for '#{t}'")
         end
         committed = Gori::Protobuf::Schemas.forget(store, all ? nil : target)
-        Result.new(JSON.build do |j|
-          j.object do
-            j.field "forgotten", all ? known.size : 1
-            j.field "persisted", committed
-            j.field "schema", Gori::Protobuf::Schemas.status
-          end
-        end)
+        Result.new({
+          forgotten: all ? known.size : 1,
+          persisted: committed,
+          schema:    Gori::Protobuf::Schemas.status,
+        }.to_json)
       end
 
       # Per-operation timeout in milliseconds, or nil for the project's io timeout. Clamped

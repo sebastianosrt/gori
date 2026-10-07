@@ -2,6 +2,7 @@ require "../paths"
 require "../url"
 require "../store"
 require "./schema"
+require "../plural"
 
 module Gori::Protobuf
   # WHERE the open project's `.proto` schema comes from, and what a captured gRPC path
@@ -108,6 +109,19 @@ module Gori::Protobuf
     # into a database read on the UI fiber.
     class_getter reflections : Array(Store::GrpcReflection) = [] of Store::GrpcReflection
 
+    # What a listing or a forget should answer to: every target the project has committed
+    # plus every one this process holds, one row per target, the in-memory entry winning a
+    # collision. Neither half alone is the truth. The store is the live view across processes,
+    # so a long-lived MCP server still lists a target another process reflected after it bound
+    # (#1227); memory holds a fetch `adopt` could not commit on a busy project (#1315). Ordered
+    # as `Store#grpc_reflections` orders them: oldest fetch first.
+    def self.reflections(store : Store) : Array(Store::GrpcReflection)
+      by_target = Hash(String, Store::GrpcReflection).new
+      store.grpc_reflections.each { |r| by_target[r.target] = r }
+      @@reflections.each { |r| by_target[r.target] = r }
+      by_target.values.sort_by! { |r| {r.fetched_at, r.target} }
+    end
+
     # Publish the open project's schema: the descriptor-set path from settings, plus every
     # target this project has already reflected against. Never raises — a project must open
     # even when its descriptor path is gone, and the failure is reported through `sources`.
@@ -146,10 +160,15 @@ module Gori::Protobuf
     def self.adopt(store : Store, target : String, service : String, services : Int32,
                    files : Int32, descriptor : Bytes) : Bool
       committed = store.put_grpc_reflection(target, service, services, files, descriptor)
-      # Re-read rather than splice the row in by hand: the Store is what orders them and what
-      # the next `load_project` will replay, and two constructions of one list is how they
-      # come to disagree.
-      @@reflections = store.grpc_reflections
+      # Spliced in by hand, committed or not, following the Store's own rule (one row per
+      # target, the newest fetch merging last). Re-reading the store on a commit threw away
+      # what this process holds only in memory — an earlier adopt a busy project did not
+      # persist came back out of the lens, and a forget that did not persist came back in (the
+      # reason `forget` below does not reload either). The next `load_project` reverts to what
+      # committed, as every surface says.
+      @@reflections = @@reflections.reject(&.target.==(target)) <<
+                      Store::GrpcReflection.new(target, service, Time.utc.to_unix_ms * 1000_i64,
+                        services, files, descriptor)
       rebuild
       committed
     end
@@ -158,7 +177,16 @@ module Gori::Protobuf
     # operator's exit from a schema they fetched — nothing here expires on its own.
     def self.forget(store : Store, target : String?) : Bool
       committed = target ? store.delete_grpc_reflection(target) : store.clear_grpc_reflections
-      @@reflections = store.grpc_reflections
+      # Drop the target from memory even when the delete did not commit (the caller reports
+      # persisted: false on a busy project, and the lens drops either way for this process).
+      # Reject directly rather than reload `store.grpc_reflections`: an uncommitted delete
+      # would otherwise restore the row from the store, and an unpersisted reflection in
+      # memory would be wiped by a reload.
+      @@reflections = if target
+                        @@reflections.reject(&.target.==(target))
+                      else
+                        [] of Store::GrpcReflection
+                      end
       rebuild
       committed
     end
@@ -238,12 +266,12 @@ module Gori::Protobuf
       # https://api.test" reads as a partial failure, and a project that only ever reflected
       # has no file to have failed.
       where = [] of String
-      where << "#{files} file#{files == 1 ? "" : "s"}" if files > 0 || reflected.empty?
+      where << Gori.plural(files, "file") if files > 0 || reflected.empty?
       unless reflected.empty?
         where << (reflected.size == 1 ? "reflection #{reflected[0].path}" : "reflection ×#{reflected.size}")
       end
       line = where.join(" · ")
-      line += " · #{msgs} message#{msgs == 1 ? "" : "s"} · #{rpcs} rpc#{rpcs == 1 ? "" : "s"}"
+      line += " · #{Gori.plural(msgs, "message")} · #{Gori.plural(rpcs, "rpc")}"
       line += " · #{bad.size} failed" unless bad.empty?
       line += " · #{@@dropped} over the #{MAX_FILES}-file limit" if @@dropped > 0
       line += " · #{s.conflicts} redefined" if s && s.conflicts > 0

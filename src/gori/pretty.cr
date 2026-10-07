@@ -1,4 +1,7 @@
 require "json"
+require "./ascii_bytes"
+require "./raw_json"
+require "./json_unicode"
 require "uri"
 require "base64"
 require "mime/multipart"
@@ -7,6 +10,9 @@ require "./media_type"
 require "./binary_document"
 require "./msgpack"
 require "./cbor"
+require "./decoder/serialized"
+require "./jwt/jwe"
+require "./plural"
 
 module Gori
   # Display-only body pretty-printer. Sits BETWEEN the transform layer
@@ -29,9 +35,10 @@ module Gori
     MAX_PARTS      = 256             # multipart parts shown
     PART_BODY_MAX  = 64 * 1024       # inline a multipart part body only if small + UTF-8
 
-    # A single-token JWT (header.payload[.signature]); the header is additionally
+    # A single-token JWS (header.payload[.signature]); the header is additionally
     # required to base64url-decode to a JSON object (see `try_jwt`) to avoid treating
-    # an ordinary dotted word like "a.b.c" as a token.
+    # an ordinary dotted word like "a.b.c" as a token. The five-part JWE shape is a
+    # separate predicate (`Jwt::Jwe::JWE_RE`), tried first in `try_jwt`.
     JWT_RE = /\A[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)?\z/
 
     RAW_ELEMENTS  = {"script", "style", "pre", "textarea"}
@@ -41,10 +48,16 @@ module Gori
     # Reflowed display bytes + a short note for the trailer. `kind` overrides the
     # highlighter's content-type-derived styling when the pretty output is no longer
     # the content-type's language (GraphQL/JWT/multipart → :text).
-    record Result, bytes : Bytes, note : String, kind : Symbol? = nil
+    alias DecodedRange = JsonUnicode::DecodedRange
+
+    record Result, bytes : Bytes, note : String, kind : Symbol? = nil,
+      decoded_ranges : Array(DecodedRange) = [] of DecodedRange,
+      protected_linefeeds : Array(Int32) = [] of Int32,
+      unicode_escape_count : Int32 = 0,
+      reflowed : Bool = true
 
     # nil = leave the body raw (the only failure signal).
-    def format(head : Bytes?, body : Bytes?) : Result?
+    def format(head : Bytes?, body : Bytes?, *, decode_unicode : Bool = false) : Result?
       return nil if body.nil? || body.empty?
       return nil if body.size > MAX_PRETTY
 
@@ -57,11 +70,12 @@ module Gori
       # content-type has to say so — this is a dispatch, not a guess (`MediaType.binary_document?`).
       return try_binary_doc(body, ct) if MediaType.binary_document?(ct)
 
-      # Content sniffs FIRST — JWT/GraphQL masquerade under generic content-types.
-      if r = try_jwt(str)
+      # Content sniffs FIRST — a native-serialization blob and a JWT both masquerade under
+      # generic content-types (and the four serialization formats have no content-type at all).
+      if r = sniffed(body, str)
         return r
       end
-      return try_json_or_graphql(str) if MediaType.json?(ct)
+      return try_json(str, decode_unicode) if MediaType.json?(ct)
       # A urlencoded body can be a GraphQL request (`query=…&variables=…`, the form
       # express-graphql and Yoga accept beside JSON). Rendering it as an anonymous field list
       # loses the document; ask the GraphQL parser first and fall back to the field list.
@@ -70,6 +84,42 @@ module Gori
       markup_or_graphql(body, str, ct, ctl)
     rescue
       nil # last-resort net: Pretty must never raise into the render path
+    end
+
+    # Decode escaped Unicode in a JSON body without changing its original whitespace. This is
+    # the `u` layer when the operator has turned pretty reflow off; the decoded text remains a
+    # display projection and is never used by the request write-back path.
+    def decode_unicode_json(head : Bytes?, body : Bytes?) : Result?
+      return nil if body.nil? || body.empty? || body.size > MAX_PRETTY
+      return nil unless MediaType.json?(MediaType.of(head))
+      raw = String.new(body)
+      return nil unless RawJson.valid?(raw)
+      unicode = JsonUnicode.decode(raw)
+      return nil if unicode.count == 0
+      Result.new(unicode.text.to_slice, "json · \\u decoded (#{unicode.count} escapes)",
+        decoded_ranges: unicode.ranges, protected_linefeeds: unicode.protected_linefeeds,
+        unicode_escape_count: unicode.count, reflowed: false)
+    rescue
+      nil
+    end
+
+    # Escape count for a plain JSON pane when pretty reflow is disabled. Keeps the `u` chip
+    # discoverable without changing the pane's bytes or allocating a decoded projection.
+    def unicode_escape_count(head : Bytes?, body : Bytes?) : Int32
+      return 0 if body.nil? || body.empty? || body.size > MAX_PRETTY
+      return 0 unless MediaType.json?(MediaType.of(head))
+      raw = String.new(body)
+      RawJson.valid?(raw) ? JsonUnicode.escape_count(raw) : 0
+    rescue
+      0
+    end
+
+    # The HEAD of `format`'s chain: the two sniffs that run before any content-type is
+    # consulted, in the order they have to run in. A serialized object graph is dispatched on
+    # its own marker (`try_serialized`) because none of those four formats has a content type;
+    # a JWT is a body shape that appears under every generic type there is.
+    private def sniffed(body : Bytes, str : String) : Result?
+      try_serialized(body) || try_jwt(str)
     end
 
     # The TAIL of `format`'s chain, split out so the whole dispatch is not one method past
@@ -116,6 +166,35 @@ module Gori
       nil # last-resort net, the same one `format` carries: never raise into the render path
     end
 
+    # ---- native serialization (Java / ViewState / PHP / pickle) ------------
+
+    # A body somebody's RUNTIME wrote — a Java `ObjectOutputStream` stream, an ASP.NET
+    # ViewState, a PHP `serialize()` value, a Python pickle. Same projection and same `kind`
+    # override as `try_binary_doc`, and nil for a body whose bytes are not what their marker
+    # claims, so the caller falls through to the hex view.
+    #
+    # A MARKER and not a content-type, which is the one thing that differs from the sibling
+    # above: none of these four formats has a content-type of its own. A Java stream comes
+    # back as `application/octet-stream`, a serialized PHP value as `text/plain`. Each marker
+    # is structural rather than a keyword (`Decoder::Serialized.sniff`), which is what keeps
+    # this from firing on an ordinary body.
+    #
+    # A ViewState is the one that will rarely reach here, and that is expected rather than a
+    # gap: it lives in an `<input value=…>` inside an HTML body, not as the body. The converter
+    # (`dotnet-viewstate`) is where an operator reads one, and the Decoder tab is where they
+    # paste it.
+    private def try_serialized(body : Bytes) : Result?
+      format, r = Decoder::Serialized.sniff(body, indent: "  ") || return nil
+      return nil if r.json.bytesize > MAX_OUT_PRETTY
+      note = String.build do |io|
+        io << "decoded: " << format
+        io << " (partial — the document ends mid-value)" unless r.complete
+      end
+      Result.new(r.json.to_slice, note, kind: :json)
+    rescue
+      nil # last-resort net, the same one `format` carries: never raise into the render path
+    end
+
     # ---- content-type ------------------------------------------------------
 
     # Worth handing to the GraphQL parser despite a content-type that claims nothing: the raw
@@ -127,43 +206,40 @@ module Gori
 
     # ---- JSON --------------------------------------------------------------
 
-    # A JSON body is EITHER a GraphQL envelope (operationName + query + variables) or plain
-    # JSON to pretty-print. Both used to JSON.parse the SAME body independently (try_graphql
-    # then try_json), so a non-GraphQL REST-JSON response — the dominant shape — built the
-    # whole JSON tree TWICE per detail-view cache rebuild. Parse ONCE, sniff GraphQL off the
-    # tree, else pretty-print the tree. Byte-identical to the old two-call dispatch on every
-    # input: invalid/empty JSON → nil via the parse rescue (as both did); a GraphQL shape →
-    # the graphql result; anything else → the pretty result (or nil for already-pretty/scalar).
-    private def try_json_or_graphql(str : String) : Result?
+    # A JSON content-type stays on its wire grammar in the default pane. Pretty changes only
+    # inter-token whitespace so escapes and duplicate keys remain visible to the operator.
+    private def try_json(str : String, decode_unicode : Bool = false) : Result?
       s = strip_bom(str).strip
-      json = JSON.parse(s)
-      # GraphQL sniff in its OWN rescue so a shape-check failure falls through to pretty-print
-      # exactly as the old try_graphql(rescue→nil)-then-try_json path did.
-      if r = (graphql_from(json) rescue nil)
-        return r
-      end
-      pretty = json.to_pretty_json
-      return nil if pretty == s # already pretty / scalar → no-op, show raw
-      slice = pretty.to_slice
-      return nil if slice.size > MAX_OUT_PRETTY
-      Result.new(slice, "pretty: json")
+      pretty = RawJson.reindent(s, "  ", MAX_OUT_PRETTY) || return nil
+      pretty_json(pretty, s, decode_unicode)
     rescue
-      nil # invalid JSON (both try_graphql and try_json returned nil here before)
+      nil # invalid JSON remains an ordinary raw-body view
+    end
+
+    private def pretty_json(pretty : String, s : String, decode_unicode : Bool = false) : Result?
+      displayed = pretty
+      ranges = [] of DecodedRange
+      protected_linefeeds = [] of Int32
+      count = JsonUnicode.escape_count(pretty)
+      if decode_unicode && count > 0
+        unicode = JsonUnicode.decode(pretty)
+        displayed = unicode.text
+        ranges = unicode.ranges
+        protected_linefeeds = unicode.protected_linefeeds
+        count = unicode.count
+      end
+      return nil if displayed == s && count == 0 # already pretty / scalar → no-op
+      slice = displayed.to_slice
+      return nil if slice.size > MAX_OUT_PRETTY
+      note = "pretty: json"
+      if decode_unicode && count > 0
+        note += " · \\u decoded (#{count} escapes)"
+      end
+      Result.new(slice, note, decoded_ranges: ranges, protected_linefeeds: protected_linefeeds,
+        unicode_escape_count: count, reflowed: pretty != s)
     end
 
     # ---- GraphQL (operationName + un-escaped query + pretty variables) ------
-
-    # GraphQL envelope over an ALREADY-PARSED body (no second parse).
-    #
-    # `Gori::Graphql` answers the shape question, and this file no longer carries its own
-    # opinion about it. It used to — a hand-rolled `{"query": …}` object check — and the two
-    # drifted exactly as duplicated detectors do: a batched request and a persisted query
-    # were GraphQL to the decoded pane and anonymous JSON to the `p` toggle beside it, on the
-    # same flow, on the same screen. `display` is likewise the pane's own renderer, so the
-    # two views of one body cannot disagree about its text either.
-    private def graphql_from(json : JSON::Any) : Result?
-      result_for(Graphql.from_json_any(json))
-    end
 
     # The same, for a body Pretty has NOT already parsed — a urlencoded `query=…`, a raw
     # `application/graphql` document, or an envelope under a content-type that hides it.
@@ -184,10 +260,18 @@ module Gori
 
     private def try_jwt(str : String) : Result?
       t = str.strip
+      # A JWE first: it is five segments, so JWT_RE would reject it and the body would render
+      # as an opaque dotted string with nothing to read. The rendered form is header-only —
+      # the claims stay encrypted, and the label says so rather than implying a decode.
+      if jwe = Jwt::Jwe.parse(t)
+        slice = Jwt::Jwe.render(jwe).to_slice
+        return nil if slice.size > MAX_OUT_PRETTY
+        return Result.new(slice, "pretty: jwe (encrypted · protected header only)", :json)
+      end
       return nil unless t =~ JWT_RE
       # Strong signal: a JWT header always base64url-decodes to a JSON object.
       header = Base64.decode(t.split('.').first)
-      return nil unless JSON.parse(String.new(header)).as_h?
+      return nil unless RawJson.members(String.new(header)) # an object, numbers of any size
       decoded = Decoder::Codecs.jwt_decode(t.to_slice)
       slice = decoded.to_slice
       return nil if slice.size > MAX_OUT_PRETTY
@@ -219,7 +303,7 @@ module Gori
       return nil if text == str # single bare token, nothing to reflow
       ob = text.to_slice
       return nil if ob.size > MAX_OUT_PRETTY
-      Result.new(ob, "pretty: form (#{pairs.size} field#{pairs.size == 1 ? "" : "s"})", :form)
+      Result.new(ob, "pretty: form (#{Gori.plural(pairs.size, "field")})", :form)
     rescue
       nil
     end
@@ -251,7 +335,7 @@ module Gori
       text = parts.join("\n\n")
       ob = text.to_slice
       return nil if ob.size > MAX_OUT_PRETTY
-      Result.new(ob, "pretty: multipart (#{count} part#{count == 1 ? "" : "s"})", :text)
+      Result.new(ob, "pretty: multipart (#{Gori.plural(count, "part")})", :text)
     rescue
       nil
     end
@@ -273,28 +357,23 @@ module Gori
     # text between tags is dropped; element text is trimmed. ANY imbalance (a stray
     # close, leftover open depth, or an unterminated `<`) aborts to nil so the caller
     # falls back to the raw bytes rather than showing a mangled tree.
+    #
+    # The output cap is checked as lines accrue, not on the joined result: each tag gets a
+    # line indented up to MAX_DEPTH, so a 1 MiB run of `<a>` reflows to ~170x its size and
+    # used to allocate hundreds of MB on every render just to be refused.
     private def indent_xml(str : String) : String?
       src = str.to_slice
       n = src.size
       depth = 0
-      lines = [] of String
+      buf = String::Builder.new
       i = 0
-      while i < n
+      # Stops at the cap with output the caller's own size check then refuses.
+      while i < n && buf.bytesize <= MAX_OUT_PRETTY
         if src[i] == 0x3C # '<'
           tend = tag_end(src, i)
           return nil if tend < 0
-          tok = String.new(src[i, tend - i])
-          case classify(tok)
-          when :close
-            depth -= 1
-            return nil if depth < 0
-            lines << indent(depth) + tok
-          when :open
-            lines << indent(depth) + tok
-            depth += 1
-          else # selfclose / comment / cdata / decl / doctype
-            lines << indent(depth) + tok
-          end
+          depth = xml_tag(buf, depth, String.new(src[i, tend - i]))
+          return nil if depth < 0
           i = tend
         else
           start = i
@@ -302,11 +381,11 @@ module Gori
             i += 1
           end
           text = String.new(src[start, i - start]).strip
-          lines << indent(depth) + text unless text.empty?
+          xml_line(buf, depth, text) unless text.empty?
         end
       end
-      return nil if depth != 0 || lines.empty?
-      lines.join('\n')
+      return nil if depth != 0 || buf.empty?
+      buf.to_s
     end
 
     # ---- HTML (additive, insert-only — never drops/alters a byte) ----------
@@ -334,8 +413,8 @@ module Gori
       depth = 0
       prev_was_tag = false
       i = 0
-      while i < n
-        if src[i] == 0x3C # '<'
+      while i < n && buf.bytesize <= MAX_OUT_PRETTY # the cap as output accrues; see `indent_xml`
+        if src[i] == 0x3C                           # '<'
           tend = tag_end(src, i)
           return nil if tend < 0
           tok = String.new(src[i, tend - i])
@@ -371,6 +450,26 @@ module Gori
         end
       end
       buf.to_s
+    end
+
+    # One tag's line; returns the depth after it, negative on a stray close.
+    private def xml_tag(buf : String::Builder, depth : Int32, tok : String) : Int32
+      case classify(tok)
+      when :close
+        depth -= 1
+        xml_line(buf, depth, tok) unless depth < 0
+      when :open
+        xml_line(buf, depth, tok)
+        depth += 1
+      else # selfclose / comment / cdata / decl / doctype
+        xml_line(buf, depth, tok)
+      end
+      depth
+    end
+
+    private def xml_line(buf : String::Builder, depth : Int32, text : String) : Nil
+      buf << '\n' unless buf.empty?
+      buf << indent(depth) << text
     end
 
     private def emit_tag(buf : String::Builder, depth : Int32, tok : String, prev_was_tag : Bool) : Nil
@@ -485,14 +584,7 @@ module Gori
       last = src.size - sb.size
       i = from
       while i <= last
-        match = true
-        sb.each_with_index do |b, k|
-          if downcase_byte(src[i + k]) != b
-            match = false
-            break
-          end
-        end
-        return i if match
+        return i if AsciiBytes.range_eq_ci?(src, i, i + sb.size, sb)
         i += 1
       end
       -1
@@ -509,6 +601,12 @@ module Gori
       # display feature (P7). The reader is still one `p` away in the response pane and in the
       # Decoder tab, where nothing is replaced.
       return nil if MediaType.binary_document?(MediaType.of(head.to_slice))
+
+      return format_json_request(body) if MediaType.json?(MediaType.of(head.to_slice))
+      format_other_request(head, body)
+    end
+
+    private def format_other_request(head : String, body : String) : String?
       markers = [] of String
 
       # 1. Extract and replace all markers with unique safe numeric strings.
@@ -574,8 +672,111 @@ module Gori
       formatted
     end
 
-    private def downcase_byte(b : UInt8) : UInt8
-      (0x41_u8 <= b <= 0x5A_u8) ? b + 0x20_u8 : b
+    # Reindent JSON without parsing and rebuilding its values. Template markers are replaced
+    # byte-wise before the temporary document is validated, then restored after whitespace-only
+    # formatting so the editor's write-back keeps the operator's payload (P7).
+    private def format_json_request(body : String) : String?
+      return nil if body.bytesize > MAX_PRETTY
+      marker_prefix = json_marker_prefix(body.to_slice)
+      temp_body, markers = extract_json_markers(body, marker_prefix)
+      formatted = RawJson.reindent(temp_body, "  ", MAX_OUT_PRETTY) || return nil
+      formatted = restore_json_markers(formatted, marker_prefix, markers)
+      formatted == body ? nil : formatted
+    end
+
+    # Replace §...§ template markers using their UTF-8 bytes. String#chars would scrub malformed
+    # bytes from an otherwise valid operator JSON string before write-back, violating P7.
+    private def extract_json_markers(body : String, marker_prefix : String) : {String, Array(String)}
+      source = body.to_slice
+      output = IO::Memory.new
+      markers = [] of String
+      i = 0
+
+      while i < source.size
+        unless json_marker_at?(source, i)
+          output.write_byte(source[i])
+          i += 1
+          next
+        end
+
+        if json_marker_at?(source, i + 2)
+          output.write(source[i, 4]) # doubled § is an escaped literal marker
+          i += 4
+          next
+        end
+
+        start = i
+        i += 2
+        while i < source.size
+          unless json_marker_at?(source, i)
+            i += 1
+            next
+          end
+          if json_marker_at?(source, i + 2)
+            i += 4
+          else
+            break
+          end
+        end
+
+        if json_marker_at?(source, i)
+          markers << String.new(source[start, i + 2 - start])
+          output << json_marker_placeholder(marker_prefix, markers.size - 1)
+          i += 2
+        else
+          output.write(source[start, source.size - start])
+          i = source.size
+        end
+      end
+
+      {String.new(output.to_slice), markers}
+    end
+
+    private def restore_json_markers(formatted : String, marker_prefix : String,
+                                     markers : Array(String)) : String
+      return formatted if markers.empty?
+
+      source = formatted.to_slice
+      prefix = marker_prefix.to_slice
+      output = IO::Memory.new
+      copied_until = 0
+      pos = 0
+      while at = AsciiBytes.index(source, prefix, pos)
+        index_start = at + prefix.size
+        marker_index = 0
+        8.times do |offset|
+          digit = source[index_start + offset] - 0x30_u8
+          marker_index = marker_index * 10 + digit
+        end
+        output.write(source[copied_until, at - copied_until]) if at > copied_until
+        output.write(markers[marker_index].to_slice)
+        copied_until = index_start + 8
+        pos = copied_until
+      end
+      output.write(source[copied_until, source.size - copied_until]) if copied_until < source.size
+      String.new(output.to_slice)
+    end
+
+    # Share an absent numeric prefix across every marker so lookup/restoration stays linear in
+    # the document size rather than rescanning the whole body for each marker. A source body
+    # can contain arbitrary number lexemes, so choose and verify the prefix against its bytes.
+    private def json_marker_prefix(source : Bytes) : String
+      seed = "87654321098765432109876543210987654321"
+      attempt = 0
+      loop do
+        suffix = attempt.to_s.rjust(8, '0')
+        candidate = seed[0, seed.size - suffix.size] + suffix
+        return candidate unless AsciiBytes.index(source, candidate.to_slice)
+        attempt += 1
+      end
+    end
+
+    private def json_marker_placeholder(prefix : String, index : Int32) : String
+      "#{prefix}#{index.to_s.rjust(8, '0')}"
+    end
+
+    private def json_marker_at?(source : Bytes, at : Int32) : Bool
+      at + 1 < source.size && source[at] == 0xc2_u8 && source[at + 1] == 0xa7_u8
     end
 
     private def strip_bom(s : String) : String

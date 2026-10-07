@@ -1,3 +1,4 @@
+require "json"
 require "termisu"
 require "../verb"
 require "../session"
@@ -5,15 +6,19 @@ require "../hotkeys"
 require "./keybind"
 require "../repeater/subtab_filter"
 require "./subtab_marks"
+require "./selection_ident"
 require "./controllers/tab_close"
+require "./editor_pane"
 require "./screen"
 require "./line_edit"
+require "./text_read_state"
 require "./geometry"
 require "./frame"
 require "./chrome"
 require "./theme"
 require "./jobs"
 require "./notifications"
+require "../plural"
 
 module Gori::Tui
   # The narrow facade a TabController is given to drive the shell's cross-cutting
@@ -59,7 +64,30 @@ module Gori::Tui
     def discover_open_flow : Nil
     end
 
+    # The flow an OPEN History detail is pinned to, or nil when none is. A History verb acts
+    # on this and not on the marks while the detail is up (`Runner#history_target_flow_ids`:
+    # live capture advances the list cursor while the detail stays on its flow), so the
+    # selection this tab publishes has to say the same thing the keys would do. The overlay
+    # state lives on the Runner and a controller cannot read it — hence the seam.
+    # A default and not an abstract, for `sitemap_open_flow`'s reason above: thirty spec
+    # doubles implement this module by hand, and a read only History reaches should not tax
+    # them all.
+    def detail_pinned_flow_id : Int64?
+      nil
+    end
+
     def diff_to_comparer : Nil
+    end
+
+    # The Params row's newest flow in the History detail (`params.open-flow`) — a double-click
+    # asks for what ↵ does, and the tab switch is the Runner's. A default, as above.
+    def params_open_flow : Nil
+    end
+
+    # The Issues detail's RELATED row ↵ (`issue.open-link`) — it navigates to the linked
+    # flow / repeater / … in that item's own tab, so it lives on the Runner like the four
+    # above, and a double-click on a link row asks for exactly what the key asks for.
+    def issue_open_link : Nil
     end
 
     # The Probe MODE picker (`probe.set-mode`), which the MODE band's chip raises on a click.
@@ -89,9 +117,10 @@ module Gori::Tui
     def open_history_view_picker : Nil
     end
 
-    # The History column editor (#819). Same seam, and same reason, as the view picker above:
-    # the Runner's own `open_history_columns` (runner/columns.cr) overrides it.
-    def open_history_columns : Nil
+    # Flip the hide-static lens (#1239) from a `static:hidden` chip. Same seam, and same reason,
+    # as the view picker above: the Runner's own `toggle_static_assets` (runner/views.cr)
+    # overrides it.
+    def toggle_static_assets : Nil
     end
 
     # Reconfigure the current Sequencer session's token descriptor/goal (the `c` chord).
@@ -129,6 +158,14 @@ module Gori::Tui
     abstract def overlay : Symbol    # read the overlay state (e.g. History reads :detail)
     abstract def active_tab : Symbol # read the active tab (Repeater reconcile gates on it)
     abstract def focus : Symbol      # read the focus model (:menu | :subtabs | :body)
+
+    # Is the History drill-in on screen, up itself or under a card opened over it? What
+    # History DRAWS on; `overlay == :detail` stays what its keys gate on, since a card up
+    # takes the keys. CONCRETE for the spec doubles, like `status(message, kind)` below;
+    # Runner overrides it with the card-aware answer.
+    def detail_shown? : Bool
+      overlay == :detail
+    end
 
     # A toast WITH a status-strip glyph: `:busy` (spinner), `:done` (✓) or `:error` (✗) — see
     # `Runner#format_status_message` for why the glyph is a kind on the call and not a prefix
@@ -289,8 +326,8 @@ module Gori::Tui
     MARKER = '▎'
 
     # {icon rect, chips rect} for one chip row — the SINGLE source of both. Returned as a
-    # pair so no caller can narrow one without the other; `Chrome.more_button_rect` +
-    # `tabs_area` are the same pair one level up. `show: false` (a fixed or self-drawn strip)
+    # pair so no caller can narrow one without the other; `Chrome.menu_geometry`'s
+    # `{segments, more}` is the same pair one level up. `show: false` (a fixed or self-drawn strip)
     # gives {nil, row}, which is byte-for-byte the layout from before the affordance existed.
     #
     # The icon is dropped when it would not leave room for the FIRST VISIBLE chip plus the
@@ -369,6 +406,8 @@ module Gori::Tui
   # (Help) overrides only `tab`/`render_body`/`command_scope`, while a rich tab
   # (Repeater) overrides the input/focus/lifecycle hooks too.
   abstract class TabController
+    include EditorPane
+
     property subtab_start : Int32 = 0
 
     # --- sub-tab filter (issue #121; shared across the multi-session workbench tabs) ---
@@ -466,6 +505,14 @@ module Gori::Tui
       ev.key.right? || (ev.key.lower_l? && bare_chord?(ev))
     end
 
+    # A modified ←/→ — one WORD, not one character. Either modifier: ⌥ is the macOS spelling,
+    # ⌃ the one every other platform uses, and which of the two a terminal actually forwards
+    # is not something the operator should have to know. Test it BEFORE `nav_left?`, which
+    # takes any ←.
+    def word_step?(ev : Termisu::Event::Key) : Bool
+      (ev.ctrl? || ev.alt?) && (ev.key.left? || ev.key.right?)
+    end
+
     # No command modifier — the shape a pane-local letter must be matched in, since anything
     # carrying ⌃/⌥ belongs to the central keymap.
     def bare_chord?(ev : Termisu::Event::Key) : Bool
@@ -541,6 +588,12 @@ module Gori::Tui
     # seen. Read after a render; a pane that has not drawn yet answers 1.
     def page_rows : Int32?
       nil
+    end
+
+    # The four keys the Runner's page route (`page_nav_delta` → `body_scroll`) answers. A tab
+    # whose pane handler ends in `true` declines them by name over its list pane.
+    private def page_nav_key?(key : Termisu::Input::Key) : Bool
+      key.page_up? || key.page_down? || key.home? || key.end?
     end
 
     # Same notch, but with the pointer position + body rect — lets a multi-pane tab
@@ -835,7 +888,7 @@ module Gori::Tui
     # place, so "close 5 sub-tabs" can reach two chips that are not on screen. The project
     # picker's delete confirm spells the same split out for the same reason.
     protected def marked_subtab_phrase(n : Int32) : String
-      base = "#{n} sub-tab#{n == 1 ? "" : "s"}"
+      base = Gori.plural(n, "sub-tab")
       hidden = hidden_marked_count
       hidden > 0 ? "#{base} (#{hidden} not on screen — the filter is hiding them)" : base
     end
@@ -846,10 +899,13 @@ module Gori::Tui
     # or outbound, and a duplicate only opens tabs the same `^W` closes again. Ascending, so
     # the clones land in the order their originals sit in.
     #
-    # Returns the sentence, or nil when the batch was refused (the caller says why).
+    # Returns the sentence, or nil when the batch was refused (and toasts why).
     protected def duplicate_marked_subtabs(refs : Array(SubtabRef), noun : String, & : Int32 -> Nil) : String?
       idxs = resolve_subtab_refs(refs)
-      return nil if idxs.size > Tui::Runner::BATCH_SUBTAB_CAP
+      if idxs.size > Tui::Runner::BATCH_SUBTAB_CAP
+        @host.status("#{refs.size} sub-tabs marked — duplicate is capped at #{Tui::Runner::BATCH_SUBTAB_CAP}")
+        return nil
+      end
       idxs.each { |i| yield i }
       "duplicated #{idxs.size} #{noun}#{idxs.size == 1 ? "" : "s"}"
     end
@@ -858,13 +914,6 @@ module Gori::Tui
     # run or a result spool still writing); every other strip always closes.
     def close_subtab_refusal(idx : Int32) : String?
       nil
-    end
-
-    # Close sub-tab `idx` and say NOTHING — the batch driver below owns the sentence, and a
-    # loop of per-tab toasts would leave only the last one on screen anyway. Returns true
-    # when the store rolled the DELETE back and the saved session will reappear.
-    protected def close_subtab_at(idx : Int32) : Bool
-      false
     end
 
     # The batch half of a close gesture (#683). Three rules, each one a defect if dropped:
@@ -897,12 +946,151 @@ module Gori::Tui
         gone << ref if ref
       end
       unmark_subtab_refs(gone)
-      msg = "closed #{gone.size} sub-tab#{gone.size == 1 ? "" : "s"}"
+      msg = "closed #{Gori.plural(gone.size, "sub-tab")}"
       msg += " · #{refused} kept (#{refusal})" if refusal
       TabClose.message(msg, orphaned > 0)
     end
 
     # ===== end sub-tab multi-select ==========================================
+
+    # ===== MCP selection snapshot (issue #1091) ==============================
+    # What the operator has SELECTED, published into the project's `ui_state` row by
+    # `Runner#ui_state_json` and read cross-process by `gori mcp get_current_context`. The
+    # agent-facing half of the mark model above (#442/#683): the TUI already knows which rows
+    # a verb would act on, and an operator saying "do X with the four I marked" had no way to
+    # hand that over except by reading ids off the screen.
+    #
+    # The contract is that the payload carries the ANSWER of the tab's own target rule
+    # (`target_ids` / `target_keys` / `target_subtab_indices` — marks if any, else the cursor)
+    # and never its inputs, so nothing downstream re-derives that rule and drifts from it.
+
+    # Cap on the ids / nodes / chips this block NAMES. `⇧T` over a captured History marks up
+    # to `HistoryView::PAGE` (1000) rows, and this JSON is rewritten into a `settings` row on
+    # the tick. 200 sits well above a `⇧T` over one screenful (a terminal shows ~60 rows), so
+    # it only trips on a deliberate mark-all over a long list — and it is NEVER a silent
+    # narrowing: `marked_count` stays the TRUE count and `truncated` says the list was cut,
+    # so a reader can tell "these are your marks" from "these are the first 200 of them".
+    SELECTION_ID_CAP = 200
+
+    # --- the four per-tab hooks; override THESE -------------------------------
+    # What this tab's selection ADDRESSES, or nil when it publishes no list selection. The
+    # closed set is "flow" | "issue" | "sitemap_node" | "intercept_item". A field rather than
+    # something inferred from the id type, because Sitemap's key is a {host, path} pair and
+    # not an integer — `kind` is what tells a reader which of `ids`/`nodes` to expect.
+    def selection_kind : String?
+      nil
+    end
+
+    # The per-tab selection body — FIELDS into an object the base has already opened. Called
+    # only when `selection_kind` is non-nil, and only on a tick that is about to write.
+    def write_selection_fields(j : JSON::Builder) : Nil
+    end
+
+    # The per-tab identity. Read on EVERY 50 ms tick: no allocation, no sort, no store round
+    # trip. In particular NOT `subtab_count` (it builds an `Array(String)` through
+    # `subtab_labels`) and NOT `marked_subtab_indices` (it allocates AND calls `retain`) —
+    # see the comment on `SelectionIdent` for why this is derived rather than a counter.
+    def list_selection_ident : SelectionIdent
+      SelectionIdent.new
+    end
+
+    # How many rows are marked on this tab, for the IDENTITY roll-up the Runner folds over
+    # every tab. O(1) and deliberately not `marked_subtab_indices.size`, which allocates and
+    # prunes — this is on the 50 ms tick. It may therefore still count a chip a peer closed;
+    # that is harmless in a change detector (the value is stable until the prune, and the
+    # prune itself moves it), but NOT in the payload, which uses `mcp_marked_count` below.
+    def mcp_mark_count : Int32
+      @subtab_marks.size
+    end
+
+    # The same count for the PAYLOAD, where a phantom is a lie rather than a stale cache key:
+    # a strip whose marked sessions were all closed by a peer must not go on telling an agent
+    # it has two. Prunes (`marked_subtab_indices` → `SubtabMarks#retain`), so it is only ever
+    # called on the publish path, at most once per `UI_STATE_THROTTLE`.
+    def mcp_marked_count : Int32
+      @subtab_marks.empty? ? mcp_mark_count : marked_subtab_indices.size
+    end
+
+    # What this tab's MARKS address, for the roll-up's label. Separate from `selection_kind`
+    # because the two can disagree: `TargetController` publishes the ACTIVE child's selection
+    # while its marks may sit on a sibling, and labelling four sitemap nodes with whatever
+    # Discover happens to be is worse than saying nothing.
+    def mcp_mark_kind : String?
+      selection_kind
+    end
+
+    # --- base-owned; do NOT override -----------------------------------------
+    # Crystal has no `override`, so a subclass defining one of these would silently REPLACE
+    # it and drop the strip marks (or the whole body) with no error anywhere.
+    # `spec/tui/ui_state_selection_spec.cr` fails if one ever does.
+
+    def selection_ident : SelectionIdent
+      ident = list_selection_ident
+      @subtab_marks.empty? ? ident : ident.copy_with(subtabs: @subtab_marks.size)
+    end
+
+    # Has this tab anything to publish? Asked by the Runner so a Help or Settings tab never
+    # writes an empty `selection` object into the row every throttle window.
+    def mcp_selection? : Bool
+      return true unless selection_kind.nil?
+      !@subtab_marks.empty? && !marked_subtab_indices.empty?
+    end
+
+    def write_mcp_selection(j : JSON::Builder) : Nil
+      j.object do
+        if kind = selection_kind
+          j.field "kind", kind
+          write_selection_fields(j)
+        end
+        write_subtab_marks(j)
+      end
+    end
+
+    # The GENERIC strip marks (#683), owned here because `@subtab_marks` is — so all nine
+    # strip-bearing tabs report them without each one remembering to.
+    #
+    # Indices and a label ONLY. The Repeater's own `write_mcp_context` already catalogues its
+    # chips with `db_id`/`flow_id`, and `subtab` is the join key between the two blocks; a
+    # second catalogue here would be a second source of truth for one strip. The other eight
+    # strips have no per-chip MCP catalogue yet, so index + label is all an agent gets for
+    # them — a known, bounded gap, said out loud in the tool description.
+    private def write_subtab_marks(j : JSON::Builder) : Nil
+      return if @subtab_marks.empty?
+      idxs = marked_subtab_indices
+      return if idxs.empty?
+      labels = subtab_labels
+      shown = idxs.first(SELECTION_ID_CAP)
+      j.field "marked_subtabs" do
+        j.array do
+          shown.each do |i|
+            j.object do
+              j.field "subtab", i
+              labels.try(&.[i]?).try { |l| j.field "label", l }
+            end
+          end
+        end
+      end
+      j.field "marked_subtab_count", idxs.size
+      j.field "marked_subtab_hidden_count", hidden_marked_count
+      j.field "marked_subtabs_truncated", true if shown.size < idxs.size
+    end
+
+    # The integer-id target block, written IDENTICALLY by History, Issues and Intercept so
+    # the three cannot drift on how `target_source` reads or on how a cut list is announced.
+    # Sitemap has its own shape (a {host, path} pair is not an id) and does not come here.
+    def self.write_id_targets(j : JSON::Builder, ids : Array(Int64), *,
+                              marked : Int32, hidden : Int32,
+                              source : String? = nil) : Nil
+      shown = ids.first(SELECTION_ID_CAP)
+      j.field "ids", shown
+      j.field "target_source", source || (marked > 0 ? "marks" : "cursor")
+      j.field "marked_count", marked
+      j.field "marked_hidden_count", hidden
+      j.field "id_cap", SELECTION_ID_CAP
+      j.field "truncated", shown.size < ids.size
+    end
+
+    # ===== end MCP selection snapshot ========================================
 
     # The sub-tab strip always carves its own hairline under the chip row. When a filter
     # bar is also shown it draws a SECOND hairline below itself, so the chrome reads
@@ -965,6 +1153,12 @@ module Gori::Tui
       @subtab_filter_editing = false
       @filter_preedit = ""
       reanchor_current
+    end
+
+    # A path that lands on a sub-tab it just made (^N, duplicate, send-to) drops a filter that
+    # hides it: the strip would otherwise draw no active chip and ←/→ would jump to an edge.
+    protected def reveal_active_subtab : Nil
+      clear_subtab_filter if (h = subtab_hidden) && h.includes?(subtab_index)
     end
 
     # Esc: drop the filter entirely and leave edit mode (every chip returns).
@@ -1075,6 +1269,73 @@ module Gori::Tui
       (ev.char || ev.key.to_char) == '?'
     end
 
+    # The QL `/` bar's keys for History, Sitemap, Issues and Probe — one grammar, one set of
+    # gestures. `bar` is the tab's view; the block is the tab's Esc. Returns true (swallows).
+    protected def handle_ql_bar_key(ev : Termisu::Event::Key, bar, help : Symbol, & : -> Nil) : Bool
+      key = ev.key
+      c = ev.char || key.to_char
+      return true if ql_bar_nav(ev, bar)
+      case
+      when key.enter?     then ql_bar_enter(bar)
+      when key.escape?    then yield
+      when key.tab?       then (bar.query_complete; on_query_edit)
+      when key.backspace? then (bar.query_backspace; on_query_edit)
+        # Above the printable arm below, which would otherwise type the `?` (see ql_help_key?).
+      when TabController.ql_help_key?(ev, bar.query) then @host.open_help_query(help)
+      else
+        if c && !ev.ctrl? && !ev.alt?
+          bar.query_insert(c)
+          on_query_edit
+          # Clear the preedit on a committed char. Issues and Probe name the bar's setter apart
+          # from the `set_preedit` their notes/rules editor answers to.
+          bar.responds_to?(:query_set_preedit) ? bar.query_set_preedit("") : bar.set_preedit("")
+        end
+      end
+      true
+    end
+
+    # Hook: the bar's text changed. History and Sitemap reload on a debounce and schedule it
+    # here; Issues and Probe re-filter inside the view (`query_edited`) and need nothing.
+    protected def on_query_edit : Nil
+    end
+
+    # Hook: ↵ applied the filter. A debounced bar runs its pending reload now.
+    protected def flush_query_reload : Nil
+    end
+
+    # ↓/↑ drive the dropdown, ←/→ the caret. Handled ahead of the `case` above rather than as
+    # four more arms in it: the dropdown's two keys pushed the key handler past the complexity
+    # gate CI runs, and "move something" is a different question from "what does this key do".
+    # `↓`/`↑` were dead in this bar before the dropdown — a one-line field has no second row to
+    # move a caret to — which is why they could be claimed without displacing anything.
+    private def ql_bar_nav(ev : Termisu::Event::Key, bar) : Bool
+      key = ev.key
+      case
+      when act = LineEdit.action(ev) # ⌃/⌥←→, Home/End, Delete, ⌥⌫ — before the bare arrows
+        bar.query_edit(act)
+        on_query_edit if LineEdit.mutating?(act)
+      when key.down?  then bar.popup_down
+      when key.up?    then bar.popup_up
+      when key.left?  then bar.query_move(-1)
+      when key.right? then bar.query_move(1)
+      else                 return false
+      end
+      true
+    end
+
+    # ↵ with the dropdown open takes the highlighted candidate and SHUTS it — the same thing ↹
+    # does, except for the shutting, which is what lets the next ↵ reach `stop_query`. Closed, it
+    # is unchanged: apply the filter and leave edit mode.
+    private def ql_bar_enter(bar) : Nil
+      if bar.popup_open?
+        bar.query_complete(close: true)
+        on_query_edit
+      else
+        flush_query_reload
+        bar.stop_query
+      end
+    end
+
     # --- filter bar rendering (shared by every opt-in tab's render_body) ---
     # Base height: guidance/input row + hairline (the bar owns the strip divider). While
     # editing, an optional suggestion row sits between the input and the hairline.
@@ -1177,12 +1438,45 @@ module Gori::Tui
     end
 
     # --- status bar ---
-    def body_badge : Symbol # :editor (captures text) | :body (navigable/read-only)
+    # :editor (captures text) | :detail (an ITEM is open over this tab's list) | :body
+    # (navigable/read-only).
+    #
+    # `:detail` exists because the badge was the one always-visible slot that could say "you
+    # are a level down", and it said so on exactly one of the three tabs that have the level:
+    # History's drill-in lives in the shell (`@overlay == :detail`) so `focus_label` saw it,
+    # while Issues' and Probe's live in their views, and both read `BODY` — the same state,
+    # two different words, on adjacent tabs.
+    def body_badge : Symbol
       :body
+    end
+
+    # A space-menu row's live state for one of this tab's toggles (`ExecContext#menu_state`,
+    # #1274): "on"/"off" (`SpaceMenu.on_off`) or a short value, nil for a row with none. The
+    # Runner asks the tab in front; the tabs with toggle-family members answer.
+    def menu_state(verb_id : String) : String?
+      nil
+    end
+
+    # The focused pane has taken the keys for a form of its own: INSERT, a hex editor, the SNI
+    # field, a field list. A sticky family card must not come back over it
+    # (`Runner#run_space_verb`), since the member that opened it is asking for input next.
+    def pane_captures_keys? : Bool
+      body_badge == :editor
     end
 
     def body_hint(focus : Symbol) : String
       ""
+    end
+
+    # The focused pane's own name, appended to the body badge (`BODY · RESPONSE`). nil — the
+    # bare badge — for every tab with one body, which is most of them.
+    #
+    # It exists for the multi-pane workbench tabs, where entering the body RESTORES the pane
+    # that was last focused: two runs of the identical keystroke prefix landed on TARGET and
+    # on RESPONSE, so the number of `↹` presses needed to reach a given pane could not be read
+    # off the screen at all. The badge is the one always-drawn slot that can say where you are.
+    def body_pane_label : String?
+      nil
     end
 
     # A hint with its chords spelled as `{verb.id}` tokens, resolved through the effective
@@ -1211,8 +1505,9 @@ module Gori::Tui
       registry = @host.session.registry
       return false unless verb = registry[id]?
       os = Verb::OsProfile.resolve(Settings.keymap_os)
-      chords = Verb::Keymap.effective_chords(verb, os, Hotkeys.rebindable_overrides(registry))
-      chords = Verb::Keymap.effective_chords(verb, os) if chords.empty?
+      keyset = Verb::Keyset.resolve(Settings.editor_keyset)
+      chords = Verb::Keymap.effective_chords(verb, os, Hotkeys.rebindable_overrides(registry), keyset)
+      chords = Verb::Keymap.effective_chords(verb, os, Verb::Keymap::NO_OVERRIDES, keyset) if chords.empty?
       chords.includes?(chord)
     end
 
@@ -1243,6 +1538,22 @@ module Gori::Tui
     # so there is always a keyboard way out of the pane.
     def editor_captures_tab? : Bool
       false
+    end
+
+    # The focused body pane is TAKING TEXT — an editor in insert mode, a query/filter bar, a
+    # field being typed into. The shell asks this before claiming the digit family
+    # (`Runner#text_input_active?`): `1`-`9` are the tab bar's slots everywhere EXCEPT where a
+    # bare printable is a character, which is the same set of places `space` is a literal.
+    #
+    # Defaults to `editor_captures_tab?` — very nearly the same question, asked for Tab — so a
+    # controller whose only text pane is a real editor needs no override. The ones that DO
+    # override have a text pane Tab does not capture: a single-line field, a READ/INS split
+    # where Tab is a focus move, or a `/` query bar the controller owns rather than the shell.
+    #
+    # Getting this wrong is quiet in one direction and loud in the other: too broad and a digit
+    # stops jumping in some pane; too narrow and a digit stops TYPING in a field. Prefer true.
+    def body_takes_text? : Bool
+      editor_captures_tab?
     end
 
     def handle_editor_tab(ev : Termisu::Event::Key) : Bool
@@ -1284,6 +1595,168 @@ module Gori::Tui
     def focus_resume : Nil
     end
 
+    # --- the EDITOR pane seam (Verb::Scope::Editor) ------------------------------
+    # Is the focused body pane a TEXT EDITOR — a pane a caret can enter INSERT in? The
+    # question `Keymap#lookup` could not ask, and the reason eleven panes hand-rolled `i` /
+    # `↵` / `x` in `handle_body_key` instead of binding them (KEY_AUDIT §1.4, §2d). The
+    # Runner asks it once per keystroke and, when it is true, consults `Scope::Editor` AHEAD
+    # of this tab's own scope (`Runner#scope_chain`).
+    #
+    # Deliberately WIDER than `body_badge == :editor`, which is the INS-only question
+    # ("are the keys under my fingers landing as text"). A Repeater request pane in READ is
+    # an editor pane with a `:body` badge, and READ is exactly where the bare-letter editor
+    # verbs live. Default false: a tab with no text pane never puts Editor in the chain.
+    def editor_pane? : Bool
+      false
+    end
+
+    # The READ half of the above. Derived rather than overridden — `body_badge` already
+    # answers "is this pane taking text", so a controller that answers `editor_pane?` gets
+    # this for free and the two can never disagree about what INS is.
+    def editor_read_mode? : Bool
+      editor_pane? && body_badge != :editor
+    end
+
+    # The READ-mode selection hooks behind `Runner#read_selection_active?` / `read_selection_text`
+    # / `read_select_line` / `read_clear_selection`. Defaults: no selection surface, so the
+    # gate is false, the "Send selection to" payload is "" and the motions are no-ops.
+    def selection_active? : Bool
+      false
+    end
+
+    def selection_text : String
+      ""
+    end
+
+    def select_line : Nil
+    end
+
+    def clear_selection : Nil
+    end
+
+    # The five editor actions the shell routes to whichever pane holds focus, mirroring the
+    # READ-mode set (`read_select_line` / `read_copy` / …) the Runner already dispatches this
+    # way. Each returns whether the focused pane handled it, so a verb fired in a pane that
+    # cannot (an editor with no undo stack, say) reports rather than silently doing nothing.
+    def editor_enter_insert : Bool
+      false
+    end
+
+    # Append = one column right, then INSERT. Both halves are motions the editors already
+    # have; there is no new editing operation here (and deliberately no `o`/open-line, which
+    # WOULD be one). The step is READ's, over `editor_text_buffer` (the read cursor writes its
+    # position back to the editor caret, so the step is what INS resumes from); a pane with no
+    # buffer just enters INSERT.
+    def editor_append_insert : Bool
+      if editor_read_mode? && (buf = editor_text_buffer)
+        area, read = buf
+        read.move(area, 0, 1)
+      end
+      editor_enter_insert
+    end
+
+    def editor_exit_insert : Bool
+      false
+    end
+
+    def editor_undo : Bool
+      false
+    end
+
+    def editor_to_top : Bool
+      editor_to_edge(-1)
+    end
+
+    def editor_to_bottom : Bool
+      editor_to_edge(1)
+    end
+
+    # READ-mode top / bottom of `editor_text_buffer`. INSERT has its own caret keys, so the
+    # verb does nothing there and says so; a pane with no buffer (a one-line TARGET) has no
+    # edge to jump to.
+    private def editor_to_edge(dir : Int32) : Bool
+      return false unless editor_read_mode? && (buf = editor_text_buffer)
+      area, read = buf
+      read.to_edge(area, dir)
+      true
+    end
+
+    # The focused editor's BUFFER and its READ state, for the READ-mode edits (`ReadEdit`:
+    # delete the selection, `dd`, `yy`, paste). Nil for a pane with no multi-line buffer to
+    # edit (a single-line TARGET row, a hex dump, a form), so the edit can say why it did not
+    # happen instead of falling through to the tab's own `d`.
+    #
+    # Only the buffer is handed out, never the edit itself: `ReadEdit` changes the text by
+    # entering INSERT and replaying ⌫ or a paste through the pane's own key path, so each
+    # pane's after-edit work (the Repeater's Content-Length, the Fuzzer's § guard, a note's
+    # save) runs exactly as it does for typing.
+    def editor_text_buffer : {TextArea, TextReadState}?
+      nil
+    end
+
+    # READ-mode WORD motion (⌥/⌃←→) over that same buffer: the editor's own word step, so READ
+    # and INSERT agree about where a word ends. One implementation for every pane, through the
+    # seam above rather than a `*_read_word` per view.
+    def editor_word_move(dir : Int32, selecting : Bool = false) : Bool
+      return false unless buf = editor_text_buffer
+      area, read = buf
+      read.word_move(area, dir, selecting)
+      true
+    end
+
+    # Is the focused READ caret holding vim's `⇧V` selection? Each READ ladder ORs this into its
+    # `selecting`, so a plain `j`/`k` at the pane's edge grows the selection the way ⇧↓/⇧↑ do,
+    # instead of leaving the pane with the lines still armed for the next `d`.
+    def editor_line_held? : Bool
+      return false unless buf = editor_text_buffer
+      area, read = buf
+      read.line_mode_held?(area)
+    end
+
+    # Esc's first job in READ: drop a live selection, so it is the SECOND Esc that leaves the
+    # pane. Every pane's own Esc leaves (to the strip, the previous card, RELATED), and with
+    # the selection kept, the next `d` deleted lines the operator had meant to let go of.
+    def editor_drop_read_selection : Bool
+      return false unless buf = editor_text_buffer
+      area, read = buf
+      return false unless read.selection?(area)
+      read.clear_selection
+      true
+    end
+
+    # `A` / `I`: the caret to the end / start of its line, then INSERT there.
+    def editor_line_insert(dir : Int32) : Bool
+      return false unless buf = editor_text_buffer
+      area, read = buf
+      read.line_edge(area, dir)
+      editor_enter_insert
+    end
+
+    # ←/→ and `h`/`l` over the same READ caret, a word at a time with ⌥/⌃ — the one sideways
+    # arm every READ ladder shares. False when `ev` is neither, or there is no buffer.
+    def editor_read_sideways(ev : Termisu::Event::Key) : Bool
+      dir = nav_left?(ev) ? -1 : (nav_right?(ev) ? 1 : 0)
+      return false if dir == 0 || !(buf = editor_text_buffer)
+      area, read = buf
+      word_step?(ev) ? read.word_move(area, dir, ev.shift?) : read.move(area, 0, dir, selecting: ev.shift?)
+      true
+    end
+
+    # --- the BODY's own `/` filter bar (the rule lists) ---------------------------------
+    # Distinct from `subtab_filter_editing?` above, which is the STRIP's bar. Five rule lists
+    # grew one in the key-audit round — Colormarker, Rewriter, Probe RULES, Host overrides and
+    # Env — and they all share `RowFilter`, so the shell needs one claim rather than five. The
+    # arm in `Runner#handle_key` routes keys here ahead of the focus ring while `editing?`,
+    # exactly as the strip's bar is routed; `body_takes_text?` is each controller's own job.
+    def list_filter_editing? : Bool
+      false
+    end
+
+    # ALWAYS consume while editing (a Tab that escaped would move the focus ring mid-edit).
+    def handle_list_filter_key(ev : Termisu::Event::Key) : Bool
+      false
+    end
+
     # Why a bare `i` does nothing on the FOCUSED pane, or nil when it should reach the keymap.
     # `i` enters INSERT in every editor pane; on the read-only pane beside one — the Repeater
     # RESPONSE, the Fuzzer RESULTS, the Decoder OUTPUT — the same reflex fell through to the
@@ -1303,13 +1776,20 @@ module Gori::Tui
     def commit : Nil # flush any in-progress edit before leave/quit
     end
 
-    def locked? : Bool # a destructive op is gated (e.g. last note can't close)
-      false
-    end
-
     # Focus a specific session/sub-tab by its persisted id (notification "jump to
     # result"). Default no-op; Repeater/Fuzzer/Miner controllers override to reveal the row.
     def reveal_session(id : Int64) : Nil
+    end
+
+    # One queued value if the channel has any, else nil — the non-blocking poll every
+    # background-fiber drain loops on (`while ev = poll(@events)`).
+    protected def poll(ch : Channel(T)) : T? forall T
+      select
+      when v = ch.receive
+        v
+      else
+        nil
+      end
     end
   end
 end

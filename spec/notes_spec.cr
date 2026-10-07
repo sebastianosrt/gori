@@ -26,6 +26,47 @@ describe Gori::Notes do
     end
   end
 
+  describe ".title" do
+    # A note is Markdown (`export_basename` writes ".md"), so its first line is almost always
+    # an ATX heading. The marker used to ride along into the TUI sub-tab chip, the `gori run
+    # notes` listing, the MCP note title and the exported filename.
+    it "drops a Markdown heading marker from the derived title" do
+      Gori::Notes.title("# Demo engagement — recon notes\n\nbody").should eq("Demo engagement — recon notes")
+      Gori::Notes.title("### Tooling cheatsheet").should eq("Tooling cheatsheet")
+      Gori::Notes.title("   ## indented up to three spaces").should eq("indented up to three spaces")
+      Gori::Notes.title("## closed atx ##").should eq("closed atx")
+    end
+
+    it "keeps a '#' that is not a heading marker" do
+      # CommonMark needs a space (or end of line) after the hashes. An issue reference or a
+      # hashtag on line one is the note's title, '#' and all — and seven hashes is not a
+      # heading either.
+      Gori::Notes.title("#1042 IDOR on /v1/users").should eq("#1042 IDOR on /v1/users")
+      Gori::Notes.title("#recon notes").should eq("#recon notes")
+      Gori::Notes.title("####### seven hashes").should eq("####### seven hashes")
+      Gori::Notes.title("    # four spaces is an indented code block").should eq("# four spaces is an indented code block")
+    end
+
+    it "does not raise on a first line gori cannot decode" do
+      # A note body is operator bytes (P7) — the MCP and CLI note tools hand this the raw
+      # column. PCRE2 RAISES on invalid UTF-8 rather than failing to match, so the heading
+      # test has to be gated on the line being decodable; an undecodable one takes the
+      # pre-Markdown path and comes back for the caller's scrubber to handle.
+      raw = String.new(Bytes[0x68, 0x69, 0x80, 0x0a, 0x78])
+      Gori::Notes.title(raw).should eq(String.new(Bytes[0x68, 0x69, 0x80]))
+      # Even when the undecodable byte follows what looks like a marker.
+      hashed = String.new(Bytes[0x23, 0x20, 0x68, 0x69, 0x80])
+      Gori::Notes.title(hashed).should eq(hashed)
+    end
+
+    it "falls through an empty heading to the next line with text" do
+      # "#" alone titles nothing; the note is still named after its content rather than "".
+      Gori::Notes.title("#\n\nthe actual first line").should eq("the actual first line")
+      Gori::Notes.title("##   \nbody").should eq("body")
+      Gori::Notes.title("#").should be_nil
+    end
+  end
+
   describe ".export_basename" do
     it "derives the filename from the note's title" do
       Gori::Notes.export_basename("My Note\nbody text", 0).should eq("My-Note.md")
@@ -136,6 +177,41 @@ describe Gori::Notes do
         store.list_links(Gori::Store::LinkOwnerKind::Note, closed).should be_empty
         store.list_links(Gori::Store::LinkOwnerKind::Note, kept).size.should eq(1)
       end
+    end
+  end
+
+  # `gori run notes update --append` (#1388): the join happens against the text the write
+  # transaction read, on a line of its own.
+  describe ".update(append:)" do
+    it "appends on a new line, and replaces without the flag" do
+      with_store do |store|
+        id = Gori::Notes.create(store, "first").not_nil!
+        Gori::Notes.update(store, id, "second", append: true).committed?.should be_true
+        Gori::Notes.load(store).notes.first.text.should eq("first\nsecond")
+        Gori::Notes.update(store, id, "only").committed?.should be_true
+        Gori::Notes.load(store).notes.first.text.should eq("only")
+        Gori::Notes.update(store, 999_i64, "x", append: true).missing?.should be_true
+      end
+    end
+
+    it "does not double a newline the note already ends with, nor lead an empty note with one" do
+      Gori::Notes.appended("a\n", "b").should eq("a\nb")
+      Gori::Notes.appended("", "b").should eq("b")
+    end
+  end
+end
+
+describe "Gori::Notes.parse with out-of-range numbers" do
+  it "reads a cur or id past Int32/Int64 without raising" do
+    doc = Gori::Notes.parse(%({"cur":9223372036854775807,"notes":[{"id":9223372036854775807,"text":"a"},"b"]})).not_nil!
+    doc.notes.size.should eq(2)
+    Gori::Notes.parse(%({"notes":[{"id":9223372036854775806,"text":"a"},"b","c"]})).not_nil!.notes.size.should eq(3)
+  end
+
+  it "creates a note when the stored next id is Int64::MAX" do
+    with_store do |store|
+      store.set_setting(Gori::Notes::DOCS_KEY, %({"cur":0,"notes":[{"id":9223372036854775807,"text":"a"}],"next_id":9223372036854775807}))
+      Gori::Notes.create(store, "b").should_not be_nil
     end
   end
 end

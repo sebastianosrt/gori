@@ -38,10 +38,16 @@ class FakeHost
   def request_overlay(kind : Symbol) : Nil
   end
 
+  getter focus_requests = [] of Symbol
+
   def request_focus(pane : Symbol) : Nil
+    @focus_requests << pane
   end
 
+  getter focus_body_calls = 0
+
   def focus_body : Nil
+    @focus_body_calls += 1
   end
 
   def resolve_subtab_focus : Nil
@@ -56,7 +62,13 @@ class FakeHost
   def open_palette : Nil
   end
 
+  # Recorded, not ignored: each `/` bar routes `?` to its OWN reference page, and the
+  # surface symbol is the whole of that wiring — hand `:issues` the Probe tables and every
+  # other assertion still passes.
+  getter help_query_surfaces = [] of Symbol
+
   def open_help_query(surface : Symbol) : Nil
+    @help_query_surfaces << surface
   end
 
   getter sitemap_opens = 0
@@ -82,6 +94,14 @@ class FakeHost
 
   def diff_to_comparer : Nil
     @diff_comparer_sends += 1
+  end
+
+  # The Issues detail's RELATED row ↵ — same shape, same reason: a double-click on a link row
+  # has to be shown reaching the seam, and the navigation itself is the Runner's.
+  getter issue_link_opens = 0
+
+  def issue_open_link : Nil
+    @issue_link_opens += 1
   end
 
   def open_space_menu : Nil
@@ -141,10 +161,13 @@ class FakeHost
   # "did the rows go" assertion cannot see. `action.call` keeps every existing caller's
   # behaviour: the dialog is not what those examples are about.
   getter confirms = [] of {String, String}
+  # Runs while the dialog is "up", before the action: a data_version tick under the modal.
+  property under_modal : Proc(Nil)? = nil
 
   def confirm(title : String, message : String, *, confirm_label : String, danger : Bool,
               return_to : Symbol = :none, &action : -> Nil) : Nil
     @confirms << {title, message}
+    @under_modal.try(&.call)
     action.call
   end
 

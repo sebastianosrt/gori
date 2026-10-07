@@ -2,6 +2,8 @@ require "../tab_controller"
 require "../project_view"
 require "../clipboard"
 require "../../env"
+require "../env_syntax_seam"
+require "../../plural"
 
 module Gori::Tui
   # The Project tab: the project overview plus five SUB-TABS (DESCRIPTION · SCOPE · HOST
@@ -24,9 +26,9 @@ module Gori::Tui
       :project
     end
 
-    # The SCOPE rule list is a navigable area with its own action menu (Project scope);
-    # the DESCRIPTION pane is a text editor (no menu — space is literal there), so its
-    # scope is irrelevant (Body, like the other editor tabs).
+    # The SCOPE rule list is a navigable area with its own action menu (Project scope). The
+    # NETWORK settings pane owns every key, so its scope registers no verb: it must not be
+    # History's Body, whose rows and `>` would otherwise reach its space menu.
     def command_scope : Verb::Scope
       case @project_view.pane
       when :scope     then Verb::Scope::Project
@@ -34,7 +36,7 @@ module Gori::Tui
       when :env       then Verb::Scope::Env
       when :activity  then Verb::Scope::ProjectActivity
       when :desc      then Verb::Scope::ProjectDesc
-      else                 Verb::Scope::Body
+      else                 Verb::Scope::ProjectSettings # :settings, the pane left
       end
     end
 
@@ -67,15 +69,15 @@ module Gori::Tui
         if @project_view.activity_querying?
           "type to filter · ↵ keep · esc clear"
         else
-          keys("↑/↓ select · ↵ open · {activity.filter-source} source · {activity.filter-level} level · {activity.filter-actor} actor · {activity.find} filter · {activity.clear} clear · space cmds · esc sub-tabs")
+          keys("↑/↓ select · ↵ open · {activity.copy} copy · {activity.filter-source} source · {activity.filter-level} level · {activity.filter-actor} actor · {activity.find} filter · {activity.clear} clear · space cmds · esc sub-tabs")
         end
       when :settings
         settings_hint
       else
         if @project_view.desc_insert_mode?
-          keys("type to edit · ⇧arrows select · {project.copy} copy · esc read · ↑/↓/↔ move · ^G goto · ^F find · ^E $EDITOR")
+          keys("type to edit · ⇧arrows select · ^Y copy · esc read · ↑/↓/↔ move · {editor.goto-line} goto · {editor.find} find · ^E $EDITOR")
         else
-          "i/↵ edit · ⇧arrows select · y copy · space cmds · ↑/↓ move · ^G goto · ^F find · esc sub-tabs"
+          keys("{editor.insert}/↵ edit · ⇧arrows select · {project.copy} copy · space cmds · ↑/↓ move · {editor.goto-line} goto · {editor.find} find · esc sub-tabs")
         end
       end
     end
@@ -177,6 +179,14 @@ module Gori::Tui
         capturing: @host.session.capturing?)
     end
 
+    # Every field on the Project tab that takes characters: the description editor in INS, the
+    # HOST OVERRIDES / ENV inline add rows, a text row in SETTINGS, and the ACTIVITY `/` bar.
+    # The same set `set_preedit` accepts — an IME composes into exactly the fields a digit is
+    # a character in — so the two are written as one expression rather than drifting apart.
+    def body_takes_text? : Bool
+      project_text_field_focused?
+    end
+
     def handle_body_key(ev : Termisu::Event::Key) : Bool
       # The SCOPE / HOST OVERRIDES panes defer their action keys (a/e/d → verbs, space →
       # action menu, Global chords → capture/rules/…) to the keymap by returning false;
@@ -195,9 +205,10 @@ module Gori::Tui
     end
 
     def handle_click(rect : Rect, mx : Int32, my : Int32) : Bool
+      @press_on_desc = false
       # Chip strip FIRST: it sits inside this tab's body rect (under the OVERVIEW band), so a
       # chip click reads as a body click unless it's claimed here. It lands on the STRIP, not
-      # in the card — clicking "DESCRIPTION" selects the sub-tab, it doesn't open the editor.
+      # in the card — clicking "Description" selects the sub-tab, it doesn't open the editor.
       if chip = @project_view.strip_chip_at(rect, mx, my)
         jump_subtab(ProjectView::PANES.index(chip) || 0)
         @host.request_focus(:subtabs)
@@ -220,7 +231,7 @@ module Gori::Tui
       when :overrides
         @project_view.focus_pane(:overrides)
         # A press inside the open add/edit row is a CARET, not a row pick — the row is text.
-        return true if @project_view.ov_field_click(mx, my)
+        return true if @project_view.ov_field.try(&.click_to_cursor(mx, my))
         # Leaving an open row for the list is a SAVE, the way the web reads a blur and the way
         # this tab's SETTINGS pane already applies a pending edit on a click out of it. A row
         # the store refuses stays open with its reason on the strip, and the pick is dropped —
@@ -234,8 +245,8 @@ module Gori::Tui
         end
       when :env
         @project_view.focus_pane(:env)
-        return true if @project_view.env_field_click(mx, my) # caret — see :overrides
-        return true if env_row_open? && !leave_env_row       # blur = save — see :overrides
+        return true if @project_view.env_field.try(&.click_to_cursor(mx, my)) # caret — see :overrides
+        return true if env_row_open? && !leave_env_row                        # blur = save — see :overrides
         # The card's scroll gauge rides its right hairline, which `env_row_at` excludes.
         if row = @project_view.env_gauge_row(rect, mx, my)
           @project_view.select_env(row)
@@ -260,7 +271,7 @@ module Gori::Tui
         @project_view.focus_pane(:desc)
         # NOR/INS chip on the DESCRIPTION card border toggles insert (same as ↵ / esc).
         if desc = @project_view.desc_card_rect(rect)
-          if Frame.mode_badge_hit(mx, my, desc.y, desc.right - 1, desc.x + 14,
+          if Frame.mode_badge_hit(mx, my, desc.y, desc.right - 1, desc.x + 2,
                @project_view.desc_insert_mode?)
             if @project_view.desc_insert_mode?
               @project_view.exit_desc_insert!
@@ -269,8 +280,16 @@ module Gori::Tui
             end
             return true
           end
+          # The card's TEXT takes the caret; its BORDER just took the focus above.
+          # `pane_at` answers `:desc` for the whole card, borders included, and
+          # `desc_click_to_cursor` clamps rather than refusing — so without this a press on
+          # the bottom hairline placed the caret on the last visible line and armed a drag
+          # there. `IssuesController#handle_detail_click` carries the same test.
+          if desc.inset(1, 1).contains?(mx, my)
+            @press_on_desc = true # the motion that continues this press belongs to the editor
+            @project_view.desc_click_to_cursor(rect, mx, my)
+          end
         end
-        @project_view.desc_click_to_cursor(rect, mx, my)
       when :settings
         handle_project_settings_click(rect, mx, my)
       end # :overview band → just take body focus
@@ -290,20 +309,43 @@ module Gori::Tui
       end
     end
 
+    # Whether the last press landed IN the DESCRIPTION card rather than on the chip strip
+    # above it or on the NOR/INS badge its own border carries. `supports_drag?` is asked with
+    # no coordinates — `drag_press_target?` runs it right after the click — so the click is
+    # what has to record where it began; `IssuesController#@detail_press` is the same guard.
+    #
+    # The bare `pane == :desc` it replaces was honest only while `desc_drag_to_cursor` refused
+    # every gesture the card was not already in INSERT for. That refusal is gone (#1124), and
+    # without this a press on the "Description" chip — or on the mode badge — followed by a
+    # twitch would drag a band open from a cell outside the text, and under `settings:mouse`
+    # drag-copy put it on the clipboard.
+    @press_on_desc = false
+
     # --- mouse drag + double-click (see TabController#supports_drag?) ---
     # A drag extends a selection over TEXT: the DESCRIPTION, or the HOST OVERRIDES / ENV row
     # while one is open. The lists themselves have no text to extend over — a drag there is a
     # fast repeated select — so they answer false. No focus/save side effects — the press that
     # began the gesture already ran them.
     def supports_drag? : Bool
-      @project_view.pane == :desc || @project_view.ov_adding? || env_row_open?
+      # Answered the way `handle_drag` DISPATCHES — by the focused pane — because that is what
+      # the motion will actually run. As a flat disjunction the three disagreed: `focus_pane`
+      # only assigns `@pane` and never closes an open HOST OVERRIDES / ENV row, so with one of
+      # those still open a press on the DESCRIPTION card's mode badge armed a drag through
+      # `env_row_open?`, and `handle_drag`'s `:desc` arm then opened a band from the border
+      # cell the press landed on.
+      case @project_view.pane
+      when :desc      then @press_on_desc
+      when :overrides then @project_view.ov_adding?
+      when :env       then env_row_open?
+      else                 false
+      end
     end
 
     def handle_drag(rect : Rect, mx : Int32, my : Int32) : Nil
       case @project_view.pane
       when :desc      then @project_view.desc_drag_to_cursor(rect, mx, my)
-      when :overrides then @project_view.ov_field_click(mx, my, selecting: true)
-      when :env       then @project_view.env_field_click(mx, my, selecting: true)
+      when :overrides then @project_view.ov_field.try(&.click_to_cursor(mx, my, selecting: true))
+      when :env       then @project_view.env_field.try(&.click_to_cursor(mx, my, selecting: true))
       end
     end
 
@@ -316,13 +358,25 @@ module Gori::Tui
     def handle_double_click(rect : Rect, mx : Int32, my : Int32) : Bool
       return false if @project_view.strip_chip_at(rect, mx, my) # a chip is a button, not text
       case @project_view.pane_at(rect, mx, my)
-      when :desc      then @project_view.desc_select_word(rect, mx, my)
+      when :desc      then desc_double_click(rect, mx, my)
       when :scope     then double_click_scope(rect, mx, my)
       when :overrides then double_click_override(rect, mx, my)
       when :env       then double_click_env(rect, mx, my)
       when :activity  then double_click_activity(rect, mx, my)
       else                 false
       end
+    end
+
+    # The DESCRIPTION card's TEXT, and only it. `pane_at` answers `:desc` for the whole card
+    # including its border rows, and `desc_select_word` hit-tests nothing — it clamps through
+    # `card.inset(1, 1)` — so a pair of presses on the bottom hairline took a word off the last
+    # visible line. That used to force INSERT; since #1124 it paints a READ band instead, which
+    # `y` copies and a toast reports — a selection the operator never pointed at, now
+    # observable. The press half carries the same test.
+    private def desc_double_click(rect : Rect, mx : Int32, my : Int32) : Bool
+      return false unless card = @project_view.desc_card_rect(rect)
+      return false unless card.inset(1, 1).contains?(mx, my)
+      @project_view.desc_select_word(rect, mx, my)
     end
 
     private def double_click_scope(rect : Rect, mx : Int32, my : Int32) : Bool
@@ -332,8 +386,18 @@ module Gori::Tui
       true
     end
 
+    # Backspace an open add/edit row; false when the ROW is empty (the caller then closes it)
+    # — never merely because the caret sits at 0, which discarded a typed line the operator
+    # had only moved the caret inside (← to the start of "TOKEN abc123", one ⌫ closed the row
+    # with the text unsaved). A caret at 0 with text behind it is an ordinary no-op. Public for its spec.
+    def self.backspace_row(field : TextField?) : Bool
+      return false if field.nil? || field.value.empty?
+      field.backspace
+      true
+    end
+
     private def double_click_override(rect : Rect, mx : Int32, my : Int32) : Bool
-      return true if @project_view.ov_field_select_word(mx, my)
+      return true if @project_view.ov_field.try(&.select_word_at(mx, my))
       # An open row the pair did not land on: the first press already tried to leave it
       # (`handle_click`) and was refused with a reason on the strip. Say nothing twice.
       return true if @project_view.ov_adding?
@@ -344,7 +408,7 @@ module Gori::Tui
     end
 
     private def double_click_env(rect : Rect, mx : Int32, my : Int32) : Bool
-      return true if @project_view.env_field_select_word(mx, my)
+      return true if @project_view.env_field.try(&.select_word_at(mx, my))
       return true if env_row_open? # as above
       return false unless idx = @project_view.env_row_at(rect, mx, my)
       @project_view.select_env(idx)
@@ -419,28 +483,35 @@ module Gori::Tui
     end
 
     def set_preedit(text : String) : Bool
-      return false unless @project_view.pane == :desc && @project_view.desc_insert_mode? ||
-                          @project_view.ov_adding? ||
-                          @project_view.env_adding? || @project_view.env_prefix_editing? ||
-                          (@project_view.pane == :settings && @project_view.settings_text_row?) ||
-                          (@project_view.pane == :activity && @project_view.activity_querying?)
+      return false unless project_text_field_focused?
       @project_view.set_preedit(text)
       true
+    end
+
+    # The Project panes that take CHARACTERS. Read by `set_preedit` (an IME composes into a
+    # text field and nothing else) and by `body_takes_text?` (a digit is a character in a text
+    # field and nothing else) — the same question twice, so it is written once.
+    private def project_text_field_focused? : Bool
+      (@project_view.pane == :desc && @project_view.desc_insert_mode?) ||
+        @project_view.ov_adding? ||
+        @project_view.env_adding? || @project_view.env_prefix_editing? ||
+        (@project_view.pane == :settings && @project_view.settings_text_row?) ||
+        (@project_view.pane == :activity && @project_view.activity_querying?)
     end
 
     def project_desc_read_mode? : Bool
       @project_view.pane == :desc && !@project_view.desc_insert_mode?
     end
 
-    def project_desc_selection_active? : Bool
+    def selection_active? : Bool
       @project_view.desc_selection?
     end
 
-    def project_desc_select_line : Nil
+    def select_line : Nil
       @project_view.desc_select_line
     end
 
-    def project_desc_clear_selection : Nil
+    def clear_selection : Nil
       @project_view.desc_clear_selection
     end
 
@@ -509,15 +580,16 @@ module Gori::Tui
     end
 
     # Runner#apply_external_change already refreshed the live Scope / HostOverrides objects
-    # this view renders straight out of; all that is left is to pull the two list selections
-    # back inside a list another process may have SHRUNK, so the highlight doesn't sit on a
-    # row that no longer exists.
+    # this view renders straight out of; all that is left is to put the two list selections
+    # back on the rows they were on, by id, in a list another process may have shifted or
+    # SHRUNK — so the highlight (and the `d`/`e`/`y` it drives) neither slides onto a
+    # neighbour nor sits on a row that no longer exists.
     #
     # ENV is the one pane that keeps its OWN copy of the data (and writes it back wholesale),
     # so it needs the copy re-seeded here rather than only on tab entry — see
     # `ProjectView#reload_env_vars` for what that copy going stale does to the store.
     def on_external_change : Nil
-      @project_view.clamp_selections
+      @project_view.reanchor_selections
       @project_view.reload_env_vars
       # `insert_event` is an ordinary insert, so a peer's write (an attached agent's tool call,
       # most of all) moves `PRAGMA data_version` and lands here. Refresh only while the pane is
@@ -582,7 +654,7 @@ module Gori::Tui
       elsif @project_view.desc_insert_mode?
         edit_desc_insert(ev, key, c)
       else
-        handle_desc_read(ev, key, c)
+        return handle_desc_read(ev, key, c)
       end
       true
     end
@@ -591,22 +663,52 @@ module Gori::Tui
     # caret and `follow_x`, so moving the caret sideways scrolls the view anyway — the
     # dedicated h-scroll chord was shadowing the selection every other text pane gives
     # ⇧arrows (and the `key.left? && selecting` branches below it were already dead code).
-    private def handle_desc_read(ev : Termisu::Event::Key, key, c : Char?) : Nil
-      return @host.open_space_menu if key.space? && !ev.ctrl? && !ev.alt?
+    # Returns false when the key should fall through to the keymap. `↵`/`i` (INSERT), `x`
+    # (select line) and `y` (copy) used to be arms here; they are now `editor.insert` /
+    # `editor.insert-enter` in `Scope::Editor` and `project.select-line` / `project.copy` in
+    # `Scope::ProjectDesc`, whose chords this handler was what made dead (KEY_AUDIT §2e).
+    private def handle_desc_read(ev : Termisu::Event::Key, key, c : Char?) : Bool
+      return true.tap { @host.open_space_menu } if key.space? && !ev.ctrl? && !ev.alt?
       selecting = ev.shift?
+      growing = selecting || editor_line_held? # vertical arms only: see RepeaterController
       case
-      when key.enter?, c == 'i'
-        @project_view.enter_desc_insert!
+      when key.enter? then return false # editor.insert-enter
       when nav_up?(ev)
         # ⇧↑ stays in the pane: leaving mid-extend abandons a selection being built.
-        (@project_view.at_top? && !selecting) ? leave_to_strip : @project_view.desc_read_move(-1, 0, selecting: selecting)
+        (@project_view.at_top? && !growing) ? leave_to_strip : @project_view.desc_read_move(-1, 0, selecting: selecting)
       when nav_down?(ev)                          then @project_view.desc_read_move(1, 0, selecting: selecting)
-      when key.left?                              then @project_view.desc_read_move(0, -1, selecting: selecting)
-      when key.right?                             then @project_view.desc_read_move(0, 1, selecting: selecting)
+      when editor_read_sideways(ev)               then nil # ←/→ h/l, ⌥ by word
       when @project_view.desc_read_motion_key(ev) then nil # Home/End/Page — the shared editor set
-      when c == 'x'                               then @project_view.desc_select_line
-      when c == 'y'                               then project_desc_copy
+      else
+        return false # i INSERT, x select-line, y copy, Global breath keys …
       end
+      true
+    end
+
+    # --- Verb::Scope::Editor — the DESCRIPTION pane ---
+    def editor_pane? : Bool
+      @project_view.pane == :desc
+    end
+
+    def editor_text_buffer : {TextArea, TextReadState}?
+      editor_pane? ? @project_view.read_edit_buffer : nil
+    end
+
+    def editor_enter_insert : Bool
+      return false unless editor_pane?
+      @project_view.enter_desc_insert!
+      true
+    end
+
+    def editor_exit_insert : Bool
+      return false unless editor_pane?
+      save
+      @project_view.exit_desc_insert!
+      true
+    end
+
+    def editor_undo : Bool
+      editor_pane? && @project_view.desc_read_undo
     end
 
     private def edit_desc_insert(ev : Termisu::Event::Key, key, c : Char?) : Nil
@@ -631,16 +733,11 @@ module Gori::Tui
 
     def project_copy : Nil
       text = @project_view.desc_copy_text
-      if text.empty?
-        @host.status("nothing to copy")
-        return
-      end
-      written = Clipboard.copy(text)
-      @host.status("copied #{written}b to clipboard#{Clipboard.note(written, text)}")
+      copy_text(text)
     end
 
     # The description selection (or current line) text without copying — "Send selection to".
-    def project_desc_selection_text : String
+    def selection_text : String
       @project_view.desc_copy_text
     end
 
@@ -662,20 +759,22 @@ module Gori::Tui
       @host.status("copied description to clipboard (#{written}b)#{Clipboard.note(written, text)}")
     end
 
-    # Bare `y` in the description: the selection when one is held, else the WHOLE description.
-    # `^Y` (project.copy -> Runner#read_copy) has always answered that way; `y` is raw-dispatched
-    # here (see verbs/core.cr for why it has no chord) and fell back to the caret's LINE, so one
-    # pane's two copy keys disagreed about what "copy with nothing selected" means. This routes
-    # both through the same choice — the rule stated once per pane, as every sibling tab does it.
-    def project_desc_copy : Nil
-      project_desc_selection_active? ? project_copy : project_copy_all
-    end
-
     # --- SCOPE pane: browse the rule list; a/e open the Miner-style popup overlay ---
     # Returns true when consumed; false defers to the keymap — a/e/d fire the scope.*-rule
     # verbs, space opens the action menu, and Global chords (capture/rules/…) work here too
     # (the list is navigable, like History).
     private def handle_project_scope_key(ev : Termisu::Event::Key) : Bool
+      list_pane_key(ev, @project_view.scope_at_top?) do |delta|
+        # ↵ (nil) opens the same popup as 'e'
+        delta ? @project_view.scope_select(delta) : scope_edit_rule
+      end
+    end
+
+    # The browse ladder the SCOPE / HOST OVERRIDES / ENV lists share. The block moves the
+    # selection by its delta, or runs the pane's ↵ action when handed nil. Returns true when
+    # consumed; false defers to the keymap — a/e/d (the pane's verbs), space (action menu),
+    # Global chords.
+    private def list_pane_key(ev : Termisu::Event::Key, at_top : Bool, &) : Bool
       key = ev.key
       if ev.ctrl? && key.lower_p?
         save
@@ -683,16 +782,20 @@ module Gori::Tui
       elsif key.escape?
         leave_to_strip
       elsif key.up? || key.lower_k?
-        @project_view.scope_at_top? ? leave_to_strip : @project_view.scope_select(-1)
+        if at_top
+          leave_to_strip
+        else
+          yield -1
+        end
       elsif key.down? || key.lower_j?
-        @project_view.scope_select(1)
+        yield 1
       elsif key.left? || key.right?
         # Inert: ←/→ belong to the STRIP one tier up, so they must not silently swap cards
         # from inside one. Swallowed rather than deferred so the keymap can't rebind them here.
       elsif key.enter?
-        scope_edit_rule # ↵ opens the same popup as 'e'
+        yield nil
       else
-        return false # a/e/d (scope.*-rule verbs), space (action menu), Global chords
+        return false
       end
       true
     end
@@ -850,13 +953,16 @@ module Gori::Tui
       label = "#{rule.include? ? "incl" : "excl"} #{rule.match_type} #{rule.pattern}"
       @host.confirm("DELETE SCOPE RULE", "Delete “#{label}”? This can't be undone.",
         confirm_label: "delete", danger: true) do
-        # The store's answer, not an assumption: a rolled-back batch leaves the rule gating
-        # traffic, and reporting "removed" over one that still gates is the failure this
-        # branch exists to prevent. Selection cannot have moved — the confirm is modal.
-        if pat = @project_view.scope_delete
-          @host.status("scope rule deleted: #{pat}#{scope_blackhole_note}")
-        else
-          @host.status("scope rule NOT removed (project busy) — it still gates traffic")
+        # By the id the question named: the modal stops the operator's keys, not the
+        # data_version tick, so a peer's write can move the selection while this is open.
+        # And the store's answer, not an assumption: a rolled-back batch leaves the rule
+        # gating traffic, and reporting "removed" over one that still gates is the failure
+        # this branch exists to prevent.
+        case @project_view.scope_delete(rule.id)
+        when :ok then @host.status("scope rule deleted: #{rule.pattern}#{scope_blackhole_note}")
+          # The peer's delete can black-hole the sandbox exactly as ours would have.
+        when :gone then @host.status("scope rule already removed elsewhere: #{rule.pattern}#{scope_blackhole_note}")
+        else            @host.status("scope rule NOT removed (project busy) — it still gates traffic")
         end
       end
     end
@@ -898,9 +1004,11 @@ module Gori::Tui
         edited = !edit_id.nil?
         verb = edited ? "updated" : "added"
         # Confirm the write AND surface that the lens is still off (the common "I added
-        # a rule but nothing filtered" confusion — the space menu's 's' enables it).
-        msg = "scope rule #{verb} — #{n} rule#{n == 1 ? "" : "s"}"
-        msg += " · space → s to enable the lens" unless @host.session.scope.enabled? || edited
+        # a rule but nothing filtered" confusion — the space menu's Toggle scope lens enables it).
+        msg = "scope rule #{verb} — #{Gori.plural(n, "rule")}"
+        unless @host.session.scope.enabled? || edited
+          msg += Hotkeys.expand_menu_paths(@host.session.registry, " · {space:scope.lens-toggle} to enable the lens")
+        end
         # An EDIT can black-hole the proxy too (flip the last include to an exclude), so
         # this path re-asks the same question the delete path does.
         msg += scope_blackhole_note
@@ -924,7 +1032,7 @@ module Gori::Tui
           # pane itself, else point at the Project tab from History/Sitemap.
           @host.active_tab == :project ? "scope lens ON, but no rules yet — add one here (a)" : "scope lens ON, but no rules yet — add some in the Project tab"
         else
-          "scope lens ON — showing in-scope only (#{n} rule#{n == 1 ? "" : "s"})"
+          "scope lens ON — showing in-scope only (#{Gori.plural(n, "rule")})"
         end
       )
     end
@@ -954,24 +1062,9 @@ module Gori::Tui
     # The add-row sub-mode swallows everything (text).
     private def handle_project_overrides_key(ev : Termisu::Event::Key) : Bool
       return (handle_project_ov_add_key(ev); true) if @project_view.ov_adding?
-      key = ev.key
-      if ev.ctrl? && key.lower_p?
-        save
-        @host.open_palette
-      elsif key.escape?
-        leave_to_strip
-      elsif key.up? || key.lower_k?
-        @project_view.ov_at_top? ? leave_to_strip : @project_view.ov_select(-1)
-      elsif key.down? || key.lower_j?
-        @project_view.ov_select(1)
-      elsif key.left? || key.right?
-        # Inert — ←/→ switch sub-tabs on the strip, not from inside a card.
-      elsif key.enter?
-        @project_view.ov_edit_start
-      else
-        return false # a/e/d (hostoverride.*-entry verbs), space (action menu), Global chords
+      list_pane_key(ev, @project_view.ov_at_top?) do |delta|
+        delta ? @project_view.ov_select(delta) : @project_view.ov_edit_start
       end
-      true
     end
 
     # The inline "add"/"edit" row: type "IP host", ↵ commits, ⌫ on an empty input
@@ -986,16 +1079,16 @@ module Gori::Tui
         # ⌫ on an already-empty row means "I am done here", so the empty check comes BEFORE
         # the field sees the key — `TextField#backspace` on an empty value is a silent no-op
         # and the row would sit there with no way out but esc.
-        @project_view.cancel_ov_add unless @project_view.ov_backspace
+        @project_view.cancel_ov_add unless ProjectController.backspace_row(@project_view.ov_field)
       elsif key.tab?
         # ↹ types the IP/host separator rather than jumping focus. There is nowhere to jump
         # to: this row is one field holding two values, and the pair is what `ov_commit`
         # parses. Same in the ENV row below and in both global editors under Settings.
-        @project_view.ov_input(' ')
+        @project_view.ov_field.try(&.insert(' '))
       else
         # Everything else goes through the shared editor: caret motion, word jumps, Home/End,
         # selection, ⌥⌫, Delete and ^Z — the keys this row used to answer with ←/→ alone.
-        @project_view.ov_edit_key(ev)
+        @project_view.ov_field.try(&.handle_edit_key(ev))
       end
     end
 
@@ -1015,13 +1108,15 @@ module Gori::Tui
     end
 
     def hostov_delete_entry : Nil
-      host = @project_view.selected_override_host || return @host.status("no host override selected")
+      entry = @project_view.selected_override || return @host.status("no host override selected")
+      host = entry.host
       @host.confirm("DELETE HOST OVERRIDE", "Delete the override for “#{host}”? This can't be undone.",
         confirm_label: "delete", danger: true) do
-        if removed = @project_view.ov_delete
-          @host.status("host override deleted: #{removed}")
-        else
-          @host.status("host override NOT deleted (project busy) — it is still in effect")
+        # By id, for the reason `scope_delete_rule` gives: the tick runs under the modal.
+        case @project_view.ov_delete(entry.id)
+        when :ok   then @host.status("host override deleted: #{host}")
+        when :gone then @host.status("host override already removed elsewhere: #{host}")
+        else            @host.status("host override NOT deleted (project busy) — it is still in effect")
         end
       end
     end
@@ -1048,24 +1143,9 @@ module Gori::Tui
     private def handle_project_env_key(ev : Termisu::Event::Key) : Bool
       return (handle_project_env_add_key(ev); true) if @project_view.env_adding?
       return (handle_project_env_prefix_key(ev); true) if @project_view.env_prefix_editing?
-      key = ev.key
-      if ev.ctrl? && key.lower_p?
-        save
-        @host.open_palette
-      elsif key.escape?
-        leave_to_strip
-      elsif key.up? || key.lower_k?
-        @project_view.env_at_top? ? leave_to_strip : @project_view.env_select(-1)
-      elsif key.down? || key.lower_j?
-        @project_view.env_select(1)
-      elsif key.left? || key.right?
-        # Inert — ←/→ switch sub-tabs on the strip, not from inside a card.
-      elsif key.enter?
-        @project_view.env_edit_start
-      else
-        return false # a/e/d (env.*-var verbs), space (action menu), Global chords
+      list_pane_key(ev, @project_view.env_at_top?) do |delta|
+        delta ? @project_view.env_select(delta) : @project_view.env_edit_start
       end
-      true
     end
 
     # --- ENV verbs (a/e/d via the keymap + the Env action menu) ---
@@ -1086,13 +1166,15 @@ module Gori::Tui
       # The KEY, never the value — a confirm is a modal an operator may be sharing a screen on.
       @host.confirm("DELETE ENV VAR", "Delete “#{key}”? This can't be undone.",
         confirm_label: "delete", danger: true) do
-        if removed = @project_view.env_delete
+        if removed = @project_view.env_delete(key)
           # Whether the write COMMITTED, like the host-override sibling above and like MCP's
           # `delete_env_var` / `gori run project env delete`. A dropped write reported as
           # "deleted" stayed convincing for the whole session, and the var came back at the
           # next launch.
           ok = persist_env_vars
           @host.status(ok ? "env var deleted: #{removed}" : "env var NOT deleted (project busy or unwritable) — try again")
+        else
+          @host.status("env var #{key} was already removed")
         end
       end
     end
@@ -1140,11 +1222,11 @@ module Gori::Tui
       elsif key.enter?
         commit_project_env
       elsif key.backspace?
-        @project_view.cancel_env_add unless @project_view.env_backspace
+        @project_view.cancel_env_add unless ProjectController.backspace_row(@project_view.env_field)
       elsif key.tab?
-        @project_view.env_input(' ') # Tab types the KEY/VALUE separator, not a pane jump
+        @project_view.env_field.try(&.insert(' ')) # Tab types the KEY/VALUE separator, not a pane jump
       else
-        @project_view.env_edit_key(ev)
+        @project_view.env_field.try(&.handle_edit_key(ev))
       end
     end
 
@@ -1178,9 +1260,9 @@ module Gori::Tui
       elsif key.enter?
         commit_project_env_prefix
       elsif key.backspace?
-        @project_view.cancel_env_prefix_edit unless @project_view.env_backspace
+        @project_view.cancel_env_prefix_edit unless ProjectController.backspace_row(@project_view.env_field)
       else
-        @project_view.env_edit_key(ev) # a sigil has no separator, so ↹ is the field's no-op
+        @project_view.env_field.try(&.handle_edit_key(ev)) # a sigil has no separator, so ↹ is the field's no-op
       end
     end
 
@@ -1192,6 +1274,12 @@ module Gori::Tui
       case kind
       when :empty then @host.status("env prefix: empty")
       when :ok
+        # The SIGIL is global and shares the `env` section with the grammar, which the merge
+        # rewrites whole: follow the file's grammar first so this write says nothing about it
+        # (`EnvSyntaxSeam`, the same seam the Settings env card's saves take). FOLLOW, not just
+        # adopt — a peer's switch re-spells this project's stored tokens, and the notices go in
+        # the ring beside the open-time ones rather than being swallowed by a prefix save.
+        EnvSyntaxSeam.announce(EnvSyntaxSeam.follow(@host.session), @host.notifications)
         Settings.env_prefix = prefix
         ok = Settings.save
         Env.bump_highlight_rev if ok
@@ -1331,7 +1419,9 @@ module Gori::Tui
       return nil unless @project_view.settings_dirty?
       host, port_s, _protocol, _proxy_host, _proxy_port, destination, auth_s, username, password, connect_s, idle_s, cap_s =
         @project_view.settings_values
-      return settings_invalid("bind IP is required", on_leave) if host.empty?
+      if err = bind_host_problem(host)
+        return settings_invalid(err, on_leave)
+      end
       port = port_s.to_i?
       unless port && 0 <= port <= 65535
         return settings_invalid("invalid bind port #{port_s.inspect}", on_leave)
@@ -1361,6 +1451,13 @@ module Gori::Tui
       line = @host.apply_project_network(config)
       @project_view.refresh_settings
       line
+    end
+
+    # Why `host` cannot be this project's bind address, or nil. Beyond "required", the same check
+    # the global editor, the wizard and `gori run project network set` run: a typo'd address
+    # stored here fails every rebind and every later open of this project.
+    private def bind_host_problem(host : String) : String?
+      host.empty? ? "bind IP is required" : Settings.bind_host_error(host)
     end
 
     # A whole number of at least 1, or nil. Shared by the three numeric project fields so they

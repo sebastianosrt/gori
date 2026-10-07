@@ -36,6 +36,7 @@ module Gori::Tui
       Verb::Scope::Intercept       => "INTERCEPT",
       Verb::Scope::Comparer        => "COMPARER",
       Verb::Scope::Diff            => "RETEST DIFF",
+      Verb::Scope::Params          => "PARAMS",
       Verb::Scope::ProjectDesc     => "PROJECT DESCRIPTION",
       Verb::Scope::Project         => "PROJECT SCOPE",
       Verb::Scope::Env             => "PROJECT ENV",
@@ -159,9 +160,9 @@ module Gori::Tui
       elsif key.enter?
         return :commit
       elsif key.up?
-        select_move(-1)
+        move(-1)
       elsif key.down?
-        select_move(1)
+        move(1)
       elsif page_key(ev)
         # PgUp/PgDn/Home/End — the list contract, `Overlay#page_key`
       elsif key.left?
@@ -188,9 +189,9 @@ module Gori::Tui
       elsif key.enter?
         accept_search
       elsif key.up?
-        select_move(-1)
+        move(-1)
       elsif key.down?
-        select_move(1)
+        move(1)
       elsif search_edit(ev)
       elsif key.backspace?
         search_backspace
@@ -225,8 +226,8 @@ module Gori::Tui
       when 'x'      then unbind_selected
       when 'r'      then reset_selected
       when 'R'      then reset_all
-      when 'k'      then select_move(-1)
-      when 'j'      then select_move(1)
+      when 'k'      then move(-1)
+      when 'j'      then move(1)
       end
     end
 
@@ -311,7 +312,7 @@ module Gori::Tui
           next
         end
         scope = SCOPE_LABEL[row.scope]? || row.scope.to_s.upcase
-        chord = effective_chord(row.verb_id).try(&.label) || "(unbound)"
+        chord = chord_label(row.verb_id)
         next unless "#{scope} #{row.title} #{chord}".downcase.includes?(needle)
         if h = header
           out << h
@@ -349,10 +350,6 @@ module Gori::Tui
       :stay
     end
 
-    def move(step : Int32) : Nil
-      select_move(step)
-    end
-
     private def selected_id : String
       @rows[@selected]?.try(&.verb_id) || ""
     end
@@ -362,9 +359,38 @@ module Gori::Tui
       (r = @rows[@selected]?) ? r.kind == :binding : false
     end
 
+    # A keyless `chord_of` verb (`repeater.toggle-resp-hex`) follows the verb it names, working
+    # copy included: its row shows that key, and a rebind of the owner moves it.
     private def effective_chord(id : String) : Verb::Chord?
       return @overrides[id] if @overrides.has_key?(id)
+      if via = via_of(id)
+        return effective_chord(via)
+      end
       Hotkeys.default_for(@registry, id, @profile)
+    end
+
+    # The verb whose key `id` borrows (`Definition#chord_of`), unless the operator bound `id`
+    # itself.
+    private def via_of(id : String) : String?
+      return nil if @overrides.has_key?(id)
+      @registry[id]?.try(&.chord_of)
+    end
+
+    # The chord column: `^X (via Toggle hex edit)` for a borrowed key, `(unbound)` for none.
+    private def chord_label(id : String) : String
+      return "(unbound)" unless chord = effective_chord(id)
+      return chord.label unless via = via_of(id)
+      "#{chord.label} (via #{@registry[via]?.try(&.title) || via})"
+    end
+
+    # A borrowed key is its owner's to move: rebinding, unbinding or resetting the borrower
+    # would change nothing the operator presses (the owner's chord still reaches it), so the
+    # row says where the key lives instead.
+    private def refuse_borrowed? : Bool
+      return false unless via = via_of(selected_id)
+      @feedback_kind = :error
+      @feedback = "this key follows #{@registry[via]?.try(&.title) || via}: change that row"
+      true
     end
 
     private def overridden?(id : String) : Bool
@@ -372,7 +398,7 @@ module Gori::Tui
     end
 
     # --- navigation ---
-    def select_move(d : Int32) : Nil
+    def move(d : Int32) : Nil
       bindings = visible_binding_indices
       return if bindings.empty?
       pos = bindings.index(@selected)
@@ -407,6 +433,7 @@ module Gori::Tui
     # --- capture sub-mode ---
     def begin_capture : Nil
       return unless selected_binding?
+      return if refuse_borrowed?
       @mode = :capture
       @feedback_kind = :hint
       @feedback = "press a key to bind · esc cancel"
@@ -446,6 +473,7 @@ module Gori::Tui
 
     def unbind_selected : Nil
       return unless selected_binding?
+      return if refuse_borrowed?
       @overrides[selected_id] = nil
       @feedback_kind = :ok
       @feedback = "unbound"
@@ -453,6 +481,7 @@ module Gori::Tui
 
     def reset_selected : Nil
       return unless selected_binding?
+      return if refuse_borrowed?
       @overrides.delete(selected_id)
       @feedback_kind = :ok
       @feedback = "reset to default"
@@ -483,10 +512,7 @@ module Gori::Tui
 
     # --- geometry (mirrors TabsOverlay; reserves the last interior row for the footer) ---
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 56}.min
-      h = {area.h - 2, @rows.size + 5}.min # top border + search/divider + list + footer + bottom border
-      return nil if w < 32 || h < 7
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      area.card?(56, @rows.size + 5, 32, 7) # h: top border + search/divider + list + footer + bottom border
     end
 
     private def list_capacity(box : Rect) : Int32
@@ -561,16 +587,13 @@ module Gori::Tui
     private def draw_binding(screen : Screen, box : Rect, i : Int32, ry : Int32, *, up : Bool, down : Bool) : Nil
       r = @rows[i]
       sel = i == @selected
-      bg = sel ? Theme.accent_bg : Theme.panel
-      screen.fill(Rect.new(box.x + 1, ry, box.w - 2, 1), bg)
-      screen.cell(box.x + 1, ry, sel ? '▎' : ' ', Theme.accent, bg)
+      bg = Frame.row_band(screen, box, ry, sel)
       ov = overridden?(r.verb_id)
       screen.cell(box.x + 3, ry, ov ? '●' : '·', ov ? Theme.accent : Theme.muted, bg)
 
       mark_x = box.right - 2
-      chord = effective_chord(r.verb_id) # resolve once (label + unbound flag derive from it)
-      clabel = chord.try(&.label) || "(unbound)"
-      unbound = chord.nil?
+      clabel = chord_label(r.verb_id)
+      unbound = effective_chord(r.verb_id).nil?
       cx = mark_x - 1 - clabel.size
       name_w = {cx - (box.x + 5) - 1, 1}.max
       screen.text(box.x + 5, ry, r.title, sel ? Theme.text_bright : Theme.text, bg, width: name_w)

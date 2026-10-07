@@ -170,7 +170,7 @@ module Gori::Tui
         focused_form.try(&.delete)
       when ev.ctrl? && key.lower_r?
         return reset_focused
-      when c && !ev.ctrl? && !ev.alt?
+      when c && !c.control? && !ev.ctrl? && !ev.alt? # termisu reads Tab as '\t'
         # Printable (incl. space) → into the focused field, exactly like the overlay:
         # space toggles a bool / cycles a choice / types into text.
         if f = focused_form
@@ -274,8 +274,10 @@ module Gori::Tui
       # `save` returns its error message and persists NOTHING when validation fails, so a
       # :saved outcome there would be a lie the host acts on — apply_settings_saved
       # rebinds the live proxy and re-pushes upstream/landing settings for input that was
-      # just rejected. Report the failure in the footer only.
-      return NONE unless form.saved?
+      # just rejected. Report the failure in the footer only. A write that failed AFTER the
+      # setters ran is the other case: the change is live, so the host must apply it, or the
+      # proxy keeps (say) skipping upstream TLS verification the footer calls applied.
+      return NONE unless form.applied?
       Outcome.new(:saved, sec.sym, msg)
     end
 
@@ -338,7 +340,9 @@ module Gori::Tui
       return render_too_small(screen, area) if box.w < 24 || box.h < 10
       Frame.card(screen, box, "PREFERENCES", border: Theme.border_focus)
       strip = Rect.new(box.x + 2, box.y + 2, box.w - 4, 1)
-      @strip_start = Chrome.render_tab_strip(screen, strip, GROUP_LABELS, @group, @on_strip, @strip_start)
+      # `bg: Theme.panel`: the strip sits inside the card, not on the canvas — the default
+      # painted each unselected group label on its own black band.
+      @strip_start = Chrome.render_tab_strip(screen, strip, GROUP_LABELS, @group, @on_strip, @strip_start, bg: Theme.panel)
       # `tee_divider`, not a bare hline: the seam now lands ├ and ┤ ON the card's side borders
       # instead of butting `─` straight into `│`, which is the whole reason frame.cr grew the
       # helper. Same focus tint as before.
@@ -366,9 +370,7 @@ module Gori::Tui
       # drops below the render guard (box.h < 10) and the modal simply doesn't draw, rather
       # than spilling the card over the tab bar / status rows.
       h = {tallest + 7, area.h - 2}.min
-      x = area.x + (area.w - w) // 2
-      y = area.y + (area.h - h) // 2
-      Rect.new(x, y, w, h)
+      area.center(w, h)
     end
 
     # Interior content rows (between the strip divider and the two footer rows).
@@ -445,26 +447,13 @@ module Gori::Tui
       if sec.sym == :theme
         name = Theme.canonical(Settings.theme)
         name_x = lx + Screen.draw_width(label) + 2
-        sx = cx - 1 - SWATCH_W
+        sx = cx - 1 - Frame::SWATCH_W
         if sx >= name_x
           screen.text(name_x, y, name, focused ? Theme.text_bright : Theme.muted, bg, width: {sx - name_x - 1, 1}.max)
-          draw_swatch(screen, sx, y, name)
+          Frame.theme_swatch(screen, sx, y, name)
         end
       end
       screen.text(cx, y, cue, focused ? Theme.accent : Theme.muted, bg, width: {content.right - cx, 1}.max)
-    end
-
-    # A tiny preview strip in the theme's OWN palette (its canvas colour framing 5 accent
-    # ticks) — the same swatch the theme card draws per row. Width == SWATCH_W.
-    SWATCH_W = 7
-
-    private def draw_swatch(screen : Screen, x : Int32, ry : Int32, name : String) : Nil
-      pal = Theme.palette(name)
-      return unless pal
-      ticks = {pal.accent, pal.green, pal.yellow, pal.red, pal.syn_header}
-      screen.cell(x, ry, ' ', pal.bg, pal.bg)
-      ticks.each_with_index { |c, i| screen.cell(x + 1 + i, ry, '█', c, pal.bg) }
-      screen.cell(x + 6, ry, ' ', pal.bg, pal.bg)
     end
 
     private def render_footer(screen : Screen, box : Rect) : Nil

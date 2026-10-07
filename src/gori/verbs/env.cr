@@ -14,24 +14,29 @@ module Gori
       have_var = ->(ctx : Verb::ExecContext) { ctx.env_var_selected? }
 
       r.register Verb::Definition.new(
-        "env.add-var", "Add env var", "Open the inline row to add a $KEY environment variable",
-        Verb::Scope::Env, [Verb::Chord.new("a")]) { |ctx| ctx.env_add_var; nil }
+        "env.add-var", "Add env var", "Open the inline row to add an environment variable",
+        Verb::Scope::Env, [Verb::Chord.new("a")], intent: :add) { |ctx| ctx.env_add_var; nil }
 
       r.register Verb::Definition.new(
         "env.copy-var", "Copy", "Copy the selected variable as KEY=VALUE",
-        Verb::Scope::Env, [Verb::Chord.new("y")], available: have_var) { |ctx| ctx.read_copy; nil }
+        Verb::Scope::Env, [Verb::Chord.new("y")], available: have_var, intent: :copy) { |ctx| ctx.read_copy; nil }
 
       r.register Verb::Definition.new(
         "env.edit-var", "Edit env var", "Edit the selected environment variable in place",
-        Verb::Scope::Env, [Verb::Chord.new("e")], available: have_var) { |ctx| ctx.env_edit_var; nil }
+        Verb::Scope::Env, [Verb::Chord.new("e")], available: have_var, intent: :edit) { |ctx| ctx.env_edit_var; nil }
 
       r.register Verb::Definition.new(
         "env.delete-var", "Delete env var", "Remove the selected environment variable",
-        Verb::Scope::Env, [Verb::Chord.new("d")], available: have_var, group: :danger) { |ctx| ctx.env_delete_var; nil }
+        Verb::Scope::Env, [Verb::Chord.new("d")], available: have_var, group: :danger, intent: :delete) { |ctx| ctx.env_delete_var; nil }
 
       r.register Verb::Definition.new(
-        "env.edit-prefix", "Change prefix", "Edit the token prefix used for $KEY substitution (applies globally)",
-        Verb::Scope::Env, mnemonic: 'p') { |ctx| ctx.env_edit_prefix; nil }
+        "env.edit-prefix", "Change prefix", "Edit the sigil that opens an env token (applies globally)",
+        Verb::Scope::Env, menu: :palette) { |ctx| ctx.env_edit_prefix; nil }
+      # The token GRAMMAR (`env.syntax`) is deliberately not a verb here. Flipping it re-reads
+      # every token already stored in project DBs, drafts, rule replacements and slot headers,
+      # so the switch has to re-spell those bytes — which is `gori settings env-syntax`'s job
+      # (it migrates the global rules there and then, and each project at its next open). A key
+      # on this pane could only set the setting, leaving the stored bytes mis-spelled.
     end
   end
 end

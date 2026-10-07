@@ -18,6 +18,7 @@ require "../host_overrides"
 require "../settings"
 require "../env"
 require "./highlight"
+require "../plural"
 
 module Gori::Tui
   # The Project tab (new default home on entry after create/select). Shows static
@@ -26,7 +27,7 @@ module Gori::Tui
   # the tab body has focus (cursor visible); Esc / ^P / ^C save + exit like NotesView.
   # Description can also be provided optionally when creating via the picker.
   class ProjectView
-    DESC_KEY = "description"
+    DESC_KEY = Gori::Project::DESCRIPTION_KEY
 
     @project : Project?
     @flow_count : Int64
@@ -78,11 +79,19 @@ module Gori::Tui
       @pane = :desc    # :desc | :scope | :overrides | :env | :settings | :activity (PANES order)
       @strip_start = 0 # first visible sub-tab chip (Chrome.render_tab_strip owns the window)
       @sel = 0         # selected rule row in the SCOPE list
+      # The id of the rule `@sel` points at, written with every move of `@sel` (`put_sel`).
+      # This view renders straight out of the live `Scope`, which `Runner#apply_external_change`
+      # reloads BEFORE anything here runs, so by the time a refresh reaches this view the list
+      # has already shifted and the old row can no longer be read off the index. A peer deleting
+      # a rule ABOVE the cursor then slid the next rule under it, and `d`/`e`/`y` acted on a row
+      # the operator never selected (#1431). Same for `@ov_sel_id` below.
+      @sel_id = nil.as(Int64?)
       # SCOPE add/edit is a centered popup (ScopeRuleOverlay), not an inline row.
 
       # HOST OVERRIDES pane: its own selection + inline add/edit row, fully independent
       # of the SCOPE pane above it (single-line "IP host" entry, /etc/hosts order).
       @ov_sel = 0
+      @ov_sel_id = nil.as(Int64?) # id of the override `@ov_sel` points at — see `@sel_id`
       @ov_adding = false
       @ov_edit_id = nil.as(Int64?) # non-nil ⇒ editing an existing override
       # The add/edit row is a real `TextField`, like `HostsOverlay`'s (its twin one modal
@@ -170,8 +179,11 @@ module Gori::Tui
       earliest = store.earliest_created_at
       # earliest_created_at is unix MICROSECONDS (the flows.created_at unit) — decoder
       # to seconds for Time.unix, like History's fmt_time does. (Passing micros makes
-      # Time.unix raise "seconds out of range".)
-      @created = earliest ? Time.unix(earliest // 1_000_000) : project.created
+      # Time.unix raise "seconds out of range".) Through `LocalTime.at`, because a stored
+      # micros value past year 9999 raises the same way — and this runs in the Runner's first
+      # `reload`, before the tick loop that absorbs a raise, so one imported row with such a
+      # stamp made the project impossible to open.
+      @created = (earliest && LocalTime.at(earliest)) || project.created
 
       # An UNSAVED buffer is not refreshed from the store: `save` only clears `@desc_dirty`
       # once the write committed, so a still-dirty buffer means the operator's text has not
@@ -183,6 +195,10 @@ module Gori::Tui
         @desc_read.sync_from(@desc_area)
       end
       load_settings_values
+      # Tab entry is the other moment a peer's write reaches these lists: the external-change
+      # tick refreshes only the ACTIVE tab, so a rule deleted while the operator was on History
+      # shifted the list with nothing here to follow the selected row.
+      reanchor_selections
       # THE one re-seed, shared with the external-change path. Tab entry is the other moment
       # the list can move under an open EDIT row — `flush_active_tab_edits` persists the
       # description and the network fields on the way out but does not cancel this row (only a
@@ -342,6 +358,11 @@ module Gori::Tui
       @desc_mode == InputMode::Insert
     end
 
+    # The description buffer READ-mode edits run against (`TabController#editor_text_buffer`).
+    def read_edit_buffer : {TextArea, TextReadState}?
+      @pane == :desc ? {@desc_area, @desc_read} : nil
+    end
+
     def enter_desc_insert! : Nil
       @desc_mode = InputMode::Insert
       @desc_read.sync_from(@desc_area)
@@ -356,6 +377,16 @@ module Gori::Tui
     def desc_read_move(dr : Int32, dc : Int32, selecting : Bool = false) : Nil
       return if desc_insert_mode?
       @desc_read.move(@desc_area, dr, dc, selecting: selecting)
+    end
+
+    # READ-mode undo (`editor.undo`). `undo` moves the EDITOR caret and READ paints from
+    # `@desc_read`, so the read cursor has to adopt what was restored — the handover
+    # `desc_read_move` gets for free and a direct `undo` does not. INS keeps its own ^Z.
+    def desc_read_undo : Bool
+      return false if desc_insert_mode?
+      undo
+      @desc_read.sync_from(@desc_area)
+      true
     end
 
     # One selection model per mode — see NotesView#selection? / RepeaterView#pane_selection?.
@@ -373,7 +404,7 @@ module Gori::Tui
 
     def desc_selection? : Bool
       return false unless @pane == :desc
-      desc_insert_mode? ? @desc_area.selection? : @desc_read.selection?
+      desc_insert_mode? ? @desc_area.selection? : @desc_read.selection?(@desc_area)
     end
 
     def desc_select_line : Nil
@@ -383,11 +414,6 @@ module Gori::Tui
 
     def desc_clear_selection : Nil
       @desc_read.clear_selection
-    end
-
-    def desc_hscroll(delta : Int32) : Nil
-      return if desc_insert_mode?
-      @desc_read.move(@desc_area, 0, delta * 4)
     end
 
     # INSERT-mode motion: the shared editor keymap (⇧arrows select, Page keys, ⌥←/→ by word,
@@ -421,18 +447,18 @@ module Gori::Tui
       @desc_area.word_delete_key?(ev)
     end
 
-    # Mouse DRAG / DOUBLE-CLICK over the description — the click already forced INSERT, so
-    # both work on the editor's own selection.
+    # Mouse DRAG / DOUBLE-CLICK over the description. Each runs against the selection model
+    # the CURRENT mode owns — INS: the editor's own anchor, painted by `TextArea#render`;
+    # READ: `@desc_read`, painted by `paint_desc_read_chrome`. Both used to force INSERT
+    # first, which put a READ-mode word out of reach of `y` (#1124).
     def desc_drag_to_cursor(rect : Rect, mx : Int32, my : Int32) : Nil
-      return unless desc_insert_mode?
-      return unless card = card_rect(rect, :desc)
-      @desc_area.click_to_cursor(card.inset(1, 1), mx, my, selecting: true)
+      desc_click_to_cursor(rect, mx, my, selecting: true)
     end
 
     def desc_select_word(rect : Rect, mx : Int32, my : Int32) : Bool
       return false unless card = card_rect(rect, :desc)
-      enter_desc_insert!
-      @desc_area.select_word_at(card.inset(1, 1), mx, my)
+      inner = card.inset(1, 1)
+      desc_insert_mode? ? @desc_area.select_word_at(inner, mx, my) : @desc_read.select_word(@desc_area, inner, mx, my)
     end
 
     # Sub-tab order, left to right. DESCRIPTION leads: it's the one card you WRITE rather
@@ -728,14 +754,14 @@ module Gori::Tui
     def select_scope(idx : Int32) : Nil
       n = @scope.rules.size
       return if n == 0
-      @sel = idx.clamp(0, n - 1)
+      put_sel(idx)
     end
 
     # Mouse: select a host override by row index (clamped to the populated list).
     def select_override(idx : Int32) : Nil
       n = @host_overrides.entries.size
       return if n == 0
-      @ov_sel = idx.clamp(0, n - 1)
+      put_ov_sel(idx)
     end
 
     # DESCRIPTION card outer rect (for border chrome hit-tests). Nil unless it's showing.
@@ -743,23 +769,28 @@ module Gori::Tui
       card_rect(rect, :desc)
     end
 
-    # Mouse: place the description-editor cursor at a click INSIDE the card, entering INS
-    # like NotesView#click_to_cursor. Selecting the sub-tab (a chip click, ↓ off the strip)
-    # deliberately does NOT come through here — that lands in READ mode, so arrows navigate.
-    def desc_click_to_cursor(rect : Rect, mx : Int32, my : Int32) : Nil
+    # Mouse: place the description-editor cursor at a click INSIDE the card, IN THE MODE THE
+    # CARD IS ALREADY IN. Selecting the sub-tab (a chip click, ↓ off the strip) deliberately
+    # does not come through here at all.
+    #
+    # The `enter_desc_insert!` that used to lead this method is gone (#1124): a click is how
+    # you aim, not how you ask to type, and arming the editor here meant the next bare letter
+    # was typed rather than run — `y` putting a `y` in the description instead of copying,
+    # over whatever was selected. INS is entered by `i` / ↵ or by clicking the NOR/INS chip
+    # this card draws on its own border. `NotesView#click_to_cursor` is the twin of this.
+    def desc_click_to_cursor(rect : Rect, mx : Int32, my : Int32, selecting : Bool = false) : Nil
       return unless card = card_rect(rect, :desc)
-      enter_desc_insert!
-      @desc_area.click_to_cursor(card.inset(1, 1), mx, my)
+      inner = card.inset(1, 1)
+      if desc_insert_mode?
+        @desc_area.click_to_cursor(inner, mx, my, selecting: selecting)
+      else
+        # Through the read state — it owns the band READ paints, and its `click` is what
+        # COLLAPSES a standing ⇧arrow selection (`sync_from` deliberately does not).
+        @desc_read.click(@desc_area, inner, mx, my, selecting: selecting)
+      end
     end
 
     # --- PROJECT SETTINGS pane (delegated from ProjectController#handle_project_settings_key) ---
-    def set_sel : Int32
-      @set_sel
-    end
-
-    def settings_scope_row? : Bool
-      @set_sel == SETTINGS_SCOPE_ROW
-    end
 
     def settings_sandbox_row? : Bool
       @set_sel == SETTINGS_SANDBOX_ROW
@@ -956,7 +987,7 @@ module Gori::Tui
     def scope_select(d : Int32) : Nil
       n = @scope.rules.size
       return if n == 0
-      @sel = (@sel + d).clamp(0, n - 1)
+      put_sel(@sel + d)
     end
 
     # Selection on the first rule (or an empty list) → ↑ pops focus to the sub-tab strip,
@@ -994,31 +1025,45 @@ module Gori::Tui
       # an ADD always appends: without this the selection stayed where it was and, on a list
       # taller than the card, the new rule was drawn off-screen — no sign the write landed.
       if edit_id.nil?
-        @sel = @scope.rules.index { |r| r.kind == kind && r.match_type == match_type && r.pattern == pattern } || @sel
+        put_sel(@scope.rules.index { |r| r.kind == kind && r.match_type == match_type && r.pattern == pattern } || @sel)
+      else
+        reanchor_sel
       end
-      clamp_sel
       :ok
     end
 
-    # Removes the selected rule, returning its pattern (for the Runner's toast) or nil.
-    def scope_delete : String?
-      rule = selected_rule
-      return nil unless rule
-      # `Scope#remove` now reports whether the DELETE committed. A rolled-back batch must not
-      # produce a "removed scope rule: <pattern>" toast over a rule that is still gating
-      # traffic; the caller turns this nil into a busy message instead.
-      return nil unless @scope.remove(rule.id)
-      clamp_sel
-      rule.pattern
+    # Removes the rule `id` names — the one the delete confirm was raised over, NOT whatever is
+    # selected when it is accepted: the data_version tick keeps running under the modal, so a
+    # peer's write can move the list between the question and the answer. Returns
+    # :ok | :gone | :failed for the controller's toast.
+    #
+    # :gone when a peer already removed it. Checked here, against a fresh read, because
+    # `Scope#remove` cannot say so: a DELETE that matches no row still commits, and "deleted"
+    # would then be reported for a rule this session never touched.
+    #
+    # :failed when the DELETE did not commit. A rolled-back batch must not produce a
+    # "removed scope rule: <pattern>" toast over a rule that is still gating traffic.
+    def scope_delete(id : Int64) : Symbol
+      # Re-read first: the live list only catches up on the next data_version tick, and a
+      # DELETE matching no row still commits, so a peer's delete since then would read :ok.
+      @scope.reload
+      unless @scope.rules.any? { |r| r.id == id }
+        reanchor_sel
+        return :gone
+      end
+      return :failed unless @scope.remove(id)
+      reanchor_sel
+      :ok
     end
 
-    # Pull BOTH list selections back inside their (possibly externally shrunk) lists. Called
-    # by the controller after Runner#apply_external_change reloaded the live Scope /
-    # HostOverrides — this view renders straight out of those objects, so a peer process
-    # deleting the last rule would otherwise leave the highlight past the end.
-    def clamp_selections : Nil
-      clamp_sel
-      clamp_ov_sel
+    # Put BOTH list selections back on the rows they were on, by id, after the live Scope /
+    # HostOverrides changed under them. Called by the controller after
+    # Runner#apply_external_change reloaded those objects, and by `reload` on tab entry — this
+    # view renders straight out of them, so a peer deleting a row above the cursor (or the last
+    # row) would otherwise leave the highlight on a neighbour, or past the end.
+    def reanchor_selections : Nil
+      reanchor_sel
+      reanchor_ov_sel
       clamp_act_sel
     end
 
@@ -1108,8 +1153,9 @@ module Gori::Tui
       end
     end
 
-    # Cycle order for the `l` chip.
-    ACT_LEVELS = [nil, "info", "success", "warn", "error"]
+    # Cycle order for the `l` chip. From `Store::EVENT_LEVELS` — the list next to the writer —
+    # for the reason ACT_SOURCES is: a copy here is a copy that drifts.
+    ACT_LEVELS = [nil] + Gori::Store::EVENT_LEVELS
 
     # How many pages `refresh_activity` walks down looking for the row that heads the loaded list
     # before it gives up and reloads. One page is the ordinary tick; five is what keeps a burst
@@ -1118,9 +1164,10 @@ module Gori::Tui
     ACT_CATCHUP_PAGES = 5
 
     # What a level chip actually matches. The feed carries TWO spellings of one level: every
-    # producer writes "warn" except the Sequencer, whose `level.to_s` writes "warning". A chip
+    # producer writes "warn", and the Sequencer used to write "warning" because its `level`
+    # symbol is the notification centre's (`:warning`) and it spelled it straight through. A chip
     # that matched its own label would hide half the warnings in the feed, and rows already
-    # written cannot be respelled.
+    # written cannot be respelled — so this stays even though new rows are all "warn".
     def self.act_level_set(level : String?) : Array(String)?
       return nil unless level
       level == "warn" ? ["warn", "warning"] : [level]
@@ -1258,15 +1305,33 @@ module Gori::Tui
                         else
                           true
                         end
-      # The cursor moves only when no walk is in progress. On a fresh empty list page one IS the
-      # cursor, and adopting it is required — without it a feed that was empty at open would keep
-      # `next_before = nil` and refuse to page past the first 200 events it ever received.
-      unless @act_walked
-        @act_next_before = page.next_before
-        @act_scanned = page.window
+      # Still nothing to show. The walk, if one is in progress, is what must survive: an
+      # operator who pressed `↓` through ten empty windows under a sparse narrowing has told
+      # this pane how far back to look, and page one — which is all that was just read — knows
+      # nothing about it. Only an UNWALKED list adopts this page's resume point; without that a
+      # feed empty at open would keep `next_before = nil` and refuse to page at all.
+      if page.rows.empty?
+        unless @act_walked
+          @act_next_before = page.next_before
+          @act_scanned = page.window
+        end
+        return
       end
-      return if page.rows.empty?
+
+      # Page one HAS rows, so the loaded list BECOMES page one — and the resume point has to
+      # become page one's with it. Keeping the walk's deep `@act_next_before` here left the two
+      # describing different places: the list ended at page one's floor while the resume point
+      # named a window far below it, so the first `↓` past the last row jumped the gap and every
+      # matching event in between was skipped without a word. (Reachable whenever more than one
+      # page of matches arrives while the list is empty and walked — an agent burst under an
+      # `actor` narrowing, a job writing 200+ rows under a `source` one.) The walk's product was
+      # "nothing matches down there", which page one having rows does not contradict; what it
+      # costs is re-walking those windows, which `↓` does, and which is the cheap half of the
+      # trade against silently losing rows.
       @act_rows = page.rows
+      @act_next_before = page.next_before
+      @act_scanned = page.window
+      @act_walked = false
       resolve_activity_anchor
     end
 
@@ -1524,8 +1589,29 @@ module Gori::Tui
       gauge_row(act_list_inner(card.inset(1, 1)), mx, my, false, @act_rows.size)
     end
 
-    private def clamp_sel : Nil
-      @sel = @sel.clamp(0, {@scope.rules.size - 1, 0}.max)
+    # THE one write of `@sel`: clamps it into the list and records the id of the rule it lands
+    # on, so the next `reanchor_sel` restores the row the operator chose rather than one a
+    # reload slid into it. A write that bypassed this would be snapped back on the next tick.
+    private def put_sel(idx : Int32) : Nil
+      rules = @scope.rules
+      @sel = idx.clamp(0, {rules.size - 1, 0}.max)
+      @sel_id = rules[@sel]?.try(&.id)
+    end
+
+    # Follow the anchored rule to wherever the reloaded list put it. When it is gone — the very
+    # rule the cursor was on was deleted — take the first rule after it, which is what a local
+    # delete leaves selected. By id, not by the old index: `scope_rules` is ORDER BY id, and a
+    # peer that also deleted rows above the cursor would make the old index skip past that rule.
+    private def reanchor_sel : Nil
+      rules = @scope.rules
+      put_sel(next_by_id(rules.map(&.id), @sel_id) || @sel)
+    end
+
+    # Where an id-anchored cursor belongs in an ORDER BY id list: its own row, else the first row
+    # after it, else the last row. Nil when nothing was anchored yet (keep the index as it is).
+    private def next_by_id(ids : Array(Int64), id : Int64?) : Int32?
+      return nil unless id
+      ids.index(id) || ids.index { |i| i > id } || ids.size - 1
     end
 
     # --- HOST OVERRIDES pane editing (delegated from the controller) — a DISTINCT pane
@@ -1537,7 +1623,7 @@ module Gori::Tui
     def ov_select(d : Int32) : Nil
       n = @host_overrides.entries.size
       return if n == 0
-      @ov_sel = (@ov_sel + d).clamp(0, n - 1)
+      put_ov_sel(@ov_sel + d)
     end
 
     # On the first override (or an empty list) → ↑ pops focus to the sub-tab strip.
@@ -1553,7 +1639,7 @@ module Gori::Tui
 
     # Open the editor ON the selected override's row, pre-filled "IP host" (edit-in-place).
     def ov_edit_start : Nil
-      entry = current_override
+      entry = selected_override
       return unless entry
       @ov_adding = true
       @ov_edit_id = entry.id
@@ -1565,47 +1651,17 @@ module Gori::Tui
       @ov_adding && !@ov_edit_id.nil?
     end
 
-    # The open row's text as typed so far — what ↵ would parse.
-    def ov_input_text : String
-      @ov_field.value
-    end
-
     def cancel_ov_add : Nil
       @ov_adding = false
       @ov_edit_id = nil
       @ov_field.set("")
     end
 
-    def ov_input(ch : Char) : Nil
-      @ov_field.insert(ch)
-    end
-
-    # Every other key of the open row — caret motion, word jumps, Home/End, selection, ⌥⌫,
-    # Delete, ^Z — through the shared editor. Answers whether the field took it.
-    def ov_edit_key(ev : Termisu::Event::Key) : Bool
-      @ov_field.handle_edit_key(ev)
-    end
-
-    # Backspace the add/edit row; false when the ROW is empty (the controller then closes it)
-    # — never merely because the caret sits at 0, which discarded a typed line the operator
-    # had only moved the caret inside. Same rule as `env_backspace`, which spells it out.
-    def ov_backspace : Bool
-      return false if @ov_field.value.empty?
-      @ov_field.backspace
-      true
-    end
-
-    # --- pointer contract for the open row (see `Overlay#text_fields` for the shape) ---
-    # A press inside the field is a CARET; a drag extends a selection; a pair selects a word.
-    # The field answers from the geometry it was last drawn at, so the row moving between the
-    # add line and an entry's own line costs the hit-test nothing. All three are false while
-    # no row is open, so a list click can never land a caret in a field that is not on screen.
-    def ov_field_click(mx : Int32, my : Int32, selecting : Bool = false) : Bool
-      @ov_adding && @ov_field.click_to_cursor(mx, my, selecting: selecting)
-    end
-
-    def ov_field_select_word(mx : Int32, my : Int32) : Bool
-      @ov_adding && @ov_field.select_word_at(mx, my)
+    # The open add/edit row's field, nil while no row is open — a list click can never land a
+    # caret in a field that is not on screen. Keys, caret, selection and the pointer contract
+    # (see `Overlay#text_fields`) all go through the shared `TextField`.
+    def ov_field : TextField?
+      @ov_field if @ov_adding
     end
 
     # Commit the add/edit row. Parses "IP host" (/etc/hosts order — IP first). Returns
@@ -1627,13 +1683,12 @@ module Gori::Tui
       if id = @ov_edit_id
         return :failed unless @host_overrides.update(id, host, ip)
         cancel_ov_add
-        clamp_ov_sel
+        reanchor_ov_sel
         :updated
       else
         return :failed unless @host_overrides.add(host, ip)
-        @ov_sel = @host_overrides.entries.size - 1 # select the new row, like ENV add
+        put_ov_sel(@host_overrides.entries.size - 1) # select the new row, like ENV add
         cancel_ov_add
-        clamp_ov_sel
         :ok
       end
     end
@@ -1642,33 +1697,45 @@ module Gori::Tui
     # Read-only and separate from `ov_delete` because the confirm has to say the name BEFORE
     # the row is gone, and `ov_delete` can only report it after.
     def selected_override_host : String?
-      current_override.try(&.host)
+      selected_override.try(&.host)
     end
 
     # The selected override as a hosts-file line (`ip host`) — what `y` copies.
     def selected_override_line : String?
-      current_override.try { |e| "#{e.ip} #{e.host}" }
+      selected_override.try { |e| "#{e.ip} #{e.host}" }
     end
 
-    # Removes the selected override, returning its host (for the toast) — or nil when there
-    # was nothing selected OR the delete did not COMMIT. `HostOverrides#remove` answers that
-    # (its doc: "false = store busy/locked/closing") and this discarded it, so a dropped
-    # write still reported "host override deleted" while the routing pin stayed live. The
-    # two writes right above in `ov_commit` already check theirs.
-    def ov_delete : String?
-      entry = current_override
-      return nil unless entry
-      return nil unless @host_overrides.remove(entry.id)
-      clamp_ov_sel
-      entry.host
-    end
-
-    private def current_override : HostOverrides::Entry?
+    # The selected override, so the delete confirm can name it AND remove that row by id — see
+    # `scope_delete` for why the selection at accept time is not that row.
+    def selected_override : HostOverrides::Entry?
       @host_overrides.entries[@ov_sel]?
     end
 
-    private def clamp_ov_sel : Nil
-      @ov_sel = @ov_sel.clamp(0, {@host_overrides.entries.size - 1, 0}.max)
+    # Removes the override `id` names. Returns :ok | :gone | :failed, the same split as
+    # `scope_delete` and for the same reasons: :gone because `HostOverrides#remove` commits a
+    # DELETE that matched nothing, and :failed because a dropped write must not report
+    # "host override deleted" while the routing pin stays live (its doc: "false = store
+    # busy/locked/closing"). The two writes right above in `ov_commit` already check theirs.
+    def ov_delete(id : Int64) : Symbol
+      @host_overrides.reload # see `scope_delete`
+      unless @host_overrides.entries.any? { |e| e.id == id }
+        reanchor_ov_sel
+        return :gone
+      end
+      return :failed unless @host_overrides.remove(id)
+      reanchor_ov_sel
+      :ok
+    end
+
+    # `put_sel` / `reanchor_sel` for the HOST OVERRIDES list (also ORDER BY id).
+    private def put_ov_sel(idx : Int32) : Nil
+      entries = @host_overrides.entries
+      @ov_sel = idx.clamp(0, {entries.size - 1, 0}.max)
+      @ov_sel_id = entries[@ov_sel]?.try(&.id)
+    end
+
+    private def reanchor_ov_sel : Nil
+      put_ov_sel(next_by_id(@host_overrides.entries.map(&.id), @ov_sel_id) || @ov_sel)
     end
 
     def env_adding? : Bool
@@ -1717,16 +1784,6 @@ module Gori::Tui
       @env_field.set("#{key} #{val}")
     end
 
-    # Whether the open row is an EDIT of an existing var (false for an add, or when closed).
-    def env_editing? : Bool
-      !env_edit_row.nil?
-    end
-
-    # The open row's text as typed so far — what ↵ would parse.
-    def env_input_text : String
-      @env_field.value
-    end
-
     def cancel_env_add : Nil
       @env_adding = false
       @env_edit_idx = nil
@@ -1757,51 +1814,14 @@ module Gori::Tui
       {:ok, text}
     end
 
-    def env_input(ch : Char) : Nil
-      @env_field.insert(ch)
-    end
-
-    # Every other key of the open add/edit/prefix row, through the shared editor (see
-    # `ov_edit_key`).
-    def env_edit_key(ev : Termisu::Event::Key) : Bool
-      @env_field.handle_edit_key(ev)
-    end
-
-    # Pointer contract for whichever ENV row is open — see `ov_field_click`.
-    def env_field_click(mx : Int32, my : Int32, selecting : Bool = false) : Bool
-      env_row_open? && @env_field.click_to_cursor(mx, my, selecting: selecting)
-    end
-
-    def env_field_select_word(mx : Int32, my : Int32) : Bool
-      env_row_open? && @env_field.select_word_at(mx, my)
-    end
-
-    private def env_row_open? : Bool
-      @env_adding || @env_prefix_editing
-    end
-
-    # Whether the row still holds text — the callers read this to tell a ⌫ that edited the
-    # line from one on an EMPTY row, which closes the row.
-    #
-    # The question is whether the ROW is empty, NOT whether the caret is at 0. Answering the
-    # caret question threw the line away: ← to the start of a typed "TOKEN abc123" and one ⌫
-    # closed the row with the text unsaved, which is the one thing a ⌫ must never do. A caret
-    # already at 0 with text behind it is an ordinary no-op, and that is what `TextField`
-    # (`EnvOverlay`'s field, the same editor one modal away) has always done.
-    def env_backspace : Bool
-      return false if @env_field.value.empty?
-      @env_field.backspace
-      true
-    end
-
-    # Caret step, clamped by the field (the keyboard reaches it through `env_edit_key`).
-    def env_move_cursor(d : Int32) : Nil
-      @env_field.move(d)
+    # The open ENV row's field (add/edit/prefix), nil while none is open — see `ov_field`.
+    def env_field : TextField?
+      @env_field if @env_adding || @env_prefix_editing
     end
 
     def env_commit : Symbol
-      text = @env_field.value.strip
-      return :empty if text.empty?
+      text = @env_field.value
+      return :empty if text.strip.empty?
       parsed = Env.parse_line(text)
       return :invalid unless parsed
       key, val = parsed
@@ -1835,11 +1855,11 @@ module Gori::Tui
       @env_items[@env_sel]?.try { |(key, val)| "#{key}=#{val}" }
     end
 
-    def env_delete : String?
-      entry = @env_items[@env_sel]?
-      return nil unless entry
-      key, _ = entry
-      @env_items.delete_at(@env_sel)
+    # By key, not the selection: the confirm is a modal and the data_version tick reloads
+    # the list under it, so the row the operator named may have moved or gone.
+    def env_delete(key : String) : String?
+      idx = @env_items.index { |(k, _)| k == key } || return nil
+      @env_items.delete_at(idx)
       clamp_env_sel
       key
     end
@@ -1905,10 +1925,6 @@ module Gori::Tui
       before = @desc_area.edits
       yield @desc_area
       @desc_dirty = true if @desc_area.edits != before
-    end
-
-    def move(dr : Int32, dc : Int32) : Nil
-      @desc_area.move(dr, dc)
     end
 
     # Mouse wheel over the DESCRIPTION: scroll the viewport (cursor follows), so a long
@@ -2147,11 +2163,12 @@ module Gori::Tui
       return if inner.h <= 0 || inner.w <= 0
       y = inner.y
 
-      # First run (no flows yet): a one-line signpost on how to start, since the empty
-      # History/Sitemap tabs don't say. Costs a row, and `overview_plan` already charged it.
+      # First run (no flows yet): a one-line signpost on how to start. Costs a row, and
+      # `overview_plan` already charged it. One step that needs no setup, plus where the rest
+      # lives (History's empty card: proxy address, CA trust); fits the 80-column overview.
       if plan.signpost
         screen.text(inner.x + 1, y,
-          Hotkeys.retag("▸ first run — point your client at the proxy · ^P: Open browser · Export CA certificate"),
+          Hotkeys.retag("▸ first run — ^P → Open browser, or see History"),
           Theme.muted, width: {inner.right - inner.x - 1, 0}.max)
         y += 1
       end
@@ -2373,15 +2390,18 @@ module Gori::Tui
       end
     end
 
-    # SCOPE card: title + the lens state riding the top border (right), then the rule
-    # list / inline add-row inside.
+    # SCOPE card: the lens state rides the top border (right), then the rule list / inline
+    # add-row inside. No TITLE on the border — the chip strip one row above already names the
+    # pane that is showing, and a card that repeats it said "Scope" twice in two rows. Every
+    # sub-tab card in this tab is titleless for that reason; the OVERVIEW band's cards keep
+    # theirs, since nothing above them names those.
     private def render_scope_card(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.w < 2 || rect.h < 2
-      Frame.card(screen, rect, "SCOPE", bg: Theme.bg, border: Frame.pane_border(focused))
+      Frame.card(screen, rect, bg: Theme.bg, border: Frame.pane_border(focused))
       n = @scope.rules.size
       # An ACTIVE lens is the one card meta that shouts — it changes what every other tab
       # shows — so this one passes its own fg rather than taking `border_meta`'s muted default.
-      Frame.border_meta(screen, rect, "SCOPE", "lens:#{@scope.enabled? ? "on" : "off"} · #{n}",
+      Frame.border_meta(screen, rect, "", "lens:#{@scope.enabled? ? "on" : "off"} · #{n}",
         fg: @scope.active? ? Theme.text_bright : Theme.muted)
       render_scope_list(screen, rect.inset(1, 1), focused)
     end
@@ -2432,15 +2452,17 @@ module Gori::Tui
       screen.text(px, y, rule.pattern, fg, bg, width: {inner.right - px, 1}.max) if inner.right > px
     end
 
-    # HOST OVERRIDES card: title + count chip riding the top border, then the entry list
-    # / inline add-row inside. A DISTINCT pane from SCOPE (own card, focus, action menu).
+    # HOST OVERRIDES card: count chip riding the top border (no title — see render_scope_card),
+    # then the entry list / inline add-row inside. A DISTINCT pane from SCOPE (own card, focus,
+    # action menu).
     private def render_overrides_card(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.w < 2 || rect.h < 2
-      Frame.card(screen, rect, "HOST OVERRIDES", bg: Theme.bg, border: Frame.pane_border(focused))
+      Frame.card(screen, rect, bg: Theme.bg, border: Frame.pane_border(focused))
       n = @host_overrides.size
       # `project`, against Settings' near-identically titled HOSTNAME OVERRIDES — these are
       # layered OVER those, and a bare count said nothing about which list you are editing.
-      Frame.border_meta(screen, rect, "HOST OVERRIDES", "project · #{n}",
+      # Empty title: the meta only needs the left stop it implies, and there is none to clear.
+      Frame.border_meta(screen, rect, "", "project · #{n}",
         fg: n > 0 ? Theme.text_bright : Theme.muted)
       render_overrides_list(screen, rect.inset(1, 1), focused)
     end
@@ -2546,11 +2568,15 @@ module Gori::Tui
 
     private def render_env_card(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.w < 2 || rect.h < 2
-      Frame.card(screen, rect, "ENVIRONMENT", bg: Theme.bg, border: Frame.pane_border(focused))
+      Frame.card(screen, rect, bg: Theme.bg, border: Frame.pane_border(focused))
       n = @env_items.size
       # `project`, against the identically-titled GLOBAL card in Settings → Env that these
       # vars are layered OVER. See `EnvOverlay#render`.
-      Frame.border_meta(screen, rect, "ENVIRONMENT", "project · prefix #{Settings.env_prefix} · #{n}")
+      # The live SPELLING, not just the sigil: under the namespaced grammar the sigil alone is
+      # half the answer, and this line is the only place on the tab that says which grammar the
+      # editors two tabs over are reading these vars under.
+      Frame.border_meta(screen, rect, "",
+        "project · #{Env.spell("KEY", Env::Namespace::Env)} · #{n}")
       render_env_list(screen, rect.inset(1, 1), focused)
     end
 
@@ -2634,11 +2660,11 @@ module Gori::Tui
       return if rect.w < 2 || rect.h < 2
       ins = focused && desc_insert_mode?
       border = Frame.pane_border(focused)
-      Frame.card(screen, rect, "DESCRIPTION", bg: Theme.bg, border: border)
+      Frame.card(screen, rect, bg: Theme.bg, border: border)
       # The REAL mode, always drawn — `Frame.mode_badge`'s contract. `project_controller`
       # hit-tests the bare `desc_insert_mode?`, so gating the draw on focus left a live
       # target on a border with nothing on it. Focus is carried by the border colour above.
-      Frame.mode_badge(screen, rect.right - 1, rect.y, rect.x + 14, desc_insert_mode?)
+      Frame.mode_badge(screen, rect.right - 1, rect.y, rect.x + 2, desc_insert_mode?)
       inner = rect.inset(1, 1)
       # Nothing written yet: the shared onboarding card instead of the void an empty TextArea
       # paints. Not in INSERT — the operator came here to type, and a "no description yet"
@@ -2674,7 +2700,7 @@ module Gori::Tui
     # visible. Network rows show their project/global source; the schema row shows what loaded.
     private def render_settings_card(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.w < 2 || rect.h < 2
-      Frame.card(screen, rect, "PROJECT SETTINGS", bg: Theme.bg, border: Frame.pane_border(focused))
+      Frame.card(screen, rect, bg: Theme.bg, border: Frame.pane_border(focused))
       inner = rect.inset(1, 1)
       return if inner.h <= 0 || inner.w <= 0
       # Scrolled, not clipped: every selected row remains visible on a short terminal.
@@ -2855,8 +2881,8 @@ module Gori::Tui
 
     private def render_activity_card(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.w < 2 || rect.h < 2
-      Frame.card(screen, rect, "ACTIVITY", bg: Theme.bg, border: Frame.pane_border(focused))
-      Frame.border_meta(screen, rect, "ACTIVITY", activity_meta,
+      Frame.card(screen, rect, bg: Theme.bg, border: Frame.pane_border(focused))
+      Frame.border_meta(screen, rect, "", activity_meta,
         fg: @act_rows.empty? ? Theme.muted : Theme.text_bright)
       render_activity_body(screen, rect, rect.inset(1, 1), focused)
     end
@@ -2867,7 +2893,7 @@ module Gori::Tui
     private def activity_meta : String
       parts = [] of String
       n = @act_rows.size
-      parts << (activity_more? ? "#{n}+ events" : "#{n} event#{n == 1 ? "" : "s"}")
+      parts << (activity_more? ? "#{n}+ events" : Gori.plural(n, "event"))
       # Rows that arrived above a cursor the operator parked further down. Named FIRST after the
       # count, because it is the only part of this line that is about something off-screen.
       #
@@ -2940,8 +2966,8 @@ module Gori::Tui
     # "Nothing matched" is only true of what was actually LOOKED at. A page stops either at the
     # end of the feed or at the scan bound, and `next_before` is the difference — so when the
     # scan stopped short, the sentence says how far it got instead of making a claim about
-    # events it never read. (Reachable only on a feed grown past its own retention cap, which
-    # `trim_events` allows for a process that writes events and captures no flows.)
+    # events it never read. (Reachable only on a feed grown past its own retention cap — a db
+    # from a build before `EVENTS_TRIM_INTERVAL`, or the overshoot that cadence permits.)
     private def activity_no_match_line : String
       base = "no events match #{activity_narrowing}"
       activity_more? ? "#{base} in the newest #{Fmt.count(@act_scanned.to_i64)} events" : base
@@ -3014,7 +3040,7 @@ module Gori::Tui
     # `Time.local` is a timezone resolution. Asking it forty times a frame to answer a question
     # whose answer is the same for every row put two tz lookups per row on the render fiber.
     def self.act_stamp(created_at : Int64, today : Time) : String
-      t = Time.unix(created_at // 1_000_000).to_local
+      t = LocalTime.at(created_at) || return "   —"
       t.date == today.date ? t.to_s("%H:%M:%S") : t.to_s("   %m-%d")
     end
 
@@ -3033,6 +3059,19 @@ module Gori::Tui
     # into a row would leave a hole in the list. The band below shows the whole thing.
     def self.act_one_line(message : String) : String
       message.scrub.gsub(/\s+/, " ").strip
+    end
+
+    # What `y` puts on the clipboard: the event as one line of plain text. A pure function of
+    # the row, like `activity_target`, so it is spec-able without a Runner.
+    #
+    # The columns the pane DROPS when it is narrow (source, actor) are always present here —
+    # a line pasted into a ticket has no pane width to excuse an absent field — and the stamp
+    # is the full date, because `act_stamp`'s bare `HH:MM:SS` only reads as today on the day
+    # it is read. The message is `act_one_line`, so a multi-line event is one row of text
+    # rather than a paste that breaks whatever it lands in.
+    def self.act_copy_line(row : Store::EventRow) : String
+      at = LocalTime.format(row.created_at, "%Y-%m-%d %H:%M:%S")
+      "#{at} · #{row.level} · #{row.source} · #{act_actor_label(row.actor)} · #{act_one_line(row.message)}"
     end
 
     # The three-state filter bar, the grammar the OAST callbacks list already uses: the input
@@ -3082,7 +3121,7 @@ module Gori::Tui
     private def format_time(t : Time?) : String
       return "—" if t.nil?
       # Local wall-clock time for creation date (no tz noise in TUI).
-      t.to_local.to_s("%Y-%m-%d %H:%M")
+      LocalTime.of(t).to_s("%Y-%m-%d %H:%M")
     end
 
     # Prose sizes for the Project pane — a space before the unit and a TB step, which is why

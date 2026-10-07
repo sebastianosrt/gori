@@ -4,6 +4,7 @@ require "../host_overrides"
 require "../repeater/exchange_meta"
 require "../repeater/flow_request"
 require "../outbound"
+require "../session_refresh/hook"
 require "./identity"
 require "./passive"
 require "./verdict"
@@ -49,6 +50,17 @@ module Gori
       def initialize(@identity, @baseline, @meta, @verdict, @delta, @summary,
                      @request, @response_head, @response_body)
       end
+
+      # This trial without the bytes only the TUI's detail pane reads: the sent request and the
+      # response body (up to the body cap each) are dropped, the response HEAD is kept (cache
+      # deception classifies it). Every field a verdict, a row or a summary reads — `meta`,
+      # `verdict`, `delta`, `summary` — was computed off those bytes already and is carried
+      # unchanged. For a headless surface that HOLDS its targets (`--format json`, an MCP job),
+      # where keeping bodies nobody will ever print is what made a run's memory grow with it.
+      def without_bytes : Trial
+        Trial.new(@identity, @baseline, @meta, @verdict, @delta, @summary,
+          Bytes.empty, @response_head, nil)
+      end
     end
 
     # Every identity's trial for ONE seeded request.
@@ -66,6 +78,11 @@ module Gori
       getter blocked_reason : String?
 
       def initialize(@flow_id, @method, @url, @trials, @blocked = 0_i64, @blocked_reason = nil)
+      end
+
+      # Every trial `without_bytes` — see there. Nothing a verdict or a count reads changes.
+      def without_bytes : Target
+        Target.new(@flow_id, @method, @url, @trials.map(&.without_bytes), @blocked, @blocked_reason)
       end
 
       # Nothing in this request actually reached the origin.
@@ -200,7 +217,7 @@ module Gori
       # says a resource is protected on the strength of a test that did not run — worse than a
       # false positive. The traffic that did go out is reported by the caller's run summary.
       def run(detail : Store::FlowDetail, identities : Array(Identity),
-              stop : Proc(Bool)? = nil) : Target?
+              stop : Proc(Bool)? = nil, *, request_target : String? = nil) : Target?
         row = detail.row
         ordered = order_baseline_first(identities)
         origin = Fuzz::Origin.new(row.scheme, row.host, row.port)
@@ -212,7 +229,13 @@ module Gori
         # a request nobody made. `FlowRequest.build` is the one home for that rewrite (plus the
         # truncated-body re-frame and the h2 pseudo-header refusal).
         built = Repeater::FlowRequest.build(detail)
-        base_bytes = drop_conditional_headers(built.bytes, row.method)
+        base_bytes = if target = request_target
+                       Repeater::FlowRequest.replace_request_target(built.bytes, target) ||
+                         raise Gori::Error.new("the captured request has no replaceable request-target")
+                     else
+                       built.bytes
+                     end
+        base_bytes = drop_conditional_headers(base_bytes, row.method)
         head_request = row.method.upcase == "HEAD"
         backend = @backend_factory.call(origin, http2)
         baseline_trial = nil.as(Trial?)
@@ -220,7 +243,7 @@ module Gori
         begin
           ordered.each do |id|
             break if stop.try(&.call)
-            trial = send_one(base_bytes, id, backend, baseline_trial, head_request)
+            trial = send_one(base_bytes, id, backend, baseline_trial, head_request, origin)
             baseline_trial ||= trial if id.baseline?
             trials << trial
           end
@@ -270,17 +293,27 @@ module Gori
       # why the safe-method gate stays the FIRST thing this method does.
       private def drop_conditional_headers(bytes : Bytes, method : String) : Bytes
         return bytes unless Passive::SAFE_METHODS.includes?(method.upcase)
-        Authorize.overlay_wire(bytes, Identity.new("conditional-headers", remove_headers: CONDITIONAL_HEADERS))
+        SessionSlot.overlay_wire(bytes, Identity.new("conditional-headers", remove_headers: CONDITIONAL_HEADERS))
       end
 
       private def send_one(base_bytes : Bytes, id : Identity,
                            backend : Fuzz::Backend, baseline_trial : Trial?,
-                           head_request : Bool) : Trial
+                           head_request : Bool, origin : Fuzz::Origin) : Trial
         # RESOLVED first: a `$NAME` in this identity's own header value expands out of this
         # identity's binding table. Nothing downstream will do it — `all_verbatim` below stops
         # the message-level pass, and `Engine.live` turns the active-slot overlay off precisely
         # so these bytes stay this identity's. See `Authorize.resolve`.
-        bytes = Authorize.overlay_wire(base_bytes, Authorize.resolve(id))
+        # The mint context names the dial, so a `$GEN.USER_AGENT` in the identity's headers
+        # agrees with the TLS preset the replay presents (#1153). Authorize has no per-send
+        # preset: the destination rule decides.
+        # The IDENTITY's before-send refresh (#1233), keyed on its own name: this sender wears no
+        # active slot (`live`), so every slot a trial goes out as is asked about in turn. An
+        # identity no slot registers (an `--identities` file, the built-in baseline) has no
+        # policy and is a no-op. It acts BEFORE the send and reads no response, so a 401 here is
+        # still the verdict — never a reason to log in again and retry.
+        SessionRefresh.before_send(id.name)
+        gen = Env::Generation.for_dial(origin.host, origin.scheme)
+        bytes = SessionSlot.overlay_wire(base_bytes, Authorize.resolve(id, gen))
         # Whole-buffer verbatim: we supply the identity ourselves, so gori's own session-binding
         # expansion must not ALSO rewrite these bytes (the same reason Probe active marks its
         # probes evidence — see `Fuzz::Backend.all_verbatim`).

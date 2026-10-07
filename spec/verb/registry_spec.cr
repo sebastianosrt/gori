@@ -20,6 +20,8 @@ private class FakeContext < ExecContext
     @tab
   end
 
+  property focused_section : Symbol = :common
+
   def focus_pane(pane : Symbol) : Nil
     @calls << :focus_pane
   end
@@ -36,6 +38,10 @@ private class FakeContext < ExecContext
     @calls << :open_palette
   end
 
+  def open_space_family(family : Symbol) : Nil
+    @calls << :open_space_family
+  end
+
   def open_notifications : Nil
     @calls << :open_notifications
   end
@@ -50,6 +56,14 @@ private class FakeContext < ExecContext
 
   def open_agents : Nil
     @calls << :open_agents
+  end
+
+  def tell_agent : Nil
+    @calls << :tell_agent
+  end
+
+  def answer_agent_question : Nil
+    @calls << :answer_agent_question
   end
 
   def open_session_slots : Nil
@@ -112,6 +126,10 @@ private class FakeContext < ExecContext
     @calls << :close_detail
   end
 
+  def detail_step_item(delta : Int32) : Nil
+    @calls << :detail_step_item
+  end
+
   def toggle_follow : Nil
     @calls << :toggle_follow
   end
@@ -160,6 +178,10 @@ private class FakeContext < ExecContext
     @calls << :history_view_pick
   end
 
+  def toggle_static_assets : Nil
+    @calls << :toggle_static_assets
+  end
+
   def history_columns_edit : Nil
     @calls << :history_columns_edit
   end
@@ -204,6 +226,10 @@ private class FakeContext < ExecContext
     @calls << :toggle_pretty
   end
 
+  def toggle_unicode_escapes : Nil
+    @calls << :toggle_unicode_escapes
+  end
+
   def repeater_selected : Nil
     @calls << :repeater_selected
   end
@@ -212,12 +238,24 @@ private class FakeContext < ExecContext
     @calls << :repeater_new
   end
 
+  def repeater_paste_curl : Nil
+    @calls << :repeater_paste_curl
+  end
+
   def repeater_send : Nil
     @calls << :repeater_send
   end
 
   def repeater_send_group : Nil
     @calls << :repeater_send_group
+  end
+
+  def repeater_send_race : Nil
+    @calls << :repeater_send_race
+  end
+
+  def repeater_timing_analysis : Nil
+    @calls << :repeater_timing_analysis
   end
 
   def repeater_find_subtab : Nil
@@ -236,6 +274,10 @@ private class FakeContext < ExecContext
     @calls << :subtab_filter_open
   end
 
+  def subtab_mark_toggle : Nil
+    @calls << :subtab_mark_toggle
+  end
+
   def subtab_mark_all : Nil
     @calls << :subtab_mark_all
   end
@@ -252,12 +294,24 @@ private class FakeContext < ExecContext
     0
   end
 
+  def subtab_jump(n : Int32) : Nil
+    @calls << :subtab_jump
+  end
+
+  def open_tab_goto : Nil
+    @calls << :open_tab_goto
+  end
+
   def repeater_rename_subtab : Nil
     @calls << :repeater_rename_subtab
   end
 
   def repeater_tag_subtab : Nil
     @calls << :repeater_tag_subtab
+  end
+
+  def repeater_use_as_refresh : Nil
+    @calls << :repeater_use_as_refresh
   end
 
   def repeater_filter_subtabs : Nil
@@ -316,8 +370,16 @@ private class FakeContext < ExecContext
     @calls << :repeater_toggle_resp_hex
   end
 
+  def repeater_toggle_unicode_escapes : Nil
+    @calls << :repeater_toggle_unicode_escapes
+  end
+
   def repeater_pretty_request : Nil
     @calls << :repeater_pretty_request
+  end
+
+  def repeater_graphql_introspection(legacy : Bool) : Nil
+    @calls << (legacy ? :repeater_graphql_introspection_legacy : :repeater_graphql_introspection)
   end
 
   def repeater_minimize : Nil
@@ -344,19 +406,15 @@ private class FakeContext < ExecContext
     @calls << :repeater_attach_chain
   end
 
-  def repeater_copy : Nil
-    @calls << :repeater_copy
-  end
-
-  def repeater_copy_all : Nil
-    @calls << :repeater_copy_all
-  end
-
   def repeater_open_response_external : Nil
     @calls << :repeater_open_response_external
   end
 
   def repeater_read_mode? : Bool
+    false
+  end
+
+  def repeater_split_request? : Bool
     false
   end
 
@@ -386,6 +444,10 @@ private class FakeContext < ExecContext
 
   def fuzz_toggle_dist : Nil
     @calls << :fuzz_toggle_dist
+  end
+
+  def fuzz_toggle_group : Nil
+    @calls << :fuzz_toggle_group
   end
 
   def fuzz_save_results : Nil
@@ -450,14 +512,6 @@ private class FakeContext < ExecContext
 
   def fuzzer_duplicate_subtab : Nil
     @calls << :fuzzer_duplicate_subtab
-  end
-
-  def fuzzer_copy : Nil
-    @calls << :fuzzer_copy
-  end
-
-  def fuzzer_copy_all : Nil
-    @calls << :fuzzer_copy_all
   end
 
   def fuzzer_read_mode? : Bool
@@ -588,6 +642,14 @@ private class FakeContext < ExecContext
     @calls << :sitemap_toggle_query_fold
   end
 
+  def sitemap_toggle_js_refs : Nil
+    @calls << :sitemap_toggle_js_refs
+  end
+
+  def sitemap_js_scan : Nil
+    @calls << :sitemap_js_scan
+  end
+
   def sitemap_discover : Nil
     @calls << :sitemap_discover
   end
@@ -604,8 +666,16 @@ private class FakeContext < ExecContext
     @calls << :sitemap_scope_add
   end
 
+  def sitemap_export : Nil
+    @calls << :sitemap_export
+  end
+
   def sitemap_mark_toggle : Nil
     @calls << :sitemap_mark_toggle
+  end
+
+  def sitemap_mark_all : Nil
+    @calls << :sitemap_mark_all
   end
 
   def sitemap_mark_clear : Nil
@@ -756,6 +826,10 @@ private class FakeContext < ExecContext
     @calls << :probe_rule_toggle
   end
 
+  def probe_rule_filter : Nil
+    @calls << :probe_rule_filter
+  end
+
   def probe_rule_add : Nil
     @calls << :probe_rule_add
   end
@@ -832,6 +906,10 @@ private class FakeContext < ExecContext
     @calls << :activity_clear
   end
 
+  def activity_copy : Nil
+    @calls << :activity_copy
+  end
+
   def activity_find : Nil
     @calls << :activity_find
   end
@@ -866,6 +944,10 @@ private class FakeContext < ExecContext
 
   def issue_close : Nil
     @calls << :issue_close
+  end
+
+  def issue_step_item(delta : Int32) : Nil
+    @calls << :issue_step_item
   end
 
   def issues_delete : Nil
@@ -937,10 +1019,6 @@ private class FakeContext < ExecContext
     @calls << :issue_edit_title
   end
 
-  def issue_open_flow : Nil
-    @calls << :issue_open_flow
-  end
-
   def issue_repeater_flow : Nil
     @calls << :issue_repeater_flow
   end
@@ -952,6 +1030,56 @@ private class FakeContext < ExecContext
   def issue_open_link : Nil
     @calls << :issue_open_link
   end
+
+  def issue_goto_link : Nil
+    @calls << :issue_goto_link
+  end
+
+  def issue_freeze_link : Nil
+    @calls << :issue_freeze_link
+  end
+
+  def issue_retest : Nil
+    @calls << :issue_retest
+  end
+
+  def issue_evidence_delete : Nil
+    @calls << :issue_evidence_delete
+  end
+
+  def issue_retest_available? : Bool
+    false
+  end
+
+  def issue_related_freezable? : Bool
+    false
+  end
+
+  def issue_related_goto? : Bool
+    false
+  end
+
+  def issue_related_frozen? : Bool
+    false
+  end
+
+  def selected_evidence_id : Int64?
+    nil
+  end
+
+  def evidence_has_links? : Bool
+    false
+  end
+
+  def evidence_source_available? : Bool
+    false
+  end
+
+  {% for name in %w[evidence_open evidence_filter evidence_compare evidence_open_issue evidence_open_source evidence_copy evidence_export evidence_duplicate_repeater evidence_link_issue evidence_unlink_issue evidence_delete] %}
+    def {{ name.id }} : Nil
+      @calls << :{{ name.id }}
+    end
+  {% end %}
 
   def issue_link_move(delta : Int32) : Nil
     @calls << :issue_link_move
@@ -1007,6 +1135,10 @@ private class FakeContext < ExecContext
 
   def probe_close : Nil
     @calls << :probe_close
+  end
+
+  def probe_step_item(delta : Int32) : Nil
+    @calls << :probe_step_item
   end
 
   def probe_query : Nil
@@ -1137,6 +1269,10 @@ private class FakeContext < ExecContext
     @calls << :open_browser_picker
   end
 
+  def open_shell_picker : Nil
+    @calls << :open_shell_picker
+  end
+
   def authorize_seed_selected : Nil
     @calls << :authorize_seed_selected
   end
@@ -1233,6 +1369,50 @@ private class FakeContext < ExecContext
     true
   end
 
+  def params_move(delta : Int32) : Nil
+    @calls << :params_move
+  end
+
+  def params_run : Nil
+    @calls << :params_run
+  end
+
+  def params_toggle_headers : Nil
+    @calls << :params_toggle_headers
+  end
+
+  def params_clear_target : Nil
+    @calls << :params_clear_target
+  end
+
+  def params_open_flow : Nil
+    @calls << :params_open_flow
+  end
+
+  def params_copy_names : Nil
+    @calls << :params_copy_names
+  end
+
+  def params_export : Nil
+    @calls << :params_export
+  end
+
+  def params_mine : Nil
+    @calls << :params_mine
+  end
+
+  def sitemap_params : Nil
+    @calls << :sitemap_params
+  end
+
+  def params_rows_shown? : Bool
+    false
+  end
+
+  def params_targeted? : Bool
+    false
+  end
+
   def comparer_swap : Nil
     @calls << :comparer_swap
   end
@@ -1267,6 +1447,10 @@ private class FakeContext < ExecContext
 
   def open_response_external : Nil
     @calls << :open_response_external
+  end
+
+  def mock_response_from_flow : Nil
+    @calls << :mock_response_from_flow
   end
 
   def comparer_new : Nil
@@ -1461,6 +1645,10 @@ private class FakeContext < ExecContext
     @calls << :rewriter_toggle
   end
 
+  def rewriter_filter : Nil
+    @calls << :rewriter_filter
+  end
+
   def rewriter_delete : Nil
     @calls << :rewriter_delete
   end
@@ -1503,6 +1691,10 @@ private class FakeContext < ExecContext
 
   def colormarker_toggle : Nil
     @calls << :colormarker_toggle
+  end
+
+  def colormarker_filter : Nil
+    @calls << :colormarker_filter
   end
 
   def colormarker_delete : Nil
@@ -1579,6 +1771,10 @@ private class FakeContext < ExecContext
 
   def probe_detail_readable? : Bool
     false
+  end
+
+  def probe_affected_selected? : Bool
+    probe_detail_readable?
   end
 
   def sequencer_analysis_readable? : Bool
@@ -1693,6 +1889,66 @@ private class FakeContext < ExecContext
     editor_focused
   end
 
+  # --- Verb::Scope::Editor (verbs/editor.cr) ---
+  property? editor_pane : Bool = false
+  property? editor_read_mode : Bool = false
+
+  def editor_enter_insert : Nil
+    @calls << :editor_enter_insert
+  end
+
+  def editor_append_insert : Nil
+    @calls << :editor_append_insert
+  end
+
+  def editor_exit_insert : Nil
+    @calls << :editor_exit_insert
+  end
+
+  def editor_undo : Nil
+    @calls << :editor_undo
+  end
+
+  def editor_to_top : Nil
+    @calls << :editor_to_top
+  end
+
+  def editor_to_bottom : Nil
+    @calls << :editor_to_bottom
+  end
+
+  def editor_word_move(dir : Int32) : Nil
+    @calls << :editor_word_move
+  end
+
+  def editor_line_insert(dir : Int32) : Nil
+    @calls << :editor_line_insert
+  end
+
+  def editor_delete_selection : Nil
+    @calls << :editor_delete_selection
+  end
+
+  def editor_paste : Nil
+    @calls << :editor_paste
+  end
+
+  def editor_delete_line : Nil
+    @calls << :editor_delete_line
+  end
+
+  def editor_yank_line : Nil
+    @calls << :editor_yank_line
+  end
+
+  def editor_goto_line : Nil
+    @calls << :editor_goto_line
+  end
+
+  def editor_find : Nil
+    @calls << :editor_find
+  end
+
   def copy_as_open : Nil
     @calls << :copy_as_open
   end
@@ -1703,6 +1959,12 @@ private class FakeContext < ExecContext
 
   def detail_navigable? : Bool
     false
+  end
+
+  property menu_states = {} of String => String
+
+  def menu_state(verb_id : String) : String?
+    @menu_states[verb_id]?
   end
 
   def space_menu_title(verb_id : String) : String?
@@ -1717,32 +1979,12 @@ private class FakeContext < ExecContext
     @calls << :open_preferences
   end
 
-  def import_har : Nil
-    @calls << :import_har
+  def open_import(kind : Symbol) : Nil
+    @calls << :open_import
   end
 
-  def import_urls : Nil
-    @calls << :import_urls
-  end
-
-  def import_oas : Nil
-    @calls << :import_oas
-  end
-
-  def import_postman : Nil
-    @calls << :import_postman
-  end
-
-  def import_insomnia : Nil
-    @calls << :import_insomnia
-  end
-
-  def import_burp : Nil
-    @calls << :import_burp
-  end
-
-  def import_wsdl : Nil
-    @calls << :import_wsdl
+  def import_curl : Nil
+    @calls << :import_curl
   end
 
   def import_running? : Bool
@@ -1784,6 +2026,7 @@ describe Gori::Verb do
       keymap.lookup(Chord.new("left"), Gori::Verb::Scope::HistoryDetail).should eq("detail.prev-pane")
       keymap.lookup(Chord.new("x"), Gori::Verb::Scope::HistoryDetail).should eq("detail.select-line")
       keymap.lookup(Chord.new("x", ctrl: true), Gori::Verb::Scope::HistoryDetail).should eq("detail.toggle-hex")
+      keymap.lookup(Chord.new("u"), Gori::Verb::Scope::HistoryDetail).should eq("detail.toggle-unicode")
       # ^U in the Fuzzer pretty-prints the template (must NOT be intercepted as clear-marks
       # anymore — clear-marks moved to the space menu as fuzz.clear-marks).
       keymap.lookup(Chord.new("u", ctrl: true), Gori::Verb::Scope::Fuzzer).should eq("fuzz.pretty-template")
@@ -1856,6 +2099,7 @@ describe Gori::Verb do
       km.lookup(Chord.new("x", ctrl: true), Gori::Verb::Scope::Repeater).should eq("repeater.toggle-hex")
       km.lookup(Chord.new("s", ctrl: true), Gori::Verb::Scope::Repeater).should eq("repeater.toggle-sni")
       km.lookup(Chord.new("l", ctrl: true), Gori::Verb::Scope::Repeater).should eq("repeater.toggle-auto-content-length")
+      km.lookup(Chord.new("u"), Gori::Verb::Scope::Repeater).should eq("repeater.toggle-unicode")
     end
 
     it "binds the Fuzzer run/stop/automark chords in Fuzzer scope" do
@@ -1863,7 +2107,7 @@ describe Gori::Verb do
       km.lookup(Chord.new("r", ctrl: true), Gori::Verb::Scope::Fuzzer).should eq("fuzz.run")
       km.lookup(Chord.new("x", ctrl: true), Gori::Verb::Scope::Fuzzer).should eq("fuzz.stop")
       km.lookup(Chord.new("a", ctrl: true), Gori::Verb::Scope::Fuzzer).should eq("fuzz.automark")
-      km.lookup(Chord.new("s", shift: true), Gori::Verb::Scope::Fuzzer).should eq("fuzz.save-results")
+      km.lookup(Chord.new("e", shift: true), Gori::Verb::Scope::Fuzzer).should eq("fuzz.save-results")
     end
 
     it "binds the Intercept catch chords in Intercept scope, shadowing the Global/Body keys" do
@@ -1943,7 +2187,25 @@ describe Gori::Verb do
       reg.search("zzxq-nope", ctx).should be_empty
     end
 
-    it "for_scope is STRICTLY scope-local — no Global fallback (the two surfaces are disjoint)" do
+    # One membership rule for "what can I do here", read by the space menu and the palette's
+    # typed search alike (#1282).
+    it "for_view is COMMON, the focused section, and the SUB-TABS bucket when the tab has a strip" do
+      reg = Registry.new
+      {"common" => :common, "req" => :request, "resp" => :response, "strip" => :subtab, "find" => :tab}.each do |id, section|
+        reg.register(Definition.new("demo.#{id}", id, "", Gori::Verb::Scope::Repeater, section: section) { |_| nil })
+      end
+      reg.register(Definition.new("demo.off", "off", "", Gori::Verb::Scope::Repeater,
+        available: ->(_c : ExecContext) { false }) { |_| nil })
+      reg.register(Definition.new("demo.other", "other", "", Gori::Verb::Scope::Body) { |_| nil })
+      ctx = FakeContext.new
+
+      reg.for_view(Gori::Verb::Scope::Repeater, :response, ctx, true).map(&.id)
+        .should eq(["demo.common", "demo.resp", "demo.strip", "demo.find"])
+      reg.for_view(Gori::Verb::Scope::Repeater, :response, ctx).map(&.id).should eq(["demo.common", "demo.resp"])
+      reg.for_view(Gori::Verb::Scope::Repeater, :tab, ctx).map(&.id).should eq(["demo.common", "demo.find"])
+    end
+
+    it "for_scope is STRICTLY scope-local — no Global fallback" do
       reg = Gori::Verbs.registry
       ctx = FakeContext.new
       ctx.selected = 5_i64 # so the flow-gated Body actions are available
@@ -1976,9 +2238,56 @@ describe Gori::Verb do
       end
     end
 
+    describe "#register_family_openers (#1295)" do
+      it "binds a family's chord once per scope with a non-hidden member, and nothing for a keyless family" do
+        reg = Registry.new
+        reg.register_family(Gori::Verb::Family.new(:send, "Send to…", '>', :send, [{:to_a, 'a'}], chord: Chord.new(">")))
+        reg.register_family(Gori::Verb::Family.new(:show, "Show…", 'Z', :view, [{:to_z, 'z'}]))
+        reg.register(Definition.new("b.a", "A", "d", Gori::Verb::Scope::Body, intent: :to_a) { |_| nil })
+        reg.register(Definition.new("s.a", "A", "d", Gori::Verb::Scope::Sitemap, intent: :to_a, hidden: true) { |_| nil })
+        reg.register(Definition.new("b.z", "Z", "d", Gori::Verb::Scope::Body, intent: :to_z) { |_| nil })
+        reg.register_family_openers
+        openers = reg.select { |v| reg.opens_family(v.id) }
+        openers.map { |v| {v.id, v.scope} }.should eq([{"send.open.body", Gori::Verb::Scope::Body}])
+        openers[0].chords.should eq([Chord.new(">")])
+        openers[0].hidden?.should be_true
+        ctx = FakeContext.new
+        openers[0].call(ctx)
+        ctx.calls.should eq([:open_space_family])
+        reg.opens_family("b.a").should be_nil
+      end
+    end
+
     describe "#validate_chords!" do
       it "passes on the shipped registry (the guarantee itself)" do
         Gori::Verbs.registry.validate_chords! # raises on any violation
+      end
+
+      it "raises on a chord_of: that its named verb's chord does not reach (#1295)" do
+        gated = Definition.new("t.gated", "G", "d", Gori::Verb::Scope::Repeater, [Chord.new("x", ctrl: true)],
+          section: :request, chord_sections: [:request]) { |_| nil }
+        {
+          {Definition.new("t.row", "R", "d", Gori::Verb::Scope::Repeater, section: :response, chord_of: "t.nope") { |_| nil }, /names no registered verb/},
+          {Definition.new("t.row", "R", "d", Gori::Verb::Scope::Fuzzer, chord_of: "t.gated") { |_| nil }, /not Fuzzer/},
+          {Definition.new("t.row", "R", "d", Gori::Verb::Scope::Repeater, section: :response, chord_of: "t.gated") { |_| nil }, /not live in response/},
+          {Definition.new("t.row", "R", "d", Gori::Verb::Scope::Repeater, [Chord.new("q")], section: :request, chord_of: "t.gated") { |_| nil }, /chords of its own/},
+          # A keyless target: the link would advertise nothing.
+          {Definition.new("t.row", "R", "d", Gori::Verb::Scope::Repeater, section: :request, chord_of: "t.keyless") { |_| nil }, /t.keyless, which has no chord/},
+          # A chain, and a cycle (here onto itself): `Hotkeys.binding_for` would recurse forever.
+          {Definition.new("t.row", "R", "d", Gori::Verb::Scope::Repeater, section: :request, chord_of: "t.link") { |_| nil }, /t.link, which has a chord_of/},
+          {Definition.new("t.row", "R", "d", Gori::Verb::Scope::Repeater, section: :request, chord_of: "t.row") { |_| nil }, /t.row, which has a chord_of/},
+        }.each do |(row, why)|
+          reg = Registry.new
+          reg.register(gated)
+          reg.register(Definition.new("t.keyless", "K", "d", Gori::Verb::Scope::Repeater, section: :request) { |_| nil })
+          reg.register(Definition.new("t.link", "L", "d", Gori::Verb::Scope::Repeater, section: :request, chord_of: "t.gated") { |_| nil })
+          reg.register(row)
+          expect_raises(Gori::Error, why) { reg.validate_chords! }
+        end
+        ok = Registry.new
+        ok.register(gated)
+        ok.register(Definition.new("t.row", "R", "d", Gori::Verb::Scope::Repeater, section: :request, chord_of: "t.gated") { |_| nil })
+        ok.validate_chords!
       end
 
       it "raises on two verbs claiming the same chord in the same scope" do

@@ -66,21 +66,31 @@ describe Gori::Tui::FuzzAdvancedOverlay do
     applied.should eq(["50"])
   end
 
-  it "↵ advances a row and, on the LAST row, does nothing at all" do
+  it "↵ advances a row and never commits, even on the LAST row" do
     # Pins the PRE-EXISTING behaviour the migration preserved: handle_key discards the
-    # case's value, so handle_text's commit-on-the-last-row never reaches the shell. Only
-    # esc and a click-away apply. See the note on FuzzAdvancedOverlay#handle_key.
+    # case's value, so ↵ never reaches the shell — only esc and a click-away apply. The
+    # last row is now the `Macro on failure` text row (#1350), so ↵ there is the early return in
+    # `handle_text` that keeps @sel from stepping out of ROWS' range; the toggle this example
+    # used to end on (`Keep interesting only`, #1240) is asserted on its own row below.
     ov = FuzzAdvancedOverlay.new(blank_snapshot)
     h = OverlayHarness.new(ov)
     h.press(Termisu::Input::Key::Enter).should eq(:open) # row 0 → row 1
     h.commits.should eq(0)
-    (FuzzAdvancedOverlay::ROWS.size - 1).times { h.press(Termisu::Input::Key::Down) }
-    h.press(Termisu::Input::Key::Enter).should eq(:open)
+    keep = FuzzAdvancedOverlay::ROWS.index! { |r| r[0] == :keep_interesting }
+    keep.times { h.press(Termisu::Input::Key::Down) }
+    h.press(Termisu::Input::Key::Up) # the ↵ above already moved one row
+    ov.snapshot.keep_interesting.should be_false
+    h.press(Termisu::Input::Key::Enter).should eq(:open) # ↵ on a toggle row flips it
     h.commits.should eq(0)
-    # …and the last row stays FOCUSED rather than stepping out of ROWS' range: what gets
-    # typed next still lands in the last row (Filter time — appended after TLS fingerprint).
-    h.type("x").should eq(:open)
-    ov.snapshot.f_time.should eq("x")
+    ov.snapshot.keep_interesting.should be_true
+
+    last = FuzzAdvancedOverlay.new(blank_snapshot)
+    lh = OverlayHarness.new(last)
+    (FuzzAdvancedOverlay::ROWS.size - 1).times { lh.press(Termisu::Input::Key::Down) }
+    lh.type("stop")
+    lh.press(Termisu::Input::Key::Enter).should eq(:open) # ↵ on the last (text) row: no commit, no overrun
+    lh.commits.should eq(0)
+    last.snapshot.macro_on_failure.should eq("stop")
   end
 
   it "a click outside the card APPLIES rather than dismissing" do
@@ -207,22 +217,23 @@ describe Gori::Tui::FuzzAdvancedOverlay do
     ov = FuzzAdvancedOverlay.new(blank_snapshot)
     h = OverlayHarness.new(ov, area: body)
     h.box.should_not be_nil
-    h.rendered?("Filter regex").should be_false # off-screen until the list scrolls
+    h.rendered?("Match time (ms)").should be_false # off-screen until the list scrolls
     (FuzzAdvancedOverlay::ROWS.size - 1).times { h.press(Termisu::Input::Key::Down) }
-    h.rendered?("Filter regex").should be_true # this render is what advances @scroll
-    h.type("x")
+    h.rendered?("Match time (ms)").should be_true # this render is what advances @scroll
 
     # The list has scrolled, so the first VISIBLE row is no longer ROWS[0] (Concurrency):
-    # the 3rd visible row is "Filter status", which is where this click must land. (WHICH row
-    # that is moves down by one every time a row is appended to the end of ROWS — the scroll
-    # needed to reach the new last row is one deeper — so this is a fact about the arithmetic,
-    # not about "Filter status".)
+    # 11 rows are drawn, so the 3rd visible row is ROWS[size - 9], which is where this click
+    # must land. (WHICH row that is moves down by one every time a row is appended to the end of
+    # ROWS — the scroll needed to reach the new last row is one deeper — so this is a fact about
+    # the arithmetic, not about "Match time"; the #1240 stop_on/keep rows pushed it from Filter
+    # status to Filter regex, and the #1350 macro rows to here. The guard names the row so the
+    # next append fails on THIS line rather than on the assertion below.)
+    FuzzAdvancedOverlay::ROWS[FuzzAdvancedOverlay::ROWS.size - 9][0].should eq(:m_time)
     h.click_in_box(2, 3).should eq(:open)
     h.type("9")
-    ov.snapshot.f_status.should eq("9") # lands near Retries if the click ignores @scroll
-    ov.snapshot.retries.should eq("0")  # …and the un-scrolled rows stay untouched
+    ov.snapshot.m_time.should eq("9")  # lands near the top if the click ignores @scroll
+    ov.snapshot.retries.should eq("0") # …and the un-scrolled rows stay untouched
     ov.snapshot.conc.should eq("20")
-    ov.snapshot.f_time.should eq("x") # the last row — Filter time, appended after TLS fingerprint
 
     h.press(Termisu::Input::Key::Escape).should eq(:closed)
     h.commits.should eq(1)

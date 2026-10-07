@@ -4,15 +4,11 @@ require "json"
 # `gori run sitemap` — the three output formats (text tree / json / paths) and the tag
 # key normalization the `sitemap tag` subcommand writes with.
 
-# `sitemap_tag_path` is private CLI glue; reopen the module for a bare-call wrapper (the
-# same whitebox trick the other CLI specs use).
+# Private CLI glue; reopen the module for bare-call wrappers (the same whitebox trick the
+# other CLI specs use).
 module Gori::CLI::Run
-  def self.sitemap_tag_path_for_spec(target : String) : String
-    sitemap_tag_path(target)
-  end
-
-  def self.collect_sitemap_for_spec(store : Gori::Store, limit : Int32) : {Array(Gori::Sitemap::Node), Bool}
-    collect_sitemap(store, Gori::QL::EMPTY, limit, false, true, true)
+  def self.collect_sitemap_for_spec(store : Gori::Store, limit : Int32, in_scope : Bool = false) : {Array(Gori::Sitemap::Node), Bool}
+    collect_sitemap(store, Gori::QL::EMPTY, limit, in_scope, true, true)
   end
 
   def self.sitemap_truncation_notice_for_spec(truncated : Bool, limit : Int32) : String?
@@ -39,12 +35,62 @@ private def sitemap_store(&)
   end
 end
 
-private def sitemap_captured(host : String, target : String) : Gori::Store::CapturedRequest
+private def sitemap_captured(host : String, target : String, scheme = "https", port = 443) : Gori::Store::CapturedRequest
   Gori::Store::CapturedRequest.new(
-    created_at: 1_000_i64, scheme: "https", host: host, port: 443,
+    created_at: 1_000_i64, scheme: scheme, host: host, port: port,
     method: "GET", target: target, http_version: "HTTP/1.1",
     head: "GET #{target} HTTP/1.1\r\nHost: #{host}\r\n\r\n".to_slice, body: nil,
     source: Gori::FlowSource::Kind::Proxy)
+end
+
+# #1371, the issue's own repro: three services on 127.0.0.1 collapsed into one `127.0.0.1` root,
+# `--format paths` printed `GET  127.0.0.1/only-tls` (no way back to a URL) and the json host
+# objects carried no scheme or port.
+describe "gori run sitemap — one root per origin" do
+  it "keeps two ports and a TLS port of one host apart in text, paths and json" do
+    sitemap_store do |store|
+      store.insert_flow(sitemap_captured("127.0.0.1", "/a", "http", 19021))
+      store.insert_flow(sitemap_captured("127.0.0.1", "http://127.0.0.1:19022/b", "http", 19022))
+      store.insert_flow(sitemap_captured("127.0.0.1", "/only-tls", "https", 8443))
+      store.insert_flow(sitemap_captured("acme.test", "/"))
+      store.flush
+
+      hosts, _ = Gori::CLI::Run.collect_sitemap_for_spec(store, 100)
+      text = Gori::CLI::Output.sitemap_text(hosts)
+      text.lines.reject(&.starts_with?(/[ └├│]/)).reject(&.empty?).should eq([
+        "http://127.0.0.1:19021  (1 path)", "http://127.0.0.1:19022  (1 path)",
+        "https://127.0.0.1:8443  (1 path)", "https://acme.test  (1 path)",
+      ])
+      Gori::CLI::Output.sitemap_paths(hosts).should eq(
+        "GET  http://127.0.0.1:19021/a\n" \
+        "GET  http://127.0.0.1:19022/b\n" \
+        "GET  https://127.0.0.1:8443/only-tls\n" \
+        "GET  https://acme.test/\n")
+
+      json = JSON.parse(Gori::CLI::Output.sitemap_json(hosts)).as_a
+      json.map { |h| {h["host"].as_s, h["scheme"].as_s, h["port"].as_i, h["origin"].as_s} }.should eq([
+        {"127.0.0.1", "http", 19021, "http://127.0.0.1:19021"},
+        {"127.0.0.1", "http", 19022, "http://127.0.0.1:19022"},
+        {"127.0.0.1", "https", 8443, "https://127.0.0.1:8443"},
+        {"acme.test", "https", 443, "https://acme.test"},
+      ])
+    end
+  end
+
+  # A host rule carries no scheme or port: it must be asked about the root's bare host, not
+  # its `scheme://host:port` label, or every origin reads out of scope.
+  it "keeps every origin of an in-scope host under --in-scope" do
+    sitemap_store do |store|
+      store.add_scope_rule("include", "host", "127.0.0.1")
+      store.insert_flow(sitemap_captured("127.0.0.1", "/a", "http", 19021))
+      store.insert_flow(sitemap_captured("127.0.0.1", "/b", "https", 8443))
+      store.insert_flow(sitemap_captured("other.test", "/"))
+      store.flush
+
+      hosts, _ = Gori::CLI::Run.collect_sitemap_for_spec(store, 100, in_scope: true)
+      hosts.map(&.label).should eq(["http://127.0.0.1:19021", "https://127.0.0.1:8443"])
+    end
+  end
 end
 
 describe "gori run sitemap — a capped scan" do
@@ -211,10 +257,12 @@ describe "gori run sitemap --format paths" do
   it "lists a query fold ONCE, at its path" do
     # Unlike an id fold, whose children are distinct endpoints, the variants here are one
     # endpoint — and this listing is what a tester pipes into the next tool.
+    # In target order, as `Store#sitemap_origin_entries` hands them over: a fold keeps its
+    # place among its siblings (#1379).
     hosts = Gori::Sitemap.build([
-      {"h", "GET", "/search?q=widgets"},
-      {"h", "POST", "/search?q=other"},
       {"h", "GET", "/login"},
+      {"h", "GET", "/search?q=other"},
+      {"h", "POST", "/search?q=widgets"},
     ])
     hosts.each { |h| Gori::Sitemap.fold_queries!(h) }
     Gori::CLI::Output.sitemap_paths(hosts).should eq(
@@ -364,48 +412,19 @@ describe "gori run sitemap --format json" do
   end
 end
 
-describe "gori run sitemap tag — the key a tag is filed under" do
-  # Every assertion here pins a LITERAL rather than re-deriving the expected value from
-  # Sitemap.normalize_path: comparing the function against itself would move both sides
-  # together, and a regression in normalize_path — the exact thing that would orphan every
-  # stored tag — would keep the spec green.
-
-  # The key KEEPS the query string, because "/login?a=1" is a distinct tree node from
-  # "/login". Stripping it would file the tag under a key no node ever has, and the tag
-  # would silently never appear in the tree.
-  it "keeps the query string, so a query-bearing endpoint keys on its own node" do
-    Gori::CLI::Run.sitemap_tag_path_for_spec("/login?a=1").should eq("/login?a=1")
-    Gori::CLI::Run.sitemap_tag_path_for_spec("/api/users").should eq("/api/users")
-    Gori::CLI::Run.sitemap_tag_path_for_spec("  /api/users  ").should eq("/api/users")
-  end
-
-  it "adds the leading slash a hand-typed --path omits, and maps empty to /" do
-    Gori::CLI::Run.sitemap_tag_path_for_spec("api/users").should eq("/api/users")
-    Gori::CLI::Run.sitemap_tag_path_for_spec("").should eq("/")
-    Gori::CLI::Run.sitemap_tag_path_for_spec("   ").should eq("/")
-  end
-
-  it "reduces an absolute-form target to its origin-form path" do
-    # A tag typed as a full URL still has to land on the node the tree built, and
-    # Sitemap.build normalizes before stamping — so the key is "/a", not the whole URL.
-    Gori::CLI::Run.sitemap_tag_path_for_spec("http://h/a").should eq("/a")
-    Gori::CLI::Run.sitemap_tag_path_for_spec("https://h/a?b=1").should eq("/a?b=1")
-  end
-end
-
 describe "gori run sitemap tag --list — the TSV line" do
-  it "folds a newline and a tab in the tag, so one tag is one line with three fields" do
+  it "names a newline and a tab in the tag, so one tag is one line with three fields" do
     # A tag is free text and can be set from the TUI or MCP too. Printed raw it broke the TSV
     # two ways at once: the newline split one tag across two physical lines, and the tab
-    # invented a fourth column. The tree view already folds the same tag to `# multi·line`.
+    # invented a fourth column. Named badges keep each hidden character visible in the TSV.
     row = Gori::CLI::Run.sitemap_tag_row_for_spec("acme.test", "/api", "multi\nline\tcol 한글 <b>")
     row.lines.size.should eq(1)
     row.split('\t').size.should eq(2)
-    row.should eq("acme.test/api\tmulti·line·col 한글 <b>")
+    row.should eq("acme.test/api\tmulti⟨LF⟩line⟨TAB⟩col 한글 <b>")
   end
 
-  it "folds the host and path halves too, and leaves an ordinary tag untouched" do
-    Gori::CLI::Run.sitemap_tag_row_for_spec("acme.test", "/a\nb", "ok").should eq("acme.test/a·b\tok")
+  it "names controls in the host and path halves too, and leaves ordinary text untouched" do
+    Gori::CLI::Run.sitemap_tag_row_for_spec("acme.test", "/a\nb", "ok").should eq("acme.test/a⟨LF⟩b\tok")
     Gori::CLI::Run.sitemap_tag_row_for_spec("acme.test", "/api", "payment flow").should eq("acme.test/api\tpayment flow")
   end
 end

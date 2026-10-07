@@ -8,6 +8,108 @@ require "../dial_address"
 module Gori::Settings
   DEFAULT_ENV_PREFIX = "$"
 
+  # The grammar an install reads and writes tokens in. See `Gori::Env::Syntax`.
+  #
+  # NAMESPACED is the grammar for everyone (`$ENV.KEY` / `$BIND.NAME`). `bare` stays as an
+  # explicit opt-out, and it is explicit in the file too: `env.syntax` is ALWAYS serialized, both
+  # values, because the ABSENCE of the key no longer means bare — it means this settings.json
+  # PREDATES namespaces, and that is a migration to run rather than a grammar to keep (see
+  # `adopt_env_syntax_for_absent_key`).
+  DEFAULT_ENV_SYNTAX = Env::Syntax::Namespaced
+
+  # What gori READS tokens as when `env.syntax` is there and says nothing gori understands — a
+  # typo, a `null`, a number, a list. NOT `DEFAULT_ENV_SYNTAX`: the default is the answer for a
+  # file that PREDATES namespaces, which is a date gori can act on (adopt, re-spell, write the key
+  # down). A value nobody can read is the opposite — it is the one state where gori knows it does
+  # not know, so it reads tokens the way the install's stored bytes are most likely to be spelled
+  # and rewrites nothing (`env_syntax_origin = Unreadable`). Bare is that reading for the same
+  # reason `EnvMigration.stored_syntax` picks it: it is the answer a wrong guess cannot lose data
+  # over, and it is what the unreadable-FILE sibling (`adopt_env_syntax_for_absent_key`) already
+  # picks for a settings.json gori could not read a byte of.
+  UNREADABLE_ENV_SYNTAX = Env::Syntax::Bare
+
+  # What the ABSENCE of `env.syntax` resolves to. A class_property so the suite can pin it: every
+  # spec home is a fresh one with no settings file, and without the pin ~1,000 bare `$TOKEN`
+  # fixtures would be read under the other grammar — and migrated on their way past.
+  class_property env_syntax_when_absent : Env::Syntax = DEFAULT_ENV_SYNTAX
+
+  # Whether a long-lived process may RE-READ `env.syntax` off the file mid-run and adopt it
+  # (`EnvMigration.follow_disk`). True in production, which is the whole point: a TUI session and a
+  # `gori mcp` server both live for hours and must follow a `gori settings env-syntax` run.
+  #
+  # A class_property so the SUITE can pin it. `with_env_syntax` sets the grammar in memory, over a
+  # temp home whose settings.json says something else entirely (or nothing) — and a seam that
+  # dutifully adopted the file's answer there would be fighting the pin rather than following a
+  # peer. The examples that exercise the seam write a real file and leave this alone.
+  class_property? env_syntax_follow_disk : Bool = true
+
+  # WHERE the grammar in memory came from, which decides whether gori may act on it. A migration
+  # rewrites stored bytes, so it may only run when this install's grammar is something the
+  # install actually SAID — never over a value gori guessed because a file could not be read
+  # (see `env_syntax_stated?`).
+  enum EnvSyntaxOrigin
+    # No `env.syntax` key on a file that was read in full (or no file at all): this home predates
+    # namespaces, so the stored tokens are bare and the grammar is adopted + written.
+    Absent
+    # A readable grammar, from the file or recovered textually from a torn one.
+    Stated
+    # The key is there and names no grammar gori knows (`"NAMESPACED!"`, `null`, `1`), or the
+    # file could not be read at all. A guess, and nothing may be rewritten against a guess.
+    Unreadable
+  end
+
+  @@env_syntax_origin : EnvSyntaxOrigin = EnvSyntaxOrigin::Absent
+
+  # What `serialize_env` writes for `syntax` while the grammar in memory is a guess: the node the
+  # file carried (a typo stays a typo), or nothing when it carried none (a `--config` naming a new
+  # file). Writing the guess down as `"bare"` made it read as stated from then on. Nil when the
+  # value in memory is the one to write.
+  @@env_syntax_unread : {JSON::Any?}? = nil
+
+  def self.env_syntax_origin : EnvSyntaxOrigin
+    @@env_syntax_origin
+  end
+
+  protected def self.env_syntax_origin=(o : EnvSyntaxOrigin) : EnvSyntaxOrigin
+    @@env_syntax_origin = o
+  end
+
+  # May gori rewrite stored tokens against the grammar in memory? True when the install SAID it
+  # (or when the absence rule settled it over a file that was read in full), false over a guess:
+  # an unreadable settings.json, a half-applied one, a value that names no grammar. A project
+  # database whose marker disagrees with a GUESS must be left exactly as it is — re-spelling it
+  # would be a permissions problem or a typo rewriting an operator's drafts.
+  def self.env_syntax_stated? : Bool
+    !@@env_syntax_origin.unreadable? && !load_degraded?
+  end
+
+  @@env_syntax : Env::Syntax = DEFAULT_ENV_SYNTAX
+
+  def self.env_syntax : Env::Syntax
+    @@env_syntax
+  end
+
+  # Bumps the highlight revision like every other env write: a `TextArea`'s styled buffer, the
+  # `Highlight` span caches and `Rules#subst_snapshot` are all keyed on it, and the SPELLING of
+  # every token in every open editor just changed.
+  def self.env_syntax=(s : Env::Syntax) : Env::Syntax
+    @@env_syntax = s
+    Env.bump_highlight_rev
+    s
+  end
+
+  # Adopt a grammar this install STATED, read back off settings.json by a long-lived process whose
+  # in-memory copy went stale under it — see `EnvMigration.follow_disk`.
+  #
+  # The ORIGIN moves with the value, and that is the whole reason this is not a plain assignment: a
+  # value that came out of a parsed `env.syntax` is exactly what `env_syntax_stated?` asks about,
+  # and leaving the origin at this run's `Absent`/`Unreadable` would let the grammar change while
+  # the re-spelling that has to accompany it stayed refused.
+  def self.adopt_stated_env_syntax(s : Env::Syntax) : Nil
+    self.env_syntax = s
+    self.env_syntax_origin = EnvSyntaxOrigin::Stated
+  end
+
   # Global hostname overrides (a process-wide /etc/hosts): ordered {host (lowercased),
   # ip} pairs. Read LIVE by Upstream.dial (edits apply on the next flow); layered
   # UNDER each project's own HostOverrides, which wins on a host collision. Edited via
@@ -17,12 +119,190 @@ module Gori::Settings
   class_property env_vars : Array({String, String}) = [] of {String, String}
   class_property project_env_vars : Array({String, String}) = [] of {String, String}
 
+  # The operator's own `$GEN.USER_AGENT` corpus (#1154): when non-empty it REPLACES the built-in
+  # list (`Env::USER_AGENTS`), because the operator knows the population they need to blend into
+  # and a built-in list goes stale in weeks. Empty — the default — means the built-in one. Every
+  # entry lands in a header verbatim, so text reaches it only through `user_agents_from_text`
+  # and the loader drops what `user_agent_error` refuses (with a load warning, never silently).
+  #
+  # Its OWN top-level section (`"user_agents": [...]`), not a key under `env`: `merge_with_disk`
+  # takes a changed section whole, and `env` is saved by the Env card on every keystroke — so a
+  # list set from `gori settings user-agents` while a TUI was open was deleted by that TUI's next
+  # env var edit, and the reverse. Two doors, two decisions, two sections.
+  class_property user_agents : Array(String) = [] of String
+
+  # Why `line` cannot be a User-Agent value, or nil. A control byte (CR/LF above all) would
+  # split or corrupt the header it lands in; a blank line is not a value anyone typed.
+  def self.user_agent_error(line : String) : String?
+    return "is blank" if line.strip.empty?
+    return "carries a control character" if line.each_char.any?(&.control?)
+    nil
+  end
+
+  # An operator's list as TEXT — one User-Agent per line, blank and `#` lines skipped, each line
+  # trimmed — the shape both the TUI editor and `gori settings user-agents --set` take. Returns
+  # the list, or the first line that cannot be one (by its line number in `text`), never both:
+  # a list with one line quietly dropped would claim a browser mix the operator did not write.
+  def self.user_agents_from_text(text : String) : Array(String) | String
+    out = [] of String
+    text.each_line(chomp: true).with_index(1) do |raw, n|
+      line = raw.strip
+      next if line.empty? || line.starts_with?('#')
+      if why = user_agent_error(line)
+        return "line #{n} #{why}"
+      end
+      out << line
+    end
+    out
+  end
+
+  # `syntax` is assigned ONLY when the key is present, and the "an absent key means this file
+  # predates namespaces" rule lives in `Settings.load` instead. That split is not cosmetic:
+  # `import_document` reuses `apply_sections` over a FILTERED document, so a theme-only profile
+  # import reaches this method with no `env` node at all — and an install would have its grammar
+  # re-derived (and its projects re-spelled) by an import that never mentioned env. An unknown
+  # value is a bad file rather than a new grammar: say so, read tokens as the default, and mark
+  # the origin `Unreadable` so nothing gets REWRITTEN against a value gori had to guess.
   private def self.parse_env(node : JSON::Any?) : Nil
     return unless e = node.try(&.as_h?)
     if pref = e["prefix"]?.try(&.as_s?)
       self.env_prefix = pref.empty? ? Env::DEFAULT_PREFIX : pref
     end
-    self.env_vars = parse_env_vars(e["vars"]?)
+    if node = e["syntax"]?
+      # PRESENT but not a string (`null`, `1`, `["namespaced"]`) is the typo path, not the
+      # absence path. `as_s?` alone would have skipped the assignment altogether and left
+      # whatever grammar was in memory — the PREVIOUS home's, since `load` runs repeatedly over
+      # different homes in one process — while `Settings.load`'s absence guard read the key as
+      # present and declined to correct it. Say so and stay bare, exactly like an unknown value.
+      if raw = node.as_s?
+        if s = Env::Syntax.parse?(raw.strip)
+          self.env_syntax = s
+          self.env_syntax_origin = EnvSyntaxOrigin::Stated
+        else
+          self.env_syntax = UNREADABLE_ENV_SYNTAX
+          self.env_syntax_origin = EnvSyntaxOrigin::Unreadable
+          @@env_syntax_unread = {node}
+          note_load_warning("settings: env.syntax #{raw.inspect} is not one of " \
+                            "#{Env::Syntax.values.join('/', &.to_s.downcase)} — reading tokens as " \
+                            "#{UNREADABLE_ENV_SYNTAX.to_s.downcase} for this run, and re-spelling " \
+                            "nothing until the value is fixed")
+        end
+      else
+        self.env_syntax = UNREADABLE_ENV_SYNTAX
+        self.env_syntax_origin = EnvSyntaxOrigin::Unreadable
+        @@env_syntax_unread = {node}
+        note_load_warning("settings: env.syntax must be a string (got #{node.to_json}) — reading " \
+                          "tokens as #{UNREADABLE_ENV_SYNTAX.to_s.downcase} for this run, and " \
+                          "re-spelling nothing until the value is fixed")
+      end
+    end
+    # `vars` follows the same rule as `syntax`: assigned ONLY when the key is PRESENT. An absent
+    # key is not an empty table — `export_document` strips `syntax` out of an exported `env`
+    # section, so a profile taken from a var-less install carries the literal document `{"env":{}}`,
+    # and a reader that treated that as "no vars" emptied the IMPORTER's global env var table (its
+    # token VALUES included) over a profile that said nothing about vars at all. `{"vars": []}` is
+    # still how a profile says "no vars", the same wholesale-replace rule every list section has.
+    self.env_vars = parse_env_vars(e["vars"]?) if e.has_key?("vars")
+  end
+
+  # Re-read the global `$KEY` table and prefix from settings.json, leaving every other section
+  # alone — the twin of `reload_saved_views_from_disk` (see `Settings.reload_section`). A
+  # long-lived process (a `gori mcp` server, a TUI) expands `$ENV.KEY` from `env_vars` at every
+  # send, so without this a token a peer rotated or deleted kept going out until a restart.
+  #
+  # The GRAMMAR is not folded here: switching it re-spells the open project, which is
+  # `EnvMigration.follow_disk`'s job — call that first. An absent `vars` / `prefix` is the
+  # empty table / default prefix, because `serialize_env` omits both at those values.
+  # Bumps the highlight revision only when the table actually moved.
+  def self.reload_env_from_disk : Nil
+    reload_section("env", absent: JSON::Any.new({} of String => JSON::Any)) do |node|
+      e = node.as_h
+      pref = e["prefix"]?.try(&.as_s?)
+      prefix = pref.nil? || pref.empty? ? DEFAULT_ENV_PREFIX : pref
+      vars = parse_env_vars(e["vars"]?)
+      next if prefix == env_prefix && vars == env_vars
+      self.env_prefix = prefix
+      self.env_vars = vars
+      Env.bump_highlight_rev
+    end
+  end
+
+  # Re-read the operator's `$GEN.USER_AGENT` corpus (#1154) from settings.json, for the reason
+  # `reload_env_from_disk` gives. An absent section is the built-in list: `serialize_user_agents`
+  # omits an empty one, so that is how a peer's reset to built-in reaches the file.
+  def self.reload_user_agents_from_disk : Nil
+    reload_section("user_agents", absent: JSON::Any.new([] of JSON::Any), object: false) do |node|
+      list = parse_user_agent_list(node)
+      self.user_agents = list unless list == user_agents
+    end
+  end
+
+  # Tolerant: a non-array reads as "none" and an unusable entry is dropped — each with a load
+  # warning, since a dropped line silently changing which browser gori claims to be is the
+  # failure this key exists to avoid. Surrounding whitespace is trimmed (a hand-edited file's
+  # indentation is not part of the value).
+  # An ABSENT section keeps the list in memory (a profile import that does not name it is not
+  # a request to empty it), the rule `vars` and `hostname_overrides` follow.
+  private def self.parse_user_agents(node : JSON::Any?) : Nil
+    return unless node
+    self.user_agents = parse_user_agent_list(node)
+  end
+
+  private def self.parse_user_agent_list(node : JSON::Any) : Array(String)
+    unless arr = node.as_a?
+      note_load_warning("settings: user_agents must be an array of strings (got #{node.to_json}) " \
+                        "— using the built-in User-Agent list")
+      return [] of String
+    end
+    out = [] of String
+    arr.each_with_index do |entry, i|
+      line = entry.as_s?.try(&.strip)
+      why = line ? user_agent_error(line) : "is not a string"
+      if why || line.nil?
+        note_load_warning("settings: user_agents entry #{i + 1} #{why} — dropped")
+        next
+      end
+      out << line
+    end
+    out
+  end
+
+  # Recover the token grammar from a settings file that would not PARSE, textually.
+  #
+  # The parse failure is somewhere in a file that is mostly rule tables and theme scalars, while
+  # the env section is three keys — so a torn or hand-mangled settings.json very often still
+  # carries `"syntax": "namespaced"` verbatim. Reading it back matters more than it looks: the
+  # unparseable path leaves every section at a factory default but `save` stays ARMED, and
+  # `serialize_env` then omits the section entirely — which the next start reads as "no syntax
+  # key", i.e. bare, forever. A namespaced install would have downgraded itself, silently, in
+  # the one direction that reinterprets every `$ENV.KEY` already stored in its projects as
+  # literal bytes.
+  #
+  # Assigns the grammar either way (`load` runs over different homes in one process, so no exit
+  # path may leave the previous home's value in memory) and returns the sentence the corrupt-file
+  # warning appends, or nil when the grammar was recovered and there is nothing to warn about.
+  # TEXTUAL on purpose: the JSON is by definition not available, and the value set is closed.
+  #
+  # The FALLBACK is `UNREADABLE_ENV_SYNTAX` and not `DEFAULT_ENV_SYNTAX`, for the reason that
+  # constant gives: the default is the answer for a file that PREDATES namespaces — a date gori can
+  # act on — while a torn file with no grammar in it is the state where gori knows it does not know.
+  # Reading it as namespaced made every stored bare `$KEY` literal text for the run, and (since
+  # `save` stays armed on this path) wrote `namespaced` into the repaired file on the next ordinary
+  # save: a silent UPGRADE of an install whose projects are all spelled the other way, from a comma.
+  private def self.recover_env_syntax_from_corrupt(raw : String) : String?
+    self.env_syntax = UNREADABLE_ENV_SYNTAX
+    # A torn file is not a file that predates namespaces, whatever the regex finds: nothing may be
+    # rewritten against it until it parses again. Recovered or not, the origin says `Unreadable`.
+    self.env_syntax_origin = EnvSyntaxOrigin::Unreadable
+    values = Env::Syntax.values.join('|', &.to_s.downcase)
+    if m = raw.match(/"syntax"\s*:\s*"(#{values})"/)
+      if s = Env::Syntax.parse?(m[1])
+        self.env_syntax = s
+        return nil
+      end
+    end
+    "gori could not read which token grammar this install speaks and is reading tokens as " \
+    "#{UNREADABLE_ENV_SYNTAX.to_s.downcase} — `gori settings env-syntax` restores it"
   end
 
   private def self.parse_env_vars(node : JSON::Any?) : Array({String, String})
@@ -73,9 +353,26 @@ module Gori::Settings
     self.hostname_overrides = [] of {String, String}
   end
 
+  # `env_syntax` is deliberately NOT reset. It is not a preference: it decides how the tokens
+  # already stored in PROJECT DATABASES — env var names, Repeater drafts, rewrite-rule
+  # replacements, slot headers — are read, and a settings reset does not speak for those. Resetting
+  # it would silently reinterpret every one of them (the same argument that keeps `project_env_vars`
+  # and the `cli_*` overlay out of a factory reset).
   private def self.reset_env : Nil
     self.env_vars = [] of {String, String}
     self.env_prefix = DEFAULT_ENV_PREFIX
+  end
+
+  # Operator data like the env values, so only the full factory reset clears it (and its confirm
+  # names it).
+  private def self.reset_user_agents : Nil
+    self.user_agents = [] of String
+  end
+
+  # Omit when empty so an untouched install never writes "user_agents": [].
+  private def self.serialize_user_agents(j : JSON::Builder) : Nil
+    return if user_agents.empty?
+    j.field "user_agents" { j.array { user_agents.each { |ua| j.string ua } } }
   end
 
   # Omit when empty so an untouched install never writes "hostname_overrides": [].
@@ -89,16 +386,34 @@ module Gori::Settings
     end
   end
 
+  # ALWAYS written, both values, which is why the `env` section is never omitted any more.
+  #
+  # The absence of `env.syntax` is no longer a value: it means the file predates namespaces, and
+  # the next load treats it as a MIGRATION to run (`adopt_env_syntax_for_absent_key`). So a
+  # grammar that is not written down is a grammar that gets re-derived — and for the `bare`
+  # opt-out that would mean the opt-out is overwritten on the very next start.
+  #
+  # This is also what lets `load` stay a READ. It adopts the absent grammar in memory and saves
+  # only when the global-rule re-spelling actually changed the file's bytes; the key itself rides
+  # out on the next save this install makes for any other reason, because that save always emits
+  # it. Re-deriving the same answer from the same absence until then is free.
+  #
+  # An EXPORT still carries no grammar: `strip_install_local` drops the key from an exported
+  # document (settings.cr), because a teammate's profile does not speak for how the tokens in
+  # THIS install's projects are read.
   private def self.serialize_env(j : JSON::Builder) : Nil
-    unless env_vars.empty? && env_prefix == DEFAULT_ENV_PREFIX
-      j.field "env" do
-        j.object do
-          j.field "prefix", env_prefix unless env_prefix == DEFAULT_ENV_PREFIX
-          unless env_vars.empty?
-            j.field "vars" do
-              j.array do
-                env_vars.each { |(key, val)| j.object { j.field "key", key; j.field "value", val } }
-              end
+    j.field "env" do
+      j.object do
+        if (unread = @@env_syntax_unread) && env_syntax_origin.unreadable?
+          unread[0].try { |v| j.field "syntax", v }
+        else
+          j.field "syntax", env_syntax.to_s.downcase
+        end
+        j.field "prefix", env_prefix unless env_prefix == DEFAULT_ENV_PREFIX
+        unless env_vars.empty?
+          j.field "vars" do
+            j.array do
+              env_vars.each { |(key, val)| j.object { j.field "key", key; j.field "value", val } }
             end
           end
         end

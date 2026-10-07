@@ -21,12 +21,49 @@ module Gori
   module Authorize
     alias Identity = ::Gori::SessionSlot
 
-    def self.serialize(identities : Array(Identity)) : String
-      SessionSlot.serialize(identities)
+    # Why an EXPLICIT identity set — a `--identities` file, an MCP `identities` array — cannot
+    # be read as written, or nil when it can. `parse_json` is tolerant on purpose (a project
+    # row must never fail a project open), so there a known field of the wrong type is simply
+    # dropped: `"set": {"Authorization": "Bearer low"}` lost its overlay, the identity went out
+    # AS CAPTURED with the baseline's own credentials, and the row read back as a BYPASS. An
+    # operator's own input is refused instead, naming the entry and the field.
+    def self.explicit_json_error(raw : String) : String?
+      arr = begin
+        JSON.parse(raw).as_a?
+      rescue JSON::ParseException
+        nil
+      end
+      return "expected a JSON array of identity objects, e.g. [{\"name\":\"anonymous\",\"remove\":[\"Cookie\"]}]" unless arr
+      arr.each_with_index do |e, i|
+        o = e.as_h?
+        return "entry #{i + 1} is not an object" unless o
+        if why = entry_field_error(o)
+          where = o["name"]?.try(&.as_s?).try { |n| "#{n.inspect} (entry #{i + 1})" } || "entry #{i + 1}"
+          return "#{where}: #{why}"
+        end
+      end
+      nil
     end
 
-    def self.parse_json(raw : String?) : Array(Identity)
-      SessionSlot.parse_json(raw)
+    # The first known field of one entry whose type `parse_json` would drop, or nil. A field
+    # given as JSON `null` is absent, as `parse_json` reads it.
+    private def self.entry_field_error(o : Hash(String, JSON::Any)) : String?
+      given = ->(key : String) { o[key]?.try { |v| v.raw.nil? ? nil : v } }
+      return %("name" must be a string) if given.call("name").try(&.as_s?.nil?)
+      return %("baseline" must be true or false) if given.call("baseline").try(&.raw.as?(Bool).nil?)
+      {"remove", "rules", "literal"}.each do |key|
+        next unless v = given.call(key)
+        return %("#{key}" must be a list of strings) unless v.as_a?.try(&.all?(&.as_s?))
+      end
+      if (v = given.call("set")) && !v.as_a?.try(&.all? { |p| set_pair?(p) })
+        return %("set" must be a list of {"name": …, "value": …} objects)
+      end
+      nil
+    end
+
+    private def self.set_pair?(p : JSON::Any) : Bool
+      h = p.as_h?
+      !h.nil? && !h["name"]?.try(&.as_s?).nil? && !h["value"]?.try(&.as_s?).nil?
     end
 
     # `id` with every `$NAME` in its header VALUES resolved out of THAT identity's own binding
@@ -58,9 +95,9 @@ module Gori
     # SEE, so the report is where the resolution happens. Not a refusal: an Authorize run that
     # dies on a half-configured identity is worse than one that says which identity went out
     # unauthenticated (`Env.take_unbound_overlay` is what a run summary drains).
-    def self.resolve(id : Identity) : Identity
+    def self.resolve(id : Identity, generation : Env::Generation) : Identity
       Env.report_unbound_overlay(id)
-      resolve_without_report(id)
+      resolve_without_report(id, generation)
     end
 
     # The RESOLUTION with NO report — for a caller that is not putting these bytes on a wire.
@@ -78,20 +115,11 @@ module Gori
     #
     # The record is also throttled per {slot, name} until a surface drains it, so a predicate
     # that got there first would have SILENCED the log line at the seam that really sends.
-    def self.resolve_without_report(id : Identity) : Identity
-      id.resolve_values { |v| Env.expand_bindings_as(v, id.name, guard_boundary: true) }
-    end
-
-    def self.overlay_request(head : Bytes, body : Bytes?, id : Identity) : Bytes
-      SessionSlot.overlay_request(head, body, id)
-    end
-
-    def self.overlay_wire(wire : Bytes, id : Identity) : Bytes
-      SessionSlot.overlay_wire(wire, id)
-    end
-
-    def self.overlay_head(head : Bytes, id : Identity) : Bytes
-      SessionSlot.overlay_head(head, id)
+    # ONE generation for the whole identity, for `Bindings#overlay`'s reason: an identity whose
+    # SET headers use `$GEN.UUID` twice is one identity on one request, so it sends one value.
+    # The caller supplies it, because only the caller knows the dial it will go out on (#1153).
+    def self.resolve_without_report(id : Identity, generation : Env::Generation) : Identity
+      id.resolve_values { |v| Env.expand_bindings_as(v, id.name, guard_boundary: true, generation: generation) }
     end
   end
 end

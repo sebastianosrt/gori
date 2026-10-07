@@ -20,7 +20,7 @@ module Gori
         # (127.0.0.1) is DELIBERATELY excluded: it is not an internal-network address, aids no
         # reconnaissance (everyone knows localhost), and is ubiquitous in JS bundles, source maps,
         # dev configs, and CSP report URIs — flagging it was almost pure false positive.
-        PRIVATE_IP = /(?<![\w.])(?:10(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}|172\.(?:1[6-9]|2\d|3[01])(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){2}|192\.168(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){2})(?![\w.])/
+        PRIVATE_IP = Utf8.tolerant(/(?<![\w.])(?:10(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}|172\.(?:1[6-9]|2\d|3[01])(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){2}|192\.168(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){2})(?![\w.])/)
 
         # Server-side error / stack-trace signatures, each tightened to a specific frame or
         # exception shape so a mere SYMBOL MENTION in documentation / tutorials / package
@@ -77,6 +77,18 @@ module Gori
           {/\bActiveRecord::[A-Z]\w+(?::|\r?\n\s*at )/, "Rails error"},
           {/\b(?:NoMethodError|NameError|NoMatchingPatternError)(?::| \()/, "Ruby error"},
           {/PHP (?:Fatal error|Parse error|Warning|Notice):/, "PHP error"},
+          # The same errors as rendered TO A BROWSER, which the `PHP ` prefix above never sees.
+          # That prefix is the LOG spelling (error_log, or display_errors with html_errors=Off);
+          # a page served by the web SAPI with display_errors on emits
+          # `<b>Warning</b>:  mysqli_connect(): … in <b>/var/www/db.php</b> on line <b>12</b>`
+          # — the string "PHP " appears nowhere in it. So the single most common PHP disclosure
+          # there is, the one that actually reaches a client, was the one shape no signature here
+          # matched. Anchored on the emitted `<path>.php … on line <N>` tail rather than on the
+          # severity word: `.php` is the literal PCRE skips on, where an alternation of
+          # Warning/Notice/Fatal would anchor on prose. The optional `</b>`/`<b>` admit both
+          # html_errors settings from one pattern. Precision tier is the `\.php\(\d+\)` frame
+          # below: a page QUOTING the error matches too, exactly as it does there.
+          {/\.php(?:<\/b>)? on line (?:<b>)?\d+/, "PHP error output"},
           # A real PHP stack/trace frame ("… /var/www/app.php(42): …") — the paren+line form
           # a path reference lacks; keeps the FP-prone bare "app.php:42" colon form out.
           {/\.php\(\d+\)/, "PHP stack frame"},
@@ -84,35 +96,32 @@ module Gori
           # so a prose mention of "goroutine" does not match.
           {/\bgoroutine \d+ \[[\w ]+\]:/, "Go stack trace"},
           {/^Stack trace:\s*(?:\n|#\d)/m, "stack trace"},
-        ]
-
-        # Alias for callers/tests that still reference BodyLeaks::SECRET_PATTERNS.
-        SECRET_PATTERNS = Secrets::PATTERNS
+        ].map { |(pat, label)| {Utf8.tolerant(pat), label} }
 
         # An active sub-resource (script/iframe) loaded over plain http on an https page —
         # genuine active mixed content (browsers block it; it signals an insecure dependency).
         # The (?<![-\w]) guard requires a real attribute boundary before `src`, so a hyphenated
         # data attribute (`data-src="http://…"`, a lazy-loading placeholder) doesn't false-match
         # — `\b` alone treated the hyphen as a boundary.
-        MIXED_ACTIVE = /<(?:script|iframe|embed)\b[^>]*(?<![-\w])src\s*=\s*["']?http:\/\//i
+        MIXED_ACTIVE = Utf8.tolerant(/<(?:script|iframe|embed)\b[^>]*(?<![-\w])src\s*=\s*["']?http:\/\//i)
         # A stylesheet or <object> is also ACTIVE mixed content (browsers block it). Attribute
         # order varies, so two lookaheads assert both attrs are present in the same <link> tag.
-        MIXED_ACTIVE_LINK   = /<link\b(?=[^>]*(?<![-\w])rel\s*=\s*["']?stylesheet)(?=[^>]*(?<![-\w])href\s*=\s*["']?http:\/\/)[^>]*>/i
-        MIXED_ACTIVE_OBJECT = /<object\b[^>]*(?<![-\w])data\s*=\s*["']?http:\/\//i
+        MIXED_ACTIVE_LINK   = Utf8.tolerant(/<link\b(?=[^>]*(?<![-\w])rel\s*=\s*["']?stylesheet)(?=[^>]*(?<![-\w])href\s*=\s*["']?http:\/\/)[^>]*>/i)
+        MIXED_ACTIVE_OBJECT = Utf8.tolerant(/<object\b[^>]*(?<![-\w])data\s*=\s*["']?http:\/\//i)
         # PASSIVE mixed content: an http:// image/media on an HTTPS page. Lower impact (not
         # blocked, but tamperable + downgrades the lock icon).
-        MIXED_PASSIVE = /<(?:img|audio|video|source)\b[^>]*(?<![-\w])src\s*=\s*["']?http:\/\//i
+        MIXED_PASSIVE = Utf8.tolerant(/<(?:img|audio|video|source)\b[^>]*(?<![-\w])src\s*=\s*["']?http:\/\//i)
 
         # A form on an HTTPS page that SUBMITS to a plain-http action: everything the user types
         # (credentials included) is sent in cleartext. Browsers flag this for password fields;
         # it's a distinct, higher-impact case than a passively-loaded sub-resource.
-        INSECURE_FORM = /<form\b[^>]*(?<![-\w])action\s*=\s*["']?http:\/\//i
+        INSECURE_FORM = Utf8.tolerant(/<form\b[^>]*(?<![-\w])action\s*=\s*["']?http:\/\//i)
 
         # A javascript: URL in an executable attribute — a client-side script sink. The negative
         # lookahead drops the ubiquitous no-op forms (javascript:void(0), javascript:;).
-        INLINE_JS_URI = /(?<![-\w])(?:href|src|action|formaction)\s*=\s*["']?javascript:(?!\s*(?:void|;|"|'))/i
+        INLINE_JS_URI = Utf8.tolerant(/(?<![-\w])(?:href|src|action|formaction)\s*=\s*["']?javascript:(?!\s*(?:void|;|"|'))/i)
         # An <a target="_blank"> tag; reverse-tabnabbing risk unless it carries rel=noopener.
-        ANCHOR_BLANK = /<a\b[^>]*(?<![-\w])target\s*=\s*["']?_blank\b[^>]*>/i
+        ANCHOR_BLANK = Utf8.tolerant(/<a\b[^>]*(?<![-\w])target\s*=\s*["']?_blank\b[^>]*>/i)
         # The rel token that defuses it. Matched case-INSENSITIVELY: ANCHOR_BLANK is /i, so it
         # happily matched `<a TARGET="_blank" REL="NOOPENER">`, and the suppression test was a
         # case-SENSITIVE `includes?` that then failed to recognise the very rel that made the tag
@@ -135,8 +144,8 @@ module Gori
         # right tool where the sibling rules use it — a Content-Type or a request target, where
         # the input is short (so the naive scan never gets going) or possibly INVALID UTF-8, on
         # which PCRE2 raises outright.
-        private HTTP_GATE  = /http:\/\//i
-        private BLANK_GATE = /_blank/i
+        private HTTP_GATE  = Utf8.tolerant(/http:\/\//i)
+        private BLANK_GATE = Utf8.tolerant(/_blank/i)
 
         def check(ctx : Context, acc : Array(Detection)) : Nil
           return unless ctx.response

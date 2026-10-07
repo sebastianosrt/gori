@@ -7,8 +7,8 @@ module Gori
     #
     # WHY NOT `require "xml"`. libxml2 is not linked into gori, and linking it would mean
     # adding `libxml2-dev` + `libxml2-static` (and its transitive static deps) to every
-    # packaging path that builds `--static` — docker/Dockerfile, the release workflow,
-    # flake.nix, Homebrew, AUR, snap. `import/burp.cr` states the same reasoning for its
+    # packaging path that builds `--static` — packaging/docker/Dockerfile, the release
+    # workflow, flake.nix, Homebrew, AUR, snap. `import/burp.cr` states the same reasoning for its
     # flat scanner; this is that decision applied to a document that actually needs a tree.
     #
     # WHY NOT `Import::Burp`'s scanner. That one matches `<name` by string index over a
@@ -84,10 +84,6 @@ module Gori
           @text = nil
         end
 
-        def name : QName
-          {@uri, @local}
-        end
-
         def display_name : String
           @prefix.empty? ? @local : "#{@prefix}:#{@local}"
         end
@@ -109,14 +105,6 @@ module Gori
 
         def element?(uri : String, local : String) : Node?
           @children.find { |c| c.uri == uri && c.local == local }
-        end
-
-        def elements(name : QName) : Array(Node)
-          elements(name[0], name[1])
-        end
-
-        def element?(name : QName) : Node?
-          element?(name[0], name[1])
         end
 
         # Resolve a QName carried as an attribute VALUE (`type="tns:Foo"`, `binding="tns:B"`,

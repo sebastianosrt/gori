@@ -16,7 +16,14 @@ module Gori::Proxy::Tls
     # it without limit. Eviction is safe: SSL_CTX up-refs the cert/key, and a live
     # OpenSSL::SSL::Socket holds its Context, so an in-use context stays valid even
     # after its Leaf leaves the cache (a later request just rebuilds it).
-    MAX_LEAVES = 256
+    #
+    # Sized by what a leaf costs now that its context skips the system CA bundle
+    # (ContextFactory.lean_server): ~0.1 ms to mint and 0.02-0.16 MB of RSS per cached leaf
+    # (bench/tls_context_bench.cr `authority` mode vs a live proxy under load), against
+    # ~3.7 ms and ~1.1 MB before. At 256, ~400 rotating HTTPS hosts thrashed the LRU and
+    # re-minted on nearly every visit; 1024 leaves stay under what 256 used to cost. A leaf
+    # is keyed by host and whether it advertises h2, so that is 512-1024 hosts.
+    MAX_LEAVES = 1024
 
     getter ca_cert_path : String
 
@@ -40,6 +47,10 @@ module Gori::Proxy::Tls
     # the key file's own 0600 below: the cert beside it is public by design.
     def self.load_or_create(dir : String, common_name : String = DEFAULT_CN) : CertAuthority
       Gori::Paths.ensure_dir(dir, tighten: false) # race-tolerant (two instances may start at once)
+      with_dir_lock(dir) { load_or_create_locked(dir, common_name) }
+    end
+
+    private def self.load_or_create_locked(dir : String, common_name : String) : CertAuthority
       cert_path = File.join(dir, CA_CERT_FILE)
       key_path = File.join(dir, CA_KEY_FILE)
 
@@ -70,9 +81,46 @@ module Gori::Proxy::Tls
           "clients will need to re-trust it)")
       else
         cert, key = CertBuilder.build_root(common_name)
-        cert.write_pem(cert_path)
-        key.write_pem(key_path) # 0600 at CREATE time — see KeyPair#write_pem
+        write_pair_locked(dir, cert, key) # key at 0600 from its first byte — see KeyPair#write_pem
         new(cert, key, cert_path)
+      end
+    end
+
+    # Hold an exclusive flock on the CA directory itself for the duration of the block. The
+    # directory is shared by every gori process on the machine (the TUI, `gori mcp`, `gori
+    # run`, `gori ca`), and without it two of them could interleave:
+    #
+    #   - two first runs at once each minted a root and wrote cert, then key, straight to the
+    #     final paths; interleaved, the dir kept one process's cert and the other's key — a
+    #     mismatched pair that loads without complaint and that every client then rejects
+    #   - a load landing between a writer's two writes (or write_pair's two renames) read a
+    #     lone cert and refused to start ("CA pair broken"), or read a mismatched pair
+    #
+    # The directory, not a lock file inside it: an operator's --ca-dir gets no stray file,
+    # and a renamed-over PEM cannot carry the lock away. Best-effort: a dir that cannot be
+    # opened, or a filesystem that refuses flock on it (Linux NFS emulates flock as a POSIX
+    # lock, which wants a writable fd: EBADF; NFSv3 without lockd: ENOLCK), proceeds
+    # unlocked, as before — a lock gori cannot take must not stop it from starting. Only the
+    # lock call is rescued, so an error from the block itself still propagates. Not
+    # re-entrant — flock locks per open file description, so a nested call from the same
+    # process waits on itself; hence the `_locked` halves that the public entry points wrap.
+    private def self.with_dir_lock(dir : String, &)
+      handle = File.open(dir, "r") rescue nil
+      return yield unless handle
+      begin
+        locked = begin
+          handle.flock_exclusive # retries with a fiber sleep: the scheduler keeps running
+          true
+        rescue IO::Error
+          false
+        end
+        begin
+          yield
+        ensure
+          handle.flock_unlock if locked
+        end
+      ensure
+        handle.close
       end
     end
 
@@ -98,14 +146,18 @@ module Gori::Proxy::Tls
       end
     end
 
-    # PEM bytes of the root certificate, for `gori ca --pem` / TUI CA copy / trust setup.
+    # PEM of the root certificate, for `gori ca --pem` and the self-serve CA download page.
+    # Encoded from the live in-memory cert, like ca_cert_der, never re-read from disk: the
+    # file can change under a running gori (`gori ca regenerate` in another shell, which
+    # says running instances keep the old CA) or vanish, and then the page offered a PEM of
+    # a root this process does not sign with, beside a DER and an SPKI pin of the one it
+    # does. A deleted file also raised here and took the whole page down with it.
     def ca_cert_pem : String
-      File.read(@ca_cert_path)
+      @cert.to_pem
     end
 
-    # DER bytes of the root certificate, for the self-serve CA download page's .der
-    # form. Encoded from the live in-memory cert (so it tracks regenerate!/import!),
-    # unlike ca_cert_pem which reads the on-disk file.
+    # DER bytes of the root certificate, for the self-serve CA download page's .der form.
+    # Encoded from the live in-memory cert, so it tracks regenerate!/import!.
     def ca_cert_der : Bytes
       @cert.to_der
     end
@@ -123,7 +175,7 @@ module Gori::Proxy::Tls
     # Adopt an externally-created root CA (`gori ca import`): read the cert + key
     # PEMs, verify they are a usable CA pair, then swap them in over the current
     # root exactly like `regenerate!`. Returns a human warning (expired / not-yet-
-    # valid) if the cert is time-invalid but otherwise usable, else nil. Raises
+    # valid / rejected by strict clients) if the cert is otherwise usable, else nil. Raises
     # Gori::Error (leaving the current CA untouched) if a PEM won't parse or the
     # pair is unusable — validation runs BEFORE anything is written.
     def import!(cert_path : String, key_path : String) : String?
@@ -167,7 +219,7 @@ module Gori::Proxy::Tls
     end
 
     # Reject an imported pair that can't serve as a signing root; return a soft
-    # warning for a time-invalid-but-usable cert. A mismatched key would make every
+    # warning for a time-invalid or strict-verify-deficient but usable cert. A mismatched key would make every
     # minted leaf fail verification, and a non-CA cert (basicConstraints CA:FALSE)
     # makes clients reject any leaf it signs — both are hard errors we catch up front.
     # A class method: it inspects the two handles via the FFI, no instance state.
@@ -201,13 +253,39 @@ module Gori::Proxy::Tls
           "with SHA-256, which Ed25519 and Ed448 keys do not support; use an EC P-256 or an " \
           "RSA root CA")
       end
+      warnings = [] of String
       if LibCrypto.x509_cmp_time(LibCrypto.x509_getm_not_after(cert.handle), Pointer(Void).null) < 0
-        return "certificate is expired"
+        warnings << "certificate is expired"
+      elsif LibCrypto.x509_cmp_time(LibCrypto.x509_getm_not_before(cert.handle), Pointer(Void).null) > 0
+        warnings << "certificate is not valid yet"
       end
-      if LibCrypto.x509_cmp_time(LibCrypto.x509_getm_not_before(cert.handle), Pointer(Void).null) > 0
-        return "certificate is not valid yet"
+      if (gaps = strict_verify_gaps(cert)).present?
+        warnings << strict_verify_warning(gaps)
       end
-      nil
+      warnings.empty? ? nil : warnings.join("; ")
+    end
+
+    # Extensions this root lacks that a STRICT verifier requires of a CA (#1168): OpenSSL's
+    # X509_V_FLAG_X509_STRICT, on by default in Python 3.13+'s `ssl.create_default_context()`,
+    # rejects a CA without a subjectKeyIdentifier or a keyUsage. gori's leaves carry an AKI
+    # whatever the root (CertBuilder.issuer_key_id), but it cannot add these to a root it
+    # does not re-issue: a root minted by an older gori, or an imported one, keeps failing
+    # strict clients until it is regenerated. Soft — lenient clients (browsers, curl) accept
+    # it — so this is only ever a warning.
+    def self.strict_verify_gaps(cert : Cert) : Array(String)
+      gaps = [] of String
+      gaps << "subjectKeyIdentifier" if LibCrypto.x509_get0_subject_key_id(cert.handle).null?
+      gaps << "keyUsage" if LibCrypto.x509_get_ext_by_nid(cert.handle, NID_KEY_USAGE, -1) < 0
+      gaps
+    end
+
+    def strict_verify_gaps : Array(String)
+      @mutex.synchronize { CertAuthority.strict_verify_gaps(@cert) }
+    end
+
+    def self.strict_verify_warning(gaps : Array(String)) : String
+      "the root CA has no #{gaps.join(" or ")} extension, so strict TLS clients (Python 3.13+, " \
+      "`openssl verify -x509_strict`) reject its certificates"
     end
 
     # Persist a cert/key pair over the on-disk root (write_pair) and swap it live. Shared by
@@ -235,6 +313,10 @@ module Gori::Proxy::Tls
       # Full parity with load_or_create, `tighten:` included: the dir may have been removed
       # at runtime, and re-creating it must not re-mode an operator's --ca-dir either.
       Gori::Paths.ensure_dir(dir, tighten: false)
+      with_dir_lock(dir) { write_pair_locked(dir, cert, key) }
+    end
+
+    private def self.write_pair_locked(dir : String, cert : Cert, key : KeyPair) : String
       cert_path = File.join(dir, CA_CERT_FILE)
       key_path = File.join(dir, CA_KEY_FILE)
       # `stage` both, THEN commit both: that ordering is the guarantee described above, and

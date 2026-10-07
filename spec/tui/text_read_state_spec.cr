@@ -1,0 +1,169 @@
+require "../spec_helper"
+require "../support/memory_backend"
+
+include Gori::Tui
+
+# `TextReadState#bind` — the READ selection is dropped when the state is handed a different
+# document, whether that is another `TextArea` (Notes: one read state, one editor per sub-tab)
+# or the same editor with its bytes replaced (a peer reload, `^E`'s hand-back, a project
+# switch). The anchor is a (line, column) pair into the text it was made in; carried across,
+# it painted a band the operator never made and `y` put the other document on the clipboard.
+private def area(text : String) : TextArea
+  ta = TextArea.new
+  ta.set_text(text)
+  ta
+end
+
+private def select_word(state : TextReadState, ed : TextArea, cy : Int32, cx : Int32) : Nil
+  ed.place_cursor(cy, cx)
+  state.select_word_at_cursor(ed).should be_true
+end
+
+describe Gori::Tui::TextReadState do
+  it "drops the band when asked about a different editor" do
+    a = area("alpha beta\ngamma delta")
+    b = area("zzzzzzzzzzzzzz")
+    state = TextReadState.new
+    select_word(state, a, 0, 7)
+    state.selection?(a).should be_true
+    state.copy_text(a).should eq("beta")
+
+    state.selection?(b).should be_false
+    state.copy_text(b).should eq("zzzzzzzzzzzzzz") # the caret LINE, not a band clamped into it
+    state.cursor.cy.should eq(b.cy)
+    state.cursor.cx.should eq(b.cx)
+  end
+
+  it "drops the band when the same editor's text is replaced" do
+    ed = area("alpha beta gamma")
+    state = TextReadState.new
+    select_word(state, ed, 0, 7)
+    state.copy_text(ed).should eq("beta")
+
+    ed.set_text("zzzzzzzzzzzzzzzzzzzz")
+    state.selection?(ed).should be_false
+    state.copy_text(ed).should eq("zzzzzzzzzzzzzzzzzzzz")
+  end
+
+  it "drops the band on an outside replacement that keeps the caret" do
+    ed = area("alpha beta gamma")
+    state = TextReadState.new
+    select_word(state, ed, 0, 7)
+    ed.replace_from_outside("zzzzzzzzzzzzzzzzzzzz")
+    state.selection?(ed).should be_false
+  end
+
+  it "keeps the band while the document is the one it was made in" do
+    ed = area("alpha beta\ngamma delta")
+    state = TextReadState.new
+    select_word(state, ed, 0, 7)
+    # Painting-adjacent calls that do not touch the text: the same state, the same revision.
+    state.sync_from(ed)
+    state.selection?(ed).should be_true
+    state.move(ed, 1, 0, selecting: true)
+    state.selection?(ed).should be_true
+    state.copy_text(ed).should eq("beta\ngamma delt")
+  end
+
+  it "adopts an INSERT selection made after typing moved the revision" do
+    ed = area("alpha beta")
+    state = TextReadState.new
+    state.sync_from(ed) # INS entered: bound at this revision
+    ed.place_cursor(0, 10)
+    ed.insert('!') # the revision moves under the bound state
+    ed.home(true)  # ⇧Home: the editor's own band over the whole line
+    state.adopt_editor_selection(ed).should be_true
+    # The adoption is what the next paint sees — a stale binding would drop it there.
+    state.sync_from(ed)
+    state.selection?(ed).should be_true
+    state.copy_text(ed).should eq("alpha beta!")
+  end
+end
+
+# A pane shrunk to nothing renders nothing, and its READ chrome must not paint the caret from
+# the last frame's rows onto whatever the rect now sits on — the borders (#1433).
+describe "Gori::Tui::TextReadState#paint_chrome after the pane shrinks" do
+  it "paints no caret into an empty rect" do
+    ed = area("one\ntwo\nthree\nfour\nfive")
+    state = TextReadState.new
+    ed.place_cursor(4, 0)
+    b = MemoryBackend.new(20, 8)
+    screen = Screen.new(b)
+    ed.render(screen, Rect.new(0, 1, 20, 5), cursor: false)
+    state.paint_chrome(screen, Rect.new(0, 1, 20, 5), ed)
+    b.bg_at(0, 5).should eq Theme.accent_bg # the caret, on its row, while the pane is tall
+
+    b2 = MemoryBackend.new(20, 8)
+    screen2 = Screen.new(b2)
+    shrunk = Rect.new(0, 1, 20, 0)
+    ed.render(screen2, shrunk, cursor: false)
+    state.paint_chrome(screen2, shrunk, ed)
+    8.times { |y| 20.times { |x| b2.bg_at(x, y).should_not eq Theme.accent_bg } }
+  end
+
+  it "never paints below a rect shorter than the rows it is handed" do
+    ed = area("one\ntwo\nthree\nfour\nfive")
+    state = TextReadState.new
+    ed.place_cursor(4, 0)
+    ed.render(Screen.new(MemoryBackend.new(20, 8)), Rect.new(0, 1, 20, 5), cursor: false)
+    b = MemoryBackend.new(20, 8)
+    state.paint_chrome(Screen.new(b), Rect.new(0, 1, 20, 2), ed)
+    (3...8).each { |y| 20.times { |x| b.bg_at(x, y).should_not eq Theme.accent_bg } }
+  end
+
+  # A line selection is a MODE, not a span shape. Grown with a column-keeping step it turned
+  # into a char rectangle, and a delete over it cut mid-line and joined the two lines.
+  describe "a line selection" do
+    it "grows by whole lines on ⇧↑, from a line shorter than the one above" do
+      ed = area("GET / HTTP/1.1\nHost: example.test\nAccept: */*")
+      state = TextReadState.new
+      ed.place_cursor(2, 0)
+      state.select_line(ed, line_mode: false)
+      state.move(ed, -1, 0, selecting: true)
+      state.linewise?(ed).should be_true
+      state.copy_text(ed).should eq("Host: example.test\nAccept: */*")
+    end
+
+    it "grows on a plain step only in line mode (vim's V), and collapses otherwise" do
+      ed = area("a\nbb\nccc")
+      state = TextReadState.new
+      state.select_line(ed, line_mode: true)
+      state.move(ed, 1, 0)
+      state.copy_text(ed).should eq("a\nbb")
+
+      state.select_line(ed, line_mode: false)
+      state.move(ed, 1, 0)
+      state.selection?(ed).should be_false
+    end
+
+    it "grows to the buffer's edge on top/bottom, as V then G does" do
+      ed = area("a\nbb\nccc\ndd")
+      state = TextReadState.new
+      ed.place_cursor(1, 0)
+      state.select_line(ed, line_mode: true)
+      state.to_edge(ed, 1)
+      state.copy_text(ed).should eq("bb\nccc\ndd")
+      state.to_edge(ed, -1)
+      state.copy_text(ed).should eq("a\nbb")
+    end
+
+    it "stops being linewise once a sideways step reshapes it" do
+      ed = area("abc\ndef")
+      state = TextReadState.new
+      state.select_line(ed, line_mode: false)
+      state.move(ed, 0, -1, selecting: true)
+      state.linewise?(ed).should be_false
+    end
+  end
+
+  it "steps a READ caret by words with the editor's own word motion" do
+    ed = area("X-Request-Id: a.b")
+    state = TextReadState.new
+    state.word_move(ed, 1)
+    state.cursor.cx.should eq(12) # past `X-Request-Id`, onto `:`
+    state.word_move(ed, 1, selecting: true)
+    state.copy_text(ed).should eq(": ")
+    state.word_move(ed, -1)
+    state.selection?(ed).should be_false
+  end
+end

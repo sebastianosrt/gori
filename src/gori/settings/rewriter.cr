@@ -26,25 +26,56 @@ module Gori::Settings
     part : String,   # Store::RulePart label — "head" | "body" | "ws"
     pattern : String,
     replacement : String,
-    op : String,          # Store::RuleOp label — "replace" | "add_header" | ... | "short_circuit"
-    match_kind : String,  # Store::MatchKind label — "literal" | "regex"
-    host : String,        # host glob ("" = every host)
-    body_file : String do # ShortCircuit stub path ("" = inline body in `replacement`)
+    op : String,         # Store::RuleOp label — "replace" | "add_header" | ... | "short_circuit"
+    match_kind : String, # Store::MatchKind label — "literal" | "regex"
+    host : String,       # host glob ("" = every host)
+    body_file : String,  # ShortCircuit stub path ("" = inline body in `replacement`); dir for `respond: dir`
+    # Store::RespondKind label and the raw RespondArgs JSON (#1237). Defaulted so a row an older
+    # binary wrote — which carries neither key — reads as the stub it always was; the parser
+    # derives `respond` from `body_file` for exactly that row (`RespondKind.implied`).
+    respond : String = "inline",
+    respond_args : String = "",
+    extra_keys : Hash(String, JSON::Any) = Hash(String, JSON::Any).new,
+    raw_target : JSON::Any? = nil,
+    raw_part : JSON::Any? = nil,
+    raw_op : JSON::Any? = nil,
+    raw_match_kind : JSON::Any? = nil,
+    # The two #1237 keys as a newer gori may have written them — a non-string `respond`, an
+    # OBJECT `respond_args` — kept so a save writes them back unchanged (the `raw_op` rule).
+    raw_respond : JSON::Any? = nil,
+    raw_respond_args : JSON::Any? = nil do
     # The rule as the proxy sees it in one project: `enabled` is the EFFECTIVE state there
     # (this rule's default unless the project overrode it) and `overridden` says which of the
     # two it is, so the list row can mark it.
     #
-    # `from_label` RAISES on an unknown label and that is safe here: a rule only reaches memory
-    # through `parse_rewriter_rules`, which clamps all four enum fields to their allowed sets,
-    # or through the CRUD below, which is handed a live rule's own `.label`. The clamp at the
-    # parse boundary is what makes this total.
+    # `to_rule` keeps the enum projections total so every surface can still list or delete a
+    # row, while the raw unknown labels travel beside them. `MatchRule#inert?` prevents those
+    # fallback enum values from ever reaching a rewrite path.
     def to_rule(enabled : Bool = @enabled, overridden : Bool = false) : Store::MatchRule
       Store::MatchRule.new(id, enabled,
         Store::RuleTarget.from_label(target), Store::RulePart.from_label(part),
         pattern, replacement,
         Store::RuleOp.from_label(op), Store::MatchKind.from_label(match_kind),
         name, host, body_file,
-        scope: Store::RuleScope::Global, overridden: overridden)
+        scope: Store::RuleScope::Global, overridden: overridden,
+        unknown_target: Store::RuleTarget.from_label?(target) ? nil : target,
+        unknown_part: Store::RulePart.from_label?(part) ? nil : part,
+        unknown_op: Store::RuleOp.from_label?(op) ? nil : op,
+        unknown_match_kind: Store::MatchKind.from_label?(match_kind) ? nil : match_kind,
+        unknown_keys: extra_keys.empty? ? nil : extra_keys.keys,
+        respond: Store::RespondKind.from_label?(respond) || Store::RespondKind.implied(body_file),
+        respond_args: respond_args,
+        unknown_respond: Store::RespondKind.from_label?(respond) ? nil : respond)
+    end
+
+    # Keep the configured state in settings.json, but don't treat an unsupported grammar value
+    # as permission to run the default operation. This is also used by profile export to avoid
+    # presenting an unknown `pipe`-shaped row as an executable command.
+    def inert? : Bool
+      Store::RuleTarget.from_label?(target).nil? || Store::RulePart.from_label?(part).nil? ||
+        Store::RuleOp.from_label?(op).nil? || Store::MatchKind.from_label?(match_kind).nil? ||
+        !extra_keys.empty? || !raw_target.nil? || !raw_part.nil? || !raw_op.nil? || !raw_match_kind.nil? ||
+        !raw_respond.nil? || to_rule.inert?
     end
 
     # Does this rule RUN AN EXTERNAL COMMAND when it fires? The question a profile's two ends
@@ -56,17 +87,41 @@ module Gori::Settings
     # here would be a second answer to that question, free to stay behind — which is exactly
     # how the export contract came to be written for `pipe`'s predecessors and never revisited.
     #
-    # `from_label` is total (an unrecognised label reads as `replace`), and `op` is clamped to
-    # RULE_OPS by every parse below, so this cannot raise on a hand-edited file.
+    # An unknown op counts as "might execute" so that profile import refuses an unknown-op rule
+    # unless --allow-commands is supplied.
     def executes? : Bool
-      Store::RuleOp.from_label(op).executes?
+      known = Store::RuleOp.from_label?(op)
+      known ? known.executes? : true
+    end
+
+    # Does the replacement carry `$NAME` tokens the env-grammar migration should re-spell?
+    # Through `RuleOp#expands_tokens?` for the same reason `executes?` goes through the enum.
+    # An unknown op projects to `replace` and stays migratable, as it was before.
+    def expands_tokens? : Bool
+      Store::RuleOp.from_label(op).expands_tokens?
     end
 
     # A pipe rule's ARGV, or nil when it does not run one. It lives in `replacement` — see
     # `Rules#pipe_argv`, which tokenizes exactly this string. Named so the profile surfaces
     # do not have to know which field a given op keeps its command in.
     def command : String?
-      executes? ? replacement : nil
+      return nil unless executes?
+      replacement.presence
+    end
+  end
+
+  # A settings rule with any other key is kept inert.
+  KNOWN_RULE_KEYS = %w[id enabled name target part pattern replacement op match_kind host body_file respond respond_args]
+
+  # Free-text fields whose non-string value has no safe reading: `host` "" is EVERY host and
+  # `replacement` "" deletes the match. Such a value is kept raw like an unknown key, so the row
+  # is inert and written back as it was.
+  RAW_TEXT_RULE_KEYS = %w[name replacement host body_file]
+
+  # The keys this binary cannot read: unknown ones, and a free-text field holding a non-string.
+  private def self.unread_rule_keys(o : Hash(String, JSON::Any)) : Hash(String, JSON::Any)
+    o.reject do |k, v|
+      KNOWN_RULE_KEYS.includes?(k) && !(RAW_TEXT_RULE_KEYS.includes?(k) && raw_label(v))
     end
   end
 
@@ -86,13 +141,9 @@ module Gori::Settings
   RULE_OPS     = %w[replace add_header set_header remove_header short_circuit pipe]
   RULE_KINDS   = %w[literal regex]
 
-  # Parse the `rewriter` section: `rules` when present, else the pre-upgrade `presets` block.
+  # Parse the `rewriter` section.
   private def self.parse_rewriter(node : JSON::Any) : Nil
-    if node["rules"]?
-      self.rewriter_rules = parse_rewriter_rules(node["rules"]?)
-    else
-      self.rewriter_rules = parse_legacy_presets(node["presets"]?)
-    end
+    self.rewriter_rules = parse_rewriter_rules(node["rules"]?)
     stored = node["next_rule_id"]?.try(&.as_i64?) || 0_i64
     # Never go BACKWARDS from the ids actually present, whatever the file says: a hand-edited
     # (or truncated) counter must not be able to mint a duplicate id.
@@ -113,13 +164,13 @@ module Gori::Settings
 
   # Tolerant global-rule parse: a non-array (or absent) node keeps the current value; entries
   # missing a pattern are dropped (a rule with no pattern can never match, and `Rules#add`
-  # refuses it anyway), as is a header op on a non-head part (`impossible_shape?`, same
-  # reasoning); the four enum fields are clamped to their allowed sets.
+  # refuses it anyway), as is a known header op on a known non-head part (`impossible_shape?`).
+  # Unknown enum labels stay in their string fields so they can be written back unchanged and
+  # shown to the operator, but the runtime projection marks the row inert.
   #
-  # Clamping rather than `from_label` is the point: those raise on an unknown label, and a
-  # single typo in a hand-edited settings.json would take the whole file down through `load`'s
-  # blanket rescue — resetting theme, hotkeys and every other section to factory defaults.
-  # Mirrors parse_scan_rules.
+  # A known label is still canonicalized case-insensitively, as it was before. An unknown label
+  # must not be clamped to a live default: this file is shared by gori binaries from different
+  # releases, and doing that turned e.g. a future `short_circuit` into a `replace` rule.
   #
   # A missing `enabled` reads as FALSE. These rules rewrite live traffic in every project, so
   # the one direction a malformed or hand-written entry may not default to is "on".
@@ -132,10 +183,13 @@ module Gori::Settings
       next unless o = e.as_h?
       pattern = o["pattern"]?.try(&.as_s?)
       next if pattern.nil? || pattern.empty?
-      op = clamp_field(o["op"]?.try(&.as_s?), RULE_OPS, "replace")
-      target = clamp_field(o["target"]?.try(&.as_s?), RULE_TARGETS, "request")
-      part = clamp_field(o["part"]?.try(&.as_s?), RULE_PARTS, "head")
-      next if impossible_shape?(op, part)
+      op, raw_op = parse_rule_label(o["op"]?, RULE_OPS, "replace")
+      target, raw_target = parse_rule_label(o["target"]?, RULE_TARGETS, "request")
+      part, raw_part = parse_rule_label(o["part"]?, RULE_PARTS, "head")
+      match_kind, raw_match_kind = parse_rule_label(o["match_kind"]?, RULE_KINDS, "literal")
+      next if known_rule_shape?(op, part) && impossible_shape?(op, part)
+      extra = unread_rule_keys(o)
+      body_file = o["body_file"]?.try(&.as_s?) || ""
       list << RewriterRule.new(
         claim_id(o["id"]?.try(&.as_i64?), seen),
         o["enabled"]?.try(&.as_bool?) || false,
@@ -144,11 +198,66 @@ module Gori::Settings
         pattern,
         o["replacement"]?.try(&.as_s?) || "",
         op,
-        clamp_field(o["match_kind"]?.try(&.as_s?), RULE_KINDS, "literal"),
+        match_kind,
         o["host"]?.try(&.as_s?) || "",
-        o["body_file"]?.try(&.as_s?) || "")
+        body_file,
+        respond_label(o["respond"]?, body_file),
+        respond_args_text(o["respond_args"]?),
+        extra_keys: extra,
+        raw_target: raw_target,
+        raw_part: raw_part,
+        raw_op: raw_op,
+        raw_match_kind: raw_match_kind,
+        raw_respond: raw_label(o["respond"]?),
+        raw_respond_args: raw_label(o["respond_args"]?))
     end
     list
+  end
+
+  private def self.parse_rule_label(node : JSON::Any?, allowed : Array(String), default : String) : {String, JSON::Any?}
+    return {default, nil} unless node
+    if s = node.as_s?
+      {keep_unknown_label(s, allowed, default), nil}
+    else
+      {node.to_json, node}
+    end
+  end
+
+  # The node itself when it is present but not a string — what a save must write back verbatim.
+  private def self.raw_label(node : JSON::Any?) : JSON::Any?
+    node if node && !node.raw.nil? && node.as_s?.nil?
+  end
+
+  # A `respond` label (#1237): canonicalized when known, carried unchanged when not (the same
+  # rule as `keep_unknown_label`), and derived from `body_file` when the key is absent — which is
+  # every row an older binary wrote, a stub whose body came from a file or from `replacement`.
+  private def self.respond_label(node : JSON::Any?, body_file : String) : String
+    return Store::RespondKind.implied(body_file).label if node.nil? || node.raw.nil?
+    str = node.as_s? || return node.to_json
+    Store::RespondKind.from_label?(str.downcase).try(&.label) || str
+  end
+
+  # The raw `respond_args` text. A string is kept as written; anything else (an object a future
+  # binary might write) is kept as its JSON so the row stays exactly as readable as it is — and
+  # `RespondArgs.parse` then decides, never silently `""`, which would drop a fault kind.
+  private def self.respond_args_text(node : JSON::Any?) : String
+    return "" if node.nil? || node.raw.nil?
+    node.as_s? || node.to_json
+  end
+
+  # Canonicalize a label this binary knows, but carry an unknown string unchanged. `nil` still
+  # means the field was omitted and keeps its documented default; a future label must never
+  # become that default on an older binary.
+  private def self.keep_unknown_label(val : String?, allowed : Array(String), default : String) : String
+    return default unless val
+    normalized = val.downcase
+    allowed.includes?(normalized) ? normalized : val
+  end
+
+  # Only known labels can name a shape that is impossible in this binary. An unknown part is
+  # retained as an inert row even when the fallback `Head` plus a header op would look valid.
+  private def self.known_rule_shape?(op : String, part : String) : Bool
+    !Store::RuleOp.from_label?(op).nil? && !Store::RulePart.from_label?(part).nil?
   end
 
   # Whether this op/part pair names a rule that could never rewrite anything: a header op
@@ -194,41 +303,6 @@ module Gori::Settings
     id > 0 && id < Int64::MAX
   end
 
-  # Adopt a pre-upgrade `rewriter.presets` block as global rules, DISABLED. A preset was inert
-  # by construction — it did nothing until you loaded it into a project — so adopting one as a
-  # live rule would start rewriting traffic in every project on the strength of an upgrade.
-  # They arrive as rows in the Rewriter list, off, where `x` arms them.
-  #
-  # No eraser is needed for the legacy key (contrast `drop_legacy_decoder_sessions`): the
-  # migration is in-memory and idempotent — `rules` wins the moment it exists, so a stale
-  # `presets` block is never read again — and the first save that touches the section replaces
-  # it with `rules` outright, because the merge sees the section change.
-  private def self.parse_legacy_presets(node : JSON::Any?) : Array(RewriterRule)
-    arr = node.try(&.as_a?)
-    return rewriter_rules unless arr
-    list = [] of RewriterRule
-    arr.each do |e|
-      next unless o = e.as_h?
-      name = o["name"]?.try(&.as_s?)
-      pattern = o["pattern"]?.try(&.as_s?)
-      next if name.nil? || name.empty? || pattern.nil? || pattern.empty?
-      op = clamp_field(o["op"]?.try(&.as_s?), RULE_OPS, "replace")
-      target = clamp_field(o["target"]?.try(&.as_s?), RULE_TARGETS, "request")
-      part = clamp_field(o["part"]?.try(&.as_s?), RULE_PARTS, "head")
-      next if impossible_shape?(op, part)
-      list << RewriterRule.new(
-        (list.size + 1).to_i64, false, name,
-        target, part,
-        pattern,
-        o["replacement"]?.try(&.as_s?) || "",
-        op,
-        clamp_field(o["match_kind"]?.try(&.as_s?), RULE_KINDS, "literal"),
-        o["host"]?.try(&.as_s?) || "",
-        o["body_file"]?.try(&.as_s?) || "")
-    end
-    list
-  end
-
   # Re-read the `rewriter` section from settings.json into memory, leaving every other section
   # alone — the counter included, so the next id minted here is one no peer has handed out.
   # See `Settings.reload_section` for why a full `Settings.load` is the wrong tool and what this
@@ -259,31 +333,26 @@ module Gori::Settings
   # commit" answer `Store#insert_rule` gives, so `Rules#add` can report the two scopes alike.
   def self.add_rewriter_rule(target : String, part : String, pattern : String, replacement : String,
                              op : String, match_kind : String, name : String, host : String,
-                             body_file : String, enabled : Bool = true) : Int64
+                             body_file : String, enabled : Bool = true,
+                             respond : String = "inline", respond_args : String = "") : Int64
     # BEFORE the snapshot below, so a refused write rolls back to what the FILE says rather than
     # to a list this process has been holding since startup. And before the mint, which is the
     # whole point: `rewriter_next_rule_id` is read from this line, and reading it stale is how
     # two processes hand the same number to two different rules.
     reload_rewriter_from_disk
-    # The answer below is a COMMIT answer, so memory has to agree with it: `save` refuses the
-    # write outright when the last load only got half the file in (`@@load_partial`), and it
-    # returns false on any transient write failure too. Mutating first and answering 0 left
-    # the rule in `rewriter_rules` — folded into `Rules.merged` by the unconditional
-    # `refresh`, rewriting live traffic in every project — while the operator was told it was
-    # not added, and written to disk by the next unrelated save that did succeed. So snapshot
-    # both properties and put them back when the write did not commit. The array is replaced
-    # wholesale everywhere and never mutated in place, so the old reference IS the snapshot.
-    prev_rules = rewriter_rules
+    # The answer below is a COMMIT answer (`commit`): a rule left in `rewriter_rules` over a
+    # refused save is folded into `Rules.merged` by the unconditional `refresh`, rewriting live
+    # traffic in every project while the operator was told it was not added. So both properties
+    # go back when the write did not commit.
     prev_next = rewriter_next_rule_id
     id = rewriter_next_rule_id
     # Saturating, because the counter itself is parsed from the file (`next_rule_id`) and a
     # bare `+ 1` on an `Int64::MAX` one raises out of an operator's "add rule" — see
     # `next_id_after`.
     self.rewriter_next_rule_id = next_id_after(id)
-    self.rewriter_rules = rewriter_rules + [RewriterRule.new(id, enabled, name, target, part,
-      pattern, replacement, op, match_kind, host, body_file)]
-    return id if save
-    self.rewriter_rules = prev_rules
+    rule = RewriterRule.new(id, enabled, name, target, part, pattern, replacement, op, match_kind,
+      host, body_file, respond, respond_args)
+    return id if commit(rewriter_rules, rewriter_rules + [rule])
     # The counter too: a burned id is not cosmetic — a project's `rewriter_overrides` key
     # outlives the rule it names, which is the whole reason ids are never reused.
     self.rewriter_next_rule_id = prev_next
@@ -294,52 +363,46 @@ module Gori::Settings
   # projects and an edit made in one of them is not a statement about the others.
   def self.update_rewriter_rule(id : Int64, target : String, part : String, pattern : String,
                                 replacement : String, op : String, match_kind : String,
-                                name : String, host : String, body_file : String) : Bool
+                                name : String, host : String, body_file : String,
+                                respond : String = "inline", respond_args : String = "") : Bool
     # A rule a peer deleted while this list sat on screen must not come BACK as an edit: after the
     # re-read there is no such id, `found` stays false, and the caller is told so.
     reload_rewriter_from_disk
-    prev_rules = rewriter_rules
-    found = false
-    self.rewriter_rules = rewriter_rules.map do |r|
-      next r unless r.id == id
-      found = true
-      RewriterRule.new(id, r.enabled, name, target, part, pattern, replacement,
-        op, match_kind, host, body_file)
-    end
+    # The caller's inert check (`Rules#update`) read a snapshot; the re-read may hold a key a
+    # newer gori wrote since. Rebuilding that row from the fields below would drop the key and
+    # its raw labels — an edit of a rule this binary cannot read — so ask the file, as
+    # `move_rewriter_rule` does.
+    return false if rewriter_rule_inert?(id)
     # See `add_rewriter_rule`: a false answer means the edit did not commit, so the edited
     # fields must not stay live either.
-    ok = found && save
-    self.rewriter_rules = prev_rules unless ok
-    ok
+    commit(rewriter_rules, replace_by_id(rewriter_rules, id) do |r|
+      RewriterRule.new(id, r.enabled, name, target, part, pattern, replacement,
+        op, match_kind, host, body_file, respond, respond_args)
+    end)
   end
 
   # The rule's DEFAULT state, which every project without an override follows.
   def self.set_rewriter_rule_enabled(id : Int64, enabled : Bool) : Bool
     reload_rewriter_from_disk # see `update_rewriter_rule`
-    prev_rules = rewriter_rules
-    found = false
-    self.rewriter_rules = rewriter_rules.map do |r|
-      next r unless r.id == id
-      found = true
-      r.copy_with(enabled: enabled)
-    end
-    ok = found && save
-    self.rewriter_rules = prev_rules unless ok
-    ok
+    # Enabling is refused against the re-read too; disabling an inert row is allowed, and
+    # `copy_with` keeps its unknown keys (`Rules#set_default`).
+    return false if enabled && rewriter_rule_inert?(id)
+    commit(rewriter_rules, replace_by_id(rewriter_rules, id, &.copy_with(enabled: enabled)))
+  end
+
+  # Whether the global rule `id` is one this binary must hold inert, as the list stands NOW —
+  # call it after `reload_rewriter_from_disk`. False for an unknown id: the caller's own lookup
+  # answers that one.
+  def self.rewriter_rule_inert?(id : Int64) : Bool
+    rewriter_rules.any? { |r| r.id == id && r.inert? }
   end
 
   def self.delete_rewriter_rule(id : Int64) : Bool
     reload_rewriter_from_disk # see `update_rewriter_rule`
-    prev_rules = rewriter_rules
-    kept = rewriter_rules.reject { |r| r.id == id }
-    return false if kept.size == rewriter_rules.size
-    self.rewriter_rules = kept
     # This one fails the OTHER way round: a dropped-then-unsaved rule has stopped rewriting
     # while the caller reports "not deleted — it is still rewriting traffic". An operator
     # deleting a containment rule has to be able to trust that sentence.
-    return true if save
-    self.rewriter_rules = prev_rules
-    false
+    commit(rewriter_rules, remove_by_id(rewriter_rules, id))
   end
 
   # Swap the rule one slot earlier (dir < 0) / later (dir > 0) among the GLOBAL rules. Never
@@ -351,17 +414,25 @@ module Gori::Settings
     # actually holds — swapping inside a stale copy would also silently re-persist that copy's
     # order over a peer's reordering, which the merge then honours as ours.
     reload_rewriter_from_disk
-    list = rewriter_rules.dup
-    i = list.index { |r| r.id == id }
-    return false unless i
-    j = i + (dir < 0 ? -1 : 1)
-    return false if j < 0 || j >= list.size
-    list[i], list[j] = list[j], list[i]
-    prev_rules = rewriter_rules
-    self.rewriter_rules = list
-    return true if save
-    self.rewriter_rules = prev_rules
-    false
+    commit(rewriter_rules, swap_adjacent(rewriter_rules, id, dir) { |a, b| a.inert? || b.inert? })
+  end
+
+  # The #1237 keys, written only when they say something the rule's other fields do not: a raw
+  # value a newer gori wrote, a `respond` other than the one `body_file` implies, or args. Every
+  # other rule — every rewrite rule, and every stub an older binary could have written — keeps
+  # exactly the keys it had, because a gori built after #1252 reads an unknown key as a reason
+  # to hold the whole rule inert, and a shared settings.json must not switch its rules off.
+  private def self.serialize_respond(j : JSON::Builder, r : RewriterRule) : Nil
+    if raw = r.raw_respond
+      j.field("respond") { raw.to_json(j) }
+    elsif r.respond != Store::RespondKind.implied(r.body_file).label || !r.respond_args.empty? || r.raw_respond_args
+      j.field "respond", r.respond
+    end
+    if raw = r.raw_respond_args
+      j.field("respond_args") { raw.to_json(j) }
+    elsif !r.respond_args.empty?
+      j.field "respond_args", r.respond_args
+    end
   end
 
   # Factory reset for this section (dispatched by Settings.reset_to_factory). The rules go;
@@ -391,15 +462,35 @@ module Gori::Settings
               j.object do
                 j.field "id", r.id
                 j.field "enabled", r.enabled
-                j.field "name", r.name
-                j.field "target", r.target
-                j.field "part", r.part
+                j.field "name", r.name unless r.extra_keys.has_key?("name")
+                if raw = r.raw_target
+                  j.field("target") { raw.to_json(j) }
+                else
+                  j.field "target", r.target
+                end
+                if raw = r.raw_part
+                  j.field("part") { raw.to_json(j) }
+                else
+                  j.field "part", r.part
+                end
                 j.field "pattern", r.pattern
-                j.field "replacement", r.replacement
-                j.field "op", r.op
-                j.field "match_kind", r.match_kind
-                j.field "host", r.host
-                j.field "body_file", r.body_file
+                j.field "replacement", r.replacement unless r.extra_keys.has_key?("replacement")
+                if raw = r.raw_op
+                  j.field("op") { raw.to_json(j) }
+                else
+                  j.field "op", r.op
+                end
+                if raw = r.raw_match_kind
+                  j.field("match_kind") { raw.to_json(j) }
+                else
+                  j.field "match_kind", r.match_kind
+                end
+                j.field "host", r.host unless r.extra_keys.has_key?("host")
+                j.field "body_file", r.body_file unless r.extra_keys.has_key?("body_file")
+                serialize_respond(j, r)
+                r.extra_keys.each do |k, v|
+                  j.field(k) { v.to_json(j) }
+                end
               end
             end
           end

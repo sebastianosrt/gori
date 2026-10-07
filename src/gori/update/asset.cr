@@ -33,6 +33,7 @@ module Gori::Update
     case os.downcase
     when "darwin", "macos", "osx" then "osx"
     when "linux"                  then "linux"
+    when "windows", "win32"       then "windows"
     else                               os.downcase
     end
   end
@@ -73,6 +74,16 @@ module Gori::Update
     norm
   end
 
+  # Whether the startup check's day cache (stamped `checked_at`, unix seconds) still
+  # stands at `now`. A stamp from the FUTURE is stale, not fresh: it is what a clock
+  # that ran ahead and was then corrected leaves in settings.json, and a bare
+  # `now - checked_at < ttl` read that negative age as fresh, so the probe stayed
+  # off — and a newer release went unannounced — until the wall clock caught up.
+  def self.check_cache_fresh?(checked_at : Int64, now : Int64, ttl : Int) : Bool
+    age = now - checked_at
+    age >= 0 && age < ttl
+  end
+
   # Release asset basename for platform (matches PR #114 / hwaro parity).
   # Linux: plain binary `gori-v{ver}-linux-{x86_64|arm64}`
   # macOS: tarball `gori-v{ver}-osx-{arm64|x86_64}.tar.gz` (contains gori + lib/)
@@ -95,8 +106,10 @@ module Gori::Update
       "gori-#{version_part}linux-#{arch_n}"
     when "osx"
       "gori-#{version_part}osx-#{arch_n}.tar.gz"
+    when "windows"
+      "gori-#{version_part}windows-#{arch_n}.exe"
     else
-      raise Error.new("unsupported OS for gori release assets: #{os} (need linux or osx/darwin)")
+      raise Error.new("unsupported OS for gori release assets: #{os} (need linux, osx/darwin or windows)")
     end
   end
 
@@ -105,6 +118,8 @@ module Gori::Update
       "osx"
     {% elsif flag?(:linux) %}
       "linux"
+    {% elsif flag?(:win32) %}
+      "windows"
     {% else %}
       "unknown"
     {% end %}
@@ -234,9 +249,8 @@ module Gori::Update
     release.assets.find { |a| a.name == want }
   end
 
-  # Parse release JSON and pick the platform asset, or raise a clear Error.
-  def self.resolve_asset_from_json(json_body : String, os : String = current_os, arch : String = current_arch) : Asset
-    release = parse_release(json_body)
+  # Pick the platform asset, or raise a clear Error.
+  def self.resolve_asset(release : Release, os : String = current_os, arch : String = current_arch) : Asset
     if release.assets.empty?
       raise Error.new(
         "latest release #{release.tag_name} has no downloadable assets yet — see #{RELEASES_URL}"
@@ -258,7 +272,7 @@ module Gori::Update
   # is none to try (`asset` already IS the alias, or the release does not list one).
   #
   # A pure lookup on purpose: no URL is ever guessed here. The redirect path puts
-  # the alias into its synthesized list up front (see synthesize_release_json),
+  # the alias into its synthesized list up front (see synthesize_release),
   # with the digest from the same SHA256SUMS fetch that gave the versioned asset
   # its own — so the retry inherits a real URL and a real checksum instead of
   # reaching back out to the host that just failed us.

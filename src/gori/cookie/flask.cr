@@ -1,3 +1,5 @@
+require "crypto/subtle"
+
 module Gori
   module Cookie
     # Flask's `SecureCookieSessionInterface` cookie (itsdangerous ≥ 2.0):
@@ -63,48 +65,23 @@ module Gori
 
       def verify(cookie : String, secret : String, salt : String = SALT) : Bool
         p = parse(cookie)
-        Cookie.secure_compare(compute_sig(signing_input(p), secret, salt), p.signature)
+        Crypto::Subtle.constant_time_compare(compute_sig(signing_input(p), secret, salt), p.signature)
       end
 
       def crack(cookie : String, secrets, salt : String = SALT) : String?
         p = parse(cookie)
         input = signing_input(p)
-        secrets.each do |s|
-          return s if Cookie.secure_compare(compute_sig(input, s, salt), p.signature)
-        end
-        nil
-      end
-
-      # Re-sign the SAME payload + timestamp with `secret` — byte-identical to the input
-      # when the secret is correct (the round-trip invariant). Preserves compression.
-      def resign(cookie : String, secret : String, salt : String = SALT) : String
-        p = parse(cookie)
-        "#{p.payload_seg}.#{p.ts_seg}.#{compute_sig(signing_input(p), secret, salt)}"
+        Cookie.first_signing(secrets, p.signature) { |s| compute_sig(input, s, salt) }
       end
 
       # Mint a fresh cookie from a JSON payload + secret. The payload is emitted UNcompressed
       # (Flask only compresses when it saves bytes; the uncompressed form always verifies).
       # `timestamp` defaults are supplied by the caller so the engine stays deterministic.
       def forge(payload_json : String, secret : String, timestamp : Int64, salt : String = SALT) : String
-        payload_seg = Cookie.b64url(compact_json(payload_json))
+        payload_seg = Cookie.b64url(Cookie.compact_json(payload_json))
         ts_seg = Cookie.int_to_b64(timestamp)
         input = "#{payload_seg}.#{ts_seg}"
         "#{input}.#{compute_sig(input, secret, salt)}"
-      end
-
-      # The session JSON, pretty-printed — decompressing first when the segment is marked.
-      # "(undecodable payload)" when it doesn't base64url→JSON, mirroring jwt_decode.
-      def payload_pretty(p : Parsed) : String
-        JSON.parse(String.new(payload_bytes(p))).to_pretty_json
-      rescue
-        "(undecodable payload)"
-      end
-
-      def payload_bytes(p : Parsed) : Bytes
-        compressed = p.payload_seg.starts_with?('.')
-        seg = compressed ? p.payload_seg[1..] : p.payload_seg
-        raw = Cookie.b64decode(seg)
-        compressed ? Cookie.zlib_inflate(raw) : raw
       end
 
       def decode_text(cookie : String) : String
@@ -113,7 +90,7 @@ module Gori
         String.build do |io|
           io << "// format: flask (itsdangerous secure cookie)\n"
           io << "// payload" << (p.payload_seg.starts_with?('.') ? " (zlib-compressed)\n" : "\n")
-          io << payload_pretty(p) << "\n\n"
+          io << Cookie.payload_pretty(p.payload_seg) << "\n\n"
           io << "// timestamp: " << (ts ? Cookie.unix_to_s(ts) : "(invalid timestamp #{p.ts_seg.inspect})") << "\n"
           io << "// signature (not verified): " << p.signature
         end
@@ -124,26 +101,12 @@ module Gori
         JSON.build do |j|
           j.object do
             j.field "format", "flask"
-            j.field "payload" { j.raw(payload_json_or_null(p)) }
+            j.field "payload" { j.raw(Cookie.payload_json_or_null(p.payload_seg)) }
             j.field "compressed", p.payload_seg.starts_with?('.')
             j.field "timestamp", Cookie.b64_to_int?(p.ts_seg)
             j.field "signature", p.signature
           end
         end
-      end
-
-      # --- internals ----------------------------------------------------------
-
-      private def payload_json_or_null(p : Parsed) : String
-        JSON.parse(String.new(payload_bytes(p))).to_json
-      rescue
-        "null"
-      end
-
-      private def compact_json(json : String) : String
-        JSON.parse(json).to_json
-      rescue ex : JSON::ParseException
-        raise CookieError.new("invalid payload JSON: #{ex.message}")
       end
     end
   end

@@ -12,6 +12,14 @@ private def capture(store, host, method, target, status = nil)
   id
 end
 
+private def capture_typed(store, target, status, content_type)
+  id = capture(store, "t.test", "GET", target)
+  store.update_response(Gori::Store::CapturedResponse.new(
+    flow_id: id, status: status, content_type: content_type,
+    head: "HTTP/1.1 #{status} X\r\nContent-Type: #{content_type}\r\n\r\n".to_slice))
+  id
+end
+
 # One flow on a non-default port, in each of the two wire shapes gori captures. The plaintext
 # forward-proxy request arrives ABSOLUTE-form (its target carries the authority); the
 # CONNECT-tunnelled one arrives ORIGIN-form. Both are the same origin on the same port.
@@ -36,13 +44,13 @@ describe Gori::QL do
 
   it "compiles AND-ed terms with parameterised values" do
     f = Gori::QL.parse("host:acme status:>=500")
-    f.sql.should eq("(lower(host) LIKE ? ESCAPE '\\' AND status >= ?)")
+    f.sql.should eq("((host) LIKE ? ESCAPE '\\' AND status >= ?)")
     f.args.should eq(["%acme%", 500])
   end
 
   it "compiles a status class to a range" do
     f = Gori::QL.parse("status:4xx")
-    f.sql.should eq("((status >= ? AND status < ?))") # clause-wrap around the range term
+    f.sql.should eq("((+status >= ? AND +status < ?))") # clause-wrap around the range term
     f.args.should eq([400, 500])
     # Case-insensitively: `InterceptFilter` folds the value before its class test, so a colour
     # rule's `status:5XX` painted rows while the History query for the same string was DROPPED.
@@ -60,7 +68,7 @@ describe Gori::QL do
 
   it "escapes LIKE metacharacters so % and _ match literally" do
     f = Gori::QL.parse("host:ac%e_")
-    f.sql.should eq("(lower(host) LIKE ? ESCAPE '\\')")
+    f.sql.should eq("((host) LIKE ? ESCAPE '\\')")
     f.args.should eq(["%ac\\%e\\_%"]) # the user's % and _ are backslash-escaped
   end
 
@@ -69,7 +77,7 @@ describe Gori::QL do
     # change from the AST compiler; the predicate is identical). Every other clause
     # shape is byte-for-byte what the old flat parser emitted.
     f = Gori::QL.parse("method:get OR -host:cdn")
-    f.sql.should eq("(upper(method) = ? OR NOT (lower(host) LIKE ? ESCAPE '\\'))")
+    f.sql.should eq("(upper(method) = ? OR NOT ((host) LIKE ? ESCAPE '\\'))")
     f.args.should eq(["GET", "%cdn%"])
   end
 
@@ -83,7 +91,7 @@ describe Gori::QL do
     # just the value after the ':', so the prefix isn't silently dropped (and a typo
     # surfaces as a no-match rather than masquerading as a successful host filter).
     f = Gori::QL.parse("hosst:acme.test")
-    f.sql.should eq("((lower(method) LIKE ? ESCAPE '\\' OR lower(host) LIKE ? ESCAPE '\\' OR lower(target) LIKE ? ESCAPE '\\'))")
+    f.sql.should eq("(((method) LIKE ? ESCAPE '\\' OR (host) LIKE ? ESCAPE '\\' OR (target) LIKE ? ESCAPE '\\'))")
     f.args.should eq(["%hosst:acme.test%", "%hosst:acme.test%", "%hosst:acme.test%"])
   end
 
@@ -129,18 +137,22 @@ describe Gori::QL do
     Gori::QL.analyze("body:\u0001").clean?.should be_false
   end
 
-  it "falls back to a byte-wise blob scan for a body: value below the 3-char trigram floor" do
-    f = Gori::QL.parse("body:ab")
-    f.sql.should contain("COALESCE(instr(request_body, CAST(? AS BLOB)), 0) > 0")
-    f.sql.should contain("COALESCE(instr(response_body, CAST(? AS BLOB)), 0) > 0")
-    f.args.should eq(["ab", "ab", "aB", "aB", "Ab", "Ab", "AB", "AB"]) # every case spelling
+  it "compiles a body: value below the 3-char trigram floor like any other literal needle" do
+    # Only the INDEX has a length floor; the term itself does not change shape, so a short
+    # needle takes the very clause an index-free longer one takes — one NUL-transparent,
+    # NULL-guarded REGEXP per body column. It used to be an `instr` per ASCII case
+    # permutation per column (eight full-BLOB scans for two characters), which also folded
+    # case by a different rule at 1-2 characters than at 3.
+    short = Gori::QL.parse("body:ab")
+    short.sql.should eq(Gori::QL.parse("body:abc", fts: false).sql)
+    short.args.should eq(["(?i)ab", "(?i)ab"])
   end
 
   # The <3-char fallback used `CAST(request_body AS TEXT)`, which SQLite truncates at the first
   # NUL — so a needle sitting AFTER a NUL byte was invisible, a monotonicity violation (a
   # shorter needle matching fewer rows) that cannot be explained to an operator. This is a tool
-  # whose targets deliberately put NULs in bodies, so the short path is now byte-wise `instr`,
-  # which is NUL-transparent. Asserted against a real store because the bug lived in SQLite's
+  # whose targets deliberately put NULs in bodies, so the short path scans the raw bytes
+  # through SafeRegexp, which is NUL-transparent. Asserted against a real store because the bug lived in SQLite's
   # cast, not in the SQL text. (The FTS >=3-char path's handling of a NUL is the trigram
   # tokenizer's, which varies by SQLite build, so it is deliberately not pinned here — this
   # test targets the blob fallback that the fix actually changed.)
@@ -164,9 +176,10 @@ describe Gori::QL do
       store.search(Gori::QL.parse("body:nu"), 50).map(&.id).should eq([buried]) # still case-insensitive
       store.search(Gori::QL.parse("body:zz"), 50).map(&.id).should be_empty
 
-      # `-body:x` (negation) must KEEP a bodyless flow, not drop it. `instr(NULL,…)` is NULL and
-      # `NOT (NULL > 0)` is NULL, which SQLite excludes — so an un-COALESCE'd instr silently
-      # narrowed the negated form. `buried` has `NU`, `bodyless` has no body at all.
+      # `-body:x` (negation) must KEEP a bodyless flow, not drop it. An unguarded predicate
+      # over a NULL body yields NULL, and `NOT NULL` is NULL, which SQLite's three-valued
+      # logic EXCLUDES — a silent narrow of the negated form, which the clause's own
+      # `IS NOT NULL` guard is there to stop. `buried` has `NU`, `bodyless` has no body.
       bodyless = store.insert_flow(Gori::Store::CapturedRequest.new(
         created_at: 3_i64, scheme: "http", host: "acme.test", port: 80,
         method: "GET", target: "/none", http_version: "HTTP/1.1",
@@ -227,16 +240,15 @@ describe Gori::QL do
     f.args.should eq(["(?i)Set\\-Cookie", "(?i)Set\\-Cookie"])
   end
 
-  it "compiles a short header: needle via byte-wise instr (NUL-transparent)" do
+  it "compiles a short header: needle exactly like a long one" do
+    # `header:` has no index to fall off, so it never had a reason for a second spelling.
     f = Gori::QL.parse("header:ab")
-    # case permutations of "ab" → ab/aB/Ab/AB, each against request + response head
-    f.sql.includes?("instr(request_head").should be_true
-    f.sql.includes?("instr(response_head").should be_true
-    f.args.size.should eq(8)
+    f.sql.should eq(Gori::QL.parse("header:abc").sql)
+    f.args.should eq(["(?i)ab", "(?i)ab"])
   end
 
   it "matches header: past an embedded NUL in the stored head bytes" do
-    # CAST AS TEXT LIKE stopped at the first NUL; the REGEXP/instr path must not.
+    # CAST AS TEXT LIKE stopped at the first NUL; the SafeRegexp path must not.
     with_store do |store|
       head = "HTTP/1.1 200 OK\r\nX-Trace: a\u0000b\r\nSet-Cookie: sid=1\r\n\r\n".to_slice
       id = store.insert_flow(Gori::Store::CapturedRequest.new(
@@ -267,6 +279,30 @@ describe Gori::QL do
       rows.map(&.scheme).to_set.should eq({"http", "https"}.to_set)
       rows.map(&.url).to_set.should eq({"http://127.0.0.1:19316/x", "https://127.0.0.1:19316/x"}.to_set)
     end
+  end
+
+  # `path:` reads the PATH, not the raw target. A plaintext forward-proxy flow keeps its
+  # absolute-form target (P7), so `path~^/admin` missed it while `path:http` and `path:<port>`
+  # matched every such flow.
+  it "path: reads the origin-form path on BOTH wire shapes" do
+    with_store do |store|
+      abs = capture_on_port(store, "http", "127.0.0.1", 19316, "http://127.0.0.1:19316/admin/panel")
+      org = capture_on_port(store, "https", "127.0.0.1", 19316, "/admin/x")
+      qry = capture_on_port(store, "http", "acme.test", 80, "http://acme.test?next=/admin")
+      bare = capture_on_port(store, "http", "acme.test", 80, "HTTP://acme.test")
+
+      store.search(Gori::QL.parse("path~^/admin"), 50).map(&.id).sort!.should eq([abs, org])
+      store.search(Gori::QL.parse("path:19316"), 50).should be_empty
+      store.search(Gori::QL.parse("path:http"), 50).should be_empty
+      store.search(Gori::QL.parse("path~^/\\?next="), 50).map(&.id).should eq([qry])
+      store.search(Gori::QL.parse("path~^/$"), 50).map(&.id).should eq([bare])
+    end
+
+    # The in-memory twin (intercept / Rewriter filters) reads the same projection.
+    subject = Gori::InterceptFilter::Subject.new(
+      method: "GET", host: "127.0.0.1", target: "http://127.0.0.1:19316/admin/panel", scheme: "http")
+    Gori::InterceptFilter.new("path~^/admin").matches?(subject).should be_true
+    Gori::InterceptFilter.new("path:19316").matches?(subject).should be_false
   end
 
   # The other half of the same rule: a default port is NOT part of the canonical URL
@@ -330,7 +366,7 @@ describe Gori::QL do
   it "compiles the ~ operator to a REGEXP over text fields" do
     Gori::QL.parse("host~^api\\.").sql.should eq("(host REGEXP ?)")
     Gori::QL.parse("host~^api\\.").args.should eq(["^api\\."])
-    Gori::QL.parse("path~\\.json$").sql.should eq("(target REGEXP ?)")
+    Gori::QL.parse("path~\\.json$").sql.should eq("(#{Gori::QL::PATH_EXPR} REGEXP ?)")
     Gori::QL.parse("url~^https").sql.should eq(
       "((CASE WHEN lower(substr(target, 1, 7)) = 'http://' OR lower(substr(target, 1, 8)) = 'https://' " \
       "THEN target ELSE (scheme || '://' " \
@@ -374,7 +410,7 @@ describe Gori::QL do
     # must fall back to a free-text LIKE search, NOT compile to the never-match clause
     # (the validity guard only applies to real regex fields).
     f = Gori::QL.parse("foo~[")
-    f.sql.should eq("((lower(method) LIKE ? ESCAPE '\\' OR lower(host) LIKE ? ESCAPE '\\' OR lower(target) LIKE ? ESCAPE '\\'))")
+    f.sql.should eq("(((method) LIKE ? ESCAPE '\\' OR (host) LIKE ? ESCAPE '\\' OR (target) LIKE ? ESCAPE '\\'))")
     f.args.should eq(["%foo~[%", "%foo~[%", "%foo~[%"])
   end
 
@@ -409,28 +445,30 @@ describe Gori::QL do
   it "compiles proto: over BOTH WS transports (grpc either side, sse by response)" do
     Gori::QL.parse("proto:ws").sql.should eq(
       "(((status IS NOT NULL AND status = 101) OR " \
-      "(status IS NOT NULL AND status >= 200 AND status < 300 AND " \
+      "(status IS NOT NULL AND +status >= 200 AND +status < 300 AND " \
       "connect_protocol IS NOT NULL AND lower(connect_protocol) = 'websocket')))")
     Gori::QL.parse("proto:websocket").sql.should eq( # alias
 "(((status IS NOT NULL AND status = 101) OR " \
-"(status IS NOT NULL AND status >= 200 AND status < 300 AND " \
+"(status IS NOT NULL AND +status >= 200 AND +status < 300 AND " \
 "connect_protocol IS NOT NULL AND lower(connect_protocol) = 'websocket')))")
     Gori::QL.parse("proto:grpc").sql.should eq(
       "(((content_type IS NOT NULL AND lower(content_type) LIKE 'application/grpc%') OR " \
       "(request_content_type IS NOT NULL AND lower(request_content_type) LIKE 'application/grpc%')))")
     Gori::QL.parse("proto:sse").sql.should eq(
-      "((content_type IS NOT NULL AND lower(content_type) LIKE 'text/event-stream%'))")
+      "((content_type IS NOT NULL AND " \
+      "lower(trim(substr(content_type, 1, instr(content_type || ';', ';') - 1))) = 'text/event-stream'))")
     Gori::QL.parse("proto:ws").args.should be_empty
   end
 
   it "compiles proto:http as a NULL-safe negation (pending/typeless flows count as http)" do
     Gori::QL.parse("proto:http").sql.should eq(
       "(NOT ((status IS NOT NULL AND status = 101) OR " \
-      "(status IS NOT NULL AND status >= 200 AND status < 300 AND " \
+      "(status IS NOT NULL AND +status >= 200 AND +status < 300 AND " \
       "connect_protocol IS NOT NULL AND lower(connect_protocol) = 'websocket')) " \
       "AND NOT ((content_type IS NOT NULL AND lower(content_type) LIKE 'application/grpc%') OR " \
       "(request_content_type IS NOT NULL AND lower(request_content_type) LIKE 'application/grpc%')) " \
-      "AND NOT (content_type IS NOT NULL AND lower(content_type) LIKE 'text/event-stream%'))")
+      "AND NOT (content_type IS NOT NULL AND " \
+      "lower(trim(substr(content_type, 1, instr(content_type || ';', ';') - 1))) = 'text/event-stream'))")
   end
 
   it "drops an unknown proto: value (match-all EMPTY, not everything)" do
@@ -445,7 +483,7 @@ describe Gori::QL do
   it "compiles the transport spellings the PROTO column prints as protocol AND scheme" do
     Gori::QL.parse("proto:wss").sql.should eq(
       "((((status IS NOT NULL AND status = 101) OR " \
-      "(status IS NOT NULL AND status >= 200 AND status < 300 AND " \
+      "(status IS NOT NULL AND +status >= 200 AND +status < 300 AND " \
       "connect_protocol IS NOT NULL AND lower(connect_protocol) = 'websocket'))) " \
       "AND scheme = 'https')")
     Gori::QL.parse("proto:grpcs").sql.should eq(
@@ -453,7 +491,8 @@ describe Gori::QL do
       "(request_content_type IS NOT NULL AND lower(request_content_type) LIKE 'application/grpc%'))) " \
       "AND scheme = 'https')")
     Gori::QL.parse("proto:sses").sql.should eq(
-      "(((content_type IS NOT NULL AND lower(content_type) LIKE 'text/event-stream%')) " \
+      "(((content_type IS NOT NULL AND " \
+      "lower(trim(substr(content_type, 1, instr(content_type || ';', ';') - 1))) = 'text/event-stream')) " \
       "AND scheme = 'https')")
     Gori::QL.parse("proto:wss").args.should be_empty
   end
@@ -521,6 +560,10 @@ describe "Gori::Store#search (QL)" do
       store.update_response(Gori::Store::CapturedResponse.new(
         flow_id: sse, status: 200, content_type: "text/event-stream; charset=utf-8",
         head: "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n".to_slice))
+      prefix = capture(store, "acme.test", "GET", "/events-prefix")
+      store.update_response(Gori::Store::CapturedResponse.new(
+        flow_id: prefix, status: 200, content_type: "text/event-streaming",
+        head: "HTTP/1.1 200 OK\r\nContent-Type: text/event-streaming\r\n\r\n".to_slice))
       # Plain HTTP (typed) and a still-pending flow (NULL status + NULL content_type).
       html = capture(store, "acme.test", "GET", "/", 200)
       pending = capture(store, "acme.test", "GET", "/pending")
@@ -530,7 +573,7 @@ describe "Gori::Store#search (QL)" do
       def_ids.call("proto:grpc").should eq([grpc])
       def_ids.call("proto:sse").should eq([sse])
       # http = everything that is NOT ws/grpc/sse — including the NULL-column pending flow.
-      def_ids.call("proto:http").should eq([html, pending].sort)
+      def_ids.call("proto:http").should eq([html, pending, prefix].sort)
       # Negation is NULL-safe too: -proto:grpc keeps the pending (NULL content_type) flow.
       def_ids.call("-proto:grpc").includes?(pending).should be_true
     end
@@ -637,7 +680,7 @@ describe "Gori::Store#search (QL)" do
       ids.call("resp.body:secrettoken").should eq([resp_side])
       ids.call("res.body:secrettoken").should eq([resp_side]) # `res.` is a synonym of `resp.`
 
-      # a short needle takes the byte-wise `instr` path instead of the index — same scoping
+      # a short needle scans the stored bytes instead of the index — same scoping
       ids.call("req.body:se").should eq([req_side])
       ids.call("resp.body:se").should eq([resp_side])
 
@@ -848,10 +891,50 @@ describe "Gori::Store#search (QL)" do
       Gori::QL.field_shaped?("status", "500").should be_true
       Gori::QL.field_shaped?("dur", "5").should be_true
     end
+
+    it "treats id:N / flow:N / flow_id:N as field-shaped, keeping api:3000 as host:port" do
+      Gori::QL.field_shaped?("id", "1").should be_true
+      Gori::QL.field_shaped?("flow", "1").should be_true
+      Gori::QL.field_shaped?("flow_id", "1").should be_true
+      Gori::QL.field_shaped?("api", "3000").should be_false
+      Gori::QL.fields_used("id:1").map(&.name).should eq(["id"])
+      Gori::QL.fields_used("flow:42").map(&.name).should eq(["flow"])
+      Gori::QL.fields_used("flow_id:100").map(&.name).should eq(["flow_id"])
+    end
+
+    # The SHAPE question is asked without the operator, and that division is load-bearing:
+    # `status~404` names a field QL has under `:` and not under `~`, so the term is DROPPED and
+    # the bar owes it the muted colour. Asking the shape question with the operator made the
+    # name unknown, the value port-shaped, the suggester silent (the name IS known) — and the
+    # whole token came back as plain text that would be searched.
+    it "keeps a known name under the wrong operator field-shaped" do
+      %w[status size dur respsize].each do |f|
+        Gori::QL::FIELD_SHAPED.call(f, '~', "404").should be_true, f
+      end
+    end
+
+    # `FIELD_SHAPED` is the same predicate in the shape the span highlighter takes, and its
+    # whole job is to keep the BAR and the REFUSALS reading one query the same way: whatever
+    # `fields_used` reports as naming a field is what the bar may paint as one.
+    it "agrees with fields_used about which tokens name a field at all" do
+      {
+        "host:api"           => true,
+        "hsot:api"           => true,
+        "resp.body:x"        => true,
+        "http://acme.test/x" => false,
+        "acme.test:8443"     => false,
+        "localhost:8080"     => false,
+        "12:34"              => false,
+      }.each do |token, names_a_field|
+        name, _, value = token.partition(':')
+        Gori::QL::FIELD_SHAPED.call(name, ':', value).should eq(names_a_field), token
+        Gori::QL.fields_used(token).empty?.should eq(!names_a_field), token
+      end
+    end
   end
 
   # A substring field folds BOTH sides — needle and haystack — and folding is only a fold if it
-  # covers the whole alphabet. SQLite's built-in `lower()` is ASCII-only, so `lower(target) LIKE
+  # covers the whole alphabet. SQLite's own LIKE fold is ASCII-only, so `target LIKE
   # '%überweisung%'` left the haystack's `Ü` uppercase and answered nothing; a non-ASCII needle
   # takes `gori_ci_contains` (Crystal's `downcase.includes?` as a UDF) instead.
   it "folds a non-ASCII needle on both sides for path:, url: and free text" do
@@ -881,7 +964,7 @@ describe "Gori::Store#search (QL)" do
     end
   end
 
-  # The ASCII needle keeps the native `lower(col) LIKE ?` path, so the LIKE-metacharacter
+  # The ASCII needle keeps the native `col LIKE ?` path, so the LIKE-metacharacter
   # escaping that path depends on must still hold over real rows, not just in the compiled SQL.
   it "still treats a literal % / _ in the needle literally" do
     with_store do |store|
@@ -1044,6 +1127,40 @@ describe "Gori::Store#search (QL)" do
     end
   end
 
+  describe ".reject_empty_reason" do
+    it "reports which term is wrong and why for an invalid status query with unclosed paren" do
+      reason = Gori::QL.reject_empty_reason("status:>=abc AND (")
+      reason.should_not be_nil
+      reason.not_nil!.should contain("`status:>=abc`")
+      reason.not_nil!.should contain("status expects a number or class (e.g. 200, 5xx)")
+    end
+
+    it "reports which term is wrong and why for other dropped field terms" do
+      Gori::QL.reject_empty_reason("dur:>abc AND (").not_nil!.should contain("`dur:>abc`")
+      Gori::QL.reject_empty_reason("dur:>abc AND (").not_nil!.should contain("duration expects a number or unit")
+      Gori::QL.reject_empty_reason("size:>abc AND (").not_nil!.should contain("`size:>abc`")
+      Gori::QL.reject_empty_reason("size:>abc AND (").not_nil!.should contain("size expects a number")
+      Gori::QL.reject_empty_reason("proto:xyz").not_nil!.should contain("proto expects #{Gori::QL::PROTO_VALUES.join(", ")}")
+      Gori::QL.reject_empty_reason("cache:xyz").not_nil!.should contain("cache expects #{Gori::QL::CACHE_VALUES.join(", ")}")
+      Gori::QL.reject_empty_reason("status~5..").not_nil!.should contain("regex matching (`~`) not supported for `status`")
+      Gori::QL.reject_empty_reason("resp.status:200").not_nil!.should contain("side prefix not supported on status")
+      Gori::QL.reject_empty_reason("req.status:200").not_nil!.should contain("side prefix not supported on status")
+      Gori::QL.reject_empty_reason("id:1").not_nil!.should contain("QL has no `id:` field")
+    end
+
+    it "asserts the src message names every FlowSource token" do
+      reason = Gori::QL.dropped_term_reason("src:bad").not_nil!
+      Gori::FlowSource::Kind.tokens.each do |token|
+        reason.should contain(token)
+      end
+      reason.should contain("gori")
+    end
+
+    it "returns nil when there are no terms to diagnose" do
+      Gori::QL.reject_empty_reason("AND (").should be_nil
+    end
+  end
+
   describe ".invalid_regex_terms" do
     it "flags a regex term whose pattern does not compile" do
       Gori::QL.invalid_regex_terms("host:h body~[bad").should eq(["body~[bad"])
@@ -1098,7 +1215,7 @@ describe "Gori::Store#search (QL)" do
     # and it is what the QL reference documents. Pinned so a future change is deliberate.
     it "drops a bad numeric term inside a NOT group and negates the survivor" do
       dropped = Gori::QL.parse("NOT (host:x AND size:>bogus)")
-      dropped.sql.should eq("(NOT (lower(host) LIKE ? ESCAPE '\\'))")
+      dropped.sql.should eq("(NOT ((host) LIKE ? ESCAPE '\\'))")
       dropped.args.should eq(["%x%"])
       dropped.sql.should eq(Gori::QL.parse("NOT host:x").sql) # bad token vanished entirely
       # analyze still SURFACES the drop even when nested under NOT
@@ -1106,7 +1223,7 @@ describe "Gori::Store#search (QL)" do
     end
 
     it "collapses an OR whose only other term dropped (the OR does nothing)" do
-      Gori::QL.parse("host:x OR size:>bogus").sql.should eq("(lower(host) LIKE ? ESCAPE '\\')")
+      Gori::QL.parse("host:x OR size:>bogus").sql.should eq("((host) LIKE ? ESCAPE '\\')")
     end
 
     # The asymmetry that makes this LOOK inconsistent: an INVALID REGEX does NOT drop —
@@ -1116,7 +1233,7 @@ describe "Gori::Store#search (QL)" do
     # hard-errors on in the MCP layer.
     it "keeps an invalid-regex term as a never-match clause inside NOT (does not drop)" do
       f = Gori::QL.parse("NOT (host:x AND body~[bad)")
-      f.sql.should eq("(NOT ((lower(host) LIKE ? ESCAPE '\\' AND 0)))")
+      f.sql.should eq("(NOT (((host) LIKE ? ESCAPE '\\' AND 0)))")
       f.args.should eq(["%x%"])
     end
   end
@@ -1126,16 +1243,16 @@ describe "Gori::Store#search (QL)" do
     # binds tighter, so the two queries below are genuinely different predicates.
     it "binds AND tighter than OR unless parenthesised" do
       loose = Gori::QL.parse("host:a OR host:b status:301")
-      loose.sql.should eq("(lower(host) LIKE ? ESCAPE '\\' OR " \
-                          "(lower(host) LIKE ? ESCAPE '\\' AND status = ?))")
+      loose.sql.should eq("((host) LIKE ? ESCAPE '\\' OR " \
+                          "((host) LIKE ? ESCAPE '\\' AND status = ?))")
       grouped = Gori::QL.parse("(host:a OR host:b) status:301")
-      grouped.sql.should eq("((lower(host) LIKE ? ESCAPE '\\' OR lower(host) LIKE ? ESCAPE '\\') " \
+      grouped.sql.should eq("(((host) LIKE ? ESCAPE '\\' OR (host) LIKE ? ESCAPE '\\') " \
                             "AND status = ?)")
     end
 
     it "negates a whole group with NOT" do
       f = Gori::QL.parse("NOT (host:a OR host:b)")
-      f.sql.should eq("(NOT ((lower(host) LIKE ? ESCAPE '\\' OR lower(host) LIKE ? ESCAPE '\\')))")
+      f.sql.should eq("(NOT (((host) LIKE ? ESCAPE '\\' OR (host) LIKE ? ESCAPE '\\')))")
       f.args.should eq(["%a%", "%b%"])
     end
 
@@ -1145,7 +1262,7 @@ describe "Gori::Store#search (QL)" do
 
     it "keeps a quoted value in one term, spaces included" do
       f = Gori::QL.parse(%(host:"my host"))
-      f.sql.should eq("(lower(host) LIKE ? ESCAPE '\\')")
+      f.sql.should eq("((host) LIKE ? ESCAPE '\\')")
       f.args.should eq(["%my host%"])
     end
 
@@ -1174,7 +1291,7 @@ describe "Gori::Store#search (QL)" do
 
     it "drops an unrecognised src: value instead of guessing, like proto:/status:" do
       Gori::QL.analyze("src:browser").ignored.should_not be_empty
-      Gori::QL.parse("src:browser host:a").sql.should eq("(lower(host) LIKE ? ESCAPE '\\')")
+      Gori::QL.parse("src:browser host:a").sql.should eq("((host) LIKE ? ESCAPE '\\')")
     end
 
     it "matches a pre-V17 flow in NEITHER direction" do
@@ -1206,12 +1323,148 @@ describe "Gori::Store#search (QL)" do
       end
     end
 
+    it "compiles static: to the static_asset column, with stub:'s spellings" do
+      Gori::QL.parse("static:true").sql.should eq("(static_asset = 1)")
+      Gori::QL.parse("static:off").sql.should eq("(static_asset = 0)")
+      # The lens is the exact predicate idx_flows_sitemap_nonstatic is partial on.
+      Gori::QL.hide_static.sql.should eq("static_asset = 0")
+      Gori::QL.analyze("static:maybe").ignored.should_not be_empty
+      Gori::QL.parse("static:maybe host:a").sql.should eq("((host) LIKE ? ESCAPE '\\')")
+      # `~` on a predicate is dropped, not free-texted.
+      Gori::QL.analyze("static~true").ignored.should_not be_empty
+    end
+
+    it "splits captured flows into static assets and the rest, NULL-free in both directions" do
+      with_store do |store|
+        png = capture_typed(store, "/logo.png", 200, "image/png")
+        font = capture_typed(store, "/f.woff2", 200, "font/woff2")
+        cached = capture(store, "t.test", "GET", "/hero.jpg?v=2", 304) # no Content-Type
+        missing = capture_typed(store, "/gone.png", 404, "image/png")
+        svg = capture_typed(store, "/icon.svg", 200, "image/svg+xml")
+        api = capture_typed(store, "/api/me", 200, "application/json; charset=utf-8")
+        pending = capture(store, "t.test", "GET", "/api/slow")
+
+        store.search(Gori::QL.parse("static:true"), 50).map(&.id).sort!.should eq([png, font, cached].sort!)
+        rest = [missing, svg, api, pending].sort!
+        store.search(Gori::QL.parse("static:false"), 50).map(&.id).sort!.should eq(rest)
+        store.search(Gori::QL.parse("-static:true"), 50).map(&.id).sort!.should eq(rest)
+        store.search(Gori::QL.hide_static, 50).map(&.id).sort!.should eq(rest)
+        store.search(Gori::QL.and(Gori::QL.parse("path:/api"), Gori::QL.hide_static), 50)
+          .map(&.id).sort!.should eq([api, pending].sort!)
+      end
+    end
+
     it "leaves a parenthesis inside a value literal (no escaping needed)" do
       # Regression guard: `path:/a(b)` parsed as one token before the grammar grew
       # parens, and must keep doing so.
       f = Gori::QL.parse("path:/a(b)")
-      f.sql.should eq("(lower(target) LIKE ? ESCAPE '\\')")
+      f.sql.should eq("((#{Gori::QL::PATH_EXPR}) LIKE ? ESCAPE '\\')")
       f.args.should eq(["%/a(b)%"])
     end
+  end
+
+  # --- cache: (#1247) -------------------------------------------------------------------------
+  describe "cache:" do
+    it "compiles to the gori_cache_status UDF over response_head" do
+      f = Gori::QL.parse("cache:hit")
+      f.sql.should eq("(gori_cache_status(response_head) = ?)")
+      f.args.should eq(["hit"])
+    end
+
+    it "documents Age: 0 and field-limited private as none, the way the classifier reads them" do
+      # The reference is what MCP `ql_reference` serves; it must not promise `cache:miss` for a
+      # response the classifier calls `none`.
+      ref = Gori::QL::REFERENCE
+      para = ref[ref.index!("Cache: cache:hit")...ref.index!("Regex (~):")]
+      miss = para[para.index!("`miss` =")...para.index!("`dynamic` =")]
+      miss.should_not contain("Age: 0")
+      none = para[para.index!("`none` =")..]
+      none.should contain("Age: 0")
+      none.should contain("private=")
+      none.should contain("does not recognise")
+      Gori::CacheStatus.classify("HTTP/1.1 200 OK\r\nAge: 0\r\n\r\n".to_slice).should eq(Gori::CacheStatus::Signal::None)
+    end
+
+    it "case-normalises the value" do
+      Gori::QL.parse("cache:HIT").should eq(Gori::QL.parse("cache:hit"))
+      Gori::QL.parse("cache:Dynamic").should eq(Gori::QL.parse("cache:dynamic"))
+    end
+
+    it "accepts every value in its vocabulary and drops an unknown one" do
+      Gori::QL::CACHE_VALUES.each do |v|
+        Gori::QL.parse("cache:#{v}").sql.should eq("(gori_cache_status(response_head) = ?)")
+      end
+      # `cache:yes` is a bad value — DROPPED (matches everything is the wrong reading), same as
+      # `proto:zzz`. An all-dropped query folds to EMPTY.
+      Gori::QL.parse("cache:yes").should eq(Gori::QL::EMPTY)
+    end
+
+    it "selects flows by their response cache headers, end to end through the UDF" do
+      with_store do |store|
+        hit = capture(store, "acme.test", "GET", "/a")
+        store.update_response(Gori::Store::CapturedResponse.new(
+          flow_id: hit, status: 200, head: "HTTP/1.1 200 OK\r\nX-Cache: HIT\r\nAge: 30\r\n\r\n".to_slice))
+        miss = capture(store, "acme.test", "GET", "/b")
+        store.update_response(Gori::Store::CapturedResponse.new(
+          flow_id: miss, status: 200, head: "HTTP/1.1 200 OK\r\nX-Cache: MISS\r\n\r\n".to_slice))
+        dyn = capture(store, "acme.test", "GET", "/c")
+        store.update_response(Gori::Store::CapturedResponse.new(
+          flow_id: dyn, status: 200, head: "HTTP/1.1 200 OK\r\nCache-Control: no-store\r\n\r\n".to_slice))
+        plain = capture(store, "acme.test", "GET", "/d")
+        store.update_response(Gori::Store::CapturedResponse.new(
+          flow_id: plain, status: 200, head: "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n".to_slice))
+        pending = capture(store, "acme.test", "GET", "/e") # never got a response
+        store.flush
+
+        store.search(Gori::QL.parse("cache:hit"), 50).map(&.id).should eq([hit])
+        store.search(Gori::QL.parse("cache:miss"), 50).map(&.id).should eq([miss])
+        store.search(Gori::QL.parse("cache:dynamic"), 50).map(&.id).should eq([dyn])
+        # `none` = no cache headers OR no response yet — so both the plain flow and the pending
+        # one, newest first.
+        store.search(Gori::QL.parse("cache:none"), 50).map(&.id).sort!.should eq([plain, pending].sort!)
+      end
+    end
+
+    it "negates and groups like any other term" do
+      with_store do |store|
+        hit = capture(store, "acme.test", "GET", "/a")
+        store.update_response(Gori::Store::CapturedResponse.new(
+          flow_id: hit, status: 200, head: "HTTP/1.1 200 OK\r\nCF-Cache-Status: HIT\r\n\r\n".to_slice))
+        miss = capture(store, "acme.test", "GET", "/b")
+        store.update_response(Gori::Store::CapturedResponse.new(
+          flow_id: miss, status: 200, head: "HTTP/1.1 200 OK\r\nCF-Cache-Status: MISS\r\n\r\n".to_slice))
+        store.flush
+
+        store.search(Gori::QL.parse("-cache:hit"), 50).map(&.id).should contain(miss)
+        store.search(Gori::QL.parse("-cache:hit"), 50).map(&.id).should_not contain(hit)
+      end
+    end
+  end
+end
+
+describe "Gori::QL.missing_colon_hint" do
+  it "names the colon form of a comparison typed without one" do
+    Gori::QL.missing_colon_hint("status>=400")
+      .should eq("`status>=400` is searched as text — did you mean `status:>=400`?")
+    Gori::QL.missing_colon_hint("host:api dur>500ms").not_nil!.should contain("`dur:>500ms`")
+    Gori::QL.missing_colon_hint("Status<500").not_nil!.should contain("`status:<500`")
+    Gori::QL.missing_colon_hint("host=api.test").not_nil!.should contain("`host:api.test`")
+    Gori::QL.missing_colon_hint("method!=GET").not_nil!.should contain("`-method:GET`")
+    Gori::QL.missing_colon_hint("resp.size>=1k").not_nil!.should contain("`resp.size:>=1k`")
+  end
+
+  it "stays quiet on everything else" do
+    Gori::QL.missing_colon_hint("status:>=400").should be_nil   # a real field term
+    Gori::QL.missing_colon_hint(%("status>=400")).should be_nil # quoted: typed on purpose
+    Gori::QL.missing_colon_hint("-status>=400").should be_nil   # an exclude
+    Gori::QL.missing_colon_hint("NOT status>=400").should be_nil
+    Gori::QL.missing_colon_hint("stauts>=400").should be_nil # unknown field
+    Gori::QL.missing_colon_hint("a=b").should be_nil
+    Gori::QL.missing_colon_hint("status>=").should be_nil
+    Gori::QL.missing_colon_hint("admin").should be_nil
+  end
+
+  it "does not change what the query compiles to" do
+    Gori::QL.parse("status>=400").sql.should_not contain("status >=")
   end
 end

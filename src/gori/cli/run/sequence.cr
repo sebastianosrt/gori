@@ -7,8 +7,7 @@ module Gori
         {"sequence (seq)", "Analyze token randomness (collect via replay, or --tokens FILE)"},
       ])]
       private def self.cmd_sequence(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         flow_id : Int64? = nil
         request_file : String? = nil
         tokens_file : String? = nil
@@ -30,7 +29,6 @@ module Gori
         allow_unscoped = false
         bind_from : Int64? = nil
         slot : String? = nil
-        positional = [] of String
 
         set_loc = ->(k : Sequencer::ExtractKind, v : String) {
           abort "gori run sequence: pick ONE token location (--cookie/--header/--regex/--position/--jsonpath)" if kind
@@ -38,19 +36,22 @@ module Gori
           selector = v
         }
 
-        parser = OptionParser.new do |p|
+        positional = parse_args(args, "gori run sequence") do |p|
           p.banner = "Usage: gori run sequence [<flow-id>] [options]"
           p.on("--flow=ID", "Seed the request from a captured flow (live replay)") { |v| flow_id = parse_flow_id(v, "gori run sequence") }
           p.on("--request=FILE", "Read a raw HTTP request to replay (live)") { |v| request_file = v }
-          p.on("--tokens=FILE", "Analyze pasted tokens (one per line; '-' = stdin) — no network") { |v| tokens_file = v }
-          p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
+          p.on("--tokens=FILE", "Analyze pasted tokens (one per line; '-' = stdin, which needs a pipe or a redirect — a terminal is refused) — no network") { |v| tokens_file = v }
+          project_options(p, proj, "read")
           p.on("--target=URL", "Origin (scheme://host[:port]); required for --request/stdin") { |v| target_override = v }
           p.on("--http2", "Force HTTP/2") { force_h2 = true }
           p.on("--sni=HOST", "TLS SNI override") { |v| sni = v }
           p.on("-k", "--insecure-upstream", "Do not verify upstream TLS certificates") { insecure = true }
-          p.on("--cookie=NAME", "Extract the token from a Set-Cookie value by name") { |v| set_loc.call(Sequencer::ExtractKind::Cookie, v) }
-          p.on("--header=NAME", "Extract the token from a response header") { |v| set_loc.call(Sequencer::ExtractKind::Header, v) }
+          # `--token-cookie`/`--token-header` (#1389): `--cookie`/`--header` SEND one on `send` and
+          # `repeater`; here they name where the token is READ from. The short forms stay.
+          p.on("--token-cookie=NAME", "Extract the token from a Set-Cookie value by name (alias: --cookie)") { |v| set_loc.call(Sequencer::ExtractKind::Cookie, v) }
+          p.on("--token-header=NAME", "Extract the token from a response header (alias: --header)") { |v| set_loc.call(Sequencer::ExtractKind::Header, v) }
+          p.on("--cookie=NAME", "Alias for --token-cookie") { |v| set_loc.call(Sequencer::ExtractKind::Cookie, v) }
+          p.on("--header=NAME", "Alias for --token-header") { |v| set_loc.call(Sequencer::ExtractKind::Header, v) }
           p.on("--regex=RE", "Extract the token via regex capture group 1 over the body") { |v| set_loc.call(Sequencer::ExtractKind::Regex, v) }
           p.on("--position=A:B", "Extract a fixed byte range of the body") { |v| set_loc.call(Sequencer::ExtractKind::Position, v) }
           p.on("--jsonpath=EXPR", "Extract the token from a JSON body path ($.a.b[0])") { |v| set_loc.call(Sequencer::ExtractKind::JsonPath, v) }
@@ -62,16 +63,12 @@ module Gori
           p.on("--timeout=SEC", "Per-request connect + idle timeout (seconds)") { |v| timeout = parse_count(v, "--timeout").seconds }
           p.on("--retries=N", "Retries on a network error") { |v| retries = parse_nonneg(v, "--retries") }
           p.on("--max-requests=N", "Hard cap on total requests sent") { |v| max_requests = parse_count(v, "--max-requests").to_i64 }
-          p.on("--bind-from=FLOW-ID", "Replay this captured flow FIRST so its response fills session bindings ($NAME)") { |v| bind_from = parse_flow_id(v, "gori run sequence") }
-          p.on("--slot=NAME", "Send as this SESSION SLOT — its header overlay, and its binding table for $NAME") { |v| slot = v.strip }
+          p.on("--bind-from=FLOW-ID", "Replay this captured flow FIRST so its response fills session bindings ($BIND.NAME; bare syntax: $NAME)") { |v| bind_from = parse_flow_id(v, "gori run sequence") }
+          p.on("--slot=NAME", "Send as this SESSION SLOT — its header overlay, and its binding table for $BIND.NAME tokens (bare syntax: $NAME)") { |v| slot = v.strip }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
-          p.on("--format=FMT", "Output: text (default) | json | jsonl | markdown") { |v| format = parse_format(v, [:text, :json, :jsonl, :markdown]) }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = before + after }
-          p.invalid_option { |f| abort "gori run sequence: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run sequence: missing value for #{f}" }
+          format_flag(p, [:text, :json, :jsonl, :markdown], "Output: text (default) | json | jsonl | markdown") { |f| format = f }
         end
-        parser.parse(args)
+        refresh_verify_upstream(!insecure)
 
         # Manual mode — analyze a token list, no network.
         if tf = tokens_file
@@ -115,8 +112,8 @@ module Gori
         # only GLOBAL vars would resolve — a `$TOKEN` defined in the project would go out
         # literally. Explicit and identical to cmd_fuzz, rather than relying on the store that
         # `cli_host_overrides` happens to open below (see run.cr's open_store).
-        hydrate_project_env(project_name, db_path) if project_name || db_path
-        bytes, default_target, src_h2, evidence = sequence_source(flow_id, request_file, project_name, db_path)
+        hydrate_project_env(proj.name, proj.db) if proj.name || proj.db
+        bytes, default_target, src_h2, evidence = sequence_source(flow_id, request_file, proj.name, proj.db)
         token_loc = build_token_loc(k, selector)
 
         config = Sequencer::Config.new(mode: Sequencer::Mode::LiveReplay, token_loc: token_loc, goal: count, concurrency: concurrency)
@@ -132,7 +129,7 @@ module Gori
           evidence: evidence, default_target: default_target,
           target: target_override, http2: force_h2 || src_h2, config: config,
           verify: !insecure, sni: sni,
-          overrides: cli_host_overrides(project_name, db_path, flow_id))
+          overrides: cli_host_overrides(proj.name, proj.db, flow_id))
         # Scope gate — see cmd_fuzz / optional_project_outbound: refuse an out-of-scope host unless
         # --allow-unscoped, and enforce Sandbox + exclude rules on every send. (The
         # --tokens path returned above without touching the network, so it needs none.)
@@ -143,7 +140,7 @@ module Gori
         # seed one identity and send as another.
         activate_slot(slot, "gori run sequence")
         preflight_bind_from(bind_from, "gori run sequence")
-        outbound = optional_project_outbound(project_name, db_path, flow_id, allow_unscoped)
+        outbound = optional_project_outbound(proj.name, proj.db, flow_id, allow_unscoped)
         plan = begin
           Sequencer::Plan.build(options, outbound)
         rescue ex : Sequencer::PlanError
@@ -160,7 +157,7 @@ module Gori
           # See CLI::Run.seed_bindings — a headless process holds no binding from a previous
           # invocation, so `--bind-from` replays one here. Without it a `$NAME` simply ships
           # literally (see `Env.unbound`); there is nothing left to refuse before the run.
-          (fid = bind_from) && seed_bindings(fid, project_name, db_path, outbound, insecure, "gori run sequence")
+          (fid = bind_from) && seed_bindings(fid, proj.name, proj.db, outbound, insecure, "gori run sequence")
           run_sequence_stream(plan.engine, origin.scheme, origin.host, origin.port, token_loc, plan.goal, format)
         ensure
           outbound.close
@@ -219,6 +216,8 @@ module Gori
           "could not determine a target host"
         in Sequencer::PlanError::Reason::NoTokenLoc
           "token location selector is empty"
+        in Sequencer::PlanError::Reason::BadPosition
+          "--position #{ex.detail} extracts nothing — B must be greater than A"
         in Sequencer::PlanError::Reason::NoTokens
           # Unreachable here: --tokens is handled above and never builds a plan.
           "no tokens to analyze"
@@ -228,12 +227,15 @@ module Gori
       end
 
       private def self.read_token_list(file : String) : Array(String)
-        raw = read_input_file(file, "gori run sequence", stdin: true)
+        raw = read_input_file(file, "gori run sequence", stdin: true, noun: "token list",
+          flag: "--tokens=-")
         # Token lists are usually text, but a stray non-UTF-8 byte (0xff/0xfe) makes the
         # PCRE2 regex split raise "Regex match error: UTF-8 error" and kill the run. Scrub
         # to valid UTF-8 first (bad bytes → U+FFFD) so a lone junk byte doesn't abort the
         # whole analysis; a normal UTF-8 file is unchanged.
-        raw.scrub.split(/\r?\n/).map(&.strip).reject(&.empty?)
+        # A leading BOM (a Windows editor's UTF-8 save) would otherwise ride on the first
+        # token and turn a fixed-length hex sample into a variable-length binary one.
+        raw.scrub.lchop('\uFEFF').split(/\r?\n/).map(&.strip).reject(&.empty?)
       end
 
       private def self.build_token_loc(kind : Sequencer::ExtractKind, selector : String) : Sequencer::TokenLoc
@@ -261,11 +263,8 @@ module Gori
         if file = request_file
           {read_input_file(file, "gori run sequence").to_slice, nil, false, false}
         elsif id = flow_id
-          store = open_store(resolve_read_project(project_name, db_path))
-          detail = begin
+          detail = with_store(resolve_read_project(project_name, db_path)) do |store|
             store.get_flow(id)
-          ensure
-            store.close
           end
           abort "gori run sequence: no flow ##{id}" unless detail
           built = Repeater::FlowRequest.build(detail)
@@ -275,7 +274,7 @@ module Gori
             "replay it with `gori run repeater #{id} --keep-request-line` to keep it")
           {built.bytes, built.target, built.http2, true}
         elsif !STDIN.tty?
-          {STDIN.gets_to_end.to_slice, nil, false, false}
+          {read_stdin_fallback(STDIN, "gori run sequence", "request").to_slice, nil, false, false}
         else
           abort "gori run sequence: no source — give a <flow-id>, --request FILE, or pipe a request on stdin"
         end
@@ -293,6 +292,7 @@ module Gori
         # `engine.run` return normally and the report below covers the interrupted path too.
         interrupted = Run.install_interrupt_trap("sequence-interrupt",
           "interrupted — stopping and reporting on what was collected…") { engine.stop }
+        say_request_line_rewrite # the run is about to send it — see `warn_request_line_rewrite`
         engine.run do |ev|
           case ev
           when Sequencer::SampleEvent
@@ -320,6 +320,13 @@ module Gori
         # still exits 0. Mirrors `gori run fuzz`'s #410 backstop and mine's above.
         if tokens.empty? && (reason = engine.first_error)
           STDERR.puts "sequence: every replay failed — #{reason}"
+          exit 1
+        end
+        # Replies came back but none carried a token where the locator looked: the CRITICAL
+        # "no usable tokens" report above rates the locator, not the generator, so it is not
+        # a result a script may read as one.
+        if tokens.empty?
+          STDERR.puts "sequence: no response carried a token at #{loc.label} — check the locator"
           exit 1
         end
       end

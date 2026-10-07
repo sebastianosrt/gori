@@ -31,29 +31,27 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     end
   end
 
-  def activity_filter_source : Nil
-    project_controller.activity_filter_source
+  # `y` on the feed — the copy reflex 24 other scopes answer, on a pane that had no copy at
+  # all. One event, one line (`ProjectView.act_copy_line`): an event is a sentence about
+  # something that already happened, so there is nothing here to copy "as" and no selection
+  # model to build — which is why this is a bare verb and not a `read_copy` pane.
+  def activity_copy : Nil
+    unless row = project_controller.view.activity_selected_row
+      @toast = "no event selected"
+      return
+    end
+    text = ProjectView.act_copy_line(row)
+    written = Clipboard.copy(text)
+    @toast = "copied event (#{written}b)#{Clipboard.note(written, text)}"
   end
 
-  def activity_filter_level : Nil
-    project_controller.activity_filter_level
-  end
-
-  def activity_filter_actor : Nil
-    project_controller.activity_filter_actor
-  end
-
-  def activity_clear_filters : Nil
-    project_controller.activity_clear_filters
-  end
-
-  def activity_find : Nil
-    project_controller.activity_find
-  end
-
-  def activity_refresh : Nil
-    project_controller.activity_refresh
-  end
+  forward activity_filter_source : Nil,
+    activity_filter_level : Nil,
+    activity_filter_actor : Nil,
+    activity_clear_filters : Nil,
+    activity_find : Nil,
+    activity_refresh : Nil,
+    to: project_controller
 
   # DESTRUCTIVE, and the prompt has to say which record is going. `c` in the notification
   # center empties a hundred in-memory notes; `c` here deletes the durable log of what every

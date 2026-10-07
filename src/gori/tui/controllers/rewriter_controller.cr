@@ -6,6 +6,8 @@ require "../../store"
 require "../../rules"
 require "../../proxy/upstream"
 require "../viewport"
+require "../row_filter"
+require "../../plural"
 
 module Gori::Tui
   # The Rewriter tab: manage the project's Match & Replace rules (the shared Rules engine
@@ -42,6 +44,7 @@ module Gori::Tui
       @last_body = Rect.new(0, 0, 0, 0) # last content rect — click/wheel geometry
       # The host the last transform scoped rules on — see `preview_host`.
       @preview_host = ""
+      @filter = RowFilter.new # the RULES list's `/` bar
     end
 
     def tab : Symbol
@@ -71,8 +74,50 @@ module Gori::Tui
       @host.session.bindings
     end
 
+    # The FILTERED list — what the RULES card shows and what `@sel` indexes. `rules_engine.rules`
+    # stays the source of truth for everything that writes, and every mutation below acts on the
+    # selected rule's ID, so a narrowing cannot send one to the wrong row. Reordering is the
+    # exception and `rewriter_move` refuses it while a query is held.
     private def rule_list : Array(Store::MatchRule)
-      rules_engine.rules
+      return rules_engine.rules unless @filter.active?
+      rules_engine.rules.select { |r| @filter.matches?(rule_haystack(r)) }
+    end
+
+    # What a row shows: the name, both halves of the rewrite, where it applies and its scope.
+    private def rule_haystack(rule : Store::MatchRule) : String
+      "#{rule.name} #{rule.pattern} #{rule.replacement} #{rule.host} #{rule.target} #{rule.part} #{rule.global? ? "global" : "project"}"
+    end
+
+    # --- the RULES list's `/` filter -------------------------------------------------------
+    def list_filter_editing? : Bool
+      @sub == :rules && @focus == :list && @filter.editing?
+    end
+
+    def handle_list_filter_key(ev : Termisu::Event::Key) : Bool
+      prev = rule_list[@sel]?.try(&.id)
+      @filter.handle_key(ev)
+      list = rule_list
+      @sel = (prev ? list.index { |r| r.id == prev } : nil) || @sel
+      @sel = @sel.clamp(0, {list.size - 1, 0}.max)
+      true
+    end
+
+    def rewriter_filter : Nil
+      return @host.status("no rules to filter — a adds one") if rules_engine.rules.empty?
+      @sub = :rules
+      @focus = :list
+      @filter.start
+    end
+
+    # The `/` bar takes the RULES card's top row while it is shown. ONE definition, read by
+    # render and by every hit-test, so a click can never resolve to a row the bar is on.
+    private def filter_row?(inner : Rect) : Bool
+      @sub == :rules && @filter.shown? && inner.h > 1
+    end
+
+    private def rules_list_rect(inner : Rect) : Rect
+      return inner unless filter_row?(inner)
+      Rect.new(inner.x, inner.y + 1, inner.w, inner.h - 1)
     end
 
     private def extract_list : Array(Store::ExtractRule)
@@ -192,6 +237,8 @@ module Gori::Tui
     end
 
     private def render_rules(screen : Screen, inner : Rect, body_focused : Bool) : Nil
+      @filter.render_bar(screen, Rect.new(inner.x + 1, inner.y, inner.w - 2, 1)) if filter_row?(inner)
+      inner = rules_list_rect(inner)
       list = rule_list
       @sel = @sel.clamp(0, {list.size - 1, 0}.max)
       ensure_visible(inner, list.size)
@@ -339,6 +386,12 @@ module Gori::Tui
     end
 
     # --- keys ---
+    # The rules sub-tab's preview INPUT pane is a real editor (it holds an HTTP message, which
+    # cannot be typed without spaces — or digits). Everything else here is a list.
+    def body_takes_text? : Bool
+      (@sub == :rules && @focus == :preview_in) || list_filter_editing?
+    end
+
     def handle_body_key(ev : Termisu::Event::Key) : Bool
       return handle_sub_key(ev) unless @sub == :rules
       case @focus
@@ -382,13 +435,15 @@ module Gori::Tui
     end
 
     # The extract sub-tab has no verbs of its own (`rewriter.add`'s chord is claimed in this
-    # SCOPE by the rules list), so its add/delete keys are whatever `rewriter.add` and
-    # `rewriter.delete` are bound to — which is exactly what its strip names for them
-    # (`body_hint` spells `{rewriter.add} add`). They used to be the literal `a`/`d`, so a
-    # rebind reached the strip and not the key under it.
+    # SCOPE by the rules list), so its add/on-off/delete keys are whatever `rewriter.add`,
+    # `rewriter.toggle` and `rewriter.delete` are bound to — which is exactly what its strip
+    # names for them (`body_hint` spells `{rewriter.add} add`). They used to be the literal
+    # `a`/`x`/`d`, so a rebind reached the strip and not the key under it.
     private def handle_extract_chord(ev : Termisu::Event::Key) : Bool
       if chord_of?(ev, "rewriter.add")
         extract_add
+      elsif chord_of?(ev, "rewriter.toggle")
+        extract_toggle
       elsif chord_of?(ev, "rewriter.delete")
         extract_delete
       else
@@ -397,9 +452,10 @@ module Gori::Tui
       true
     end
 
-    # Edit and on/off stay literal: the strip names them literally too (`rewriter.edit` is
-    # a two-chord verb no rebind can move, and `x` is the pane-local toggle on every rule
-    # list) — and so does the bindings sub-tab's `d`, which clears a value, not a rule.
+    # Edit stays literal — `rewriter.edit` is a two-chord verb no rebind can move — and so
+    # does the bindings sub-tab's `d`, which clears a value, not a rule. On/off is NOT literal
+    # any more: it follows `rewriter.toggle`'s chord through `handle_extract_chord` below, the
+    # way add and delete already followed theirs.
     private def handle_sub_action_key(key : Termisu::Input::Key, c : Char?) : Bool
       if @sub == :bindings
         return false unless c == 'd'
@@ -408,7 +464,6 @@ module Gori::Tui
       end
       case
       when key.enter?, c == 'e' then extract_edit
-      when c == 'x'             then extract_toggle
       else                           return false
       end
       true
@@ -425,15 +480,8 @@ module Gori::Tui
       when key.up?, c == 'k'   then move_up
       when key.down?, c == 'j' then list_down
       when key.escape?         then @host.request_focus(:menu)
-      when c == 'x'
-        # The one action still dispatched here, and not an oversight: `rewriter.select-line`
-        # binds bare `x` in this same SCOPE for the preview pane, and `Keymap#lookup` is keyed
-        # by scope alone — a chord on `rewriter.toggle` would shadow one of the two. The
-        # keymap has no focus dimension; this method only runs when the LIST has focus, so it
-        # is the disambiguator. (Trade-off: `x` alone is not rebindable here.)
-        rewriter_toggle
       else
-        # a/↵/e/d/⇧X/s/⇧J/⇧K defer to the central keymap, so the rule actions are
+        # a/↵/e/d/t/⇧X/s/⇧J/⇧K defer to the central keymap, so the rule actions are
         # REBINDABLE and dispatch through the same `available?` gate the space menu uses —
         # which is now focus-aware (`rewriter_rule_list_focused?`), because a chord has no
         # `section:` to keep it away from the preview panes the way the menu entries do.
@@ -612,6 +660,7 @@ module Gori::Tui
         return true
       end
       # The RULES list's scroll gauge rides the card's right hairline, which `row_at` excludes.
+      inner = rules_list_rect(inner)
       if row = @view.rules_gauge_row_at(inner, mx, my, rule_list.size, rules_engine.active?)
         @focus = :list
         @sel = row
@@ -682,7 +731,7 @@ module Gori::Tui
     private def double_click_row(inner : Rect, mx : Int32, my : Int32) : Bool
       case @sub
       when :rules
-        return false unless @view.row_at(inner, mx, my, @scroll, rule_list.size, rules_engine.active?)
+        return false unless @view.row_at(rules_list_rect(inner), mx, my, @scroll, rule_list.size, rules_engine.active?)
         rewriter_edit
       when :extract
         return false unless @view.sub_row_at(inner, mx, my, @sub_scroll, sub_count)
@@ -698,7 +747,7 @@ module Gori::Tui
     # is the editable sample. The INPUT half used to be absent everywhere here, so a ⇧arrow
     # selection built in that editor could be destroyed by the next printable (TextArea#insert
     # cuts it) but never copied. Same shape as RepeaterView#pane_selection?.
-    def rewriter_selection_active? : Bool
+    def selection_active? : Bool
       return false unless @sub == :rules
       case @focus
       when :preview_out then @out.selection?
@@ -707,7 +756,7 @@ module Gori::Tui
       end
     end
 
-    def rewriter_selection_text : String
+    def selection_text : String
       return "" unless @sub == :rules
       case @focus
       when :preview_in then @preview_input.selection_text || @preview_input.text
@@ -718,17 +767,17 @@ module Gori::Tui
       end
     end
 
-    def rewriter_select_line : Nil
+    def select_line : Nil
       return unless @sub == :rules && @focus == :preview_out
       sync_preview_out
       @out.select_line
     end
 
-    # Both panes, for the same reason `rewriter_selection_active?` answers for both: the verb
+    # Both panes, for the same reason `selection_active?` answers for both: the verb
     # that calls this is gated on THAT predicate, so a ⇧arrow band built in the INPUT editor
     # made "Clear selection" appear in the menu and then do nothing — the one gesture that
     # offers itself and refuses.
-    def rewriter_clear_selection : Nil
+    def clear_selection : Nil
       return unless @sub == :rules
       case @focus
       when :preview_in  then @preview_input.clear_selection
@@ -738,26 +787,22 @@ module Gori::Tui
 
     # `y`: the selection, or the whole transformed sample when nothing is selected. The pane is
     # the only place the post-rewrite bytes exist — the sample in the store is the INPUT.
-    # Same `Clipboard.copy` + status shape every other tab's copy verb uses, so the toast reads
-    # the same and the OSC-52 truncation note is not re-derived here.
+    # `copy_text`, the shape every other tab's copy verb uses, so the toast reads the same and
+    # the OSC-52 truncation note is not re-derived here. An empty pane answers "nothing to copy"
+    # rather than returning silently: on the INPUT sample `^Y` is the ONLY copy and the footer
+    # names it, so an empty pane swallowing the chord reads as a dead key.
     def rewriter_copy : Nil
       sel, text = rewriter_copy_target
       return if text.nil? # not a preview pane — the verb's gate should have caught it
-                # "nothing to copy" rather than a silent return: on the INPUT sample `^Y` is the ONLY
-                # copy and the footer names it, so an empty pane swallowing the chord reads as a dead
-                # key. Every sibling tab's `do_copy` answers here; this one returned.
-      return @host.status("nothing to copy") if text.empty?
-      written = Clipboard.copy(text)
-      note = Clipboard.note(written, text)
-      @host.status(sel ? "copied #{written}b to clipboard#{note}" : "copied all (#{written}b)#{note}")
+      copy_text(text, sel ? nil : "all")
     end
 
     # What `rewriter_copy` would put on the clipboard and whether it is a selection, without
-    # writing it — the JWT half of this sweep grew `jwt_copy_text` for the same reason: the
+    # writing it — the JWT half of this sweep grew `pane_copy_text` for the same reason: the
     # decision is worth asserting on its own, and `Clipboard.copy` writes OSC 52 to the tty.
     # `nil` text = a focus that has no copy (the rule list).
     #
-    # This is NOT `rewriter_selection_text`, which is the "Send selection to" payload and
+    # This is NOT `selection_text`, which is the "Send selection to" payload and
     # always narrows to the band; a copy with no band falls back to the whole pane.
     def rewriter_copy_target : {Bool, String?}
       return {false, nil} unless @sub == :rules
@@ -814,6 +859,7 @@ module Gori::Tui
     end
 
     def set_preedit(text : String) : Bool
+      return @filter.set_preedit(text) if list_filter_editing?
       return false unless @focus == :preview_in
       @preview_input.set_preedit(text)
       true
@@ -841,11 +887,12 @@ module Gori::Tui
       end
       @sub = :rules
       @sel = last_index_of_scope(Store::RuleScope::Project)
-      @host.status("installed \"#{preset.name}\" — #{n} rule#{n == 1 ? "" : "s"} added (editable, deletable like any other)")
+      @host.status("installed \"#{preset.name}\" — #{Gori.plural(n, "rule")} added (editable, deletable like any other)")
     end
 
     def rewriter_edit : Nil
       if rule = selected_rule
+        return @host.status("#{rule.inert_reason} — can't edit this rule; delete it or use a newer gori") if rule.inert?
         @host.open_rewriter_rule_editor(rule)
       else
         @host.status("no rewrite rule selected")
@@ -877,6 +924,7 @@ module Gori::Tui
     def rewriter_toggle : Nil
       rule = selected_rule || return @host.status("no rewrite rule selected")
       unless rules_engine.toggle(rule.id, rule.scope)
+        return @host.status("#{rule.inert_reason} — can't enable this rule; use a newer gori") if rule.inert? && !rule.enabled?
         return @host.status("enable/disable NOT applied (project busy) — the rule is unchanged")
       end
       state = rule.enabled? ? "disabled" : "enabled"
@@ -887,6 +935,9 @@ module Gori::Tui
     def rewriter_toggle_default : Nil
       rule = selected_rule || return @host.status("no rewrite rule selected")
       return @host.status("only a global rule has a default — this one is project-scoped") unless rule.global?
+      if rule.inert? && (global = Settings.rewriter_rules.find { |r| r.id == rule.id }) && !global.enabled
+        return @host.status("#{rule.inert_reason} — can't enable this rule; use a newer gori")
+      end
       unless rules_engine.toggle_default(rule.id)
         return @host.status("default NOT changed (settings not writable) — the rule is unchanged")
       end
@@ -896,10 +947,20 @@ module Gori::Tui
     end
 
     def rewriter_move(dir : Int32) : Nil
+      # Order is the composition order; a filtered list is not that order.
+      return @host.status("clear the filter (esc on the / bar) to reorder — order is the whole list's") if @filter.active?
       rule = selected_rule || return @host.status("no rewrite rule selected")
       # Only follow the rule when it actually moved: ⇧J on the last GLOBAL rule cannot push it
       # into the project block (that is a scope change, `s`), and walking the cursor there
       # anyway would read as a swap that never happened.
+      return @host.status("#{rule.inert_reason} — can't reorder this rule; use a newer gori") if rule.inert?
+      scoped = rule_list.select { |r| r.scope == rule.scope }
+      if i = scoped.index { |r| r.id == rule.id }
+        j = i + (dir < 0 ? -1 : 1)
+        if 0 <= j < scoped.size && (target = scoped[j]) && target.inert?
+          return @host.status("#{target.inert_reason} — can't reorder this rule; use a newer gori")
+        end
+      end
       if rules_engine.move(rule.id, dir, rule.scope)
         move_sel(dir)
       elsif !at_scope_edge?(rule, dir)
@@ -931,10 +992,11 @@ module Gori::Tui
     # all. For a global rule `enabled?` is its state HERE, which is the state on that row.
     def rewriter_duplicate : Nil
       rule = selected_rule || return @host.status("no rewrite rule selected")
+      return @host.status("#{rule.inert_reason} — can't duplicate this rule; use a newer gori") if rule.inert?
       name = rule.name.empty? ? "" : "#{rule.name} copy"
       unless rules_engine.add(rule.target, rule.part, rule.pattern, rule.replacement,
                rule.op, rule.match_kind, name, rule.host, rule.body_file, scope: rule.scope,
-               enabled: rule.enabled?)
+               enabled: rule.enabled?, respond: rule.respond, respond_args: rule.respond_args)
         return @host.status("rule NOT duplicated (project busy or settings not writable)")
       end
       # Land on the copy, as `apply_rewriter_rule` lands on an added rule and `install_preset`
@@ -951,6 +1013,7 @@ module Gori::Tui
     # its fields and the state it has HERE; what changes is who else sees it.
     def rewriter_scope_toggle : Nil
       rule = selected_rule || return @host.status("no rewrite rule selected")
+      return @host.status("#{rule.inert_reason} — can't move this rule; use a newer gori") if rule.inert?
       to = rule.global? ? Store::RuleScope::Project : Store::RuleScope::Global
       unless rules_engine.set_scope(rule, to)
         return @host.status("scope NOT changed (project busy or settings not writable) — the rule is unchanged")
@@ -976,8 +1039,10 @@ module Gori::Tui
       return false unless ov.valid?
       if id = ov.edit_id
         from = ov.edit_scope || Store::RuleScope::Project
+        return true if reject_inert_edit?(id, from)
         unless rules_engine.update(id, ov.target, ov.part, ov.pattern, ov.replacement,
-                 ov.op, ov.match_kind, ov.name, ov.host, ov.body_file, scope: from)
+                 ov.op, ov.match_kind, ov.name, ov.host, ov.body_file, scope: from,
+                 respond: ov.respond, respond_args: ov.respond_args)
           @host.status("rule NOT saved (project busy or settings not writable) — it is unchanged")
           return true
         end
@@ -994,7 +1059,8 @@ module Gori::Tui
         end
       else
         unless rules_engine.add(ov.target, ov.part, ov.pattern, ov.replacement,
-                 ov.op, ov.match_kind, ov.name, ov.host, ov.body_file, scope: ov.scope)
+                 ov.op, ov.match_kind, ov.name, ov.host, ov.body_file, scope: ov.scope,
+                 respond: ov.respond, respond_args: ov.respond_args)
           # Report rather than re-select: with nothing added, `last_index_of_scope` would
           # move the highlight onto whatever already sat at the end of that block.
           @host.status("rule NOT added (project busy or settings not writable)")
@@ -1003,6 +1069,13 @@ module Gori::Tui
         # A global rule lands at the end of the GLOBAL block, which is not the end of the list.
         @sel = last_index_of_scope(ov.scope)
       end
+      true
+    end
+
+    private def reject_inert_edit?(id : Int64, scope : Store::RuleScope) : Bool
+      rule = rule_list.find { |r| r.id == id && r.scope == scope }
+      return false unless rule && rule.inert?
+      @host.status("#{rule.inert_reason} — can't edit this rule; delete it or use a newer gori")
       true
     end
 
@@ -1036,12 +1109,13 @@ module Gori::Tui
       end
       # Disabling the WRITER also un-declares the name, so a rewrite rule naming it goes
       # back to refusing rather than injecting a value nothing is refreshing any more.
-      @host.status(rule.enabled? ? "$#{rule.name} extract rule disabled" : "$#{rule.name} extract rule enabled")
+      spelled = Env.spell(rule.name, Env::Namespace::Bind)
+      @host.status(rule.enabled? ? "#{spelled} extract rule disabled" : "#{spelled} extract rule enabled")
     end
 
     def extract_delete : Nil
       rule = selected_extract_rule || return @host.status("no extract rule selected")
-      @host.confirm("DELETE EXTRACT RULE", "Delete “$#{rule.name}”? Its binding is forgotten too.",
+      @host.confirm("DELETE EXTRACT RULE", "Delete “#{Env.spell(rule.name, Env::Namespace::Bind)}”? Its binding is forgotten too.",
         confirm_label: "delete", danger: true) do
         ok = bindings.remove(rule.id)
         @sub_sel = @sub_sel.clamp(0, {extract_list.size - 1, 0}.max)
@@ -1053,7 +1127,8 @@ module Gori::Tui
     # instead of going out with a stale token, which is the point of having the action.
     def binding_clear : Nil
       row = binding_rows[@sub_sel]? || return @host.status("no binding selected")
-      return @host.status("$#{row.name} is not bound") unless row.bound?
+      spelled = Env.spell(row.name, Env::Namespace::Bind)
+      return @host.status("#{spelled} is not bound") unless row.bound?
       # `clear_row` takes the row's OWN table, because the pane lists one row per (rule,
       # table) and the operator is pointing at ONE of them. The predecessor this replaced
       # forgot the current send context instead — the active slot plus the global table — so
@@ -1061,7 +1136,7 @@ module Gori::Tui
       # the row under the cursor still bound, with no way to clear it while that slot was not
       # the active one. It is deleted; `clear_row(name, nil)` is how the global table is cleared.
       bindings.clear_row(row.name, row.slot)
-      @host.status(row.slot ? "$#{row.name} cleared for #{row.slot}" : "$#{row.name} cleared")
+      @host.status(row.slot ? "#{spelled} cleared for #{row.slot}" : "#{spelled} cleared")
     end
 
     # Commit the extract-rule editor overlay. Returns false — and says why — when the table
@@ -1090,9 +1165,10 @@ module Gori::Tui
     end
 
     def body_hint(focus : Symbol) : String
+      return @filter.hint if list_filter_editing?
       case @sub
       when :extract
-        return keys("↹ section · ↑/↓ select · {rewriter.add} add · ↵/e edit · x on/off · {rewriter.delete} delete · space cmds · esc tabs")
+        return keys("↹ section · ↑/↓ select · {rewriter.add} add · ↵/e edit · {rewriter.toggle} on/off · {rewriter.delete} delete · space cmds · esc tabs")
       when :bindings
         return "↹ section · ↑/↓ select · d clear · space cmds · esc tabs"
       end
@@ -1105,7 +1181,7 @@ module Gori::Tui
       when :preview_out
         keys("↑/↓ move · ⇧arrows select · {rewriter.copy} copy · {rewriter.select-line} line · space cmds · ← input · esc input")
       else
-        keys("↹ section · ↑/↓ select · {rewriter.add} add · ↵/e edit · x on/off · {rewriter.scope} global/project · {rewriter.delete} delete · {rewriter.move-up}/{rewriter.move-down} reorder · esc tabs")
+        keys("↹ section · ↑/↓ select · {rewriter.add} add · ↵/e edit · {rewriter.toggle} on/off · {rewriter.filter} filter · {space:rewriter.scope} global/project · {rewriter.delete} delete · {rewriter.move-up}/{rewriter.move-down} reorder · esc tabs")
       end
     end
   end

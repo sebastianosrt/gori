@@ -1,29 +1,59 @@
 require "../store"
 require "../repeater/flow_request"
+require "../repeater/ws_engine"
 require "../proxy/codec/http1"
 
 module Gori
   module Probe
+    # Does this flow plausibly HOLD a WebSocket transcript — i.e. is it worth reading
+    # `ws_messages` for? The gate in front of every WS rescan, and it is deliberately WIDER
+    # than `Store::FlowDetail#websocket?`.
+    #
+    # `websocket?` answers "did this flow OPEN a socket", which it settles from the HANDSHAKE:
+    # for h1 it requires the stored REQUEST head to carry `Upgrade: websocket`, for h2 an
+    # extended CONNECT marker. That is the right question for HAR export and for refusing a
+    # one-shot replay. It is the wrong one here, because rows can exist without a handshake
+    # that proves them: `Import::Har.ws_messages` has no status or header gate at all — its
+    # comment says outright that "every reader asks the ROWS" — so a foreign HAR whose entry
+    # carries `_webSocketMessages` beside a request head with the `Upgrade:` line stripped
+    # (Chrome's provisional headers) lands real frames on a flow `websocket?` calls false.
+    # Gating the scanner on it alone traded the h2 blind spot for an imported-capture one:
+    # History's MESSAGES pane still showed the transcript while the probe reported nothing.
+    #
+    # So: either transport's handshake, OR a bare 101 — the predicate the scanner used before
+    # it learned about h2, kept so this only ever WIDENS. Everything it lets through costs one
+    # `ws_messages_after` query that returns nothing; nothing it lets through can produce a
+    # finding that is not in the rows.
+    def self.ws_transcript_possible?(detail : Store::FlowDetail) : Bool
+      detail.websocket? || detail.row.status == 101
+    end
+
+    # Project a Repeater WebSocket send's captured frames onto the `Store::WsMessage` rows the
+    # passive WS rule reads, so a socket driven from a Repeater tab is scanned exactly as one
+    # the proxy captured. Ids are unused by the rule (nothing reads them back), so they are 0.
+    #
+    # It carries each frame's REAL opcode and drops ONLY control frames. That is the whole
+    # reason this is a named function rather than a `map` at the call site: the TUI's copy
+    # filtered to `opcode == 1` and stamped every row it kept as text, so a BINARY frame never
+    # reached `Passive::WsPayloads` — which scans binary frames deliberately (protobuf/msgpack/
+    # CBOR is the mainstream realtime encoding, and a credential rides in one as an ordinary
+    # ASCII string field). A secret in a binary frame was therefore reported for a socket gori
+    # watched and missed for the same socket replayed by hand. Control frames (ping/pong/close)
+    # carry no application payload, which is why the rule skips them anyway.
+    def self.ws_messages_from(messages : Array(Repeater::WsEngine::Message), *,
+                              flow_id : Int64?, repeater_id : Int64,
+                              created_at : Int64 = Time.utc.to_unix_ms * 1000) : Array(Store::WsMessage)
+      messages.compact_map do |m|
+        next if m.opcode >= 8 # control frame — see Store::WsMessage#control?
+        next if m.payload.empty?
+        Store::WsMessage.new(0_i64, flow_id || 0_i64, repeater_id, created_at, m.direction,
+          m.opcode, m.payload)
+      end
+    end
+
     # Build a synthetic FlowDetail from a persisted Repeater tab so Passive.analyze can
     # run over Repeater send results the same way it runs over History flows. Returns nil
     # when there is no scorable response (no head, or only an error with empty head).
-    # Byte-level subsequence index. `String#index` cannot be used on these bytes: they may not
-    # be valid UTF-8, and scrubbing first is exactly what this file must not do to the body.
-    private def self.index_seq(hay : Bytes, needle : Bytes) : Int32?
-      return nil if needle.empty? || hay.size < needle.size
-      last = hay.size - needle.size
-      i = 0
-      while i <= last
-        j = 0
-        while j < needle.size && hay[i + j] == needle[j]
-          j += 1
-        end
-        return i if j == needle.size
-        i += 1
-      end
-      nil
-    end
-
     def self.detail_from_repeater(record : Store::RepeaterRecord) : Store::FlowDetail?
       head = record.response_head
       return nil if head.nil? || head.empty?
@@ -46,15 +76,14 @@ module Gori
       #     authored — differential rules compared against a differently-framed baseline, and
       #     corrupted bytes reached the origin.
       #
-      # Take whichever blank-line boundary occurs FIRST — the editor uses bare-LF, so a
-      # literal "\r\n\r\n" inside the body must not win over the true earlier "\n\n" head
-      # boundary (the naive `crlf || lf` fallback would snap to the body's sequence).
+      # `Env.head_body_separator` takes whichever blank-line boundary occurs FIRST — the
+      # editor uses bare-LF, so a literal "\r\n\r\n" inside the body must not win over the
+      # true earlier "\n\n" head boundary — and `String#index` cannot be used on these bytes:
+      # they may not be valid UTF-8, and scrubbing first is exactly what this must not do.
       raw_req = record.request
-      sep_crlf = index_seq(raw_req, "\r\n\r\n".to_slice)
-      sep_lf = index_seq(raw_req, "\n\n".to_slice)
-      sep = [sep_crlf, sep_lf].compact.min?
-      req_head_s = String.new(sep ? raw_req[0, sep] : raw_req).scrub
-      body_start = sep ? sep + (sep == sep_crlf ? 4 : 2) : nil
+      sep = Env.head_body_separator(raw_req)
+      req_head_s = String.new(sep ? raw_req[0, sep[0]] : raw_req).scrub
+      body_start = sep.try { |(offset, width)| offset + width }
       # The Repeater editor serializes request text with BARE-LF line endings, but
       # Http1.parse_headers recognizes only CRLF: without normalizing the internal separators,
       # the first CRLF found is the appended terminator, so parse_headers starts at the blank

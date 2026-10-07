@@ -1,5 +1,5 @@
 +++
-title = "Configuration"
+title = "Configure gori and Its Root CA"
 description = "Where gori stores data, how to configure the network, and the root CA."
 weight = 40
 +++
@@ -25,7 +25,7 @@ gori settings          # print the settings.json path
 gori settings --edit   # open it in your editor
 ```
 
-You rarely need to edit the file by hand. Everything in it is editable in-app from one surface, the **Preferences** modal, grouped into four sub-tabs (General, Appearance, Editor & Keys, Network & Tabs):
+You rarely need to edit the file by hand. Everything in it is editable in-app from one surface, the **Preferences** modal, grouped into five sub-tabs (General, Appearance, Editor & Keys, Network & Tabs, AI):
 
 | Open it with | Lands on |
 |--------------|----------|
@@ -37,17 +37,17 @@ You rarely need to edit the file by hand. Everything in it is editable in-app fr
 
 ## Network
 
-By default the proxy listens on `127.0.0.1:8070` and connects directly to targets. You can change that in three places, highest priority first:
+With no upstream setting or process proxy environment, the proxy listens on `127.0.0.1:8070` and connects directly to targets. You can change the gori-side route in three places, highest priority first:
 
-1. **Per-project**: pin a bind address, port, and upstream for one project from the **Project** tab; these win for that project only.
+1. **Per-project**: pin a bind address, port, and upstream for one project from the **Project** tab, or headless with [`gori run project network`](/reference/cli/#project-network); these win for that project only.
 2. **CLI flags**: `--listen` / `--port` override the global default for the current process, without writing to disk.
 3. **`settings.json` `network`**: the shared default, edited by the first-run wizard and Preferences → **Network**.
 
-When nothing is set, the factory default is `127.0.0.1:8070`, direct. See [network](/reference/config/#network) for every key and [Per-Project Overrides](/reference/config/#per-project-overrides) for the exact precedence.
+When nothing is set, the factory default is `127.0.0.1:8070`, direct. If `network.upstream_proxy` is blank, gori also honors the conventional `HTTPS_PROXY`, `HTTP_PROXY`, and `ALL_PROXY` variables (including lowercase spellings), with `NO_PROXY` / `no_proxy` exceptions; `localhost` and loopback destinations always stay direct. An explicit project upstream, upstream rule, or non-empty gori scalar wins over those variables. See [network](/reference/config/#network) for every key and [Per-Project Overrides](/reference/config/#per-project-overrides) for the exact precedence.
 
 ## The Root CA
 
-To intercept HTTPS, clients must trust gori's root certificate, kept in `~/.gori/ca` as `root.crt.pem` and `root.key.pem`.
+To intercept HTTPS, clients must trust gori's root certificate, kept in `$GORI_HOME/ca` (`~/.gori/ca` by default) as `root.crt.pem` and `root.key.pem`.
 
 ```bash
 gori ca                       # print the certificate path
@@ -71,6 +71,8 @@ gori ca import --cert root.crt.pem --key root.key.pem --yes
 The same action is available from the palette (**Import CA certificate**). gori checks the key matches the cert, that it is a CA, and that it can actually sign a leaf with the key before adopting it. An Ed25519 or Ed448 root is rejected, because leaves are signed with SHA-256. Distribute only `root.crt.pem` to trust; keep `root.key.pem` secret. See [`gori ca import`](/reference/cli/#gori-ca-import).
 
 The palette's **Open browser** action launches an installed browser with an isolated profile that already trusts the CA and routes through the proxy (see the [Quick Start](/getting-started/quick-start/)).
+
+For command-line tools, the palette's **Open shell** action does the same for a terminal: **Open shell here** hands this terminal to your `$SHELL` with the proxy and a CA bundle already set (gori keeps capturing and comes back when the shell exits; it needs capture on and intercept off, since held requests could not be forwarded while the shell has the screen), and **Copy env** copies a single-line command (`eval "$(gori run shell --print ...)"`) to the clipboard so another pane can evaluate its own environment. From any terminal, `gori run shell` does the same (see [`gori run shell`](/reference/cli/#run-shell)).
 
 ## Full Reference
 

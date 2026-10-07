@@ -1,5 +1,5 @@
 +++
-title = "Configuration"
+title = "Configuration Reference"
 description = "The settings.json keys and the GORI_HOME storage layout."
 weight = 20
 +++
@@ -17,9 +17,14 @@ Everything lives under `GORI_HOME` (`$GORI_HOME` if set and non-empty, otherwise
 | `projects/` | One subdirectory per named project, each with its own DB |
 | `ca/` | Root CA: `root.crt.pem` and `root.key.pem` |
 | `themes/` | User themes |
-| `wordlists/` | Fuzzer / miner wordlists |
+| `wordlists/` | The global [wordlist catalog](/guide/repeater-and-fuzzer/#wordlist-catalog): named lists for the Fuzzer, Miner, Discover and Cookie cracking (owner-only files) |
 | `protos/` | gRPC descriptor sets (`protoc --descriptor_set_out`), loaded by any project with no path of its own |
 | `active_project` | Marker for the most-recently-used project |
+| `gori.log` | The TUI's log |
+| `browser/` | Profiles for the browsers **Open browser** launches |
+| `shell/` | CA bundle and environment for **Open shell** |
+| `spool/` | A running fuzz sweep's full results, until they are saved or discarded |
+| `preview/` | Temporary files handed to an external viewer |
 
 ## settings.json
 
@@ -43,17 +48,17 @@ Its location resolves as `--config PATH` → `$GORI_CONFIG` → `$GORI_HOME/sett
 |-----|------|---------|-------------|
 | `bind_host` | string | `127.0.0.1` | Global default listen address (used when a project has no `net.bind_host`) |
 | `bind_port` | integer | `8070` | Global default listen port (used when a project has no `net.bind_port`) |
-| `upstream_proxy` | string | `""` | Global default upstream: legacy `host:port`/`http://…`, `http+tls://…` (TLS to the proxy), or `socks5://…`/`socks5h://…`; empty = direct. Project `net.upstream_proxy` wins when set. `https://…` is the **legacy spelling of the plaintext form**; see [upstream_rules](#upstream_rules) |
+| `upstream_proxy` | string | `""` | Global default upstream: legacy `host:port`/`http://…`, `http+tls://…` (TLS to the proxy), or `socks5://…`/`socks5h://…`; empty = environment fallback (`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`, then direct). Project `net.upstream_proxy` wins when set. `https://…` is the **legacy spelling of the plaintext form**; see [upstream_rules](#upstream-rules) |
 | `upstream_proxy_ca` | string | `""` | PEM bundle trusted for the **upstream proxy's own** certificate on an `http+tls` hop, in addition to the system store. Blank = system trust only. A path, never a secret, so it is safe to share in a profile |
 | `upstream_proxy_insecure` | bool | `false` | Skip verification of the **upstream proxy's** certificate. Independent of `verify_upstream` and untouched by `--insecure-upstream`, which are about the **origin**. Off by default: that hop carries every `CONNECT` authority and every `Proxy-Authorization` credential |
 | `verify_upstream` | bool | `true` | Verify upstream TLS certificates against the system CA trust store, resolved automatically from standard locations (honouring `SSL_CERT_FILE` / `SSL_CERT_DIR`); if none is found, HTTPS verification fails; set `SSL_CERT_FILE` or turn this off. Toggling it re-syncs the running proxy, the active prober, and the Repeater / Fuzzer / Miner senders without a restart. `--insecure-upstream` seeds it off for one session |
 | `serve_landing` | bool | `true` | Serve the built-in info / CA-download page, both when the listen address is hit directly and at the reserved host `http://gori.proxy/` (or `http://gori/`) for a client already pointed at the proxy |
 | `connect_timeout_secs` | integer | `30` | Upstream connect timeout in seconds (minimum `1`) |
 | `io_timeout_secs` | integer | `30` | Upstream read / write idle timeout in seconds (minimum `1`) |
-| `capture_max_mib` | integer | `2` | Largest body stored per message, in MiB. Larger bodies still forward byte-exact; only the stored copy is truncated, and the true wire size is recorded |
+| `capture_max_mib` | integer | `2` | Largest body stored per message, in MiB (1–2047). Larger bodies still forward byte-exact; only the stored copy is truncated, and the true wire size is recorded |
 | `http2` | string | `"auto"` | `auto` reflects the origin's ALPN; `off` forces HTTP/1.1 on every tunnelled connection. See [http2](#http2) below |
 | `strip_alt_svc` | bool | `false` | Remove the `Alt-Svc` response fields advertising HTTP/3 before the client sees them, so a browser cannot switch to a transport gori does not carry. See [strip_alt_svc](#strip-alt-svc) below |
-| `tls_passthrough` | array | `[]` | Hosts to relay without decrypting. See [tls_passthrough](#tls_passthrough) below |
+| `tls_passthrough` | array | `[]` | Hosts to relay without decrypting. See [tls_passthrough](#tls-passthrough) below |
 
 CLI `--listen` / `--port` override these for the current process only (not written to disk). See [Per-Project Overrides](#per-project-overrides).
 
@@ -165,11 +170,11 @@ A transparent listener serves clients that believe they are talking to the origi
 
 That answer is an **address and a port**. The port is authoritative: it is the port the client actually connected to, so it outranks both `target_port` and any port in the client's `Host` header. The address is where gori **dials**, whatever the client called the destination.
 
-**The client's own bytes** supply the name: the `Host` header for cleartext, the TLS **SNI** for HTTPS, read out of the ClientHello *before* the handshake. gori keeps using the name whenever there is one, because a name is what everything downstream needs: which leaf certificate to mint, the sandbox gate, the [passthrough list](#tls_passthrough), the origin ALPN probe, scope matching, and what History shows. The kernel's address fills in as the name only when there is no name at all.
+**The client's own bytes** supply the name: the `Host` header for cleartext, the TLS **SNI** for HTTPS, read out of the ClientHello *before* the handshake. gori keeps using the name whenever there is one, because a name is what everything downstream needs: which leaf certificate to mint, the sandbox gate, the [passthrough list](#tls-passthrough), the origin ALPN probe, scope matching, and what History shows. The kernel's address fills in as the name only when there is no name at all.
 
 So the two never compete. The name identifies the destination and travels upstream byte-exact; the address decides which machine the connection reaches. A client that lies in `Host` still gets a certificate for the name it asked for and still shows up in History under it, but it cannot move gori's upstream connection anywhere.
 
-A [hostname override](#hostname_overrides) still wins over the kernel address, because it is a mapping you wrote by name. That is the one way a transparent destination can be redirected, and it takes an entry in your own table to do it.
+A [hostname override](#hostname-overrides) still wins over the kernel address, because it is a mapping you wrote by name. That is the one way a transparent destination can be redirected, and it takes an entry in your own table to do it.
 
 Which source decided a destination is written to the log, once per listener and once again if it ever changes, so a destination that looks wrong can be traced instead of guessed at.
 
@@ -216,7 +221,7 @@ A SOCKS5 listener (RFC 1928) takes its destination from the client in a handshak
 { "host": "127.0.0.1", "port": 1080, "mode": "socks5" }
 ```
 
-This is the mode for a client that *can* be pointed at a proxy, just not at an HTTP one: `ALL_PROXY=socks5://127.0.0.1:1080`, a runtime whose only proxy setting is SOCKS, a tool that speaks SOCKS and nothing else. gori already speaks the other end of the same protocol (an [`upstream_rules`](#upstream_rules) entry with `"kind": "socks5"` reaches an origin *through* somebody else's SOCKS proxy), so the word appears twice in this file, pointing opposite ways. This one is inbound.
+This is the mode for a client that *can* be pointed at a proxy, just not at an HTTP one: `ALL_PROXY=socks5://127.0.0.1:1080`, a runtime whose only proxy setting is SOCKS, a tool that speaks SOCKS and nothing else. gori already speaks the other end of the same protocol (an [`upstream_rules`](#upstream-rules) entry with `"kind": "socks5"` reaches an origin *through* somebody else's SOCKS proxy), so the word appears twice in this file, pointing opposite ways. This one is inbound.
 
 The destination arrives **declared**, which is what it has over transparent mode: no kernel redirect rule, and nothing has to recover the destination from an SNI or a `Host` header. On a cleartext connection a request whose `Host` names somewhere else is still sent where the handshake said, and the handshake's authority is what History records, while the client's own header is forwarded byte for byte. On a TLS connection the SNI supplies the *name* instead (the leaf is minted for it, the passthrough list and the Sandbox match on it, and it is what History shows), while the connection is dialled at the destination the handshake declared: the same split [transparent mode](#transparent-mode) has between the name and the address. A ClientHello carrying no SNI falls back to the declared destination for both.
 
@@ -232,6 +237,8 @@ Every refusal is recorded in the project as a flow carrying its reason, too. A c
 
 `network.upstream_proxy` is the catch-all route. Bare `host:port` and `http://…` use a plaintext HTTP CONNECT proxy (default port `8080`). `http+tls://…` uses the same CONNECT protocol with the hop to the proxy wrapped in TLS (default port `443`). `socks5://…` resolves destination names **locally** and sends an address literal; `socks5h://…` sends hostname targets as `ATYP DOMAIN` so the **proxy** resolves them. Both SOCKS forms default to port 1080. URI credentials are refused; configure direct credentials in the Project tab, or use an `upstream_rules` entry with `username` and `password_env`.
 
+When this scalar is blank, gori consults the process environment at dial time. HTTP origins select `HTTP_PROXY`, then `ALL_PROXY`; HTTPS origins select `HTTPS_PROXY`, then `HTTP_PROXY`, then `ALL_PROXY`. Uppercase names are preferred and lowercase spellings are accepted. `NO_PROXY` / `no_proxy` supports `*`, hosts and domains, bracketed IPv6 literals, optional ports, and IPv4/IPv6 CIDR blocks (`10.0.0.0/8,fd00::/8`, matched against an address-literal destination); a match goes direct. `localhost` and loopback addresses are always direct, whatever `NO_PROXY` says — on every dial, TLS passthrough and CONNECT tunnels included; the exemption is about the destination, so a proxy that itself listens on `127.0.0.1` is still used for remote targets. The unspecified addresses `0.0.0.0` and `::` count as loopback here, and so does any numeric IPv4 spelling the system resolver accepts (`127.1`, `0x7f.0.0.1`, `2130706433`): the loopback check and the CIDR entries read such a destination as the dotted address it resolves to, while the dial and the `CONNECT` line keep the spelling that was sent. Inside a [gori shell](/reference/cli/#run-shell), the proxy variables that shell exported (pointing back at the gori that started it) are passed over, and the values it replaced (a corporate `HTTPS_PROXY`, its `NO_PROXY`) are read instead, so a gori started there does not chain its requests through its parent. An explicit project upstream, matching rule (including `direct`), or non-empty scalar takes precedence over the environment. In this environment-variable convention, `http://` means a plaintext HTTP CONNECT proxy (port 80 when none is given, not the scalar's 8080) and `https://` means TLS to the proxy; the persisted `network.upstream_proxy` `https://` spelling retains its legacy plaintext meaning.
+
 #### `https://` means the plaintext proxy, not TLS
 
 `https://proxy:3128` has meant *a plaintext HTTP CONNECT proxy* since before gori could speak TLS to a proxy at all, and it still does. It was not reclaimed: every existing `settings.json` carrying one means the plaintext form, and redefining the scheme would have moved that egress onto a handshake the proxy may not offer, on upgrade, with no edit. So the spelling is **accepted unchanged and reported**, never reinterpreted:
@@ -244,7 +251,7 @@ Every refusal is recorded in the project as a flow carrying its reason, too. A c
 
 The `CONNECT` request line (which names the origin you are reaching for) and the `Proxy-Authorization` header are written **inside** the TLS session, never in front of it. Nothing about the request is sent before the handshake completes.
 
-The proxy leg is verified on its **own** hostname: SNI and the checked certificate name are the proxy address you configured, never the origin's, and never a [host override](#hostname_overrides) (overrides apply to the origin leg only). It is governed by `network.upstream_proxy_ca` and `network.upstream_proxy_insecure`, **not** by `verify_upstream` / `--insecure-upstream`, which describe the origin. A relaxed origin policy for one broken target does not stop authenticating the proxy that carries the whole session, and a rejected proxy certificate says so in those terms rather than offering `--insecure-upstream` as a fix.
+The proxy leg is verified on its **own** hostname: SNI and the checked certificate name are the proxy address you configured, never the origin's, and never a [host override](#hostname-overrides) (overrides apply to the origin leg only). It is governed by `network.upstream_proxy_ca` and `network.upstream_proxy_insecure`, **not** by `verify_upstream` / `--insecure-upstream`, which describe the origin. A relaxed origin policy for one broken target does not stop authenticating the proxy that carries the whole session, and a rejected proxy certificate says so in those terms rather than offering `--insecure-upstream` as a fix.
 
 An `https://` origin reached through an `http+tls` proxy is TLS inside TLS: the origin handshake runs over the tunnel, so the origin's certificate is still verified end to end under its own policy.
 
@@ -274,7 +281,7 @@ Rules are **ordered** and the **first match wins**, so specific rules go above g
 | Key | Type | Description |
 |-----|------|-------------|
 | `host` | string | Host pattern, same dialect as scope `host` rules: `corp.internal` covers that host and its subdomains, `*.corp.internal` is a glob, `*` is the catch-all. Case-insensitive |
-| `kind` | string | `direct`, `http`, `http+tls` (HTTP CONNECT over TLS), `socks5` (local DNS), or `socks5h` (proxy DNS). An unknown kind drops the rule rather than being treated as `direct`, which would quietly disable an intended proxy |
+| `kind` | string | `direct`, `http`, `http+tls` (HTTP CONNECT over TLS), `socks5` (local DNS), or `socks5h` (proxy DNS). An unknown kind (or a missing host) drops the rule and fails every rule-routed dial closed until the file is fixed, rather than being treated as `direct`, which would quietly disable an intended proxy |
 | `addr` | string | Proxy `host:port`. Port defaults to `8080` for `http`, `443` for `http+tls`, and `1080` for either SOCKS kind. Must be absent for `direct` |
 | `username` | string | Optional. Sent as HTTP Basic (RFC 7617) for `http` and `http+tls`, or via the RFC 1929 exchange for either SOCKS kind |
 | `password_env` | string | Optional. The **name** of an OS environment variable holding the password |
@@ -292,19 +299,20 @@ Precedence, highest first:
 | 1 (highest) | Project `net.upstream_proxy`: an explicit per-project pin, which bypasses the table wholesale |
 | 2 | `upstream_rules`, first host match |
 | 3 | `network.upstream_proxy`: the implicit catch-all |
-| 4 (lowest) | Direct |
+| 4 | Process environment (`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`) when the scalar is blank, subject to `NO_PROXY` / `no_proxy` (hosts, domains, ports, CIDR blocks); localhost and loopback are always direct here |
+| 5 (lowest) | Direct |
 
 For an open project, **Destination host** is evaluated before this table. `*` (the default)
 leaves the precedence above unchanged; a non-matching destination goes direct without falling
 through to a global rule or scalar proxy.
 
-A rule is matched against the **original** hostname, before any [host override](#hostname_overrides) is applied; an override only changes which IP is dialled.
+A rule is matched against the **original** hostname, before any [host override](#hostname-overrides) is applied; an override only changes which IP is dialled.
 
 ### outbound_tls
 
 Per-destination TLS policy for the connections gori **makes**: a client certificate to present, the protocol range / cipher list to negotiate with, and the shape of the ClientHello gori sends (its [TLS fingerprint](#tls-fingerprint)). Ordered, first match wins, same host-pattern dialect. Edit with `gori settings --edit`.
 
-This is a separate table from [`upstream_rules`](#upstream_rules) on purpose. Both are keyed by destination host, but they answer different questions, and folding them together would make the common shape inexpressible: "everything through the corporate proxy, plus a client certificate for one host" would need the proxy address duplicated onto that host's row, because one first-match table can only apply a single row per host.
+This is a separate table from [`upstream_rules`](#upstream-rules) on purpose. Both are keyed by destination host, but they answer different questions, and folding them together would make the common shape inexpressible: "everything through the corporate proxy, plus a client certificate for one host" would need the proxy address duplicated onto that host's row, because one first-match table can only apply a single row per host.
 
 ```json
 {
@@ -402,13 +410,13 @@ An invalid `groups`, `sigalgs`, `ciphersuites` or `alpn` value is checked by han
 
 The same line appears as a notification in the TUI. A bad rule affects only its own destination; every other rule, and the rest of gori, still work.
 
-**This table is per DESTINATION, and a fingerprint A/B is not.** "Does this endpoint answer differently as `chrome` than as `curl`?" is a question about one host, and editing a rule here between two sends changes the handshake for every other tab and background capture hitting that host at the same time. A Repeater tab (`␣T`) and a fuzz run (`--tls-preset`) can each name a fingerprint for themselves instead, resolved at dial time and leaving this table alone; see [per-send TLS fingerprints](/reference/cli/#per-send-tls-fingerprints). Such an override replaces the ClientHello shape only: the `client_cert`/`client_key`, `min_version`/`max_version` and `permissive` configured here still apply.
+**This table is per DESTINATION, and a fingerprint A/B is not.** "Does this endpoint answer differently as `chrome` than as `curl`?" is a question about one host, and editing a rule here between two sends changes the handshake for every other tab and background capture hitting that host at the same time. A Repeater tab (`␣Pt`) and a fuzz run (`--tls-preset`) can each name a fingerprint for themselves instead, resolved at dial time and leaving this table alone; see [per-send TLS fingerprints](/reference/cli/#per-send-tls-fingerprints). Such an override replaces the ClientHello shape only: the `client_cert`/`client_key`, `min_version`/`max_version` and `permissive` configured here still apply.
 
 Inbound fingerprint *spoofing* (making the client's own handshake look like something else) is not in scope here; this section only shapes the connections gori makes.
 
 ### layout
 
-Per-area TUI layout prefs (command palette → **Settings: Layout**). Omitted when both values are factory defaults.
+Per-area TUI layout prefs (command palette → **Settings: Layout**). Omitted when every value is a factory default.
 
 ```json
 {
@@ -418,7 +426,8 @@ Per-area TUI layout prefs (command palette → **Settings: Layout**). Omitted wh
     "issues_preview": false,
     "history_list_order": "newest",
     "sitemap_expand_depth": -1,
-    "tab_numbers": false
+    "tab_numbers": true,
+    "tab_slots": true
   }
 }
 ```
@@ -430,7 +439,8 @@ Per-area TUI layout prefs (command palette → **Settings: Layout**). Omitted wh
 | `issues_preview` | bool | `false` | Issues list page shows a bottom summary of the selected issue |
 | `history_list_order` | string | `"newest"` | List sort: `"newest"` (newest at top) or `"oldest"` (oldest at top) |
 | `sitemap_expand_depth` | integer | `-1` | How deep the Sitemap tree opens after reload: `-1` = all expanded; `0`-`3` = expand only nodes shallower than this depth |
-| `tab_numbers` | bool | `false` | Paint `1:`…`9:` before the first nine tabs on the tab bar — the positions the `1`-`9` jump keys answer to |
+| `tab_numbers` | bool | `true` | Paint `1:`…`9:` before the nine slots on the tab bar — the positions the `1`-`9` jump keys answer to |
+| `tab_slots` | bool | `true` | Cap the tab bar at nine numbered slots: `settings:tabs` refuses a tenth, and a longer saved layout is truncated to its first nine (the rest stay reachable with `0`). `false` restores the unbounded, `‹ ›`-scrolling bar |
 
 ### statusline
 
@@ -440,7 +450,7 @@ An opt-in extra row at the very bottom of the TUI (Preferences → **General** �
 {
   "statusline": {
     "enabled": true,
-    "command": "printf 'proj:%s flows:%s' \"$(jq -r .project)\" \"$(jq -r .flows)\"",
+    "command": "date '+%H:%M'",
     "interval": 3,
     "timeout": 10
   }
@@ -458,33 +468,9 @@ The command's stdout is parsed for ANSI/SGR colour escapes (16-colour, 256-colou
 
 `timeout` is deliberately separate from `interval`. Runs never overlap (gori launches the next one only after the previous has finished), so a script slower than `interval` simply refreshes as fast as it can rather than being killed on every run. A run that does exceed `timeout` is terminated and the row reads `⋯ (timed out)`.
 
-A command that fails without printing anything reports its exit status instead of leaving the row blank: `⋯ (exit 127)` for a command that was not found, `⋯ (killed)` for one a signal ended. A command that exits cleanly having printed nothing leaves the row empty, which is a legitimate thing for a script to do. stderr is discarded either way.
-
 Edits take effect immediately: saving a new `command`, `interval` or `timeout` re-runs the command on the next frame instead of waiting out the current interval.
 
-Each run receives a JSON context on stdin describing the live session, so scripts can display proxy state without querying gori:
-
-```json
-{
-  "version": 1,
-  "project": "acme",
-  "capturing": true,
-  "flows": 1234,
-  "proxy": { "host": "127.0.0.1", "port": 8070, "addr": "127.0.0.1:8070" },
-  "upstream": "",
-  "upstream_rules": 0
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `version` | integer | Context schema version (currently `1`) |
-| `project` | string | Active project name |
-| `capturing` | bool | Whether the proxy is currently capturing |
-| `flows` | integer | Number of captured flows |
-| `proxy.host` / `proxy.port` / `proxy.addr` | string / integer / string | The address the proxy is actually listening on |
-| `upstream` | string | The **catch-all** upstream proxy address/URI, or empty when connecting directly. A destination matched by an [upstream rule](#upstream_rules) routes elsewhere; this field does not reflect that |
-| `upstream_rules` | integer | Number of [upstream rules](#upstream_rules) in effect. Non-zero means routing is per-destination and `upstream` alone does not describe where traffic goes |
+The [Statusline guide](/guide/statusline/) has the rest: the [JSON context](/guide/statusline/#context) every run reads on stdin, [commands to paste in](/guide/statusline/#presets) with a picture of the row each one produces, and [what the row says when a command fails](/guide/statusline/#failures).
 
 ### display
 
@@ -507,7 +493,7 @@ Message-body and chrome prefs (command palette → **Settings: Display**). Omitt
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `detail_pane` | string | `"request"` | Which pane a freshly-opened History flow shows first: `"request"` or `"response"` |
-| `history_time_format` | string | `"absolute"` | History list time column: `"absolute"` (MM-DD HH:MM:SS) or `"relative"` (3s/5m/2h) |
+| `history_time_format` | string | `"absolute"` | History list time column: `"absolute"` (MM-DD HH:MM:SS, just HH:MM:SS on a narrow terminal) or `"relative"` (3s/5m/2h) |
 | `show_gutter` | bool | `true` | Line-number gutter on the message body views |
 | `wrap_lines` | bool | `true` | Soft-wrap a line too wide for a message pane onto continuation rows (the gutter numbers the first). `false` draws one row per line and scrolls sideways instead, following the caret |
 | `preview_body_kib` | integer | `64` | How many body bytes the History list preview reads (display only, not the capture limit) |
@@ -536,11 +522,12 @@ Edit from Preferences → **Network & Tabs** → **Network** → **Hostname over
 
 ### env
 
-Tokens like `$TOKEN` expand at send time in Repeater, Fuzzer, Miner, Intercept, CLI, and MCP:
+Tokens like `$ENV.TOKEN` expand at send time in Repeater, Fuzzer, Miner, Intercept, CLI, and MCP (in captured or held bytes, only the tokens you typed):
 
 ```json
 {
   "env": {
+    "syntax": "namespaced",
     "prefix": "$",
     "vars": [
       { "key": "TOKEN", "value": "eyJhbGciOi…" }
@@ -551,10 +538,28 @@ Tokens like `$TOKEN` expand at send time in Repeater, Fuzzer, Miner, Intercept, 
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `prefix` | string | `"$"` | Token prefix (`$KEY`) |
+| `syntax` | string | `"namespaced"` | Token grammar: `namespaced` (`$ENV.KEY` env vars, `$BIND.NAME` session bindings, `$GEN.NAME` per-request generators) or `bare` (`$KEY`, `$NAME`, and no generators). **Absence means the file predates namespaces**: the next start adopts `namespaced`, re-spells the global rewrite rules (keeping a `settings.json.pre-namespaced-<timestamp>` copy) and writes the key. Every project re-spells its own stored tokens the first time it opens, with a backup beside the database. `bare` is the explicit opt-out and re-spells each project back. Switch with [`gori settings env-syntax`](/reference/cli/#env-syntax) |
+| `prefix` | string | `"$"` | The sigil that opens a token (`$ENV.KEY`), in either grammar |
 | `vars` | array | `[]` | Global key/value pairs; project vars (Project tab → ENV) override on collision |
 
+A running TUI or `gori mcp` server re-reads `vars` and `prefix` when another process changes the file, so a token rotated or deleted elsewhere stops going out without a restart.
+
 See [Environment Variables](/guide/repeater-and-fuzzer/#environment-variables).
+
+### user_agents {#user-agents}
+
+Your own list for [`$GEN.USER_AGENT`](/guide/repeater-and-fuzzer/#environment-variables) and its family names. When set, it **replaces** the built-in browser list; absent or empty means the built-in one:
+
+```json
+{
+  "user_agents": [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:156.0) Gecko/20100101 Firefox/156.0"
+  ]
+}
+```
+
+Each entry goes into a header verbatim, so an entry that is blank or carries a control or invisible format character is dropped on load, with a warning. `$GEN.USER_AGENT_CHROME` / `_FIREFOX` / `_SAFARI` draw from your lines of that browser (`Chrome/`, `Firefox/`, or `Safari/` without either), and from the built-in family when you listed none. Edit it from Preferences → **Editor & Keys** → **User-Agents**, or with [`gori settings user-agents`](/reference/cli/#user-agents). Like `env`, a running TUI or `gori mcp` server follows a change made by another process without a restart.
 
 ### general
 
@@ -622,7 +627,9 @@ Saved defaults for a Discover run. Written only once you save the discover optio
     "concurrency": 20,
     "spider": true,
     "bruteforce": true,
-    "extensions": false
+    "extensions": false,
+    "keep_alive": true,
+    "assets": false
   }
 }
 ```
@@ -635,6 +642,8 @@ Saved defaults for a Discover run. Written only once you save the discover optio
 | `spider` | bool | `true` | Follow links found in responses |
 | `bruteforce` | bool | `true` | Brute-force paths from the wordlist |
 | `extensions` | bool | `false` | Also probe extension variants of each candidate |
+| `keep_alive` | bool | `true` | Reuse upstream connections across requests (the **Keep-alive** toggle in the Discover overlay). A file written before the key existed reads as `true` |
+| `assets` | bool | `false` | Also fetch images, fonts and media during the crawl |
 
 ### mine
 
@@ -645,6 +654,7 @@ Saved Param Miner defaults, written only once you save the mine options:
 | `locations` | array | `[]` | Where to inject: `query`, `form`, `multipart`, `json`, `headers`, `cookies`. Empty means auto-detect per request |
 | `concurrency` | integer | `10` | Parallel requests |
 | `notify` | string | `"when-found"` | `"when-found"`, `"always"`, or `"off"` |
+| `keep_alive` | bool | `true` | Reuse upstream connections across requests (the **Keep-alive** toggle in the Mine overlay). A file written before the key existed reads as `true` |
 
 ### scan_rules
 
@@ -708,7 +718,7 @@ Surfaces that do not own capture never prune, whatever the cap says: `gori mcp`'
 
 ### oast_providers
 
-OAST providers defined once and reusable across every project. Project-scoped providers live in the project database instead; these are the global library, edited in Preferences → **OAST providers**.
+OAST providers defined once and reusable across every project. Project-scoped providers live in the project database instead; these are the global library, added in the OAST tab's provider overlay with its scope set to `global`.
 
 ```json
 {
@@ -729,7 +739,7 @@ OAST providers defined once and reusable across every project. Project-scoped pr
 |-----|------|-------------|
 | `id` | string | Random hex token assigned on creation. Do not hand-edit |
 | `name` | string | Label shown in the OAST tab |
-| `kind` | string | Provider type, e.g. `interactsh` |
+| `kind` | string | Provider type: `interactsh`, `custom-http`, `webhook.site`, `BOAST`, or `postbin` |
 | `host` | string | Provider host |
 | `token` | string | Optional auth token for the provider |
 | `enabled` | bool | Whether the provider is selectable (default `true`) |
@@ -762,7 +772,7 @@ The last three are state gori maintains; only `check_enabled` is meant to be edi
 
 ### fuzzer
 
-Wordlist paths remembered by the Fuzzer's Payload overlay. Scratch state, not project data.
+Wordlists remembered by the Fuzzer's Payload overlay. Scratch state, not project data. A list in the [wordlist catalog](/guide/repeater-and-fuzzer/#wordlist-catalog) is stored by its name (`common.txt`), or by its path when a file of that name in the working directory would shadow the name; an entry an older gori stored as the absolute path into the catalog reads the same. Any other path is kept exactly as given.
 
 ```json
 {
@@ -775,38 +785,142 @@ Wordlist paths remembered by the Fuzzer's Payload overlay. Scratch state, not pr
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `recent_wordlists` | array | Most-recently-applied wordlist paths, newest first, capped at 10 |
-| `favorite_wordlists` | array | Paths starred in the Path field, offered ahead of the recents |
+| `recent_wordlists` | array | Most-recently-applied wordlists (catalog names, or paths), newest first, capped at 10 |
+| `favorite_wordlists` | array | Wordlists starred in the Path field (catalog names, or paths), offered ahead of the recents |
 
 Omitted until you apply or star a wordlist.
+
+### redaction
+
+The [safe evidence export](/reference/cli/#safe-evidence-export) profiles, which one is active, whether it applies without being asked, and the per-install placeholder secret.
+
+```json
+{
+  "redaction": {
+    "active": "pci",
+    "default": true,
+    "salt": "…64 hex…",
+    "profiles": [
+      {
+        "name": "pci",
+        "description": "cardholder data for this engagement",
+        "json_fields": ["card_number", "cvv"],
+        "json_pointers": ["/data/acct", "/users/-/token"],
+        "form_keys": ["cc"],
+        "patterns": ["account=(\\d+)"]
+      }
+    ]
+  }
+}
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `active` | string | `""` | Profile a safe export uses when the invocation names none. Empty = the built-in `default` |
+| `default` | bool | `false` | Sanitize shareable output *without* `--redact`. With it on, `--no-redact` is the explicit path back to the captured bytes |
+| `salt` | string | minted | HMAC key behind every `[REDACTED:<tag>]`. Written once, on first use, and never shown in any UI |
+| `profiles` | array | `[]` | Named rule sets. A profile whose `name` matches a built-in replaces it |
+
+Each profile carries `name` plus any of `description`, `json_fields`, `json_pointers`, `form_keys` and `patterns` — see [run redact](/reference/cli/#run-redact) for what each kind matches. Parsing is tolerant: an entry with no usable `name` is dropped, and a rule entry that is not a non-empty string is skipped rather than failing the load.
+
+The salt is a **secret**, kept beside `env`'s token values on the same terms (the tree is `0700`, the file `0600`). A factory reset keeps it — discarding it would silently break every placeholder in every artifact already written — and a plain `gori settings export` carries it, so share `gori run redact profiles --format json` instead when you mean to hand over only the rules.
+
+Project-scoped profiles live in the project database rather than here; see [Per-Project Overrides](#per-project-overrides).
+
+### rewriter, colormarker, saved_views and decoder {#global-libraries}
+
+These four sections hold libraries rather than switches. `rewriter`, `colormarker` and `saved_views` are the **global** rows of the Match & Replace rules, the History colour rules and the History views; a project keeps its own rows in its database and can override a global row's on/off state there. `decoder` holds the named Decoder chains. Create and edit them from their tabs or with [`gori run rewriter`](/reference/cli/#run-rewriter), [`gori run colormarker`](/reference/cli/#run-colormarker) and [`gori run views`](/reference/cli/#run-views) and `--scope global`, which validate each row. What they write looks like this:
+
+```json
+{
+  "rewriter": {
+    "next_rule_id": 3,
+    "rules": [
+      {
+        "id": 1, "enabled": true, "name": "no CSP",
+        "target": "response", "part": "head", "op": "remove_header", "match_kind": "literal",
+        "pattern": "Content-Security-Policy", "replacement": "", "host": "", "body_file": ""
+      },
+      {
+        "id": 2, "enabled": true, "name": "",
+        "target": "request", "part": "head", "op": "short_circuit", "match_kind": "literal",
+        "pattern": "/api/pay", "replacement": "", "host": "example.com", "body_file": "",
+        "respond": "fault", "respond_args": "{\"fault\":\"reset\",\"delay_ms\":500}"
+      }
+    ]
+  },
+  "colormarker": {
+    "next_rule_id": 2,
+    "rules": [
+      { "id": 1, "enabled": true, "name": "admin", "when": "path:/admin", "color": "teal", "style": "full" }
+    ],
+    "colors": [ { "name": "teal", "hex": "#2aa198" } ]
+  },
+  "saved_views": {
+    "next_view_id": 2,
+    "views": [ { "id": 1, "name": "APIs", "query": "path:/api" } ]
+  },
+  "decoder": {
+    "chains": [ { "name": "myenc", "spec": "base64-encode > url-encode" } ]
+  }
+}
+```
+
+A `rewriter` rule's fields map onto the `gori run rewriter add` flags:
+
+| Key | Flag | Description |
+|-----|------|-------------|
+| `id` | | Global rule id. A project's override names the rule by this id |
+| `enabled` | `--disabled` | The rule's default state. A rule with no `enabled` key reads as off |
+| `name` | `--name` | Label in the rule list |
+| `target` | `--target` | `request` or `response` |
+| `part` | `--part` | `head`, `body` or `ws` |
+| `op` | `--op` | `replace`, `add_header`, `set_header`, `remove_header`, `short_circuit` or `pipe` |
+| `match_kind` | `--match` | `literal` or `regex` |
+| `pattern` | `--find` | What to match. A rule with an empty `pattern` is dropped when the file loads |
+| `replacement` | `--value` | Replacement text, header value, canned response, or the `pipe` command |
+| `host` | `--host` | Host glob; empty applies everywhere |
+| `body_file` | `--body-file`, `--map-dir` | The file a `short_circuit` rule serves, or the directory it maps |
+| `respond` | | How a `short_circuit` rule answers: `inline`, `file`, `dir` or `fault`. Omitted when it is what `body_file` implies (`file` with one, `inline` without) and there are no `respond_args` |
+| `respond_args` | `--strip-prefix`, `--fallthrough`, `--fault`, `--delay`, `--hang` | A JSON object **stored as a string**, with `strip_prefix`, `fallthrough`, `fault` (`close`/`reset`/`hang`), `delay_ms` and `hang_ms` |
+
+A `colormarker` rule carries `when` (the History QL condition, `--when`), `color` (`red`, `orange`, `yellow`, `green`, `blue`, `purple`, or the name of an entry in `colors`) and `style` (`full` tints the row, `strip` paints one cell). A rule with no `enabled` key reads as on, since a colour rule never touches traffic. `colors` is the custom palette `gori run colormarker color add --name --hex` writes, and an entry with a blank or duplicate name or an unreadable hex is dropped. A `saved_views` entry is an `id`, a `name` and a History QL `query`. A `decoder` chain is a `name` and the `spec` it runs; the Decoder tab's **Save chain by name** writes it.
+
+`next_rule_id` and `next_view_id` only ever count up. A project's overrides refer to global rows by id, and a reused id would hand an old override to a new rule, so these counters survive deleting every rule and a factory reset. In a `rewriter` rule, a label this gori does not know (one a newer build wrote) is kept as written and holds the rule inert instead of being rewritten to a default, and so does an extra key.
 
 ### Other sections
 
 | Section | Description |
 |---------|-------------|
 | `theme` | Active theme name (default `goridark`). See the [Themes guide](/guide/themes/) |
-| `mouse` | Mouse support toggle |
+| `mouse` | Mouse support toggle (on by default) |
 | `mouse_drag` | What releasing a drag does: `select` (default) or `copy` |
-| `pretty_bodies` | Pretty-print JSON/XML/etc. bodies in the detail view |
+| `pretty_bodies` | Pretty-print JSON/XML/etc. bodies in the detail view (on by default) |
 | `editor` | External editor `command` and Markdown handling |
-| `tabs` | Which TUI tabs are shown/hidden |
-| `hostname_overrides` | Global host → IP dial map. See [hostname_overrides](#hostname_overrides) above |
-| `env` | Env-token prefix and global values. See [env](#env) above |
-| `hotkeys` | Keybinding overrides (`os` layer + `command_modifier` + `bindings`). See the [Hotkeys guide](/guide/hotkeys/) |
+| `tabs` | Which TUI tabs are shown/hidden, in tab-bar order |
+| `hostname_overrides` | Global host → IP dial map. See [hostname_overrides](#hostname-overrides) above |
+| `env` | Env-token grammar (`syntax`), sigil and global values. See [env](#env) above |
+| `user_agents` | Your own list for `$GEN.USER_AGENT`, replacing the built-in one. See [user_agents](#user-agents) above |
+| `hotkeys` | Keybinding overrides (`os` layer + `command_modifier` + `keyset` + `bindings`). See the [Hotkeys guide](/guide/hotkeys/) |
 | `hooks` | External process hooks: `timeout_secs` (default 5, clamped 1-60) is the wall-clock budget one hook run gets at every seam. See [Process hooks](/guide/scripting/#process-hooks) |
-| `decoder` | Named Decoder chain specs, shared by every project and callable as a chain step by name (open sub-tabs live in the project database) |
-| `rewriter` | GLOBAL Match & Replace rules, applied in every project, each with a default on/off state a project can override. See [Global and project rules](/guide/proxy/#global-and-project-rules) |
-| `colormarker` | GLOBAL History row-colour rules, with the same global/project split as `rewriter`. Display only: a colour rule never modifies traffic. See [run colormarker](/reference/cli/#run-colormarker) |
+| `decoder` | Named Decoder chain specs, shared by every project and callable as a chain step by name (open sub-tabs live in the project database). See [above](#global-libraries) |
+| `rewriter` | GLOBAL Match & Replace rules, applied in every project, each with a default on/off state a project can override. See [Global and project rules](/guide/proxy/#global-and-project-rules); the row shape is [above](#global-libraries) |
+| `colormarker` | GLOBAL History row-colour rules and the custom colour palette, with the same global/project split as `rewriter`. Display only: a colour rule never modifies traffic. See [run colormarker](/reference/cli/#run-colormarker); the row shape is [above](#global-libraries) |
 | `mine` | Saved Param Miner defaults. See [mine](#mine) above |
-| `saved_views` | The GLOBAL History **views** library: named QL queries applied as a lens, with the same global/project split `rewriter` has. See [run views](/reference/cli/#run-views) |
-| `companion` | Miss Ring, the mascot: `enabled` (off by default), `placement` (`body` \| `bar`), `motion` (`lively` \| `calm` \| `still`) and `notices`. See the [Settings guide](/guide/settings/) |
-| `layout` | History / Probe / Issues previews, Sitemap expand depth, tab-bar numbers. See [layout](#layout) above |
+| `saved_views` | The GLOBAL History **views** library: named QL queries applied as a lens, with the same global/project split `rewriter` has. See [run views](/reference/cli/#run-views); the row shape is [above](#global-libraries) |
+| `companion` | Miss Ring, the mascot: `enabled` (on by default), `placement` (`body` \| `bar`), `motion` (`lively` \| `calm` \| `still`), `notices` and `replies` (`hold` \| `timed`: whether an agent's reply stays until your next key or click). See the [Settings guide](/guide/settings/) |
+| `layout` | History / Probe / Issues previews, History list order, Sitemap expand depth, tab-bar numbers and slots. See [layout](#layout) above |
 | `statusline` | Bottom status row that runs a command on an interval. See [statusline](#statusline) above |
+| `redaction` | Safe-export profiles, the active one, the on-by-default switch and the placeholder salt. See [redaction](#redaction) above |
 | `display` | Default detail pane, list time format, line-number gutter, `wrap_lines` (soft-wrap long lines, on by default), preview body cap, `resource_meter` (the CPU/memory readout at the far right of the bottom bar, on by default), and `terminal_title` |
+| `mcp` | How `gori mcp` delivers "Tell the agent…" messages: `channels` (off by default) enables the `claude/channel` push as a last resort, tried only when neither the inbox socket nor the Codex queue answered. Those two, the tool-result carry and the `operator_messages` poll always run. See [Messages from gori](/guide/mcp/#messages-from-gori) |
+| `mcp_permissions` | Preferences › AI › MCP permissions: the groups of `gori mcp` tools an attached agent may NOT use, as `"<group>": false` (`send`, `intercept`, `write`, `scope`, `projects`). Absent means every group is allowed. The object is the whole set, so a group it does not name is allowed; an unknown key is kept. Read when `gori mcp` starts. See [Permissions from Preferences](/guide/mcp/#permissions-from-preferences) |
 
 ## Per-Project Overrides
 
-A project can pin its own network settings without editing the global file. These are stored in the project database (keys `net.bind_host`, `net.bind_port`, `net.upstream_proxy`, `net.upstream_destination_host`, `net.upstream_auth`, `net.connect_timeout_secs`, `net.io_timeout_secs`, `net.capture_max_mib`) and edited from the **Project** tab's **Project settings** sub-tab.
+A project can also carry its own **redaction** config under the `redaction` key — its own profiles, which one is active, and its own answer to "sanitize by default" (including an explicit `false` that turns a global default off for one engagement). Written by [`gori run redact`](/reference/cli/#run-redact); resolution is project, then global, then built-in, first match by name.
+
+A project can pin its own network settings without editing the global file. These are stored in the project database (keys `net.bind_host`, `net.bind_port`, `net.upstream_proxy`, `net.upstream_destination_host`, `net.upstream_auth`, `net.connect_timeout_secs`, `net.io_timeout_secs`, `net.capture_max_mib`) and edited from the **Project** tab's **Project settings** sub-tab, or headless with [`gori run project network`](/reference/cli/#project-network) (`list`, `get`, `set`, `unset`). A project imported from a `.gori` archive ([`gori run project import`](/reference/cli/#project-import)) arrives with none of these keys and none of its project host overrides, so it starts on this machine's global network settings.
 
 **Destination host** limits proxy routing to one case-insensitive host pattern. `*` is the default and makes every destination eligible; `example.com` covers that host and its subdomains, while `*.example.com` covers subdomains only. Domain, IPv4, IPv6, and `*`-based IP patterns are accepted. A non-match always goes direct and does not fall through to `upstream_rules` or `network.upstream_proxy`. This gate applies to every gori-owned dial while the project is active, including capture, replay, scanners, the updater, and OAST traffic.
 
@@ -834,8 +948,8 @@ The timeout and capture-limit keys are engagement properties rather than machine
 | 3 | `settings.json` `network.*` |
 | 4 (lowest) | Factory defaults `127.0.0.1:8070` / direct |
 
-Saving a Project-tab field that equals the current global value deletes that KV key, so the project keeps inheriting future global edits instead of freezing a duplicate. **Destination host** has no global counterpart; saving its default `*` deletes its project key.
+Saving a Project-tab field that equals the current global value deletes that KV key, so the project keeps inheriting future global edits instead of freezing a duplicate. **Destination host** has no global counterpart; saving its default `*` deletes its project key. `gori run project network set` names one key, so it pins even a value equal to the global (`unset` is the way to inherit), and an empty `upstream_proxy` pins a direct route rather than inheriting.
 
 ## Projects & Database
 
-Each project keeps at most `retention.max_flows` flows (100,000 by default; see [retention](#retention)); older ones are pruned so the file plateaus. Each project is a SQLite database (via `crystal-db` / `crystal-sqlite3`) holding flows, WebSocket messages, scope rules, issues, match rules, HTTP/2 frames, repeater and fuzz sessions, host overrides, sitemap tags, miner sessions, and Probe issues, plus a full-text index over flow bodies. Stored request/response bodies are capped at 2 MiB; larger bodies are truncated in the database, but their true wire size is still recorded. Serve any project's database directly with `--db PATH`, or select a named project with `--project NAME`.
+Each project keeps at most `retention.max_flows` flows (100,000 by default; see [retention](#retention)); older ones are pruned so the file plateaus. Each project is a SQLite database (via `crystal-db` / `crystal-sqlite3`) holding flows, WebSocket messages, scope rules, issues, match rules, HTTP/2 frames, repeater and fuzz sessions, host overrides, sitemap tags, miner sessions, and Probe issues, plus a full-text index over flow bodies. Stored request/response bodies are capped at `network.capture_max_mib` (2 MiB by default); larger bodies are truncated in the database, but their true wire size is still recorded. Open any project's database directly with `--db PATH`; `gori run` and `gori mcp` also select a named project with `--project NAME`.

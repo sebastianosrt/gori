@@ -3,6 +3,7 @@ require "../env"
 require "../host_overrides"
 require "../outbound"
 require "../repeater/flow_request"
+require "../request_macro"
 require "./content_length"
 require "./engine"
 require "./generator"
@@ -37,6 +38,9 @@ module Gori::Fuzz
       UnresolvedEnv
       # `--race`/`race_count` below 2 — a race needs at least two connections in flight
       # together, so 1 is just a send (refused, not silently clamped, so the operator sees why).
+      # Also a race group that would send more than `max_requests` (`detail` = the request
+      # count the group needs, warm-ups included; nil for the below-2 case): a group is sent
+      # whole, so the cap can only be honoured by refusing it (#1204).
       BadRaceCount
       # The run's TLS fingerprint override names a preset gori does not have (`detail` = the
       # name as given). Refused rather than ignored, for the reason `Repeater::PlanError`'s
@@ -201,6 +205,15 @@ module Gori::Fuzz
     # spelling: the handshake is part 0 of the run's position space (see `Fuzz::WsScript`), so
     # `auto_mark`, `marks`, `sources`, `processors` and `auto_encode` all keep their meaning.
     property ws_messages : Array(WsMessageSource)?
+    # The project a `ProjectSource` in `sources` reads (#1352), or nil when the surface has no
+    # project to read. Passed in rather than loaded, like `overrides`: only a surface can reach a
+    # store. `Plan.build` resolves every `ProjectSource` against it — the one place a project is
+    # read for a run — and a source with no project to read is refused there, by name.
+    property project : Gori::Store?
+    # Drain the off-commit search index before a `body:`/free-text source query runs, and refuse
+    # when it cannot (the default: one-shot CLI and MCP). The live TUI passes false — it must not
+    # stall its frame waiting for a writer — and reads the backlog off the report instead.
+    property? project_drain_fts : Bool
 
     def initialize(@template : String = "",
                    *,
@@ -220,7 +233,9 @@ module Gori::Fuzz
                    @overrides : Gori::HostOverrides? = nil,
                    @env_vars : Hash(String, String)? = nil,
                    @grpc_fields : Array(String) = [] of String,
-                   @ws_messages : Array(WsMessageSource)? = nil)
+                   @ws_messages : Array(WsMessageSource)? = nil,
+                   @project : Gori::Store? = nil,
+                   @project_drain_fts : Bool = true)
     end
   end
 
@@ -266,6 +281,22 @@ module Gori::Fuzz
     # Reported here for the same reason `rewrites_content_length?` is: a fact about the run
     # that only the builder can see, said ONCE, up front, by whichever surface asked.
     getter shadowed_marks : Array(String)
+    # How many payload sets this run was given but will never draw from — the count, not the
+    # sets, because the operator identifies them by the ORDER they typed them in.
+    #
+    # `Generator`'s set contract is silent by construction: Sniper and BatteringRam read
+    # `@sets[0]` and nothing else, and Pitchfork / ClusterBomb map set `k` to position `k`, so
+    # any set past position_count is never opened. Both discards happened with no word said —
+    # `-w users.txt -w passwords.txt` under the DEFAULT mode swept `users.txt` into both
+    # positions and reported `N sent · 0 errors`, a run that looks like the one the operator
+    # asked for and tested half of it. A missing wordlist in the dropped slot did not even
+    # raise, because nothing ever opened it.
+    #
+    # A NOTE and not a refusal, for the reason `ws_ignored_knobs` gives: passing more sets than
+    # a mode consumes is not wrong (a saved command line switched from pitchfork to sniper for
+    # one run is the ordinary case), it is just inert — and being told nothing is how the
+    # operator comes to believe both lists were swept.
+    getter unused_payload_sets : Int32
     # Which positions this run percent-encodes for, and the encode itself. Exposed so a
     # surface can SAY so (the CLI notes it once, up front, and names `--no-encode`) and so
     # the TUI's request RECONSTRUCTION can reproduce the bytes the generator produced —
@@ -288,7 +319,7 @@ module Gori::Fuzz
     # A NOTE and not a refusal, for the reason `ws_ignored_knobs` gives: an unframed request is
     # a legitimate thing to send on purpose, and refusing a run over it would be hostile. What
     # is not legitimate is sending it by accident and being told nothing, which is what happened
-    # while `add_content_length_when_missing` defaulted false (see there). The remedy this one
+    # while `update_content_length` stopped short of adding the header (see there). The remedy this one
     # names is the OPPOSITE of `rewrites_content_length?`'s: turn the knob ON, not off.
     getter? unframed_body : Bool
     # The marked WebSocket script, or nil for an ordinary HTTP sweep. `template` above stays the
@@ -320,6 +351,17 @@ module Gori::Fuzz
     # `config` — `config.tls_preset` is what the operator typed, this is what the dial uses.
     getter tls_preset : String?
 
+    # What each project-derived payload set (`ProjectSource`, #1352) read: its source, how many
+    # flows and values, what was withheld as sensitive, and what cut it short — in the order the
+    # sets were given. Empty for a run with none. A fact about the run only the builder can see,
+    # said once up front by whichever surface asked, and never carrying a value.
+    getter payload_reports : Array(PayloadFrom::Report)
+
+    # The run's request-time macro (#1350), or nil when it has none. The same object the engine
+    # gates every candidate through; a surface reads `request_macro_info` for the plan-time line
+    # and `Progress#request_macro` for what happened.
+    getter request_macro : RequestMacro::Lane?
+
     def initialize(@engine : Engine, @generator : Generator, @matcher : Matcher,
                    @config : Config, @origin : Origin, @template : Template,
                    @http2 : Bool, @request_target : String,
@@ -327,11 +369,22 @@ module Gori::Fuzz
                    @rewrites_content_length : Bool = false,
                    @unframed_body : Bool = false,
                    @shadowed_marks : Array(String) = [] of String,
+                   @unused_payload_sets : Int32 = 0,
                    @auto_encode : AutoEncode = AutoEncode.none,
                    @ws_script : WsScript? = nil,
                    @ws_ignored_knobs : Array(Symbol) = [] of Symbol,
                    @grpc_fields : GrpcFieldTemplate? = nil,
-                   @tls_preset : String? = nil)
+                   @tls_preset : String? = nil,
+                   @payload_reports : Array(PayloadFrom::Report) = [] of PayloadFrom::Report,
+                   @request_macro : RequestMacro::Lane? = nil)
+    end
+
+    # What the macro does to this run, said before it starts: the steps, the cadence, whether a
+    # value is shared between candidates, and the parallelism that leaves the run. nil without a
+    # macro. The engine's OWN clamped concurrency and race size, so the line cannot describe a
+    # number the run will not use.
+    def request_macro_info : RequestMacro::Info?
+      @request_macro.try(&.info(@engine.concurrency, @engine.race_count))
     end
 
     # Does this run sweep a WebSocket script rather than an HTTP request?
@@ -388,7 +441,11 @@ module Gori::Fuzz
       # not. nil — every other evidence caller — keeps the blanket skip.
       text =
         if options.evidence?
-          (vars = options.env_vars) ? String.new(Env.expand_wire(options.template, vars)) : options.template
+          # `unescape: Owns::None`: `Escape::Preserve` is a BARE-mode knob, and under the namespaced
+          # grammar `Env.unescape_set` ignores it and hands this pass its own `resolve` set — so a
+          # narrowed evidence expansion CONSUMED `$$ENV.X` and replayed `$ENV.X`. The narrowing is
+          # about the var TABLE; the escape belongs to the capture either way.
+          (vars = options.env_vars) ? String.new(Env.expand_wire(options.template, vars, unescape: Env::Owns::None)) : options.template
         else
           String.new(Env.expand_wire(options.template))
         end
@@ -458,6 +515,8 @@ module Gori::Fuzz
       # would otherwise be reported as "a gRPC field position and --race cannot combine" and the
       # operator would never learn that a race of 1 is refused on its own terms.
       race_count = validate_race_count(options.config.race_count)
+      validate_race_budget(race_count, options.config, options.http2?)
+      validate_stop_on(race_count, options.config, options.matcher)
       # Beside the race guard rather than at the `Sender` it feeds, so an unknown preset is
       # refused before the run reads a wordlist off disk or resolves a `.proto` — everything
       # after this point is work the operator does not want done for a run that cannot start.
@@ -475,13 +534,30 @@ module Gori::Fuzz
       # both guards below (and NoPayloads, one screen down) are skipped when it is set.
       # (`race_count` is validated above, ahead of the gRPC field guard — see there.)
       raise PlanError.new(PlanError::Reason::NoPositions, "the template has no §…§ positions") if marked.position_count == 0 && !race_count
-      # The twin of `refuse_unresolved`, one line down and for the same reason: a `¦chain` this
-      # run cannot apply leaves the position's payload UNTRANSFORMED on the wire. See
-      # `refuse_unrunnable_chains` (the shared validator the Repeater send path also calls).
+      # The twin of the target's unresolved-token refusal (`resolve_origin`, below), for the same
+      # reason: a `¦chain` this run cannot apply leaves the position's payload UNTRANSFORMED on
+      # the wire. See `refuse_unrunnable_chains` (the shared validator the Repeater send path
+      # also calls).
       refuse_unrunnable_chains(marked.positions, Decoder.shared_registry)
 
       origin = resolve_origin(options)
 
+      # The request-time macro (#1350), validated HERE for the reason every other refusal is:
+      # before a wordlist is read or a socket is dialled. Its steps are the FIRST traffic the run
+      # produces, and a macro that cannot work must not send a request to find out.
+      request_macro = build_request_macro(options, outbound, race_count,
+        [text] + (ws_texts || [] of String))
+      # The group's own size was judged above, before the macro existed. The steps run once
+      # before the group and cannot be split off it, so they count toward the same cap.
+      if request_macro
+        validate_race_budget(race_count, options.config, options.http2?,
+          request_macro.macro_requests(1_i64))
+      end
+
+      # Project-derived sets are read HERE, before the sets are paired with the processing
+      # pipeline: every surface hands over the same `ProjectSource`, and this is the one place a
+      # store is read for a run. Skipped for a race, which draws from no set at all.
+      payload_reports = race_count ? [] of PayloadFrom::Report : resolve_project_sources(options)
       sets = options.sources.map { |src| PayloadSet.new(src, options.processors) }
       raise PlanError.new(PlanError::Reason::NoPayloads, "no payload sets") if sets.empty? && !race_count
 
@@ -495,6 +571,10 @@ module Gori::Fuzz
       # `#total` (the only readers of `@sets`) are never called on that path; `Engine#run_race`
       # calls `Generator#baseline_request` instead, which does not touch `@sets` either.
       gen_sets = sets.empty? ? [] of PayloadSet : (config.mode.per_position? ? sets : [sets.first])
+      # Sets handed over that `Generator` will never draw from. Counted off `gen_sets` and the
+      # run's own position count — the two facts `Generator#set_for` actually maps through — so
+      # this cannot drift from the contract it reports on. See `Plan#unused_payload_sets`.
+      unused_sets = Math.max(sets.size - Math.min(gen_sets.size, marked.position_count), 0)
       # A payload a field's DECLARATION cannot hold, refused before the first dial — `abc` into
       # an `int32`, an enum name the schema does not carry. Beside `refuse_unrunnable_chains`
       # above and for the same reason its comment gives, over the sets the generator will
@@ -546,16 +626,66 @@ module Gori::Fuzz
         # bare hello. `config` — not `options` — is the carrier, because a finished run has to
         # be able to say which handshake produced its results.
         tls_preset: tls_preset)
-      new(engine: Engine.new(generator, matcher, sender, config), generator: generator,
+      new(engine: Engine.new(generator, matcher, sender, config, request_macro), generator: generator,
         matcher: matcher, config: config, origin: origin, template: template,
         http2: options.http2?, request_target: request_target, mark_matches: mark_matches,
         pool: sender.pool,
         rewrites_content_length: config.update_content_length? &&
                                  ContentLength.sync(generator.baseline_raw, false) != generator.baseline_raw,
         unframed_body: unframed_body?(config, generator.baseline_raw),
-        shadowed_marks: shadowed_marks, auto_encode: auto_encode,
+        shadowed_marks: shadowed_marks, unused_payload_sets: unused_sets, auto_encode: auto_encode,
         ws_script: ws_script, ws_ignored_knobs: ws_ignored, grpc_fields: grpc_fields,
-        tls_preset: sender.tls_preset)
+        tls_preset: sender.tls_preset, payload_reports: payload_reports,
+        request_macro: request_macro)
+    end
+
+    # The run's macro lane, or nil when it has none (or has it `off`).
+    #
+    # Refused, in this order and each with the words the operator can act on: no project to read
+    # the steps from; a race whose group the cadence cannot cover; a step that cannot run
+    # (`Runner.build` names it); a request that can never carry what the steps produce.
+    #
+    # The race rule is the "unsafe combination" the issue names. A race releases N copies of ONE
+    # request together, so they can only share one value; a cadence shorter than the group would
+    # promise a fresh value per request (or per few) that N identical, simultaneous requests
+    # cannot have. Refusing is the honest answer — silently sharing would change the test the
+    # cadence describes. With `every >= N` the group is one epoch: the steps run once, before the
+    # group is dialled, and every member carries what they left, which is also exactly the
+    # experiment "redeem one single-use token from N connections at once".
+    private def self.build_request_macro(options : PlanOptions, outbound : Gori::Outbound,
+                                         race : Int32?, candidates : Array(String)) : RequestMacro::Lane?
+      spec = options.config.request_macro
+      return nil unless spec && spec.active?
+      store = options.project || raise RequestMacro::Error.new(
+        "a macro reads its steps from the project's Repeater sessions, and this run has no project attached — " \
+        "open one (--project / --db), or seed the run from a captured flow or a Repeater session")
+      if race
+        group = Math.min(race, Engine::MAX_RACE_SIZE)
+        if spec.cadence.every < group
+          raise RequestMacro::Error.new(
+            "a race sends #{group} identical requests together, so they can only share ONE macro value, " \
+            "but this macro runs #{spec.cadence.label} — set the cadence to at least #{group} " \
+            "(the macro then runs once, before the group is dialled), or turn the macro off")
+        end
+      end
+      runner = RequestMacro::Runner.build(spec, store, outbound,
+        overrides: options.overrides, verify: options.verify?)
+      runner.check_reachable!(candidates, options.evidence?)
+      RequestMacro::Lane.new(spec, runner, "fuzzer")
+    end
+
+    # Resolve every `ProjectSource` against the project the surface handed over (#1352). A
+    # reading run with no project to read is refused by name rather than reaching `size` and
+    # failing there with no context. The reports come back in set order.
+    private def self.resolve_project_sources(options : PlanOptions) : Array(PayloadFrom::Report)
+      reports = [] of PayloadFrom::Report
+      options.sources.each do |src|
+        next unless src.is_a?(ProjectSource)
+        store = options.project || raise PayloadFrom::Error.new(
+          "payload source #{src.spec.label.inspect} reads the project's captured data, and this run has no project to read")
+        reports << src.resolve!(store, drain_fts: options.project_drain_fts?)
+      end
+      reports
     end
 
     # Will this run put an UNFRAMED body on the wire? See `Plan#unframed_body?`.
@@ -567,10 +697,10 @@ module Gori::Fuzz
     # `\n\r\n`, a `Transfer-Encoding` that only the last coding makes chunked) cannot be judged
     # one way by the framing check and another by the pass that does the framing.
     #
-    # The guard comes first so the healthy default (both knobs on, gori frames it) pays no
+    # The guard comes first so the healthy default (the knob on, gori frames it) pays no
     # render at all — this runs once per plan build, but `baseline_raw` can be a large capture.
     private def self.unframed_body?(config : Config, raw : Bytes) : Bool
-      return false if config.update_content_length? && config.add_content_length_when_missing?
+      return false if config.update_content_length?
       ContentLength.sync(raw, true) != ContentLength.sync(raw, false)
     end
 
@@ -688,21 +818,9 @@ module Gori::Fuzz
     private def self.resolve_origin(options : PlanOptions) : Origin
       raw = options.target.presence || options.default_target.presence
       raise PlanError.new(PlanError::Reason::NoTarget, "no target origin") unless raw
-      # `deferred: nil` — a DIAL TUPLE cannot defer. Every other unresolved-name site skips a
-      # DECLARED binding because a send seam re-scans the same value with `Env.expand_bindings`
-      # later; this value is read ONCE, frozen into the plan, and never
-      # looked at again — `Fuzz::Sender`/`Discover::Sender` build their ConnPool on it and the
-      # Layer-1 `Outbound#check` verdict was already taken against it, so re-resolving per send
-      # would move the dial target out from under a scope decision. Deferring bought nothing
-      # anyway: a binding value is a token observed from a response, never a hostname, a port
-      # or an SNI. Left deferred it shipped as the literal `$SESSION` — every send failing DNS,
-      # and `Outbound.scope_url` asked about `https://$SESSION/a`, a URL no rule can match, so
-      # the run was refused as out-of-scope, naming the wrong gate.
-      refuse_unresolved(Env.unresolved(raw, deferred: nil))
-      url = Env.expand(raw)
-      scheme, host, port = Repeater::FlowRequest.parse_target(url)
-      raise PlanError.new(PlanError::Reason::BadTarget, "could not parse a host from #{url.inspect}", url) if host.empty?
-      Origin.new(scheme, host, port)
+      Origin.new(*Repeater::FlowRequest.dial_target(raw))
+    rescue e : Repeater::FlowRequest::DialTargetError
+      raise PlanError.new(e.unresolved? ? PlanError::Reason::UnresolvedEnv : PlanError::Reason::BadTarget, e.message.to_s, e.detail)
     end
 
     # Race mode needs at least two connections in flight together (one is just a send).
@@ -722,30 +840,53 @@ module Gori::Fuzz
       race_count
     end
 
+    # A race group is released whole — splitting it at a budget boundary would break the
+    # synchronization it exists for — so a group larger than `max_requests` cannot be clamped
+    # to the budget, only refused. Refused HERE, before any dial, so the cap stays a true
+    # bound on what leaves gori (#1204); `CappedBackend#send_race` holds the same line at
+    # send time. Counts the group as the engine will run it (clamped to `MAX_RACE_SIZE`),
+    # plus one warm-up per connection when the run carries one — not under h2, where
+    # `Sender#send_race` degrades to independent sends and never sends the warm-up.
+    private def self.validate_race_budget(race_count : Int32?, config : Config, http2 : Bool,
+                                          extra : Int64 = 0_i64) : Nil
+      return unless (n = race_count) && (cap = config.max_requests) && cap > 0
+      conns = n.clamp(1, Engine::MAX_RACE_SIZE).to_i64
+      warmup = config.race_warmup && !http2
+      needed = (warmup ? conns * 2 : conns) + extra
+      return if needed <= cap
+      warm = warmup ? " (a warm-up and the race request on each connection)" : ""
+      steps = extra > 0 ? " plus #{extra} macro step#{extra == 1 ? "" : "s"} before the group" : ""
+      raise PlanError.new(PlanError::Reason::BadRaceCount,
+        "a race of #{conns} connections sends #{needed} requests#{warm}#{steps}, over the " \
+        "#{cap}-request cap; a race group is sent whole, never split", needed.to_s)
+    end
+
     # The run's fingerprint override, validated. Same shape and same reasoning as
     # `validate_race_count` above: a plan-INPUT refusal, so it rides the `rescue
     # Fuzz::PlanError` every surface already wraps `Plan.build` in. Returns the NORMALISED
     # name, which is what the sender, the pool and the run record all carry.
+    # `stop_on` (issue #1240: a match count or a separate condition) cannot ride a race run: a
+    # race group is released whole, so there is no per-row verdict for it to fire on. A no-op
+    # for every run that set neither, so the ordinary sweep is untouched.
+    #
+    # A plain `Gori::Error`, deliberately NOT a `PlanError::Reason`, for the reason
+    # `WsError`/`GrpcFieldError` above are not: that enum is `case … in`'d exhaustively across
+    # three surfaces, and this refusal reads identically on all of them, so the builder writes
+    # the sentence once and every surface's existing `Gori::Error` path carries it.
+    private def self.validate_stop_on(race_count : Int32?, config : Config, matcher : Matcher) : Nil
+      return unless race_count
+      return unless config.stop_after_matches || matcher.stop_condition
+      raise Gori::Error.new(
+        "stop_on cannot combine with --race: a race group is N byte-identical copies of ONE " \
+        "request released together in a single write, so there is no per-response verdict for a " \
+        "stop condition or a match count to fire on. Drop --race, or drop the stop condition")
+    end
+
     private def self.validate_tls_preset(name : String?) : String?
       if err = Settings.tls_preset_error(name)
         raise PlanError.new(PlanError::Reason::TlsPreset, err, name.try(&.strip))
       end
       Settings.tls_preset_normalize(name)
-    end
-
-    # Refuse a run whose TARGET carries a token that resolves to nothing.
-    #
-    # The template half of this is gone — a `$NAME` with no value is a literal string on the
-    # wire now, everywhere. A DIAL TUPLE is the exception the note at the call site argues:
-    # `$` is not a legal byte in a hostname, so there is no operator test case to protect,
-    # and a literal `$SESSION` there makes `Outbound.scope_url` ask about `https://$SESSION/a`
-    # — a URL no rule can match — so the run comes back refused as OUT-OF-SCOPE, naming a
-    # gate that was never the problem. Refusing here names the real one.
-    private def self.refuse_unresolved(names : Array(String)) : Nil
-      return if names.empty?
-      detail = Env.token_list(names)
-      raise PlanError.new(PlanError::Reason::UnresolvedEnv,
-        "unresolved env #{detail}", detail)
     end
 
     # Refuse a run whose `§value¦chain§` markers name a converter the registry cannot apply.
@@ -761,8 +902,8 @@ module Gori::Fuzz
     # `"matched":true`. `gori run decoder` names the identical refusal off the identical
     # registry one screen away.
     #
-    # So it is refused HERE, beside `refuse_unresolved`, whose comment makes the same argument
-    # for `$KEY`: this builder is the surface-independent chokepoint every fuzz surface goes
+    # So it is refused HERE, the argument `FlowRequest.refuse_unresolved_dial` makes for a
+    # target's `$KEY`: this builder is the surface-independent chokepoint every fuzz surface goes
     # through, and a refusal before the first dial is the only report a sweep of ten thousand
     # requests can act on.
     #

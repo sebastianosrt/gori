@@ -12,10 +12,24 @@ describe Gori::Tui::TrafficEmptyState do
     backend.contains?("waiting for traffic").should be_true
     backend.contains?("FLOW LOG").should be_true
     backend.contains?("localhost:8070").should be_true
-    backend.contains?("Open browser").should be_true
-    backend.contains?("HTTP/3 / QUIC bypasses").should be_true
-    backend.contains?("──►").should be_true
     backend.contains?("SITE MAP").should be_false
+  end
+
+  # The beginner's three steps: proxy (address once), HTTPS trust, or the browser that does
+  # both. Every palette row reads as a route (`^P` → title), and nothing clips with `…`.
+  it "walks the history card through proxy, CA trust and Open browser without clipping" do
+    {120, 80}.each do |w|
+      backend = MemoryBackend.new(w, 14)
+      TrafficEmptyState.render(Screen.new(backend), Rect.new(0, 0, w, 14),
+        variant: :history, listen: {"127.0.0.1", 18997}, capturing: true)
+      text = (1...14).join("\n") { |y| backend.row(y) } # row 0 is the "waiting…" headline
+      text.scan("localhost:18997").size.should eq(1)
+      backend.contains?("set your client's HTTP+HTTPS proxy").should be_true
+      backend.contains?("trust gori's CA — browse http://gori.proxy/").should be_true
+      backend.contains?("^P → Copy CA certificate path").should be_true
+      backend.contains?("^P   → Open browser: proxied, CA trusted").should be_true
+      text.includes?('…').should be_false
+    end
   end
 
   it "renders the sitemap site-map card with tree hints" do
@@ -42,6 +56,7 @@ describe Gori::Tui::TrafficEmptyState do
       variant: :history, listen: {"127.0.0.1", 8070}, capturing: false)
     backend.contains?("capture is OFF").should be_true
     backend.contains?("press c").should be_true
+    backend.contains?("tab bar").should be_true
   end
 
   it "degrades history to compact stream lines on a narrow pane" do
@@ -85,8 +100,54 @@ describe Gori::Tui::TrafficEmptyState do
       variant: :intercept, listen: {"127.0.0.1", 8070}, capturing: true, catch_on: false)
     backend.contains?("no held messages").should be_true
     backend.contains?("INTERCEPT").should be_true
-    backend.contains?("press i").should be_true
-    backend.contains?("i:CATCH").should be_true
+    backend.contains?("Holds each matching request here").should be_true
+    backend.contains?("catch is OFF — press to start holding").should be_true
+    backend.contains?("c:REQ").should be_true
+    backend.contains?("c:REQ   hold requests, responses or both").should be_true
+    backend.contains?("f forward · d drop").should be_true
+    backend.contains?("/ condition").should be_true
+  end
+
+  # From the tab bar the queue's keys are spelled behind the key that enters it, never bare
+  # (`c` there stops capture); `i` is Global and needs no route. Every row fits 80 columns.
+  it "routes intercept queue keys through ↓ while the tab bar has focus" do
+    {120, 76}.each do |w|
+      backend = MemoryBackend.new(w, 13)
+      TrafficEmptyState.render(Screen.new(backend), Rect.new(0, 0, w, 13),
+        variant: :intercept, capturing: false, catch_on: false, body_focused: false,
+        catch_direction: "REQ")
+      backend.contains?("focus body").should be_false
+      backend.contains?("DIR:REQ").should be_true
+      backend.contains?("c:REQ").should be_false
+      backend.contains?("↓ then f forward · d drop").should be_true
+      backend.contains?("↓ then c: hold requests, responses or both").should be_true
+      backend.contains?("↓ then / condition").should be_true
+      backend.contains?(" i   catch is OFF").should be_true
+      backend.contains?("tab bar").should be_true
+      backend.contains?("…").should be_false
+    end
+  end
+
+  it "routes intercept queue keys through ↓ in the medium unfocused card" do
+    backend = MemoryBackend.new(50, 5)
+    TrafficEmptyState.render(Screen.new(backend), Rect.new(0, 0, 50, 5),
+      variant: :intercept, catch_on: true, body_focused: false)
+    backend.contains?("↓ then f forward · d drop · / condition").should be_true
+  end
+
+  it "routes the intercept filter key through ↓ in the minimal unfocused card" do
+    backend = MemoryBackend.new(50, 4)
+    TrafficEmptyState.render(Screen.new(backend), Rect.new(0, 0, 50, 4),
+      variant: :intercept, catch_on: true, body_focused: false)
+    backend.contains?("i catch · ↓ then / filter").should be_true
+  end
+
+  it "does not advertise a send chord on an empty Miner session" do
+    [{60, 12}, {60, 6}, {34, 4}].each do |(w, h)|
+      backend = MemoryBackend.new(w, h)
+      TrafficEmptyState.render(Screen.new(backend), Rect.new(0, 0, w, h), variant: :miner)
+      backend.contains?("^R").should be_false
+    end
   end
 
   it "renders the repeater resend card" do
@@ -186,7 +247,14 @@ describe Gori::Tui::TrafficEmptyState do
     TrafficEmptyState.render(Screen.new(backend), Rect.new(0, 0, 60, 12), variant: :project_env)
     backend.contains?("VARIABLES").should be_true
     backend.contains?("reuse across requests").should be_true
-    backend.contains?("add a $KEY variable").should be_true
+    # No `$KEY` in the static copy any more: the two lines that name a TOKEN are built at render
+    # time through `Env.spell`, because a frozen `$KEY` here teaches the one spelling that does
+    # not resolve under the namespaced grammar. This bullet names no token at all.
+    backend.contains?("add a variable").should be_true
+    backend.contains?("in a request expands when you send").should be_true
+    # The space menu offers only Add here; Change prefix is palette-only (#1282, #1433).
+    backend.contains?("Change prefix").should be_true
+    backend.contains?("space").should be_false
   end
 
   # The four engine tabs whose "nothing open yet" state used to be one muted line, while their
@@ -255,7 +323,7 @@ describe Gori::Tui::TrafficEmptyState do
   # The four Project sub-tab cards were the ones #928 missed: their chips were written as bare
   # literals with no `verb:`, so a rebind reached the status strip beside them (which goes
   # through `keys()`) and not the card. An operator rebinding "Add env var" to `n` then read
-  # `a  add a $KEY variable` on the only screen that was offering to teach them the key.
+  # `a  add a variable` on the only screen that was offering to teach them the key.
   it "resolves the four Project sub-tab chips through the registry too" do
     prev = Gori::Settings.keymap_overrides
     begin
@@ -268,7 +336,7 @@ describe Gori::Tui::TrafficEmptyState do
       TrafficEmptyState.registry = Gori::Verbs.registry
       { {:project_scope, "add an include or exclude rule", "n"},
        {:project_overrides, "map a host to an IP", "n"},
-       {:project_env, "add a $KEY variable", "n"},
+       {:project_env, "add a variable", "n"},
        {:project_activity, "filter by source", "w"},
       }.each do |(variant, label, want)|
         backend = MemoryBackend.new(70, 16)
@@ -308,7 +376,7 @@ describe Gori::Tui::TrafficEmptyState do
     backend.contains?("no mining session").should be_true
     backend.contains?("MINER").should be_true
     backend.contains?("Mine parameters").should be_true
-    backend.contains?("^R").should be_true
+    backend.contains?("^R").should be_false
   end
 
   it "renders the sequencer token card" do
@@ -411,6 +479,6 @@ describe Gori::Tui::TrafficEmptyState do
       variant: :sitemap, listen: {"127.0.0.1", 8070}, capturing: false)
     backend.contains?("no traffic captured").should be_true
     backend.contains?("◆ proxy").should be_true
-    backend.contains?("^P Open br").should be_true # truncated on narrow panes
+    backend.contains?("^P → Op").should be_true # truncated on narrow panes
   end
 end

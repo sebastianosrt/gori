@@ -19,7 +19,8 @@ module Gori
           io << "# Issues — " << project_name << "\n\n"
           io << "_" << issues.size << " issues · exported " << Time.local.to_s("%Y-%m-%d %H:%M") << "_\n"
           issues.each do |f|
-            append_issue(io, f, f.flow_id.try { |fid| store.get_flow(fid) }, resolve_issue_links(f, store))
+            append_issue(io, f, f.flow_id.try { |fid| store.get_flow(fid) }, resolve_issue_links(f, store),
+              frozen: store.issue_evidence(f.id))
           end
         end
       end
@@ -38,8 +39,14 @@ module Gori
       # because those same bytes already ride structurally in `webRequest`/`webResponse`, and
       # embedding them twice roughly DOUBLED the document — enough to push an engagement past
       # the size limit on a `gh api .../code-scanning/sarifs` upload.
+      #
+      # `frozen` (#1038) arrives pre-fetched for the same reason — one store read per issue,
+      # paid by the caller that has the store. The SARIF writer leaves it empty: its result
+      # already carries the exchange as webRequest/webResponse, and a provenance block about
+      # copies it does not include would be a list of hashes with nothing to check them against.
       private def self.append_issue(io : String::Builder, f : Store::Issue, flow : Store::FlowDetail?,
-                                    resolved_links : Array(Links::Resolved), evidence : Bool = true) : Nil
+                                    resolved_links : Array(Links::Resolved), evidence : Bool = true,
+                                    frozen : Array(Store::IssueEvidenceMeta) = [] of Store::IssueEvidenceMeta) : Nil
         io << "\n## [" << f.severity.label << "] " << one_line(f.title) << "\n\n"
         io << "- **Severity:** " << f.severity.label << "\n"
         if cvss = f.cvss
@@ -50,24 +57,14 @@ module Gori
         end
         io << "- **Status:** " << f.status.label << "\n"
         io << "- **Host:** " << (f.host.try { |h| one_line(h) } || "—") << "\n"
-        if fid = f.flow_id
-          io << "- **Flow:** "
-          if flow
-            # method/target/host are captured (attacker/server-controlled) data — an embedded
-            # newline (reachable via an h2 :path/:method pseudo-header) would break the one-line
-            # structure, so sanitize them like f.title/f.host above.
-            # `Url.absolute_form?`, not `starts_with?("http")`: the loose test calls
-            # `httpbin.org/x` absolute and drops the host, and misses `HTTP://` (schemes
-            # are case-insensitive, RFC 3986 3.1) so an uppercase target came out doubled
-            # as `a.testHTTP://a.test/x`. Composed by hand rather than via `Url.location`
-            # only because each part has to be `one_line`d first.
-            loc = Url.absolute_form?(flow.row.target) ? one_line(flow.row.target) : "#{one_line(flow.row.host)}#{one_line(flow.row.target)}"
-            io << one_line(flow.row.method) << " " << loc << " → " << (flow.row.status || "-") << " (#" << fid << ")\n"
-          else
-            io << "#" << fid << " (no longer captured)\n"
-          end
-        end
+        # No `- **Flow:**` bullet. The primary flow is the FIRST entry of the Related list
+        # below — `resolve_issue_links` puts it there, exactly once, and synthesises it when
+        # the link row is missing — because a report reader asking "what backs this finding"
+        # was being answered twice, in two spellings, one of them above the list of the other.
+        # The request/response fences further down still come from this flow: they are the
+        # report's evidence, and which row they belong to is the first one.
         append_related_links(io, resolved_links)
+        append_frozen_evidence(io, frozen)
         # notes is multi-line by design (free text) — scrub_controls fixes invalid UTF-8
         # AND strips terminal escape sequences (ESC/BEL/OSC/CSI) so a notes value carrying
         # an OSC "set window title" can't drive a TTY when the report is printed/`cat`d,
@@ -79,41 +76,63 @@ module Gori
         end
       end
 
-      # An issue's related workbench entities, resolved for display. One place, because both
-      # Markdown (`append_related_links`) and SARIF (a `gori/links` property bag) need the same
-      # list and reading it twice per issue is two round-trips for one answer.
+      # An issue's related workbench entities, resolved for display, PRIMARY FLOW FIRST. One
+      # place, because both Markdown (`append_related_links`) and SARIF (a `gori/links`
+      # property bag) need the same list and reading it twice per issue is two round-trips for
+      # one answer.
+      #
+      # `Links.issue_links`, where this used to call `dedupe_issue_flow`: the primary flow was
+      # taken OUT of the list because it had a bullet of its own above it, and now it leads the
+      # list instead. Same count either way — the flow appears exactly once — so a reader
+      # parsing `### Related` sees one more entry and no duplicate.
       protected def self.resolve_issue_links(f : Store::Issue, store : Store) : Array(Links::Resolved)
         Links.resolve_all(store,
-          Links.dedupe_issue_flow(store.list_links(Store::LinkOwnerKind::Issue, f.id), f.flow_id))
+          Links.issue_links(store.list_links(Store::LinkOwnerKind::Issue, f.id), f))
       end
 
       def self.json(issues : Array(Store::Issue), store : Store? = nil) : String
         JSON.build do |j|
           j.array do
-            issues.each do |f|
-              j.object do
-                j.field "id", f.id
-                # title/host: normalise with one_line (scrub + collapse control chars) — they're
-                # semantically single-line fields, so a raw newline is worth collapsing even though
-                # JSON itself would tolerate it verbatim (an MCP tool response IS this same JSON
-                # shape, and a client rendering "title" inline shouldn't see it split mid-string).
-                j.field "title", one_line(f.title)
-                j.field "severity", f.severity.label
-                j.field "status", f.status.label
-                j.field "cvss", f.cvss.try { |c| one_line(c) }
-                j.field "cvss_score", f.cvss_score
-                j.field "host", f.host.try { |h| one_line(h) }
-                j.field "flow_id", f.flow_id
-                j.field "created_at", f.created_at
-                j.field "updated_at", f.updated_at
-                # notes is multi-line BY DESIGN (free-text) — only the encoding-safety half of
-                # one_line applies; collapsing its newlines would mangle a legitimate multi-line note.
-                j.field "notes", scrub_only(f.notes)
-                j.field "links" do
-                  j.array { append_links_json(j, f, store) }
-                end
-              end
-            end
+            issues.each { |f| issue_object(j, f, store) }
+          end
+        end
+      end
+
+      # ONE issue as a standalone object: the element `json` puts in its array, for
+      # `gori run issues create --format json` (#1117). Both go through `issue_object`, so a
+      # script that files an issue and later lists it reads one shape, not two that drift.
+      def self.issue_json(f : Store::Issue, store : Store? = nil) : String
+        JSON.build { |j| issue_object(j, f, store) }
+      end
+
+      def self.issue_object(j : JSON::Builder, f : Store::Issue, store : Store?) : Nil
+        j.object do
+          j.field "id", f.id
+          # title/host: normalise with one_line (scrub + collapse control chars) — they're
+          # semantically single-line fields, so a raw newline is worth collapsing even though
+          # JSON itself would tolerate it verbatim (an MCP tool response IS this same JSON
+          # shape, and a client rendering "title" inline shouldn't see it split mid-string).
+          j.field "title", one_line(f.title)
+          j.field "severity", f.severity.label
+          j.field "status", f.status.label
+          j.field "cvss", f.cvss.try { |c| one_line(c) }
+          j.field "cvss_score", f.cvss_score
+          j.field "host", f.host.try { |h| one_line(h) }
+          # KEPT for compatibility, and it is the same fact as `links[0]`: the flow the
+          # issue was filed from is the first entry of `links` below. Readers that only
+          # know this field keep working; readers that want everything backing the issue
+          # read one array instead of a field plus an array.
+          j.field "flow_id", f.flow_id
+          j.field "created_at", f.created_at
+          j.field "updated_at", f.updated_at
+          # notes is multi-line BY DESIGN (free-text) — only the encoding-safety half of
+          # one_line applies; collapsing its newlines would mangle a legitimate multi-line note.
+          j.field "notes", scrub_only(f.notes)
+          j.field "links" do
+            j.array { append_links_json(j, f, store) }
+          end
+          j.field "evidence" do
+            j.array { append_evidence_json(j, f, store) }
           end
         end
       end
@@ -163,10 +182,68 @@ module Gori
         end
       end
 
+      # The issue's frozen copies (#1038) as PROVENANCE — source, moment, shape, hashes — and
+      # never the bytes. A report says what the evidence was and how to verify a raw export
+      # of it against the hash; the bytes themselves leave the project only by an explicit
+      # raw export, which is what "raw export remains explicit" means.
+      private def self.append_frozen_evidence(io : String::Builder, metas : Array(Store::IssueEvidenceMeta)) : Nil
+        return if metas.empty?
+        io << "\n### Frozen evidence\n\n"
+        metas.each do |m|
+          io << "- **frozen** " << one_line(m.method) << " " << one_line(m.url)
+          io << " — " << m.source_label << " · " << Gori::LocalTime.utc(m.created_at, "%Y-%m-%d %H:%M:%S UTC")
+          io << " · " << Evidence.outcome(m)
+          io << " · " << m.bytes << " bytes"
+          io << " · sha256 req " << m.request_sha256
+          io << " res " << (m.response_sha256 || "—")
+          io << " (truncated at capture)" if m.request_truncated? || m.response_truncated?
+          io << "\n"
+        end
+      end
+
+      # The JSON twin of `append_frozen_evidence`: one object per copy, provenance and hashes,
+      # no bytes. `error` and `url` are captured text and go through `one_line` like every
+      # other captured string in this array's parent object.
+      def self.append_evidence_json(j : JSON::Builder, f : Store::Issue, store : Store?) : Nil
+        return unless store
+        store.issue_evidence(f.id).each { |m| j.object { evidence_fields(j, m) } }
+      end
+
+      # ONE copy's provenance fields — the object the JSON export, MCP `get_issue` /
+      # `list_evidence` / `get_evidence` and `gori run evidence --format json` all emit, so a
+      # reader that learned the shape from one surface can read it off another. `one_line`
+      # on the four captured strings, like the title/host fields beside them.
+      def self.evidence_fields(j : JSON::Builder, m : Store::IssueEvidenceMeta) : Nil
+        j.field "id", m.id
+        # `issue_ids`, never a singular `issue_id`: membership is many-to-many (#1039), and
+        # a "the" issue picked out of N would read as this copy's owner even inside
+        # `get_issue`'s own array, where it may name a DIFFERENT issue. An empty array is a
+        # snapshot deliberately kept without a finding.
+        j.field "issue_ids", m.issue_ids
+        j.field "source_kind", m.source_kind.label
+        j.field "source_id", m.source_id
+        j.field "source_detached", true if m.source_detached?
+        j.field "frozen_at", m.created_at
+        j.field "method", one_line(m.method)
+        j.field "url", one_line(m.url)
+        j.field "protocol", m.protocol.try { |p| one_line(p) }
+        j.field "status", m.status
+        j.field "duration_us", m.duration_us
+        j.field "error", m.error.try { |e| one_line(e) }
+        j.field "request_truncated", m.request_truncated?
+        j.field "response_truncated", m.response_truncated?
+        j.field "request_sha256", m.request_sha256
+        j.field "response_sha256", m.response_sha256
+        j.field "bytes", m.bytes
+      end
+
+      # The `links` array of the JSON export and of MCP `get_issue` / `list_issues`. The
+      # PRIMARY flow leads it and appears exactly once (`Links.issue_links`); `flow_id` stays
+      # on the object beside it, which is the compat spelling of the same fact — the first
+      # entry of this array.
       def self.append_links_json(j : JSON::Builder, f : Store::Issue, store : Store?) : Nil
         return unless store
-        links = Links.dedupe_issue_flow(
-          store.list_links(Store::LinkOwnerKind::Issue, f.id), f.flow_id)
+        links = Links.issue_links(store.list_links(Store::LinkOwnerKind::Issue, f.id), f)
         Links.resolve_all(store, links).each do |res|
           j.object do
             j.field "kind", res.link.ref_kind.label
@@ -260,7 +337,7 @@ module Gori
       # Drop a UTF-8 sequence the `cap` cut left incomplete: walk back over trailing
       # continuation bytes (10xxxxxx), then over the lead byte (11xxxxxx) they belonged to.
       # Leaves the slice ending on a whole codepoint so a split char isn't read as binary.
-      private def self.trim_to_codepoint_boundary(slice : Bytes) : Bytes
+      def self.trim_to_codepoint_boundary(slice : Bytes) : Bytes
         n = slice.size
         while n > 0 && (slice[n - 1] & 0xC0) == 0x80 # continuation byte
           n -= 1

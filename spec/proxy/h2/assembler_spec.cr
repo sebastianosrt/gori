@@ -53,6 +53,7 @@ end
 private class RecSink < Gori::Proxy::FlowSink
   getter requests = [] of Gori::Store::CapturedRequest
   getter responses = [] of Gori::Store::CapturedResponse
+  getter tunnel_completions = [] of Int64
   @id = 0_i64
 
   def on_request(req : Gori::Store::CapturedRequest) : Int64
@@ -67,12 +68,16 @@ private class RecSink < Gori::Proxy::FlowSink
   def on_ws_message(flow_id : Int64, direction : String, opcode : Int32, payload : Bytes,
                     shape : Gori::Proxy::WS::Shape = Gori::Proxy::WS::Shape::DEFAULT) : Nil
   end
+
+  def on_tunnel_complete(flow_id : Int64) : Nil
+    @tunnel_completions << flow_id
+  end
 end
 
 describe Gori::Proxy::H2::Assembler do
   it "assembles a request stream into a flow (HPACK-decoded)" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "fallback.host", 443, 123_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "fallback.host", 443)
 
     # RFC 7541 C.4.1 header block → GET http / www.example.com, with END_STREAM.
     block = hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")
@@ -94,7 +99,7 @@ describe Gori::Proxy::H2::Assembler do
 
   it "links a response (HEADERS + DATA) to the request flow" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
 
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
@@ -121,7 +126,7 @@ describe Gori::Proxy::H2::Assembler do
 
   it "reports the FINAL status, not an interim 1xx, when a 100 precedes the 200" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
     # Interim 100 Continue (END_HEADERS, NO END_STREAM): HPACK literal :status = "100".
@@ -136,6 +141,56 @@ describe Gori::Proxy::H2::Assembler do
     String.new(sink.responses.first.head).should contain("HTTP/2 200")
   end
 
+  it "keeps each replaced interim head on the response, in order, and caps a flood of them" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
+    enc = Gori::Proxy::H2::HPACK::Encoder.new
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
+      hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
+    assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS, enc.encode([{":status", "100"}])))
+    extra = Gori::Store::Interims::MAX_KEPT + 3
+    extra.times do |i|
+      assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS,
+        enc.encode([{":status", "103"}, {"link", "</#{i}.css>; rel=preload"}])))
+    end
+    assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS, enc.encode([{":status", "200"}])))
+    # A :status block AFTER the final head is a late interim — a trailer finding, not one of these.
+    assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
+      enc.encode([{":status", "103"}])))
+
+    resp = sink.responses.first
+    resp.status.should eq(200)
+    interims = resp.interims.not_nil!
+    interims.heads.size.should eq(Gori::Store::Interims::MAX_KEPT)
+    interims.heads.first.status.should eq(100)
+    String.new(interims.heads.first.head).should eq("HTTP/2 100\r\n\r\n")
+    String.new(interims.heads[1].head).should contain("link: </0.css>")
+    interims.omitted.should eq(extra + 1 - Gori::Store::Interims::MAX_KEPT)
+    interims.omitted_note.not_nil!.should contain("sent #{extra + 1} interim 1xx responses")
+  end
+
+  # h1 refuses a run past `MAX_INTERIM`; h2 cannot stop the relay, so the projection stops
+  # COUNTING there and says so once, rather than tallying a flood without end.
+  it "stops counting interims at h1's MAX_INTERIM and names the flood in an advisory" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
+    enc = Gori::Proxy::H2::HPACK::Encoder.new
+    assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
+      hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
+    cap = Gori::Proxy::ClientConn::MAX_INTERIM
+    (cap + 50).times do
+      assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS, enc.encode([{":status", "103"}])))
+    end
+    assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM, enc.encode([{":status", "204"}])))
+
+    resp = sink.responses.first
+    resp.status.should eq(204)
+    interims = resp.interims.not_nil!
+    interims.heads.size.should eq(Gori::Store::Interims::MAX_KEPT)
+    (interims.heads.size + interims.omitted).should eq(cap)
+    resp.advisory.not_nil!.should contain("more than #{cap} interim 1xx header blocks")
+  end
+
   # RFC 9113 8.1 forbids pseudo-headers in trailers, so a `:status` arriving AFTER a final
   # response head is a broken or hostile origin — not the interim-1xx handover the replace
   # branch exists for. It used to take that branch anyway: the trailer REPLACED the real
@@ -143,7 +198,7 @@ describe Gori::Proxy::H2::Assembler do
   # Set-Cookie, with `trailer_names.clear` erasing the marker that would have explained it.
   it "does not let a status-bearing TRAILER replace a final response head" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
     # A real 200 head carrying a content-type worth losing.
@@ -173,7 +228,7 @@ describe Gori::Proxy::H2::Assembler do
   # and `advisory` is where a finding gori has about a flow lives.
   it "reports a pseudo-header in a trailer section, and keeps it out of the trailer marker" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
     head = Gori::Proxy::H2::HPACK::Encoder.new.encode([
@@ -202,7 +257,7 @@ describe Gori::Proxy::H2::Assembler do
   # regular fields where the repeater discards them — on a proxy those fields ARE the finding.
   it "names a late interim block the way the repeater does, and keeps its fields" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
     head = Gori::Proxy::H2::HPACK::Encoder.new.encode([
@@ -225,7 +280,7 @@ describe Gori::Proxy::H2::Assembler do
 
   it "carries a request body across DATA frames" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     # POST-like: headers without END_STREAM, then a DATA frame closes the stream.
     assembler.feed("out", headers_frame(3_u32, Frame::END_HEADERS,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
@@ -237,7 +292,7 @@ describe Gori::Proxy::H2::Assembler do
 
   it "emits both halves when the response completes before the request body (early response)" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
 
     # Client sends request HEADERS but keeps streaming its body (no END_STREAM).
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS,
@@ -260,7 +315,7 @@ describe Gori::Proxy::H2::Assembler do
 
   it "flushes a partial response as Aborted when the stream is reset mid-stream" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
 
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
@@ -280,7 +335,7 @@ describe Gori::Proxy::H2::Assembler do
 
   it "finalizes an in-flight stream when the connection closes (no permanent Pending)" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
 
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
@@ -297,7 +352,7 @@ describe Gori::Proxy::H2::Assembler do
 
   it "skips a PADDED DATA frame whose pad length exceeds the payload (no garbage projection)" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.feed("out", headers_frame(5_u32, Frame::END_HEADERS,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff"))) # request headers, stream open
     # PADDED DATA: payload[0]=0xff claims 255 pad bytes, but only 4 data bytes follow.
@@ -308,7 +363,7 @@ describe Gori::Proxy::H2::Assembler do
 
   it "emits the request when END_STREAM (illegally) rides on a CONTINUATION frame" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     block = hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")
     # HEADERS without END_HEADERS (partial block), then CONTINUATION carrying the rest
     # with END_HEADERS|END_STREAM — RFC-illegal, but must not silently drop + leak.
@@ -321,14 +376,14 @@ describe Gori::Proxy::H2::Assembler do
 
   it "ignores connection-level frames (stream 0)" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.feed("out", Frame::Header.new(Frame::Type::Settings.value, 0_u8, 0_u32, Bytes.empty))
     sink.requests.should be_empty
   end
 
   it "merges h2 trailers into the response (gRPC grpc-status)" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "grpc.test", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "grpc.test", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
 
@@ -358,7 +413,7 @@ describe Gori::Proxy::H2::Assembler do
 
   it "does not name a trailer when the response had no trailing HEADERS block" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
     assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS, Bytes[0x88_u8]))
@@ -371,7 +426,7 @@ describe Gori::Proxy::H2::Assembler do
   # probe is the same test on this side as `grpc-status` is on the other.
   it "names REQUEST trailers in the stored request head, as it already did for the response" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "grpc.test", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "grpc.test", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
     assembler.feed("out", data_frame(1_u32, 0_u8, "body"))
@@ -391,7 +446,7 @@ describe Gori::Proxy::H2::Assembler do
   # Complement: the same request WITHOUT a trailing block must be byte-identical to before.
   it "does not name a trailer on a request that had no trailing HEADERS block" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "grpc.test", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "grpc.test", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
     String.new(sink.requests.first.head).should_not contain("X-Gori-Trailers")
@@ -404,7 +459,7 @@ describe Gori::Proxy::H2::Assembler do
   # every other connection and the Store writer fiber got no turn for the whole of it (P6).
   it "records a large trailer block without a quadratic dedupe scan" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "grpc.test", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "grpc.test", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
     assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS, Bytes[0x88_u8]))
@@ -428,7 +483,7 @@ describe Gori::Proxy::H2::Assembler do
   # trailer's marker line.
   it "still names a trailer whose name was already recorded against a replaced interim head" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "grpc.test", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "grpc.test", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
     # Interim 100, then a trailer recorded against it.
@@ -449,7 +504,7 @@ describe Gori::Proxy::H2::Assembler do
 
   it "captures a server push (PUSH_PROMISE → promised-stream flow + response)" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
 
     # PUSH_PROMISE on stream 1 promising stream 2, request = GET / www.example.com.
     pp = IO::Memory.new
@@ -486,7 +541,7 @@ describe Gori::Proxy::H2::Assembler do
   # Complement: a request the client actually sent carries no push marker.
   it "does not mark an ordinary client request as pushed" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
     String.new(sink.requests.first.head).should_not contain("X-Gori-Pushed")
@@ -498,7 +553,7 @@ describe Gori::Proxy::H2::Assembler do
   # statement is dropped for exactly the messages it is about.
   it "records an advisory that arrives BEFORE the stream's first frame" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.note_advisory(1_u32, "a rule could not run here")
     assembler.note_advisory(1_u32, "a rule could not run here") # deduped, not doubled
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
@@ -511,7 +566,7 @@ describe Gori::Proxy::H2::Assembler do
   # not-a-stream, and a Slot keyed 0 is the freeze D1 rule 1 forbids).
   it "ignores an advisory for stream 0" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.note_advisory(0_u32, "not about any message")
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
@@ -525,7 +580,7 @@ describe Gori::Proxy::H2::Assembler do
   # describes the symptom and not the fact.
   it "names RFC 8441 extended CONNECT on the flow instead of only the symptom" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "ws.test", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "ws.test", 443)
     block = IO::Memory.new
     [{":method", "CONNECT"}, {":scheme", "https"}, {":authority", "ws.test"},
      {":path", "/chat"}, {":protocol", "websocket"}].each do |(n, v)|
@@ -548,7 +603,7 @@ describe Gori::Proxy::H2::Assembler do
   # Complement: an ordinary stream torn down the same way keeps the bare reason.
   it "leaves an ordinary aborted stream's reason alone" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
     assembler.finalize_all("h2 connection closed")
@@ -561,7 +616,7 @@ describe Gori::Proxy::H2::Assembler do
   # view. It must be ignored, and must not open/track the stream.
   it "drops a lone CONTINUATION on a never-opened stream and still emits the real request" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     # A single CONTINUATION with END_HEADERS|END_STREAM, empty payload, on a stream that never
     # had HEADERS — the fabrication primitive.
     assembler.feed("out", Frame::Header.new(Frame::Type::Continuation.value,
@@ -580,7 +635,7 @@ describe Gori::Proxy::H2::Assembler do
   # not append to / re-emit the finished stream.
   it "drops a CONTINUATION that arrives after the header block already ended" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.feed("out", headers_frame(5_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
     sink.requests.size.should eq(1)
@@ -595,7 +650,7 @@ describe Gori::Proxy::H2::Assembler do
   # blind capture for the rest of the connection.
   it "does not let non-opening frames exhaust the live-stream cap" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     # More WINDOW_UPDATE frames than the cap, each on a distinct unknown (even) stream id.
     (1_u32..1500_u32).each do |i|
       sid = i * 2
@@ -620,11 +675,13 @@ describe Gori::Proxy::H2::Assembler do
   # and no Match&Replace.
   it "advises on a CLEANLY closed extended CONNECT stream, not only on an aborted one" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS, connect_block))
     # The origin accepts, relays frames, and both halves END_STREAM: state Complete.
     assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS, Bytes[0x88_u8]))
+    sink.tunnel_completions.should be_empty
     assembler.feed("in", data_frame(1_u32, Frame::END_STREAM, "\x81\x03one"))
+    sink.tunnel_completions.should be_empty # wait for the client's CLOSE / END_STREAM too
     assembler.feed("out", data_frame(1_u32, Frame::END_STREAM, "\x88\x02\x03\xe8"))
 
     sink.requests.size.should eq(1)
@@ -646,6 +703,7 @@ describe Gori::Proxy::H2::Assembler do
     # `spec/proxy/h2/ws_capture_spec.cr` for the transcript itself.
     resp.advisory.not_nil!.should contain("gori read its frames")
     resp.advisory.not_nil!.should contain("Match&Replace are NOT available")
+    sink.tunnel_completions.should eq([1_i64])
     # ... and the head names the stream shape, which the pseudo filter dropped entirely.
     String.new(sink.requests.first.head).should contain("X-Gori-Protocol: websocket")
   end
@@ -654,7 +712,7 @@ describe Gori::Proxy::H2::Assembler do
   # what an operator reads first), and the advisory is there too rather than instead.
   it "keeps the aborted extended CONNECT reason AND writes the advisory" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS, connect_block))
     assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS, Bytes[0x88_u8]))
     assembler.finalize_all("h2 connection closed")
@@ -666,6 +724,27 @@ describe Gori::Proxy::H2::Assembler do
     resp.error.not_nil!.should contain("h2 connection closed")
     resp.error.not_nil!.should contain("RFC 8441 extended CONNECT")
     resp.advisory.not_nil!.should contain("RFC 8441 extended CONNECT")
+    sink.tunnel_completions.should eq([1_i64])
+  end
+
+  it "notifies capture completion for accepted WebSockets past the transcript cap" do
+    sink = RecSink.new
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443)
+    max = Gori::Proxy::H2::WsCapture::MAX_STREAMS
+    ids = (0..max).map { |i| (i * 2 + 1).to_u32 }
+
+    ids.each do |id|
+      assembler.feed("out", headers_frame(id, Frame::END_HEADERS, connect_block))
+      assembler.feed("in", headers_frame(id, Frame::END_HEADERS,
+        Gori::Proxy::H2::HPACK::Encoder.new.encode([{":status", "200"}])))
+    end
+    sink.tunnel_completions.should be_empty # all sockets remain open
+
+    assembler.finalize_all("h2 connection closed")
+
+    sink.requests.size.should eq(max + 1)
+    sink.tunnel_completions.should eq(Array(Int64).new(max + 1) { |i| (i + 1).to_i64 })
+    sink.requests.last.advisory.not_nil!.should contain("no message transcript")
   end
 
   # A REFUSED extended CONNECT, which is the common answer: a WAF, a gateway or an origin with
@@ -676,7 +755,7 @@ describe Gori::Proxy::H2::Assembler do
   # produced a second, invented `GET /` row against the target host.
   it "does not invent a second flow when the origin refuses an extended CONNECT" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS, connect_block))
     refusal = Gori::Proxy::H2::HPACK::Encoder.new.encode([{":status", "400"}])
     assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM, refusal))
@@ -701,7 +780,7 @@ describe Gori::Proxy::H2::Assembler do
   # projection stopped happening", so both dispositions are pinned side by side.
   it "still projects exactly one flow when the origin ACCEPTS the extended CONNECT" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS, connect_block))
     assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS, Bytes[0x88_u8]))
     assembler.feed("in", data_frame(1_u32, Frame::END_STREAM, "\x81\x03one"))
@@ -716,7 +795,7 @@ describe Gori::Proxy::H2::Assembler do
   # signal is on every CONNECT and says nothing.
   it "leaves an ordinary CONNECT tunnel unannotated" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS, plain_connect_block))
     assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS, Bytes[0x88_u8]))
     assembler.feed("in", data_frame(1_u32, Frame::END_STREAM, "bytes"))
@@ -730,7 +809,7 @@ describe Gori::Proxy::H2::Assembler do
   # ... and neither does an ordinary GET, which is what every other flow on the connection is.
   it "leaves an ordinary request unannotated" do
     sink = RecSink.new
-    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443, 1_i64)
+    assembler = Gori::Proxy::H2::Assembler.new(sink, "example.com", 443)
     assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hexb("828684418cf1e3c2e5f23a6ba0ab90f4ff")))
     sink.requests.first.advisory.should be_nil

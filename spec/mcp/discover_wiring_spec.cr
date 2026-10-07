@@ -86,7 +86,7 @@ describe "MCP discover_start refuses a header it will not send" do
     end
   end
 
-  it "names a header that only becomes unsafe after $VAR expansion" do
+  it "names a header that only becomes unsafe after env expansion" do
     port = HTML_ORIGIN_PORT
     with_store do |store|
       saved = Gori::Settings.env_vars
@@ -95,6 +95,8 @@ describe "MCP discover_start refuses a header it will not send" do
         # Built BEFORE the vars are set: constructing Tools runs `Env.load_project(store)`,
         # which would otherwise reset them from the (empty) project.
         tools = tools_for(store)
+        # Settle the global env section, so the per-call re-read (#1217) keeps the pin below.
+        Gori::Settings.reload_env_from_disk
         Gori::Settings.env_prefix = "$"
         # The header the caller passed is fine; the VALUE bound to TOKEN is not. (A purely
         # TRAILING newline is not this case: both `unsafe_expanded` and `Headers.expand`
@@ -106,7 +108,7 @@ describe "MCP discover_start refuses a header it will not send" do
            "allow_unscoped" => true}.to_json)
         err.should be_true
         text.should contain("Authorization")
-        text.should contain("$VAR expansion")
+        text.should contain("env expansion")
       ensure
         Gori::Settings.env_vars = saved || [] of {String, String}
         Gori::Settings.env_prefix = saved_prefix || "$"

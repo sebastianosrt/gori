@@ -4,6 +4,7 @@ require "./fmt"
 require "./frame"
 require "./overlay"
 require "./notifications"
+require "../plural"
 
 module Gori::Tui
   # The notification center: a centered overlay listing recent notifications (newest
@@ -43,6 +44,20 @@ module Gori::Tui
       # newest note, i.e. row 0 of the newest-first list, and is O(1) where `all` reverses
       # the whole ring.
       @anchor = @store.latest.try(&.id)
+    end
+
+    # Put the cursor back on ONE note by id, rather than on the newest (#1090). The detail
+    # card hands the operator back here when it closes, and "back" has to mean the row they
+    # were reading: a fresh overlay anchors to `latest`, which is a different note whenever
+    # anything drained while the card was up. A no-op when that note has aged out of the
+    # ring: the cursor then stays wherever it already was, which is the same choice
+    # `index_in` makes when an anchor stops resolving. Writing the id in regardless would be
+    # worse than a no-op — @selected is a ROW NUMBER, and re-seeding it from a list the note
+    # has left points it at whichever note has since taken that row.
+    def anchor_to(id : Int32) : Nil
+      return unless i = notes.index { |n| n.id == id }
+      @anchor = id
+      @selected = i
     end
 
     def reset : Nil
@@ -89,6 +104,10 @@ module Gori::Tui
       "NOTIFICATIONS"
     end
 
+    # `↵ open` covers both of the things ↵ does — jump to a note's result, or open the long
+    # form of a note that carries one (#1090). The row itself says which, with the `›`
+    # marker draw_row puts before the age; naming both here would make the hint longer than
+    # the card for a distinction the row already draws.
     def hint : String
       if flash = @flash
         return "#{flash} · ↑/↓ select · ↵ open · esc close"
@@ -195,11 +214,8 @@ module Gori::Tui
     # Centered box for `area`, sized to the content (min 6 rows), or nil when it can't
     # fit. Mirrors HostsOverlay#overlay_box so the geometry math is consistent.
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 60}.min
       rows = {notes.size, 6}.max
-      h = {area.h - 2, rows + 3}.min # title gap + list + bottom border
-      return nil if w < 28 || h < 6
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      area.card?(60, rows + 3, 28, 6) # h: title gap + list + bottom border
     end
 
     def render(screen : Screen, area : Rect) : Nil
@@ -213,7 +229,7 @@ module Gori::Tui
       # highlight uses or the two disagree the first time a drain prepends.
       list = notes
       Frame.card(screen, box, "NOTIFICATIONS", border: Theme.border_focus)
-      meta = "#{list.size} item#{list.size == 1 ? "" : "s"}"
+      meta = Gori.plural(list.size, "item")
       Frame.border_meta(screen, box, "NOTIFICATIONS", meta, bg: Theme.panel)
 
       cap = list_capacity(box)
@@ -234,9 +250,7 @@ module Gori::Tui
     end
 
     private def draw_row(screen : Screen, box : Rect, note : Notifications::Note, sel : Bool, py : Int32) : Nil
-      bg = sel ? Theme.accent_bg : Theme.panel
-      screen.fill(Rect.new(box.x + 1, py, box.w - 2, 1), bg)
-      screen.cell(box.x + 1, py, sel ? '▎' : ' ', Theme.accent, bg)
+      bg = Frame.row_band(screen, box, py, sel)
       g, gc = glyph(note.level)
       screen.cell(box.x + 3, py, g, gc, bg)
       bold = note.read ? Attribute::None : Attribute::Bold
@@ -251,8 +265,18 @@ module Gori::Tui
         screen.text(msg_x, py, tag, Theme.accent, bg, Attribute::Bold)
         msg_x += tag.size + 1
       end
-      msg_w = {box.right - 1 - msg_x - (stamp.size + 1), 1}.max
+      # A note that carries a long form gets a `›` in front of its age (#1090): ↵ on this row
+      # opens a card rather than jumping to a result, and those are different enough that the
+      # row has to say which one it is before the operator presses it. The message gives up
+      # the two columns it takes, so the marker cannot land on top of the text.
+      # An agent's question still waiting on the operator (#1324) wears `?` instead, in the
+      # `ask:` chip's colour: ↵ there opens the answer card, not the long form.
+      marker = note.question_open? ? "?" : (note.detail ? "›" : "")
+      marker_fg = note.question_open? ? Theme.orange : Theme.muted
+      tail = stamp.size + 1 + (marker.empty? ? 0 : 2)
+      msg_w = {box.right - 1 - msg_x - tail, 1}.max
       screen.text(msg_x, py, note.message, fg, bg, bold, width: msg_w)
+      screen.text(box.right - 1 - stamp.size - 2, py, marker, marker_fg, bg) unless marker.empty?
       screen.text(box.right - 1 - stamp.size, py, stamp, Theme.muted, bg)
     end
 

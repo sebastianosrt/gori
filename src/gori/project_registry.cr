@@ -3,6 +3,7 @@ require "digest/sha256"
 require "./durable_file"
 require "./project"
 require "./store"
+require "./env"
 require "./capture_lock"
 require "./open_lock"
 
@@ -29,18 +30,65 @@ module Gori
     # Lives inside the project dir, so it is never itself listed as a project.
     ID_FILE = ".id"
 
+    # Why a name gori will not make a directory out of was refused, in the one sentence the
+    # three surfaces print verbatim ("gori run project create: …", MCP's INVALID_ARGUMENT,
+    # the TUI picker's flash row). Bare "invalid project name" named the verdict and not the
+    # rule, so `!!!` and `...` read as gori being broken rather than as a name it cannot
+    # slugify. ADVICE, not the predicate: `#slugify` also keeps `_` and any non-ASCII
+    # character, so a name gori refuses is one made entirely of `.`, `-`, spaces and other
+    # ASCII punctuation — "add a letter or a digit" always fixes it, which is what an
+    # operator needs, while spelling the full rule here would only invite a second copy of
+    # it. See `#slugify` for why a dot-run must never become a path.
+    UNSLUGGABLE_NAME  = "invalid project name: it needs at least one letter or digit"
+    INVALID_UTF8_NAME = "invalid project name: it must be valid UTF-8"
+
+    # …and why a RENAME was refused, which is a different rule: a rename never touches the
+    # directory slug (see #rename), so the only name it cannot take is an empty one. Its own
+    # constant rather than a third wording at the call site: the TUI picker checks this before
+    # calling, and a picker disagreeing with the registry about the same refusal is the drift
+    # `UNSLUGGABLE_NAME` was extracted to stop.
+    BLANK_NAME = "invalid project name: it cannot be blank"
+
     def initialize(@root : String)
     end
 
+    # Why a name was refused because it addresses MORE THAN ONE project. A `Gori::Error`, so
+    # every surface that already turns one into a sentence (`gori run`, MCP's
+    # INVALID_ARGUMENT, `gori mcp --project`'s unbound start) prints it without new plumbing;
+    # the message names every candidate by the two handles that are unique (short id, slug).
+    class Ambiguous < Gori::Error
+      getter candidates : Array(Project)
+
+      def initialize(message : String, @candidates : Array(Project))
+        super(message)
+      end
+    end
+
     # Resolve a project by (case-insensitively, in priority order): its exact short
-    # id, its exact directory slug, its exact verbatim display name, or a UNIQUE
-    # PREFIX of its short id — git-style abbreviation. Lets `gori mcp --project=api`
-    # work when the display name is a non-ASCII phrase stored in `.name`, and
-    # `--project=a1b2` work as a short handle decoupled from the (renamable) name.
+    # id, its exact directory slug or verbatim display name, or a UNIQUE PREFIX of its
+    # short id — git-style abbreviation. Lets `gori mcp --project=api` work when the
+    # display name is a non-ASCII phrase stored in `.name`, and `--project=a1b2` work as a
+    # short handle decoupled from the (renamable) name.
     #
-    # Order matters: all three EXACT matches are tried before the id-prefix, so a
-    # hex-like display name can never be shadowed by another project's id prefix.
-    # An ambiguous prefix (2+ ids share it) resolves to nothing rather than guessing.
+    # Order matters: the exact matches are tried before the id-prefix, so a hex-like
+    # display name can never be shadowed by another project's id prefix. An ambiguous
+    # prefix (2+ ids share it) resolves to nothing rather than guessing.
+    #
+    # Slug and display name are ONE tier, and a name they split between two projects raises
+    # `Ambiguous` instead of picking (#1163). Trying the slug first meant `client-2024` —
+    # the name `project create` had just reported creating (as slug `client-2024-2`) —
+    # resolved to the older `Client 2024` whose slug it happened to be, and every
+    # `--project client-2024` wrote into the other engagement's project. Preferring the
+    # name instead is the same bug pointed the other way: a script that addressed
+    # `Client 2024` by its slug would be silently re-aimed the moment someone created
+    # `client-2024`. Refusing is the only answer that is never wrong, and both projects
+    # stay reachable by the short id and slug the refusal names.
+    #
+    # Display names are not unique by design (two checkouts with one basename share one,
+    # slugs `api` and `api-2`). When the slug match is ALSO one of the name matches, the
+    # slug decides (`--project=api` is `api`, never `api-2` by MRU order); two name matches
+    # with no slug among them are ambiguous, the rule `gori run project delete` used to
+    # keep for itself — a guess is no better for a write than for an rm_rf.
     def find(name_or_slug : String) : Project?
       q = name_or_slug.strip.downcase
       return nil if q.empty?
@@ -49,14 +97,50 @@ module Gori
 
       # Exact short id — the opaque, name-independent handle; most specific, so first.
       entries.each { |project, id| return project if id == q }
-      # A slug is unique while display names need not be (two workspaces with the
-      # same basename deliberately share a display name). Prefer an exact slug so
-      # `--project=api` cannot resolve the newer `api-2` merely due to MRU order.
-      entries.each { |project, _| return project if slug_of(project).downcase == q }
-      entries.each { |project, _| return project if project.name.downcase == q }
+      by_slug = entries.find { |project, _| slug_of(project).downcase == q }.try(&.[0])
+      by_name = entries.compact_map { |project, _| project if project.name.downcase == q }
+      return by_slug if by_slug && (by_name.empty? || by_name.any? { |p| p.dir == by_slug.dir })
+      return by_name.first if by_slug.nil? && by_name.size == 1
+      raise ambiguous(name_or_slug.strip, by_slug, by_name) unless by_name.empty?
       # Git-style abbreviation: a prefix that uniquely identifies ONE project's id.
       prefixed = entries.select { |_, id| id && id.starts_with?(q) }
       prefixed.size == 1 ? prefixed.first[0] : nil
+    end
+
+    private def ambiguous(query : String, by_slug : Project?, by_name : Array(Project)) : Ambiguous
+      candidates = by_slug ? [by_slug] + by_name : by_name
+      listed = candidates.map do |p|
+        how = by_slug && p.dir == by_slug.dir ? "by slug" : "by name"
+        "#{p.name.inspect} #{how} (slug #{slug_of(p)}, id #{id_of(p) || "—"})"
+      end
+      Ambiguous.new("project '#{query}' is ambiguous — it matches #{listed.join(" and ")}; " \
+                    "name one by its slug or short id", candidates)
+    end
+
+    # Why `name` cannot be given to a project other than `except`: it is already another
+    # project's short id or directory slug, so `#find` would resolve it there first
+    # (short id) or refuse it as ambiguous (slug) — a name `create` reports making that
+    # then never addresses the project it made (#1163). Nil when the name is free.
+    #
+    # A name equal to the project's OWN slug is not a collision (renaming `api-2` to
+    # `api-2`). `create_or_reopen` asks only before making a NEW project, so a same-name
+    # reopen never gets here; a rename onto another project's slug is refused even when that
+    # project shares the name, because the slug would still win and the renamed one would
+    # answer to nothing.
+    def shadowed_name_reason(name : String, except : Project? = nil) : String?
+      q = name.strip.downcase
+      return nil if q.empty?
+      list.each do |p|
+        next if except && p.dir == except.dir
+        if id_of(p).try(&.downcase) == q
+          return "project name #{name.strip.inspect} is already the short id of project #{p.name.inspect} — pick another name"
+        end
+        if slug_of(p).downcase == q
+          return "project name #{name.strip.inspect} is already the directory slug of project " \
+                 "#{p.name.inspect} (id #{id_of(p) || "—"}) — pick another name, or use that project"
+        end
+      end
+      nil
     end
 
     # The on-disk directory name for a project (the slugified workspace dir).
@@ -104,6 +188,39 @@ module Gori
       projects.first?
     end
 
+    # A project together with the sidecar facts a LISTING both filters on and prints: its
+    # short id, its directory slug, and the workspace it is bound to. Each of those is a
+    # separate small file read, so a surface that filters AND prints them must read them
+    # once rather than twice per project — on a host holding a project per worktree that is
+    # hundreds of syscalls either way.
+    record Entry, project : Project, id : String?, slug : String, workspace : String? do
+      # Whether an operator's free-text narrowing keeps this project. A case-insensitive
+      # SUBSTRING over every spelling that ADDRESSES a project, plus the workspace path a
+      # headless bind uses. Deliberately looser than `#find`, whose exact/unique-prefix
+      # rules answer nothing for the half-remembered name that sends someone to a listing
+      # in the first place — and ONE predicate, because `gori run project list --query` and
+      # MCP `list_projects{query}` offering the same narrowing must not disagree about what
+      # "acme" matches.
+      def matches?(needle : String) : Bool
+        return true if needle.empty?
+        project.name.downcase.includes?(needle) || slug.downcase.includes?(needle) ||
+          !!id.try(&.downcase.includes?(needle)) || !!workspace.try(&.downcase.includes?(needle))
+      end
+    end
+
+    # `list`, with each project's sidecars read once. Same most-recently-active-first order.
+    def entries : Array(Entry)
+      list.map { |project| Entry.new(project, id_of(project), slug_of(project), workspace_of(project)) }
+    end
+
+    # The needle `Entry#matches?` takes: a caller's raw query folded once, or nil when it
+    # narrows nothing (absent, blank). Spelled here so the two listings that offer the
+    # narrowing cannot fold it differently — a query that is trimmed on one surface and not
+    # the other is the same drift as two predicates.
+    def self.needle(query : String?) : String?
+      query.try(&.strip.presence).try(&.downcase)
+    end
+
     # Existing named projects, most-recently-active first.
     def list : Array(Project)
       return [] of Project unless Dir.exists?(@root)
@@ -139,30 +256,113 @@ module Gori
       create_or_reopen(name, description)[0]
     end
 
+    # The display name and directory slug an import under *name* would claim, or the
+    # `Gori::Error` #import_database would refuse it with. Creates nothing, so a preview can
+    # report a name collision before the operator confirms the import; #import_database still
+    # claims the directory atomically, for a peer that wins between the two.
+    def import_target(name : String) : {String, String}
+      display = validated_display_name(name)
+      base_slug = slugify(display)
+      raise Gori::Error.new(UNSLUGGABLE_NAME) if base_slug.empty?
+      projects = list
+      raise Gori::Error.new("project #{display.inspect} already exists — choose another name") \
+        if projects.any? { |project| project.name.downcase == display.downcase }
+      shadowed_name_reason(display).try { |why| raise Gori::Error.new(why) }
+      if project = projects.find { |candidate| slug_of(candidate).downcase == base_slug.downcase }
+        raise Gori::Error.new("project slug #{base_slug.inspect} already belongs to " \
+                              "#{project.name.inspect} (id #{id_of(project) || "—"}) — choose another name")
+      end
+      if project = projects.find { |candidate| id_of(candidate).try(&.downcase) == base_slug.downcase }
+        raise Gori::Error.new("project name #{display.inspect} would use the short id of " \
+                              "#{project.name.inspect} — choose another name")
+      end
+      # A leftover directory without a database is not a project #list shows, but the import
+      # cannot claim it either — say so here rather than only at the directory claim.
+      if File.exists?(File.join(@root, base_slug))
+        raise Gori::Error.new("project slug #{base_slug.inspect} is already in use — choose another name")
+      end
+      {display, base_slug}
+    end
+
+    # Register a validated database snapshot as a NEW project. Unlike #create, importing must
+    # never reopen an existing project and replace its database. A directory is claimed
+    # atomically, sidecars are written before the DB becomes visible to #list, and the archive's
+    # machine-local `.workspace` / lock files are not copied.
+    def import_database(name : String, database_path : String) : Project
+      raise Gori::Error.new("project archive database is missing") unless File.file?(database_path)
+      display, base_slug = import_target(name)
+
+      Paths.ensure_dir(@root)
+      dir = File.join(@root, base_slug)
+      begin
+        Dir.mkdir(dir, Paths::DIR_MODE)
+        File.chmod(dir, Paths::DIR_MODE) rescue nil
+      rescue File::AlreadyExistsError
+        # The atomic claim also catches an importer/creator that won after the checks above.
+        raise Gori::Error.new("project slug #{base_slug.inspect} is already in use — choose another name")
+      end
+
+      begin
+        DurableFile.write(File.join(dir, NAME_FILE), display,
+          perm: File::Permissions.new(0o600), inherit: false)
+        DurableFile.write(File.join(dir, ID_FILE), generate_id,
+          perm: File::Permissions.new(0o600), inherit: false)
+        staged_db = File.tempname(".gori.db.import", ".tmp", dir: dir)
+        begin
+          File.open(staged_db, "w", perm: File::Permissions.new(0o600)) do |target|
+            File.open(database_path, "r") { |source| IO.copy(source, target) }
+            target.flush
+            target.fsync
+          end
+          File.rename(staged_db, File.join(dir, Project::DB_FILE))
+        ensure
+          File.delete?(staged_db)
+        end
+        Project.new(display, File.join(dir, Project::DB_FILE))
+      rescue ex
+        FileUtils.rm_rf(dir)
+        raise ex
+      end
+    end
+
     # #create, plus WHICH of the two it did: `true` = a new project, `false` = reopened one
     # that already existed under that name. Only the registry can answer that honestly — it
     # is the one that resolves the slug — so every caller that reports "created" (CLI, MCP)
     # reads it from here instead of guessing beforehand with #find, which also matches a
     # short-id prefix and would call a brand-new project a reopen.
     def create_or_reopen(name : String, description : String = "") : {Project, Bool}
-      display = name.strip
+      display = validated_display_name(name)
       slug = slugify(display)
-      raise Gori::Error.new("invalid project name") if slug.empty?
+      raise Gori::Error.new(UNSLUGGABLE_NAME) if slug.empty?
       slug = unique_slug(slug, display) # don't merge into a DIFFERENT project that slugifies alike
       dir = File.join(@root, slug)
       db_path = File.join(dir, Project::DB_FILE)
       # A DB at the resolved path is the same thing #list calls an existing project.
       reopened = File.exists?(db_path)
+      # Before anything touches disk: a NEW project whose name is already another project's
+      # slug or short id would be reported "created" and then never resolve by that name.
+      # A reopen is left alone — the project exists, and refusing it strands nothing new.
+      unless reopened
+        shadowed_name_reason(display).try { |why| raise Gori::Error.new(why) }
+      end
       Paths.ensure_dir(dir) # 0700 — the project dir holds a DB of captured secrets
       # Persist the verbatim display name so a later `list` shows "My Project", not
       # the lossy slug "my-project".
       #
-      # Durably, because this REPLACES an existing name on a reopen and `File.write`
-      # truncates first: a crash or a full disk between the two leaves the picker showing a
-      # half-written name, or none. Same helper the settings/CA/marker writes use — the
-      # sidecars were the last user-visible state still on a truncating write.
-      DurableFile.write(File.join(dir, NAME_FILE), display,
-        perm: File::Permissions.new(0o600)) rescue nil
+      # A reopen keeps the name it already has: the match is case-insensitive, so
+      # `create foo` reopening `Foo` used to report "reopened" while quietly renaming it —
+      # that is `rename`'s job. Only a reopened legacy project with no name sidecar gets one.
+      #
+      # Durably, because `File.write` truncates first: a crash or a full disk between the two
+      # leaves the picker showing a half-written name, or none. Same helper the
+      # settings/CA/marker writes use.
+      stored = reopened ? display_name(dir, "") : ""
+      if stored.empty?
+        DurableFile.write(File.join(dir, NAME_FILE), display,
+          perm: File::Permissions.new(0o600)) rescue nil
+      else
+        display = stored
+      end
       write_id_if_absent(dir) # a fresh project gets a stable short id; a reopen keeps its own
       proj = Project.new(display, db_path)
       # Open once even with no description: this creates the DB + runs migrations, and #list
@@ -171,7 +371,15 @@ module Gori
       s = Store.open(proj.db_path, retention_flows: Store::RETENTION_UNLIMITED)
       begin
         desc = description.strip
-        s.set_setting("description", desc) unless desc.empty?
+        s.set_setting(Project::DESCRIPTION_KEY, desc) unless desc.empty?
+        # A BRAND-NEW database is born speaking this install's token grammar, so it says so. The
+        # marker's absence means bare (every project written before namespaces existed carries no
+        # marker), and a fresh namespaced project that left it absent would hand its first opener a
+        # pointless bare → namespaced scan of its own namespaced text — harmless today only because
+        # no name in either table is spelled `ENV` or `BIND`. Only when the file did NOT exist
+        # before: `create_or_reopen` also REOPENS, and stamping a bare-era database would claim a
+        # grammar its bytes are not in and skip the migration that fixes them.
+        s.set_setting(Env::PROJECT_SYNTAX_KEY, Settings.env_syntax.to_s.downcase) unless reopened
       ensure
         s.close
       end
@@ -190,7 +398,7 @@ module Gori
 
       display = name.strip
       base_slug = slugify(display)
-      raise Gori::Error.new("invalid project name") if base_slug.empty?
+      raise Gori::Error.new(UNSLUGGABLE_NAME) if base_slug.empty?
 
       # The projects ROOT, not the project dir: the leaf below is claimed with a bare
       # `Dir.mkdir` for its atomicity, and that fails outright (ENOENT) when the root does
@@ -372,9 +580,12 @@ module Gori
     # label shown in the picker and `find` by display name changes. Empty / blank
     # names are rejected the same way create() rejects an unslugifiable name.
     def rename(project : Project, new_name : String) : Project
-      display = new_name.strip
-      raise Gori::Error.new("invalid project name") if display.empty?
+      display = validated_display_name(new_name)
+      raise Gori::Error.new(BLANK_NAME) if display.empty?
       raise Gori::Error.new("project directory missing") unless Dir.exists?(project.dir)
+      # The rename twin of `create_or_reopen`'s check: a name that another project's slug or
+      # short id already answers to would make `--project NAME` resolve elsewhere or refuse.
+      shadowed_name_reason(display, except: project).try { |why| raise Gori::Error.new(why) }
       # A rename replaces a name that is already there, so it gets the same durable
       # replace as `create`'s — and unlike that one it is NOT best-effort: a rename the
       # operator asked for either lands or raises.
@@ -383,13 +594,27 @@ module Gori
       Project.new(display, project.db_path, project.ephemeral?)
     end
 
+    # Project names reach terminal titles and are persisted verbatim in `.name`; validate the
+    # bytes once for every write path so a manifest cannot install ANSI/OSC controls either.
+    private def validated_display_name(name : String) : String
+      raise Gori::Error.new(INVALID_UTF8_NAME) unless name.valid_encoding?
+      display = name.strip
+      if display.each_char.any? do |char|
+           code = char.ord
+           code < 0x20 || (code >= 0x7f && code <= 0x9f)
+         end
+        raise Gori::Error.new("invalid project name: control characters are not allowed")
+      end
+      display
+    end
+
     # Slugify a display name into a safe directory name. gsub removes path
     # separators; stripping leading/trailing '-' AND '.' means a dot-only name
     # ("." / ".." / "...") collapses to "" and is rejected by create() — otherwise
     # File.join(@root, slug) would resolve to @root or its parent (traversal).
     private def slugify(name : String) : String
       slug = name.downcase.gsub(/[^a-z0-9._-]+/, "-").strip("-.")
-      return slug unless slug.empty?
+      return cap_slug(slug) unless slug.empty?
       # An all-non-ASCII display name (e.g. "日本語") has no [a-z0-9] to slugify and would
       # otherwise collapse to "" and be rejected as "invalid project name" — leaving such
       # projects completely unusable via --project. When the name carries real (non-ASCII)
@@ -400,6 +625,24 @@ module Gori
       # dot-run must never become a path (traversal).
       return slug unless name.each_char.any? { |c| c.ord > 127 }
       "project-#{Digest::SHA256.hexdigest(name)[0, 10]}"
+    end
+
+    # The longest slug a project directory gets. A file name is at most 255 bytes, and a
+    # 300-character name failed on every surface with the OS's raw "File name too long"; the
+    # headroom below that is for `unique_slug`'s `-2` and the `<slug>.gori` an export defaults
+    # to. The slug is ASCII, so characters are bytes.
+    MAX_SLUG = 128
+
+    # A slug past MAX_SLUG keeps its head and ends in a hash of the whole slug, so two long
+    # names that share the head still get different directories, and the same name (in any
+    # letter case, since the slug is lowercase) still reopens its own. Shorter slugs are
+    # untouched, and so is a longer one whose directory already exists — a name of 129–255 bytes
+    # was a valid directory before the cap, and capping it would open a second, empty project
+    # under the same name.
+    private def cap_slug(slug : String) : String
+      return slug if slug.bytesize <= MAX_SLUG
+      return slug if slug.bytesize <= 255 && Dir.exists?(File.join(@root, slug))
+      "#{slug[0, MAX_SLUG - 9].rstrip("-.")}-#{Digest::SHA256.hexdigest(slug)[0, 8]}"
     end
   end
 end

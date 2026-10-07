@@ -26,6 +26,15 @@ describe "Chrome sub-tab strip — chip geometry in display columns" do
     CJK_LABEL.size.should eq(14)
   end
 
+  # A chip wider than the whole strip is clipped to it, not dropped: the window parks on the
+  # active chip, so dropping it left no active chip and nothing to click.
+  it "keeps an active chip wider than the strip, clipped to it" do
+    rect = Gori::Tui::Rect.new(0, 0, 20, 1)
+    segs = Chrome.strip_segments(rect, cjk_labels, 0)
+    segs.map(&.[0]).should eq([0])
+    segs[0][1].right.should be <= rect.right - 1
+  end
+
   it "sizes a chip by the columns it paints, not by its character count" do
     seg = Chrome.strip_segments(CJK_RECT, cjk_labels, 0)[0][1]
     seg.w.should eq(Screen.display_width(CJK_LABEL) + 2) # " label " — one pad each side
@@ -93,6 +102,27 @@ describe "Chrome sub-tab strip — chip geometry in display columns" do
     backend.row(0)[seg.x + 1].should eq(CJK_LABEL[0])
   end
 
+  # `bg:` is the surface the strip sits on. Inside a card (the Preferences modal) the canvas
+  # default painted each inactive label on its own black band, flush to the text, while the
+  # pad and gap columns kept the card's colour — so every cell the strip paints outside a
+  # pill must take the surface, and the receded gold must be blended over it.
+  it "paints every non-pill cell on the surface it is handed" do
+    Theme.panel.should_not eq(Theme.bg) # else this example proves nothing
+    labels = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]
+    rect = Rect.new(0, 0, 24, 1) # narrow: the active chip scrolls the window, so both markers show
+    backend = MemoryBackend.new(rect.w, 1)
+    Screen.new(backend).fill(rect, Theme.panel)
+    start = Chrome.render_tab_strip(Screen.new(backend), rect, labels, 3, focused: false, bg: Theme.panel)
+    start.should be > 0
+    backend.row(0)[0].should eq('‹')
+    backend.row(0)[rect.right - 1].should eq('›')
+    pill = Chrome.strip_segments(rect, labels, 3, start).find! { |(i, _)| i == 3 }[1]
+    dim = Theme.blend(Theme.focus_gold, Theme.panel, Chrome::SUBTAB_DIM_GOLD)
+    rect.w.times do |x|
+      backend.bg_at(x, 0).should eq(pill.contains?(x, 0) ? dim : Theme.panel)
+    end
+  end
+
   it "keeps the ASCII strip byte-for-byte where it was" do
     # display_width takes its printable-ASCII fast path here, so the common strip must not
     # have moved a single column.
@@ -108,7 +138,7 @@ describe "Chrome tab menu — chip geometry in display columns" do
     # but menu_layout takes `tabs:` from the caller and shares scroll_start with the sub-tab
     # strip, and the two must not measure a label differently.
     tabs = [{:cjk, CJK_LABEL}, {:beta, "beta"}]
-    segs = Chrome.menu_segments(CJK_RECT, :cjk, tabs: tabs)
+    segs = Chrome.menu_geometry(CJK_RECT, :cjk, tabs: tabs).segments
     segs[0][1].w.should eq(Screen.display_width(CJK_LABEL) + 2)
     segs[1][1].x.should be >= segs[0][1].right
   end

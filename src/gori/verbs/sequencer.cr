@@ -15,26 +15,26 @@ module Gori
 
       r.register Verb::Definition.new(
         "history.sequence", "Send to Sequencer", "Collect this flow's token and analyze its randomness",
-        Verb::Scope::Body, available: history_selected, mnemonic: 'q', group: :send) { |ctx| ctx.sequence_selected; nil }
+        Verb::Scope::Body, available: history_selected, intent: :to_sequencer, group: :send) { |ctx| ctx.sequence_selected; nil }
       r.register Verb::Definition.new(
         "detail.sequence", "Send to Sequencer", "Collect this flow's token and analyze its randomness",
-        Verb::Scope::HistoryDetail, mnemonic: 'q', group: :send) { |ctx| ctx.close_detail; ctx.sequence_selected; nil }
+        Verb::Scope::HistoryDetail, intent: :to_sequencer, group: :send) { |ctx| ctx.close_detail; ctx.sequence_selected; nil }
       r.register Verb::Definition.new(
         "repeater.sequence", "Send to Sequencer", "Collect this request's token repeatedly and analyze randomness",
-        Verb::Scope::Repeater, available: in_repeater, mnemonic: 'q') { |ctx| ctx.sequence_from_repeater; nil }
+        Verb::Scope::Repeater, available: in_repeater, intent: :to_sequencer) { |ctx| ctx.sequence_from_repeater; nil }
       # Scope::Sitemap already gates this to the Target/Sitemap sub-tab (command_scope
       # returns Sitemap only then) — no current_tab predicate, which would check the
       # retired :sitemap top-level symbol and never fire (Sitemap is now a Target sub-tab).
       r.register Verb::Definition.new(
         "sitemap.sequence", "Send to Sequencer", "Collect the selected endpoint's token and analyze randomness",
-        Verb::Scope::Sitemap, mnemonic: 'q', group: :send) { |ctx| ctx.sequence_from_sitemap; nil }
+        Verb::Scope::Sitemap, intent: :to_sequencer, group: :send) { |ctx| ctx.sequence_from_sitemap; nil }
 
       r.register Verb::Definition.new(
         "sequence.run", "Run collection", "Re-run token collection for this session", Verb::Scope::Sequencer,
-        [Verb::Chord.new("r", ctrl: true)], available: in_sequencer, mnemonic: 'r') { |ctx| ctx.sequence_run; nil }
+        [Verb::Chord.new("r", ctrl: true)], available: in_sequencer, intent: :run) { |ctx| ctx.sequence_run; nil }
       r.register Verb::Definition.new(
         "sequence.stop", "Stop collection", "Stop the running collection", Verb::Scope::Sequencer,
-        [Verb::Chord.new("x", ctrl: true)], available: in_sequencer, mnemonic: 's') { |ctx| ctx.sequence_stop; nil }
+        [Verb::Chord.new("x", ctrl: true)], available: in_sequencer, intent: :stop) { |ctx| ctx.sequence_stop; nil }
       # Reconfigure the token descriptor / goal — the in-body 'c' chord promoted to a verb.
       r.register Verb::Definition.new(
         "sequence.configure", "Configure token", "Set the token location (cookie/header/regex/position/jsonpath) + goal",
@@ -50,49 +50,53 @@ module Gori
       r.register Verb::Definition.new(
         "sequence.export", "Export report…", "Write this session's randomness report to a Markdown file (asks for the path)",
         Verb::Scope::Sequencer, [Verb::Chord.new("e", shift: true)], available: has_report,
-        mnemonic: 'E') { |ctx| ctx.sequence_export(:markdown); nil }
-      # 'J', because without a mnemonic AND without a chord this verb was reachable from
-      # NOTHING: `menu_key` returns nil, `SpaceMenu#open` filters on `menu_key`, and the
-      # palette only queries Global scope — so a shipped export had no keyboard path at all.
-      # Its Markdown twin four lines up carries ⇧E + 'E'; Issues solves the same two-format
-      # problem by registering the palette entries in `Scope::Global` instead.
+        intent: :export) { |ctx| ctx.sequence_export(:markdown); nil }
+      # Palette-only (#1282): its Markdown twin four lines up carries ⇧E + 'E', and the JSON
+      # form is the rarer export. It once had no mnemonic AND no chord, and was reachable from
+      # NOTHING while the palette searched Global only; the palette's typed search finds a
+      # tab's actions now, and `spec/verbs/registry_reach_spec.cr` pins that it lists this one.
       r.register Verb::Definition.new(
         "sequence.export-json", "Export report (JSON)…", "Write this session's randomness report to a JSON file (asks for the path)",
-        Verb::Scope::Sequencer, [] of Verb::Chord, available: has_report,
-        mnemonic: 'J') { |ctx| ctx.sequence_export(:json); nil }
+        Verb::Scope::Sequencer, [] of Verb::Chord, available: has_report, menu: :palette) { |ctx| ctx.sequence_export(:json); nil }
       r.register Verb::Definition.new(
         "sequence.promote", "File as issue", "Record this randomness verdict in the Issues report (no token values)",
         Verb::Scope::Sequencer, [] of Verb::Chord, available: has_report,
-        mnemonic: 'i') { |ctx| ctx.sequence_promote; nil }
+        intent: :file_issue) { |ctx| ctx.sequence_promote; nil }
 
-      # The strip's `r` rename / ^W close. `Runner#renameable_subtabs?` and `#subtab_close`
+      # The strip's `e` rename / ^W close. `Runner#renameable_subtabs?` and `#subtab_close`
       # have listed :sequencer all along, but with no verbs this tab had NO `:subtab` menu
       # group at all — the only multi-session tab without one. 'e'/'w' are free in
       # COMMON ∪ :subtab (COMMON: r/s/c/i/x/y/v/S/E/J).
+      #
+      # 'e' and NOT the 'r' the strip binds: COMMON's 'r' here is `sequence.run`, the menu echo of
+      # `^R`, and COMMON renders inside the :subtab view. A rename does not take the Run
+      # letter — see `repeater.rename-subtab` for the full note.
       in_seq = ->(ctx : Verb::ExecContext) { ctx.current_tab == :sequencer }
       r.register Verb::Definition.new(
         "sequence.rename-subtab", "Rename subtab", "Rename the active sequencing session's sub-tab chip",
-        Verb::Scope::Sequencer, available: in_seq, mnemonic: 'e', section: :subtab) { |ctx| ctx.sequencer_rename_subtab; nil }
-      # `:common`, not `:subtab` — the space menu renders COMMON ∪ the FOCUSED PANE's section,
-      # so a `:subtab` close is invisible from the body and reachable only after moving focus
-      # to the strip. Decoder and JWT fixed that for themselves; this is the same fix.
+        Verb::Scope::Sequencer, available: in_seq, intent: :rename, section: :subtab) { |ctx| ctx.sequencer_rename_subtab; nil }
+      # `:subtab`, with the rest of the chip family. Until #1055 this had to be `:common` —
+      # the menu rendered COMMON ∪ the FOCUSED PANE's section, so a `:subtab` close was
+      # invisible from the body and reachable only after moving focus to the strip. The
+      # SUB-TABS bucket now rides along with every view, so the honest section is free.
       #
       # Repeater and Fuzzer deliberately do NOT follow: `repeater.mark-word` / `fuzz.mark-word`
       # own 'w' in their `:request` / `:template` sections, so a COMMON 'w' would collide there
       # and `Registry#validate_menu_keys!` would raise at boot. Their close stays in :subtab.
       r.register Verb::Definition.new(
         "sequence.close-subtab", "Close subtab", "Close the active sequencing session",
-        Verb::Scope::Sequencer, available: in_seq, mnemonic: 'w') { |ctx| ctx.sequencer_close_subtab; nil }
+        Verb::Scope::Sequencer, [Verb::Chord.new("w", ctrl: true)],
+        available: in_seq, intent: :close, section: :subtab) { |ctx| ctx.sequencer_close_subtab; nil }
       r.register Verb::Definition.new(
         "sequence.find-subtab", "Search sub-tabs", "Filter the open sequencing sessions and jump to one",
         Verb::Scope::Sequencer,
         available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :sequencer && ctx.subtab_search_count >= 1 },
-        mnemonic: 'f', section: :tab) { |ctx| ctx.subtab_search_open; nil }
+        intent: :find_subtab, section: :tab) { |ctx| ctx.subtab_search_open; nil }
       r.register Verb::Definition.new(
         "sequence.filter-subtabs", "Filter sub-tabs", "Filter the sequencing sub-tab strip by name / host / method",
         Verb::Scope::Sequencer,
         available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :sequencer && ctx.subtab_search_count >= 2 },
-        mnemonic: '/', section: :tab) { |ctx| ctx.subtab_filter_open; nil }
+        intent: :filter, section: :tab) { |ctx| ctx.subtab_filter_open; nil }
 
       # Sub-tab multi-select (#683). `t` marks a chip and `⇧T` marks the strip; ^W then
       # closes every marked one, `space ▸ r` sends them, and so on — the existing verbs
@@ -100,11 +104,14 @@ module Gori
       # `@focus == :subtabs` returns before the keymap, so a chord could never fire on the
       # strip, and it WOULD fire in the body, marking sub-tabs while the operator types.
       r.register Verb::Definition.new(
+        "sequence.subtab-mark", "Mark sub-tab", "Mark or unmark the active sub-tab (the strip's `t`) — the actions above then act on every marked one",
+        Verb::Scope::Sequencer, available: subtab_mark_ready(:sequencer), intent: :mark, section: :subtab) { |ctx| ctx.subtab_mark_toggle; nil }
+      r.register Verb::Definition.new(
         "sequence.subtab-mark-all", "Mark all sub-tabs", "Mark every session the sub-tab filter shows — the actions above then act on all of them",
-        Verb::Scope::Sequencer, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :sequencer && ctx.subtab_search_count >= 2 }, mnemonic: 'T', section: :subtab) { |ctx| ctx.subtab_mark_all; nil }
+        Verb::Scope::Sequencer, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :sequencer && ctx.subtab_search_count >= 2 }, intent: :mark_all, section: :subtab) { |ctx| ctx.subtab_mark_all; nil }
       r.register Verb::Definition.new(
         "sequence.subtab-mark-clear", "Clear marks", "Drop every sub-tab mark (esc on the strip does the same)",
-        Verb::Scope::Sequencer, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :sequencer && ctx.subtab_marked_count > 0 }, mnemonic: 'N', section: :subtab) { |ctx| ctx.subtab_mark_clear; nil }
+        Verb::Scope::Sequencer, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :sequencer && ctx.subtab_marked_count > 0 }, intent: :mark_clear, section: :subtab) { |ctx| ctx.subtab_mark_clear; nil }
     end
   end
 end

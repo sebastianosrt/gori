@@ -20,6 +20,18 @@ module Gori::CLI::Run
   def self.issue_flow_error_for_spec(store : Gori::Store, flow_id : Int64?) : String?
     issue_flow_error(store, flow_id)
   end
+
+  def self.issue_flow_range_error_for_spec(flow_id : Int64?) : String?
+    issue_flow_range_error(flow_id)
+  end
+
+  def self.issue_created_output_for_spec(store : Gori::Store, id : Int64, format : Symbol) : String
+    issue_created_output(store, id, format)
+  end
+
+  def self.issue_delete_confirmation_error_for_spec(id : Int64, yes : Bool) : String?
+    issue_delete_confirmation_error(id, yes)
+  end
 end
 
 private def captured_flow(store : Gori::Store) : Int64
@@ -54,6 +66,20 @@ describe "gori run issues create --flow" do
       Gori::CLI::Run.issue_flow_error_for_spec(store, -5_i64)
         .should eq("invalid --flow -5 (expected a positive flow id)")
     end
+  end
+
+  # The `<= 0` half answers with NO store, which is what lets `create` ask it before
+  # `--notes-stdin` blocks to EOF (#1019): draining a generator's output and then refusing an
+  # argument that was wrong the moment it was typed costs the operator the write-up. A positive
+  # id gets nil here on purpose — whether it EXISTS is a question only the store can answer, and
+  # that is the one refusal on this command a pipe is legitimately drained for.
+  it "answers the zero/negative half without a store, and leaves existence to the store" do
+    Gori::CLI::Run.issue_flow_range_error_for_spec(0_i64)
+      .should eq("invalid --flow 0 (expected a positive flow id)")
+    Gori::CLI::Run.issue_flow_range_error_for_spec(-5_i64)
+      .should eq("invalid --flow -5 (expected a positive flow id)")
+    Gori::CLI::Run.issue_flow_range_error_for_spec(424_242_i64).should be_nil
+    Gori::CLI::Run.issue_flow_range_error_for_spec(nil).should be_nil
   end
 
   it "accepts a real flow id, and says nothing when --flow was not given" do
@@ -112,6 +138,15 @@ describe "gori run issues — the text listing" do
 end
 
 describe "gori run issues --format json" do
+  it "JSON-escapes embedded NUL bytes in issue notes" do
+    body = String.new(Bytes[0x62, 0x65, 0x66, 0x6f, 0x72, 0x65, 0x00, 0x61, 0x66, 0x74, 0x65, 0x72])
+    output = Gori::Issues::Export.issue_json(
+      issue(1_i64, "NUL notes", Gori::Store::Severity::Low, nil, nil, body))
+
+    output.should contain("\\u0000")
+    JSON.parse(output)["notes"].as_s.to_slice.should eq(body.to_slice)
+  end
+
   it "serialises issues with the documented fields" do
     issues = [
       issue(1_i64, "XSS", Gori::Store::Severity::High, "shop.test", 13_i64, "reflected",
@@ -140,10 +175,45 @@ describe "gori run issues --format json" do
         Gori::Store::LinkRefKind::Repeater, 9_i64)
       parsed = JSON.parse(Gori::Issues::Export.json(store.issues, store)).as_a
       links = parsed[0]["links"].as_a
-      links.size.should eq(1) # primary flow link is deduped from the export list
-      links[0]["kind"].as_s.should eq("repeater")
-      links[0]["ref_id"].as_i.should eq(9)
-      links[0]["label"].as_s.should_not be_empty
+      # The primary flow LEADS the list and appears exactly once — it is the issue's first
+      # related item, and `flow_id` beside it is the compat spelling of that same entry.
+      links.size.should eq(2)
+      links[0]["kind"].as_s.should eq("flow")
+      links[0]["ref_id"].as_i64.should eq(fid)
+      parsed[0]["flow_id"].as_i64.should eq(fid)
+      links[1]["kind"].as_s.should eq("repeater")
+      links[1]["ref_id"].as_i.should eq(9)
+      links[1]["label"].as_s.should_not be_empty
+    end
+  end
+end
+
+# `issues create --format json` (#1117): a script filing a finding had to scrape the id out of
+# "Issue #7 created successfully.". The object is the one the listing prints for that row, so
+# reading it back later gives the same shape the create answered with.
+describe "gori run issues create --format json" do
+  it "prints the new issue's listing object, id included" do
+    with_store do |store|
+      fid = captured_flow(store)
+      id = store.insert_issue("SQLi in /admin", Gori::Store::Severity::High, "acme.test", fid,
+        cvss: "9.8", notes: "reproduced twice")
+      created = JSON.parse(Gori::CLI::Run.issue_created_output_for_spec(store, id, :json))
+      created["id"].as_i64.should eq(id)
+      created["title"].as_s.should eq("SQLi in /admin")
+      created["severity"].as_s.should eq("high")
+      created["notes"].as_s.should eq("reproduced twice")
+
+      listed = JSON.parse(Gori::Issues::Export.json(store.issues, store)).as_a.find! { |o| o["id"].as_i64 == id }
+      created.as_h.keys.should eq(listed.as_h.keys)
+      created.should eq(listed)
+    end
+  end
+
+  it "keeps the text sentence unchanged" do
+    with_store do |store|
+      id = store.insert_issue("t", Gori::Store::Severity::Info, nil, nil)
+      Gori::CLI::Run.issue_created_output_for_spec(store, id, :text)
+        .should eq("Issue ##{id} created successfully.")
     end
   end
 end
@@ -174,7 +244,10 @@ describe "gori run issues --format markdown" do
       md = Gori::Issues::Export.markdown(issues, store, "demo")
       md.should contain("### Request")
       md.should contain("GET /v1/debug HTTP/1.1")
-      md.should contain("(##{fid})")
+      # The flow the report fences is named ONCE, as the first row of Related — there is no
+      # `- **Flow:**` bullet above the list saying the same thing in another vocabulary.
+      md.should contain("### Related\n\n- **hist** https://api.test/v1/debug — GET api.test/v1/debug\n")
+      md.should_not contain("**Flow:**")
       # The header block's terminating CRLF CRLF is trimmed, so the last header
       # line abuts the closing fence (no stack of blank lines inside the block).
       md.should contain("Host: api.test\n```")
@@ -215,6 +288,18 @@ describe "gori run issues --format markdown" do
     end
   end
 
+  # #1191: SARIF redacts credential headers unless opted in. `cmd_issues_list` opens a store
+  # and writes to STDOUT, so — like `history --include-sensitive` — the forwarding is asserted
+  # over the source: the flag is declared, and the SARIF emit site passes a fourth argument
+  # (without it the export silently stays redacted whatever the operator asked for).
+  it "declares --include-sensitive and forwards it to the SARIF export" do
+    src = File.read(File.join(__DIR__, "..", "..", "..", "src", "gori", "cli", "run", "issues.cr"))
+    src.should contain("p.on(\"--include-sensitive\"")
+    sites = src.scan(/Export\.sarif\(([^)]*)\)/)
+    sites.size.should eq(1)
+    sites[0][1].split(',').size.should eq(4)
+  end
+
   it "scrubs control bytes on the STDOUT path but keeps a file export verbatim" do
     # The Markdown report embeds attacker-controlled evidence bodies; printed to a TTY a
     # raw OSC could drive the terminal. `--export PATH` writes the bytes untouched — a
@@ -225,5 +310,24 @@ describe "gori run issues --format markdown" do
     scrubbed.should_not contain('\a')
     scrubbed.should contain("\n") # structure preserved
     scrubbed.should contain("\ttab")
+  end
+end
+
+describe "gori run issues delete --yes confirmation" do
+  it "refuses without --yes" do
+    err = Gori::CLI::Run.issue_delete_confirmation_error_for_spec(12_i64, false).not_nil!
+    err.should contain("refusing to delete issue #12 without --yes")
+    err.should contain("deleted issues cannot be recovered")
+  end
+
+  it "allows deletion with --yes" do
+    Gori::CLI::Run.issue_delete_confirmation_error_for_spec(12_i64, true).should be_nil
+  end
+
+  it "declares --yes and -y in the delete option parser" do
+    src = File.read(File.join(__DIR__, "..", "..", "..", "src", "gori", "cli", "run", "issues.cr"))
+    body = src[/private def self\.cmd_issues_delete\(.*?\n      end\n/m]
+    body.should contain("p.on(\"-y\", \"--yes\"")
+    body.should contain("issue_delete_confirmation_error")
   end
 end

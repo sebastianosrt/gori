@@ -3,7 +3,9 @@ require "json"
 require "mime/multipart"
 require "./types" # Location, which apply's own signature names
 require "../fuzz/content_length"
+require "../ascii_bytes"
 require "../process_hook"
+require "../json_spans"
 
 module Gori::Miner
   # Adds candidate parameters to a request at a chosen location, keeping everything
@@ -16,7 +18,7 @@ module Gori::Miner
     MAX_URL_BYTES = 8 * 1024
 
     # JSON candidate keys are injected into EVERY object node in the body (see
-    # inject_json_text). The node set is capped (BFS shallow-first) and derived once from the
+    # inject_json_nodes). The node set is capped (BFS shallow-first) and derived once from the
     # BASE body — a fixed count independent of the current bucket, so a name always hits the same
     # nodes across the initial bucket, its bisection halves, and confirmation (coverage invariance).
     MAX_JSON_NODES = 32
@@ -315,20 +317,6 @@ module Gori::Miner
       body.size >= 2 && body[body.size - 2] == 0x0d_u8 && body[body.size - 1] == 0x0a_u8
     end
 
-    # First occurrence of `needle` at or after `from`, byte-wise (String#index would corrupt a
-    # non-UTF-8 body). Used to locate an injected JSON fragment whose final offset only exists
-    # after `any.to_json` has reserialized the whole body.
-    private def self.forward_index_of(haystack : Bytes, needle : Bytes, from : Int32) : Int32?
-      return nil if needle.empty? || needle.size > haystack.size
-      i = from < 0 ? 0 : from
-      last = haystack.size - needle.size
-      while i <= last
-        return i if haystack[i, needle.size] == needle
-        i += 1
-      end
-      nil
-    end
-
     # Sort spans by start and fold any that touch or overlap into one. `Env.expand_bindings`
     # walks the verbatim list with a single forward cursor, so it requires sorted + disjoint
     # ranges; only the JSON path can emit incidentally overlapping fragments, but every caller
@@ -363,24 +351,98 @@ module Gori::Miner
       io.write(new_body)
       out = io.to_slice
 
-      # A JSON candidate is reserialized (`any.to_json`) or textually spliced, so its final
-      # position is only known after the fact: locate every injected `"name":"value"` fragment
-      # in the new body (the SAME spelling both paths emit — `n.to_json`/`v.to_json`, no space,
-      # Crystal-compact). A name is injected into every object node, so a fragment can recur;
-      # each occurrence is a span. Values are canaries here (unique), so a fragment cannot
-      # collide with pre-existing body content, and merge_spans folds any incidental overlap so
-      # the list stays sorted+disjoint for `Env.expand_bindings`' cursor.
       body_off = head.size + eol.bytesize * 2
+      {out, merge_spans(json_spans(new_body, body_off, params))}
+    end
+
+    # Byte spans of every injected `"name":"value"` fragment in the reserialized body.
+    #
+    # A JSON candidate is spliced into every object node, so its final
+    # position is only known after the fact — and a name is injected into EVERY object node, so
+    # each fragment can recur, each occurrence its own span. The SAME spelling both inject paths
+    # emit (`n.to_json`/`v.to_json`, no space, Crystal-compact) is what is searched for.
+    #
+    # Two roads to the identical span set. The general one (`json_spans_by_fragment`) searches
+    # the whole body for each fragment, which is O(body) PER candidate: measured, a 128-name
+    # bucket over a 32-node body spent ~29 ms here, ~80× the ~370 µs the reserialization itself
+    # costs — the span scan, not the JSON work, was the JSON location's real per-probe cost. The
+    # fast one exploits what the miner ALWAYS injects: DISTINCT canary values (`Canary.fresh`).
+    # Every fragment ends in its canary, and a canary appears nowhere else, so ONE
+    # memchr-accelerated scan of the body for canary tokens — the same scan `Fingerprint` runs —
+    # locates all of them at once, O(body) for the whole bucket. It falls back to the general
+    # search the moment a value is not a distinct canary (the specs, any hand-driven
+    # `apply_with_spans`), so the answer is byte-identical either way.
+    #
+    # Returns spans in whatever order each road emits them; `inject_json` runs `merge_spans` on
+    # the result to give `Env.expand_bindings`' single-cursor walk the sorted+disjoint list it
+    # requires.
+    private def self.json_spans(new_body : Bytes, body_off : Int32,
+                                params : Array({String, String})) : Array({Int32, Int32})
+      if by_canary = canary_fragments(params)
+        json_spans_by_canary(new_body, body_off, by_canary)
+      else
+        json_spans_by_fragment(new_body, body_off, params)
+      end
+    end
+
+    # `{canary => its full "name":"value" fragment}`, or nil the moment a value is not a
+    # DISTINCT canary — the signal to take the general span search instead. A canary
+    # (`Canary.shaped?`: `gq` + 8 lower-hex) needs no JSON escaping, so the fragment's tail is
+    # exactly `"` + canary + `"` and the canary's byte offset inside the fragment is fixed at
+    # `frag.size - Canary::LEN - 1`. A repeated value would make one canary map to two fragments,
+    # which the by-canary scan cannot disambiguate, so that too falls back.
+    private def self.canary_fragments(params : Array({String, String})) : Hash(String, Bytes)?
+      map = Hash(String, Bytes).new(initial_capacity: params.size)
+      params.each do |(n, v)|
+        return nil unless Canary.shaped?(v)
+        return nil if map.has_key?(v)
+        map[v] = "#{n.to_json}:#{v.to_json}".to_slice
+      end
+      map
+    end
+
+    # Locate injected fragments by scanning ONCE for their canary tails (`Canary.each_token`, the
+    # same memchr scan `Fingerprint` runs). A body position holding a canary is the tail of
+    # exactly one fragment; its start is a fixed offset back, and the full-fragment VERIFY keeps a
+    # stray canary-shaped token in PRE-EXISTING body content — or one that happens to also equal
+    # an injected value — from ever becoming a span (the general search would not have matched
+    # there either).
+    private def self.json_spans_by_canary(new_body : Bytes, body_off : Int32,
+                                          by_canary : Hash(String, Bytes)) : Array({Int32, Int32})
+      spans = [] of {Int32, Int32}
+      Canary.each_token(new_body) do |i|
+        # `each_token` already validated the shape, so the map lookup only has to reject a token
+        # that is not one of THIS bucket's injected values.
+        next unless frag = by_canary[String.new(new_body[i, Canary::LEN])]?
+        # `start >= 0` AND `start + frag.size <= size`: a canary at the very END of the body (a
+        # bare canary-shaped token in a malformed, non-parsing body — the `splice_json_object`
+        # road — that also equals an injected value) leaves no room for the fragment's closing
+        # quote, so the slice read would run past the body. The general search never matches
+        # there either, so skipping keeps the two roads identical.
+        start = i - (frag.size - Canary::LEN - 1)
+        if start >= 0 && start + frag.size <= new_body.size && new_body[start, frag.size] == frag
+          spans << {body_off + start, body_off + start + frag.size}
+        end
+      end
+      spans
+    end
+
+    # The general span search: O(body) per candidate. Correct for ANY value (the specs' plain
+    # `"v"`, a hand-driven `apply_with_spans`), and the fallback when the fast canary scan cannot
+    # apply. Returns spans grouped by candidate, not ordered — `json_spans`' caller merges them.
+    private def self.json_spans_by_fragment(new_body : Bytes, body_off : Int32,
+                                            params : Array({String, String})) : Array({Int32, Int32})
       spans = [] of {Int32, Int32}
       params.each do |(n, v)|
         frag = "#{n.to_json}:#{v.to_json}".to_slice
         from = 0
-        while idx = forward_index_of(new_body, frag, from)
+        # Byte-wise: String#index would corrupt a non-UTF-8 body.
+        while idx = AsciiBytes.index(new_body, frag, from)
           spans << {body_off + idx, body_off + idx + frag.size}
           from = idx + frag.size
         end
       end
-      {out, merge_spans(spans)}
+      spans
     end
 
     # The new JSON body for `body`, or nil when this location has nothing to inject into.
@@ -398,27 +460,24 @@ module Gori::Miner
     #
     # …while the FORM location on the same shape was already byte-exact, which is the control.
     #
-    # A body that is not valid UTF-8 cannot round-trip through `JSON::Any` AT ALL — `JSON.parse`
-    # takes a String and `any.to_json` emits one — so it takes the road a body that does not
-    # cleanly parse already takes: the top-level `{`-splice, done on BYTES here so every
-    # captured byte survives. And `json_object_node_count`, the gate `Detect` asks, reports 0
-    # for such a body, so the Json location is not OFFERED for it and `gori run mine` names it
-    # skipped (`warn_mine_locations`) instead of quietly mining a request it had rewritten.
+    # A body that is not valid UTF-8 keeps the road it had before the node walk below existed:
+    # the top-level `{`-splice, done on BYTES so every captured byte survives. And
+    # `json_object_node_count`, the gate `Detect` asks, reports 0 for such a body, so the Json
+    # location is not OFFERED for it and `gori run mine` names it skipped
+    # (`warn_mine_locations`) instead of quietly mining a request it had rewritten.
     private def self.inject_json_body(body : Bytes, params : Array({String, String})) : Bytes?
-      text = String.new(body)
-      return splice_json_object(body, params) unless text.valid_encoding?
-      inject_json_text(text, params).try(&.to_slice)
+      return splice_json_object(body, params) unless String.new(body).valid_encoding?
+      inject_json_nodes(body, params)
     end
 
     # The top-level `{`-splice on BYTES: the pairs go in right after the FIRST `{`, every other
-    # byte of `body` copied through verbatim. Same spelling and same position as the String
-    # fallback in `inject_json_text` produces, so the two paths agree; this one exists for the
-    # bodies `JSON::Any` cannot hold. nil when there is no `{` to splice into.
+    # byte of `body` copied through verbatim. The road for a body the node walk cannot take —
+    # one that is not valid UTF-8, or not one JSON value. nil when there is no `{` to splice into.
     private def self.splice_json_object(body : Bytes, params : Array({String, String})) : Bytes?
-      bi = forward_index_of(body, "{".to_slice, 0)
+      bi = body.index(0x7b_u8) # `{`
       return nil unless bi
       at = bi + 1
-      inserts = params.map { |(n, v)| "#{n.to_json}:#{v.to_json}" }.join(',')
+      inserts = json_members(params)
       sep = closes_immediately?(body, at) ? "" : ","
       io = IO::Memory.new(body.size + inserts.bytesize + 1)
       io.write(body[0, at])
@@ -428,8 +487,7 @@ module Gori::Miner
     end
 
     # Whether the object just spliced into closes immediately (only JSON whitespace between
-    # `from` and its `}`) — then the inserted pairs need no trailing comma. This is what the
-    # String fallback spells `after.lstrip.starts_with?('}')`.
+    # `from` and its `}`) — then the inserted pairs need no trailing comma.
     private def self.closes_immediately?(body : Bytes, from : Int32) : Bool
       i = from
       while i < body.size
@@ -444,51 +502,32 @@ module Gori::Miner
     # inside a root array, and nested objects — capped BFS shallow-first (MAX_JSON_NODES). Returns
     # nil when the body carries no object node (array-of-scalars / scalar / bool / null root),
     # leaving it unchanged (Detect won't offer Json there; this only guards a hand-driven call).
-    # A body that doesn't cleanly parse falls back to the top-level textual `{`-splice.
+    # A body that doesn't cleanly parse falls back to the top-level `{`-splice.
     #
-    # `btext` must be valid UTF-8 — `inject_json_body` owns that check and routes bytes that
-    # are not to `splice_json_object`. Do NOT restore a `scrub` here to make it total.
-    def self.inject_json_text(btext : String, params : Array({String, String})) : String?
-      begin
-        any = JSON.parse(btext)
-        nodes = collect_object_nodes(any, MAX_JSON_NODES)
-        return nil if nodes.empty?
-        nodes.each { |node| params.each { |(n, v)| node[n] = JSON::Any.new(v) } }
-        return any.to_json
-      rescue JSON::ParseException
-        # fall through to the textual splice (nested/array injection needs a real parse)
-      end
-      bi = btext.index('{')
-      return nil unless bi
-      after = btext[(bi + 1)..]
-      sep = after.lstrip.starts_with?('}') ? "" : ","
-      inserts = params.map { |(n, v)| "#{n.to_json}:#{v.to_json}" }.join(',')
-      "#{btext[0..bi]}#{inserts}#{sep}#{after}"
+    # SPLICED, never re-serialized (#1183). Each candidate member is appended after the last
+    # member of its object and every other byte is the captured one. This used to be
+    # `JSON.parse` + `node[n] = v` + `to_json`, and the hash folded a duplicated member away:
+    # `{"dup":"first","dup":"second"}` went out as `{"dup":"second",…}` on every probe while
+    # the baseline kept both, so a first-wins target was mined against a request it had never
+    # been sent. The same round trip re-spelled numbers and escapes, and one number past
+    # Int64/Float64 sent the whole body down the root-only fallback.
+    private def self.inject_json_nodes(body : Bytes, params : Array({String, String})) : Bytes?
+      nodes = JsonSpans.objects(body, MAX_JSON_NODES)
+      return splice_json_object(body, params) unless nodes
+      return nil if nodes.empty?
+      JsonSpans.append_members(body, nodes, json_members(params))
     end
 
-    # Object-hash nodes reachable from `any`, BFS (shallow-first), capped at `cap`. Each returned
-    # hash is the BACKING store of a JSON::Any (a reference), so mutating it in place persists
-    # through `any.to_json`. Iterative (Deque) so an adversarially deep body can't blow the stack.
-    private def self.collect_object_nodes(any : JSON::Any, cap : Int32) : Array(Hash(String, JSON::Any))
-      out = [] of Hash(String, JSON::Any)
-      queue = Deque(JSON::Any){any}
-      until queue.empty? || out.size >= cap
-        node = queue.shift
-        if h = node.as_h?
-          out << h
-          h.each_value { |v| queue << v }
-        elsif a = node.as_a?
-          a.each { |v| queue << v }
-        end
-      end
-      out
+    # `"n":"v",…` — the one spelling both inject roads emit and `json_spans` searches for.
+    private def self.json_members(params : Array({String, String})) : String
+      params.map { |(n, v)| "#{n.to_json}:#{v.to_json}" }.join(',')
     end
 
     # How many injectable object nodes the body carries (capped). Shared by Detect (is Json
     # applicable?) and the engine (per-name bucket byte-budget), so the two never drift.
     #
-    # 0 for a body that is not valid UTF-8, and NOT via a `scrub`: `JSON.parse` cannot hold
-    # those bytes (see `inject_json_body`), so there is no node set to count. The scrubbed
+    # 0 for a body that is not valid UTF-8, and NOT via a `scrub`: `inject_json_body` does not
+    # walk such a body's nodes, so there is no node set to count. The scrubbed
     # parse this used to do answered "yes, N nodes" about a body it had just rewritten — which
     # is how the Json location came to be auto-selected for `application/json` traffic the
     # miner could then only send corrupted. Reporting 0 makes `Detect` stop offering it, so a
@@ -496,11 +535,8 @@ module Gori::Miner
     # `splice_json_object` still injects into exactly ONE node on that road, which is what the
     # engine's `{count, 1}.max` byte budget then assumes.
     def self.json_object_node_count(body : Bytes, cap : Int32) : Int32
-      text = String.new(body)
-      return 0 unless text.valid_encoding?
-      collect_object_nodes(JSON.parse(text), cap).size
-    rescue JSON::ParseException
-      0
+      return 0 unless String.new(body).valid_encoding?
+      JsonSpans.objects(body, cap).try(&.size) || 0
     end
 
     # ── headers ──────────────────────────────────────────────────────────────────────
@@ -574,8 +610,9 @@ module Gori::Miner
     # The parameter names `request` already carries at `location` — the ones a mine must NOT
     # test, because a name that is visible in the request is by definition not a HIDDEN one.
     #
-    # Testing them is not merely redundant, it is destructive at Json: `inject_json_text`
-    # writes `node[name] = canary`, which OVERWRITES the operator's own value. Measured on
+    # Testing them is not merely redundant, it is destructive at Json: the injector appends a
+    # second `name` member after the operator's, and a last-wins parser — most of them — reads
+    # that as OVERWRITING the operator's own value. Measured on
     # `{"user":"alice","q":"hi"}` with `user` in the wordlist — the miner sent
     # `{"user":"gq28707e5e","q":"hi"}`, the page changed because a REQUIRED parameter had been
     # replaced, and `user` came back as a CONFIRMED "hidden parameter" that was in the request
@@ -686,21 +723,16 @@ module Gori::Miner
     end
 
     # Keys of every object node the Json injector would write into — the node set is the same
-    # capped BFS `inject_json_text` walks, so this cannot disagree with what gets clobbered.
+    # capped BFS `inject_json_nodes` walks, so this cannot disagree with what gets clobbered.
+    # A body that does not parse takes the `{`-splice road, whose keys this cannot read, so it
+    # reports none: best-effort, as above.
     private def self.json_names(request : Bytes) : Set(String)
       _, body, _ = split(request)
       found = Set(String).new
-      return found if body.empty?
-      text = String.new(body)
-      return found unless text.valid_encoding?
-      begin
-        nodes = collect_object_nodes(JSON.parse(text), MAX_JSON_NODES)
-      rescue JSON::ParseException
-        # A body that does not parse takes the `{`-splice road, which appends rather than
-        # replaces — nothing to protect, so nothing to report.
-        return found
+      return found if body.empty? || !String.new(body).valid_encoding?
+      JsonSpans.objects(body, MAX_JSON_NODES).try &.each do |node|
+        node.members.each { |m| found << m.key }
       end
-      nodes.each { |node| node.each_key { |k| found << k } }
       found
     end
 

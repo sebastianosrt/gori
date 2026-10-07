@@ -8,7 +8,8 @@ module Gori
     class Tools
       # --- discover (spider + directory brute-force) --------------------------
 
-      @[Tool("discover_start", gated: true, agent_action: true, env_refresh: true)]
+      @[Tool("discover_start", gated: true, agent_action: true, env_refresh: true,
+        requires: ["discover_status", "discover_results", "discover_stop", "get_flow", "list_sitemap"], permission: "send")]
       private def discover_start(h) : Result
         # ONE Outbound for the whole call: the builder derives the crawl-time ScopePolicy
         # from it (see Discover::Plan.resolve_policy) and the Layer-1 check below reads the
@@ -55,7 +56,7 @@ module Gori
         unsafe = Discover::Headers.unsafe_expanded(config.headers)
         unless unsafe.empty?
           raise FuzzArgError.new("header #{unsafe.first.inspect} rejected — its value contains CR or LF " \
-                                 "after $VAR expansion, which would splice extra headers into every probe")
+                                 "after env expansion, which would splice extra headers into every probe")
         end
         options = Discover::PlanOptions.new(str(h, "url") || "", config: config,
           verify: !bool_arg(h, "insecure", false) && @verify_upstream,
@@ -73,7 +74,11 @@ module Gori
       # able to ask for an unbounded crawl). `user_wordlist` lives on the Config like every
       # other knob — the builder reads it from there on all three surfaces.
       private def discover_config(h) : Discover::Config
-        cap = optional_int_arg(h, "max_requests")
+        # A non-positive cap is ignored, as `fuzz_config` does: `cap_reached?` reads 0 / -1 as
+        # "no cap", so `{cap, MAX}.min` turned `max_requests: 0` into an UNBOUNDED crawl.
+        cap = optional_int_arg(h, "max_requests").try { |m| m > 0 ? m : nil }
+        wordlist = str(h, "wordlist").presence
+        wordlist.try { |w| wordlist_stream_refusal(w.strip) }.try { |why| raise FuzzArgError.new(why) }
         Discover::Config.new(
           concurrency: clamp(optional_int_arg(h, "concurrency"), 20, DISCOVER_MAX_CONCURRENCY),
           rps: optional_float_arg(h, "rate"),
@@ -84,13 +89,16 @@ module Gori
           retries: (optional_int_arg(h, "retries") || 1_i64).clamp(0_i64, 1000_i64).to_i,
           max_requests: cap ? {cap, DISCOVER_MAX_REQUESTS}.min : DISCOVER_MAX_REQUESTS,
           keep_alive: bool_arg(h, "keep_alive", true),
+          crawl_assets: bool_arg(h, "crawl_assets", false),
           # Both default ON, and both must be readable as a NAMED refusal when the value is
           # unintelligible: `spider: 0` used to come back as nil → `true`, so the crawl ran
           # after the caller asked for it off AND slipped past the "at least one technique"
           # guard that `spider: false` correctly trips.
           spider: bool_arg(h, "spider", true), bruteforce: bool_arg(h, "bruteforce", true),
-          max_depth: clamp(optional_int_arg(h, "max_depth"), 4, DISCOVER_MAX_DEPTH),
-          user_wordlist: str(h, "wordlist").presence,
+          # Floor 0, not 1: `max_depth: 0` means "the seed only", as `gori run discover
+          # --max-depth 0` does. `clamp` floors at 1, which crawled links the caller ruled out.
+          max_depth: (optional_int_arg(h, "max_depth") || 4_i64).clamp(0_i64, DISCOVER_MAX_DEPTH.to_i64).to_i,
+          user_wordlist: wordlist,
           extensions: discover_extensions(h), containment: discover_containment(h),
           headers: discover_headers(h))
       end
@@ -234,14 +242,17 @@ module Gori
       # get_flow reflect it. A store write failure (lock/disk) must not kill the running scan.
       private def store_discover_finding(djob : DiscoverJob, f : Discover::Finding, base_ts : Int64,
                                          exchange : Discover::Exchange? = nil) : Nil
+        idx = nil
         if djob.results.size < DISCOVER_MAX_STORED
           djob.results << f
+          idx = djob.results.size - 1
         else
           djob.truncated = true
         end
         pair = Discover::Persist.flow_pair(f, base_ts + djob.results.size, exchange,
           surface: Gori::FlowSource::Surface::Mcp, source_ref: djob.id)
         djob.persist_buf << {pair.request, pair.response}
+        djob.persist_owners << idx
         if djob.persist_buf.size >= DISCOVER_PERSIST_BATCH ||
            Time.instant - djob.persist_at >= DISCOVER_PERSIST_INTERVAL
           flush_discover_persist(djob)
@@ -274,18 +285,46 @@ module Gori
         # `job_project_mismatch` makes on the read side.
         if djob.db_path != @db_path
           Log.warn { "discover job #{djob.id}: dropping #{djob.persist_buf.size} unflushed finding(s) — project changed since the run started" }
-          djob.persist_buf.clear
+          drop_unsaved(djob)
           return
         end
-        store.insert_import_batch(djob.persist_buf)
-        djob.persist_buf.clear
-      rescue
-        djob.persist_buf.clear # a store failure must not wedge the crawl or grow forever
+        # The COMMITTED count, not a fire-and-forget: 0 is a batch the writer rolled back (a peer
+        # holding the writer slot past the busy budget) or a closing store, and clearing the
+        # buffer over it silently lost up to 64 findings' rows per collision. The CLI twin
+        # (`flush_discover`) reports the same number on STDERR and exits 1 (#1118).
+        ids = store.insert_import_batch_ids(djob.persist_buf)
+        lost = djob.persist_buf.size - ids.size
+        if lost > 0
+          djob.unsaved += lost
+          Log.warn { "discover job #{djob.id}: #{lost} finding(s) not saved as flows (store busy or closing) — their rows cannot be opened" }
+        end
+        # Pair by POSITION, and only when the writer answered for the whole batch — the TUI
+        # twin's rule (`DiscoverController#flush_persist`): a short reply would slide every id
+        # onto the wrong finding. No id just means the row has no `flow_id` to offer.
+        if ids.size == djob.persist_owners.size
+          djob.persist_owners.each_with_index { |idx, i| djob.flow_ids[idx] = ids[i] if idx }
+        end
+        clear_persist(djob)
+      rescue ex
+        # A store failure must not wedge the crawl or grow the buffer forever — but it is a
+        # loss, and it is counted as one.
+        Log.warn { "discover job #{djob.id}: #{djob.persist_buf.size} finding(s) not saved as flows (#{ex.message})" }
+        drop_unsaved(djob)
       end
 
-      @[Tool("discover_status", gated: true)]
+      private def drop_unsaved(djob : DiscoverJob) : Nil
+        djob.unsaved += djob.persist_buf.size
+        clear_persist(djob)
+      end
+
+      private def clear_persist(djob : DiscoverJob) : Nil
+        djob.persist_buf.clear
+        djob.persist_owners.clear
+      end
+
+      @[Tool("discover_status", gated: true, read_only: true, permission: "send")]
       private def discover_status(h) : Result
-        djob = lookup_discover_job(h)
+        djob = lookup_job(h, @discover_jobs, "discover", "status")
         return djob if djob.is_a?(Result)
         s = djob.stats
         Result.new(JSON.build do |j|
@@ -301,6 +340,9 @@ module Gori
             # says whether it ended having covered everything it queued.
             j.field "incomplete_reason", incomplete_reason(djob.status)
             j.field "results_truncated", djob.truncated?
+            # Findings whose flow rows were not written (see `DiscoverJob#unsaved`). Non-zero
+            # means that many of `found` cannot be opened with get_flow / seen in list_sitemap.
+            j.field "unsaved_flows", djob.unsaved
             j.field "error", djob.error_msg
             if s
               j.field "calibrated_out", s.calibrated_out
@@ -311,6 +353,10 @@ module Gori
               # Non-zero means the ORIGIN stopped discriminating between paths mid-sweep, so
               # an agent must read that directory's silence as unmeasured rather than empty.
               j.field "drift_suppressed", s.drift_suppressed
+              # URLs the run FOUND and deliberately did not request: a linked image, font,
+              # track or archive, whose body no extractor can read. Non-zero is not a gap in
+              # the crawl — set crawl_assets to turn them into rows.
+              j.field "assets_skipped", s.assets_skipped
               j.field("confidence_histogram") { j.array { s.conf_hist.each { |c| j.number(c) } } }
             end
             emit_audit(j, djob.audit, djob.ended_at_ms)
@@ -318,61 +364,38 @@ module Gori
         end)
       end
 
-      @[Tool("discover_results", gated: true)]
+      DISCOVER_RESULTS_LIMIT = PageLimit.new(100, 1000)
+
+      @[Tool("discover_results", gated: true, read_only: true, requires: ["get_flow"], permission: "send")]
       private def discover_results(h) : Result
-        djob = lookup_discover_job(h)
+        djob = lookup_job(h, @discover_jobs, "discover", "results")
         return djob if djob.is_a?(Result)
-        req_off = optional_int_arg(h, "offset")
-        req_lim = optional_int_arg(h, "limit")
-        offset = clamp_nonneg(req_off)
-        limit = clamp(req_lim, 100, 1000)
-        page = djob.results[offset, limit]? || [] of Discover::Finding
+        pg = page_args(h, DISCOVER_RESULTS_LIMIT)
+        page = djob.results[pg.offset, pg.limit]? || [] of Discover::Finding
         Result.new(JSON.build do |j|
           j.object do
-            j.field("findings") { j.array { page.each { |f| discover_finding_json(j, f) } } }
-            j.field "returned", page.size
-            j.field "offset", offset
+            j.field("findings") do
+              j.array { page.each_with_index { |f, i| Serialize.discover_finding(j, f, djob.flow_ids[pg.offset + i]?) } }
+            end
+            emit_page(j, pg, page.size)
             j.field "total_available", djob.results.size
-            j.field "limit", limit
-            emit_clamp(j, req_off, offset, req_lim, limit)
             j.field "job_complete", djob.status != :running
             # `has_more` is about this PAGE. A budget-capped run has no more stored findings
             # and still is not an exhaustive answer — that is what incomplete_reason says.
-            j.field "has_more", offset + page.size < djob.results.size
+            j.field "has_more", pg.offset + page.size < djob.results.size
             j.field "incomplete_reason", incomplete_reason(djob.status)
             j.field "queued", djob.queued
             j.field "results_truncated", djob.truncated?
+            j.field "unsaved_flows", djob.unsaved
           end
         end)
       end
 
-      private def discover_finding_json(j : JSON::Builder, f : Discover::Finding) : Nil
-        j.object do
-          j.field "url", Serialize.text(f.url)
-          j.field "method", Serialize.text(f.method)
-          j.field "status", f.status
-          j.field "length", f.length
-          j.field "content_type", Serialize.text(f.content_type)
-          j.field "source", f.source.label
-          j.field "depth", f.depth
-          j.field "confidence", f.confidence.round(2)
-        end
-      end
-
-      @[Tool("discover_stop", gated: true, agent_action: true)]
+      @[Tool("discover_stop", gated: true, agent_action: true, permission: "send")]
       private def discover_stop(h) : Result
-        djob = lookup_discover_job(h)
+        djob = lookup_job(h, @discover_jobs, "discover", "stop")
         return djob if djob.is_a?(Result)
-        djob.stop
         stop_and_report(djob)
-      end
-
-      private def lookup_discover_job(h) : DiscoverJob | Result
-        id = str(h, "job_id")
-        return Result.new("missing required 'job_id'", is_error: true) if id.nil? || id.empty?
-        job = @discover_jobs[id]?
-        return not_found("no discover job #{id}") unless job
-        job_project_mismatch(job) || job
       end
 
       # The tools/list schemas for the Discover tools, kept beside the handlers that
@@ -394,9 +417,9 @@ module Gori
           s.field "spider", boolprop("follow links (default true)")
           s.field "bruteforce", boolprop("brute-force directory/path names (default true)")
           s.field "max_depth", intprop("spider depth from the seed (default 4, max #{DISCOVER_MAX_DEPTH})")
-          s.field "wordlist", strprop("path to an extra path wordlist (merged with the built-in list)")
+          s.field "wordlist", strprop("path to an extra path wordlist, or the name of a saved list (list_wordlists); merged with the built-in list")
           s.field "extensions", strprop("comma list of extensions to also probe (e.g. php,json,bak)")
-          s.field "headers", objprop("custom request-header name->value map added to every probe (e.g. Authorization/Cookie); overrides Accept/User-Agent, Host/Connection are ignored")
+          s.field "headers", header_map_prop("custom request headers added to every probe (e.g. Authorization/Cookie): a name->value map, or a [{\"name\",\"value\"}] list; overrides Accept/User-Agent, Host/Connection are ignored")
           s.field "containment", enumprop("how far off the seed the crawl may wander (default scope-aware)", DISCOVER_CONTAINMENTS)
           s.field "concurrency", intprop("parallel requests (default 20, max #{DISCOVER_MAX_CONCURRENCY})")
           s.field "rate", numprop("requests/sec cap, fractional allowed (0 = unlimited; 0.5 = one request every two seconds)")
@@ -407,14 +430,17 @@ module Gori
           s.field "http2", boolprop("send over HTTP/2 (TLS+ALPN h2, or h2c prior-knowledge on http://) instead of HTTP/1.1 (default false, mirrors CLI --http2)")
           s.field "throttle_ms", intprop("fixed delay between requests in ms — an alternative to 'rate' for a target that rate-limits on inter-request gap rather than throughput (mirrors CLI --throttle)")
           s.field "max_requests", intprop("caller cap on total requests")
-          s.field "keep_alive", boolprop("reuse one HTTP/1.1 connection per origin across many probes (default true) — one TCP/TLS handshake per worker instead of per probe, which is the largest cost of a brute-force pass. Set false to dial a fresh connection per probe, which is what you want when the target behaves per-connection (connection-scoped rate limits, a load balancer pinning by connection).")
+          s.field "keep_alive", boolprop("reuse one connection per origin across many probes (default true) — one TCP/TLS handshake per worker instead of per probe, which is the largest cost of a brute-force pass. Set false to dial a fresh connection per probe, which is what you want when the target behaves per-connection (connection-scoped rate limits, a load balancer pinning by connection).")
+          s.field "crawl_assets", boolprop("fetch the images, fonts, media and archives a page links (default false). Off, those URLs are not requested at all: their bodies carry no endpoint any extractor can read, they cost a full download each, and they spend the same page budget as HTML. Their DIRECTORY is still brute-forced, so /uploads/ is still swept because /uploads/photo.jpg was linked — only the picture's own row is missing. Turn on to inventory a target's static surface; discover_status.assets_skipped says how many rows that adds.")
           s.field "allow_unscoped", boolprop("run even when the target host is outside the project's configured scope — REQUIRED for an out-of-scope target, or when no scope is configured")
         end
 
         tool j, "discover_status", "Counts + state of a discover job (running|done|budget_exhausted|stopped|error), " \
                                    "including the FP/FN figures (calibrated_out / *_suppressed). " \
                                    "budget_exhausted means max_requests halted the run with tasks still queued — a " \
-                                   "partial sweep, NOT an exhaustive one; see incomplete_reason and queued." do |s|
+                                   "partial sweep, NOT an exhaustive one; see incomplete_reason and queued. " \
+                                   "unsaved_flows counts findings whose History/Sitemap rows could not be written " \
+                                   "(project busy); those findings are listed but cannot be opened with get_flow." do |s|
           s.field "job_id", strprop("id from discover_start"), required: true
         end
 
@@ -423,7 +449,7 @@ module Gori
           "has_more is about THIS page; incomplete_reason says whether the RUN covered everything it queued." do |s|
           s.field "job_id", strprop("id from discover_start"), required: true
           s.field "offset", intprop("start row (default 0)")
-          s.field "limit", intprop("max rows (default 100, max 1000)")
+          s.field "limit", limitprop("max rows", DISCOVER_RESULTS_LIMIT)
         end
 
         tool j, "discover_stop", "Stop a running discover job (in-flight requests finish)." do |s|

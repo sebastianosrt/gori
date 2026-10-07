@@ -25,6 +25,29 @@ describe Gori::Discover::Extract do
     html_hrefs(body).should contain("/next-page")
   end
 
+  # #1182: attribute order is not significant, and a browser follows a quoted relative URL. The
+  # old single regex required `http-equiv` first and stopped its URL class at either quote.
+  it "extracts a meta refresh whatever the attribute order, and a quoted relative url (#1182)" do
+    html_hrefs(%(<meta content="0;url=/meta-order" http-equiv="refresh">).to_slice).should eq(["/meta-order"])
+    html_hrefs(%(<meta http-equiv="refresh" content="0; url='meta-quoted'">).to_slice).should eq(["meta-quoted"])
+    html_hrefs(%(<META Content='5; URL="a b"' HTTP-EQUIV=Refresh>).to_slice).should eq(["a b"])
+    html_hrefs(%(<meta content="0; url=/x?a=1&amp;b=2" http-equiv="&#x72;efresh">).to_slice).should eq(["/x?a=1&b=2"])
+  end
+
+  it "reads a meta refresh only from a refresh tag's own attributes (#1182)" do
+    html_hrefs(%(<meta name="x" content="0;url=/not-refresh">).to_slice).should be_empty
+    html_hrefs(%(<meta http-equiv="refresh" data-x='content="0;url=/inner"'>).to_slice).should be_empty
+    html_hrefs(%(<meta http-equiv="refresh" content="5">).to_slice).should be_empty
+    # the FIRST of a repeated attribute is the one HTML keeps
+    html_hrefs(%(<meta http-equiv="refresh" content="0;url=/first" content="0;url=/second">).to_slice)
+      .should eq(["/first"])
+  end
+
+  it "reads a hostile meta tag with a long name and an unclosed quote in bounded time" do
+    evil = ("<meta http-equiv=refresh " + ("n" * 200_000) + "=\"" + ("v" * 200_000)).to_slice
+    html_hrefs(evil).should be_empty
+  end
+
   it "extracts robots Disallow / Allow paths (skipping a bare slash)" do
     body = "User-agent: *\nDisallow: /admin\nAllow: /public\nDisallow: /\n# comment\n".to_slice
     links = E.from_robots(body)
@@ -552,5 +575,76 @@ describe Gori::Discover::Extract do
       E.from_text(%(see http://h/p?a=1&amp b).to_slice).should eq(["http://h/p?a=1&amp"])
       E.from_robots("Disallow: /x?a=1&amp;b=2\n".to_slice).should eq(["/x?a=1&amp;b=2"])
     end
+  end
+  # `Engine#extract_links` asks for both on every html-like body; the combined entry point
+  # exists so the body's text is scanned into a String once instead of once per question.
+  # What it must not do is answer either question differently.
+  describe "from_html_with_base" do
+    it "agrees with the two calls it replaces" do
+      body = %(<html><head><base href="/app/"><a href="x">1</a></head><body>) \
+             %(<script>fetch("/api/v1/cart")</script><a href="/b">2</a></body></html>).to_slice
+      found, base = E.from_html_with_base(body)
+      found.should eq(E.from_html(body))
+      base.should eq(E.base_href(body))
+      base.should eq("/app/")
+      found.map(&.href).should contain("/api/v1/cart")
+    end
+
+    it "answers a nil base for a document that declares none" do
+      body = %(<a href="/a">x</a>).to_slice
+      found, base = E.from_html_with_base(body)
+      base.should be_nil
+      found.map(&.href).should eq(["/a"])
+    end
+  end
+
+  # Links a response declares in its HEAD. Pure String helpers — `Engine#header_links` walks
+  # the HeaderList and calls these — so the cases are about the field grammars.
+  describe "header link sources" do
+    it "takes every bracketed target out of an RFC 8288 Link field" do
+      v = %(</page/2>; rel="next", <https://api.h/v2/schema>; rel=describedby; type="application/json")
+      E.from_link_header(v).should eq(["/page/2", "https://api.h/v2/schema"])
+    end
+
+    # The parameters are metadata: `rel`'s value is a relation type, and a `title` may name
+    # anything at all. Only what is in angle brackets is a URL.
+    it "ignores the parameters beside the target" do
+      E.from_link_header(%(</a>; rel="/not-a-link"; title="/nor-this")).should eq(["/a"])
+      E.from_link_header("rel=next").should be_empty
+      E.from_link_header("<>").should be_empty
+    end
+
+    it "reads the url out of a Refresh field, quoted or not" do
+      E.refresh_url("5; url=/next").should eq("/next")
+      E.refresh_url(%(0;URL='/other')).should eq("/other")
+      E.refresh_url("0; url=/a; junk").should eq("/a")
+      E.refresh_url("5").should be_nil
+    end
+
+    # A cookie scoped to a subtree is the application saying where it is mounted. `Path=/` is
+    # the default and says nothing, so it is not a candidate.
+    it "takes a narrowing Set-Cookie path and refuses the default one" do
+      E.cookie_path("sid=x; Path=/admin; HttpOnly").should eq("/admin")
+      E.cookie_path("sid=x; path=/app/v2").should eq("/app/v2")
+      E.cookie_path("sid=x; Path=/").should be_nil
+      E.cookie_path("sid=x; HttpOnly").should be_nil
+      # RFC 6265 5.2.4: a value not starting with '/' is the default path.
+      E.cookie_path("sid=x; Path=admin").should be_nil
+    end
+
+    # RFC 6265 5.2.4 takes the LAST Path attribute of the field.
+    it "takes the last Path when a field repeats it" do
+      E.cookie_path("sid=x; Path=/a; Path=/b").should eq("/b")
+    end
+  end
+end
+
+# A header value reaches PCRE, which raises on invalid UTF-8; the raise used to cost the page.
+describe "Gori::Discover::Extract header readers on invalid UTF-8" do
+  it "reads a Latin-1 Link, Refresh or Set-Cookie value without raising" do
+    latin = ->(s : String) { String.new(s.to_slice.map { |b| b == '~'.ord ? 0xe9_u8 : b }) }
+    Gori::Discover::Extract.cookie_path(latin.call("sid=~t~; Path=/app")).should eq("/app")
+    Gori::Discover::Extract.refresh_url(latin.call("0; url=/n~xt")).should_not be_nil
+    Gori::Discover::Extract.from_link_header(latin.call("</a~>; rel=next")).size.should eq(1)
   end
 end

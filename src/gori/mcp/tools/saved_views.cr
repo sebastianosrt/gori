@@ -39,7 +39,7 @@ module Gori
                     # Which view the TUI is showing this project through. It does NOT apply to
                     # `list_history`, which filters only by the `view` it is passed — a stored
                     # UI preference must never silently drop rows from a headless answer, the
-                    # same line `--in-scope` draws against the persisted ⇧S lens. Reported so an
+                    # same line `--in-scope` draws against the persisted `s` lens. Reported so an
                     # agent can offer the operator's own scoping, not so it is assumed.
                     j.field "active", active ? active.key == v.key : v.key == SavedViews.all_view.key
                     j.field "editable", !v.builtin?
@@ -62,7 +62,7 @@ module Gori
         when "builtin"
           err("built-in views cannot be edited", "INVALID_ARGUMENT", field: "scope")
         else
-          # Refused rather than clamped, for the reason `color_rule_scope` states: reading
+          # Refused rather than clamped, for the reason `label_arg` states: reading
           # "globl" as "project" would report success for an edit meant for every project.
           err("invalid scope (project | global)", "INVALID_ARGUMENT", field: "scope")
         end
@@ -102,12 +102,10 @@ module Gori
         not_found("no view named #{name.inspect}")
       end
 
-      @[Tool("create_view", gated: true, agent_action: true)]
+      @[Tool("create_view", gated: true, agent_action: true, permission: "write")]
       private def create_view(h) : Result
-        name = str(h, "name")
-        return err("missing required 'name'", "INVALID_ARGUMENT", field: "name") if name.nil?
-        query = str(h, "query")
-        return err("missing required 'query'", "INVALID_ARGUMENT", field: "query") if query.nil?
+        name = required_str(h, "name", blank: true)
+        query = required_str(h, "query", blank: true)
         scope = view_write_scope(h)
         return scope if scope.is_a?(Result)
         # The engine owns what is legal, so the TUI, the CLI and this surface cannot disagree.
@@ -125,10 +123,9 @@ module Gori
 
       # Rename, re-query, or both. Omitted fields are left unchanged, the same contract
       # `update_color_rule` has.
-      @[Tool("update_view", gated: true, agent_action: true)]
+      @[Tool("update_view", gated: true, agent_action: true, permission: "write")]
       private def update_view(h) : Result
-        name = str(h, "name")
-        return err("missing required 'name'", "INVALID_ARGUMENT", field: "name") if name.nil?
+        name = required_str(h, "name", blank: true)
         scope = view_write_scope(h)
         return scope if scope.is_a?(Result)
         found = find_view(name, scope)
@@ -152,24 +149,32 @@ module Gori
         view_result(SavedViews::View.new(found.id, new_name, new_query, scope), "updated")
       end
 
-      @[Tool("delete_view", gated: true, agent_action: true)]
+      @[Tool("delete_view", gated: true, agent_action: true, permission: "write")]
       private def delete_view(h) : Result
-        name = str(h, "name")
-        return err("missing required 'name'", "INVALID_ARGUMENT", field: "name") if name.nil?
+        name = required_str(h, "name", blank: true)
         scope = view_write_scope(h)
         return scope if scope.is_a?(Result)
         found = find_view(name, scope)
         return found if found.is_a?(Result)
-        unless SavedViews.remove(store, found)
-          return busy(scope == "global" ? "failed to delete global view (settings not writable)" : "failed to delete view (store busy or unwritable)")
+        # THIS project's pointer is kept off it (see `SavedViews.delete`). Only a GLOBAL view can
+        # be named from another project, and that pointer stays inert: global ids come from a
+        # monotonic counter and are never reused. A project view's id is a rowid and is not.
+        warning = nil.as(String?)
+        case SavedViews.delete(store, found)
+        in SavedViews::DeleteOutcome::NotDeleted
+          return busy("failed to reset the project's active view, so the view was NOT deleted (store busy or unwritable); retry")
+        in SavedViews::DeleteOutcome::RemoveRefused
+          what = scope == "global" ? "failed to delete global view (settings not writable)" : "failed to delete view (store busy or unwritable)"
+          return busy("#{what}; if it was the project's active view, that is All now")
+        in SavedViews::DeleteOutcome::PointerLeft
+          warning = VIEW_POINTER_LEFT
+        in SavedViews::DeleteOutcome::Deleted
         end
-        # THIS project's pointer is cleared; another project's stays inert, because ids come
-        # from monotonic counters and are never reused.
-        SavedViews.set_active(store, nil) if store.setting(SavedViews::ACTIVE_KEY) == found.key
         Result.new(JSON.build do |j|
           j.object do
             j.field "deleted", found.name
             j.field "scope", found.scope
+            j.field "warning", warning if warning
           end
         end)
       end
@@ -215,22 +220,28 @@ module Gori
         return busy("failed to move view to #{dest} — it was left where it was") unless moved
         # The move minted a new id in the destination store, so a `history_view` pointer naming
         # the old one is now dangling.
-        repoint_active_view(view, moved)
-        view_result(moved, "moved")
+        # The move itself committed, so a refused re-point is a warning on the success, never a
+        # retryable error: the same call would now find the view already moved.
+        warning = SavedViews.repoint_active_if(store, view, moved) ? nil : MOVE_POINTER_WARNING
+        view_result(moved, "moved", warning)
       end
 
-      private def repoint_active_view(from : SavedViews::View, to : SavedViews::View) : Nil
-        return unless store.setting(SavedViews::ACTIVE_KEY) == from.key
-        SavedViews.set_active(store, to)
-      end
+      private VIEW_POINTER_LEFT = "the view was deleted, but another gori made it the project's active view meanwhile " \
+                                  "and that pointer could not be reset (store busy or unwritable): it names the deleted " \
+                                  "id, which the next project view created can take and turn on"
 
-      private def view_result(view : SavedViews::View, action : String) : Result
+      private MOVE_POINTER_WARNING = "the view moved, but the project's active view was NOT re-pointed to it " \
+                                     "(store busy or unwritable) and still names its old id, which the next " \
+                                     "project view created can take and turn on"
+
+      private def view_result(view : SavedViews::View, action : String, warning : String? = nil) : Result
         Result.new(JSON.build do |j|
           j.object do
             j.field action, view.name
             j.field "name", view.name
             j.field "query", view.query
             j.field "scope", view.scope
+            j.field "warning", warning if warning
           end
         end)
       end

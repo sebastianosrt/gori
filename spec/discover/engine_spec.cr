@@ -51,6 +51,21 @@ private def make(status : Int32, body : String, ctype : String? = "text/html", l
   R.new(head, body.to_slice, resp, 1000_i64)
 end
 
+# `make` with EXTRA response header lines. The header-borne link sources (`Link`,
+# `Content-Location`, `Refresh`, `Set-Cookie`) are FIELDS, not body, so a spec has to be able
+# to frame them.
+private def make_h(status : Int32, body : String, headers : Array({String, String}),
+                   ctype : String? = "text/html") : R
+  head = String.build do |s|
+    s << "HTTP/1.1 " << status << " X\r\n"
+    s << "Content-Type: " << ctype << "\r\n" if ctype
+    headers.each { |(n, v)| s << n << ": " << v << "\r\n" }
+    s << "Content-Length: " << body.bytesize << "\r\n\r\n"
+  end.to_slice
+  resp = Gori::Proxy::Codec::Http1.parse_response_head(head)
+  R.new(head, body.to_slice, resp, 1000_i64)
+end
+
 private def html(body : String) : R
   make(200, body)
 end
@@ -283,6 +298,18 @@ describe Gori::Discover::Engine do
     kinds.last.should eq(:done)
   end
 
+  # A retry the request budget refuses sent nothing, so its answer is the failure it was
+  # retrying. Returning the cap marker read as "the budget ran out": a dead origin finished as
+  # a clean run, exit 0 and no error, where `--retries 0` reported the connect failure.
+  it "reports the failure a budget-refused retry was retrying" do
+    cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 1, concurrency: 1,
+      retries: 1, retry_pause: 1.millisecond, max_requests: 1_i64)
+    dead = RouteBackend.new(->(_t : String) { R.new(Bytes.new(0), nil, nil, 0_i64, "connect failed") })
+    kinds, messages = terminal_of(D::Engine.new("http://t/", [] of String, dead, cfg))
+    kinds.should contain(:error)
+    messages.join.should contain("connect failed")
+  end
+
   it "stops a /user/{n} link farm via template folding" do
     cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 5, max_pages: 1000,
       template_saturation: 20, concurrency: 2, retries: 0)
@@ -440,13 +467,16 @@ describe Gori::Discover::Engine do
   it "survives a backend that raises without hanging (worker rescue keeps @pending balanced)" do
     cfg = D::Config.new(spider: true, bruteforce: true, concurrency: 2, retries: 0, calibrate_probes: 1)
     engine = D::Engine.new("http://t/", ["admin"], RaisingBackend.new, cfg)
-    done = false
+    terminal = [] of Symbol
     findings = [] of D::Finding
     engine.run do |ev|
       findings << ev.finding if ev.is_a?(D::FindingEvent)
-      done = true if ev.is_a?(D::DoneEvent)
+      terminal << :done if ev.is_a?(D::DoneEvent)
+      terminal << :error if ev.is_a?(D::ErrorEvent)
     end
-    done.should be_true # terminated cleanly instead of blocking forever
+    # Terminated cleanly instead of blocking forever — and, since #1385, as the terminal
+    # ERROR a run in which no send ever succeeded is, naming the raise.
+    terminal.should eq([:error])
     findings.should be_empty
   end
 
@@ -748,11 +778,14 @@ describe Gori::Discover::Engine do
     end
   end
 
-  # The other half of `text_like?`: a crawl follows `<img src>` like any other link, so binary
-  # responses are the common case here. Scanning one costs `Extract.text` a full `String#scrub`
-  # (a second walk that rebuilds the whole body) to feed a regex no image can match.
+  # The other half of `text_like?`: with `crawl_assets` on, a crawl follows `<img src>` like any
+  # other link, so binary responses are the common case here. Scanning one costs `Extract.text`
+  # a full `String#scrub` (a second walk that rebuilds the whole body) to feed a regex no image
+  # can match. (`crawl_assets` OFF is the default and skips the fetch entirely — its own cases
+  # are below; this one has to turn it on to reach the body at all.)
   it "does not scan a binary response body for endpoints" do
-    cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 3, concurrency: 2, retries: 0)
+    cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 3, concurrency: 2, retries: 0,
+      crawl_assets: true)
     findings, _ = run_discover("http://t/", [] of String, cfg) do |t|
       case t
       when "/"           then html(%(<img src="/logo.png">))
@@ -1018,6 +1051,18 @@ describe Gori::Discover::Engine do
       kinds.should eq([:error]) # terminal, so a consumer cannot settle a "0 found" success over it
       messages.first.should contain("not bound yet")
       engine.first_error.should_not be_nil
+    end
+
+    # #1385: a SPIDERING run against a dead port. Every crawl task completes — as a refused
+    # connect — so the page counter the predicate used to require at zero was not, and the run
+    # ended Done ("0 found · 656 sent · 325 errors", exit 0).
+    it "ends in a terminal ErrorEvent when a spidering run reached nothing" do
+      cfg = D::Config.new(spider: true, bruteforce: true, calibrate_probes: 1, concurrency: 2, retries: 0)
+      dead = R.new(Bytes.new(0), nil, nil, 0_i64, "connect failed: t:80 — host unreachable (DNS/refused/timeout)")
+      engine = D::Engine.new("http://t/", ["admin", "login"], RouteBackend.new(->(_t : String) { dead }), cfg)
+      kinds, messages = terminal_of(engine)
+      kinds.should eq([:error])
+      messages.first.should contain("connect failed")
     end
 
     # …but a run that DID get an answer keeps its results, however many later sends were
@@ -1432,5 +1477,258 @@ describe Gori::Discover::Engine do
 
     # One probe was in flight when stop was requested; the remaining seven must not go out.
     bogus.should eq(1)
+  end
+  # ── what a brute-force HIT's body says ─────────────────────────────────────────────────
+  #
+  # Only Crawl/Fetch outcomes used to carry links, so a wordlist hit was a dead end: the sweep
+  # could find `swagger.json`, report it, and learn nothing from the one document on the
+  # target that enumerates every route it serves.
+  describe "links a brute-force hit names" do
+    it "follows the endpoints a discovered API document lists" do
+      cfg = D::Config.new(spider: true, bruteforce: true, max_depth: 3, concurrency: 2,
+        retries: 0, calibrate_probes: 2)
+      sent = [] of String
+      findings, _ = run_discover("http://t/", %w[swagger.json], cfg) do |t|
+        sent << t
+        case t
+        when "/"               then html("<h1>hi</h1>")
+        when "/swagger.json"   then make(200, %({"paths":{"/api/v2/orders":{},"/api/v2/refunds":{}}}), "application/json")
+        when "/api/v2/orders"  then make(200, "[]", "application/json")
+        when "/api/v2/refunds" then make(200, "[]", "application/json")
+        else                        notfound
+        end
+      end
+      sent.should contain("/api/v2/orders")
+      sent.should contain("/api/v2/refunds")
+      findings.map(&.url).should contain("http://t/api/v2/orders")
+    end
+
+    # An autoindex is the other high-yield hit: the directory's real contents, declared, which
+    # no wordlist would have guessed.
+    it "follows the entries an autoindex page lists" do
+      cfg = D::Config.new(spider: true, bruteforce: true, max_depth: 3, concurrency: 2,
+        retries: 0, calibrate_probes: 2)
+      sent = [] of String
+      run_discover("http://t/", %w[backup], cfg) do |t|
+        sent << t
+        case t
+        when "/"       then html("<h1>hi</h1>")
+        when "/backup" then html(%(<a href="/backup/2026-09-01.sql">dump</a>))
+        else                notfound
+        end
+      end
+      sent.should contain("/backup/2026-09-01.sql")
+    end
+
+    # The saving that makes reading a probe body affordable: the ~315 per directory that MISS
+    # are never scanned at all, so a soft-404 page quoting a path costs nothing.
+    it "does not read the body of a probe that missed its baseline" do
+      cfg = D::Config.new(spider: false, bruteforce: true, concurrency: 1, retries: 0,
+        calibrate_probes: 2)
+      sent = [] of String
+      run_discover("http://t/", %w[admin], cfg) do |t|
+        sent << t
+        # Every unknown path — the bogus calibration probes AND `/admin` — gets the SAME soft
+        # 404, so `/admin` is a miss. The page quotes an endpoint; nothing may follow it.
+        make(404, %(<a href="/api/hidden">not found</a>))
+      end
+      sent.should_not contain("/api/hidden")
+    end
+  end
+
+  # ── links a response declares in its HEADERS ───────────────────────────────────────────
+  describe "header-borne link sources" do
+    it "follows an RFC 8288 Link target" do
+      cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 3, concurrency: 2, retries: 0)
+      sent = [] of String
+      findings, _ = run_discover("http://t/", [] of String, cfg) do |t|
+        sent << t
+        case t
+        when "/"       then make_h(200, "no links in this body", [{"Link", %(</page/2>; rel="next")}])
+        when "/page/2" then html("page two")
+        else                notfound
+        end
+      end
+      sent.should contain("/page/2")
+      findings.map(&.url).should contain("http://t/page/2")
+    end
+
+    it "follows Content-Location and the Refresh header" do
+      cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 3, concurrency: 2, retries: 0)
+      sent = [] of String
+      run_discover("http://t/", [] of String, cfg) do |t|
+        sent << t
+        case t
+        when "/" then make_h(200, "body", [{"Content-Location", "/canonical"}, {"Refresh", "5; url=/lobby"}])
+        else          html("ok")
+        end
+      end
+      sent.should contain("/canonical")
+      sent.should contain("/lobby")
+    end
+
+    # A cookie scoped to a subtree is the application saying where it is mounted — a real
+    # source of an UNLINKED directory, which is the whole point of this engine.
+    it "crawls a subtree a Set-Cookie scopes itself to" do
+      cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 3, concurrency: 2, retries: 0)
+      sent = [] of String
+      run_discover("http://t/", [] of String, cfg) do |t|
+        sent << t
+        case t
+        when "/"      then make_h(200, "body", [{"Set-Cookie", "sid=abc; Path=/admin; HttpOnly"}])
+        when "/admin" then html("the admin app")
+        else               notfound
+        end
+      end
+      sent.should contain("/admin")
+    end
+
+    # …but it is a HINT, not a link: nothing said a document lives there, so it enters as
+    # INFERRED and has to answer for itself before it earns a ~315-request sweep of its
+    # directory. Same rule a script literal goes through.
+    it "does not sweep a cookie-scoped subtree that answers nothing" do
+      cfg = D::Config.new(spider: true, bruteforce: true, max_depth: 3, concurrency: 2,
+        retries: 0, calibrate_probes: 2)
+      sent = [] of String
+      run_discover("http://t/", %w[secret], cfg) do |t|
+        sent << t
+        case t
+        when "/" then make_h(200, "body", [{"Set-Cookie", "sid=abc; Path=/ghost"}])
+        else          notfound
+        end
+      end
+      sent.should contain("/ghost")
+      sent.should_not contain("/ghost/secret")
+    end
+  end
+
+  # 405 is a crawler's blind spot by construction: a form target, a JSON API that only takes
+  # POST and a WebDAV collection are each reached by GET exactly once, answer 405, and used to
+  # be dropped on the floor — while being the endpoints most worth testing.
+  it "records a 405 as proof the path exists" do
+    cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 3, concurrency: 2, retries: 0)
+    findings, _ = run_discover("http://t/", [] of String, cfg) do |t|
+      case t
+      when "/"           then html(%(<form action="/api/orders" method="post"></form>))
+      when "/api/orders" then make(405, "method not allowed", "application/json")
+      else                    notfound
+      end
+    end
+    f = findings.find { |x| x.url == "http://t/api/orders" }
+    f.should_not be_nil
+    f.not_nil!.status.should eq(405)
+  end
+
+  # ── binary assets ──────────────────────────────────────────────────────────────────────
+  #
+  # A page names dozens of them; each costs a real request and a full body download for bytes
+  # `text_like?` then refuses to scan, and each used to spend a `max_pages` slot too.
+  describe "linked binary assets" do
+    it "does not request them, and says how many it skipped" do
+      cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 3, concurrency: 2, retries: 0)
+      sent = [] of String
+      findings, stats = run_discover("http://t/", [] of String, cfg) do |t|
+        sent << t
+        case t
+        when "/" then html(%(<img src="/img/a.jpg"><img src="/img/b.png">) \
+                           %(<link href="/css/app.css"><a href="/about">a</a>))
+        else html("ok")
+        end
+      end
+      sent.should_not contain("/img/a.jpg")
+      sent.should_not contain("/img/b.png")
+      stats.assets_skipped.should eq(2)
+      # Everything whose body can be read is still fetched — the predicate is narrow on purpose.
+      sent.should contain("/css/app.css")
+      sent.should contain("/about")
+      findings.map(&.url).should_not contain("http://t/img/a.jpg")
+    end
+
+    it "requests them when the operator asks for them" do
+      cfg = D::Config.new(spider: true, bruteforce: false, max_depth: 3, concurrency: 2, retries: 0,
+        crawl_assets: true)
+      sent = [] of String
+      _, stats = run_discover("http://t/", [] of String, cfg) do |t|
+        sent << t
+        t == "/" ? html(%(<img src="/img/a.jpg">)) : make(200, "\u{89}PNG", "image/png")
+      end
+      sent.should contain("/img/a.jpg")
+      stats.assets_skipped.should eq(0)
+    end
+
+    # What must NOT be lost: the asset's directory. `/uploads/` is swept because
+    # `/uploads/photo.jpg` was linked, exactly as it was before the skip existed.
+    it "still sweeps the directory an unfetched asset lives in" do
+      cfg = D::Config.new(spider: true, bruteforce: true, max_depth: 3, concurrency: 2,
+        retries: 0, calibrate_probes: 2)
+      sent = [] of String
+      run_discover("http://t/", %w[secret], cfg) do |t|
+        sent << t
+        t == "/" ? html(%(<img src="/uploads/photo.jpg">)) : notfound
+      end
+      sent.should_not contain("/uploads/photo.jpg")
+      sent.should contain("/uploads/secret")
+    end
+  end
+
+  # WELL_KNOWN and `wordlists/paths.txt` overlap on purpose, and without `@seen` registration
+  # the origin's own directory sweep re-requested every overlapping document: a second GET,
+  # judged against a soft-404 baseline, for a body the run had already fetched and read.
+  it "does not re-probe a well-known document its own wordlist also names" do
+    cfg = D::Config.new(spider: true, bruteforce: true, max_depth: 2, concurrency: 2,
+      retries: 0, calibrate_probes: 2)
+    sent = [] of String
+    run_discover("http://t/", %w[robots.txt openapi.json admin], cfg) do |t|
+      sent << t
+      case t
+      when "/" then html("<h1>hi</h1>")
+      else          notfound
+      end
+    end
+    sent.count("/robots.txt").should eq(1)
+    sent.count("/openapi.json").should eq(1)
+    # The wordlist itself still runs — only the duplicate is gone.
+    sent.should contain("/admin")
+  end
+
+  # `admin.php` + `--extensions php` is `admin.php.php`, which no server routes: one wasted
+  # request per such word per directory, and a third of the built-in list is dotted names.
+  describe "extensions appended to an already-dotted word" do
+    it "skips the extension the word already carries" do
+      cfg = D::Config.new(spider: false, bruteforce: true, concurrency: 2, retries: 0,
+        calibrate_probes: 2, extensions: ["php"])
+      sent = [] of String
+      run_discover("http://t/", %w[admin.php], cfg) do |t|
+        sent << t
+        notfound
+      end
+      sent.should contain("/admin.php")
+      sent.should_not contain("/admin.php.php")
+    end
+
+    # …and only that one. `admin.php.bak` is the canonical editor/deploy backup and one of the
+    # highest-yield candidates there is, so a rule phrased as "no extensions on dotted words"
+    # would delete the reason extensions exist.
+    it "still appends a DIFFERENT extension to a dotted word" do
+      cfg = D::Config.new(spider: false, bruteforce: true, concurrency: 2, retries: 0,
+        calibrate_probes: 2, extensions: ["bak"])
+      sent = [] of String
+      run_discover("http://t/", %w[admin.php], cfg) do |t|
+        sent << t
+        notfound
+      end
+      sent.should contain("/admin.php.bak")
+    end
+
+    it "matches the word's extension case-insensitively" do
+      cfg = D::Config.new(spider: false, bruteforce: true, concurrency: 2, retries: 0,
+        calibrate_probes: 2, extensions: ["PHP"])
+      sent = [] of String
+      run_discover("http://t/", %w[Admin.Php], cfg) do |t|
+        sent << t
+        notfound
+      end
+      sent.should_not contain("/Admin.Php.PHP")
+    end
   end
 end

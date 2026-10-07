@@ -4,6 +4,7 @@ require "openssl/hmac"
 require "digest/sha1"
 require "digest/sha256"
 require "compress/zlib"
+require "./raw_json"
 require "./cookie/flask"
 require "./cookie/rack"
 require "./cookie/django"
@@ -62,12 +63,16 @@ module Gori
 
     # {format, payload, signature, …} JSON — the stable shape shared by `gori run cookie
     # --format json` and the MCP cookie_decode tool (the DecodedView lesson: one source).
+    #
+    # Scrubbed: a payload's bytes are the cookie's, lifted from captured traffic and chosen by
+    # whoever set it, and one that is not UTF-8 made the whole document invalid JSON. The
+    # structure is ASCII, so a bad byte can only sit inside a string literal.
     def decode_json(cookie : String, format : String? = nil) : String
       case resolve(cookie, format)
       when "flask" then Flask.decode_json(cookie)
       when "rack"  then Rack.decode_json(cookie)
       else              Django.decode_json(cookie)
-      end
+      end.scrub
     end
 
     # Does `secret` sign this cookie? False on a structural parse failure too (a malformed
@@ -116,15 +121,6 @@ module Gori
       raise CookieError.new("invalid base64 segment")
     end
 
-    # Constant-time byte compare — signatures are secrets-adjacent; don't leak position
-    # of the first mismatch through timing even though this is a local, offline check.
-    def secure_compare(a : String, b : String) : Bool
-      return false if a.bytesize != b.bytesize
-      diff = 0_u8
-      a.to_slice.each_with_index { |byte, i| diff |= byte ^ b.to_slice[i] }
-      diff == 0
-    end
-
     # itsdangerous timestamp codec: a big-endian, minimal-length integer, base64url'd.
     # `int_to_bytes(0)` is the empty string (matches Python), so a zero timestamp round-
     # trips to "".
@@ -139,17 +135,10 @@ module Gori
       b64url(Slice.new(bytes.to_unsafe, bytes.size))
     end
 
-    def b64_to_int(seg : String) : Int64
-      n = 0_i64
-      b64decode(seg).each { |byte| n = n << 8 | byte }
-      n
-    end
-
-    # Tolerant sibling of `b64_to_int` for the DECODE path (Crystal's raise-vs-`?`
-    # convention): nil when the segment isn't valid base64 OR decodes to more than 8 bytes
+    # The DECODE path's segment reader: nil when the segment isn't valid base64 OR decodes to more than 8 bytes
     # (no real itsdangerous unix second is that wide). A crafted Flask cookie chooses this
     # segment freely, so `Flask.decode_text`/`decode_json` must render "(invalid …)"/null
-    # rather than let `b64_to_int`'s raise refuse the whole cookie — hiding the perfectly
+    # rather than raise and refuse the whole cookie — hiding the perfectly
     # readable payload and signature. This is the exact contract `base62_decode` already
     # gives Django's timestamp (see spec: "decodes a cookie carrying an oversized/invalid
     # timestamp instead of crashing"); Flask had been left the odd sibling out.
@@ -195,6 +184,43 @@ module Gori
       raise CookieError.new("invalid zlib-compressed payload")
     end
 
+    # The JSON inside a Flask/Django payload segment, inflated first when a leading "."
+    # marks it zlib-compressed.
+    def payload_bytes(seg : String) : Bytes
+      compressed = seg.starts_with?('.')
+      raw = b64decode(compressed ? seg[1..] : seg)
+      compressed ? zlib_inflate(raw) : raw
+    end
+
+    # The session JSON, pretty-printed. "(undecodable payload)" when it doesn't
+    # base64url→JSON, mirroring jwt_decode.
+    def payload_pretty(seg : String) : String
+      RawJson.reformat(String.new(payload_bytes(seg)), "  ")
+    rescue
+      "(undecodable payload)"
+    end
+
+    def payload_json_or_null(seg : String) : String
+      RawJson.reformat(String.new(payload_bytes(seg)))
+    rescue
+      "null"
+    end
+
+    def compact_json(json : String) : String
+      RawJson.reformat(json) # numbers and duplicate keys as written (#1200, as #1169 for JWT)
+    rescue ex : JSON::ParseException
+      raise CookieError.new("invalid payload JSON: #{ex.message}")
+    end
+
+    # First of `secrets` whose signature (the block) matches `signature`, compared in
+    # constant time; nil when none does.
+    def first_signing(secrets, signature : String, & : String -> String) : String?
+      secrets.each do |s|
+        return s if Crypto::Subtle.constant_time_compare(yield(s), signature)
+      end
+      nil
+    end
+
     BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
     # django.core.signing timestamp codec: base62 of the plain unix second.
@@ -236,6 +262,25 @@ module Gori
       "#{Time.unix(unix).to_s("%Y-%m-%d %H:%M:%SZ")} (unix #{unix})"
     rescue
       "unix #{unix}"
+    end
+
+    # The Django HMAC algorithm read off a cookie's signature byte length — HMAC-SHA1 is
+    # 20 raw bytes, HMAC-SHA256 is 32, an unambiguous tell that needs no secret. nil when the
+    # cookie is not a parseable 3-part Django token or the signature is some other length, so a
+    # caller can fall back to its default. The three surfaces use this to spare the operator the
+    # "correct secret reads as ✗ bad key because the app is still on SHA-1" trap without a flag:
+    # the Cookie tab's algorithm badge, and `gori run cookie` / the MCP cookie_verify+cookie_crack
+    # tools when no algorithm is pinned. Django ≥3.1 defaults to SHA-256, so a 32-byte signature
+    # is the common case; a 20-byte one is the older app the default would otherwise mis-verify.
+    def detect_django_algo(cookie : String) : String?
+      parts = cookie.strip.split(':')
+      return nil unless parts.size == 3
+      case b64decode(parts[2]).size
+      when 20 then "sha1"
+      when 32 then "sha256"
+      end
+    rescue CookieError
+      nil
     end
 
     # --- internals ----------------------------------------------------------

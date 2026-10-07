@@ -4,6 +4,7 @@ require "../../authorize/engine"
 require "../../outbound"
 require "../../settings"
 require "../../authorize/passive"
+require "../../plural"
 
 module Gori::Tui
   # The Authorize tab: replay one or more captured requests under several identities and read
@@ -124,7 +125,10 @@ module Gori::Tui
         # seam, so an edit that cleared them re-pointed the operator's `$SESSION` at the global
         # table while the card went on showing the identity they meant. `gori run session edit`
         # and MCP `update_session_slot` both keep them; this was the one surface that did not.
+        # The refresh STEPS are the same kind of thing (#1233): the form shows them and edits
+        # only their policy, so the list's steps stand.
         list[i] = identity.with_baseline(list[i].baseline?).with_rules(list[i].rules)
+          .copy_with(refresh: list[i].refresh)
       else
         list << identity.with_baseline(false)
       end
@@ -148,7 +152,8 @@ module Gori::Tui
       # deleted by this whole-list save, with no error and no row that ever showed it existed.
       # Same refresh and the same reason as MCP's `fresh_slots`.
       @host.session.slots.reload
-      merged = merge_peer_slots(list, @host.session.slots.slots)
+      fresh = @host.session.slots.slots
+      merged = carry_refresh_steps(merge_peer_slots(list, fresh), fresh)
       # Through the live registry, not `set_setting`: `SessionSlots#save` persists the same row
       # AND updates the object every send seam consults, dropping the active pointer when the
       # slot it named is gone. Writing the row by hand left the two out of step — the tab
@@ -173,6 +178,18 @@ module Gori::Tui
     #   in `fresh`, in neither base nor `list` -> a peer ADDED it: carry it over
     #   in base and in `list`, not in `fresh`  -> a peer DELETED it: drop it
     #   in base, not in `list`                 -> the OPERATOR deleted it: stays deleted
+    # The PERSISTED refresh steps onto every slot this card is about to save (#1233). The card
+    # never edits steps — they are appended from a Repeater sub-tab (`space → b`), `gori run
+    # session edit --refresh` or MCP, often while this card's cached list is older — so a
+    # whole-list save built from the cache would silently drop every step added since.
+    private def carry_refresh_steps(list : Array(Authorize::Identity),
+                                    fresh : Array(Authorize::Identity)) : Array(Authorize::Identity)
+      list.map do |s|
+        persisted = fresh.find(&.name.==(s.name))
+        persisted && persisted.refresh != s.refresh ? s.copy_with(refresh: persisted.refresh) : s
+      end
+    end
+
     private def merge_peer_slots(list : Array(Authorize::Identity),
                                  fresh : Array(Authorize::Identity)) : Array(Authorize::Identity)
       base = @identities_base
@@ -356,21 +373,10 @@ module Gori::Tui
     private def drain_seeds : Bool
       added = false
       DRAIN_CAP.times do
-        break unless detail = next_seed
+        break unless detail = poll(@seeds)
         added = true if accept_seed(detail)
       end
       added
-    end
-
-    # One queued flow if the watcher found any, else nil — a non-blocking channel poll, the
-    # twin of `next_outcome`.
-    private def next_seed : Store::FlowDetail?
-      select
-      when d = @seeds.receive
-        d
-      else
-        nil
-      end
     end
 
     # Decide one flow the watcher handed over, COUNTING the outcome either way. Every refusal
@@ -497,7 +503,7 @@ module Gori::Tui
     #
     # Requests go out one at a time and each finished one streams back its own Target, so the
     # table fills as the run proceeds. The scope gate (Outbound) is the one Probe active uses.
-    def run(mode : Symbol = :pending) : Nil
+    def run(mode : Symbol) : Nil
       return @host.status("send requests here first (Send to Authorize from History)") unless @view.any_requests?
       return @host.status("a run is already in flight") if running?
       batch = select_batch(mode)
@@ -530,7 +536,7 @@ module Gori::Tui
       @view.mark_running(@batch_ids)
       gen = (@gen += 1)
       @active_gen = gen
-      noun = "#{batch.size} request#{batch.size == 1 ? "" : "s"}"
+      noun = Gori.plural(batch.size, "request")
       @job_id = @host.jobs.start(:authorize, noun, Jobs::Goto.new(:authorize))
       @host.status("authorize: replaying #{noun} under #{idents.size} identities…")
       # Snapshot the details now — the background fiber must not touch the view.
@@ -672,7 +678,7 @@ module Gori::Tui
     # words every other surface prints for it.
     private def skip_phrase(count : Int32, reason : Symbol?) : String
       label = reason ? " (#{Authorize::Passive.reason_label(reason)})" : ""
-      "#{count} request#{count == 1 ? "" : "s"} skipped#{label}"
+      "#{Gori.plural(count, "request")} skipped#{label}"
     end
 
     # Ask the run to stop. Cooperative: the flag is polled between requests AND between
@@ -724,7 +730,7 @@ module Gori::Tui
       n = @view.size
       return @host.status("authorize: nothing to clear") if n <= 0
       @host.confirm("CLEAR AUTHORIZE",
-        "Empty the queue of #{n} request#{n == 1 ? "" : "s"}?\n\n" \
+        "Empty the queue of #{Gori.plural(n, "request")}?\n\n" \
         "Every identity's result goes with them.\n" \
         "This can't be undone.",
         confirm_label: "clear", danger: true) { clear_now }
@@ -753,7 +759,7 @@ module Gori::Tui
     def drain_events : Bool
       drained = drain_seeds
       DRAIN_CAP.times do
-        break unless o = next_outcome
+        break unless o = poll(@events)
         apply_outcome(o)
         drained = true
       end
@@ -764,16 +770,6 @@ module Gori::Tui
       # stretch an operator is asking "is this doing anything?".
       @view.passive_note = passive_readout if @passive
       drained
-    end
-
-    # One finished request if any is queued, else nil — a non-blocking channel poll.
-    private def next_outcome : Outcome?
-      select
-      when o = @events.receive
-        o
-      else
-        nil
-      end
     end
 
     private def apply_outcome(o : Outcome) : Nil
@@ -868,7 +864,7 @@ module Gori::Tui
         why = @view.unanswered_reason_in(@batch_ids)
         parts << "#{unanswered} whose every send failed#{why ? " (#{why})" : ""}"
       end
-      "authorize: nothing was compared — #{done} request#{done == 1 ? "" : "s"} · " \
+      "authorize: nothing was compared — #{Gori.plural(done, "request")} · " \
       "#{parts.join(" · ")} · this is not a result"
     end
 
@@ -879,6 +875,11 @@ module Gori::Tui
       BodyChrome.framed(screen, rect, focused) do |inner|
         @view.render(screen, inner, focused)
       end
+    end
+
+    # The requests `/` filter bar.
+    def body_takes_text? : Bool
+      querying?
     end
 
     def handle_body_key(ev : Termisu::Event::Key) : Bool
@@ -937,7 +938,7 @@ module Gori::Tui
 
     # --- the request-list `/` filter (a text sub-mode the shell claims ahead of the focus ring) ---
     def querying? : Bool
-      @view.filter_editing?
+      @view.filter.editing?
     end
 
     def handle_query_key(ev : Termisu::Event::Key) : Bool
@@ -945,7 +946,7 @@ module Gori::Tui
     end
 
     def set_preedit(text : String) : Bool
-      @view.set_filter_preedit(text)
+      @view.filter.set_preedit(text)
     end
 
     def body_badge : Symbol
@@ -955,7 +956,7 @@ module Gori::Tui
     # `/` — narrow the queue by method / host / path / verdict. Refused with nothing queued.
     def authorize_filter : Nil
       return @host.status("nothing to filter — Send to Authorize from History to begin") unless @view.any_requests?
-      @view.filter_start
+      @view.filter.start
     end
 
     # `y`: the selected request as `METHOD host/path`.
@@ -983,18 +984,22 @@ module Gori::Tui
       true
     end
 
+    # Every branch ends in `esc tabs` (the empty one names it BEFORE its sentence, which is
+    # prose and would bury it). `pane_advance`'s comment above already states that escape is
+    # the way out to the tab bar; until now this line — the only place the operator would
+    # read it — was the one that did not.
     def body_hint(focus : Symbol) : String
       passive = @passive ? " · PASSIVE on" : ""
       unless @view.any_requests?
-        return keys("{authorize.identities} identities · {authorize.passive} passive · Send to Authorize from History to begin#{passive}")
+        return keys("{authorize.identities} identities · {authorize.passive} passive · esc tabs · Send to Authorize from History to begin#{passive}")
       end
-      return @view.filter_hint if querying?
-      return keys("↑/↓ request · ⇥ identity · {authorize.stop} stop#{passive} · space cmds") if running?
+      return @view.filter.hint if querying?
+      return keys("↑/↓ request · ⇥ identity · {authorize.stop} stop#{passive} · space cmds · esc tabs") if running?
       # `⇧X clear` is named here and NOT in the running branch above: that one is deliberately
       # the two keys a run leaves meaningful, and "empty the queue" is not the thing to put in
       # front of an operator watching one go out. Resolved through the keymap so a rebind
       # reaches the hint; the rest of this line is still literal, as its siblings are.
-      keys("↑/↓ request · ⇥ identity · {authorize.run} run · {authorize.run-all} all · {authorize.identities} identities · {authorize.passive} passive#{passive} · {authorize.filter} filter · {authorize.copy} copy · {authorize.clear} clear · space cmds")
+      keys("↑/↓ request · ⇥ identity · {authorize.run} run · {authorize.run-all} all · {authorize.identities} identities · {authorize.passive} passive#{passive} · {authorize.filter} filter · {authorize.copy} copy · {authorize.clear} clear · space cmds · esc tabs")
     end
   end
 end

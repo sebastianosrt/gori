@@ -1,5 +1,6 @@
 require "../spec_helper"
 require "../support/mcp_harness"
+require "../support/jose_keys"
 
 describe Gori::MCP::Server do
   describe "ql_reference" do
@@ -29,8 +30,56 @@ describe Gori::MCP::Server do
         mcp_seed_flow(store, "ex.test", "GET", "/", 200)
         mcp_seed_flow(store, "other.test", "GET", "/", 200)
         call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_history","arguments":{"query":"host:ex.test status:>=foo"}}})
-        rows = mcp_tool_payload(mcp_drive(store, call)[0])["flows"].as_a
-        rows.size.should eq(1) # host:ex.test applied, bad status term dropped
+        payload = mcp_tool_payload(mcp_drive(store, call)[0])
+        payload["flows"].as_a.size.should eq(1) # host:ex.test applied, bad status term dropped
+        # …and SAYS it dropped it: the result is broader than asked, and the caller of this
+        # transport has no stderr for the warning `gori run history` prints.
+        payload["ignored_terms"].as_a.map(&.as_s).should eq(["status:>=foo"])
+        payload["ignored_terms_note"].as_s.should contain("BROADER")
+      end
+    end
+
+    # Every read tool that runs its query through `ql_filter_or_error` names what it dropped —
+    # the tester's `status:abc method:POST` returned every POST from list_history, list_sitemap
+    # and probe_scan with nothing on the reply to say `status:abc` had gone.
+    it "names the dropped terms on every lenient query tool, and says nothing on a clean query" do
+      with_store do |store|
+        mcp_seed_flow(store, "ex.test", "POST", "/a", 200)
+        tools = tools_for(store)
+        {
+          "list_history"      => {} of String => JSON::Any,
+          "list_sitemap"      => {} of String => JSON::Any,
+          "list_params"       => {} of String => JSON::Any,
+          "export_openapi"    => {} of String => JSON::Any,
+          "scan_js_endpoints" => {} of String => JSON::Any,
+          "probe_scan"        => {} of String => JSON::Any,
+        }.merge({
+          "list_sitemap collapse" => {"collapse_transport" => JSON::Any.new(true)},
+          "list_history ids"      => {"ids" => JSON.parse(%([#{store.recent_flows(1).first.id}]))},
+        }).each do |label, extra|
+          name = label.split(' ').first
+          run = ->(query : String) do
+            r = tools.call(name, JSON::Any.new(extra.merge({"query" => JSON::Any.new(query)})))
+            r.is_error.should be_false, "#{label}: #{r.text}"
+            JSON.parse(r.text)
+          end
+          dirty = run.call("status:abc method:POST")
+          dirty["ignored_terms"]?.try(&.as_a.map(&.as_s)).should eq(["status:abc"]), "#{label} did not name the dropped term"
+          clean = run.call("method:POST")
+          clean["ignored_terms"]?.should be_nil, "#{label} warned about a clean query"
+          clean["ignored_terms_note"]?.should be_nil
+        end
+      end
+    end
+
+    # An ACTIVE scan sends probes for every selected flow, so the widening is refused up front
+    # instead of named on a reply that comes after the traffic.
+    it "refuses an active probe_scan whose query drops a term" do
+      with_store do |store|
+        mcp_seed_flow(store, "ex.test", "POST", "/a", 200)
+        r = tools_for(store).call("probe_scan", JSON.parse(%({"active":true,"allow_unscoped":true,"query":"status:abc method:POST"})))
+        r.is_error.should be_true
+        r.text.should contain("status:abc")
       end
     end
 
@@ -221,6 +270,36 @@ describe Gori::MCP::Server do
       end
     end
 
+    it "jwt_decode and jwt_encode set keep a token whose claim is past Int64 (#1169)" do
+      h = Base64.urlsafe_encode(%({"alg":"HS256","typ":"JWT"}), padding: false)
+      p = Base64.urlsafe_encode(%({"sub":"admin","uid":18446744073709551615}), padding: false)
+      big = "#{h}.#{p}.sig"
+      with_store do |store|
+        # Read raw: the reply carries the digits as a JSON number, which Crystal's own
+        # `JSON.parse` (the harness) cannot hold either — that inability was the bug.
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_decode","arguments":{"token":"#{big}"}}})
+        output = IO::Memory.new
+        Gori::MCP::Server.new(store, allow_actions: false, verify_upstream: true, input: IO::Memory.new(call + "\n"), output: output).run
+        output.to_s.should contain(%(\\"payload\\":{\\"sub\\":\\"admin\\",\\"uid\\":18446744073709551615}))
+
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_encode","arguments":{"token":"#{big}","set":["role=x"],"secret":"k"}}})
+        token = mcp_tool_payload(mcp_drive(store, call)[0])["token"].as_s
+        String.new(Base64.decode(token.split('.')[1]))
+          .should eq(%({"sub":"admin","uid":18446744073709551615,"role":"x"}))
+      end
+    end
+
+    it "jwt_encode refuses to patch a token whose payload is not JSON instead of starting from {}" do
+      h = Base64.urlsafe_encode(%({"alg":"HS256"}), padding: false)
+      bad = "#{h}.#{Base64.urlsafe_encode("notjson", padding: false)}.sig"
+      with_store do |store|
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_encode","arguments":{"token":"#{bad}","set":["role=x"],"secret":"k"}}})
+        resp = mcp_drive(store, call)[0]
+        resp["result"]["isError"].as_bool.should be_true
+        resp["result"]["content"][0]["text"].as_s.should contain("refusing to re-sign")
+      end
+    end
+
     it "jwt_encode refuses payload and set together" do
       with_store do |store|
         call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_encode","arguments":{"payload":"{}","set":["role=admin"],"secret":"k"}}})
@@ -231,19 +310,139 @@ describe Gori::MCP::Server do
     it "jwt_attacks lists none/weak-secret/header-inject payloads" do
       with_store do |store|
         call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_attacks","arguments":{"token":"#{jwt}"}}})
-        cats = mcp_tool_payload(mcp_drive(store, call, allow_actions: false)[0]).as_a.map(&.["category"].as_s).uniq!
+        cats = mcp_tool_payload(mcp_drive(store, call, allow_actions: false)[0])["items"].as_a.map(&.["category"].as_s).uniq!
         cats.should contain("none")
         cats.should contain("weak-secret")
         cats.should contain("header-inject")
       end
     end
 
-    it "all three jwt tools are listed even in read-only mode" do
+    it "every jwt tool is listed even in read-only mode" do
       with_store do |store|
         names = mcp_drive(store, %({"jsonrpc":"2.0","id":1,"method":"tools/list"}), allow_actions: false)[0]["result"]["tools"].as_a.map(&.["name"].as_s)
         names.should contain("jwt_decode")
         names.should contain("jwt_encode")
         names.should contain("jwt_attacks")
+        names.should contain("jwt_verify")
+      end
+    end
+
+    it "jwt_encode signs with a PEM key for an asymmetric alg" do
+      with_store do |store|
+        pem = JoseKeys::EC256.gsub('\n', "\\n")
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_encode","arguments":{"token":"#{jwt}","alg":"ES256","key":"#{pem}"}}})
+        resp = mcp_drive(store, call)[0]
+        resp["result"]["isError"]?.try(&.as_bool).should_not be_true
+        token = mcp_tool_payload(resp)["token"].as_s
+        Gori::Jwt.verify(token, JoseKeys::EC256_PUB).verified.should be_true
+      end
+    end
+
+    it "jwt_encode refuses secret and key together rather than picking one" do
+      with_store do |store|
+        pem = JoseKeys::EC256.gsub('\n', "\\n")
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_encode","arguments":{"token":"#{jwt}","alg":"ES256","key":"#{pem}","secret":"k"}}})
+        mcp_drive(store, call)[0]["result"]["isError"].as_bool.should be_true
+      end
+    end
+
+    it "jwt_verify answers yes/no rather than erroring on a bad signature" do
+      with_store do |store|
+        ok = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_verify","arguments":{"token":"#{jwt}","secret":"secret"}}})
+        no = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"jwt_verify","arguments":{"token":"#{jwt}","secret":"nope"}}})
+        resps = mcp_drive(store, ok, no, allow_actions: false)
+        mcp_tool_payload(resps[0])["verified"].as_bool.should be_true
+        # A "no" is an ANSWER: the tool must not report it as an error, or an agent reads a
+        # failed verification as a broken call and retries instead of concluding.
+        resps[1]["result"]["isError"]?.try(&.as_bool).should_not be_true
+        mcp_tool_payload(resps[1])["verified"].as_bool.should be_false
+      end
+    end
+
+    it "jwt_verify says why a no is a no, with a code to branch on (#1370)" do
+      with_store do |store|
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_verify","arguments":{"token":"#{jwt}","secret":"nope"}}})
+        payload = mcp_tool_payload(mcp_drive(store, call, allow_actions: false)[0])
+        payload["verified"].as_bool.should be_false
+        payload["code"].as_s.should eq("signature_mismatch")
+        payload["reason"].as_s.should_not be_empty
+      end
+    end
+
+    it "jwt_verify refuses a call naming no key, but checks an explicit empty secret" do
+      with_store do |store|
+        empty_signed = Gori::Jwt.encode("{}", %({"sub":"1"}), "HS256", "")
+        none = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_verify","arguments":{"token":"#{empty_signed}"}}})
+        nulls = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"jwt_verify","arguments":{"token":"#{empty_signed}","secret":null,"key":""}}})
+        empty = %({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"jwt_verify","arguments":{"token":"#{empty_signed}","secret":""}}})
+        resps = mcp_drive(store, none, nulls, empty, allow_actions: false)
+        # Naming no key used to check the empty secret — and so VERIFY this token — silently.
+        resps[0]["result"]["isError"].as_bool.should be_true
+        resps[0]["result"]["content"][0]["text"].as_s.should contain("needs 'secret' (HMAC) or 'key' (PEM)")
+        resps[1]["result"]["isError"].as_bool.should be_true
+        resps[2]["result"]["isError"]?.try(&.as_bool).should_not be_true
+        mcp_tool_payload(resps[2])["verified"].as_bool.should be_true
+      end
+    end
+
+    it "jwt_verify refuses an explicit empty secret beside a key, and answers a key mismatch" do
+      with_store do |store|
+        es = Gori::Jwt.encode("{}", %({"sub":"1"}), "ES256", JoseKeys::EC256)
+        rsa = JoseKeys::RSA_PUB.gsub('\n', "\\n")
+        both = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_verify","arguments":{"token":"#{es}","secret":"","key":"#{rsa}"}}})
+        wrong_kind = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"jwt_verify","arguments":{"token":"#{es}","key":"#{rsa}"}}})
+        resps = mcp_drive(store, both, wrong_kind, allow_actions: false)
+        resps[0]["result"]["isError"].as_bool.should be_true
+        # The token's alg is captured text: an RSA key under its ES256 is an answer, not a bad call.
+        resps[1]["result"]["isError"]?.try(&.as_bool).should_not be_true
+        mcp_tool_payload(resps[1])["code"].as_s.should eq("key_mismatch")
+      end
+    end
+
+    it "jwt_verify's description names every code the engine can answer" do
+      with_store do |store|
+        tools = mcp_drive(store, %({"jsonrpc":"2.0","id":1,"method":"tools/list"}), allow_actions: false)[0]["result"]["tools"].as_a
+        desc = tools.find! { |t| t["name"].as_s == "jwt_verify" }["description"].as_s
+        # Whole words: `malformed` is also a substring of `signature_malformed`.
+        Gori::Jwt::VerifyCode.values.each { |c| desc.should match(/(?<![a-z_])#{c.label}(?![a-z_])/) }
+      end
+    end
+
+    it "jwt_verify checks an ES256 token against a PEM public key" do
+      with_store do |store|
+        token = Gori::Jwt.encode("{}", %({"sub":"1"}), "ES256", JoseKeys::EC256)
+        pem = JoseKeys::EC256_PUB.gsub('\n', "\\n")
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_verify","arguments":{"token":"#{token}","key":"#{pem}"}}})
+        payload = mcp_tool_payload(mcp_drive(store, call, allow_actions: false)[0])
+        payload["alg"].as_s.should eq("ES256")
+        payload["verified"].as_bool.should be_true
+      end
+    end
+
+    it "jwt_attacks adds the algorithm-confusion family only with a public_key" do
+      with_store do |store|
+        token = Gori::Jwt.encode("{}", %({"sub":"1"}), "RS256", JoseKeys::RSA)
+        pem = JoseKeys::RSA_PUB.gsub('\n', "\\n")
+        plain = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_attacks","arguments":{"token":"#{token}"}}})
+        keyed = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"jwt_attacks","arguments":{"token":"#{token}","public_key":"#{pem}"}}})
+        resps = mcp_drive(store, plain, keyed, allow_actions: false)
+        mcp_tool_payload(resps[0])["items"].as_a.map(&.["category"].as_s).should_not contain("alg-confusion")
+        mcp_tool_payload(resps[1])["items"].as_a.map(&.["category"].as_s).should contain("alg-confusion")
+      end
+    end
+
+    it "jwt_decode reports an encrypted token as a JWE with no payload" do
+      with_store do |store|
+        header = Base64.urlsafe_encode(%({"alg":"RSA-OAEP","enc":"A256GCM"}), padding: false)
+        jwe = "#{header}.d3JhcA.aXYtMTIz.Y2lwaGVy.dGFn"
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"jwt_decode","arguments":{"token":"#{jwe}"}}})
+        resp = mcp_drive(store, call, allow_actions: false)[0]
+        resp["result"]["isError"]?.try(&.as_bool).should_not be_true
+        payload = mcp_tool_payload(resp)
+        payload["type"].as_s.should eq("JWE")
+        payload["enc"].as_s.should eq("A256GCM")
+        payload["payload"].raw.should be_nil
+        payload["encrypted"].as_bool.should be_true
       end
     end
 

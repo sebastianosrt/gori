@@ -13,18 +13,42 @@ require "../notes"
 require "../issues_export" # Issues::Export.one_line / .scrub_only
 require "../jwt"
 require "../authorize/engine"
+# `Serialize.sensitive_header?` — the ONE predicate behind every `[REDACTED]` in the tree.
+# `cli/run/intercept.cr` already reaches for its `redact_head`/`redact_message_lines`: the
+# layering contract gates CORE subsystems knowing about a surface, not surface ↔ surface.
+require "../mcp/serialize"
 require "../tui/screen" # Screen.display_width — the cell measure every column here pads against
+require "../unicode_reveal"
 
 module Gori
   module CLI
-    # TUI-free output formatting shared by `gori run` and the headless capture
-    # printer. Pure functions over Store read-models → Strings; no terminal, no
-    # colour. The JSON shape here is the stable, documented contract for scripts.
+    # TUI-free output formatting and stream helpers shared by `gori run` and the
+    # headless capture printer. The JSON shape here is the stable, documented script contract.
     module Output
+      # A scalar result is line-terminated for a terminal and byte-exact when piped.
+      def self.write_value(io : IO, value : String, terminal : Bool) : Nil
+        if terminal
+          io.puts value
+        else
+          io.write(value.to_slice)
+        end
+      end
+
+      # Raw byte output keeps its octets; a terminal gets a separating newline for readability.
+      def self.write_value(io : IO, value : Bytes, terminal : Bool) : Nil
+        io.write(value)
+        io.puts if terminal && !value.empty? && value[-1] != 0x0A_u8
+      end
+
       # One JSON object (one line, for JSON-Lines streams) describing a flow row.
       def self.flow_row_json(row : Store::FlowRow, request_head : Bytes? = nil,
-                             columns : Array({String, String})? = nil) : String
-        JSON.build { |j| flow_row_fields(j, row, request_head, columns) }
+                             columns : Array({String, String})? = nil,
+                             *, include_sensitive : Bool = false,
+                             columns_redacted : Bool = false) : String
+        JSON.build do |j|
+          flow_row_fields(j, row, request_head, columns,
+            include_sensitive: include_sensitive, columns_redacted: columns_redacted)
+        end
       end
 
       # Emits the flow-row fields into an open builder (reused by `show`, which
@@ -39,9 +63,21 @@ module Gori
       # full?") and a script that wants one wants the other; the plain `flow_row_json(row)`
       # that `gori run capture`'s live stream and MCP's serializer mirror is byte-identical
       # to what it always was. See spec/cli/run/history_spec.cr, which pins that key set.
+      #
+      # `include_sensitive` defaults to FALSE — an inventory row's `headers` block carries
+      # Authorization/Cookie VALUES only when the caller asks for them (#1002). The default
+      # is the fail-closed one because the parameter is threaded through existing call sites
+      # that predate it, so a caller that never heard of the flag redacts.
+      # `columns_redacted` says whether the CALLER already blanked a sensitive column value
+      # (`sensitive_column?`, applied where the column descriptors are — see
+      # `Run.row_columns`). It only feeds the marker: a `res:header:set-cookie` column can be
+      # the sole redaction on a row whose REQUEST carried nothing sensitive, and the marker
+      # has to be true for that row rather than only for the `headers` block's own hits.
       def self.flow_row_fields(j : JSON::Builder, row : Store::FlowRow,
                                request_head : Bytes? = nil,
-                               columns : Array({String, String})? = nil) : Nil
+                               columns : Array({String, String})? = nil,
+                               *, include_sensitive : Bool = false,
+                               columns_redacted : Bool = false) : Nil
         j.object do
           j.field "id", row.id
           j.field "created_at", row.created_at
@@ -53,7 +89,7 @@ module Gori
           # `gori run history --format json` against `list_history` could not compare the two
           # as strings, and the CLI carried no RFC3339 field anywhere in the tree. Additive:
           # `time` keeps its exact spelling and value, so nothing reading it breaks.
-          j.field "created_at_iso", iso_time_utc(row.created_at)
+          j.field "created_at_iso", Gori.iso_micros(row.created_at)
           # Wire-derived, every one of them — see `json_captured`.
           json_captured(j, "scheme", row.scheme)
           json_captured(j, "method", row.method)
@@ -70,6 +106,8 @@ module Gori
           # the two key sets against each other): a consumer of either feed has no other way
           # to tell a gori-authored stub response from one the origin actually sent (#511).
           j.field "short_circuited", row.short_circuited?
+          # Edited at Intercept (#1378) — the stored request is the operator's, not the client's.
+          j.field "intercept_edited", row.intercept_edited?
           # Where this flow came from (`Gori::FlowSource`). Emitted on EVERY row, `null`
           # included, for `short_circuited`'s reason: a consumer has no other way to tell a
           # request gori sent from traffic the target's client produced, and an absent field
@@ -88,16 +126,25 @@ module Gori
           # `Store::WsMessage#emit_shape_json` uses.
           advisories = row.advisories
           unless advisories.empty?
-            j.field("advisory") { j.array { advisories.each { |l| j.string(term_safe(l)) } } }
+            j.field("advisory") { j.array { advisories.each { |l| j.string(l.scrub) } } }
           end
+          redacted = false
           if head = request_head
             # `FlowRow#url` — the ONE definition of a flow's absolute URL (default-port
             # elision, IPv6 bracketing, an absolute-form target passed through). A script
             # re-deriving it from scheme/host/port/target gets exactly those three cases
             # wrong, which is why the field exists at all.
             json_captured(j, "url", row.url)
-            j.field("headers") { request_headers_json(j, head) }
+            j.field("headers") { redacted = request_headers_json(j, head, include_sensitive) }
           end
+          # `sensitive_headers_redacted` only when a value ACTUALLY was — the same
+          # field-presence discipline `advisory`, `headers` and `columns` keep here, and the
+          # reason it matters more on this feed than on a detail object: a `false` on every row
+          # of a JSON-Lines stream is a per-row cost for a fact about the invocation.
+          #
+          # OUTSIDE the head block, because a redacted COLUMN is a redaction whether or not
+          # this row has a request head to show (a Pending capture has none).
+          j.field "sensitive_headers_redacted", true if redacted || columns_redacted
           # User-defined History columns (#819), when the caller asked for any. Emitted only
           # then, so a script keying off field presence is not broken by a field it never asked
           # for — the same discipline `advisory` and `headers` keep here.
@@ -114,15 +161,17 @@ module Gori
       private def self.columns_json(j : JSON::Builder, columns : Array({String, String})) : Nil
         j.object do
           DisplayColumns.fold_by_label(columns).each do |(label, values)|
-            # `term_safe` on the KEY as well as the value. `DisplayColumns.parse_spec` already
+            # `scrub` on the KEY as well as the value. `DisplayColumns.parse_spec` already
             # scrubs a label off ARGV, and a stored label comes from a TextField — this is the
             # backstop that makes the emitter safe on its own, since a raw key that is not valid
-            # UTF-8 poisons the whole document rather than its own row.
-            key = term_safe(label)
+            # UTF-8 poisons the whole document rather than its own row. Not `term_safe`: its
+            # badges are a terminal projection, and a JSON string carries NBSP/ZWSP/bidi as-is
+            # (see `json_captured`).
+            key = label.scrub
             if values.size == 1
-              j.field key, term_safe(values.first)
+              j.field key, values.first.scrub
             else
-              j.field(key) { j.array { values.each { |v| j.string(term_safe(v)) } } }
+              j.field(key) { j.array { values.each { |v| j.string(v.scrub) } } }
             end
           end
         end
@@ -143,13 +192,38 @@ module Gori
       # A duplicate name that differs only in CASE is one JSON key (`Accept` and `accept` are
       # the same field, RFC 9110 §5.1) and folds into the same array; the FIRST spelling seen
       # is the key, so the object reads like the wire it came from.
-      private def self.request_headers_json(j : JSON::Builder, head : Bytes) : Nil
+      #
+      # Authorization/Cookie/Set-Cookie/API-key VALUES are `[REDACTED]` unless the caller
+      # passed `include_sensitive` (#1002): this block rides along on an INVENTORY row, so a
+      # `gori run history --format json` run to answer "what did I capture?" was placing
+      # session material in whatever log or agent transcript read the listing. Redacted per
+      # NAME rather than by running `Serialize.redact_head` over the bytes and re-parsing:
+      # the stored octets are canonical and this object is a derived projection of them, so
+      # the projection is what filters — re-parsing a head nothing ever sent inverts that.
+      # `Serialize.sensitive_header?` is the ONE predicate (same list `redact_head` and every
+      # redacting MCP tool use); a second copy here is a second answer, and the wrong answer
+      # prints a secret. Redaction keys off the DOWNCASED name, not the emitted key, because
+      # the fold emits the first spelling seen — `COOKIE:` has to redact too.
+      #
+      # A repeated sensitive name stays an ARRAY of `[REDACTED]`, one per occurrence: the
+      # count is the shape of the message (a split `Cookie`), not the secret, and collapsing
+      # it would make the redacted listing disagree with the unredacted one about what the
+      # wire held. Returns whether anything was redacted, for the row's marker field.
+      private def self.request_headers_json(j : JSON::Builder, head : Bytes,
+                                            include_sensitive : Bool) : Bool
         # Insertion-ordered, keyed case-insensitively: Hash keeps insertion order in Crystal,
         # so one pass gives both wire order and the fold.
         order = [] of String
         by_key = {} of String => Array(String)
+        # The field the next obs-fold continuation belongs to.
+        last_key : String? = nil
         Proxy::Codec::Http1.parse_request_head(head).headers.each do |h|
+          if fold_continuation?(h.name)
+            fold_into(by_key, last_key, h)
+            next
+          end
           key = h.name.downcase
+          last_key = key
           if bucket = by_key[key]?
             bucket << h.value
           else
@@ -157,16 +231,86 @@ module Gori
             order << h.name
           end
         end
+        redacted = false
         j.object do
           order.each do |name|
             values = by_key[name.downcase]
+            # The redaction decision is per NAME and the single/array split is per VALUE
+            # COUNT, so hoisting the first above the second is what keeps this two branches
+            # instead of the four an inline test produced — the emit was written twice with
+            # only the value expression differing.
+            #
+            # `SENSITIVE_HEADERS` directly rather than `sensitive_header?`, which re-runs
+            # `strip.downcase` on a key this loop already downcased: `String#downcase` always
+            # allocates, and this is a per-header, per-row loop on a streaming listing. The
+            # predicate stays for its un-normalized callers.
+            sensitive = !include_sensitive && MCP::Serialize::SENSITIVE_HEADERS.includes?(name.downcase)
+            redacted ||= sensitive
             if values.size == 1
-              json_captured(j, name.scrub, values[0])
+              j.field name.scrub, sensitive ? "[REDACTED]" : values[0].scrub
             else
-              j.field(name.scrub) { j.array { values.each { |v| j.string(v.scrub) } } }
+              j.field(name.scrub) { j.array { values.each { |v| j.string(sensitive ? "[REDACTED]" : v.scrub) } } }
             end
           end
         end
+        redacted
+      end
+
+      # Is this parsed header name actually an obs-fold CONTINUATION of the field before it?
+      #
+      # A field line beginning with SP or HTAB is a continuation by definition (RFC 9110 §5.2,
+      # RFC 7230 §3.2.4), and `Codec::Http1.parse_headers` has no fold handling at all: it
+      # splits every colon-bearing line into name/value, so
+      # `Cookie: sid=X` + `\r\n redirect=https://x/?tok=T` arrived here as a SECOND header
+      # literally named `" redirect=https"` with value `"//x/?tok=T"`. That invented field was
+      # not sensitive by name, so its value printed in the clear beside the `Cookie: [REDACTED]`
+      # it was part of — and redacting only the VALUE would not have been enough either,
+      # because the split put `redirect=https` in the KEY. `Serialize.redact_head` states the
+      # rule this path was missing: "An obs-fold continuation of a sensitive field is
+      # sensitive too."
+      #
+      # `name` is unstripped here (parse_headers takes the bytes before the colon verbatim), so
+      # leading whitespace appears if and only if the LINE had it — the signal is exact.
+      private def self.fold_continuation?(name : String) : Bool
+        name.starts_with?(' ') || name.starts_with?('\t')
+      end
+
+      # Join a continuation into the field it continues, per RFC 7230 §3.2.4 (the fold becomes
+      # one SP), instead of emitting it as a field of its own. The colon the parser cut on is
+      # put back, because it was value bytes.
+      #
+      # This closes the colon-bearing case, which is the one that LEAKED — a colonless
+      # continuation never reaches here at all (`parse_headers` keeps only lines with a colon),
+      # so it stays silently dropped from this projection exactly as before. That is a fidelity
+      # gap, not a disclosure: `--include-sensitive` under-reports such a fold, and the
+      # byte-exact channel for it is `gori run show --format raw`. Closing it properly means
+      # teaching the CODEC about obs-fold, which is a change to the canonical parse and not to
+      # a listing.
+      #
+      # Dropped when there is nothing to continue: a head whose first field line is a
+      # continuation is malformed, and inventing a field to hang it on is the bug above.
+      private def self.fold_into(by_key : Hash(String, Array(String)), last_key : String?,
+                                 h : Proxy::Codec::Header) : Nil
+        return unless lk = last_key
+        return unless bucket = by_key[lk]?
+        bucket[-1] = "#{bucket[-1]} #{h.name.strip}:#{h.value}"
+      end
+
+      # Does this History column extract a SENSITIVE header value (#1002)?
+      #
+      # It exists because the project's CONFIGURED columns are drawn by default, with no flag
+      # on the invocation: a `req:header:authorization` set once in the TUI's Columns… dialog
+      # printed its value on every later `--format json` run, in the same object as the
+      # `sensitive_headers_redacted: true` the redacted `headers` block had just asserted. One
+      # row cannot both withhold a credential and print it.
+      #
+      # `cookie:` is covered whatever its selector, because a named cookie's value is by
+      # construction a substring of the `Cookie` header this row redacts. The three
+      # content-scoped kinds (`regex:`, `jsonpath:`, `position:`) are NOT: they can lift a
+      # credential out of any byte of the message and the descriptor cannot say whether they
+      # do, so the docs name them as uncovered rather than implying a guarantee.
+      def self.sensitive_column?(c : Store::DisplayColumn) : Bool
+        Gori::DisplayColumns.sensitive?(c)
       end
 
       # Emit `name` carrying a CAPTURED string, scrubbed to U+FFFD. The JSON counterpart of
@@ -178,10 +322,9 @@ module Gori
       # carrying a single control byte (`term_safe`'s doc names the hazard). One such byte
       # makes the WHOLE document invalid, not just its own field: `python3 json.loads` fails
       # outright with UnicodeDecodeError, and in a JSON-Lines stream every later line is lost
-      # with it. This was fixed field-by-field as each instance was found — fuzz `payloads`
-      # (`fuzz_row_fields`), every sitemap label, `grpc_message` in three emitters — while
-      # `flow_row_fields`, `discover_finding_fields`, `sequence_sample_json` and the `error`
-      # fields kept emitting raw. `MCP::Serialize.text` is the same decision on the agent
+      # with it. This was fixed field-by-field as each instance was found — fuzz `payloads`,
+      # every sitemap label, `grpc_message` in three emitters — while `flow_row_fields`, the
+      # discover rows, `sequence_sample_json` and the `error` fields kept emitting raw. `MCP::Serialize.text` is the same decision on the agent
       # surface; this is its name here.
       #
       # NOT `term_safe`: control bytes are legitimate content in a JSON string (they are
@@ -197,11 +340,11 @@ module Gori
         j.field name, s.try(&.scrub)
       end
 
-      # Neutralize terminal control bytes in an untrusted CAPTURED string before it is
-      # printed to a live terminal. A malicious client can embed ANSI/OSC escape
-      # sequences in its request line (method / host / target), which `puts` would
-      # otherwise inject verbatim into the operator's terminal (and re-inject on every
-      # later view). Replace every control char (incl. ESC, CR/LF, tab, C1) with '·'.
+      # Make hidden/control codepoints in an untrusted CAPTURED string visible before it is
+      # printed to a live terminal. A malicious client can embed ANSI/OSC escape sequences
+      # in its request line (method / host / target), which `puts` would otherwise inject
+      # verbatim into the operator's terminal (and re-inject on every later view). Named
+      # badges keep the byte's identity visible while preventing terminal control handling.
       #
       # Also scrubs invalid UTF-8 first: a captured host/path is raw bytes off the wire
       # (see Sitemap.template_class's comment) and can be invalid UTF-8 without containing
@@ -211,18 +354,30 @@ module Gori
       # valid-UTF-8 case, so this stays free when there's nothing to fix.
       def self.term_safe(s : String) : String
         s = s.scrub
-        return s unless s.each_char.any?(&.control?)
-        String.build { |io| s.each_char { |c| io << (c.control? ? '·' : c) } }
+        UnicodeReveal.visible(s) || s
       end
 
-      # Like `term_safe` but preserves '\n'/'\t', so a captured multi-line head/body keeps
-      # its layout while ANSI/OSC/CSI escapes and other control bytes are neutralized. Use
+      # Like `term_safe` but preserves line breaks, so a captured multi-line head/body keeps
+      # its layout while tabs, ANSI/OSC/CSI escapes and other hidden controls get named badges. Use
       # for captured text written to a live terminal (the `show`/`repeater` text views).
       # `--format raw` stays the exact-bytes path for scripts/redirection.
+      #
+      # CRLF is ONE grapheme cluster (UAX #29 GB3), so it never equals "\n" here — matching
+      # only "\n" badged every CRLF head as `⟨CR⟩⟨LF⟩` and printed it on one line. CRLF is
+      # the HTTP line ending, so it renders as a plain break; a lone CR keeps its badge.
       def self.term_safe_multiline(s : String) : String
         s = s.scrub
-        return s unless s.each_char.any? { |c| c.control? && c != '\n' && c != '\t' }
-        String.build { |io| s.each_char { |c| io << ((c.control? && c != '\n' && c != '\t') ? '·' : c) } }
+        return s unless s.each_char.any? { |c| c != '\n' && !UnicodeReveal.label(c.ord).nil? }
+        String.build do |io|
+          s.each_grapheme do |grapheme|
+            text = grapheme.to_s
+            if text == "\n" || text == "\r\n"
+              io << '\n'
+            else
+              io << (UnicodeReveal.visible(text) || text)
+            end
+          end
+        end
       end
 
       # The listing's location cell: the flow's absolute URL minus the scheme the SCHEME column
@@ -256,8 +411,8 @@ module Gori
       # `주문 조회 재전송` in a 20-column cell and put seven spaces too many after it, stepping
       # the `→ target` column of that ONE row out of line. The TUI's History list, laid out
       # from the same data, is exactly aligned — so this was a surface divergence, not a
-      # missing feature. `gori settings import` already measured this way (see its own
-      # `column_width`); this is that measure given one home for the whole surface.
+      # missing feature. `gori settings import` already measured this way; this is that
+      # measure given one home for the whole surface.
       #
       # `Tui::Screen` is a surface reaching into another surface, which the layering contract
       # allows (it gates CORE subsystems, not `cli/` ↔ `tui/`), and `display_width` is a pure
@@ -302,7 +457,14 @@ module Gori
           io << dur
           # Never silently: a text-mode reader scanning this list would otherwise take a
           # stub for traffic the server produced.
-          io << "  [stub]" if row.short_circuited?
+          # With WHICH rule answered, when the flow recorded it (#1237) — the rule may since have
+          # been edited or deleted, and this is the only place a list reader would learn it.
+          if row.short_circuited?
+            io << "  [stub"
+            row.source_ref.try { |r| io << " · " << term_safe(r) unless r.empty? }
+            io << ']'
+          end
+          io << "  [edited]" if row.intercept_edited?
           # Same reasoning again, one axis over: a row gori itself put on the wire must not
           # scan as traffic the target's client produced. Only when it IS one — a proxy
           # capture is the norm, and a chip on every row teaches nothing. The lowercase token
@@ -324,8 +486,10 @@ module Gori
 
       # --- fuzz result rows ---------------------------------------------------
 
-      def self.fuzz_row_json(r : Fuzz::Result) : String
-        JSON.build { |j| fuzz_row_fields(j, r) }
+      # One spelling for both surfaces: the MCP `fuzz_results` row. `flow_id` is the History
+      # flow `--record-history` wrote this row to; absent when nothing was recorded.
+      def self.fuzz_row_json(r : Fuzz::Result, flow_id : Int64? = nil) : String
+        JSON.build { |j| MCP::Serialize.fuzz_result(j, r, flow_id) }
       end
 
       # Incremental `--format json` writer. The opening bracket is emitted immediately and
@@ -333,9 +497,27 @@ module Gori
       # Result array merely to produce an array on stdout. Owners close it from ensure: an
       # interrupted or exceptional run is therefore still a valid JSON prefix array (`[]` when
       # no row completed), rather than a missing document or a dangling `[...,` fragment.
+      #
+      # Rows go out in INDEX order (#1386), not in the order concurrent workers finished them —
+      # a script diffing two runs, or reading row N as payload N, needs the array to be stable.
+      # A row that finishes ahead of a lower index is HELD until that index is settled, and
+      # `skip` settles an index whose row is not printed (a plain non-match), so the buffer is
+      # only ever the out-of-order window the concurrency allows, never the run. The job
+      # indices are the generator's own 0-based counter; one that never arrives (a stopped run,
+      # a job the engine's worker rescue dropped without a ResultEvent) would hold everything
+      # after it, so the buffer is BOUNDED: past `MAX_HELD` rows the lowest are written and the
+      # cursor skips the gap, keeping memory at the window whatever the run size. A row for a
+      # skipped index that turns up later is written where it lands.
       class FuzzArrayStream
         @first = true
         @closed = false
+        @next = 0_i64
+        # Settled indices at or past `@next`, with their encoded rows (empty = settled, not shown).
+        @held = {} of Int64 => Array(String)
+
+        # Far wider than any concurrency window (a run's workers hold at most a few hundred
+        # indices open at once), so it only ever engages when an index will never settle.
+        MAX_HELD = 4096
 
         def initialize(@io : IO,
                        @encoder : Proc(Fuzz::Result, String) = ->(result : Fuzz::Result) { Output.fuzz_row_json(result) })
@@ -343,143 +525,67 @@ module Gori
           @io.flush
         end
 
-        def append(result : Fuzz::Result) : Nil
+        def append(result : Fuzz::Result, flow_id : Int64? = nil) : Nil
           raise IO::Error.new("fuzz JSON array is already closed") if @closed
           # Build a complete JSON value before emitting its separator. If encoding raises, close
           # can still terminate the previous valid prefix rather than producing `[...,]`.
-          encoded = @encoder.call(result)
-          @io << ',' unless @first
-          @io << encoded
-          @io.flush
-          @first = false
+          encoded = flow_id ? Output.fuzz_row_json(result, flow_id) : @encoder.call(result)
+          settle(result.index, encoded)
+        end
+
+        # `result.index` finished without a row to print.
+        def skip(index : Int64) : Nil
+          return if @closed
+          settle(index, nil)
         end
 
         def close : Nil
           return if @closed
+          @held.keys.sort!.each { |i| @held[i].each { |row| write(row) } }
+          @held.clear
           @io << "]\n"
           @io.flush
           @closed = true
         end
-      end
 
-      def self.fuzz_array_json(results : Array(Fuzz::Result)) : String
-        JSON.build { |j| j.array { results.each { |r| fuzz_row_fields(j, r) } } }
-      end
+        private def settle(index : Int64, encoded : String?) : Nil
+          # An index already past the cursor (a duplicate) has nothing to wait for.
+          if index < @next
+            write(encoded) if encoded
+            return
+          end
+          rows = (@held[index] ||= [] of String)
+          rows << encoded if encoded
+          drain
+          if @held.size > MAX_HELD
+            @next = @held.keys.min
+            drain
+          end
+        end
 
-      def self.fuzz_row_fields(j : JSON::Builder, r : Fuzz::Result) : Nil
-        j.object do
-          j.field "index", r.index
-          # `.scrub`: a `Fuzz::Payload` is byte-faithful, so a wordlist entry may be invalid
-          # UTF-8 (a raw `\xff\xfe` bad-strings payload). `JSON::Builder#string` escapes JSON
-          # metacharacters but passes raw bytes straight through, so one such payload used to
-          # produce a document no JSON parser would accept — poisoning EVERY row, not just its
-          # own. Scrubbing to U+FFFD matches the MCP emitter (`Serialize.text`) and keeps the
-          # report parseable; the exact bytes that went out are recoverable from `request`.
-          j.field("payloads") { j.array { r.payloads.each { |p| j.string(p.scrub) } } }
-          j.field "position", r.position
-          j.field "status", r.status
-          j.field "length", r.length
-          j.field "words", r.words
-          j.field "lines", r.lines
-          j.field "duration_us", r.duration_us
-          j.field "matched", r.matched?
-          # A send failure's text can quote bytes the ORIGIN chose (a status line, a header a
-          # codec refused), so it is captured data like `payloads` two fields up. MCP's
-          # `Serialize.fuzz_result` has always wrapped this in `text()`.
-          json_captured(j, "error", r.error)
-          # A declared `¦chain` that could not run on this payload — the payload went out
-          # UNTRANSFORMED. Emitted (and only when set) so a script never reads `"error":null`
-          # for a request that sent a different test than the operator asked for. `.scrub` for
-          # the same reason `payloads` is scrubbed: a codec's refusal can quote a byte from the
-          # payload, and one invalid byte would poison the whole document.
-          if ce = r.chain_error
-            j.field "chain_error", ce.scrub
+        private def drain : Nil
+          while ready = @held.delete(@next)
+            ready.each { |row| write(row) }
+            @next += 1
           end
-          # The gRPC CALL's outcome. `status` is 200 for EVERY gRPC response, so without these
-          # a sweep against an origin denying every call was byte-identical to one against an
-          # origin allowing them all. Emitted only when the response actually carried them, so
-          # a non-gRPC run's JSON is unchanged. `.scrub`: `grpc-message` is origin-chosen text.
-          if gs = r.grpc_status
-            j.field "grpc_status", gs
-            j.field "grpc_status_name", Proxy::H2::Grpc.status_name(gs)
-          end
-          if gm = r.grpc_message
-            j.field "grpc_message", gm.scrub
-          end
-          # The WebSocket SESSION's outcome, for the same reason the two gRPC fields above
-          # exist: `status` is 101 for every successful handshake there is, so a sweep whose
-          # payloads all made the origin close with `1008 Policy Violation` was byte-identical
-          # in JSON to one it accepted. `ws_frames_in` counts the INBOUND frames gori kept
-          # (its own `[gori]` advisory rows excluded) — `length` is those payloads
-          # concatenated and cannot distinguish one long answer from many short ones. Emitted
-          # only when the row carried them, so an HTTP run's JSON is unchanged.
-          if fi = r.ws_frames_in
-            j.field "ws_frames_in", fi
-          end
-          if cc = r.ws_close_code
-            j.field "ws_close_code", cc
-          end
-          # `--extract` is a regex capture out of the RESPONSE BODY, so this is arbitrary
-          # origin bytes BY CONSTRUCTION — the sharpest instance of the class in this file,
-          # and the one the `payloads` fix above did not cover. MCP wraps it in `text()`.
-          json_captured(j, "extracted", r.extracted)
-          # Only when true. This is an exception rather than a per-row property, and a `false`
-          # on every row of every clean run would bury the one row that matters.
-          j.field "retried", true if r.retried?
-          # `--retries` re-sent this variation after a network error — DISTINCT from `retried`
-          # (a keep-alive pool re-send). Only when it happened, with the count.
-          if r.resent?
-            j.field "resent", true
-            j.field "resent_count", r.resent_count
-          end
-          # The captured response is SHORT (origin closed early / read deadline / capture
-          # ceiling), so `length`/`words`/`lines` describe a fragment. Only when it happened, with
-          # the SAME three-way sentence `CLI::Run.incomplete_reason` gives the Repeater and MCP so
-          # a truncation is never worded two ways. The classifier keys off the raw body, kept only
-          # under keep_bodies — an unmatched body-dropped row still names closed/timeout, just not
-          # the ceiling cause. A synthetic Repeater::Result forwards the body + timing.
-          if r.incomplete?
-            j.field "incomplete", true
-            j.field "incomplete_reason",
-              CLI::Run.incomplete_reason(Repeater::Result.new(Bytes.new(0), r.body, nil, r.duration_us), r.timed_out?)
-          end
+        end
+
+        private def write(encoded : String) : Nil
+          @io << ',' unless @first
+          @io << encoded
+          @io.flush
+          @first = false
         end
       end
 
       # --- miner finding rows -------------------------------------------------
 
       def self.mine_row_json(f : Miner::Finding) : String
-        JSON.build { |j| mine_finding_fields(j, f) }
+        JSON.build { |j| MCP::Serialize.mine_finding(j, f) }
       end
 
       def self.mine_array_json(findings : Array(Miner::Finding)) : String
-        JSON.build { |j| j.array { findings.each { |f| mine_finding_fields(j, f) } } }
-      end
-
-      def self.mine_finding_fields(j : JSON::Builder, f : Miner::Finding) : Nil
-        j.object do
-          # A mined parameter name comes from a wordlist FILE the operator supplied, so it can
-          # be arbitrary bytes — the same argument `fuzz_row_fields` makes for `payloads`.
-          # (`canary` below is gori-generated and fixed-length, so it needs nothing.)
-          json_captured(j, "name", f.name)
-          j.field "location", f.location.label
-          j.field "evidence", f.evidence.label
-          j.field "confidence", f.confidence.label
-          j.field "canary", f.canary
-          j.field "status", f.status
-          j.field "delta", f.delta
-          # The gRPC CALL's outcome. `status` above is 200 for every gRPC response, so without
-          # these a mine against a target denying every candidate was byte-identical to one
-          # allowing them all. Emitted only when the confirming round carried them, so a
-          # non-gRPC run's JSON is unchanged. `.scrub`: `grpc-message` is origin-chosen text.
-          if gs = f.grpc_status
-            j.field "grpc_status", gs
-            j.field "grpc_status_name", Proxy::H2::Grpc.status_name(gs)
-          end
-          if gm = f.grpc_message
-            j.field "grpc_message", gm.scrub
-          end
-        end
+        JSON.build { |j| j.array { findings.each { |f| MCP::Serialize.mine_finding(j, f) } } }
       end
 
       # "[+] debug                 query    · length"
@@ -556,28 +662,11 @@ module Gori
       # --- discover findings --------------------------------------------------
 
       def self.discover_row_json(f : Discover::Finding) : String
-        JSON.build { |j| discover_finding_fields(j, f) }
+        JSON.build { |j| MCP::Serialize.discover_finding(j, f) }
       end
 
       def self.discover_array_json(findings : Array(Discover::Finding)) : String
-        JSON.build { |j| j.array { findings.each { |f| discover_finding_fields(j, f) } } }
-      end
-
-      def self.discover_finding_fields(j : JSON::Builder, f : Discover::Finding) : Nil
-        j.object do
-          # A crawled URL is built from a page's own `<a href>` and `content_type` is a
-          # response header, so both are outside-origin. `Discover::Url.parse` percent-encodes
-          # the octets `<= 0x20` / `0x7F` (#394) but nothing above 0x7F, so a high byte reaches
-          # here intact. MCP's `discover_finding_json` wraps all three in `Serialize.text`.
-          json_captured(j, "url", f.url)
-          json_captured(j, "method", f.method)
-          j.field "status", f.status
-          j.field "length", f.length
-          json_captured(j, "content_type", f.content_type)
-          j.field "source", f.source.label
-          j.field "depth", f.depth
-          j.field "confidence", f.confidence.round(2)
-        end
+        JSON.build { |j| j.array { findings.each { |f| MCP::Serialize.discover_finding(j, f) } } }
       end
 
       # "200  GET  http://h/admin  (bruteforced 0.92)"
@@ -592,16 +681,9 @@ module Gori
 
       # --- probe scan issues --------------------------------------------------
 
-      def self.probe_group_json(g : Probe::Group) : String
-        JSON.build { |j| probe_group_fields(j, g) }
-      end
-
+      # `Probe.group_json` is the shared field shape (also used by the MCP probe_scan tool).
       def self.probe_array_json(groups : Array(Probe::Group)) : String
-        JSON.build { |j| j.array { groups.each { |g| probe_group_fields(j, g) } } }
-      end
-
-      def self.probe_group_fields(j : JSON::Builder, g : Probe::Group) : Nil
-        Probe.group_json(j, g) # shared field shape (also used by the MCP probe_scan tool)
+        JSON.build { |j| j.array { groups.each { |g| Probe.group_json(j, g) } } }
       end
 
       # "[high]      secret_in_url             api.test   ×3   CWE-598   token"
@@ -678,8 +760,17 @@ module Gori
         end
       end
 
+      # Named, because not every row printed is a match: a re-sent, truncated or errored row
+      # is shown too, and `fuzz show` lists a saved run's every row. `flow_id` is the History
+      # flow `--record-history` wrote the row to.
+      private def self.fuzz_row_marks(io : IO, r : Fuzz::Result, flow_id : Int64?) : Nil
+        io << "  matched" if r.matched?
+        io << "  stop-hit" if r.stop_hit?
+        io << "  flow #" << flow_id if flow_id
+      end
+
       # "#0     admin                 200   1.2kB     142w    31ms"
-      def self.fuzz_row_text(r : Fuzz::Result) : String
+      def self.fuzz_row_text(r : Fuzz::Result, flow_id : Int64? = nil) : String
         String.build do |io|
           io << '#' << r.index.to_s.ljust(6)
           # ONE one-line terminal-safety seam for every dynamic fuzz-row string below. Payloads
@@ -702,6 +793,7 @@ module Gori
           if extracted = r.extracted
             io << "  ⟦" << term_safe(extracted) << '⟧'
           end
+          fuzz_row_marks(io, r, flow_id)
           # Before the error text, because it qualifies the SEND rather than the response: this
           # request went out twice (see `Fuzz::Result#retried?`).
           io << "  re-sent" if r.retried?
@@ -723,6 +815,35 @@ module Gori
             io << "  " << Run.incomplete_reason(Repeater::Result.new(Bytes.new(0), r.body, nil, r.duration_us), r.timed_out?)
           end
         end
+      end
+
+      # One response-shape cluster (#1351) as a text line: its id (what `--cluster` takes), size,
+      # outcome, metric ranges, hit count and the representative row's index and payload. Same
+      # term-safety seam as `fuzz_row_text`: the payload is operator bytes.
+      def self.fuzz_cluster_text(c : Fuzz::Clusters::Cluster) : String
+        rep = c.representative
+        String.build do |io|
+          io << c.hex << "  ×" << c.count.to_s.ljust(6)
+          if c.status
+            io << "  " << c.status.to_s.ljust(4)
+            io << "  " << range_text(human_size(c.length_min), human_size(c.length_max)).ljust(15)
+            io << "  " << "#{range_text(c.words_min.to_s, c.words_max.to_s)}w".ljust(10)
+          else
+            # A failed send has no response to measure: its class is the whole row.
+            io << "  " << "ERR #{c.error_class.try(&.label)}".ljust(33)
+          end
+          io << "  grpc " << rep.grpc_status if rep.grpc_status
+          io << "  ws close " << rep.ws_close_code if rep.ws_close_code
+          io << "  " << c.matched << " hit" if c.matched > 0
+          io << "  " << c.errored << " err" if c.errored > 0 && c.status
+          io << "  " << c.incomplete << " incomplete" if c.incomplete > 0
+          io << "  ≈" if c.approximate?
+          io << "  #" << rep.index << ' ' << term_safe(rep.payloads.join(", "))
+        end
+      end
+
+      private def self.range_text(lo : String, hi : String) : String
+        lo == hi ? lo : "#{lo}–#{hi}"
       end
 
       # The WebSocket half of a fuzz row. A separate method rather than two more branches inline:
@@ -883,19 +1004,21 @@ module Gori
 
       # --- notes --------------------------------------------------------------
 
-      # Title shown in listings: the note's first non-blank line, or a positional
+      # Title shown in listings: the note's title (`Notes.title` — first line with text,
+      # Markdown heading marker dropped), or a positional
       # fallback for a blank note (mirrors the TUI sub-tab's "note N").
       def self.note_label(idx : Int32, text : String) : String
         Notes.title(text) || "note #{idx + 1}"
       end
 
-      # "* 1  title  (12 lines, 340B)" — 1-based index, '*' marks the active note.
-      def self.note_row_text(idx : Int32, text : String, current : Bool) : String
+      # "* 1  title  (id 7, 12 lines, 340B)" — 1-based index, '*' marks the active note,
+      # and the stable id is shown for commands such as `links --note`.
+      def self.note_row_text(idx : Int32, id : Int64, text : String, current : Bool) : String
         lines = Notes.line_count(text)
         String.build do |io|
           io << (current ? '*' : ' ') << ' '
           io << (idx + 1) << "  " << note_label(idx, text)
-          io << "  (" << lines << (lines == 1 ? " line, " : " lines, ") << human_size(text.bytesize.to_i64) << ')'
+          io << "  (id " << id << ", " << lines << (lines == 1 ? " line, " : " lines, ") << human_size(text.bytesize.to_i64) << ')'
         end
       end
 
@@ -953,6 +1076,7 @@ module Gori
             io << '\n' if i > 0
             io << term_safe(host.label)
             io << "  (" << sitemap_path_count(host.endpoints) << ')' if host.endpoints > 0
+            io << "  (js only — never requested)" if host.unrequested?
             io << '\n'
             sitemap_text_children(host, "", io)
           end
@@ -1014,9 +1138,19 @@ module Gori
         # Say it rather than silently showing a short path: this node's `path` is a PREFIX
         # of a target that ran past Sitemap::MAX_DEPTH segments.
         io << "  … +depth (truncated)" if node.truncated
+        sitemap_js_label(node, io)
         if t = node.tag
           io << "  # " << term_safe(t)
         end
+      end
+
+      # A path captured JavaScript references (#1243): how many flows named it, and whether any
+      # request ever did. A node carrying methods was requested, so it only gets the count.
+      private def self.sitemap_js_label(node : Sitemap::Node, io : IO) : Nil
+        return if node.js_refs == 0
+        io << "  (js: " << (node.js_refs == 1 ? "1 flow" : "#{node.js_refs} flows")
+        io << ", never requested" if node.methods.empty?
+        io << ')'
       end
 
       private def self.sitemap_path_count(n : Int32) : String
@@ -1033,8 +1167,11 @@ module Gori
         n == 1 ? "1 query" : "#{n} queries"
       end
 
-      # Flat endpoint listing — one line per (host, path) with its comma-joined method
-      # set, e.g. "GET,POST  acme.test/api/users". Pipe/grep-friendly; ID folding is
+      # Flat endpoint listing — one line per (origin, path) with its comma-joined method
+      # set, e.g. "GET,POST  https://acme.test/api/users": a URL, so the line feeds the next
+      # tool as it is (#1371 — keyed on the bare host it printed `127.0.0.1/only-tls`, which
+      # named no scheme or port). A host-level tree (no origins) prefixes the bare host.
+      # Pipe/grep-friendly; ID folding is
       # irrelevant here (every endpoint is listed, even folded ones, because /users/<a> and
       # /users/<b> are distinct endpoints). A QUERY fold is the one exception: it emits ONE
       # line for the path it stands for and its variants are not descended into, because
@@ -1089,20 +1226,23 @@ module Gori
         end
       end
 
-      # The endpoint tree as JSON: an array of host objects, each `{host, endpoints,
-      # tag?, children}`. A child node is `{label, path, methods?, tag?, children?}`,
+      # The endpoint tree as JSON: an array of host objects, each `{host, scheme, port, origin,
+      # endpoints, tag?, children}` — one per ORIGIN, `host` the bare host. A child node is `{label, path, methods?, tag?, children?}`,
       # or for a synthetic fold `{label, grouped:true, template?, methods?, children}` — an
       # id fold has no path, `template` ("{uuid}"/"{hex}"/"{date}") marks an ID fold as
       # opposed to a numeric run, and its `methods` are the UNION of its children's verbs. A
       # QUERY fold is marked `query_fold:true` and DOES carry `path` (the path-only endpoint)
-      # plus `queries` (how many query strings it stands for). The stable, documented machine contract. Unlike the text tree
+      # plus `queries` (how many query strings it stands for). Under `--js-refs` a node may add
+      # `js_refs` (flows whose JavaScript references it) and `unrequested:true` (it exists only
+      # because of such a reference; a host can carry it too). The stable, documented machine contract. Unlike the text tree
       # (which collapses a numeric fold and shows one representative under an ID fold),
       # JSON always keeps every child nested — the complete tree, with `grouped` as the
       # hint so a consumer can collapse it itself.
       #
       # Emitted by hand to an IO rather than through JSON::Builder: the tree nests one
       # object + one "children" array per path segment (~2 JSON levels each), and
-      # JSON::Builder hard-caps nesting at 100, so a captured path ~45 segments deep tore
+      # JSON::Builder capped nesting at 100 (1024 now, see json_nesting.cr — still a cap a
+      # path can reach), so a captured path ~45 segments deep tore
       # the whole report down with `JSON::Error: Nesting of 100 is too deep`. A security
       # tool must not silently truncate the endpoint tree, so we drop the artificial
       # ceiling instead — String#to_json still does every value's escaping, so the bytes
@@ -1121,16 +1261,30 @@ module Gori
       private def self.sitemap_host_json(io : IO, host : Sitemap::Node) : Nil
         io << '{'
         # host.label/tag are captured/user data and can be invalid UTF-8 (see
-        # Sitemap.template_class) — term_safe scrubs that (and strips control bytes),
-        # so this stays valid UTF-8 JSON like the text/paths formats already are.
+        # Sitemap.template_class) — `scrub` keeps this valid UTF-8 JSON. Not `term_safe`:
+        # `to_json` escapes control bytes, and its badges would rewrite the value a script
+        # reads (see `json_captured`).
+        # `host` stays the BARE host — the documented key, and what `sitemap tag --host` takes
+        # — and a root built from origins adds where its endpoints were sent (#1371): two
+        # ports of one host are two objects, told apart by `scheme`/`port`. `origin` is the
+        # prefix `--format paths` prints, so a consumer need not rebuild the default-port and
+        # IPv6-bracket rules itself.
         io << %("host":)
-        term_safe(host.label).to_json(io)
+        host.host.scrub.to_json(io)
+        if o = host.origin
+          io << %(,"scheme":)
+          o.scheme.scrub.to_json(io)
+          io << %(,"port":) << o.port
+          io << %(,"origin":)
+          o.label.scrub.to_json(io)
+        end
         io << %(,"endpoints":)
         host.endpoints.to_json(io)
         if t = host.tag
           io << %(,"tag":)
-          term_safe(t).to_json(io)
+          t.scrub.to_json(io)
         end
+        io << %(,"unrequested":true) if host.unrequested?
         sitemap_children_json(io, host)
         io << '}'
       end
@@ -1140,7 +1294,7 @@ module Gori
       private def self.sitemap_node_json_open(io : IO, node : Sitemap::Node) : Nil
         io << '{'
         io << %("label":)
-        term_safe(node.label).to_json(io)
+        node.label.scrub.to_json(io)
         # A fold is synthetic — its `path` is always "" and carries no meaning, so it is
         # omitted rather than emitted as an empty string. `template` names the id class
         # so a consumer can tell an id fold from a numeric run without parsing labels.
@@ -1154,13 +1308,13 @@ module Gori
             # `queries` is how many query strings it stands for (the variants are still
             # nested as children, each with its own full path).
             io << %(,"query_fold":true,"path":)
-            term_safe(node.path).to_json(io)
+            node.path.scrub.to_json(io)
             io << %(,"queries":)
             Sitemap.query_variants(node).to_json(io)
           end
         else
           io << %(,"path":)
-          term_safe(node.path).to_json(io)
+          node.path.scrub.to_json(io)
         end
         # On a fold these are the union of its children's verbs, not its own.
         verbs = node.grouped ? node.fold_methods : node.methods
@@ -1168,17 +1322,22 @@ module Gori
           io << %(,"methods":[)
           verbs.each_with_index do |m, i|
             io << ',' if i > 0
-            term_safe(m).to_json(io)
+            m.scrub.to_json(io)
           end
           io << ']'
         end
         if t = node.tag
           io << %(,"tag":)
-          term_safe(t).to_json(io)
+          t.scrub.to_json(io)
         end
         # `path` here is a PREFIX of the captured target — see Sitemap::MAX_DEPTH. Emitted
         # so a consumer can tell a real leaf from a cut one instead of trusting the path.
         io << %(,"truncated":true) if node.truncated
+        # `js_refs`: flows whose JavaScript references this path (`--js-refs`, #1243).
+        # `unrequested`: the node exists only because of such a reference — no captured request
+        # reaches it or anything under it, and it never carries `methods`.
+        io << %(,"js_refs":) << node.js_refs if node.js_refs > 0
+        io << %(,"unrequested":true) if node.unrequested?
       end
 
       # Iterative for the same reason as `sitemap_text_children`. Unlike the text walks this
@@ -1257,29 +1416,19 @@ module Gori
 
       # Local ISO-8601 from unix micros (the store's created_at unit). Lossy on purpose: this
       # is the field a human reads off a terminal, so it stays in the operator's timezone and
-      # drops the micros. `iso_time_utc` is the machine-readable one.
-      def self.iso_time(micros : Int64) : String
-        Time.unix(micros // 1_000_000).to_local.to_s("%Y-%m-%dT%H:%M:%S%:z")
-      end
-
-      # RFC3339 UTC at millisecond precision from unix micros — the `*_iso` convention the
-      # MCP surface uses everywhere and the CLI used nowhere (`grep -rn '_iso' src/gori/cli/`
-      # returned zero while MCP had fifteen). Byte-for-byte identical to
-      # `MCP::Serialize.unix_micros_iso`, which `spec/cli/run/history_spec.cr` pins against
-      # this — the same lockstep-by-spec arrangement `emit_body_json` and
-      # `emit_trailers_json` already have with their MCP counterparts.
+      # drops the micros. `Gori.iso_micros` is the machine-readable one.
       #
-      # Reimplemented rather than called: `CLI::Output` has no dependency on `MCP::` and
-      # should not gain one for four lines. The dependency between these two surfaces is
-      # one-way but still UNDECLARED: `cli/run/{intercept,history}.cr` call `MCP::Serialize.*`
-      # with no `require` of their own (they link because `src/gori.cr` pulls in both). That is
-      # the direction DESIGN.md §2.1 already documents and tolerates; the reverse edge — MCP
-      # reaching into `CLI::Output` for the WS shape — is gone, moved onto the model that owns
-      # the data (`Store::WsMessage#emit_shape_json`). Reimplementing here keeps `CLI::Output`
-      # itself free of `MCP::` rather than adding the first such call to this file.
-      def self.iso_time_utc(micros : Int64) : String
-        sec, micro = micros.divmod(1_000_000)
-        (Time.utc(1970, 1, 1) + sec.seconds + micro.microseconds).to_s("%Y-%m-%dT%H:%M:%S.%LZ")
+      # Through `LocalTime` because `to_local` RAISES for some operators and not others: a
+      # stored instant near `Time::MAX` plus a POSITIVE utc offset lands past it, so
+      # `TZ=Asia/Seoul` and `TZ=Europe/Berlin` got `ArgumentError: Invalid time: seconds out
+      # of range` where `TZ=UTC` and `TZ=America/New_York` printed the row. Reachable from
+      # ordinary data — a HAR entry dated `9999-12-31T23:59:59.999Z` imports without
+      # complaint — and because the row is then STORED, every later `history --format json`
+      # died on it after writing `[` and some rows, handing a script an invalid document
+      # rather than an error it could see. The same helper guards the eight render paths that
+      # read `created_at` the same way; see `Gori::LocalTime`.
+      def self.iso_time(micros : Int64) : String
+        LocalTime.format(micros, "%Y-%m-%dT%H:%M:%S%:z")
       end
 
       private def self.round1(n : Float64) : String

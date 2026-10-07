@@ -115,7 +115,9 @@ module Gori
         id = doc.next_id
         notes = doc.notes + [NoteEntry.new(id, text)]
         created = id
-        serialize(notes.size - 1, notes, id + 1)
+        # `&+`, here and at every id step: a stored id at Int64::MAX (a foreign or hand-edited
+        # row) made each of them raise, so the notes could be neither read nor saved.
+        serialize(notes.size - 1, notes, id &+ 1)
       end
       committed ? created : nil
     end
@@ -123,7 +125,11 @@ module Gori
     # Replace one note's text. `Missing` when the id is not in the set the transaction read —
     # which is the authoritative one, so a note a peer deleted a moment ago reports Missing
     # rather than being silently resurrected by our stale copy.
-    def self.update(store : Store, id : Int64, text : String) : Write
+    #
+    # `append:` adds `text` after the note's current text, on a line of its own (`gori run notes
+    # update --append`, #1388). It is joined HERE, against the text the transaction read, so an
+    # edit a peer made a moment ago is appended to rather than overwritten by our older copy.
+    def self.update(store : Store, id : Int64, text : String, *, append : Bool = false) : Write
       legacy = store.setting(LEGACY_KEY)
       found = false
       committed = store.mutate_setting(DOCS_KEY) do |raw|
@@ -132,12 +138,18 @@ module Gori
         if idx
           found = true
           notes = doc.notes.dup
-          notes[idx] = NoteEntry.new(id, text)
+          notes[idx] = NoteEntry.new(id, append ? appended(notes[idx].text, text) : text)
           serialize(doc.cur, notes, doc.next_id)
         end
       end
       return Write::Busy unless committed
       found ? Write::Committed : Write::Missing
+    end
+
+    # `text` after `existing`, starting a new line unless `existing` is empty or already ends one.
+    def self.appended(existing : String, text : String) : String
+      return text if existing.empty?
+      existing.ends_with?('\n') ? existing + text : "#{existing}\n#{text}"
     end
 
     # Drop one note. `cur` is re-clamped against the set the transaction read, not ours.
@@ -211,7 +223,7 @@ module Gori
       return nil unless doc
       arr = doc["notes"]?.try(&.as_a?)
       return nil unless arr
-      cur = doc["cur"]?.try(&.as_i?) || 0
+      cur = doc["cur"]?.try(&.as_i64?).try(&.clamp(0, Int32::MAX).to_i32) || 0
       next_id = doc["next_id"]?.try(&.as_i64?) || 0_i64
       entries = [] of NoteEntry
       legacy_id = 1_i64
@@ -220,11 +232,11 @@ module Gori
           id = obj["id"]?.try(&.as_i64?) || legacy_id
           text = obj["text"]?.try(&.as_s?) || ""
           entries << NoteEntry.new(id, text)
-          legacy_id = {legacy_id, id + 1}.max
+          legacy_id = {legacy_id, id &+ 1}.max
         else
           text = v.as_s? || ""
           entries << NoteEntry.new(legacy_id, text)
-          legacy_id += 1
+          legacy_id &+= 1
         end
       end
       next_id = {next_id, legacy_id}.max
@@ -255,7 +267,9 @@ module Gori
 
     # Reconcile THIS session's notes with the currently-persisted set before a save,
     # so two TUI sessions open on the same project don't clobber each other's notes.
-    # `persisted` is re-read at save time; `mine` is this session's notes (id → text);
+    # `persisted` is re-read at save time; `mine` is the notes this session CHANGED (id → text),
+    # never its whole loaded set — every entry is an edit that wins, so passing an untouched,
+    # stale copy reverts a peer's edit to that note (#1415; see `Tui::NotesView#save`);
     # `deleted` is the ids this session closed. Merge rules (per-note last-writer-wins,
     # keyed by the stable id):
     #   - a persisted note THIS session also has  → this session's text (an edit)
@@ -300,17 +314,86 @@ module Gori
       # cross-session-unique ids: the two notes fold into one and the later text wins. It also
       # adopts the deleted note's `entity_links`, since those are keyed by (Note, id).
       Doc.new(cur.clamp(0, {result.size - 1, 0}.max), result,
-        {next_id, persisted.next_id, max_id + 1}.max)
+        {next_id, persisted.next_id, max_id &+ 1}.max)
     end
 
-    # The note's title: its first non-blank line, trimmed; nil when the note is
-    # empty/all-whitespace. Mirrors how the TUI derives each sub-tab's label.
+    # The note's title: its first non-blank line, trimmed, with a Markdown ATX heading marker
+    # removed; nil when the note is empty/all-whitespace. Mirrors how the TUI derives each
+    # sub-tab's label.
+    #
+    # A note IS Markdown — `export_basename` writes ".md", and the demo project's own notes
+    # open with "# …" — so almost every titled note starts its first line with hashes. They
+    # were carried through verbatim, which cost two columns of a sub-tab chip that is already
+    # truncating ("1:# Demo engagem…"), opened every `gori run notes` row with punctuation,
+    # and put a leading '#' on the exported filename. Stripped HERE, in the one home the
+    # comment above already claims, so the four surfaces cannot disagree about it.
+    #
+    # CommonMark's ATX rule, not a bare lstrip: one to six '#' after at most three spaces of
+    # indent, and then a space/tab or the end of the line. "#hashtag" and "#1042" are NOT
+    # headings and keep their '#' — a note whose first line is an issue reference should not
+    # lose it. The optional closing run ("## Title ##") goes too, and a heading with no text
+    # after the marker falls through to the next non-blank line rather than titling the note
+    # with "".
+    # `[#]` and not a bare `#`: in a Crystal regex literal `#{` opens an interpolation.
+    ATX_OPEN  = /\A[ ]{0,3}[#]{1,6}(?:[ \t]+|\z)/
+    ATX_CLOSE = /[ \t]+[#]+\z/
+
     def self.title(text : String) : String?
-      text.split('\n').each do |raw|
+      title_and_detail(text)[0]
+    end
+
+    # The same title, from a buffer already split into lines — the TUI editor's own shape
+    # (`TextArea#each_line`). See the Iterator overload of `title_and_detail`.
+    def self.title(lines : Iterator(String)) : String?
+      title_and_detail(lines)[0]
+    end
+
+    # `title`, plus the first non-blank line AFTER the one the title came from — the second
+    # line a picker row shows beside the name. Both come off ONE scan because a caller that
+    # re-derives "line one is the title" gets it wrong the moment a title falls through an
+    # empty heading: `Runner#note_link_rows` did exactly that and printed the note's own name
+    # in both columns, which is the thing its comment says it exists to prevent.
+    #
+    # `each_line` with an early return, not `split('\n')`: this runs on the TUI render path —
+    # `NotesView::Note#label` calls it for every chip, every frame — and a note is free text
+    # that may hold a pasted 10k-line response. The old spelling materialised that array to
+    # read line one of it.
+    #
+    # `valid_encoding?` BEFORE the regex, and it is not defensive: a note body is operator
+    # bytes (P7), the MCP and CLI note tools hand this the raw column, and PCRE2 RAISES
+    # `ArgumentError: UTF-8 error: isolated byte with 0x80 bit set` rather than failing to
+    # match. A line gori cannot decode is not a heading it can parse either, so it takes the
+    # pre-Markdown path — `line.strip`, exactly what this returned before — and the caller's
+    # own scrubber still gets its turn on the way out.
+    def self.title_and_detail(text : String) : {String?, String}
+      title_and_detail(text.each_line)
+    end
+
+    # The scan itself, over lines with their `\n` already gone — `String#each_line` for a
+    # stored body, or `TextArea#each_line` for the TUI's live buffer, whose `text` JOINS the
+    # whole note to hand it here. That join is what the chip labels paid, per chip, several
+    # times a frame: 4 notes of 750 KB was ~3 MB allocated per `subtab_labels` call to read
+    # one line of each. The two sources yield the same lines (a TextArea line never holds a
+    # `\n`; a `\r` before one is stripped below either way), so the answer is the same.
+    def self.title_and_detail(lines : Iterator(String)) : {String?, String}
+      title = nil.as(String?)
+      lines.each do |raw|
         line = raw.rstrip('\r')
-        return line.strip unless line.blank?
+        next if line.blank?
+        if found = title
+          return {found, line.strip}
+        end
+        # One `match`, reused for the slice: `matches?` + `sub` walks the line twice.
+        unless line.valid_encoding? && (m = ATX_OPEN.match(line))
+          title = line.strip
+          next
+        end
+        head = line[m.end(0)..].sub(ATX_CLOSE, "").strip
+        # A bare marker ("#", "##   ") heads nothing — fall through to the next line with
+        # text rather than titling the note "".
+        title = head unless head.empty?
       end
-      nil
+      {title, ""}
     end
 
     # Number of editor lines in a note (split on '\n'); an empty note is one line.

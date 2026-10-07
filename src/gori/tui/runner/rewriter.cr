@@ -1,37 +1,42 @@
 # Rewriter (Match & Replace rules) — ExecContext verb implementations, reopens Gori::Tui::Runner (see
 # tui/runner.cr for the event loop, Host facade, overlays, and rendering).
 class Gori::Tui::Runner < Gori::Verb::ExecContext
-  def rewriter_add : Nil
-    rewriter_controller.rewriter_add
+  # "Mock this response" (#1237): the flow's captured response, snapshotted by `MockFromFlow`
+  # (the engine `gori run rewriter add --from-flow` and MCP `from_flow_id` share), opened as an
+  # unsaved rule form. Nothing is written until the operator saves it (P4).
+  #
+  # `history_target_flow_id`, not the list cursor, for the reason `open_response_external`
+  # gives: live capture moves the cursor while the detail stays pinned to its own flow.
+  def mock_response_from_flow : Nil
+    id = history_target_flow_id
+    return status("mock: select a flow first") unless id
+    detail = @session.store.get_flow(id)
+    return status("mock: flow ##{id} is no longer in History") unless detail
+    drafted = MockFromFlow.draft(detail)
+    if refusal = drafted.as?(MockFromFlow::Refusal)
+      return status("mock: can't mock flow ##{id} — #{refusal.message}")
+    end
+    draft = drafted.as(MockFromFlow::Draft)
+    open_rewriter_rule_form(RewriterRuleOverlay.new(op: "short_circuit", match: "regex",
+      pattern: draft.pattern, host: draft.host, replacement: draft.replacement,
+      name: "mock flow ##{id}"))
   end
 
-  def rewriter_preset : Nil
-    rewriter_controller.rewriter_preset
-  end
-
-  def rewriter_edit : Nil
-    rewriter_controller.rewriter_edit
-  end
-
-  def rewriter_toggle : Nil
-    rewriter_controller.rewriter_toggle
-  end
-
-  def rewriter_delete : Nil
-    rewriter_controller.rewriter_delete
-  end
+  forward rewriter_add : Nil,
+    rewriter_preset : Nil,
+    rewriter_edit : Nil,
+    rewriter_toggle : Nil,
+    rewriter_delete : Nil,
+    rewriter_filter : Nil,
+    to: rewriter_controller
 
   def rewriter_move(dir : Int32) : Nil
     rewriter_controller.rewriter_move(dir)
   end
 
-  def rewriter_duplicate : Nil
-    rewriter_controller.rewriter_duplicate
-  end
-
-  def rewriter_reload : Nil
-    rewriter_controller.rewriter_reload
-  end
+  forward rewriter_duplicate : Nil,
+    rewriter_reload : Nil,
+    to: rewriter_controller
 
   # A rule the operator can actually SEE is selected. The sub-tab half is load-bearing: the
   # Rewriter tab is one workflow with three sub-tabs, `selected_rule` is the RULES list
@@ -46,10 +51,6 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     rewriter_controller.rules_sub? && !rewriter_controller.selected_rule.nil?
   end
 
-  def rewriter_rules_sub? : Bool
-    rewriter_controller.rules_sub?
-  end
-
   # The list is on screen AND has focus — what a rule CHORD has to mean. See the comment on
   # `rewriter_rule_selected?` above for the `@sub` half of this; this is the `@focus` half.
   def rewriter_rule_list_focused? : Bool
@@ -62,13 +63,9 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     rewriter_controller.rules_sub? && !!rewriter_controller.selected_rule.try(&.global?)
   end
 
-  def rewriter_scope_toggle : Nil
-    rewriter_controller.rewriter_scope_toggle
-  end
-
-  def rewriter_toggle_default : Nil
-    rewriter_controller.rewriter_toggle_default
-  end
+  forward rewriter_scope_toggle : Nil,
+    rewriter_toggle_default : Nil,
+    to: rewriter_controller
 
   # The PREVIEW OUTPUT pane holds focus — the gate for its four read verbs (x / v / S / y).
   def rewriter_preview_out? : Bool

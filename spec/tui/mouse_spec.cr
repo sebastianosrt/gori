@@ -1,5 +1,6 @@
 require "../spec_helper"
 require "../support/memory_backend"
+require "../support/tui_probes"
 
 include Gori::Tui
 
@@ -21,10 +22,10 @@ private def add_flow(store, method, target)
     head: "#{method} #{target} HTTP/1.1\r\nHost: h.test\r\n\r\n".to_slice, body: nil, source: Gori::FlowSource::Kind::Proxy))
 end
 
-describe "Chrome.menu_segments" do
+describe "Chrome.menu_geometry segments" do
   it "lays out every tab left-to-right, non-overlapping, on a wide row" do
     rect = Rect.new(2, 1, 220, 1)
-    segs = Chrome.menu_segments(rect, :project)
+    segs = Chrome.menu_geometry(rect, :project).segments
     segs.size.should eq(Chrome::TABS.size) # all tabs fit on a wide row
     segs.map(&.first).should eq(Chrome::TABS.map(&.first))
     segs.each { |(_, r)| r.y.should eq(1) }
@@ -34,7 +35,7 @@ describe "Chrome.menu_segments" do
 
   it "maps a click inside a segment back to that tab" do
     rect = Rect.new(2, 1, 120, 1)
-    segs = Chrome.menu_segments(rect, :history)
+    segs = Chrome.menu_geometry(rect, :history).segments
     hist = segs.find { |(s, _)| s == :history }.not_nil![1]
     hit = segs.find { |(_, r)| r.contains?(hist.x + 1, 1) }
     hit.not_nil![0].should eq(:history)
@@ -43,11 +44,11 @@ describe "Chrome.menu_segments" do
   it "keeps the active tab visible on a narrow row (scroll window)" do
     rect = Rect.new(0, 1, 22, 1)
     # :notes sits near the right end — the windowing must still include it.
-    Chrome.menu_segments(rect, :notes).map(&.first).includes?(:notes).should be_true
+    Chrome.menu_geometry(rect, :notes).segments.map(&.first).includes?(:notes).should be_true
   end
 
   it "returns no segments for an empty rect" do
-    Chrome.menu_segments(Rect.new(0, 0, 0, 0), :project).empty?.should be_true
+    Chrome.menu_geometry(Rect.new(0, 0, 0, 0), :project).segments.empty?.should be_true
   end
 end
 
@@ -271,7 +272,7 @@ describe "Frame.left_chip_hit / right_badge_hit" do
 end
 
 describe "RepeaterView#chrome_hit" do
-  it "hits response d/x/p chips and request SEND/CL/PRETTY badges on the border row" do
+  it "hits response ⇧D/^X/p chips and request SEND/CL/PRETTY badges on the border row" do
     view = RepeaterView.new
     view.load_blank
     rect = Rect.new(0, 0, 100, 24)
@@ -283,10 +284,12 @@ describe "RepeaterView#chrome_hit" do
     resp = Rect.new(content.x + half + 1, content.y, {content.w - half - 1, 0}.max, content.h)
     req = Rect.new(content.x, content.y, half, content.h)
 
-    # RESPONSE chips start at resp.x + 12
+    # RESPONSE chips start at resp.x + 12; the live diff chord is two display cells.
+    diff_label = " #{Gori::Hotkeys.binding_label(Gori::Verbs.registry, "repeater.toggle-diff", "⇧D")}:diff "
+    hex_label = " #{Gori::Hotkeys.binding_label(Gori::Verbs.registry, "repeater.toggle-resp-hex", "^X")}:hex "
     view.chrome_hit(rect, resp.x + 12, resp.y).should eq(:diff)
-    view.chrome_hit(rect, resp.x + 12 + 9, resp.y).should eq(:hex) # past " d:diff " + gap
-    view.chrome_hit(rect, resp.x + 12 + 9 + 9, resp.y).should eq(:pretty)
+    view.chrome_hit(rect, resp.x + 12 + Screen.draw_width(diff_label) + 1, resp.y).should eq(:hex)
+    view.chrome_hit(rect, resp.x + 12 + Screen.draw_width(diff_label) + 1 + Screen.draw_width(hex_label) + 1, resp.y).should eq(:pretty)
 
     # REQUEST right-chain: rightmost is SEND, then CL, PRETTY, then READ/INS
     send_label = " ^R:SEND "
@@ -310,13 +313,36 @@ describe "RepeaterView#chrome_hit" do
   end
 end
 
+describe "RepeaterView plain-word badges" do
+  # `^L` spells AUTO-LEN only when the whole chain still fits; the 100-column example above
+  # keeps CL, so a narrow border never trades a chip for the longer word.
+  it "spells AUTO-LEN on a wide border, clickable where drawn, and names the TLS default" do
+    view = RepeaterView.new
+    view.load_blank
+    rect = Rect.new(0, 0, 120, 24)
+    b = MemoryBackend.new(120, 24)
+    view.render(Screen.new(b), rect, focused: false)
+
+    req_y = rect.y + 3
+    row = b.row(req_y)
+    row.should contain("^L:AUTO-LEN")
+    row.should contain("↵:READ")
+    col = row.index!("^L:AUTO-LEN")
+    view.chrome_hit(rect, col, req_y).should eq(:cl)
+    view.chrome_hit(rect, col + "^L:AUTO-LEN".size - 1, req_y).should eq(:cl)
+
+    tls = b.row(rect.y).index!("TLS default")
+    view.chrome_hit(rect, tls, rect.y).should eq(:tls_preset)
+  end
+end
+
 describe "InterceptView#bar_zone_at" do
   it "maps i:CATCH / direction / condition to separate zones" do
     view = InterceptView.new
     rect = Rect.new(0, 0, 80, 1)
-    # " i:CATCH " at x+1 (cols 1..9), then gap, then "c:ALL" (default)
+    # " i:CATCH " at x+1 (cols 1..9), then gap, then "c:REQ" (default)
     view.bar_zone_at(rect, 2, 0).should eq(:catch)
-    view.bar_zone_at(rect, 1 + " i:CATCH ".size + 1, 0).should eq(:direction) # start of c:ALL
+    view.bar_zone_at(rect, 1 + " i:CATCH ".size + 1, 0).should eq(:direction) # start of c:REQ
     view.bar_zone_at(rect, 40, 0).should eq(:condition)
     view.bar_zone_at(rect, 2, 1).should be_nil # off the bar row
   end

@@ -3,6 +3,8 @@ require "../proxy/h2/grpc"
 require "../intercept_filter"
 require "../repeater/engine"
 require "../ascii_bytes"
+require "../utf8"
+require "./shape"
 
 module Gori::Fuzz
   # gRPC facts a fuzz run needs off raw wire bytes: the CALL's outcome (which for gRPC is
@@ -57,7 +59,7 @@ module Gori::Fuzz
           next unless idx = line.index(':')
           value = line[(idx + 1)..].strip
           case line[0, idx].strip.downcase
-          when "grpc-status"  then code = value.to_i?
+          when "grpc-status"  then code = Proxy::H2::Grpc.parse_status(value)
           when "grpc-message" then msg = value.presence
           end
         end
@@ -67,6 +69,18 @@ module Gori::Fuzz
       end
       return {nil, nil} unless body && AsciiBytes.contains_ci?(head, WEB_NEEDLE)
       Proxy::H2::Grpc.trailer_status(Gori::MediaType.of(head), body)
+    end
+
+    # `response` over a WIRE body — one still carrying its `Content-Encoding`, as a
+    # `Repeater::Result` and a stored flow do. grpc-web's outcome is a frame INSIDE the body,
+    # and an origin is free to gzip that body like any other, so reading the trailer frame off
+    # the coded octets finds nothing and a denied call reads as one with no status at all. The
+    # decode is paid only past every cheap answer: a head that already carries the status, a
+    # response that is not grpc-web.
+    def self.response_wire(head : Bytes?, body : Bytes?) : {Int32?, String?}
+      verdict = response(head, nil)
+      return verdict if verdict[0] || body.nil? || !head || !AsciiBytes.contains_ci?(head, WEB_NEEDLE)
+      Proxy::H2::Grpc.wire_trailer_status(head, body)
     end
 
     # Does this REQUEST declare a gRPC content-type? Read once per run off the template's
@@ -188,6 +202,79 @@ module Gori::Fuzz
   # apart from "this target's response length is just noisy" (needs a wider sample set).
   record BaselineSample, metrics : Metrics, payload_len : Int32
 
+  # Apply one `stop_on` term to a condition matcher, returning an error SENTENCE or nil — the
+  # one home for the `DIM:SPEC` grammar the CLI (`--stop-on`) and the TUI Advanced row share
+  # (MCP names its dimensions as a JSON object and builds the matcher directly). A leading `!`
+  # makes the term a FILTER, so `!regex:Invalid password` stops when the body no longer carries
+  # it — the matcher's own way of expressing "missing". The SPEC keeps every colon after the
+  # first, so a regex may contain them. It never raises and never aborts: a value-level typo
+  # (`status:2OO`) parses lenient here and is caught by `Matcher#spec_error`, exactly as a
+  # `--mc 2OO` is; only a bad DIMENSION or an uncompilable regex is reported here.
+  # The non-regex `stop_on` dimensions, each as {set-match, set-filter, get-match, get-filter}
+  # — ONE table, so a dimension added here is both settable and refused when repeated; a
+  # table rather than a `case` so `apply_stop_term` stays one lookup, not one branch per
+  # dimension.
+  # `regex` is not here: it compiles its value, which the plain string setters do not.
+  STOP_DIMENSIONS = {
+    "status" => {->(m : Matcher, v : String) { m.match_status = v }, ->(m : Matcher, v : String) { m.filter_status = v },
+                 ->(m : Matcher) { m.match_status }, ->(m : Matcher) { m.filter_status }},
+    "grpc" => {->(m : Matcher, v : String) { m.match_grpc = v }, ->(m : Matcher, v : String) { m.filter_grpc = v },
+               ->(m : Matcher) { m.match_grpc }, ->(m : Matcher) { m.filter_grpc }},
+    "size" => {->(m : Matcher, v : String) { m.match_size = v }, ->(m : Matcher, v : String) { m.filter_size = v },
+               ->(m : Matcher) { m.match_size }, ->(m : Matcher) { m.filter_size }},
+    "words" => {->(m : Matcher, v : String) { m.match_words = v }, ->(m : Matcher, v : String) { m.filter_words = v },
+                ->(m : Matcher) { m.match_words }, ->(m : Matcher) { m.filter_words }},
+    "lines" => {->(m : Matcher, v : String) { m.match_lines = v }, ->(m : Matcher, v : String) { m.filter_lines = v },
+                ->(m : Matcher) { m.match_lines }, ->(m : Matcher) { m.filter_lines }},
+    "time" => {->(m : Matcher, v : String) { m.match_time = v }, ->(m : Matcher, v : String) { m.filter_time = v },
+               ->(m : Matcher) { m.match_time }, ->(m : Matcher) { m.filter_time }},
+    "header" => {->(m : Matcher, v : String) { m.match_header = v }, ->(m : Matcher, v : String) { m.filter_header = v },
+                 ->(m : Matcher) { m.match_header }, ->(m : Matcher) { m.filter_header }},
+  }
+
+  def self.apply_stop_term(spec : String, m : Matcher) : String?
+    neg = spec.starts_with?('!')
+    dim, sep, val = (neg ? spec[1..] : spec).partition(':')
+    return "stop_on term #{spec.inspect}: use DIM:SPEC (e.g. regex:admin, status:200, !regex:Invalid password)" if sep.empty?
+    return "stop_on term #{spec.inspect}: empty value" if val.blank?
+    key = dim.strip.downcase
+    return apply_stop_regex(m, val, neg) if key == "regex"
+    setters = STOP_DIMENSIONS[key]?
+    unless setters
+      return "stop_on term #{spec.inspect}: unknown dimension #{dim.inspect} " \
+             "(status|grpc|size|words|lines|time|header|regex, optionally !-negated)"
+    end
+    return stop_term_repeated(spec, key) if stop_term_set?(m, key, neg)
+    (neg ? setters[1] : setters[0]).call(m, val)
+    nil
+  end
+
+  private def self.apply_stop_regex(m : Matcher, val : String, neg : Bool) : String?
+    return stop_term_repeated(val, "regex") if (neg ? m.filter_regex : m.match_regex)
+    re = (Regex.new(val) rescue nil)
+    return "stop_on regex #{val.inspect} is not a valid regular expression" unless re
+    neg ? (m.filter_regex = re) : (m.match_regex = re)
+    nil
+  end
+
+  # A second term on the same side of the same dimension used to REPLACE the first:
+  # `--stop-on status:500 --stop-on status:302` kept only 302, and a 500 never stopped the run.
+  # Terms of different dimensions AND, so a repeat is refused rather than guessed at.
+  private def self.stop_term_set?(m : Matcher, key : String, neg : Bool) : Bool
+    return false unless dim = STOP_DIMENSIONS[key]?
+    current = (neg ? dim[3] : dim[2]).call(m)
+    !current.nil? && !current.blank?
+  end
+
+  private def self.stop_term_repeated(spec : String, key : String) : String
+    hint = case key
+           when "regex"  then "join them into one pattern (a|b)"
+           when "header" then "a header term is one substring; use regex:(a|b) for either"
+           else               "list the values in one term (#{key}:500,302)"
+           end
+    "stop_on term #{spec.inspect}: #{key} is already set by an earlier term — #{hint}"
+  end
+
   # Decides whether a response is "interesting" and extracts a value from it.
   # ffuf/Burp semantics: a result is MATCHED when every active matcher dimension
   # passes AND no filter dimension passes. Each dimension is a comma-list spec
@@ -304,6 +391,19 @@ module Gori::Fuzz
     property? auto_calibrate : Bool
     property keep_bodies : Symbol # :none | :matched | :all
 
+    # A SEPARATE match/filter predicate whose match ENDS the run — the `stop_on` condition
+    # (issue #1240), independent of this matcher's own dimensions. A run can `--mc 200` while
+    # it stops on `--stop-on 'regex:Welcome admin'`, or on `--stop-on '!regex:Invalid
+    # password'` (the body no longer contains it) — the latter is a filter_regex with no match
+    # spec, exactly as `Matcher` already expresses "missing".
+    #
+    # It is a `Matcher`, not a second parser, so its grammar and its `spec_error` are this
+    # file's; but it is NEVER built from its own decode. `Matcher#build` evaluates it through
+    # `decide_precomputed` on the SAME decoded body/text/metrics it computed for the run's own
+    # verdict — a second decode per response would double the hot path (P6). nil = no stop
+    # condition, which is every run that came before.
+    property stop_condition : Matcher? = nil
+
     # The template is a gRPC request whose SEED body frames cleanly (set once by
     # `Fuzz::Plan.build` — see `GrpcVerdict.framed_template?`). While it is on, every rendered
     # request is re-scanned and the ones a payload left MIS-framed are counted below.
@@ -332,6 +432,20 @@ module Gori::Fuzz
       @len_tol = Matcher.tolerance(samples.map(&.metrics.length), LEN_JITTER_FLOOR)
       @word_tol = Matcher.tolerance(samples.map(&.metrics.words.to_i64), COUNT_JITTER_FLOOR)
       @line_tol = Matcher.tolerance(samples.map(&.metrics.lines.to_i64), COUNT_JITTER_FLOOR)
+    end
+
+    # `true` for the four bytes `count_metrics` treats as whitespace (space, tab, LF, CR),
+    # `false` for every other byte — as a 256-entry table so that test is one load instead of
+    # four comparisons. Deliberately NOT `Char#whitespace?`: the scan is over raw response
+    # bytes, where a UTF-8 continuation byte must not be read as a character at all, and this
+    # is the same four bytes the previous `==` chain named.
+    WS_TABLE = begin
+      t = StaticArray(UInt8, 256).new(0_u8)
+      t[0x20] = 1_u8 # space
+      t[0x09] = 1_u8 # tab
+      t[0x0a] = 1_u8 # LF
+      t[0x0d] = 1_u8 # CR
+      t
     end
 
     # A generous per-pair slack (bytes) for the length-tracks-payload check below — covers
@@ -438,7 +552,7 @@ module Gori::Fuzz
     # baseline from the unmodified request).
     def metrics(raw : Repeater::Result) : Metrics
       body = decode(raw)
-      words, lines = count_metrics(body)
+      words, lines = Matcher.count_metrics(body)
       Metrics.new(raw.response.try(&.status), body.size.to_i64, words, lines, raw.duration_us)
     end
 
@@ -459,13 +573,32 @@ module Gori::Fuzz
       # origin is free to gzip that body like any other.
       grpc_status, grpc_message = GrpcVerdict.response(raw.head, body)
       length = body.size.to_i64
-      words, lines = count_metrics(body)
+      words, lines = Matcher.count_metrics(body)
 
-      need_text = !@match_regex.nil? || !@filter_regex.nil? || !@extract.nil?
-      text = need_text ? String.new(body).scrub : ""
+      # The stop condition's regex counts toward `need_text` too — it is evaluated on this same
+      # `text` below, so if it needs a body match the decode has to happen even when the run's
+      # own matchers do not (`--stop-on 'regex:…'` with no `--mr`).
+      elapsed = elapsed_ms(raw)
+      need_text = needs_text? || (@stop_condition.try(&.needs_text?) || false)
+      # `Gori::Utf8.text`, not `String.new(body).scrub`: the scrub is mandatory (PCRE2 raises on
+      # an invalid byte rather than not matching) but `String#scrub` charges every VALID body a
+      # full character-by-character decode to be told there was nothing to repair — 681µs against
+      # 81µs on a 216 KB body, once per response, on every run that sets `--mr`/`--fr`/`--extract`.
+      text = need_text ? Gori::Utf8.text(body) : ""
       extracted = extract_value(text)
-      matched = decide(raw, status, grpc_status, length, words, lines, elapsed_ms(raw), text)
-      keep = keep?(matched)
+      matched = decide(raw, status, grpc_status, length, words, lines, elapsed, text)
+      # The SEPARATE stop condition, on the very metrics/text just computed (never a second
+      # decode). nil for every run without `stop_on`, so the common path is unchanged.
+      stop_hit = @stop_condition.try(&.decide(raw, status, grpc_status, length, words, lines, elapsed, text)) || false
+      # A stop row's bytes are retained even under `keep_bodies: :matched`: it is the row that
+      # ended the run, and dropping its request/response would leave the operator the verdict
+      # with no evidence for it.
+      keep = keep?(matched) || stop_hit
+      # The response-shape key `Fuzz::Clusters` groups by (#1351), on this same decode and
+      # before the bytes below are dropped by the retention policy.
+      # A failed send has no body to mask, so its needles are never built.
+      shape = Shape.compute(status, grpc_status, raw.error, raw.incomplete?, raw.timed_out?,
+        raw.head, body, status ? Shape.needles(job) : Shape::NO_NEEDLES)
 
       Result.new(
         index: job.index, payloads: job.payloads, position: job.position,
@@ -477,7 +610,8 @@ module Gori::Fuzz
         wire: keep ? raw.wire.try { |w| present(w) } : nil,
         chain_error: job.chain_error,
         grpc_status: grpc_status, grpc_message: grpc_message,
-        timed_out: raw.timed_out?, resent_count: resent_count)
+        timed_out: raw.timed_out?, resent_count: resent_count, stop_hit: stop_hit,
+        shape: shape)
     end
 
     # Count a rendered request whose gRPC framing a payload broke. Only reached while
@@ -498,9 +632,20 @@ module Gori::Fuzz
       raw.duration_us // 1000
     end
 
-    private def decide(raw : Repeater::Result, status : Int32?, grpc_status : Int32?,
-                       length : Int64, words : Int32, lines : Int32, elapsed_ms : Int64,
-                       text : String) : Bool
+    # Whether any dimension this matcher evaluates reads the decoded body TEXT — the two body
+    # regexes and the extract. `build` ORs this with the stop condition's own answer to decide
+    # whether to pay the decode, so a `stop_on` regex is not silently never evaluated.
+    def needs_text? : Bool
+      !@match_regex.nil? || !@filter_regex.nil? || !@extract.nil?
+    end
+
+    # This matcher's verdict on metrics + text already decoded. PROTECTED, not private: a run's
+    # matcher also asks it of its `stop_condition` (another instance) on the single decode
+    # `build` paid for — the same answer as if that matcher had built the row itself, without
+    # decoding again.
+    protected def decide(raw : Repeater::Result, status : Int32?, grpc_status : Int32?,
+                         length : Int64, words : Int32, lines : Int32, elapsed_ms : Int64,
+                         text : String) : Bool
       return false unless eligible?(raw)
       return false if calibrated_out?(status, length, words, lines)
       matchers_pass?(raw, status, grpc_status, length, words, lines, elapsed_ms, text) &&
@@ -598,6 +743,13 @@ module Gori::Fuzz
         forms = dim == "status" ? "a status, a class (2xx), a range (200-299) or a comparator (>=400)" : "a number, a range (100-200) or a comparator (>=100)"
         return "#{which} #{dim} spec #{spec.inspect}: #{bad.inspect} is not #{forms}"
       end
+      # The separate stop condition is validated through the SAME predicate, so a `stop_on`
+      # typo (`--stop-on 'size:1O00'`) is refused at the surface exactly as a `--ms` one is,
+      # rather than running the whole sweep and never stopping. Its message names `stop`, so
+      # the operator knows which of the two predicates the bad term is in.
+      if err = @stop_condition.try(&.spec_error)
+        return "stop #{err}"
+      end
       nil
     end
 
@@ -660,8 +812,15 @@ module Gori::Fuzz
         regex_pass?(@filter_regex, text, default: false)
     end
 
+    # `matches_at_byte_index?(text, 0)`, not `matches?(text)`. The two run the same PCRE2 match
+    # from the same offset, but `matches?` takes a CHARACTER index and converts it — and
+    # `String#char_index_to_byte_index` asks `single_byte_optimizable?`, which computes
+    # `String#size`, a full UTF-8 character count over the whole body. For the constant 0 that
+    # conversion cannot produce anything but 0, and it measured 593 profile samples against 263
+    # for the match itself: more than twice the response's regex cost spent deciding that byte 0
+    # is byte 0. Same answer, on an empty body too (`char_index_to_byte_index(0)` is 0 there).
     private def regex_pass?(re : Regex?, text : String, default : Bool) : Bool
-      re ? re.matches?(text) : default
+      re ? re.matches_at_byte_index?(text, 0) : default
     rescue Regex::Error
       # A catastrophic-backtracking user regex (--mr / --fr) raises "match limit exceeded" on a
       # large response body instead of returning false; treat an un-evaluable pattern as no-match
@@ -704,7 +863,9 @@ module Gori::Fuzz
     private def extract_value(text : String) : String?
       re = @extract
       return nil if re.nil? || text.empty?
-      md = re.match(text)
+      # `match_at_byte_index`, for the reason `regex_pass?` gives: `Regex#match`'s char-index
+      # conversion is a whole-body character count to turn 0 into 0.
+      md = re.match_at_byte_index(text, 0)
       return nil unless md
       md[1]? || md[0]
     rescue Regex::Error
@@ -740,19 +901,31 @@ module Gori::Fuzz
 
     # Word count (whitespace transitions) AND line count (0x0a bytes) over the decoded body
     # in ONE allocation-free pass. 0x0a is already a whitespace byte in the word scan, so
-    # counting lines inside that same branch is bit-identical to two separate traversals.
-    private def count_metrics(body : Bytes) : {Int32, Int32}
+    # counting lines in the same step is bit-identical to two separate traversals.
+    #
+    # Table-driven and branchless on the word half. This runs over EVERY response of every run,
+    # unconditionally — there is no spec to switch it off the way `--mr` switches the regex on —
+    # so the four-way `==` chain per byte was the run's floor. `WS_TABLE` answers "is this byte
+    # whitespace" with one load, and a word OPENS exactly where the previous byte was whitespace
+    # and this one is not, which is `prev & (ws ^ 1)` with no branch to mispredict. Measured
+    # 147µs -> 80µs on a 216 KB body; the counts are unchanged (`prev` starts at 1 because a body
+    # begins "after whitespace", which is what `in_word = false` meant).
+    #
+    # Public because `Miner::Fingerprint` counts the same way over its own decode.
+    def self.count_metrics(body : Bytes) : {Int32, Int32}
       words = 0
       lines = 0
-      in_word = false
-      body.each do |b|
-        if b == 0x20_u8 || b == 0x09_u8 || b == 0x0a_u8 || b == 0x0d_u8
-          in_word = false
-          lines += 1 if b == 0x0a_u8
-        elsif !in_word
-          in_word = true
-          words += 1
-        end
+      prev_ws = 1
+      table = WS_TABLE.to_unsafe
+      p = body.to_unsafe
+      stop = p + body.size
+      while p < stop
+        b = p.value
+        ws = table[b].to_i32
+        words += prev_ws & (ws ^ 1)
+        lines += 1 if b == 0x0a_u8
+        prev_ws = ws
+        p += 1
       end
       {words, lines}
     end
@@ -862,7 +1035,7 @@ module Gori::Fuzz
           end
         end
         # `[1-5]xx` — a class no HTTP status can belong to (`6xx`) is as unsatisfiable as a typo.
-        !(rest.matches?(/\A[1-5]xx\z/) || rest.to_i?)
+        !(Utf8.subject(rest).matches?(/\A[1-5]xx\z/) || rest.to_i?)
       end
     end
 

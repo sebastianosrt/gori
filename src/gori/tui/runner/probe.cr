@@ -5,51 +5,38 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     probe_controller.probe_move(delta)
   end
 
-  def probe_open : Nil
-    probe_controller.probe_open
-  end
+  forward probe_open : Nil,
+    probe_close : Nil,
+    to: probe_controller
 
-  def probe_close : Nil
-    probe_controller.probe_close
+  # `⇧N`/`⇧P` in the drill-in — the next/previous finding, in place.
+  def probe_step_item(delta : Int32) : Nil
+    probe_controller.probe_step_item(delta)
   end
 
   def probe_query : Nil
     probe_controller.view.start_query
   end
 
-  def probe_clear : Nil
-    probe_controller.probe_clear
-  end
-
-  def probe_delete : Nil
-    probe_controller.probe_delete
-  end
+  forward probe_clear : Nil,
+    probe_delete : Nil,
+    to: probe_controller
 
   # Open the MODE picker (a shell overlay); its injected commit applies it to the analyzer.
   def probe_set_mode : Nil
     open_choice_picker(ChoicePicker.for_probe_mode(@session.probe.mode.value)) { |p| apply_probe_mode(p) }
   end
 
-  def probe_dismiss : Nil
-    probe_controller.probe_dismiss
-  end
-
-  def probe_toggle_closed : Nil
-    probe_controller.probe_toggle_closed
-  end
-
-  def probe_dismiss_code : Nil
-    probe_controller.probe_dismiss_code
-  end
-
-  def probe_dismiss_host : Nil
-    probe_controller.probe_dismiss_host
-  end
+  forward probe_dismiss : Nil,
+    probe_toggle_closed : Nil,
+    probe_dismiss_code : Nil,
+    probe_dismiss_host : Nil,
+    to: probe_controller
 
   # Jump from an issue to its sample evidence: History flow when present, else the
   # Repeater tab that first produced the hit (Repeater-sourced passive issues).
   def probe_open_flow : Nil
-    return unless i = probe_controller.view.target_issue
+    return unless i = probe_target_now
     if fid = i.sample_flow_id
       if history_controller.view.open_detail_id(fid, @session.store)
         @active_tab = :history
@@ -69,7 +56,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
 
   # ↵ on the AFFECTED URLS list: open the flow THAT url was captured on, which for a group of
   # 50 is 50 different exchanges — `o` can only ever reach the one sample. CROSS-TAB mediator:
-  # reads the Probe controller, drives the History controller + overlay (issue_open_flow's shape).
+  # reads the Probe controller, drives the History controller + overlay (`navigate_link_ref`'s shape).
   #
   # The list holds bare strings — `upsert_probe_issue` accumulates `Detection#url` and keeps no
   # per-URL flow id — so the row is resolved through the store by URL, narrowed by the issue's
@@ -102,7 +89,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   # Send an issue's sample flow to Repeater to re-test it (mirrors issue_repeater_flow).
   # When the only evidence is a Repeater tab, jump there instead of re-spawning.
   def probe_repeater_flow : Nil
-    return unless i = probe_controller.view.target_issue
+    return unless i = probe_target_now
     if fid = i.sample_flow_id
       if @session.store.get_flow(fid)
         repeater_flow(fid)
@@ -137,7 +124,8 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
 
   # Probe findings list → the selected issue's sample flow (re-test the evidence in place).
   def probe_active_rescan : Nil
-    return (@toast = "select an issue first") unless i = probe_controller.view.target_issue
+    return (@toast = "select an issue first") unless probe_controller.view.target_issue
+    return unless i = probe_target_now
     fid = i.sample_flow_id
     return (@toast = "this issue has no captured flow to re-scan") unless fid
     detail = @session.store.get_flow(fid)
@@ -153,9 +141,11 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   end
 
   # Promote a machine-found Probe issue to a human-confirmed Issue (the bridge to the
-  # Issues report). Reuses Store#insert_issue; the issue's severity/host/sample flow carry over.
+  # Issues report). Probe::Triage.promote carries its severity/host, notes and affected flows over.
   def probe_promote : Nil
-    return unless i = probe_controller.view.target_issue
+    # The row as it is NOW: promotion copies its sample flow into the new Issue and keys
+    # "already promoted" off its status.
+    return unless i = probe_target_now
     # Same call the CLI/MCP promote paths make. A store-busy Failed must NOT read as
     # "already promoted" — that would tell the user to stop retrying the one thing that
     # would fix it.
@@ -170,8 +160,24 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     end
   end
 
+  # The targeted finding as it is NOW, for a verb that follows its sample flow or writes it
+  # (see ProbeView#fresh_target_issue). The list is re-read only when a finding moves, and a
+  # history clear nulls `sample_flow_id` without moving one — so the listed copy can name a flow
+  # id the clear has since handed to a DIFFERENT capture. nil with nothing targeted, and nil
+  # with a toast when the row is gone.
+  private def probe_target_now : Store::ProbeIssue?
+    return nil unless probe_controller.view.target_issue
+    issue = probe_controller.view.fresh_target_issue(@session.store)
+    @toast = "issue no longer exists" unless issue
+    issue
+  end
+
   def probe_rule_toggle : Nil
     probe_controller.rules_toggle_selected
+  end
+
+  def probe_rule_filter : Nil
+    probe_controller.rules_filter
   end
 
   def probe_rule_add : Nil
@@ -190,12 +196,15 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     probe_controller.rules_custom_selected?
   end
 
-  # A Probe issue's detail is open — the gate for its AFFECTED URLS read verbs.
-  def probe_detail_readable? : Bool
-    probe_controller.probe_detail_readable?
+  # A Probe issue's detail is open — the gate for its read panes' verbs (either pane).
+  forward probe_detail_readable? : Bool, to: probe_controller
+
+  # An AFFECTED URL is under the caret — `probe_affected_url` already answers nil while
+  # DESCRIPTION holds focus, so this reads the same fact `probe_open_affected` acts on rather
+  # than a second one that could disagree with it.
+  def probe_affected_selected? : Bool
+    !probe_controller.probe_affected_url.nil?
   end
 
-  def probe_issue_selected? : Bool
-    probe_controller.probe_issue_selected?
-  end
+  forward probe_issue_selected? : Bool, to: probe_controller
 end

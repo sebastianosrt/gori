@@ -7,8 +7,10 @@ require "./project"
 require "./project_registry"
 require "./session"
 require "./store"
+require "./idle_gc"
 require "./proxy/tls/cert_authority"
 require "./cli/output"
+require "./capture_completion"
 require "./verb"
 require "./verbs/core"
 require "./verbs/history"
@@ -16,6 +18,7 @@ require "./verbs/sitemap"
 require "./verbs/issues"
 require "./verbs/comparer"
 require "./verbs/diff"
+require "./verbs/params"
 require "./verbs/decoder"
 require "./verbs/jwt"
 require "./verbs/cookie"
@@ -64,7 +67,12 @@ module Gori
     # alternate screen and SGR-1006 mouse reporting still on and only `reset` recovers it.
     # `gori run capture` never touched the tty, so its exit-on-HUP costs at most a partial
     # line — and trapping it there would silently turn a documented 129 into a 0.
-    TUI_SIGNALS = CAPTURE_SIGNALS + [Signal::HUP]
+    {% if flag?(:win32) %}
+      # Windows has no HUP; a closed console window arrives as TERM (`win32_signal.cr`).
+      TUI_SIGNALS = CAPTURE_SIGNALS
+    {% else %}
+      TUI_SIGNALS = CAPTURE_SIGNALS + [Signal::HUP]
+    {% end %}
 
     # Restores the terminal when a DELIVERED signal would otherwise kill the TUI outright.
     #
@@ -100,7 +108,12 @@ module Gori
 
       # Never returns: a signal sent to self under the default disposition terminates the
       # process inside the `kill` syscall, before any further fiber can be scheduled.
-      REAL_DIE = ->(sig : Signal) { Process.signal(sig, Process.pid) }
+      {% if flag?(:win32) %}
+        # Windows cannot signal a process: exit with the status a signal death reads as.
+        REAL_DIE = ->(sig : Signal) { exit 128 + sig.value }
+      {% else %}
+        REAL_DIE = ->(sig : Signal) { Process.signal(sig, Process.pid) }
+      {% end %}
 
       def initialize(@restore : Proc(Nil),
                      @signals : Array(Signal) = TUI_SIGNALS,
@@ -162,6 +175,7 @@ module Gori
       # depends on landing in gori.log. Re-assert gori's binding now that Termisu has had its
       # say (same memoized io — no new fd, no duplicate lines).
       Tui.bind_log_file
+      IdleGc.start # hand the heap a capture burst grew back to the OS once the process is idle
 
       begin
         # Armed FIRST, before anything else in this block: `open_terminal` above has ALREADY
@@ -199,7 +213,8 @@ module Gori
         # flag deliberately no longer touches (Settings.cli_bind_host). That separation is what
         # keeps the wizard from writing a one-run override into settings.json as the permanent
         # default, while this session still binds where the flag said.
-        wizard_error = File.exists?(Settings.path) ? nil : Tui::SetupWizard.new(term).run
+        handoff = open_db_path ? Tui::Tutorial::Handoff::Direct : Tui::Tutorial::Handoff::Picker
+        wizard_error = File.exists?(Settings.path) ? nil : Tui::SetupWizard.new(term, handoff).run
         # `notice` is the picker's one-line "here is why you are looking at this screen".
         # A failed open used to fall through to the picker in SILENCE, its reason reachable
         # only by knowing to read ~/.gori/gori.log, so an operator who typo'd `--db` saw
@@ -222,11 +237,13 @@ module Gori
           notice = db_error || notice
         end
         loop do
-          project = Tui::ProjectPicker.new(term, projects, notice: notice).run
+          picker = Tui::ProjectPicker.new(term, projects, notice: notice)
+          project = picker.run
           break unless project # nil => quit gori
           # Reassigned every pass: a picker-chosen project that won't open reports it the
           # same way, and a successful open clears the previous failure's notice.
-          outcome, notice = open_or_report_guard(project, term)
+          # `focus_flow_id` is set when the pick came from a cross-project search hit (#1229).
+          outcome, notice = open_or_report_guard(project, term, picker.focus_flow_id)
           break if outcome == :quit
         end
       ensure
@@ -254,8 +271,9 @@ module Gori
     end
 
     # Non-interactive capture into `project`. Binds the proxy (fatal on failure, as
-    # capture is the whole point here), streams one line per completed/errored flow
-    # (`:text` = the legacy format, `:json` = JSON-Lines), and runs until INT/TERM,
+    # capture is the whole point here), streams each completed/errored flow (`:text` = the
+    # legacy line, `:jsonl` = one object per line, `:json` = one array, closed when the stream
+    # ends — see `capture_printer`), and runs until INT/TERM,
     # an optional wall-clock `every` duration, or an optional completed-flow `max`.
     # Returns true when shutdown came from INT/TERM (caller should exit 130), false
     # when `--for` / `--max` ended the run on purpose.
@@ -269,14 +287,21 @@ module Gori
           # unreadable) gets a clean error, not a raw DB::ConnectionRefused backtrace.
           abort "gori run capture: cannot open database #{project.db_path}: #{ex.message.presence || "not a valid SQLite database (or unreadable)"}"
         end
+      # The open-time token-grammar reconcile, on this surface's channel. `Log` rather than a bare
+      # STDERR line so it lands in the same stream as the rest of a capture's diagnostics — and
+      # never in the `:json` flow stream on STDOUT, which is somebody's input.
+      session.env_syntax_migration.try(&.notices.each { |line| Log.info { line } })
+      Settings.take_env_syntax_global_migration.try { |g| Log.info { g.line } }
       if err = session.bind_error
         STDERR.puts "gori: not capturing — #{err}"
         STDERR.puts "  another gori instance may hold this project or the port; close it or pass --port."
         session.close
         exit 1
       end
-      print_banner(session)
-      spawn { capture_printer(session, format, max) }
+      print_banner(session, max, every)
+      IdleGc.start # hand the heap a capture burst grew back to the OS once the process is idle
+      printer_done = Channel(Nil).new(1)
+      spawn { capture_printer(session, format, max, printer_done) }
       reload_stop = spawn_reload_loop(session)
       signaled = false
       install_signal_traps { signaled = true }
@@ -293,6 +318,13 @@ module Gori
       # to make no further store calls — safe to close the store right after.
       reload_stop.send(nil) rescue nil
       session.close
+      # The printer owns the stream's last bytes (a `--format json` array's closing `]`), and
+      # closing the session is what ends it: wait for it, so the process cannot exit with the
+      # array still open. Bounded, so a printer stuck on a full pipe cannot hold the exit.
+      select
+      when printer_done.receive
+      when timeout(2.seconds)
+      end
       signaled
     end
 
@@ -310,20 +342,24 @@ module Gori
     # ALREADY held. A compact that starts in the gap between the probe and the open falls
     # through to `try_shared` and waits it out exactly as before, which is the rare race inside
     # an already-rare collision.
-    private def open_or_report_guard(project : Project, term : Termisu) : {Symbol, String?}
+    private def open_or_report_guard(project : Project, term : Termisu,
+                                     focus_flow_id : Int64? = nil) : {Symbol, String?}
       if OpenLock.guarded?(project.db_path)
         # `:back` with a reason is the picker's own "here is why you are looking at this
         # screen" channel — the same one a failed open uses, so this needs no new surface.
         return {:back, OpenLock.guarded_message(project.db_path)}
       end
-      open_and_run(project, term)
+      open_and_run(project, term, focus_flow_id)
     end
 
     # `{outcome, error}`. `outcome` is :quit (leave gori) or :back (return to the picker);
     # `error` is a one-line reason and is non-nil ONLY when the session never opened, so the
     # caller can tell "the user pressed q" apart from "this project never opened" — both of
     # which are :back, and only one of which is worth putting on screen.
-    private def open_and_run(project : Project, term : Termisu) : {Symbol, String?}
+    #
+    # `focus_flow_id` opens the session on that flow's History detail (see
+    # `Runner#focus_flow_on_start`).
+    private def open_and_run(project : Project, term : Termisu, focus_flow_id : Int64? = nil) : {Symbol, String?}
       # Pick up any bind address / verify-upstream toggle changed via Settings since startup
       # (the previous session kept its values; this one opens on the new ones). `startup_*`,
       # not the bare globals: a `-l`/`-p` flag lives in its own layer now, and dropping it here
@@ -349,6 +385,7 @@ module Gori
         end
       begin
         runner = Tui::Runner.new(session, term)
+        runner.focus_flow_on_start = focus_flow_id
         # Verify on but no CA trust store resolvable (e.g. a static musl build on a host
         # without a standard CA bundle): every HTTPS flow would fail upstream verification
         # (#323). Surface it once at startup — the per-flow error (#332) explains each failure,
@@ -372,30 +409,32 @@ module Gori
       end
     end
 
-    private def capture_printer(session : Session, format : Symbol, max : Int32?) : Nil
+    private def capture_printer(session : Session, format : Symbol, max : Int32?,
+                                done : Channel(Nil)) : Nil
       printed = 0
-      seen = Set(Int64).new
+      completion = CaptureCompletion.new
+      # `json` is ONE array, as on every other command, and `jsonl` one object per line (#1386).
+      # It used to be JSON-Lines for both. The array is opened at once, each flow is written as
+      # it completes, and it is closed in the `ensure` below whichever way the stream ends —
+      # `--max`, `--for`, a signal — so what a consumer collects is always one JSON document.
+      array = format == :json
+      if array
+        print '['
+        STDOUT.flush
+      end
       loop do
         event = session.flow_events.receive
-        next unless event.kind == :updated # one line per completed/errored flow
-        # A WebSocket flow (status 101) emits an :updated PER message on the SAME id;
-        # print + count it ONCE (its first update), else it prints duplicate rows and
-        # its own messages trip --max, tearing the live connection down mid-stream.
-        next if seen.includes?(event.id)
-        if row = session.store.flow_row(event.id)
-          # Only WS re-emits :updated, so only WS ids need de-dup tracking — keeping
-          # `seen` bounded by concurrent WS flows instead of growing per HTTP flow for
-          # the lifetime of a long `gori run capture` session.
-          seen << event.id if row.status == 101
-          # Stream the SAME row rendering `gori run history` prints, so capture and
-          # history output never drift (text = human-readable; json = stable contract).
-          puts(format == :json ? CLI::Output.flow_row_json(row) : CLI::Output.flow_row_text(row))
-          STDOUT.flush # stream each flow promptly even when piped (block-buffered)
-          printed += 1
-          if max && printed >= max
-            @shutdown.send(nil) rescue nil # hit --max: ask the main fiber to wind down
-            break
-          end
+        next unless row = session.store.flow_row(event.id)
+        next unless completion.ready?(event, row)
+        # An upgraded flow emits an :updated event for its handshake and another :updated event
+        # for each captured message. Count it only on the one completion event after the tunnel
+        # closes; ordinary flows still count on their response update.
+        print_capture_row(row, format, first: printed.zero?)
+        STDOUT.flush # stream each flow promptly even when piped (block-buffered)
+        printed += 1
+        if max && printed >= max
+          @shutdown.send(nil) rescue nil # hit --max: ask the main fiber to wind down
+          break
         end
       end
     rescue Channel::ClosedError
@@ -410,6 +449,29 @@ module Gori
       # so there's nothing left to stream — wind the session down gracefully
       # instead of letting the unhandled error take down the whole process.
       @shutdown.send(nil) rescue nil
+      array = false # nobody is left to read a closing bracket
+    ensure
+      close_capture_array if array
+      done.send(nil) # buffered and never closed, so this cannot block or raise
+    end
+
+    # One completed flow on the capture stream: an array element (comma-led after the first),
+    # a JSON line, or a text row.
+    private def print_capture_row(row : Store::FlowRow, format : Symbol, *, first : Bool) : Nil
+      case format
+      when :json
+        print ',' unless first
+        print CLI::Output.flow_row_json(row)
+      when :jsonl then puts CLI::Output.flow_row_json(row)
+      else             puts CLI::Output.flow_row_text(row)
+      end
+    end
+
+    private def close_capture_array : Nil
+      puts ']'
+      STDOUT.flush
+    rescue IO::Error
+      # the reader is gone; there is nobody to close the document for
     end
 
     # A peer's RULE edits, which the reload loop has already adopted into the objects this process
@@ -554,7 +616,7 @@ module Gori
       stop
     end
 
-    private def print_banner(session : Session) : Nil
+    private def print_banner(session : Session, max : Int32?, every : Time::Span?) : Nil
       proxy = session.proxy
       upstream = @config.insecure_upstream? ? "insecure-upstream" : "verify-upstream"
       # The bind is what we CALL the listener; `addr` is what the user can actually type
@@ -575,7 +637,15 @@ module Gori
       Settings.outbound_tls_warnings.each { |w| STDERR.puts "  ⚠ #{w}" }
       # See the sibling emission in `open_and_run`.
       Settings.upstream_proxy_warnings.each { |w| STDERR.puts "  ⚠ #{w}" }
-      STDERR.puts "  press Ctrl-C to stop"
+      # A timed or counted run ends by itself, so "press Ctrl-C to stop" alone read as if it
+      # would not (#1507). `--for` only takes whole s/m/h, which `span_label` prints exactly.
+      stops = [every.try { |e| "after #{SessionSlot::RefreshBefore.span_label(e)}" },
+               max.try { |n| "after #{Gori.plural(n, "flow")}" }].compact
+      if stops.empty?
+        STDERR.puts "  press Ctrl-C to stop"
+      else
+        STDERR.puts "  stops #{stops.join(" or ")}; press Ctrl-C to stop sooner"
+      end
     end
 
     # Headless capture's orderly stop: the main fiber is parked on `@shutdown.receive`, so a

@@ -1,0 +1,374 @@
+# `gori run evidence` — FROZEN evidence (#1038/#1039): the immutable copy of one exchange,
+# taken from a captured Flow or a Repeater tab at the moment it proved the finding. `links`
+# is the pointer; this is the bytes. A script that confirms a finding and then retests the
+# fix freezes twice and the issue holds both.
+#
+# Issue membership is many-to-many and mutable (`link`/`unlink`) while the bytes are not, so
+# `list` without `--issue` is the headless twin of the TUI's Evidence tab: the project-wide
+# archive, orphans included. Anything narrower could not name a snapshot whose last Issue
+# link is gone, which is exactly the copy that needs finding.
+require "../../evidence"
+require "../../mcp/serialize"
+
+module Gori
+  module CLI
+    module Run
+      @[Subcommand("evidence", help: [
+        {"evidence", "Freeze/list/show/link/unlink/delete frozen request+response copies"},
+      ])]
+      private def self.cmd_evidence(args : Array(String)) : Nil
+        case sub = args.first?
+        when "freeze"       then cmd_evidence_freeze(args[1..])
+        when "list"         then cmd_evidence_list(args[1..])
+        when "show"         then cmd_evidence_show(args[1..])
+        when "link"         then cmd_evidence_membership(args[1..], link: true)
+        when "unlink"       then cmd_evidence_membership(args[1..], link: false)
+        when "delete", "rm" then cmd_evidence_delete(args[1..])
+        else
+          # See `verb_token?` — a bare word here is a mistyped verb, not a query.
+          if verb_token?(sub)
+            abort "gori run evidence: unknown subcommand '#{sub}' (freeze, list, show, link, unlink, delete/rm)"
+          end
+          cmd_evidence_list(args)
+        end
+      end
+
+      private def self.cmd_evidence_freeze(args : Array(String)) : Nil
+        proj = ProjectFlags.new
+        issue_id : Int64? = nil
+        ref_s : String? = nil
+        ref_id : Int64? = nil
+        link = true
+        allow_drift = false
+        format = :text
+
+        parse_no_positionals(args, "gori run evidence freeze",
+          "every end is named by a flag (--issue, --ref, --ref-id)") do |p|
+          p.banner = "Usage: gori run evidence freeze --issue=N --ref=flow|repeater --ref-id=M [--no-link]\n\n" \
+                     "Copy a flow's or a Repeater tab's CURRENT exchange into immutable evidence on\n" \
+                     "issue N: request, response, status, timing, protocol, error and truncation\n" \
+                     "state, with a SHA-256 of each. The Repeater's next send and History retention\n" \
+                     "cannot reach the copy. Freeze again after a retest to keep both.\n" \
+                     "A Repeater tab that has never been sent is refused: there is no exchange,\n" \
+                     "and so is one whose request was edited after its stored response arrived —\n" \
+                     "that pair never happened. Send it again, or --allow-drift to keep it anyway."
+          project_options(p, proj, "update")
+          p.on("--issue=N", "Issue id that owns the copy (required)") { |v| issue_id = parse_id(v, "gori run evidence", "--issue") }
+          p.on("--ref=KIND", "Source kind: flow | repeater (required)") { |v| ref_s = v.strip.downcase }
+          p.on("--ref-id=M", "Source id (required)") { |v| ref_id = parse_id(v, "gori run evidence", "--ref-id") }
+          p.on("--no-link", "Only copy — do not also file the live link `links add` would") { link = false }
+          p.on("--allow-drift", "Freeze a Repeater tab whose request was edited after its stored response") { allow_drift = true }
+          format_flag(p, [:text, :json], "Output: text (default) | json") { |f| format = f }
+        end
+        iid, kind, rid = resolve_freeze_ends(issue_id, ref_s, ref_id)
+
+        with_store(resolve_read_project(proj.name, proj.db)) do |store|
+          abort "gori run evidence freeze: no issue with id #{iid}" unless store.get_issue(iid)
+          snap = freeze_snapshot(store, kind, rid, allow_drift)
+          abort "gori run evidence freeze: #{snap}" if snap.is_a?(String)
+          id, status = store.freeze_evidence(iid, snap, link: link)
+          case status
+          in .issue_gone? then abort "gori run evidence freeze: issue ##{iid} was deleted before the copy was written"
+          in .quota?
+            abort "gori run evidence freeze: evidence quota reached (#{store.evidence_bytes} of #{Evidence::QUOTA_BYTES} bytes used) — delete a frozen copy first"
+          in .busy? then abort "gori run evidence freeze: nothing frozen (project busy or unwritable)"
+          in .ok?   then nil
+          end
+          meta = store.get_evidence_meta(id) || abort("gori run evidence freeze: frozen evidence ##{id} vanished before it could be read back")
+          if format == :json
+            puts(JSON.build { |j| j.object { MCP::Serialize.evidence_meta(j, meta); j.field "linked", link } })
+          else
+            puts "Frozen evidence ##{id} on issue ##{iid} from #{meta.source_label}#{link ? " (linked)" : ""}: " \
+                 "#{Evidence.label(meta)} → #{Evidence.outcome(meta)}, #{evidence_bytes_text(meta.bytes)}"
+            puts "  sha256 req #{meta.request_sha256}"
+            puts "  sha256 res #{meta.response_sha256 || "— (no response)"}"
+          end
+        end
+      end
+
+      # The copy to write, or the sentence to refuse with — `Evidence.snapshot_for`'s
+      # refusals plus the drift gate, answered together so the command asks once.
+      #
+      # Drift is REFUSED by default here where the TUI asks: this command is what a script
+      # calls, and a script cannot look at the tab. `--allow-drift` is the operator saying
+      # they already know — the copy is still written and still labelled evidence, and the
+      # sentence names the flag so nobody has to go looking for it.
+      private def self.freeze_snapshot(store : Store, kind : Store::LinkRefKind, id : Int64,
+                                       allow_drift : Bool) : Evidence::Snapshot | String
+        snap = Evidence.snapshot_for(store, kind, id)
+        return snap if snap.is_a?(String)
+        Evidence.drift_refusal(snap, allow_drift, "--allow-drift") || snap
+      end
+
+      private def self.cmd_evidence_list(args : Array(String)) : Nil
+        proj = ProjectFlags.new
+        issue_id : Int64? = nil
+        format = :text
+
+        leftover = parse_args(args, "gori run evidence") do |p|
+          p.banner = "Usage: gori run evidence [list] [--issue=N]\n\n" \
+                     "List frozen evidence: source, when the copy was taken, status, size, the\n" \
+                     "Issues it is linked to and the SHA-256 of the stored request and response.\n" \
+                     "Never the bytes — those are `gori run evidence show ID`.\n\n" \
+                     "Without --issue this is the whole project archive, newest first, INCLUDING\n" \
+                     "orphans (a snapshot whose last Issue link was removed, or whose Issue was\n" \
+                     "deleted) — the copies no per-issue listing can reach.\n\n" \
+                     "Or run with a subcommand:\n" \
+                     "  gori run evidence freeze --issue=N --ref=flow|repeater --ref-id=M [--no-link]\n" \
+                     "  gori run evidence show ID [--include-sensitive] [--format=json]\n" \
+                     "  gori run evidence link ID --issue=N\n" \
+                     "  gori run evidence unlink ID --issue=N\n" \
+                     "  gori run evidence delete ID   (`rm` is accepted)"
+          project_options(p, proj, "read")
+          p.on("--issue=N", "Issue id (omit for the whole project archive)") { |v| issue_id = parse_id(v, "gori run evidence", "--issue") }
+          format_flag(p, [:text, :json], "Output: text (default) | json") { |f| format = f }
+        end
+        refuse_list_leftovers(leftover, "evidence", "freeze, list, show, link, unlink, delete/rm")
+        iid = issue_id
+
+        metas = with_store(resolve_read_project(proj.name, proj.db), read_only: true) do |store|
+          if iid
+            abort "gori run evidence: no issue with id #{iid}" unless store.get_issue(iid)
+            store.issue_evidence(iid)
+          else
+            store.evidence
+          end
+        end
+
+        if format == :json
+          puts(JSON.build { |j| j.array { metas.each { |m| j.object { MCP::Serialize.evidence_meta(j, m) } } } })
+        elsif metas.empty?
+          puts iid ? "no frozen evidence on issue ##{iid}" : "no frozen evidence in this project"
+        else
+          metas.each { |m| puts evidence_line(m) }
+        end
+      end
+
+      private def self.cmd_evidence_show(args : Array(String)) : Nil
+        proj = ProjectFlags.new
+        format = :text
+        include_sensitive = false
+
+        positional = parse_args(args, "gori run evidence show") do |p|
+          p.banner = "Usage: gori run evidence show ID [--include-sensitive] [--format=text|json]\n\n" \
+                     "Print one frozen copy: its provenance, then the request and the response as\n" \
+                     "they were stored. Authorization / Cookie / Set-Cookie / API-key values read\n" \
+                     "[REDACTED] unless --include-sensitive, and bodies go through the project's\n" \
+                     "default redaction profile (`gori run redact default`) unless it is passed;\n" \
+                     "the SHA-256s cover the stored wire bytes, so verifying them needs the raw\n" \
+                     "head. Bodies are decoded and capped at #{Issues::Export::EVIDENCE_CAP} bytes on the text form."
+          project_options(p, proj, "read")
+          p.on("--include-sensitive", "Emit credential header values verbatim instead of [REDACTED]") { include_sensitive = true }
+          format_flag(p, [:text, :json], "Output: text (default) | json") { |f| format = f }
+        end
+        id = require_positional_id(positional, "gori run evidence show", "id", "gori run evidence")
+
+        # The project's default body redaction, as MCP `get_evidence` and the TUI apply it — read
+        # while the store is open, since the profile lives on its settings row.
+        ev, note = with_store(resolve_read_project(proj.name, proj.db), read_only: true) do |store|
+          ev = store.get_evidence(id) || abort_closing(store, "gori run evidence show: no frozen evidence with id #{id}")
+          matcher = include_sensitive ? nil : Redact::Policy.ambient(store)
+          next {ev, nil} unless matcher
+          clean, count, decoded = Redact::Wire.evidence(ev, matcher)
+          {clean, MCP::Serialize::RedactionNote.new(matcher.profile.name, count, 0, decoded)}
+        end
+
+        if format == :json
+          puts MCP::Serialize.evidence_json(ev, include_sensitive, redaction: note)
+        else
+          puts evidence_text(ev, include_sensitive)
+          if n = note
+            STDERR.puts "gori run evidence show: bodies sanitized with profile #{n.profile.inspect} " \
+                        "(#{Gori.plural(n.bodies, "value")} redacted; --include-sensitive shows them)"
+          end
+        end
+      end
+
+      # Issue membership is mutable; the snapshot and its hashes are not. Link and unlink
+      # therefore name the frozen copy positionally and the Issue explicitly, rather than
+      # reusing the live entity-link command whose target is a source object.
+      private def self.cmd_evidence_membership(args : Array(String), *, link : Bool) : Nil
+        verb = link ? "link" : "unlink"
+        proj = ProjectFlags.new
+        issue_id : Int64? = nil
+
+        positional = parse_args(args, "gori run evidence #{verb}") do |p|
+          p.banner = "Usage: gori run evidence #{verb} ID --issue=N\n\n" \
+                     "#{link ? "Attach" : "Detach"} an Issue without changing the frozen bytes, hashes, or provenance. " \
+                     "Removing the last Issue leaves an orphan; it does not delete the snapshot."
+          project_options(p, proj, "update")
+          p.on("--issue=N", "Issue id (required)") { |v| issue_id = parse_id(v, "gori run evidence", "--issue") }
+        end
+        id = require_positional_id(positional, "gori run evidence #{verb}", "id", "gori run evidence")
+        iid_opt = issue_id
+        abort "gori run evidence #{verb}: --issue is required" if iid_opt.nil?
+        iid = iid_opt
+
+        with_store(resolve_read_project(proj.name, proj.db)) do |store|
+          meta = store.get_evidence_meta(id) || abort("gori run evidence #{verb}: no frozen evidence with id #{id}")
+          abort "gori run evidence #{verb}: no issue with id #{iid}" unless store.get_issue(iid)
+          if link
+            evidence_link_one(store, meta, iid)
+          else
+            evidence_unlink_one(store, meta, iid)
+          end
+        end
+      end
+
+      # An already-linked pair is reported, not refused: `link` states an end state, and a
+      # script that runs twice has not failed. `unlink` DOES refuse a pair that is not
+      # linked — there the end state is reached by doing nothing, but naming a link that
+      # was never there is a typo'd id far more often than it is idempotence.
+      private def self.evidence_link_one(store : Store, meta : Store::IssueEvidenceMeta, iid : Int64) : Nil
+        if meta.issue_ids.includes?(iid)
+          puts "Frozen evidence ##{meta.id} was already linked to issue ##{iid}."
+          return
+        end
+        abort "gori run evidence link: NOT linked (project busy or either row disappeared)" unless store.link_evidence(meta.id, iid)
+        puts "Linked frozen evidence ##{meta.id} to issue ##{iid}."
+      end
+
+      private def self.evidence_unlink_one(store : Store, meta : Store::IssueEvidenceMeta, iid : Int64) : Nil
+        unless meta.issue_ids.includes?(iid)
+          abort "gori run evidence unlink: frozen evidence ##{meta.id} is not linked to issue ##{iid}"
+        end
+        abort "gori run evidence unlink: NOT unlinked (project busy or link disappeared)" unless store.unlink_evidence(meta.id, iid)
+        orphaned = store.get_evidence_meta(meta.id).try(&.orphaned?) || false
+        puts "Unlinked frozen evidence ##{meta.id} from issue ##{iid}.#{orphaned ? " The snapshot is now orphaned." : ""}"
+      end
+
+      private def self.cmd_evidence_delete(args : Array(String)) : Nil
+        proj = ProjectFlags.new
+        yes = false
+
+        positional = parse_args(args, "gori run evidence delete") do |p|
+          p.banner = "Usage: gori run evidence delete ID --yes\n\n" \
+                     "Delete one frozen copy. Its bytes cannot be recovered from the source — that is\n" \
+                     "why they were frozen — so prefer freezing a newer copy beside it."
+          p.on("-y", "--yes", "Confirm deletion") { yes = true }
+          project_options(p, proj, "update")
+        end
+        id = require_positional_id(positional, "gori run evidence delete", "id", "gori run evidence")
+
+        with_store(resolve_read_project(proj.name, proj.db)) do |store|
+          meta = store.get_evidence_meta(id) || abort("gori run evidence delete: no frozen evidence with id #{id}")
+          # Gated like every other destructive verb here (`issues delete`, `notes delete`, …),
+          # and for the reason the help gives: a frozen copy is the one that cannot come back.
+          unless yes
+            abort "gori run evidence delete: refusing to delete frozen evidence ##{id} without --yes; " \
+                  "its bytes cannot be recovered"
+          end
+          abort "gori run evidence delete: NOT deleted (project busy or unwritable) — the copy is unchanged" unless store.delete_evidence(id)
+          linked = meta.issue_ids.empty? ? " (orphaned)" : " linked to #{meta.issue_ids.map { |iid| "issue ##{iid}" }.join(", ")}"
+          puts "Frozen evidence ##{id}#{linked} deleted."
+        end
+      end
+
+      # The required {issue id, source kind, source id} triple — split out for the reason
+      # `resolve_link_ends` is: the values are assigned inside OptionParser blocks, so Crystal
+      # keeps them nilable in place.
+      private def self.resolve_freeze_ends(issue_id : Int64?, ref_s : String?,
+                                           ref_id : Int64?) : {Int64, Store::LinkRefKind, Int64}
+        abort "gori run evidence freeze: --issue is required" if issue_id.nil?
+        abort "gori run evidence freeze: --ref is required (flow|repeater)" if ref_s.nil?
+        abort "gori run evidence freeze: --ref-id is required" if ref_id.nil?
+        kind = Store::LinkRefKind.parse(ref_s)
+        unless kind && Evidence.freezable?(kind)
+          abort "gori run evidence freeze: invalid --ref '#{ref_s}' (flow|repeater — a fuzz or miner session has no single exchange to freeze)"
+        end
+        {issue_id, kind, ref_id}
+      end
+
+      # `34567 bytes (33.8kB)` — BOTH spellings wherever a size is printed in text mode. The
+      # raw count stays first and unchanged because a script greps this line (`awk` on the
+      # field before `bytes`), and the human reading it should not have to divide by 1024 twice
+      # to learn the copy is small. `Output.human_size` is the CLI's own formatter, so a size
+      # here reads the way `run project` and `run ls` already spell one — deliberately not
+      # identical to the TUI's `Fmt.size` in the last half-cell of a unit (the rule the two
+      # share is the unit choice, not the rendering; see `human_size`). Under 1 kB there is no
+      # second spelling to give: `512 bytes (512B)` says nothing twice, so the suffix drops.
+      private def self.evidence_bytes_text(bytes : Int64) : String
+        return "#{bytes} bytes" if bytes < 1024
+        "#{bytes} bytes (#{CLI::Output.human_size(bytes)})"
+      end
+
+      # `#12  hist #3  2026-09-11T05:02:33Z  POST acme.test/login → 200  34567 bytes  sha256 req a1b2… res c3d4…`
+      # — one row per copy, the provenance the RELATED card shows plus the hash prefixes.
+      private def self.evidence_line(m : Store::IssueEvidenceMeta) : String
+        outcome = Evidence.outcome(m)
+        notes = [] of String
+        notes << "request truncated" if m.request_truncated?
+        notes << "response truncated" if m.response_truncated?
+        tail = notes.empty? ? "" : "  (#{notes.join(", ")} at capture)"
+        linked = m.issue_ids.empty? ? "orphaned" : m.issue_ids.map { |id| "##{id}" }.join(",")
+        "##{m.id}  #{m.source_label}  #{Gori.iso_micros(m.created_at)}  " \
+        "#{Issues::Export.one_line(Evidence.label(m))} → #{outcome}  #{evidence_bytes_text(m.bytes)}  " \
+        "sha256 req #{m.request_sha256[0, 12]}… res #{m.response_sha256.try { |h| "#{h[0, 12]}…" } || "—"}  " \
+        "issues #{linked}#{tail}"
+      end
+
+      # The text form of one copy: provenance lines, then the two messages. Heads through the
+      # same redaction MCP's `get_flow` applies; bodies decoded and capped like the Markdown
+      # report's evidence fences, and dropped with a note when they are not text.
+      private def self.evidence_text(ev : Store::IssueEvidence, include_sensitive : Bool) : String
+        m = ev.meta
+        String.build do |io|
+          io << "frozen evidence #" << m.id << "\n"
+          io << "issues:   "
+          if m.issue_ids.empty?
+            io << "— (orphaned)\n"
+          else
+            io << m.issue_ids.map { |id| "##{id}" }.join(", ") << "\n"
+          end
+          io << "source:   " << m.source_label << "\n"
+          io << "frozen:   " << Gori.iso_micros(m.created_at) << "\n"
+          io << "exchange: " << Issues::Export.one_line(Evidence.label(m)) << " → "
+          if st = m.status
+            io << st
+            m.error.try { |e| io << " · error: " << Issues::Export.one_line(e) }
+          elsif e = m.error
+            io << "error: " << Issues::Export.one_line(e)
+          else
+            io << "no response"
+          end
+          io << " · " << (m.protocol.try { |p| Issues::Export.one_line(p) } || "?")
+          m.duration_us.try { |d| io << " · " << d << "µs" }
+          io << " · " << evidence_bytes_text(m.bytes) << "\n"
+          io << "sha256:   req " << m.request_sha256 << "\n"
+          io << "          res " << (m.response_sha256 || "— (no response)") << "\n"
+          io << "note:     request body truncated at capture\n" if m.request_truncated?
+          io << "note:     response body truncated at capture\n" if m.response_truncated?
+          io << "note:     credential header values read [REDACTED]; --include-sensitive prints them (the hashes cover the raw bytes)\n" unless include_sensitive
+          append_message(io, "request", ev.request_head, ev.request_body, include_sensitive)
+          if head = ev.response_head
+            append_message(io, "response", head, ev.response_body, include_sensitive)
+          else
+            io << "\n--- response ---\n(none)\n"
+          end
+        end
+      end
+
+      private def self.append_message(io : String::Builder, name : String, head : Bytes, body : Bytes?,
+                                      include_sensitive : Bool) : Nil
+        io << "\n--- " << name << " ---\n"
+        head_text = MCP::Serialize.redact_head(Issues::Export.scrub_controls(String.new(head)), include_sensitive)
+        io << head_text
+        io << "\n" unless head_text.ends_with?("\n")
+        shown = Entity.bytes(head, body)
+        return if shown.nil? || shown.empty?
+        decoded_size = shown.size
+        cut = decoded_size > Issues::Export::EVIDENCE_CAP
+        # Back the cut off to a codepoint boundary first — the Markdown report's own rule —
+        # or a multibyte character split at exactly the cap reads the whole page as binary.
+        shown = Issues::Export.trim_to_codepoint_boundary(shown[0, Issues::Export::EVIDENCE_CAP]) if cut
+        text = String.new(shown)
+        if text.valid_encoding?
+          io << Issues::Export.scrub_controls(text) << "\n"
+        else
+          io << "[binary body omitted, " << decoded_size << " decoded bytes]\n"
+        end
+        io << "[… body display cut at " << Issues::Export::EVIDENCE_CAP << " bytes; the stored copy is complete]\n" if cut
+      end
+    end
+  end
+end

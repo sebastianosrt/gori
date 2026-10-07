@@ -26,6 +26,16 @@ describe Gori::MCP::RequestBuilder do
     String.new(Gori::MCP::RequestBuilder.build(args).bytes).should contain("Authorization: Bearer T\r\n")
   end
 
+  # The OTHER array spelling of a header set, and the one this same server teaches: it is
+  # what `create_session_slot{set_headers}` and `authorize_start{identities}` take, so an
+  # agent that has read one of those schemas sends it here too. Refusing it made
+  # `send_request` the odd tool out for a shape gori itself had shown the model.
+  it "accepts headers as an array of {name, value} objects" do
+    args = JSON.parse({"url"     => "http://h.test/x",
+                       "headers" => [{"name" => "Authorization", "value" => "Bearer T"}]}.to_json).as_h
+    String.new(Gori::MCP::RequestBuilder.build(args).bytes).should contain("Authorization: Bearer T\r\n")
+  end
+
   # BEHAVIOUR CHANGE, pinned deliberately: an unusable `headers` must RAISE, never vanish.
   # Silently dropping it is what made the bug invisible on both surfaces.
   it "raises rather than silently dropping an unusable headers value" do
@@ -34,6 +44,21 @@ describe Gori::MCP::RequestBuilder do
       expect_raises(Gori::Error, /headers/) { Gori::MCP::RequestBuilder.build(args) }
     end
     args = JSON.parse({"url" => "http://h.test/x", "headers" => [["only-one"]]}.to_json).as_h
+    expect_raises(Gori::Error, /headers/) { Gori::MCP::RequestBuilder.build(args) }
+    # …and an object entry that is a name->value MAP rather than the {name, value} pair is
+    # still refused: there is no defensible reading of it that is not a guess.
+    args = JSON.parse({"url" => "http://h.test/x", "headers" => [{"Authorization" => "Bearer T"}]}.to_json).as_h
+    expect_raises(Gori::Error, /name/) { Gori::MCP::RequestBuilder.build(args) }
+    # A JSON `null` is PRESENT as far as `o["name"]?` is concerned — JSON::Any wrapping nil is
+    # truthy — so without the presence read these reach the wire as `": Bearer T"`, and
+    # discover_start formats that into a line naming nothing the caller wrote.
+    [nil, "", "  "].each do |name|
+      args = JSON.parse({"url"     => "http://h.test/x",
+                         "headers" => [{"name" => name, "value" => "Bearer T"}]}.to_json).as_h
+      expect_raises(Gori::Error, /name/) { Gori::MCP::RequestBuilder.build(args) }
+    end
+    args = JSON.parse({"url"     => "http://h.test/x",
+                       "headers" => [{"name" => "Authorization", "value" => nil}]}.to_json).as_h
     expect_raises(Gori::Error, /headers/) { Gori::MCP::RequestBuilder.build(args) }
   end
 
@@ -52,6 +77,14 @@ describe Gori::MCP::RequestBuilder do
     raw = "GET /v HTTP/1.1\r\nHost: h.test\r\nX-T: $NOPE\r\n\r\n"
     args = JSON.parse({"url" => "http://h.test/", "raw" => raw, "verbatim" => true}.to_json).as_h
     String.new(Gori::MCP::RequestBuilder.build(args).bytes).should contain("$NOPE")
+  end
+
+  it "leaves a structured send's headers and body unexpanded under verbatim, as the CLI does" do
+    args = JSON.parse({"url" => "http://h.test/", "method" => "POST", "verbatim" => true,
+                       "headers" => {"X-A" => "$ENV.NOPE"}, "body" => "b=$ENV.NOPE"}.to_json).as_h
+    wire = String.new(Gori::MCP::RequestBuilder.build(args).bytes)
+    wire.should contain("X-A: $ENV.NOPE")
+    wire.should end_with("b=$ENV.NOPE")
   end
 
   it "builds exact request bytes with Host + Content-Length" do
@@ -86,6 +119,14 @@ describe Gori::MCP::RequestBuilder do
     args = {"url" => JSON::Any.new("http://h.test/"), "raw" => JSON::Any.new(raw)}
     out = String.new(Gori::MCP::RequestBuilder.build(args).bytes)
     out.should eq("POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\na\nb\nc") # head CRLF, body LFs intact
+  end
+
+  # The typed half moved to `Repeater::UrlRequest` (#1116); the refusal a call with two
+  # mistakes gets must not have moved with it — the request-target is judged before the
+  # headers are read, as it always was.
+  it "refuses a bad request-target before an unusable headers value" do
+    args = JSON.parse(%({"url":"http://h.test/a b","headers":5})).as_h
+    expect_raises(Gori::Error, /request target/) { Gori::MCP::RequestBuilder.build(args) }
   end
 
   it "raises when the url has no host" do

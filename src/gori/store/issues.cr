@@ -4,25 +4,46 @@ module Gori
   class Store
     # --- issues ------------------------------------------------------------
 
+    # Issue notes can arrive as arbitrary bytes through `--notes-file` or `--notes-stdin`.
+    # SQLite stores the whole TEXT value, but crystal-sqlite3's String reader stops at NUL;
+    # CAST keeps the read length-aware without changing existing rows or their storage class.
+    private ISSUE_NOTES_COL = "CAST(notes AS BLOB) AS notes"
+
     # 0 == not persisted. Three callers guard on that, so the id must come from the
     # COMMITTED signal, not from the local the closure captured: the closure runs inside
     # the transaction, but the batch can still roll back afterwards (a COMMIT-time
     # SQLITE_FULL/IOERR, or an unrelated co-submitted write raising — writer_loop batches
     # up to BATCH_MAX ops from every fiber into one transaction). Returning the captured
-    # id there handed out the rowid of an issue that does not exist, and because
-    # `issues.id` is INTEGER PRIMARY KEY without AUTOINCREMENT the next issue created is
-    # handed that same id and silently adopts any entity_links written against it.
-    def insert_issue(title : String, severity : Severity, host : String?, flow_id : Int64?, cvss : String? = nil) : Int64
+    # id there handed out the rowid of an issue that does not exist, and the next issue
+    # created is handed that same id — `sqlite_sequence` rolls back with the insert, so V40's
+    # AUTOINCREMENT does not retire it — and silently adopts any entity_links written against it.
+    #
+    # `notes` defaults to the `''` this always wrote, so no existing caller changes. It is a
+    # parameter at all for the create-with-a-body path (`gori run issues create --notes…`,
+    # #1019): filed as part of the INSERT, an issue and its body arrive in one transaction,
+    # where an insert-then-`update_issue` sequence can land its first half and lose the second.
+    # Every surface that files with a body now rides this — the CLI (#1019), the TUI form
+    # (#1019, see `Runner#create_issue_from_form`) and MCP `create_issue{notes:}` (#1076) —
+    # because one transaction is the only shape where a peer reading the project between the
+    # two writes cannot see a titled issue with no body.
+    def insert_issue(title : String, severity : Severity, host : String?, flow_id : Int64?, cvss : String? = nil,
+                     notes : String = "") : Int64
       ts = now_us
       issue_id = 0_i64
       cvss = canonical_cvss(cvss)
       ok = exec_task_ok ->(c : DB::Connection) {
-        c.exec("INSERT INTO issues (created_at, updated_at, title, severity, host, flow_id, notes, cvss) VALUES (?,?,?,?,?,?,'',?)",
-          ts, ts, title, severity.value, host, flow_id, cvss)
+        c.exec("INSERT INTO issues (created_at, updated_at, title, severity, host, flow_id, notes, cvss) VALUES (?,?,?,?,?,?,?,?)",
+          ts, ts, title, severity.value, host, flow_id, notes, cvss)
         # Capture the issue's own id BEFORE the entity_links insert below overwrites
         # last_insert_rowid: exec_task's generic reply reads it AFTER the closure, so with
         # a flow_id it would otherwise return the link row's id, not the issue's.
         issue_id = c.scalar("SELECT last_insert_rowid()").as(Int64)
+        # The primary flow's `entity_links` row, in the SAME transaction as the issue. Not an
+        # optimisation and not a convenience: the primary flow IS the issue's first related
+        # row now — in the TUI card, the Markdown report, the JSON export and MCP — so a
+        # `flow_id` with no link row is an issue whose own seed is missing from every list that
+        # answers "what backs this". `Links.issue_links` synthesises the row for the pre-migration
+        # and imported projects that can still hold one, but nothing this store writes may need it.
         if fid = flow_id
           c.exec(
             "INSERT OR IGNORE INTO entity_links (owner_kind, owner_id, ref_kind, ref_id, created_at) VALUES ('issue', ?, 'flow', ?, ?)",
@@ -122,18 +143,28 @@ module Gori
     #
     # `owner_kind = 'issue'` is the complete link cascade: `LinkOwnerKind` is Issue|Note and
     # an issue is never a `ref_kind`, so no row in the table points AT what this drops.
+    #
+    # Evidence membership goes with the Issues, but the immutable copies do not (#1039):
+    # the project-wide Evidence tab keeps orphaned snapshots visible and deletable.
     def clear_issues : Bool
       exec_task_ok ->(c : DB::Connection) {
         c.exec("DELETE FROM entity_links WHERE owner_kind = 'issue'")
+        c.exec("DELETE FROM evidence_issue_links")
+        clear_issue_retest(c)
         c.exec("DELETE FROM issues")
         nil
       }
     end
 
     # One issue's cascade, on an OPEN connection (no transaction of its own) — the shared
-    # body of the singular and batch deletes.
+    # body of the singular and batch deletes. Frozen evidence is unlinked, not deleted.
     private def delete_issue_one(c : DB::Connection, id : Int64) : Nil
       c.exec("DELETE FROM entity_links WHERE owner_kind = 'issue' AND owner_id = ?", id)
+      c.exec("DELETE FROM evidence_issue_links WHERE issue_id = ?", id)
+      # Retest steps and runs DO cascade (#1036), where frozen evidence does not: a run
+      # summary is a statement about one issue's check and means nothing detached from it,
+      # while a frozen exchange is bytes that outlive any filing.
+      delete_issue_retest(c, id)
       c.exec("DELETE FROM issues WHERE id = ?", id)
     end
 
@@ -155,7 +186,7 @@ module Gori
     def issues : Array(Issue)
       list = [] of Issue
       @db.query(<<-SQL) do |rs|
-        SELECT id, created_at, updated_at, title, severity, host, flow_id, notes, status, cvss
+        SELECT id, created_at, updated_at, title, severity, host, flow_id, #{ISSUE_NOTES_COL}, status, cvss
         FROM issues ORDER BY severity DESC, created_at DESC
         SQL
         rs.each { list << read_issue(rs) }
@@ -164,7 +195,7 @@ module Gori
     end
 
     def get_issue(id : Int64) : Issue?
-      @db.query("SELECT id, created_at, updated_at, title, severity, host, flow_id, notes, status, cvss FROM issues WHERE id = ?", id) do |rs|
+      @db.query("SELECT id, created_at, updated_at, title, severity, host, flow_id, #{ISSUE_NOTES_COL}, status, cvss FROM issues WHERE id = ?", id) do |rs|
         return read_issue(rs) if rs.move_next
       end
       nil

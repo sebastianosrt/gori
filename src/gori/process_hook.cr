@@ -5,10 +5,14 @@ module Gori
   # This is gori's whole extension axis. Burp answers "run MY code over these bytes" with
   # BApps/Bambdas, Caido with a JS plugin SDK; gori answers with the UNIX process boundary —
   # language-agnostic, reuses every script the operator already owns, and needs no in-process
-  # runtime, no stable ABI and no recompile (P0). Four seams call it and NONE re-implement it
+  # runtime, no stable ABI and no recompile (P0). Every seam calls it and NONE re-implements it
   # (P1/§2): the Rewriter `pipe` op (`rules.cr`), the Decoder chain `exec:` step
-  # (`decoder/chain.cr`), the Probe `exec` custom rule (`probe/custom_rule.cr`), and the Miner's
-  # per-probe request hook (`miner/inject.cr`, driven by `miner/hook_backend.cr`).
+  # (`decoder/chain.cr`), the Probe `exec` custom rule (`probe/custom_rule.cr`), the Miner's
+  # per-probe request hook (`miner/inject.cr`, driven by `miner/hook_backend.cr`), and — not an
+  # operator hook at all, but the same bounded-spawn need — the Codex delivery route's `lsof`
+  # and `codex queue` (`mcp/codex_queue.cr`). `spec/settings/profile_commands_spec.cr` counts
+  # these call sites the way it counts `Process.run`, so a sixth arrives with the same question
+  # asked of it: where does the program come from, and can a profile set it?
   #
   # TRUST: a hook runs with the OPERATOR'S OWN privileges. It is not sandboxed, jailed or
   # confined in any way, deliberately — the same trust level a `--config` file, a Rewriter
@@ -228,13 +232,6 @@ module Gori
       nil
     end
 
-    # The argv, or nil when the spec cannot be tokenized. For the run paths, which have already
-    # been validated at the write surface and only need the happy answer.
-    def self.argv?(spec : String) : Array(String)?
-      out = parse_argv(spec)
-      out.is_a?(Array) ? out : nil
-    end
-
     def self.valid_argv?(spec : String) : Bool
       parse_argv(spec).is_a?(Array)
     end
@@ -273,7 +270,7 @@ module Gori
             error: Process::Redirect::Pipe)
         rescue ex : Exception
           # `Process.new` raises for ENOENT/EACCES/EISDIR and for a fork that fails outright.
-          return Result.spawn_failed(label, spawn_message(ex))
+          return Result.spawn_failed(label, spawn_message(ex, argv[0]))
         end
 
       out_ch, err_ch, wait_ch = start_pumps(process, stdin)
@@ -392,9 +389,15 @@ module Gori
     # `Process.new`'s exception, phrased for an operator rather than for a stack trace. The
     # common ones by far are "the path is wrong" and "it is not executable", and the raw
     # `Error initializing process: …` prefix buries both.
-    private def self.spawn_message(ex : Exception) : String
+    #
+    # Windows quotes the whole command line where POSIX quotes the program alone, and an
+    # argument can carry a captured token: that quote is narrowed to the program.
+    private def self.spawn_message(ex : Exception, program : String) : String
       msg = (ex.message || ex.class.name).gsub(/\s+/, " ").strip
       msg = msg.sub(/\AError (initializing|executing) process:?\s*/i, "")
+      {% if flag?(:win32) %}
+        msg = msg.sub(/\A'.*'(?=:)/) { "'#{program}'" } # a block: `\` in a path is no backreference
+      {% end %}
       "could not run it (#{msg})"
     end
   end

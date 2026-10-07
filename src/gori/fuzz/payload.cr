@@ -1,3 +1,5 @@
+require "../tty_path"
+require "../wordlist_catalog"
 require "uri"
 require "base64"
 require "digest/md5"
@@ -73,10 +75,19 @@ module Gori::Fuzz
   # the second `open` blocks forever). Such a path is read ONCE into an `InlineList`
   # instead, and both `size` and every cursor are served from it — the same materializing
   # shape `Miner::Wordlist.load` already uses, which is why `mine -w /dev/stdin` works.
+  #
+  # `spec` is what the operator typed and `path` is what is read. They differ when `spec` is a
+  # bare name that is not in the current directory but is a list in the global catalog
+  # (`WordlistCatalog.resolve`, #1353): `-w common.txt` then reads `$GORI_HOME/wordlists/common.txt`
+  # from any working directory. A spec with a `/` in it is a path and is read exactly as given.
   class WordlistFile < PayloadSource
+    getter spec : String
     getter path : String
 
-    def initialize(@path : String)
+    def initialize(@spec : String)
+      resolution = WordlistCatalog.resolve(@spec)
+      @path = resolution.path
+      @not_found_hint = WordlistCatalog.missing_hint(resolution)
       @count = nil.as(Int64?)
       @counted = false
       @cache = nil.as(InlineList?)
@@ -146,9 +157,18 @@ module Gori::Fuzz
     # `File::NotFoundError: Error opening file with mode 'r'` backtrace out of the
     # File.each_line / File.open below.
     private def ensure_readable : Nil
-      raise Gori::Error.new("wordlist not found: #{@path}") unless File.exists?(@path)
+      unless File.exists?(@path)
+        hint = @not_found_hint
+        raise Gori::Error.new("wordlist not found: #{@path}#{hint ? " (#{hint})" : ""}")
+      end
       raise Gori::Error.new("wordlist is a directory, not a file: #{@path}") if File.directory?(@path)
       raise Gori::Error.new("wordlist not readable: #{@path}") unless File::Info.readable?(@path)
+      # A terminal is a character device that never ends: the count pass below would block on
+      # it forever, and every byte typed would be echoed into the scrollback first (#1034).
+      if Gori::TtyPath.terminal?(@path)
+        raise Gori::Error.new("wordlist is a terminal, not a file: #{@path} — pipe the list in " \
+                              "(`generator | gori run fuzz … -w /dev/stdin`) or name a real path")
+      end
     end
 
     private class LineIterator < SetIterator
@@ -247,10 +267,19 @@ module Gori::Fuzz
   # Brute-force: every string of length min..max over a charset (odometer). `size`
   # saturates to nil on Int64 overflow so the run is gated by a cap.
   class BruteForce < PayloadSource
+    # The longest payload length any surface accepts. A real length, not Int32::MAX:
+    # `BruteIterator` allocates an odometer of `min` slots up front, so `ab:2000000000` was
+    # an 8.6 GB `Array.new` before a byte was sent — and the request budget caps how MANY
+    # payloads go out, never how long one is. 4096 leaves the one legitimate long shape (a
+    # single-character charset used as padding) intact.
+    MAX_LEN = 4096
+
+    # Lengths are clamped to MAX_LEN here, so no surface can reach the allocation (the TUI
+    # Fuzzer's brute row went straight through); the CLI refuses past it with a message first.
     def initialize(charset : String, min : Int32, max : Int32)
       @chars = charset.chars
-      @min = min < 1 ? 1 : min
-      @max = max < @min ? @min : max
+      @min = min.clamp(1, MAX_LEN).as(Int32)
+      @max = max.clamp(@min, MAX_LEN).as(Int32)
     end
 
     def size : Int64?
@@ -380,12 +409,27 @@ module Gori::Fuzz
 
     def apply(s : String) : String
       case @kind
-      when :url     then URI.encode_www_form(s, space_to_plus: false)
+      when :url     then url(s)
       when :url_all then String.build { |io| s.to_slice.each { |b| io << '%' << b.to_s(16).rjust(2, '0').upcase } }
       when :base64  then Base64.strict_encode(s)
       when :hex     then s.to_slice.hexstring
       else               s
       end
+    end
+
+    # `URI.encode_www_form(s, space_to_plus: false)`, minus the allocation when the answer is
+    # `s`. That call copies EVERY payload through a `String.build` even when it has nothing to
+    # escape, and since `--auto` (`Fuzz::AutoEncode`) made this the default for every
+    # query/form position, that is one throwaway String per request of every sweep — and most
+    # of a wordlist is `admin` / `config` / `v2`, which encode to themselves.
+    #
+    # The predicate is `URI.unreserved?`, the SAME one `encode_www_form` passes down to
+    # `URI.encode`: with `space_to_plus: false` a byte is copied verbatim there iff
+    # `char.ascii? && URI.unreserved?(byte)`, and an unreserved byte is ASCII by construction.
+    # So an all-unreserved payload is byte-for-byte `s`, and anything else takes the same
+    # stdlib path it always did.
+    private def url(s : String) : String
+      s.to_slice.all? { |b| URI.unreserved?(b) } ? s : URI.encode_www_form(s, space_to_plus: false)
     end
   end
 

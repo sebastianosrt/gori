@@ -120,7 +120,7 @@ describe "RepeaterView gRPC FIELDS editor (#828)" do
       end
     end
 
-    it "draws the named field in the request pane and a ␣E:FIELDS badge" do
+    it "draws the named field in the request pane and a ␣Pf:FIELDS badge" do
       with_demo_schema do
         grpc_tmp_store do |store|
           view = grpc_view(store, get_user_request("hahwul"))
@@ -164,6 +164,24 @@ describe "RepeaterView gRPC FIELDS editor (#828)" do
           view.grpc_field_begin.should be_nil # seeded with the captured value
           view.grpc_field_apply.should be_nil # applied unchanged
           sent_payload(view).should eq(payload)
+        end
+      end
+    end
+
+    # The minimal encoding above round-trips either way; a padded tag or length does not —
+    # text has no spelling for it, so re-encoding the untouched seed normalised the octets.
+    it "keeps a non-minimal encoding when the value is applied unchanged" do
+      with_demo_schema do
+        grpc_tmp_store do |store|
+          [Bytes[0x8a, 0x00, 0x06] + "hahwul".to_slice,
+           Bytes[0x0a, 0x86, 0x00] + "hahwul".to_slice].each do |payload|
+            view = grpc_view(store, payload)
+            view.toggle_grpc_fields
+            view.grpc_field_rows[0].seed.should eq("hahwul")
+            view.grpc_field_begin.should be_nil
+            view.grpc_field_apply.should be_nil
+            sent_payload(view).should eq(payload)
+          end
         end
       end
     end
@@ -233,7 +251,7 @@ describe "RepeaterView gRPC FIELDS editor (#828)" do
           view.toggle_grpc_fields
           view.grpc_field_begin
           view.grpc_fields_editing?.should be_true
-          view.toggle_grpc_fields.should be_false # the ␣E:FIELDS badge click
+          view.toggle_grpc_fields.should be_false # the ␣Pf:FIELDS badge click
           # A live `grpc_fields_editing?` with the form gone locks the tab against a
           # cross-session reconcile forever and routes IME composition into a dead buffer.
           view.grpc_fields_editing?.should be_false
@@ -412,7 +430,7 @@ end
 # the one route by which the row a value was opened on can stop existing.
 private def empty_the_payload_under_the_form(view : RepeaterView) : Nil
   view.toggle_request_hex
-  32.times { view.hex_delete } # forward-delete: the cursor enters at byte 0
+  32.times { view.hex_key(hex_ev(Termisu::Input::Key::Delete)) } # forward-delete: the cursor enters at byte 0
   view.toggle_request_hex
 end
 

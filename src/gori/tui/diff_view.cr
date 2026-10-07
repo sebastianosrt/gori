@@ -5,6 +5,7 @@ require "./fmt"
 require "./viewport"
 require "../diff"
 require "../project"
+require "../plural"
 
 module Gori::Tui
   # The retest view: two PROJECTS in the slots instead of two flows, and endpoints for
@@ -111,6 +112,13 @@ module Gori::Tui
     def move(delta : Int32) : Nil
       return if @rows.empty?
       @selected = (@selected + delta).clamp(0, @rows.size - 1)
+    end
+
+    # For the ↑-at-top release (`Runner#diff_move`). An EMPTY list is "at the top" too: with
+    # no rows there is nothing to walk, so ↑ has to be the way out rather than a dead key —
+    # which is the state the tab opens in, before a baseline is picked.
+    def at_top? : Bool
+      @rows.empty? || @selected <= 0
     end
 
     def select_index(i : Int32) : Nil
@@ -232,7 +240,7 @@ module Gori::Tui
       base = "#{tag}  #{project.name}"
       return base unless cov
       "#{base}   #{Fmt.count(cov.flows)} flows · #{cov.endpoints} endpoints · " \
-      "#{cov.hosts} host#{cov.hosts == 1 ? "" : "s"}#{cov.truncated ? " · TRUNCATED" : ""}"
+      "#{Gori.plural(cov.hosts, "host")}#{cov.truncated ? " · TRUNCATED" : ""}"
     end
 
     private def summary(r : Gori::Diff::Report) : String

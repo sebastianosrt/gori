@@ -7,7 +7,9 @@ class Gori::Tui::RepeaterView
   # through the same helper — so the split column is one continuous document in both modes.
   def request_read_move(dr : Int32, dc : Int32, selecting : Bool = false) : Nil
     return if request_insert? || request_hex?
-    return if dc == 0 && try_cross_req_pane(dr)
+    # A selection being grown stays in its sub-pane: envelope and decoded are two editors, so
+    # crossing would silently drop it.
+    return if dc == 0 && !selecting && try_cross_req_pane(dr)
     request_read_step(dr, dc, selecting)
   end
 
@@ -27,6 +29,14 @@ class Gori::Tui::RepeaterView
   private def request_read_step(dr : Int32, dc : Int32, selecting : Bool) : Nil
     return if request_read_lines.empty?
     @req_read.move(req_editor, dr, dc, selecting: selecting)
+  end
+
+  # READ-mode top / bottom of the request buffer (`editor.top` / `editor.bottom`). The whole
+  # request is ONE editor even when the column is split into sub-panes — `request_read_lines`
+  # is `req_editor`'s snapshot — so the buffer edges are the editor's own, not a sub-pane's.
+  def request_read_to_edge(dir : Int32) : Nil
+    return if request_insert? || request_hex?
+    @req_read.to_edge(req_editor, dir)
   end
 
   def request_read_lines : Array(String)
@@ -49,6 +59,15 @@ class Gori::Tui::RepeaterView
     @req_read.copy_all(req_editor)
   end
 
+  # The request buffer READ-mode edits run against (`TabController#editor_text_buffer`):
+  # whichever sub-pane `req_editor` names, envelope or decoded. Nil while the request is
+  # captured some other way: hex edit owns the bytes, the gRPC FIELDS form owns the message.
+  def read_edit_buffer : {TextArea, TextReadState}?
+    return nil unless @focus == :request
+    return nil if request_hex? || grpc_fields_editing?
+    {req_editor, @req_read}
+  end
+
   # The active transcript rows when the response pane is a transcript (WS / gRPC / group
   # send), else nil (a normal single response). The single source these read/copy/search
   # paths share so a new transcript mode wires into all of them at once.
@@ -57,11 +76,6 @@ class Gori::Tui::RepeaterView
     return grpc_transcript_lines if @grpc_mode
     return group_transcript_lines if group_mode?
     nil
-  end
-
-  def resp_plain_lines : Array(String)
-    size, line_at = resp_line_source
-    (0...size).map { |i| line_at.call(i) }
   end
 
   # O(1) count + lazy line fetch for the response pane the read cursor is on. THE one
@@ -144,7 +158,7 @@ class Gori::Tui::RepeaterView
     # drives `Runner#read_selection_active?`, which gates BOTH the space-menu entry's title
     # and `read_copy`, so claiming a selection here while copy still read `@req_read` would
     # offer "Copy selection" and then copy the caret line.
-    when :request  then pane_insert?(:request) ? req_editor.selection? : @req_read.selection?
+    when :request  then pane_insert?(:request) ? req_editor.selection? : @req_read.selection?(req_editor)
     when :response then @resp_cursor.selection?
     when :target   then !pane_insert?(:target) && @target_read.selection?(target_active_cx)
     else                false

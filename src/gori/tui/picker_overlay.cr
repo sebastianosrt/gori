@@ -35,6 +35,19 @@ module Gori::Tui
     # 500-flow FlowPicker had no other gait than one row at a time — and moved up to the
     # base once the list cards needed the same four keys).
 
+    # The prelude every picker's `handle_key` opens with: esc → :cancel, ↵ → :commit, ↑/↓ and
+    # the page keys move (→ :stay); nil for any other key, which the picker answers itself.
+    private def nav_key(ev : Termisu::Event::Key) : Symbol?
+      key = ev.key
+      case
+      when key.escape?  then :cancel
+      when key.up?      then move(-1); :stay
+      when key.down?    then move(1); :stay
+      when page_key(ev) then :stay
+      when key.enter?   then :commit
+      end
+    end
+
     def set_selected(idx : Int32) : Nil
       n = entry_count
       return if n == 0
@@ -59,6 +72,76 @@ module Gori::Tui
     private def ensure_visible(list_h : Int32) : Nil
       @list_last_h = list_h
       @scroll = Viewport.scroll_to_show(@selected, @scroll, list_h, entry_count)
+    end
+  end
+
+  # The plain half of the family (copy-as, send-to, the OAST provider and session pickers):
+  # no filter, just a centered card of one-line rows sized to the widest of them. The card,
+  # its hit-test and the row chrome (background, selection bar) live here; a subclass draws
+  # what is ON a row and says how wide its card wants to be.
+  abstract class PlainPickerOverlay < PickerOverlay
+    def empty? : Bool
+      entry_count == 0
+    end
+
+    # The card's preferred width before the area clamp: the widest row plus its padding.
+    # Only called on a non-empty list, so a `max_of` over the rows is safe.
+    private abstract def card_w : Int32
+
+    # Draw row `idx` at `ry`, over the background and selection bar already painted.
+    private abstract def draw_row(screen : Screen, box : Rect, ry : Int32, idx : Int32,
+                                  active : Bool, bg : Color) : Nil
+
+    # The narrowest card worth drawing.
+    private def min_w : Int32
+      18
+    end
+
+    # The card heading. The focus badge by default; SendPicker heads its card with a sentence.
+    private def card_title : String
+      title
+    end
+
+    # Centered card geometry over `area`, the inverse of render's offset math. nil when
+    # render would draw nothing. The empty guard comes first because `card_w` is a max_of
+    # over the rows and PickerOverlay#handle_click calls this on EVERY click.
+    def overlay_box(area : Rect) : Rect?
+      return nil if empty?
+      w = {area.w - 4, card_w}.min
+      h = {entry_count + 2, area.h - 2}.min
+      return nil if w < min_w || area.h < 5
+      area.center(w, h)
+    end
+
+    # Row index under (mx,my), mirroring render's list loop; nil outside. Bound to the rows
+    # ACTUALLY drawn, so a click on a height-clamped card's bottom border can't pick one that
+    # was never there.
+    def row_at(box : Rect, mx : Int32, my : Int32) : Int32?
+      rows = {box.h - 2, entry_count}.min
+      i = my - (box.y + 1)
+      return nil if i < 0 || i >= rows
+      return nil if mx <= box.x || mx >= box.right - 1
+      ci = @scroll + i
+      ci < entry_count ? ci : nil
+    end
+
+    def render(screen : Screen, area : Rect) : Nil
+      box = overlay_box(area)
+      unless box
+        Overlay.too_small(screen, area, "picker needs a larger window")
+        return
+      end
+      Frame.card(screen, box, card_title, border: Theme.border_focus)
+      rows = {box.h - 2, entry_count}.min
+      ensure_visible(rows)
+      (0...rows).each do |i|
+        ci = @scroll + i
+        break if ci >= entry_count
+        ry = box.y + 1 + i
+        active = ci == @selected
+        bg = Frame.row_band(screen, box, ry, active)
+        draw_row(screen, box, ry, ci, active, bg)
+      end
     end
   end
 
@@ -100,22 +183,16 @@ module Gori::Tui
     # esc cancels · ↑/↓ move · ↵ picks · ⌫ edits the filter · anything else printable
     # goes into the filter (query_char drops control chars itself).
     def handle_key(ev : Termisu::Event::Key) : Symbol
-      key = ev.key
-      case
-      when key.escape?  then return :cancel
-      when key.up?      then move(-1)
-      when key.down?    then move(1)
-      when page_key(ev) then nil
-      when key.enter?   then return :commit
-      else
-        # The field refuses a Ctrl/Alt chord itself (`TextField#handle_edit_key` — the
-        # `Event::Key#char` fallback would otherwise type 'p' for ^P into the filter), and
-        # ⇥, which a picker has no use for. Refilter only when the TEXT changed: a caret
-        # motion must not reset the cursor to the top of the list.
-        before = @field.value
-        if @field.handle_edit_key(ev) && @field.value != before
-          refilter
-        end
+      if nav = nav_key(ev)
+        return nav
+      end
+      # The field refuses a Ctrl/Alt chord itself (`TextField#handle_edit_key` — the
+      # `Event::Key#char` fallback would otherwise type 'p' for ^P into the filter), and
+      # ⇥, which a picker has no use for. Refilter only when the TEXT changed: a caret
+      # motion must not reset the cursor to the top of the list.
+      before = @field.value
+      if @field.handle_edit_key(ev) && @field.value != before
+        refilter
       end
       :stay
     end
@@ -136,9 +213,56 @@ module Gori::Tui
       box.y + LIST_OFFSET
     end
 
+    # The card, its filter bar and the list window, as every filter picker opens its render:
+    # `{box, list_top, list_h}`, or nil — after the too-small line — when there is no room.
+    private def render_card(screen : Screen, area : Rect, title : String, idle_hint : String,
+                            too_small : String = "picker needs a larger window") : {Rect, Int32, Int32}?
+      unless box = overlay_box(area)
+        Overlay.too_small(screen, area, too_small)
+        return
+      end
+      Frame.card(screen, box, title, border: Theme.border_focus)
+      list_top = render_filter(screen, box, idle_hint)
+      list_h = list_height(box)
+      ensure_visible(list_h)
+      {box, list_top, list_h}
+    end
+
+    # Each visible list row's y and its index into the `count` navigable rows.
+    private def each_visible_row(list_top : Int32, list_h : Int32, count : Int32, &) : Nil
+      (0...list_h).each do |i|
+        ri = @scroll + i
+        break if ri >= count
+        yield list_top + i, ri
+      end
+    end
+
     # Rows visible in the list area of `box`.
     private def list_height(box : Rect) : Int32
       box.bottom - 1 - (box.y + LIST_OFFSET)
+    end
+
+    # The card's widest, before the area clamp.
+    private def card_max_w : Int32
+      96
+    end
+
+    # A centred card filling the body height, `card_max_w` wide at most — a stable height, so
+    # it does not resize as the filter narrows. nil when there isn't room to draw.
+    def overlay_box(area : Rect) : Rect?
+      w = {area.w - 4, card_max_w}.min
+      h = area.h - 2
+      return nil if w < 30 || h < 8
+      area.center(w, h)
+    end
+
+    # Row index under (mx,my), mirroring the list loop under `render_filter`; nil off it.
+    def row_at(box : Rect, mx : Int32, my : Int32) : Int32?
+      i = my - (box.y + LIST_OFFSET)
+      return nil if i < 0 || i >= list_height(box)
+      return nil if mx < box.x + 1 || mx >= box.right - 1
+      ri = @scroll + i
+      ri < entry_count ? ri : nil
     end
 
     # Recompute the visible rows for the current query and reset the cursor. Subclasses

@@ -2,10 +2,17 @@
 # helper that writes the server entry into an agent's config. Reopens Gori::CLI; the
 # argv dispatch that reaches these lives in cli.cr.
 module Gori::CLI
+  # What `--pin-project` withholds: every tool that rebinds the server or reads a project
+  # other than the bound one (#1508). Folded into `--tools` as subtractions, so the banner,
+  # the empty-catalogue refusal and `tools/list` all see it through the one filter.
+  MCP_PIN_EXCLUDES = %w[list_projects switch_project create_project delete_project
+    import_project export_project diff_projects]
+
   # `gori mcp` starts a Model Context Protocol server over stdio (JSON-RPC 2.0):
   # an AI client (Claude Desktop / Claude Code) spawns it and queries gori's
   # captured data + drives repeaters. STDOUT is the protocol channel, so EVERYTHING
   # else (logs, the resolved-db banner, errors) goes to STDERR.
+
   private def self.run_mcp(args : Array(String)) : Nil
     db_path = nil.as(String?)
     project = nil.as(String?)
@@ -14,6 +21,7 @@ module Gori::CLI
     tools_spec = nil.as(String?)
     use_active_project = false
     no_project = false
+    pin_project = false
     # A LIST, not a single slot: `gori mcp --install-claude-code --install-codex` is what
     # someone who runs two agents types, and the last-one-wins slot this used to be
     # configured Codex alone and said nothing about the client it skipped — the same
@@ -21,7 +29,7 @@ module Gori::CLI
     # selector flags, spent on a whole client instead of one flag.
     install_targets = [] of String
 
-    parser = OptionParser.new do |p|
+    parser = option_parser("gori mcp") do |p|
       p.banner = "Usage: gori mcp [options]\n\n" \
                  "Start an MCP (Model Context Protocol) server over stdio. An AI client\n" \
                  "spawns this and talks JSON-RPC on stdin/stdout. With no --db/--project,\n" \
@@ -32,28 +40,25 @@ module Gori::CLI
       p.on("--project=NAME", "Serve a named project's db") { |v| project = v }
       p.on("--use-active-project", "Ignore the current Git workspace and serve the active TUI/MRU project") { use_active_project = true }
       p.on("--no-project", "Start unbound even inside a Git workspace (agent picks via list/create/switch)") { no_project = true }
-      p.on("--insecure-upstream", "send_request: skip upstream TLS verification") { insecure_upstream = true }
+      p.on("--insecure-upstream", "Skip upstream TLS verification for every tool that sends (send_request, fuzz, grpc_reflect, session refresh, OAST, …)") { insecure_upstream = true }
       p.on("--read-only", "Disable action tools (send_request, create/update_issue); serve the project without a writer") { read_only = true }
-      p.on("--tools=SPEC", "Advertise only these tools — comma-separated names/globs, '-' subtracts " \
-                           "(e.g. 'list_*,get_*,send_request' or '-fuzz_*,-mine_*'). The full catalogue is " \
-                           "~43k tokens of client context; this trims it") { |v| tools_spec = v }
+      p.on("--tools=SPEC", mcp_tools_help) { |v| tools_spec = v }
+      p.on("--pin-project", "Keep the server on the project it starts with: withhold #{MCP_PIN_EXCLUDES.join(", ")}") { pin_project = true }
       p.on("--install-agy", "Install gori as an MCP server in Antigravity (~/.gemini/antigravity-cli/mcp_config.json)") { install_targets << "agy" }
       p.on("--install-codex", "Install gori as an MCP server in Codex (~/.codex/config.toml)") { install_targets << "codex" }
       p.on("--install-claude", "Install gori as an MCP server in Claude Desktop config") { install_targets << "claude" }
-      p.on("--install-claude-code", "Install gori as an MCP server in Claude Code (~/.claude.json)") { install_targets << "claude-code" }
+      p.on("--install-claude-code", "Install gori as an MCP server in Claude Code (~/.claude.json, or $CLAUDE_CONFIG_DIR)") { install_targets << "claude-code" }
       p.on("--install-grok", "Install gori as an MCP server in Grok (~/.grok/config.toml)") { install_targets << "grok" }
       p.on("--install-hermes", "Install gori as an MCP server in Hermes ($HERMES_HOME, default ~/.hermes/config.yaml)") { install_targets << "hermes" }
-      p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-      p.invalid_option { |flag| abort "unknown option: #{flag}\n#{p}" }
-      p.missing_option { |flag| abort "missing value for #{flag}" }
+      p.on("--install-pi", "Install gori as an MCP server in Pi ($PI_CODING_AGENT_DIR, default ~/.pi/agent/mcp.json; requires an MCP adapter)") { install_targets << "pi" }
     end
     parser.parse(args)
 
     if use_active_project && (db_path.try(&.presence) || project.try(&.presence))
       abort "gori mcp: --use-active-project cannot be combined with --db/--project"
     end
-    if no_project && (db_path.try(&.presence) || project.try(&.presence) || use_active_project)
-      abort "gori mcp: --no-project cannot be combined with --db/--project/--use-active-project"
+    if no_project && (db_path.try(&.presence) || project.try(&.presence) || use_active_project || pin_project)
+      abort "gori mcp: --no-project cannot be combined with --db/--project/--use-active-project/--pin-project"
     end
 
     # Parsed BEFORE anything opens a store or writes a config: a misspelled pattern must
@@ -61,25 +66,81 @@ module Gori::CLI
     # server advertising a handful of tools, which an agent cannot tell from a gori that
     # simply does not have the feature.
     tool_filter = nil.as(MCP::ToolFilter?)
-    if spec = tools_spec.try(&.strip).presence
-      known = MCP::Tools::TOOL_NAMES.reject { |n| read_only && MCP::Tools::GATED_TOOLS.includes?(n) }
-      case parsed = MCP::ToolFilter.parse(spec, known)
+    # The pin rides on the spec as subtractions; a pin alone is a leading subtraction, which
+    # starts from the whole catalogue (`ToolFilter.parse`).
+    filter_spec = tools_spec.try(&.strip).presence
+    filter_flags = nil.as(String?)
+    if pin_project
+      filter_flags = [filter_spec.try { |s| "--tools=#{s}" }, "--pin-project"].compact.join(' ')
+      filter_spec = [filter_spec, MCP_PIN_EXCLUDES.join(',') { |t| "-#{t}" }].compact.join(',')
+    end
+    if spec = filter_spec
+      # Resolved against the WHOLE catalogue, never against the read-only subset. The two
+      # flags describe different things — `--tools` names tools, `--read-only` withholds
+      # them — and folding the gate into the name table made every action tool read as a
+      # MISSPELLING: `--read-only --tools='list_*,get_*,send_request'`, the example in this
+      # command's own `--tools` help, aborted with `"send_request" matches no tool`, which
+      # sent the operator hunting for a typo in a name they had spelled correctly. The gate
+      # is applied after the spec resolves, exactly where it is applied everywhere else
+      # (`Tools#list`).
+      case parsed = MCP::ToolFilter.parse(spec, MCP::Tools::TOOL_NAMES,
+        MCP::Tools::TOOL_DEPENDENCIES, filter_flags)
       in String          then abort parsed
       in MCP::ToolFilter then tool_filter = parsed
       end
+    end
+    # …and the "you would advertise nothing" refusal the filter makes on its own, for the
+    # one way the gate can still empty the set: a spec that names only action tools on a
+    # read-only server. Said with the reason, because the names in it are all real.
+    advertised = MCP::Tools.served_names(tool_filter, !read_only)
+    if tool_filter && advertised.empty?
+      abort "gori mcp: --tools=#{tools_spec} selects only tools that --read-only disables, " \
+            "so the server would advertise nothing. Name a read tool, or drop --read-only."
     end
 
     unless install_targets.empty?
       # Settings.path_override is `--config`, already stripped from argv by CLI.run before
       # dispatch — so run_mcp never sees the flag and can only read it back from here.
+      if pin_project && !(db_path.try(&.presence) || project.try(&.presence) || use_active_project)
+        STDERR.puts "gori mcp: note: --pin-project pins whatever the client's working directory binds; " \
+                    "spawned outside a Git workspace the server will refuse to start. Pass --project or --db to pin a fixed project."
+      end
       ok = install_mcp_config(install_targets, db_path, project, read_only, insecure_upstream,
-        use_active_project, no_project, Settings.path_override, tools_spec)
+        use_active_project, no_project, Settings.path_override, tools_spec, pin_project)
       exit(ok ? 0 : 1)
     end
 
     # Logs to STDERR ONLY — STDOUT is reserved for the JSON-RPC stream.
-    Log.setup(:info, Log::IOBackend.new(STDERR))
+    Log.setup(:info, StderrLog.new)
     Settings.load # send_request's repeater engines read the upstream-proxy setting from here
+    # A fuzz or mine job grows the heap the way capture does; give it back once the agent is idle.
+    IdleGc.start
+    # Preferences › AI › MCP permissions, latched for this process like `mcp_channels`, and
+    # never failing open: a settings file this start could not read in full denies every group
+    # rather than serving them all (`mcp_enforced_denials`).
+    denied, denial_warning = Settings.mcp_enforced_denials
+    Log.warn { "mcp: #{denial_warning}" } if denial_warning
+    unless (groups = Settings.mcp_permission_groups(denied)).empty?
+      Log.info { "mcp: switched off in Preferences (AI › MCP permissions): #{groups.join(", ", &.title)}" }
+      advertised = MCP::Tools.served_names(tool_filter, !read_only, denied)
+      # The `--read-only` refusal above, for the switches: a spec whose every tool is in a
+      # group the operator turned off would start a server with an empty tools/list, which an
+      # agent cannot tell from a gori without the feature. Refused here, AFTER the install
+      # branch — an installed command outlives today's switches.
+      if tool_filter && advertised.empty?
+        abort "gori mcp: every tool --tools=#{tools_spec} selects is switched off in Preferences " \
+              "(AI › MCP permissions: #{groups.join(", ", &.title)}), so the server would advertise " \
+              "nothing. Allow a group there, or name a read tool."
+      end
+    end
+
+    # The catalogue is the first thing this server spends, and it spends it on the operator's
+    # behalf before a question is asked: an MCP client loads every tool description into the
+    # model's context and keeps it there for the session. Said on EVERY start — which is why
+    # it is HERE and not beside the bound server below: an unbound start (outside a git
+    # workspace, `--no-project`, or a database that would not open) spends exactly the same
+    # context and used to say nothing at all.
+    Log.info { mcp_catalogue_banner(tool_filter, read_only, denied) }
 
     selection, bind_error = if no_project
                               {MCP::ProjectResolver::Selection.new(nil, nil, nil, "unbound"), nil}
@@ -93,19 +154,18 @@ module Gori::CLI
     project_id = selection.project_id
 
     unless selection.bound?
-      Log.info { "mcp: unbound (no project); use list_projects / create_project / switch_project (actions=#{!read_only})" }
+      # Unbound with every binder withheld is a server no call can use or repair.
+      abort "gori mcp: --pin-project needs a project, but this start is unbound#{": #{bind_error}" if bind_error}" if pin_project
+      log_unbound_binders(advertised, tool_filter, read_only, denied)
       server = MCP::Server.new(nil, allow_actions: !read_only, verify_upstream: !insecure_upstream,
         project_name: nil, project_slug: nil, db_path: nil,
         selection_source: selection.source, workspace_root: nil, project_id: nil,
-        bind_error: bind_error, tool_filter: tool_filter)
+        bind_error: bind_error, tool_filter: tool_filter, denied_permissions: denied)
       server.run
       return
     end
 
     resolved = selection.db_path.not_nil!
-    if f = tool_filter
-      Log.info { "mcp: --tools=#{f.spec} advertises #{f.size} of #{MCP::Tools::TOOL_NAMES.size} tools: #{f.names.join(", ")}" }
-    end
     Log.info { "mcp: serving #{resolved}#{" (#{project_name})" if project_name}#{" [#{project_slug}]" if project_slug} source=#{selection.source} (actions=#{!read_only})" }
     if selection.auto_created
       Log.warn { "mcp: created an isolated project for workspace #{selection.workspace_root}; use --project/--db to override" }
@@ -136,11 +196,18 @@ module Gori::CLI
           read_only: read_only, background_index: false)
       rescue ex : DB::Error | SQLite3::Exception | Error
         reason = "cannot open database #{resolved}: #{ex.message.presence || "not a valid SQLite database (or unreadable)"}"
+        abort "gori mcp: --pin-project needs a project, but #{reason}" if pin_project
         Log.error { "mcp: #{reason}; starting unbound" }
+        # The DEGRADED start is unbound too, and is the one the operator is most likely to be
+        # watching — so it gets the same binder check the deliberate `--no-project` start
+        # gets. Without it, a filtered server whose database would not open told the agent
+        # "the operator must restart" while the operator's own stderr said only that the file
+        # was bad (#1136).
+        log_unbound_binders(advertised, tool_filter, read_only, denied)
         server = MCP::Server.new(nil, allow_actions: !read_only, verify_upstream: !insecure_upstream,
           project_name: nil, project_slug: nil, db_path: nil,
           selection_source: "unbound", workspace_root: nil, project_id: nil,
-          bind_error: reason, tool_filter: tool_filter)
+          bind_error: reason, tool_filter: tool_filter, denied_permissions: denied)
         server.run
         return
       end
@@ -149,28 +216,107 @@ module Gori::CLI
       server = MCP::Server.new(store, allow_actions: !read_only, verify_upstream: !insecure_upstream,
         project_name: project_name, project_slug: project_slug, db_path: resolved,
         selection_source: selection.source, workspace_root: selection.workspace_root,
-        project_id: project_id, tool_filter: tool_filter)
+        project_id: project_id, tool_filter: tool_filter, denied_permissions: denied)
       server.run # blocks until STDIN EOF (client closed)
     ensure
       store.close
     end
   end
 
+  # The `--tools` help. No size in it: this text is compiled in, and every number ever
+  # written here had drifted by the time #1137 measured it — the startup log weighs the
+  # catalogue it is about to serve instead. The profile column is as wide as the longest
+  # name, not a fixed `ljust`, which pads only when the value is SHORTER and would run a
+  # longer profile's name straight into its summary.
+  def self.mcp_tools_help : String
+    width = MCP::ToolFilter::PROFILES.max_of(&.name.size) + 3
+    String.build do |io|
+      io << "Advertise only these tools: comma-separated names, globs or @profiles,\n"
+      io << "'-' subtracts (e.g. '@recon', '@minimal,send_request', '-fuzz_*,-mine_*').\n"
+      io << "Required companions are included automatically; conflicting explicit exclusions are refused.\n"
+      io << "The client loads every advertised tool into the model's context; the\n"
+      io << "startup log says how much. Profiles:"
+      MCP::ToolFilter::PROFILES.each do |pr|
+        io << "\n  " << "@#{pr.name}".ljust(width) << pr.summary
+      end
+    end
+  end
+
+  # The start-up line that says what this server's catalogue costs.
+  #
+  # Said on EVERY start, bound or not (see the call site), and the count is what this process
+  # will actually advertise, gate included; "all 179 tools (--read-only)" overstated a
+  # 62-tool catalogue by threefold, on the one line whose whole job is that number. The
+  # WEIGHT is measured from the very listing the client will be handed, rather than written
+  # into help or docs, for the reason `mcp_tools_help` gives. One JSON build per start — the
+  # same work the server's first `declared_args` does again, off any hot path.
+  def self.mcp_catalogue_banner(tool_filter : MCP::ToolFilter?, read_only : Bool,
+                                denied : Set(String)? = nil) : String
+    advertised = MCP::Tools.served_names(tool_filter, !read_only, denied)
+    total = MCP::Tools::TOOL_NAMES.size
+    weight = MCP::Tools.catalogue_weight(tool_filter, !read_only, denied)
+    if f = tool_filter
+      "mcp: #{f.flags} advertises #{advertised.size} of #{total} tools (#{weight}): #{advertised.sort.join(", ")}"
+    else
+      served = advertised.size == total ? "all #{advertised.size}" : "#{advertised.size} of #{total}"
+      "mcp: advertising #{served} tools#{" (--read-only)" if read_only} (#{weight}); " \
+      "narrow it with a --tools profile (#{MCP::ToolFilter.profile_names}) or a --tools=SPEC " \
+      "of names and globs to spend less of the model's context on it"
+    end
+  end
+
   # Writes the MCP entry into every named client config. Returns false if ANY target
   # failed — reported per target, and never as an abort partway through, which would have
   # made "which clients did gori configure?" depend on the order the flags were typed in.
+  # What the operator is told about an unbound start, named from what this process will
+  # ACTUALLY advertise rather than from the three tools that exist. `--tools` can remove every
+  # one of them, and a server left without a PICKER (`switch_project` / `create_project`)
+  # cannot be repaired from the agent's side at all — `list_projects` lists and binds nothing,
+  # so serving it alone buys the agent a listing and a refusal per entry. That is an operator
+  # mistake, made at start-up, and stderr is the only surface the operator is looking at when
+  # it is made — the agent never sees it (#1136).
+  private def self.log_unbound_binders(advertised : Array(String), tool_filter : MCP::ToolFilter?,
+                                       read_only : Bool, denied : Set(String)) : Nil
+    tools_flags = tool_filter.try(&.flags)
+    if MCP::Tools::PROJECT_PICKERS.none? { |n| advertised.includes?(n) }
+      Log.warn do
+        spec = tools_flags ? "#{tools_flags} advertises" : "this server advertises"
+        fixes = [] of String
+        if MCP::Tools.denied_permission(denied, "switch_project")
+          fixes << "allow Manage projects in Preferences (AI › MCP permissions)"
+        end
+        # Every cause that removed the binder, not the first one found: fixing one of two
+        # leaves the server exactly as unbindable as it was.
+        if fixes.empty? || (tool_filter && !tool_filter.allows?("switch_project"))
+          fixes << "add switch_project to --tools"
+        end
+        fix = "or #{fixes.join(" and ")}"
+        "mcp: unbound (no project) and #{spec} neither of " \
+        "#{MCP::Tools::PROJECT_PICKERS.join(", ")} — no call can bind a project. " \
+        "Restart with --project/--db, #{fix}"
+      end
+    else
+      usable = MCP::Tools::PROJECT_BINDERS.select { |n| advertised.includes?(n) }
+      Log.info { "mcp: unbound (no project); use #{usable.join(" / ")} (actions=#{!read_only})" }
+    end
+  end
+
   private def self.install_mcp_config(targets : Array(String), db_path : String?, project : String?,
                                       read_only : Bool, insecure_upstream : Bool,
                                       use_active_project : Bool, no_project : Bool,
-                                      settings_path : String?, tools_spec : String? = nil) : Bool
+                                      settings_path : String?, tools_spec : String? = nil,
+                                      pin_project : Bool = false) : Bool
     exe = MCP::Install.executable_path
     outcomes = MCP::Install.install_all(targets, exe_path: exe, db_path: db_path, project: project,
       read_only: read_only, insecure_upstream: insecure_upstream,
       use_active_project: use_active_project, no_project: no_project,
-      settings_path: settings_path, tools_spec: tools_spec)
+      settings_path: settings_path, tools_spec: tools_spec, pin_project: pin_project)
     outcomes.each do |outcome|
       if path = outcome.path
         puts "Successfully installed gori MCP server configuration to #{path}"
+        if outcome.target == "pi"
+          puts "Pi requires an MCP adapter (e.g. pi install npm:pi-mcp-adapter). Restart Pi to load the configuration."
+        end
       else
         STDERR.puts "Failed to install MCP config for #{outcome.target}: #{outcome.error}"
       end

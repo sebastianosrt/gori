@@ -20,6 +20,7 @@ module Gori::Tui
 
     # One rendered line: an ordered partition of the source line into spans.
     alias Line = Array(Span)
+    alias DecodedRange = {Int32, Int32, Int32} # body line, first character, one-past-last character
 
     # --- public entry points -------------------------------------------------
 
@@ -72,7 +73,7 @@ module Gori::Tui
       end
 
       # Build from wire/display bytes without splitting into strings.
-      def self.from_bytes(bytes : Bytes) : BodyLines
+      def self.from_bytes(bytes : Bytes, protected_linefeeds : Array(Int32) = [] of Int32) : BodyLines
         return empty if bytes.empty?
         starts = Array(Int32).new
         starts << 0
@@ -80,8 +81,13 @@ module Gori::Tui
         # one iteration per body byte, so opening a 10 MB response walked 10M times in
         # Crystal. Same result, and the scan is now the libc one.
         pos = 0
+        protected_i = 0
         while nl = bytes.index(0x0A_u8, pos)
-          starts << (nl + 1)
+          if protected_i < protected_linefeeds.size && protected_linefeeds[protected_i] == nl
+            protected_i += 1
+          else
+            starts << (nl + 1)
+          end
           pos = nl + 1
         end
         new(bytes, starts, nil)
@@ -102,10 +108,6 @@ module Gori::Tui
         else
           @starts.size
         end
-      end
-
-      def empty? : Bool
-        size == 0
       end
 
       # Materialise line `i` (0-based). Same scrub/rstrip rules as `to_lines`.
@@ -132,15 +134,36 @@ module Gori::Tui
     # whole array for a request. It is opt-IN rather than derived from `request`, so the
     # read-only windowed callers that never had the overlay keep rendering exactly as they do.
     record Windowed, head : Array(Line), body : BodyLines, kind : Symbol,
-      env_tokens : Bool = false, literal : Set(String)? = nil do
+      env_tokens : Bool = false, literal : Set(String)? = nil,
+      decoded_ranges : Array(DecodedRange) = [] of DecodedRange do
       def total : Int32
         head.size + body.size
       end
 
       # The styled line at absolute index `i` (head pre-styled, body styled lazily).
       def line_at(i : Int32) : Line
-        line = i < head.size ? head[i] : Highlight.body_styled(body[i - head.size], kind)
+        if i < head.size
+          line = head[i]
+        else
+          body_i = i - head.size
+          line = Highlight.body_styled(body[body_i], kind)
+          ranges = Highlight.decoded_ranges_for(decoded_ranges, body_i)
+          line = Highlight.emphasize(line, ranges) unless ranges.empty?
+        end
         env_tokens ? Highlight.with_env_tokens(line, literal) : line
+      end
+
+      # The line's own characters, colour dropped — WITHOUT styling it. A body line is already
+      # a String in `body`, so `Highlight.plain(line_at(i))` was tokenising it and then throwing
+      # every span colour away; the head is pre-styled, so there it is only the join.
+      # Mirrors `HistoryView::DetailView#line_text`, and is exact for the same reason: spans
+      # partition the line in order and carry no inserted padding, and the `env_tokens` overlay
+      # only SPLITS spans — so the concatenation is the source line either way.
+      #
+      # The seam a pane needs when its only source is styled but it addresses text: ReadPane's
+      # caret, selection, search and copy all read this, once per drawn logical line.
+      def plain_at(i : Int32) : String
+        i < head.size ? Highlight.plain(head[i]) : body[i - head.size]
       end
     end
 
@@ -152,7 +175,9 @@ module Gori::Tui
 
     # `kind` overrides the content-type-derived styling (used by Pretty when its
     # output is no longer the content-type's language, e.g. GraphQL/JWT → :text).
-    def self.message_windowed(head : Bytes?, body : Bytes?, request : Bool, kind : Symbol? = nil) : Windowed
+    def self.message_windowed(head : Bytes?, body : Bytes?, request : Bool, kind : Symbol? = nil,
+                              *, decoded_ranges : Array(DecodedRange) = [] of DecodedRange,
+                              protected_linefeeds : Array(Int32) = [] of Int32) : Windowed
       head_lines = to_lines(head)
       # A captured head ends with the CRLFCRLF terminator, which `to_lines` turns
       # into trailing "" entries ("…\r\n\r\n" → […, "", ""]). Drop them so the
@@ -178,12 +203,77 @@ module Gori::Tui
         end
       end
       styled << blank if has_body # the head/body separator
-      Windowed.new(styled, has_body ? BodyLines.from_bytes(body.not_nil!) : BodyLines.empty, kind)
+      Windowed.new(styled, has_body ? BodyLines.from_bytes(body.not_nil!, protected_linefeeds) : BodyLines.empty, kind,
+        decoded_ranges: decoded_ranges)
     end
 
     # Style a single body line (the public seam for windowed rendering).
     def self.body_styled(raw : String, kind : Symbol) : Line
       body_line(raw, kind)
+    end
+
+    # Underline characters produced by on-demand JSON escape decoding. The ranges address the
+    # decoded source text, before Screen turns any invisible codepoints into display badges.
+    def self.emphasize(line : Line, ranges : Array({Int32, Int32})) : Line
+      return line if ranges.empty?
+      ordered = ranges.select { |(a, b)| a < b }
+      ordered.sort_by!(&.[0])
+      return line if ordered.empty?
+
+      out = [] of Span
+      range_i = 0
+      offset = 0
+      line.each do |span|
+        text = span.text
+        finish = offset + text.size
+        pos = 0
+        while pos < text.size
+          range = ordered[range_i]?
+          while range && range[1] <= offset + pos
+            range_i += 1
+            range = ordered[range_i]?
+          end
+
+          if range.nil? || range[0] >= finish
+            out << Span.new(text[pos..], span.fg, span.attr) if pos < text.size
+            pos = text.size
+          elsif offset + pos < range[0]
+            stop = {range[0] - offset, text.size}.min
+            out << Span.new(text[pos...stop], span.fg, span.attr)
+            pos = stop
+          else
+            stop = {range[1] - offset, text.size}.min
+            out << Span.new(text[pos...stop], Theme.accent, span.attr | Attribute::Underline) if stop > pos
+            pos = stop
+            range_i += 1 if offset + pos >= range[1]
+          end
+        end
+        offset = finish
+      end
+      out
+    end
+
+    # Decoded ranges are appended in source order. Binary-search their first body line so drawing
+    # one visible line does not scan every decoded escape in a multi-megabyte response.
+    def self.decoded_ranges_for(ranges : Array(DecodedRange), line_i : Int32) : Array({Int32, Int32})
+      low = 0
+      high = ranges.size
+      while low < high
+        middle = (low + high) // 2
+        if ranges[middle][0] < line_i
+          low = middle + 1
+        else
+          high = middle
+        end
+      end
+
+      selected = [] of {Int32, Int32}
+      while low < ranges.size && ranges[low][0] == line_i
+        range = ranges[low]
+        selected << {range[1], range[2]}
+        low += 1
+      end
+      selected
     end
 
     # Highlight a message held as one combined text blob (Intercept's byte-exact
@@ -229,11 +319,15 @@ module Gori::Tui
     # Without it an unrecognised `hsot:` renders in the same confident blue as a real field,
     # which is the one visible signal an operator has while typing, and it says the opposite of
     # the truth.
+    # `shaped` is what keeps a pasted URL out of the muted colour: `known` alone cannot tell
+    # `hsot:acme` (a typo) from `http://acme.test/x` (a token the backend free-texts by design
+    # and reports as naming no field), because it never sees the value. See `FilterAst.spans`.
     def self.filter_query(query : String, base : Color = Theme.text,
                           seps : String = FilterAst::SEPS_FIELD_REGEX,
-                          known : Proc(String, Char, Bool)? = nil) : Array(Color)
+                          known : Proc(String, Char, Bool)? = nil,
+                          shaped : Proc(String, Char, String, Bool)? = nil) : Array(Color)
       colors = Array(Color).new(query.size, base)
-      FilterAst.spans(query, seps, known).each do |span|
+      FilterAst.spans(query, seps, known, shaped).each do |span|
         fg = case span.kind
              in .operator? then Theme.syn_keyword
              in .paren?    then Theme.syn_keyword
@@ -271,18 +365,27 @@ module Gori::Tui
       # first — wasted per-frame allocation on the TARGET rows that redraw each frame.
       prefix = Settings.env_prefix
       return [Span.new(text, base_fg, attr)] if prefix.empty? || !text.includes?(prefix)
-      regions = Env.token_regions(text, prefix)
+      # `regions` and not `token_regions`: the NAMESPACE is what decides which table answered
+      # `known`, and it is also the half the literal set has to be asked about. The 3-tuple
+      # projection drops it, so this read the name out of the painted text with a `plen` slice
+      # — which under the namespaced grammar sliced `ENV.HOST` and matched nothing.
+      regions = Env.regions(text, prefix)
       return [Span.new(text, base_fg, attr)] if regions.empty?
       spans = [] of Span
       pos = 0
-      plen = prefix.size
-      regions.each do |(a, b, known)|
-        spans << Span.new(text[pos...a], base_fg, attr) if a > pos
+      regions.each do |r|
+        spans << Span.new(text[pos...r.start], base_fg, attr) if r.start > pos
         # A name the caller ships literally is not resolvable ON THIS BUFFER, whatever the
         # global var table says — paint what the wire will carry, not what it could have.
-        known = false if known && literal && literal.includes?(text[(a + plen)...b])
-        spans << Span.new(text[a...b], known ? Theme.env_known : Theme.env_unknown, known ? attr : (attr | Attribute::Italic))
-        pos = b
+        # Keyed QUALIFIED when the token names a namespace, so an evidence `$ENV.id` cannot be
+        # dimmed by a literal `$BIND.id` the same buffer carried.
+        known = r.known
+        if known && literal
+          ns = r.ns
+          known = false if literal.includes?(ns ? Env.qualify(ns, r.name) : r.name)
+        end
+        spans << Span.new(text[r.start...r.stop], known ? Theme.env_known : Theme.env_unknown, known ? attr : (attr | Attribute::Italic))
+        pos = r.stop
       end
       spans << Span.new(text[pos..], base_fg, attr) if pos < text.size
       spans
@@ -445,11 +548,12 @@ module Gori::Tui
       limit = width || (screen.width - x)
       return x if limit <= 0
 
-      # Special case for width=1: always show the first glyph (even if it is
-      # wide, e.g. Hangul), never ellipsis. Matches Screen#fit policy.
+      # Special case for width=1: show the first glyph, never an ellipsis — unless it is wide
+      # (e.g. Hangul), which would paint 2 cells into 1. Matches Screen#fit policy.
       if limit == 1
         if line.present? && !line[0].text.empty?
           first = line[0].text.each_grapheme.first.to_s
+          first = "…" if Screen.grapheme_cols(first) > 1
           # Char path so a leading C0 control becomes the space cell (not rejected).
           if first.size == 1
             screen.cell(x, y, first[0], line[0].fg, bg, line[0].attr)
@@ -467,8 +571,8 @@ module Gori::Tui
       # glyphs, so its width is its char count: skip the grapheme walk (and its per-glyph
       # `g.to_s` String) entirely, mirroring Screen#text's ASCII fast path. Mixed lines
       # stay correct — width accumulates across spans regardless of which branch each takes.
-      # Non-printable spans use `grapheme_cols` (≥1) so an embedded tab still counts as a
-      # cell — same floor as Screen#text / the editor caret (issue #278).
+      # Non-printable spans use `grapheme_cols`, which measures the visible badge for a
+      # control rather than the zero-width source codepoint.
       overflow = false
       acc = 0
       line.each do |span|
@@ -520,9 +624,8 @@ module Gori::Tui
               done = true
               break
             end
-            # Single codepoint → Char path (C0 control → space via ASCII_CELL). Multi-
-            # codepoint clusters stay on the String path. Floor-to-1 above means a tab
-            # advances one column instead of collapsing the rest of the line leftward.
+            # Single codepoint → Char path. Multi-codepoint clusters stay on the String
+            # path. Unsafe codepoints expand into named badges through Screen#cell.
             if gs.size == 1
               screen.cell(x + visual_col, y, gs[0], span.fg, bg, span.attr)
             else
@@ -572,7 +675,7 @@ module Gori::Tui
         # (each of which allocates a String for `grapheme_cols`). That walk is what a minified
         # body line costs once it is panned to the right: O(the columns scrolled off), every
         # frame, on the one line long enough to need panning.
-        if span.text.ascii_only?
+        if Screen.printable_ascii?(span.text)
           kept = span.text[(start_col - acc)..]
           acc = start_col
           cutting = false
@@ -608,7 +711,7 @@ module Gori::Tui
       return s if start_col <= 0
       # ASCII fast path, exactly as in `slice_left` above and for the same reason: column ==
       # char index, so no cluster can straddle the cut and the tail is one slice.
-      return start_col >= s.size ? "" : s[start_col..] if s.ascii_only?
+      return start_col >= s.size ? "" : s[start_col..] if Screen.printable_ascii?(s)
       acc = 0
       cutting = true
       String.build do |io|
@@ -698,15 +801,6 @@ module Gori::Tui
       sliced
     end
 
-    # Total drawn column span of a styled line (sum of its spans) — used to clamp a
-    # horizontal scroll offset against the widest currently-visible row. Uses draw_width,
-    # which is what `draw` below actually advances by: ≥1 per cluster so an embedded tab
-    # keeps its cell, but ONE cluster per glyph so a ZWJ emoji doesn't inflate the line by
-    # its codepoint count and let the view scroll past the end of the content.
-    def self.line_width(line : Line) : Int32
-      line.sum { |span| Screen.draw_width(span.text) }
-    end
-
     # The styled line's own characters, colour dropped. The bridge for a pane whose ONLY source
     # is styled — the windowed message views (`Windowed#line_at` returns a `Line`) — into
     # anything that addresses text: `ReadPane`'s caret and selection, a copy, a search. Spans
@@ -717,7 +811,11 @@ module Gori::Tui
       String.build { |io| line.each { |span| io << span.text } }
     end
 
-    # As `line_width`, but stops summing once the running width reaches `limit` — and
+    # Drawn column span of a styled line — used to clamp a horizontal scroll offset against
+    # the widest currently-visible row. Measures what `draw` actually advances by: ≥1 per
+    # cluster so an embedded tab keeps its cell, but ONE cluster per glyph so a ZWJ emoji
+    # doesn't inflate the line by its codepoint count and let the view scroll past the end of
+    # the content. Stops summing once the running width reaches `limit` — and
     # caps WITHIN a span too (a huge minified body is one plain span > MAX_HL_LINE), so
     # the per-frame h-scroll clamp never fully measures a multi-MB line. See
     # Screen.draw_width_upto. Exact for lines narrower than limit.

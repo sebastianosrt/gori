@@ -10,24 +10,45 @@ module Gori
     class Tools
       # --- mine tools (gated, async job model) --------------------------------
 
-      @[Tool("mine_start", gated: true, agent_action: true, env_refresh: true)]
+      @[Tool("mine_start", gated: true, agent_action: true, env_refresh: true,
+        requires: ["mine_status", "mine_results", "mine_stop"], permission: "send")]
       private def mine_start(h) : Result
         ob = outbound(bool_arg(h, "allow_unscoped", false))
-        engine, origin, total = build_mine_job(h, ob)
-        sc = ob.check("#{origin.scheme}://#{origin.host}/", origin.host,
-          Outbound.exclude_url(origin.scheme, origin.host, "/", origin.port))
+        plan = build_mine_job(h, ob)
+        engine, origin, total, project_reports = plan.engine, plan.origin, plan.total_names, plan.project_reports
+        # Gate on the template's real request-target, not a bare `/` — the check
+        # `sequence_start` and `gori run mine` make. A path-scoped include refused an in-scope
+        # run, and a path EXCLUDE passed Layer 1 because `/` never matched it.
+        sc = ob.check_request(origin.scheme, origin.host, plan.request_target, origin.port)
         return scope_blocked(sc) if sc.blocked?
         @job_seq += 1
         id = "mn_#{@job_seq}"
+        # The cap the engine runs with, read back off the plan: the raw arg disagreed with the
+        # run whenever it was above the ceiling or non-positive.
         audit = JobAudit.new("#{origin.scheme}://#{origin.host}:#{origin.port}",
-          optional_float_arg(h, "rate"), clamp(optional_int_arg(h, "concurrency"), 10, MINE_MAX_CONCURRENCY),
-          optional_int_arg(h, "max_requests"), Time.utc.to_unix_ms)
+          optional_float_arg(h, "rate"), plan.config.concurrency,
+          plan.config.max_requests, Time.utc.to_unix_ms)
         mjob = MineJob.new(id, total, engine, audit, @db_path)
         evict_finished_jobs(@mine_jobs)
         @mine_jobs[id] = mjob
         Log.info { "mine_start #{id} #{origin.scheme}://#{origin.host}:#{origin.port} scope=#{sc.decision} names=#{total}" }
         spawn(name: "mcp-mine-#{id}") { run_mine_job(mjob, engine) }
-        Result.new(JSON.build { |j| j.object { j.field "job_id", id; j.field "names", total; j.field "status", "running"; emit_scope(j, sc) } })
+        Result.new(JSON.build do |j|
+          j.object do
+            j.field "job_id", id
+            j.field "names", total
+            j.field "status", "running"
+            emit_scope(j, sc)
+            emit_request_macro_plan(j, engine.request_macro.try(&.info(engine.concurrency)))
+            # What each `payload_from` name source read (#1352): flows and names counted, the
+            # sensitive-value policy, what cut it short. Only when the run had one.
+            unless project_reports.empty?
+              j.field "payload_sources" do
+                payload_reports_json(j, project_reports)
+              end
+            end
+          end
+        end)
       rescue ex : FuzzArgError
         Result.new(ex.message || "invalid mine arguments", is_error: true)
       end
@@ -81,9 +102,9 @@ module Gori
         end
       end
 
-      @[Tool("mine_status", gated: true)]
+      @[Tool("mine_status", gated: true, read_only: true, permission: "send")]
       private def mine_status(h) : Result
-        mjob = lookup_mine_job(h)
+        mjob = lookup_job(h, @mine_jobs, "mine", "status")
         return mjob if mjob.is_a?(Result)
         Result.new(JSON.build do |j|
           j.object do
@@ -95,6 +116,7 @@ module Gori
             j.field "sent", mjob.sent
             j.field "found", mjob.found
             j.field "errors", mjob.errors
+            emit_request_macro_status(j, mjob.engine.request_macro)
             j.field "baseline_stable", mjob.baseline_stable?
             # How this run had to be calibrated: the status varied, the endpoint echoes any
             # input (reflection detection is then OFF at those locations), it never answered at
@@ -138,94 +160,69 @@ module Gori
             # can still reconcile the count it was given against the wordlist it supplied.
             engine.skipped_names.each { |(loc, n)| mine_skip_row(j, loc, n, "invalid-at-location") }
             engine.present_names.each { |(loc, n)| mine_skip_row(j, loc, n, "already-in-request") }
+            # A named location this request cannot carry at all: every candidate name went
+            # untested there, and `names_total` counts none of them (#1203).
+            engine.inapplicable.each { |loc| mine_skip_row(j, loc, engine.candidate_names, "not-applicable") }
           end
         end
       end
 
       private def mine_skip_row(j : JSON::Builder, loc : Miner::Location, n : Int32, reason : String) : Nil
-        j.object do
-          j.field "location", loc.label
-          j.field "names", n
-          j.field "reason", reason
-        end
+        {location: loc.label, names: n, reason: reason}.to_json(j)
       end
 
-      @[Tool("mine_results", gated: true)]
+      MINE_RESULTS_LIMIT = PageLimit.new(100, 1000)
+
+      @[Tool("mine_results", gated: true, read_only: true, permission: "send")]
       private def mine_results(h) : Result
-        mjob = lookup_mine_job(h)
+        mjob = lookup_job(h, @mine_jobs, "mine", "results")
         return mjob if mjob.is_a?(Result)
-        req_off = optional_int_arg(h, "offset")
-        req_lim = optional_int_arg(h, "limit")
-        offset = clamp_nonneg(req_off)
-        limit = clamp(req_lim, 100, 1000)
-        page = mjob.results[offset, limit]? || [] of Miner::Finding
+        pg = page_args(h, MINE_RESULTS_LIMIT)
+        page = mjob.results[pg.offset, pg.limit]? || [] of Miner::Finding
         Result.new(JSON.build do |j|
           j.object do
-            j.field("findings") { j.array { page.each { |f| mine_finding_json(j, f) } } }
-            j.field "returned", page.size
-            j.field "offset", offset
+            j.field("findings") { j.array { page.each { |f| Serialize.mine_finding(j, f) } } }
+            emit_page(j, pg, page.size)
             j.field "total_available", mjob.results.size
-            j.field "limit", limit
-            emit_clamp(j, req_off, offset, req_lim, limit)
             j.field "job_complete", mjob.status != :running
-            j.field "page_complete", offset + page.size >= mjob.results.size
-            j.field "has_more", offset + page.size < mjob.results.size
+            j.field "page_complete", pg.offset + page.size >= mjob.results.size
+            j.field "has_more", pg.offset + page.size < mjob.results.size
             j.field "incomplete_reason", incomplete_reason(mjob.status)
             j.field "results_truncated", mjob.truncated?
           end
         end)
       end
 
-      @[Tool("mine_stop", gated: true, agent_action: true)]
+      @[Tool("mine_stop", gated: true, agent_action: true, permission: "send")]
       private def mine_stop(h) : Result
-        mjob = lookup_mine_job(h)
+        mjob = lookup_job(h, @mine_jobs, "mine", "stop")
         return mjob if mjob.is_a?(Result)
-        mjob.stop
         stop_and_report(mjob)
-      end
-
-      private def lookup_mine_job(h) : MineJob | Result
-        id = str(h, "job_id")
-        return Result.new("missing required 'job_id'", is_error: true) if id.nil? || id.empty?
-        job = @mine_jobs[id]?
-        return not_found("no mine job #{id}") unless job
-        job_project_mismatch(job) || job
-      end
-
-      private def mine_finding_json(j : JSON::Builder, f : Miner::Finding) : Nil
-        j.object do
-          # name comes from a caller-supplied wordlist FILE (arbitrary bytes on disk).
-          j.field "name", Serialize.text(f.name)
-          j.field "location", f.location.label
-          j.field "evidence", f.evidence.label
-          j.field "confidence", f.confidence.label
-          j.field "canary", Serialize.text(f.canary)
-          j.field "status", f.status
-          j.field "delta", f.delta
-          # The gRPC CALL's outcome, from the confirming round's `grpc-status`/`grpc-message`
-          # trailers — `status` above is 200 for every gRPC response. Emitted only when the
-          # response actually carried it, so a non-gRPC run's rows are unchanged.
-          if gs = f.grpc_status
-            j.field "grpc_status", gs
-            j.field "grpc_status_name", Proxy::H2::Grpc.status_name(gs)
-          end
-          j.field "grpc_message", Serialize.text(f.grpc_message) if f.grpc_message
-        end
       end
 
       # Build a ready-to-run mining engine + its origin + name count. Raises FuzzArgError
       # (clean message) on malformed input. Reuses the fuzz timeout helper.
-      private def build_mine_job(h, ob : Outbound) : {Miner::Engine, Fuzz::Origin, Int64}
+      private def build_mine_job(h, ob : Outbound) : Miner::Plan
         text, default_target, src_h2, evidence = mine_template_source(h)
         config = Miner::Config.new
         config.concurrency = clamp(optional_int_arg(h, "concurrency"), 10, MINE_MAX_CONCURRENCY)
         config.rps = optional_float_arg(h, "rate")
         config.timeout = fuzz_timeout(h)
         config.retries = (optional_int_arg(h, "retries") || 1_i64).clamp(0_i64, 1000_i64).to_i # clamp before .to_i (Int32) so a huge value can't OverflowError past the clean-error handler
-        cap = optional_int_arg(h, "max_requests")
+        # A non-positive cap is ignored, as `fuzz_config` does: `CappedBackend` reads 0 / -1 as
+        # "no cap", so `{cap, MAX}.min` turned `max_requests: 0` into an UNBOUNDED run.
+        cap = optional_int_arg(h, "max_requests").try { |m| m > 0 ? m : nil }
         config.max_requests = cap ? {cap, MINE_MAX_REQUESTS}.min : MINE_MAX_REQUESTS
         config.user_wordlist = str(h, "wordlist").presence
+        config.user_wordlist.try { |w| wordlist_stream_refusal(w.strip) }.try { |why| raise FuzzArgError.new(why) }
+        config.seed_names = begin
+          str_list(h, "names").flat_map(&.split(',')).map(&.strip).reject(&.empty?)
+        rescue ex : Gori::Error
+          raise FuzzArgError.new(ex.message || "invalid 'names'")
+        end
         config.hook = str(h, "hook").presence
+        # The request-time macro (#1350), parsed here and wired by `Plan.build`.
+        config.request_macro = request_macro_spec(h)
         optional_int_arg(h, "throttle_ms").try { |v| config.throttle_ms = v.clamp(0_i64, 600_000_i64).to_i }
         config.keep_alive = bool_arg(h, "keep_alive", true)
         options = Miner::PlanOptions.new(text,
@@ -244,11 +241,35 @@ module Gori
           # route to it at all, so a param-mine against a vhost whose SNI must differ from the
           # Host header — exactly what this tool exists for — was unreachable from an agent.
           sni: str(h, "sni"),
-          overrides: HostOverrides.load(store))
-        plan = Miner::Plan.build(options, ob)
-        {plan.engine, plan.origin, plan.total_names}
+          overrides: HostOverrides.load(store),
+          # Candidate names read from the project's own captured data (#1352), tested after
+          # `names` and before the built-in list and `wordlist`. Resolved by the plan builder.
+          project_names: mine_project_names(h), project: store)
+        Miner::Plan.build(options, ob)
       rescue ex : Miner::PlanError
         raise FuzzArgError.new(mine_plan_error(ex))
+      rescue ex : Gori::Error
+        # `PayloadFrom::Error` and `RequestMacro::Error` both: each builder writes its own
+        # sentence, and it reads the same on every surface.
+        raise FuzzArgError.new(ex.message || "invalid mine arguments")
+      end
+
+      # `payload_from`: a list of `<QL> param-names` descriptors (a bare string is one), with the
+      # shared policy beside it as `payload_from_include_sensitive` / `_locations` / `_max_flows` /
+      # `_max_values`. A projection other than param-names is refused: a Miner source is a list of
+      # NAMES, and the values of a parameter are `fuzz_start`'s business.
+      private def mine_project_names(h) : Array(PayloadFrom::Spec)
+        descs = str_list(h, "payload_from")
+        return [] of PayloadFrom::Spec if descs.empty?
+        policy = payload_policy_arg(h, "payload_from_")
+        descs.map do |d|
+          spec = payload_spec_arg(d, "payload_from")
+          unless spec.projection.param_names?
+            raise FuzzArgError.new("'payload_from' on mine_start reads parameter NAMES — use the param-names projection " \
+                                   "(got #{spec.projection.label}; its values are for fuzz_start)")
+          end
+          spec.apply(policy)
+        end
       end
 
       # MCP's wording for a plan the args can't produce — the builder reports the
@@ -260,7 +281,7 @@ module Gori
         in Miner::PlanError::Reason::BadTarget
           "could not parse a host from '#{ex.detail}'"
         in Miner::PlanError::Reason::NoLocations
-          "no applicable locations for this request"
+          (why = ex.detail) ? "no requested location applies to this request — #{why}" : "no applicable locations for this request"
         in Miner::PlanError::Reason::Wordlist
           "wordlist error: #{ex.detail}"
         in Miner::PlanError::Reason::NoNames
@@ -336,7 +357,13 @@ module Gori
           s.field "flow_id", intprop("seed the request from a captured flow id (instead of template)")
           s.field "url", strprop("absolute target URL (scheme+host) that sets the origin — a 'template' or 'flow_id' is still REQUIRED; url alone does NOT define the request (unlike send_request)")
           s.field "locations", strprop("comma list of where to mine: #{MINE_LOCATIONS.join(",")} (default: auto-detect; multipart is applicable but off by default — pass it explicitly)")
-          s.field "wordlist", strprop("path to an extra param-name wordlist (merged with the built-in list)")
+          s.field "wordlist", strprop("path to an extra param-name wordlist, or the name of a saved list (list_wordlists); merged with the built-in list")
+          s.field "names", strarrprop("names to test FIRST, ahead of the built-in list and any wordlist — e.g. list_params names seen on this host's other endpoints but not on this one")
+          s.field "payload_from", strarrprop("candidate names read from the project's captured data, each '<QL> param-names' (e.g. 'host:api.example param-names'), tested after `names` and BEFORE the built-in list and `wordlist`. Reads the project, sends nothing; the reply's payload_sources says what each read. Cookies and headers only when payload_from_locations names them")
+          s.field "payload_from_include_sensitive", boolprop("also read credential material for payload_from (default false; a NAME is never withheld, so this only matters for cookie/header locations you name)")
+          s.field "payload_from_locations", strprop("locations payload_from reads, comma list of query,form,multipart,json,headers,cookies (default query,form,multipart,json)")
+          s.field "payload_from_max_flows", intprop("newest flows each payload_from source reads (default #{PayloadFrom::DEFAULT_MAX_FLOWS}, max #{PayloadFrom::MAX_FLOWS})")
+          s.field "payload_from_max_values", intprop("distinct names each payload_from source keeps (default #{PayloadFrom::DEFAULT_MAX_VALUES}, max #{PayloadFrom::MAX_VALUES})")
           s.field "bucket", intprop("names stuffed per request before bisection (per location)")
           s.field "concurrency", intprop("parallel requests (default 10, max #{MINE_MAX_CONCURRENCY})")
           s.field "rate", numprop("requests/sec cap, fractional allowed (0 = unlimited; 0.5 = one request every two seconds)")
@@ -344,11 +371,12 @@ module Gori
           s.field "retries", intprop("retries per request on a network error")
           s.field "http2", boolprop("use real HTTP/2 (default false)")
           s.field "insecure", boolprop("skip upstream TLS verification (default false)")
-          s.field "throttle_ms", intprop("fixed delay between requests in ms — an alternative to 'rate' for a target that rate-limits on inter-request gap rather than throughput (mirrors CLI --throttle)")
+          s.field "throttle_ms", intprop("fixed delay between requests in ms, for a target that limits on the gap between requests rather than throughput (CLI --throttle)")
           s.field "sni", strprop("TLS SNI override, independent of the Host header — the vhost-confusion / domain-fronting test (mirrors CLI --sni)")
           s.field "max_requests", intprop("caller cap on total requests")
-          s.field "hook", strprop("transform each assembled request through an external command (argv, no shell — e.g. \"./sign.sh\") before it is sent; its stdout is the request that ships. For a signed/HMAC'd/nonce API where a raw candidate is rejected before the miner learns anything. A hook that fails to run SKIPS the candidate with a reported reason (never a clean negative). One #{Gori::Settings.hook_timeout_secs}s (settings.hooks.timeout_secs) budget PER request; a mine's request count is bounded by max_requests, so the total hook cost is too.")
-          s.field "keep_alive", boolprop("reuse one HTTP/1.1 connection across the mine's probes (default true) — one TCP/TLS handshake per worker instead of per probe, which is most of a mine's wall clock. Set false to dial a fresh connection per probe, which is what you want when the target behaves per-connection (connection-scoped rate limits, a load balancer pinning by connection).")
+          s.field "hook", strprop("pipe each assembled request through an external command (argv, no shell, e.g. \"./sign.sh\"); its stdout is the request sent. For a signed/HMAC/nonce API that rejects a raw candidate. A hook that fails SKIPS the candidate with a reason (never a clean negative). #{Gori::Settings.hook_timeout_secs}s (settings.hooks.timeout_secs) per request, bounded overall by max_requests.")
+          request_macro_props(s, "request")
+          s.field "keep_alive", boolprop("reuse one HTTP/1.1 connection per worker across probes (default true), which saves most of a mine's wall clock. Set false to dial per probe: for connection-scoped rate limits or a load balancer pinning by connection.")
           s.field "allow_unscoped", boolprop("run even when the target host is outside the project's configured scope — REQUIRED to run against an out-of-scope target, or when no scope is configured at all (active requests are refused by default without a matching scope)")
         end
 
@@ -356,9 +384,10 @@ module Gori
                                "budget_exhausted means max_requests halted the run before every name was tried; see incomplete_reason. " \
                                "`skipped` lists wordlist names that were NOT tested, per location, against `candidate_names` " \
                                "(the wordlist's own size), each with a reason: `invalid-at-location` (a header/cookie name must be " \
-                               "an RFC 7230 token, and framing headers are never injected) or `already-in-request` (a name the " \
-                               "request already carries there is a VISIBLE parameter, not a hidden one). names_total counts only " \
-                               "the names that survived both filters, so without `skipped` an incomplete sweep reads as a clean " \
+                               "an RFC 7230 token, and framing headers are never injected), `already-in-request` (a name the " \
+                               "request already carries there is a VISIBLE parameter, not a hidden one) or `not-applicable` (a " \
+                               "requested location this request cannot carry, e.g. json with no JSON body; every name at it). " \
+                               "names_total counts only the names that survived those filters, so without `skipped` an incomplete sweep reads as a clean " \
                                "one. `baseline_warning` names anything that makes findings tentative — READ IT even when " \
                                "baseline_stable is true: the endpoint-echoes-any-input note (reflection findings are disabled " \
                                "at those locations) is independent of stability." do |s|
@@ -369,7 +398,7 @@ module Gori
           "Paged discovered parameters for a mine job (name, location, evidence, confidence, canary, status, delta)." do |s|
           s.field "job_id", strprop("id from mine_start"), required: true
           s.field "offset", intprop("start row (default 0)")
-          s.field "limit", intprop("max rows (default 100, max 1000)")
+          s.field "limit", limitprop("max rows", MINE_RESULTS_LIMIT)
         end
 
         tool j, "mine_stop", "Stop a running mine job (in-flight requests finish)." do |s|

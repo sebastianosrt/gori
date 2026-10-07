@@ -26,6 +26,14 @@ module Gori::Decoder
     "#{name}: this gori was built with -Dwithout_native_codecs, so libbrotlidec/libzstd are not linked in"
   end
 
+  private def self.windows_bestfit_converter(code_page : Int32) : Converter
+    text("windows-bestfit-#{code_page}", "bestfit-#{code_page}", "worstfit-#{code_page}",
+      category: Category::Encoding, direction: Direction::Encode,
+      description: "Windows CP#{code_page} ANSI Best-Fit table preview (unmapped characters become '?')") do |s|
+      Codecs.windows_bestfit_preview(s, code_page)
+    end
+  end
+
   def self.default_registry : Registry
     r = Registry.new
 
@@ -41,9 +49,10 @@ module Gori::Decoder
       description: "Base64 URL-safe encode (-_ alphabet, padded)") { |b| Base64.urlsafe_encode(b, padding: true) }
 
     # ---------------- ENCODING: url ----------------
-    r.register text("url-encode", "url", "urlencode", "percent-encode",
-      category: Category::Encoding, direction: Direction::Encode,
-      description: "URL/percent encode (form style: space -> '+')") { |s| URI.encode_www_form(s) }
+    # Byte-wise, like url-decode's output: a binary intermediate round-trips (%FF stays %FF).
+    r.register encode("url-encode", "url", "urlencode", "percent-encode",
+      category: Category::Encoding,
+      description: "URL/percent encode (form style: space -> '+')") { |b| URI.encode_www_form(String.new(b)) }
     r.register text("url-decode", "urldecode", "percent-decode",
       category: Category::Encoding, direction: Direction::Decode,
       description: "URL/percent decode ('+' -> space, %XX)") { |s| URI.decode_www_form(s) }
@@ -98,6 +107,46 @@ module Gori::Decoder
     r.register text("punycode-decode", "idn-decode", "unpunycode",
       category: Category::Encoding, direction: Direction::Decode,
       description: "Punycode/IDN decode per dot-label (xn-- labels only)") { |s| Codecs.punycode_decode(s) }
+
+    # ---------------- ENCODING: Unicode normalization ----------------
+    r.register text("nfc", "unicode-nfc", "normalize-nfc",
+      category: Category::Encoding, direction: Direction::Encode,
+      description: "Unicode canonical composition (NFC, one-way)") { |s| s.unicode_normalize(:nfc) }
+    r.register text("nfd", "unicode-nfd", "normalize-nfd",
+      category: Category::Encoding, direction: Direction::Encode,
+      description: "Unicode canonical decomposition (NFD, one-way)") { |s| s.unicode_normalize(:nfd) }
+    r.register text("nfkc", "unicode-nfkc", "normalize-nfkc",
+      category: Category::Encoding, direction: Direction::Encode,
+      description: "Unicode compatibility composition (NFKC, one-way)") { |s| s.unicode_normalize(:nfkc) }
+    r.register text("nfkd", "unicode-nfkd", "normalize-nfkd",
+      category: Category::Encoding, direction: Direction::Encode,
+      description: "Unicode compatibility decomposition (NFKD, one-way)") { |s| s.unicode_normalize(:nfkd) }
+
+    # ---------------- ENCODING: RFC 2047 encoded words ----------------
+    r.register text("rfc2047-q-encode", "encoded-word-q-encode", "mime-word-q-encode",
+      category: Category::Encoding, direction: Direction::Encode,
+      description: "RFC 2047 UTF-8 encoded-word (Q, folds at 75 octets)") { |s| Codecs.rfc2047_q_encode(s) }
+    r.register text("rfc2047-b-encode", "encoded-word-b-encode", "mime-word-b-encode",
+      category: Category::Encoding, direction: Direction::Encode,
+      description: "RFC 2047 UTF-8 encoded-word (Base64, folds at 75 octets)") { |s| Codecs.rfc2047_b_encode(s) }
+    r.register text("rfc2047-q-decode", "encoded-word-q-decode", "mime-word-q-decode",
+      category: Category::Encoding, direction: Direction::Decode,
+      description: "Decode RFC 2047 Q encoded-words (UTF-8, ASCII, Latin-1, Windows-1252)") { |s| Codecs.rfc2047_decode(s, 'Q'.ord.to_u8) }
+    r.register text("rfc2047-b-decode", "encoded-word-b-decode", "mime-word-b-decode",
+      category: Category::Encoding, direction: Direction::Decode,
+      description: "Decode RFC 2047 Base64 encoded-words (UTF-8, ASCII, Latin-1, Windows-1252)") { |s| Codecs.rfc2047_decode(s, 'B'.ord.to_u8) }
+    r.register text("rfc2047-decode", "encoded-word-decode", "mime-word-decode",
+      category: Category::Encoding, direction: Direction::Decode,
+      description: "Decode RFC 2047 Q/Base64 encoded-words (UTF-8, ASCII, Latin-1, Windows-1252)") { |s| Codecs.rfc2047_decode(s) }
+
+    # ---------------- ENCODING: lossy security transforms ----------------
+    r.register Converter.new("codepoint-overflow", ["mod-256", "unicode-overflow"],
+      Category::Encoding, Direction::Encode,
+      "Map each Unicode codepoint to its low byte (mod 256)",
+      ->(input : Bytes) { Codecs.codepoint_overflow(input) })
+    Codecs::WINDOWS_BESTFIT_CODE_PAGES.each do |code_page|
+      r.register(windows_bestfit_converter(code_page))
+    end
 
     # ---------------- ENCODING: number bases (byte-oriented, space-separated) ----------------
     r.register encode("decimal-encode", "decimal", "to-decimal", "dec",
@@ -157,6 +206,24 @@ module Gori::Decoder
     r.register bytes("cbor-decode", "cbor", "uncbor",
       category: Category::Serialization, direction: Direction::Decode,
       description: "CBOR → JSON (RFC 8949, schema-less; $bin / $tag / $bignum are named)") { |b| Codecs.cbor_to_json(b) }
+
+    # Native serialization: an object graph somebody's runtime wrote. Read-only for a second
+    # reason on top of the one above — a faithful Java/.NET serializer is not worth writing
+    # here, and an edited graph is not what the operator came for. `pickle-disasm` DISASSEMBLES
+    # and never executes; the reason a pickle is dangerous is exactly that reading it normally
+    # means running it (#1011).
+    r.register bytes("java-deserialize", "java", "java-serialized", "rO0",
+      category: Category::Serialization, direction: Direction::Decode,
+      description: "Java serialized stream → JSON (class descriptors, fields, $ref handles)") { |b| Codecs.java_to_json(b) }
+    r.register bytes("dotnet-viewstate", "viewstate", "losformatter", "aspnet-viewstate",
+      category: Category::Serialization, direction: Direction::Decode,
+      description: "ASP.NET ViewState → JSON (ObjectStateFormatter tokens; flags MAC present/absent)") { |b| Codecs.viewstate_to_json(b) }
+    r.register bytes("php-unserialize", "php", "unserialize", "php-serialized",
+      category: Category::Serialization, direction: Direction::Decode,
+      description: "PHP serialize() → JSON ($class, demangled private/protected props, $ref)") { |b| Codecs.php_to_json(b) }
+    r.register bytes("pickle-disasm", "pickle", "python-pickle", "pickletools",
+      category: Category::Serialization, direction: Direction::Decode,
+      description: "Python pickle → opcode disassembly (never executed; names every GLOBAL/REDUCE)") { |b| Codecs.pickle_to_json(b) }
 
     # ---------------- TOKEN ----------------
     r.register encode("jwt-decode", "jwt",

@@ -16,7 +16,7 @@ describe Gori::Proxy::H2::HPACK do
   end
 
   it "the Huffman table is a complete prefix code (Kraft equality)" do
-    sum = HPACK::HUFF_LEN.sum { |l| 2.0 ** (-l.to_i) } + 2.0 ** (-HPACK::EOS_LEN)
+    sum = HPACK::HUFF_LEN.sum { |l| 2.0 ** (-l.to_i) } + 2.0 ** -30 # the 30-bit EOS code
     sum.should be_close(1.0, 1e-9)
   end
 
@@ -94,6 +94,26 @@ describe Gori::Proxy::H2::HPACK do
     # valid padding — a truncated code, not the last-byte EOS pad.
     expect_raises(Gori::Error, /truncated huffman code/) { HPACK.huffman_decode(Bytes[0xff_u8]) }
     expect_raises(Gori::Error, /truncated huffman code/) { HPACK.huffman_decode(Bytes[0xff_u8, 0xff_u8]) }
+  end
+
+  it "Huffman decode fills its output exactly at the densest input (all 5-bit codes)" do
+    # The decoder writes into a String presized to 8n/5 + 1 octets, the bound for the
+    # shortest (5-bit) code. Symbols that are all 5-bit codes hit it for every
+    # padding remainder; an empty input decodes to an empty string.
+    HPACK.huffman_decode(Bytes.empty).should eq("")
+    (1..64).each do |n|
+      s = "0" * n
+      HPACK.huffman_decode(HPACK.huffman_encode(s)).should eq(s)
+      mixed = String.new(Bytes.new(n) { |i| "012aceiost".byte_at(i % 10) })
+      HPACK.huffman_decode(HPACK.huffman_encode(mixed)).should eq(mixed)
+    end
+  end
+
+  it "rejects an explicit EOS symbol inside the data (RFC 7541 §5.2)" do
+    # EOS is 30 one-bits; a string that contains it is a decoding error, whether it
+    # ends the input or is followed by more code bits.
+    expect_raises(Gori::Error, /huffman/) { HPACK.huffman_decode(Bytes[0xff, 0xff, 0xff, 0xfc]) }
+    expect_raises(Gori::Error, /huffman/) { HPACK.huffman_decode(Bytes[0xff, 0xff, 0xff, 0xff, 0x00]) }
   end
 
   it "Huffman decode is exact over many random byte strings (FSM regression guard)" do
@@ -299,39 +319,23 @@ describe Gori::Proxy::H2::HPACK do
     end
   end
 
-  it "signals a dynamic table size change before the next block (§4.2/§6.3)" do
-    enc = HPACK::Encoder.new(indexing: true)
+  it "applies a dynamic table size update that leads a block (§4.2/§6.3)" do
+    # The encoder never resizes, so these updates are hand-encoded: what a peer
+    # that honours its own SETTINGS_HEADER_TABLE_SIZE changes would send.
     dec = HPACK::Decoder.new
-    dec.decode(enc.encode([{"x-a", "1"}, {"x-b", "2"}]))
-    enc.dynamic_entries.size.should eq(2)
+    dec.decode(HPACK::Encoder.new(indexing: true).encode([{"x-a", "1"}, {"x-b", "2"}]))
+    dec.dynamic_entries.size.should eq(2)
 
-    # 40 bytes holds exactly one 36-byte entry, so the older one is evicted here,
-    # before the decoder has been told anything.
-    enc.max_size = 40
-    enc.dynamic_entries.should eq([{"x-b", "2"}])
-    block = enc.encode([{"x-c", "3"}])
-    (block[0] & 0xe0).should eq(0x20) # §6.3 dynamic table size update leads the block
-    dec.decode(block).should eq([{"x-c", "3"}])
+    # 40 bytes holds exactly one 36-byte entry, so the older one is evicted.
+    tail = HPACK::Encoder.new.encode([{"x-c", "3"}])
+    dec.decode(Bytes[0x3f, 0x09] + tail).should eq([{"x-c", "3"}]) # 31 + 9 = 40
     dec.max_size.should eq(40)
-    enc.dynamic_entries.should eq(dec.dynamic_entries) # decoder evicted with us
+    dec.dynamic_entries.should eq([{"x-b", "2"}])
 
-    # Two moves between blocks collapse to {low-water mark, final}: the decoder has
-    # to perform the eviction the low value caused, or every later index is off.
-    enc.max_size = 0
-    enc.max_size = 4096
-    block = enc.encode([{"x-d", "4"}])
-    dec.decode(block).should eq([{"x-d", "4"}])
+    # Two updates in one block: the low-water mark empties the table, then 4096.
+    dec.decode(Bytes[0x20, 0x3f, 0xe1, 0x1f] + tail).should eq([{"x-c", "3"}])
     dec.max_size.should eq(4096)
-    enc.dynamic_entries.should eq(dec.dynamic_entries)
-    # No change since the last block → no update byte.
-    (enc.encode([{"x-e", "5"}])[0] & 0xe0).should_not eq(0x20)
-  end
-
-  it "clamps a size update to the bound the decoder enforces" do
-    enc = HPACK::Encoder.new
-    enc.max_size = Int32::MAX
-    enc.max_size.should eq(HPACK::Encoder::MAX_TABLE_SIZE)
-    HPACK::Decoder.new.decode(enc.encode([{"x", "y"}])).should eq([{"x", "y"}]) # not rejected
+    dec.dynamic_entries.should be_empty
   end
 
   # --- adversarial input (P7: encode what the peer sent, don't judge it) -------

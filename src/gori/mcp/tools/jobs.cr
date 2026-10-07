@@ -5,7 +5,7 @@ module Gori
     class Tools
       # --- unified async job management (list/get/stop across fuzz + mine) -----
 
-      @[Tool("list_jobs", gated: true)]
+      @[Tool("list_jobs", gated: true, read_only: true, permission: "send")]
       private def list_jobs : Result
         Result.new(JSON.build do |j|
           j.object do
@@ -80,9 +80,49 @@ module Gori
         end)
       end
 
+      # Each async kind's id prefix (`fuzz_start` mints `fz_1`, `mine_start` `mn_2`, …) — the
+      # same dispatch `get_job` does on the maps, spelled for an id no map holds any more.
+      JOB_ID_PREFIXES = {"fz_" => "fuzz", "mn_" => "mine", "ds_" => "discover",
+                         "sq_" => "sequence", "az_" => "authorize"}
+
+      # The kind of job `id` names: the map that holds it, else its prefix, else nil.
+      private def job_kind_of(id : String) : String?
+        return "fuzz" if @jobs.has_key?(id)
+        return "mine" if @mine_jobs.has_key?(id)
+        return "discover" if @discover_jobs.has_key?(id)
+        return "sequence" if @sequence_jobs.has_key?(id)
+        return "authorize" if @authorize_jobs.has_key?(id)
+        JOB_ID_PREFIXES.find { |prefix, _| id.starts_with?(prefix) }.try(&.[1])
+      end
+
+      # The NOT_FOUND for a `<kind>_<verb>` call whose id this kind's map does not hold. When
+      # the id names ANOTHER kind — a mine id handed to fuzz_results, the mistake a caller
+      # polling several jobs makes — say which tool reads it, instead of "no fuzz job mn_2"
+      # about a job that exists one tool over.
+      private def job_not_found(id : String, kind : String, verb : String) : Result
+        other = job_kind_of(id)
+        if other && other != kind
+          return err("no #{kind} job #{id} — #{id} is a #{other} job: use #{other}_#{verb} " \
+                     "(or get_job / stop_job, which take any kind)", "NOT_FOUND",
+            field: "job_id", details: JSON.parse({"job_kind" => other}.to_json))
+        end
+        not_found("no #{kind} job #{id}")
+      end
+
+      # The `kind` job `job_id` names in `jobs`, or the error Result the caller returns as-is.
+      # `missing_field` is the field a missing `job_id` refusal names: only authorize names it.
+      private def lookup_job(h, jobs : Hash(String, T), kind : String, verb : String,
+                             missing_field : String? = nil) : T | Result forall T
+        id = str(h, "job_id")
+        return err("missing required 'job_id'", "INVALID_ARGUMENT", field: missing_field) if id.nil? || id.empty?
+        job = jobs[id]?
+        return job_not_found(id, kind, verb) unless job
+        job_project_mismatch(job) || job
+      end
+
       # A job started before a switch_project is still LISTED (so an agent can see why an id
       # it remembers now refuses), but flagged — its *_results/*_status read PROJECT_CHANGED.
-      private def emit_job_project(j : JSON::Builder, job : FuzzJob | MineJob | DiscoverJob | SequenceJob | AuthorizeJob) : Nil
+      private def emit_job_project(j : JSON::Builder, job : Job) : Nil
         return if job.db_path == @db_path
         j.field "project_changed", true
         j.field "job_db_path", job.db_path
@@ -91,7 +131,7 @@ module Gori
       # Unified status for a fuzz, mine, discover, sequence, or authorize job (dispatch by the
       # id prefix), so a caller polling many jobs needs one tool. Delegates to the per-engine status
       # serializers, which already carry counts/audit/incomplete_reason.
-      @[Tool("get_job", gated: true)]
+      @[Tool("get_job", gated: true, read_only: true, permission: "send")]
       private def get_job(h) : Result
         id = str(h, "job_id")
         return err("missing required 'job_id'", "INVALID_ARGUMENT", field: "job_id") if id.nil? || id.empty?
@@ -113,7 +153,7 @@ module Gori
       # Stop a fuzz, mine, discover, sequence, or authorize job. With wait:true, blocks (yielding to the runner
       # fiber via sleep) until the job reaches a terminal state or wait_timeout_ms
       # elapses, so a caller can stop-and-confirm in one call instead of polling.
-      @[Tool("stop_job", gated: true, agent_action: true)]
+      @[Tool("stop_job", gated: true, agent_action: true, permission: "send")]
       private def stop_job(h) : Result
         id = str(h, "job_id")
         return err("missing required 'job_id'", "INVALID_ARGUMENT", field: "job_id") if id.nil? || id.empty?
@@ -127,11 +167,11 @@ module Gori
         # concludes the run is still going and keeps polling a job nothing will restart.
         wait = bool_arg(h, "wait", false)
         budget = optional_int_arg(h, "wait_timeout_ms").try(&.clamp(1_i64, 60_000_i64)) || 10_000_i64
-        job.stop
+        return emit_stop_result(job, already_finished: true) unless request_stop(job)
         waited_out = false
         if wait
           deadline = Time.utc.to_unix_ms + budget
-          while job_running?(job)
+          while job.status == :running
             if Time.utc.to_unix_ms >= deadline
               waited_out = true
               break
@@ -151,41 +191,44 @@ module Gori
       # aborted a run that was in flight" and reports a COMPLETE run as cancelled, or its
       # results as partial. `stop_job` has always re-read the status; this is the same read,
       # so all six stop surfaces now answer the same way.
-      private def stop_and_report(job : FuzzJob | MineJob | DiscoverJob | SequenceJob | AuthorizeJob) : Result
+      private def stop_and_report(job : Job) : Result
+        emit_stop_result(job, already_finished: !request_stop(job))
+      end
+
+      # Ask a RUNNING job to stop, and answer whether it was running. A job that already
+      # reached a terminal state is left alone: `job.stop` stamps `stop_requested_at`, so
+      # stopping a finished run used to report `stop_requested: true` with a request time
+      # LATER than `stopped_at` — a stop that "happened" after the run it claims to have
+      # ended. The reply then says `already_finished` instead (`emit_stop_result`).
+      private def request_stop(job : Job) : Bool
+        return false unless job.status == :running
         job.stop
-        emit_stop_result(job)
+        true
       end
 
       # The stop reply itself, shared by `stop_job` (which may have waited first) and the
       # five per-kind tools. Read AFTER the stop and any wait, never assumed.
-      private def emit_stop_result(job : FuzzJob | MineJob | DiscoverJob | SequenceJob | AuthorizeJob,
-                                   waited_out : Bool = false) : Result
-        status, stopped_at = job_status_and_end(job)
+      private def emit_stop_result(job : Job, waited_out : Bool = false, *, already_finished : Bool = false) : Result
+        status = job.status.to_s
+        stopped_at = job.ended_at_ms
+        requested = job.stop_requested_at_ms
         Result.new(JSON.build do |j|
           j.object do
             j.field "job_id", job.id
             j.field "status", status
-            j.field "stop_requested", true
+            # Whether a stop was ever asked of this run — false when it ended on its own and
+            # this call found it over. A repeat stop of a run an earlier call stopped reads true.
+            j.field "stop_requested", !requested.nil?
             j.field "stopped", status != "running"
+            # This call found the run already terminal and changed nothing.
+            j.field "already_finished", true if already_finished
             j.field "timed_out", true if waited_out
-            if sr = job_stop_requested(job)
+            if sr = requested
               j.field "stop_requested_at", sr
             end
             j.field "stopped_at", stopped_at
           end
         end)
-      end
-
-      private def job_running?(job : FuzzJob | MineJob | DiscoverJob | SequenceJob | AuthorizeJob) : Bool
-        job.status == :running
-      end
-
-      private def job_status_and_end(job : FuzzJob | MineJob | DiscoverJob | SequenceJob | AuthorizeJob) : {String, Int64?}
-        {job.status.to_s, job.ended_at_ms}
-      end
-
-      private def job_stop_requested(job : FuzzJob | MineJob | DiscoverJob | SequenceJob | AuthorizeJob) : Int64?
-        job.stop_requested_at_ms
       end
 
       # The tools/list schemas for the job-control tools, kept beside the handlers that

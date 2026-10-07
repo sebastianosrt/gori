@@ -1,0 +1,224 @@
+require "../../cache_deception"
+require "../../authorize/engine"
+require "../../host_overrides"
+require "../../plural"
+
+# `gori run cache-deception` — check captured flows for WEB CACHE DECEPTION, the headless
+# equivalent of the MCP `cache_deception_check` tool. Replays each flow as its captured
+# (authenticated) identity to prime any cache, re-requests the SAME url anonymously, then makes
+# a cache-busted anonymous control request. Borrows the Authorize engine.
+module Gori
+  module CLI
+    module Run
+      @[Subcommand("cache-deception", help: [
+        {"cache-deception [<id>…]", "Check flows for web cache deception (authenticated, anonymous, cache-busted control)"},
+      ])]
+      private def self.cmd_cache_deception(args : Array(String)) : Nil
+        proj = ProjectFlags.new
+        flow_ids = [] of Int64
+        unsafe_methods = false
+        allow_unscoped = false
+        insecure = false
+        timeout = Authorize::ACTIVE_TIMEOUT
+        format = :text
+
+        positional = parse_args(args, "gori run cache-deception") do |p|
+          p.banner = "Usage: gori run cache-deception [<flow-id>…] [options]\n\n" \
+                     "For each selected flow, replay it as its captured (AUTHENTICATED) identity to\n" \
+                     "prime any cache, re-request the SAME url with NO session, then compare with an\n" \
+                     "anonymous cache-busted control request. Matching content supports a public\n" \
+                     "verdict only when the control is not itself a cache hit; otherwise the buster\n" \
+                     "may have been ignored. If the anonymous request gets the authenticated response\n" \
+                     "FROM a cache and the control differs, that private response may be cached under\n" \
+                     "a key an anonymous client hits — a web cache deception. The crafted paths that\n" \
+                     "are the Fuzzer's `cache-delimiters` payload set; check the promising hits here.\n\n" \
+                     "Only safe methods (GET/HEAD/OPTIONS) are checked without --unsafe-methods."
+          p.on("--flow=ID", "Check this captured flow (repeatable; same as a positional id)") { |v| flow_ids << parse_flow_id(v, "gori run cache-deception") }
+          project_options(p, proj, "read")
+          p.on("--unsafe-methods", "Also check POST/PUT/PATCH/DELETE — side effects can run up to three times") { unsafe_methods = true }
+          p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
+          p.on("-k", "--insecure-upstream", "Do not verify upstream TLS certificates") { insecure = true }
+          p.on("--timeout=SEC", "Per-request connect + idle timeout (seconds)") { |v| timeout = parse_count(v, "--timeout").seconds }
+          format_flag(p, [:text, :json, :jsonl], "Output: text (default) | json (one array at the end) | jsonl (streamed)") { |f| format = f }
+        end
+        refresh_verify_upstream(!insecure)
+        positional.each { |s| flow_ids << parse_flow_id(s, "gori run cache-deception") }
+        abort "gori run cache-deception: name at least one flow id (or --flow ID)" if flow_ids.empty?
+
+        project = resolve_read_project(proj.name, proj.db)
+        store = open_store(project)
+        outbound = project_outbound(project, allow_unscoped)
+        overrides = Gori::HostOverrides.load(store)
+        engine = Authorize::Engine.live(outbound, !insecure, timeout, overrides: overrides)
+        # The same stop `authorize` takes: polled before every send, so a SIGINT ends the run
+        # with what was already checked — and the buffered `--format json` array — printed.
+        stopping = false
+        interrupted = Run.install_interrupt_trap("cache-deception-interrupt",
+          "interrupted — stopping and reporting the flows already checked…") { stopping = true }
+
+        reports, checked, sent, failed =
+          begin
+            check_cache_deception_flows(store, engine, outbound, flow_ids.uniq, unsafe_methods, format,
+              -> { stopping })
+          ensure
+            store.close
+            outbound.close
+          end
+
+        emit_cache_deception_json_array(reports) if format == :json
+        deceptions = reports.count(&.verdict.deception?)
+        STDERR.puts "checked #{Gori.plural(checked, "flow")} — " \
+                    "#{deceptions} likely cache deception#{deceptions == 1 ? "" : "s"}"
+        Run.report_interrupted(checked, "flow", "checked") if interrupted.call
+        exit_if_no_cache_deception_evidence(reports, sent, checked, failed)
+      end
+
+      # The per-flow loop, returning `{reports, checked, sent, failed}`. One flow that cannot be
+      # replayed is not the end of the selection — the same rule as `gori run authorize`'s
+      # `on_error`: a raise before any send (a backend that cannot be built, or a head
+      # `FlowRequest.build` refuses that `skip_reason` did not screen) is reported on STDERR
+      # and the run moves on. Escaping here lost every remaining flow AND the buffered
+      # `--format json` array with its summary.
+      private def self.check_cache_deception_flows(store : Store, engine : Authorize::Engine,
+                                                   outbound : Outbound, flow_ids : Array(Int64),
+                                                   unsafe_methods : Bool, format : Symbol,
+                                                   stop : Proc(Bool)? = nil)
+        reports = [] of CacheDeception::Report
+        checked = 0
+        sent = 0
+        failed = 0
+        flow_ids.each do |id|
+          break if stop.try(&.call)
+          detail = store.get_flow(id)
+          unless detail
+            STDERR.puts "gori run cache-deception: no flow with id #{id}"
+            next
+          end
+          next if report_skip_reason?(id, detail, unsafe_methods)
+          next if report_outbound_skip?(id, detail.row, outbound)
+          report = begin
+            CacheDeception.check(engine, detail, stop: stop)
+          rescue ex
+            failed += 1
+            STDERR.puts "  #{authorize_failure_text(detail, ex)}"
+            next
+          end
+          next unless report # nil only if the engine was stopped before completing the check
+          reports << report
+          sent += report.sent_count
+          checked += 1 unless report.verdict.blocked? || report.verdict.errored?
+          emit_cache_deception(report, format) if format != :json
+        end
+        {reports, checked, sent, failed}
+      end
+
+      private def self.exit_if_no_cache_deception_evidence(reports : Array(CacheDeception::Report),
+                                                           sent : Int32, checked : Int32,
+                                                           failed : Int32) : Nil
+        if reports.empty?
+          STDERR.puts "gori run cache-deception: no flow was checked — every selection was missing, skipped, " \
+                      "#{failed > 0 ? "out of scope, or could not be replayed" : "or out of scope"}"
+          exit 1
+        end
+        if sent == 0
+          STDERR.puts "gori run cache-deception: every send was refused before the socket"
+          exit 1
+        end
+        if checked == 0
+          STDERR.puts "gori run cache-deception: no response could be compared"
+          exit 1
+        end
+      end
+
+      private def self.report_outbound_skip?(id : Int64, row : Store::FlowRow,
+                                             outbound : Outbound) : Bool
+        verdict = outbound.check_request(row.scheme, row.host, row.target, row.port)
+        return false unless verdict.blocked?
+        STDERR.puts "  skip flow #{id}: #{Outbound.remedy(verdict, "--allow-unscoped")}"
+        true
+      end
+
+      private def self.report_skip_reason?(id : Int64, detail : Store::FlowDetail,
+                                           unsafe_methods : Bool) : Bool
+        reason = CacheDeception.skip_reason(detail, unsafe_methods)
+        return false unless reason
+        STDERR.puts "  skip flow #{id}: #{Authorize::Passive.reason_label(reason)}" \
+                    "#{reason == :unsafe_method ? " (pass --unsafe-methods to check it anyway)" : ""}"
+        true
+      end
+
+      private def self.emit_cache_deception(report : CacheDeception::Report, format : Symbol) : Nil
+        case format
+        when :jsonl then puts cache_deception_report_json(report)
+        else             puts cache_deception_report_text(report)
+        end
+      end
+
+      private def self.cache_deception_report_text(report : CacheDeception::Report) : String
+        auth = report.authenticated
+        anon = report.anonymous
+        control = report.control
+        detail = String.build do |io|
+          io << "  authenticated: " << (auth ? cache_deception_trial_text(auth) : "—")
+          io << "  ·  anonymous: " << (anon ? cache_deception_trial_text(anon) : "—")
+          io << "  ·  cache-busted: " << (control ? cache_deception_trial_text(control) : "—")
+          io << "  ·  anonymous cache: " << report.cache.token
+        end
+        # Method and URL are the captured request's own bytes, and a trial error can quote the
+        # origin: neither reaches the terminal raw, as `authorize` and `show` print them.
+        "[#{report.verdict.label}] #{CLI::Output.term_safe(report.method)} #{CLI::Output.term_safe(report.url)}\n" \
+        "#{CLI::Output.term_safe(detail)}"
+      end
+
+      private def self.cache_deception_trial_text(trial : Authorize::Trial) : String
+        cache = CacheStatus.classify(trial.response_head).token
+        if e = trial.summary.error
+          "error (#{e}), cache: #{cache}"
+        else
+          "#{trial.summary.status || "—"} #{trial.summary.size || 0}b, cache: #{cache}"
+        end
+      end
+
+      private def self.cache_deception_report_json(report : CacheDeception::Report) : String
+        JSON.build { |j| cache_deception_report_fields(j, report) }
+      end
+
+      private def self.emit_cache_deception_json_array(reports : Array(CacheDeception::Report)) : Nil
+        puts(JSON.build do |j|
+          j.array { reports.each { |r| cache_deception_report_fields(j, r) } }
+        end)
+      end
+
+      private def self.cache_deception_report_fields(j : JSON::Builder, report : CacheDeception::Report) : Nil
+        j.object do
+          j.field "flow_id", report.flow_id
+          # Captured bytes, scrubbed to valid UTF-8 the way `authorize --format json` and MCP
+          # `cache_deception_check` emit them; a raw 0xFF here made the whole document invalid.
+          CLI::Output.json_captured(j, "method", report.method)
+          CLI::Output.json_captured(j, "url", report.url)
+          j.field "verdict", report.verdict.label
+          j.field "deception", report.verdict.deception?
+          j.field "cache", report.cache.token
+          cache_deception_trial_fields(j, "authenticated", report.authenticated)
+          cache_deception_trial_fields(j, "anonymous", report.anonymous)
+          cache_deception_trial_fields(j, "cache_busted", report.control)
+          report.blocked_reason.try { |r| CLI::Output.json_captured(j, "blocked_reason", r) }
+        end
+      end
+
+      private def self.cache_deception_trial_fields(j : JSON::Builder, name : String,
+                                                    trial : Authorize::Trial?) : Nil
+        return unless trial
+        j.field name do
+          j.object do
+            j.field "status", trial.summary.status
+            j.field "size", trial.summary.size
+            j.field "verdict", trial.verdict.label
+            j.field "cache", CacheStatus.classify(trial.response_head).token
+            trial.summary.error.try { |e| CLI::Output.json_captured(j, "error", e) }
+          end
+        end
+      end
+    end
+  end
+end

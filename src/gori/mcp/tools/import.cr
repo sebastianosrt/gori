@@ -7,7 +7,7 @@ module Gori
     class Tools
       # Bulk-import flows into the project's History from a HAR export, a URL list, an
       # OpenAPI/Swagger spec, a Postman or Insomnia collection, a Burp item export, or a
-      # WSDL 1.1 service description — the MCP counterpart of `gori run import`. `path` is
+      # WSDL 1.1 service description, or curl commands — the MCP counterpart of `gori run import`. `path` is
       # resolved on the MCP SERVER's filesystem (same trust boundary as send_request/repeater
       # — this process runs locally alongside the agent).
       KINDS = {
@@ -18,18 +18,26 @@ module Gori
         "insomnia" => :insomnia,
         "burp"     => :burp,
         "wsdl"     => :wsdl,
+        "curl"     => :curl,
       }
 
-      @[Tool("import_flows", gated: true, agent_action: true)]
+      @[Tool("import_flows", gated: true, agent_action: true, permission: "write")]
       private def import_flows(h) : Result
-        kind_s = str(h, "kind").try(&.strip.downcase)
-        kind = kind_s.try { |k| KINDS[k]? }
-        unless kind_s && kind
-          return err("invalid 'kind' (expected #{KINDS.keys.join("|")})", "INVALID_ARGUMENT", field: "kind")
+        kind_s = str(h, "kind").try(&.strip.downcase).presence
+        # ABSENT and WRONG are two different mistakes, and only one of them is a value to
+        # look at again. "invalid 'kind'" for an argument that was never sent reads as a
+        # rejected value, which is the sentence an agent answers by re-spelling the one it
+        # did send — `path` one line below has always said this correctly.
+        unless kind_s
+          return err("missing required 'kind' (expected #{KINDS.keys.join("|")})",
+            "INVALID_ARGUMENT", field: "kind")
         end
-        path = str(h, "path").try(&.strip)
-        return err("missing required 'path'", "INVALID_ARGUMENT", field: "path") if path.nil? || path.empty?
-        result = Import.import_file(store, kind, path, Gori::FlowSource::Surface::Mcp)
+        unless kind = KINDS[kind_s]?
+          return err("invalid 'kind' #{kind_s.inspect} (expected #{KINDS.keys.join("|")})",
+            "INVALID_ARGUMENT", field: "kind")
+        end
+        result = import_source(h, kind, kind_s)
+        return result if result.is_a?(Result)
         # import_file RAISES when the parse yields zero flows, so it only returns here with
         # ≥1 flow to insert. A count of 0 therefore means the batch write was rolled back
         # (store busy/locked) — NOT an empty import — so surface it as retryable rather than
@@ -38,7 +46,7 @@ module Gori
         Result.new(JSON.build do |j|
           j.object do
             j.field "kind", kind_s
-            j.field "path", path
+            str(h, "path").try(&.strip).presence.try { |path| j.field "path", path }
             j.field "count", result.count
             j.field "attempted", result.attempted
             j.field "skipped", result.skipped
@@ -46,10 +54,28 @@ module Gori
             # committed. Named rather than implied, so an agent does not read a short count as
             # a complete import of a smaller file.
             result.shortfall_note.try { |note| j.field "partial", note }
+            # A curl command's flags the import could not carry (transport options, a path curl
+            # would have collapsed) — named, so an agent does not assume they took effect.
+            j.field "notes", result.notes unless result.notes.empty?
           end
         end)
       rescue ex : Gori::Error
         err(ex.message || "import failed", "INVALID_ARGUMENT")
+      end
+
+      # Run the import from whichever source the call named — a `path` on the server's
+      # filesystem, or the source itself as `text`: an agent holds a copied curl command, a HAR
+      # it fetched or a URL list it built as a string, and writing it to a file first only to
+      # name that file would be a detour (`Import.import_text`). A refused combination comes
+      # back as the error `Result`.
+      private def import_source(h, kind : Symbol, kind_s : String) : Import::Result | Result
+        path = str(h, "path").try(&.strip).presence
+        # Blank is absent, as `path` above: a client filling every property sends `text: ""`.
+        text = str(h, "text").presence
+        return err("pass 'path' or 'text', not both", "INVALID_ARGUMENT", field: "text") if text && path
+        return Import.import_text(store, kind, text, Gori::FlowSource::Surface::Mcp) if text
+        return Import.import_file(store, kind, path, Gori::FlowSource::Surface::Mcp) if path
+        err("missing required 'path' or 'text'", "INVALID_ARGUMENT", field: "path")
       end
 
       # The tools/list schemas for the import tools, kept beside the handlers that
@@ -61,13 +87,18 @@ module Gori
 
         tool j, "import_flows",
           "Bulk-import flows into the project's History from a HAR export, a URL list, an " \
-          "OpenAPI/Swagger spec, a Postman Collection v2 or Insomnia v4 export, a Burp Suite " \
-          "item export, or a WSDL 1.1 service description (SOAP 1.1/1.2) — the MCP equivalent " \
-          "of `gori run import`. `path` is read from the MCP SERVER's local filesystem (this " \
-          "process runs locally, same trust boundary as send_request). Only `har` and `burp` " \
-          "carry responses; the rest import request templates with no response." do |s|
+          "OpenAPI 3.x or Swagger 2.0 spec (local refs only), a Postman Collection v2 or Insomnia v4 export, a Burp Suite " \
+          "item export, a WSDL 1.1 service description (SOAP 1.1/1.2), or curl commands — the MCP " \
+          "equivalent of `gori run import`. Pass the source as `path` (read from the MCP SERVER's local " \
+          "filesystem — this process runs locally, same trust boundary as send_request) or as `text`, " \
+          "the document itself. For curl, one flow per request; transport flags such as -k/-x/-L are " \
+          "ignored and listed in `notes`. Only `har` and `burp` carry responses; the rest import " \
+          "request templates with no response. Imports are not deduplicated: re-importing a file " \
+          "adds its flows again, and `notes` says so when this project already holds flows from a " \
+          "file of the same name." do |s|
           s.field "kind", enumprop("the source format to read", KINDS.keys), required: true
-          s.field "path", strprop("filesystem path to the source file"), required: true
+          s.field "path", strprop("filesystem path to the source file (this or 'text')")
+          s.field "text", strprop("the source document itself (a HAR, a URL list, a spec, curl commands, …) instead of a file")
         end
       end
     end

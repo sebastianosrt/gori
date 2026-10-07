@@ -32,63 +32,75 @@ class Gori::Tui::RepeaterView
     # to read as the front of the next request — gori desyncing its own connection while
     # reporting `✓ sent`. Hex mode is the documented byte-exact escape hatch; it has to
     # start from the bytes.
-    @req_hex_edit = HexEdit.new(@grpc_mode ? @grpc_payload : @editor.wire_bytes)
+    #
+    # The bytes TEXT mode sends, though, not the line buffer verbatim (#1427). A typed or
+    # pasted line carries the editor's bare LF, which `expanded_text_to_bytes` promotes to
+    # CRLF in the head (and in a CRLF-less multipart body) on every ^R. Seeding the raw buffer
+    # made ^X a peek that changed the wire: the pane showed, and hex-mode ^R sent, a bare-LF
+    # head text mode never would — and a typed multipart body shipped LF under the
+    # Content-Length the reflection measured over its CRLF form. `$KEY` expansion is
+    # deliberately NOT applied: an edited buffer is what `request_text` persists.
+    @req_hex_edit = HexEdit.new(@grpc_mode ? @grpc_payload : hex_seed)
     @scroll_req = 0 # entering the same bytes isn't an edit — no @dirty
   end
 
+  # The one place those fixups are withheld is a CAPTURE they would rewrite (P7). The h1 codec
+  # keeps a bare-LF head byte-exact, HAR import keeps an LF-delimited multipart body, and text
+  # mode promotes both on every send — so for a malformed capture this buffer is the ONLY road
+  # to the bytes the client sent, which is the payload. Judged on the seed bytes gori was
+  # handed (`@evidence_env_seed`), not the live buffer: a header the operator typed into an
+  # ordinary capture still gets the CRLF text mode gives it.
+  private def hex_seed : Bytes
+    wire = @editor.wire_text
+    seed = @evidence_env_seed
+    return wire.to_slice if @evidence && text_wire_form(seed) != seed.to_slice
+    text_wire_form(wire)
+  end
+
+  # The Content-Length line the last exit from hex rewrote, as its {from, to} values — nil when
+  # the exit left the header alone. The controller's toast reads it, so the resync below is said
+  # out loud rather than only redrawn.
+  getter hex_exit_resync : {String, String}? = nil
+
   private def exit_request_hex : Nil
-    if (h = @req_hex_edit) && h.mutated? # a pure peek (no edits) leaves state + @dirty untouched
-      if @grpc_mode
-        @grpc_payload = h.to_bytes # keep the edited payload byte-exact (reframed on send)
-        # …and tell the FIELDS form its rows are stale: it reads the same payload, and a hex
-        # edit can add, remove or retype a field under names it has already drawn (#828).
-        invalidate_grpc_fields
-      else
-        # Round-trips byte-exactly now: set_text keeps each line's terminator in @eols, and
-        # `String.new(Bytes)` does not scrub, so the hex buffer's bytes come back out of
-        # `wire_bytes` unchanged — hex ⇄ text is no longer a one-way door.
-        @editor.set_text(String.new(h.to_bytes))
-      end
-      @dirty = true # the edit is a content change
-    end
+    @hex_exit_resync = nil
+    h = @req_hex_edit
+    # Cleared FIRST: while the hex buffer is set it is authoritative, and the reflection below
+    # declines to touch the editor it would be overriding.
     @req_hex_edit = nil
-  end
-
-  # Mutators delegated from the Runner's hex key handler (each marks @dirty only on
-  # a real change, so save persists + the cross-session reconcile won't clobber).
-  def hex_set_nibble(c : Char) : Nil
-    return unless (h = @req_hex_edit) && (v = c.to_i?(16))
-    @dirty = true if h.set_nibble(v)
-  end
-
-  def hex_move(dr : Int32, dc : Int32) : Nil # navigation does NOT dirty
-    return unless h = @req_hex_edit
-    if dr != 0
-      h.move_rows(dr)
-    elsif dc < 0
-      h.move_left
-    elsif dc > 0
-      h.move_right
+    return unless h && h.mutated? # a pure peek (no edits) leaves state + @dirty untouched
+    if @grpc_mode
+      @grpc_payload = h.to_bytes # keep the edited payload byte-exact (reframed on send)
+      # …and tell the FIELDS form its rows are stale: it reads the same payload, and a hex
+      # edit can add, remove or retype a field under names it has already drawn (#828).
+      invalidate_grpc_fields
+    else
+      # Round-trips byte-exactly now: set_text keeps each line's terminator in @eols, and
+      # `String.new(Bytes)` does not scrub, so the hex buffer's bytes come back out of
+      # `wire_bytes` unchanged — hex ⇄ text is no longer a one-way door.
+      @editor.set_text(String.new(h.to_bytes))
+      # …and back in text, auto-CL owns the length again: `finalize_wire` resyncs it on ^R, so
+      # the visible header has to say the same number. This exit was the one buffer mutation
+      # that did not reflect, and a hex edit that grew the body left `Content-Length: 4` on
+      # screen over the `5` the send framed (#1426). A mismatch built in hex is corrected by the
+      # same rule as one typed in text — sending from hex, or ^L off first, keeps it as built.
+      before = @editor.lines_snapshot
+      reflect_content_length_in_editor
+      @hex_exit_resync = content_length_change(before, @editor.lines_snapshot)
     end
+    @dirty = true # the edit is a content change
   end
 
-  def hex_home : Nil
-    @req_hex_edit.try(&.home)
+  # The first header line the reflection changed, as its {from, to} values. The reflection
+  # rewrites Content-Length lines only, so any differing line is one.
+  private def content_length_change(before : Array(String), after : Array(String)) : {String, String}?
+    i = (0...before.size).find { |k| before[k] != after[k]? } || return
+    {before[i].split(':', 2)[1]?.to_s.strip, after[i].split(':', 2)[1]?.to_s.strip}
   end
 
-  def hex_end : Nil
-    @req_hex_edit.try(&.end_of_row)
-  end
-
-  def hex_insert : Nil
-    @dirty = true if @req_hex_edit.try(&.insert_byte)
-  end
-
-  def hex_backspace : Nil
-    @dirty = true if @req_hex_edit.try(&.backspace)
-  end
-
-  def hex_delete : Nil
-    @dirty = true if @req_hex_edit.try(&.delete)
+  # The hex editor's keys (`HexEdit#handle_key`), marking @dirty only on a real change so save
+  # persists and the cross-session reconcile won't clobber.
+  def hex_key(ev : Termisu::Event::Key) : Nil
+    @dirty = true if @req_hex_edit.try(&.handle_key(ev))
   end
 end

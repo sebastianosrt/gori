@@ -6,40 +6,33 @@ module Gori
   module CLI
     module Run
       private def self.cmd_repeater_minimize(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         insecure = false
         apply = false
         verbatim = false
         format = :text
         allow_unscoped = false
         slot : String? = nil
-        positional = [] of String
 
-        parser = OptionParser.new do |p|
+        positional = parse_args(args, "gori run repeater minimize") do |p|
           p.banner = "Usage: gori run repeater minimize <repeater-id> [options]\n\n" \
                      "Strip cosmetic headers, tracking-cookie crumbs, and unused query/body params\n" \
                      "from a saved repeater request, keeping the response within tolerance of a\n" \
                      "calibrated baseline. SENDS MANY REAL REQUESTS (capped at #{Repeater::Minimize::SEND_CAP}).\n" \
                      "Prints the trimmed request; pass --apply to also save it back to the session."
-          p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
+          project_options(p, proj, "read")
           p.on("--apply", "Write the minimized request back into the repeater session") { apply = true }
-          p.on("--verbatim", "Send the stored bytes as-is: no $VAR expansion, no Content-Length resync (same meaning as `repeater send --verbatim`; body params stop being candidates because their framing could not be kept honest)") { verbatim = true }
+          p.on("--verbatim", "Send the stored bytes as-is: no token expansion ($ENV.KEY / $BIND.NAME / $GEN.UUID — bare syntax $KEY / $NAME — stay literal), no Content-Length resync (same meaning as `repeater send --verbatim`; body params stop being candidates because their framing could not be kept honest)") { verbatim = true }
           p.on("-k", "--insecure-upstream", "Do not verify the upstream TLS certificate") { insecure = true }
           # Back-compat alias: this command shipped as `--insecure` while every sibling
           # (`repeater send`, the single-flow replay, `repeater h2`, fuzz/mine/…) spells it
           # `--insecure-upstream`, so a script passing the family-wide flag aborted here alone.
           p.on("--insecure", "Alias for --insecure-upstream") { insecure = true }
           p.on("--allow-unscoped", "Minimize even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
-          p.on("--slot=NAME", "Send as this SESSION SLOT — its header overlay, and its binding table for $NAME") { |v| slot = v.strip }
-          p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = before + after }
-          p.invalid_option { |f| abort "gori run repeater minimize: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run repeater minimize: missing value for #{f}" }
+          p.on("--slot=NAME", "Send as this SESSION SLOT — its header overlay, and its binding table for $BIND.NAME tokens (bare syntax: $NAME)") { |v| slot = v.strip }
+          format_flag(p, [:text, :json], "Output: text (default) | json") { |f| format = f }
         end
-        parser.parse(args)
+        refresh_verify_upstream(!insecure)
 
         abort "gori run repeater minimize: too many arguments (expected one <repeater-id>, got: #{positional.join(" ")})" if positional.size > 1
         id_s = positional.first? || abort("gori run repeater minimize: <repeater-id> is required")
@@ -53,7 +46,7 @@ module Gori
         # this command runs, and a minimize is minutes long (up to SEND_CAP real sends).
         # Re-resolving at apply time therefore let a peer's write steer the UPDATE into a
         # DIFFERENT project's `repeaters` row #id.
-        project = resolve_read_project(project_name, db_path)
+        project = resolve_read_project(proj.name, proj.db)
         store = open_store(project)
         # HostOverrides.load snapshots rows into memory, so it is safe to keep past the close.
         # Loaded from the SAME open that fetched `rec` rather than via cli_host_overrides,
@@ -66,7 +59,7 @@ module Gori
         end
         abort "gori run repeater minimize: no repeater session ##{id}" unless rec
         activate_slot(slot, "gori run repeater minimize")
-        outbound = project_outbound(project_name, db_path, allow_unscoped)
+        outbound = project_outbound(project, allow_unscoped)
 
         text = String.new(rec.request)
         scheme, host, port = minimize_target_or_abort(id, rec, text, outbound)
@@ -178,8 +171,10 @@ module Gori
             w.close
           end
           unless applied
-            STDERR.puts "gori run repeater minimize: --apply did NOT commit (project busy) — " \
-                        "session ##{id} still holds the original request"
+            # `update_repeater` answers false for a rolled-back write AND for a row that is
+            # gone: the search took seconds, and a peer may have closed the tab meanwhile.
+            STDERR.puts "gori run repeater minimize: --apply did NOT commit (project busy, or session " \
+                        "##{id} was deleted during the search) — the session, if it still exists, holds the original request"
           end
         end
         # The report is rendered through the SAME resolver the search used, so the request
@@ -287,7 +282,7 @@ module Gori
         if Repeater::WsEngine.replayable?(text)
           abort "gori run repeater minimize: session ##{id} is a WebSocket handshake — minimize works on plain HTTP requests"
         end
-        # The TUI refuses this too (repeater_view.cr#minimizable?). A saved request holding
+        # The TUI refuses this too (RepeaterView#minimize_refusal). A saved request holding
         # §fuzz§ markers is a TEMPLATE, not a request: minimizing it would send 250 requests
         # containing literal § bytes (garbage the origin answers uniformly, which then lets
         # real headers look removable) and --apply would overwrite the user's marked-up
@@ -315,8 +310,12 @@ module Gori
         # TARGET and SNI are refused — `$` is not a legal byte in a hostname, and a literal one
         # there comes back as an unparseable target or an out-of-scope block, naming the wrong
         # gate. The MCP and TUI minimize paths carry the same two checks.
-        names = Env.unresolved(rec.target) |
-                (rec.sni.try { |s| Env.unresolved(s) } || [] of String)
+        # `deferred: nil`, like every other dial tuple. The default suppresses a DECLARED binding
+        # name on the argument that a later pass resolves it — true of a request body, false of a
+        # target: `Env.expand` resolves a dial tuple with `resolve: Owns::Env` alone and nothing
+        # re-scans it, so a `$BIND.HOST` here reaches DNS spelled `$BIND.HOST`.
+        names = Env.unresolved(rec.target, deferred: nil) |
+                (rec.sni.try { |s| Env.unresolved(s, deferred: nil) } || [] of String)
         unless names.empty?
           abort "gori run repeater minimize: " +
                 env_unresolved_error(Env.token_list(names), " for session ##{id}")
@@ -331,8 +330,9 @@ module Gori
         if verdict.blocked?
           abort "gori run repeater minimize: #{host} is out of the project scope — #{Gori::Outbound.remedy(verdict, "--allow-unscoped")}"
         end
-        # Layer 2 (Sandbox / exclude): applies even under --allow-unscoped.
-        if reason = outbound.send_block(scheme, host, target, port)
+        # Layer 2 (Sandbox / exclude): applies even under --allow-unscoped, in the sweep form every
+        # candidate send is held to (Fuzz::Sender), so an excluded target is refused up front.
+        if reason = outbound.sweep_block(scheme, host, target, port)
           abort "gori run repeater minimize: #{reason}"
         end
         {scheme, host, port}
@@ -394,8 +394,7 @@ module Gori
         STDERR.puts report.note
         report.removed.each { |r| STDERR.puts "  - [#{r.kind.to_s.downcase}] #{r.label}" }
         STDERR.puts "saved back to session ##{id}" if applied
-        STDOUT.write(wire)
-        STDOUT.puts unless wire.empty? || wire[-1] == 0x0A_u8
+        CLI::Output.write_value(STDOUT, wire, STDOUT.tty?)
       end
     end
   end

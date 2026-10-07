@@ -1,6 +1,7 @@
 require "json"
 require "../../store"
 require "../../colormarker"
+require "../serialize"
 
 module Gori
   module MCP
@@ -20,7 +21,7 @@ module Gori
       private def list_color_rules(h) : Result
         want = nil.as(Store::RuleScope?)
         if present?(h, "scope")
-          sc = color_rule_scope(h)
+          sc = rule_scope(h)
           return sc if sc.is_a?(Result)
           want = sc
         end
@@ -31,38 +32,11 @@ module Gori
             j.field "count", rules.size
             j.field "rules" do
               j.array do
-                rules.each do |r|
-                  j.object do
-                    j.field "id", r.id
-                    j.field "scope", r.scope.label
-                    # The EFFECTIVE state here. For a global rule the library's own default may
-                    # differ — this project overrode it — and both are reported so an agent can
-                    # tell "off everywhere" from "off in this engagement".
-                    j.field "enabled", r.enabled?
-                    if r.global?
-                      j.field "overridden", r.overridden?
-                      j.field "default_enabled", Settings.colormarker_rules.find { |g| g.id == r.id }.try(&.enabled)
-                    end
-                    j.field "name", r.name
-                    j.field "when", r.match_filter
-                    j.field "color", r.color
-                    j.field "style", r.style.label
-                  end
-                end
+                rules.each { |r| Serialize.color_rule(j, r) }
               end
             end
           end
         end)
-      end
-
-      # The `scope` argument, defaulting to this project — the safe direction. An unrecognised
-      # value is REFUSED rather than clamped, because clamping "globl" to project would report
-      # success for an edit the caller meant to make everywhere.
-      private def color_rule_scope(h) : Store::RuleScope | Result
-        s = str(h, "scope")
-        return Store::RuleScope::Project if s.nil? || s.empty?
-        Store::RuleScope.values.find { |v| v.label == s.downcase } ||
-          err("invalid 'scope' (expected #{RULE_SCOPES.join("|")})", "INVALID_ARGUMENT", field: "scope")
       end
 
       # A colour LABEL: one of the six built-in words, or the name of a user-defined custom
@@ -87,16 +61,15 @@ module Gori
         Store::MarkerStyle.from_label(s)
       end
 
-      @[Tool("create_color_rule", gated: true, agent_action: true)]
+      @[Tool("create_color_rule", gated: true, agent_action: true, permission: "write")]
       private def create_color_rule(h) : Result
-        filter = str(h, "when")
-        return err("missing required 'when'", "INVALID_ARGUMENT", field: "when") if filter.nil?
+        filter = required_str(h, "when", blank: true)
         # The engine owns what is legal, so the TUI form, the CLI and this surface cannot
         # disagree. All three refusals name a rule that would otherwise fail SILENTLY.
         if reason = Gori::Colormarker.unusable_reason(filter)
           return err(reason, "INVALID_ARGUMENT", field: "when")
         end
-        scope = color_rule_scope(h)
+        scope = rule_scope(h)
         return scope if scope.is_a?(Result)
         color = marker_color(h, "yellow")
         return color if color.is_a?(Result)
@@ -136,11 +109,10 @@ module Gori
         j.field "notes" { j.array { notes.each { |n| j.string n } } }
       end
 
-      @[Tool("update_color_rule", gated: true, agent_action: true)]
+      @[Tool("update_color_rule", gated: true, agent_action: true, permission: "write")]
       private def update_color_rule(h) : Result
-        id = int(h, "id")
-        return err(id_error(h, "id"), "INVALID_ARGUMENT", field: "id") unless id
-        scope = color_rule_scope(h)
+        id = required_id(h, "id")
+        scope = rule_scope(h)
         return scope if scope.is_a?(Result)
         existing = Gori::Colormarker.merged(store).find { |r| r.id == id && r.scope == scope }
         return not_found("no #{scope.label} colour rule with id #{id}") unless existing
@@ -176,11 +148,10 @@ module Gori
       # For a global rule this writes THIS PROJECT's override by default — the same meaning `x`
       # has in the Colormarker tab. `everywhere: true` changes the library's own default
       # instead, which reaches every project that has not overridden it.
-      @[Tool("set_color_rule_enabled", gated: true, agent_action: true)]
+      @[Tool("set_color_rule_enabled", gated: true, agent_action: true, permission: "write")]
       private def set_color_rule_enabled(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
-        scope = color_rule_scope(h)
+        id = required_id(h, "id")
+        scope = rule_scope(h)
         return scope if scope.is_a?(Result)
         enabled = optional_bool_arg(h, "enabled")
         return Result.new("missing required 'enabled' (true|false)", is_error: true) if enabled.nil?
@@ -216,11 +187,10 @@ module Gori
         rule.enabled == enabled ? store.clear_colormarker_override(id) : store.set_colormarker_override(id, enabled)
       end
 
-      @[Tool("delete_color_rule", gated: true, agent_action: true)]
+      @[Tool("delete_color_rule", gated: true, agent_action: true, permission: "write")]
       private def delete_color_rule(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
-        scope = color_rule_scope(h)
+        id = required_id(h, "id")
+        scope = rule_scope(h)
         return scope if scope.is_a?(Result)
         return not_found("no #{scope.label} colour rule with id #{id}") unless color_rule_exists?(id, scope)
         ok =
@@ -235,16 +205,15 @@ module Gori
             store.delete_color_rule(id)
           end
         return busy("colour rule NOT deleted (store busy or unwritable); the row colour is unchanged") unless ok
-        Result.new(JSON.build { |j| j.object { j.field "id", id; j.field "scope", scope.label; j.field "deleted", true } })
+        Result.new({id: id, scope: scope.label, deleted: true}.to_json)
       end
 
       # Reorder within a scope. The scope boundary is not a position: every global rule resolves
       # before every project one, so moving past the end of a block is a scope change.
-      @[Tool("move_color_rule", gated: true, agent_action: true)]
+      @[Tool("move_color_rule", gated: true, agent_action: true, permission: "write")]
       private def move_color_rule(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
-        scope = color_rule_scope(h)
+        id = required_id(h, "id")
+        scope = rule_scope(h)
         return scope if scope.is_a?(Result)
         dir_s = str(h, "direction")
         dir =
@@ -271,19 +240,26 @@ module Gori
         else
           return busy("colour rule NOT moved (project busy) — the precedence order is unchanged") unless store.move_color_rule(id, dir)
         end
-        Result.new(JSON.build { |j| j.object { j.field "id", id; j.field "scope", scope.label; j.field "moved", dir_s } })
+        Result.new({id: id, scope: scope.label, moved: dir_s}.to_json)
       end
+
+      COLOR_PREVIEW_LIMIT = PageLimit.new(Gori::Colormarker::PREVIEW_SCAN, 5000)
 
       # How many recent flows a candidate condition would MATCH, and how many it would actually
       # PAINT once the rules that already resolve ahead of it are counted. The second number is
       # the one that answers "will I see this": an earlier enabled rule may already claim the row.
       @[Tool("preview_color_rule")]
       private def preview_color_rule(h) : Result
-        filter = str(h, "when")
-        return err("missing required 'when'", "INVALID_ARGUMENT", field: "when") if filter.nil?
+        filter = required_str(h, "when", blank: true)
         if reason = Gori::Colormarker.unusable_reason(filter)
           return err(reason, "INVALID_ARGUMENT", field: "when")
         end
+        # WHICH store the rule would be created in, because that decides which existing rules
+        # can claim a row from it: every global rule resolves before every project one, so a
+        # project rule is never ahead of a global candidate. Previewing everything as a project
+        # rule reported `would_paint: 0` for a global rule that in fact paints every row.
+        scope = rule_scope(h)
+        return scope if scope.is_a?(Result)
         # Clamp in Int64, THEN narrow: `.to_i` is checked, so clamping after it meant
         # `{"limit": 10000000000}` — the "no limit" number an LLM reaches for — OverflowError'd
         # past the INVALID_ARGUMENT arm at `Tools#call` and came back INTERNAL, telling the
@@ -291,11 +267,12 @@ module Gori
         # `bounded_int_arg`: this argument has always been forgiving at both ends, and `0` is
         # the other spelling of "no limit" an agent reaches for — turning that into a hard
         # INVALID_ARGUMENT would be a second, opposite way to fail the same call.
-        limit = (optional_int_arg(h, "limit") || Gori::Colormarker::PREVIEW_SCAN.to_i64).clamp(1_i64, 5000_i64).to_i
-        existing = Gori::Colormarker.merged(store)
-        pv = Gori::Colormarker.preview(store, filter, existing, limit)
+        limit = clamp(optional_int_arg(h, "limit"), COLOR_PREVIEW_LIMIT)
+        ahead = Gori::Colormarker.rules_ahead(Gori::Colormarker.merged(store), 0_i64, scope)
+        pv = Gori::Colormarker.preview(store, filter, ahead, limit)
         Result.new(JSON.build do |j|
           j.object do
+            j.field "scope", scope.label
             j.field "would_match", pv.matched
             j.field "would_paint", pv.painted
             j.field "scanned", pv.scanned
@@ -327,24 +304,17 @@ module Gori
         end)
       end
 
-      @[Tool("create_custom_color", gated: true, agent_action: true)]
+      @[Tool("create_custom_color", gated: true, agent_action: true, permission: "write")]
       private def create_custom_color(h) : Result
-        name = str(h, "name")
-        return err("missing required 'name'", "INVALID_ARGUMENT", field: "name") if name.nil?
-        hex = str(h, "hex")
-        return err("missing required 'hex'", "INVALID_ARGUMENT", field: "hex") if hex.nil?
+        name = required_str(h, "name", blank: true)
+        hex = required_str(h, "hex", blank: true)
         # The settings registry is the arbiter of name/hex legality and uniqueness — a non-nil
         # message means it refused, said the same way the CLI and TUI say it.
         if msg = Settings.add_colormarker_color(name, hex)
           return err(msg, "INVALID_ARGUMENT", field: "name")
         end
         norm = Settings.colormarker_colors.find { |c| c.name == name.strip.downcase }
-        Result.new(JSON.build do |j|
-          j.object do
-            j.field "name", norm.try(&.name) || name.strip.downcase
-            j.field "hex", norm.try(&.hex) || hex
-          end
-        end)
+        Result.new({name: norm.try(&.name) || name.strip.downcase, hex: norm.try(&.hex) || hex}.to_json)
       end
 
       # Edit a custom colour in place. Present because `Settings.update_colormarker_color` had
@@ -354,10 +324,9 @@ module Gori
       #
       # Both editable fields default to the current value, so `hex` alone recolours and
       # `new_name` alone renames. The registry is the arbiter of legality and uniqueness.
-      @[Tool("update_custom_color", gated: true, agent_action: true)]
+      @[Tool("update_custom_color", gated: true, agent_action: true, permission: "write")]
       private def update_custom_color(h) : Result
-        name = str(h, "name")
-        return err("missing required 'name'", "INVALID_ARGUMENT", field: "name") if name.nil?
+        name = required_str(h, "name", blank: true)
         key = name.strip.downcase
         current = Settings.colormarker_colors.find { |c| c.name == key }
         return not_found("no custom colour named '#{key}'") unless current
@@ -380,14 +349,13 @@ module Gori
         end)
       end
 
-      @[Tool("delete_custom_color", gated: true, agent_action: true)]
+      @[Tool("delete_custom_color", gated: true, agent_action: true, permission: "write")]
       private def delete_custom_color(h) : Result
-        name = str(h, "name")
-        return err("missing required 'name'", "INVALID_ARGUMENT", field: "name") if name.nil?
+        name = required_str(h, "name", blank: true)
         key = name.strip.downcase
         return not_found("no custom colour named '#{key}'") unless Settings.colormarker_colors.any? { |c| c.name == key }
         return busy("custom colour NOT deleted (settings not writable)") unless Settings.delete_colormarker_color(key)
-        Result.new(JSON.build { |j| j.object { j.field "name", key; j.field "deleted", true } })
+        Result.new({name: key, deleted: true}.to_json)
       end
 
       # Whether a colour rule id exists IN THAT SCOPE. A full read (neither store has a
@@ -423,7 +391,10 @@ module Gori
           "(an earlier enabled rule may claim the row first), WITHOUT creating anything. " \
           "Display only — nothing here modifies traffic." do |s|
           s.field "when", strprop("the condition to test (see create_color_rule)"), required: true
-          s.field "limit", intprop("recent flows to scan (default 500)")
+          s.field "scope", enumprop("preview as a rule in this store (default project). It changes " \
+                                    "`would_paint`: every global rule resolves before every project one, " \
+                                    "so no project rule can claim a row from a global candidate", RULE_SCOPES)
+          s.field "limit", limitprop("recent flows to scan", COLOR_PREVIEW_LIMIT)
         end
 
         tool j, "list_custom_colors",
@@ -441,7 +412,7 @@ module Gori
           "project when scope=global. The FIRST enabled matching rule paints a row and the " \
           "rest are never consulted, so precedence matters — use move_color_rule to change " \
           "it. Display only — a colour rule never modifies traffic." do |s|
-          s.field "when", strprop("the condition, in History QL — the SAME query language and the same fields list_history takes: host: path: url: method: scheme: proto: status: size: reqsize: respsize: dur: header: body: stub: scope:, ~regex on host/path/url/header/body, plus AND/OR/NOT, -negation and (grouping). Matched against the captured flow. CAVEATS, each of which otherwise fails silently: `host:` is a SUBSTRING, not a DNS-label glob, so host:alpha.test also matches xalpha.test; a flow with no response yet has no status, and is painted once the response lands; `scope:in`/`scope:out` follows the project's scope rules as they change and ignores the ⇧S display lens, so with NO scope rules configured nothing is in scope and both spellings paint nothing; and `body:` here SCANS rather than reading the trigram index list_history uses, so it reaches binary bodies that index skips, but it reads only the first 64 KiB of each side and reads the bytes AS CAPTURED, so a match past that bound — or inside a gzipped body — is not painted"), required: true
+          s.field "when", strprop("the condition, in History QL — the SAME query language and the same fields list_history takes: host: path: url: method: scheme: proto: status: size: reqsize: respsize: dur: header: body: stub: static: scope:, ~regex on host/path/url/header/body, plus AND/OR/NOT, -negation and (grouping). Matched against the captured flow. CAVEATS, each of which otherwise fails silently: `host:` is a SUBSTRING, not a DNS-label glob, so host:alpha.test also matches xalpha.test; a flow with no response yet has no status, and is painted once the response lands; `scope:in`/`scope:out` follows the project's scope rules as they change and ignores the `s` display lens, so with NO scope rules configured nothing is in scope and both spellings paint nothing; and `body:` here SCANS rather than reading the trigram index list_history uses, so it reaches binary bodies that index skips, but it reads only the first 64 KiB of each side and reads the bytes AS CAPTURED, so a match past that bound — or inside a gzipped body — is not painted"), required: true
           s.field "color", strprop("red | orange | yellow | green | blue | purple (default yellow) — resolved through the active theme, so it reads correctly on light and dark alike — OR the name of a custom colour (list_custom_colors / create_custom_color), which carries an absolute hex")
           s.field "style", enumprop("full tints the whole History row; strip paints one colour cell in a narrow column ahead of TIME (default full)", Settings::COLORMARKER_STYLES)
           s.field "name", strprop("optional label for the rule")

@@ -37,7 +37,7 @@ module Gori::CLI::Run
   end
 
   def self.rewriter_rule_json_for_spec(r : Store::MatchRule) : String
-    JSON.build { |j| rewriter_rule_json(j, r) }
+    JSON.build { |j| Gori::MCP::Serialize.match_rule(j, r) }
   end
 
   def self.extract_rule_row_for_spec(r : Store::ExtractRule) : String
@@ -45,7 +45,7 @@ module Gori::CLI::Run
   end
 
   def self.extract_rule_json_for_spec(r : Store::ExtractRule) : String
-    JSON.build { |j| extract_rule_json(j, r) }
+    JSON.build { |j| Gori::MCP::Serialize.extract_rule(j, r) }
   end
 
   def self.parse_extract_range_for_spec(raw : String) : {Int32, Int32}
@@ -53,8 +53,37 @@ module Gori::CLI::Run
   end
 
   def self.check_short_circuit_args_for_spec(op : Store::RuleOp, value : String,
-                                             response_file : String?, body_file : String) : String
+                                             response_file : String?, body_file : String) : String?
     check_short_circuit_args(op, value, response_file, body_file)
+  end
+
+  def self.mock_respond_for_spec(op : Store::RuleOp, body_file : String, map_dir : String? = nil,
+                                 strip_prefix = "", fallthrough = false, fault : String? = nil,
+                                 delay_ms = 0, hang_ms : Int32? = nil) : {Store::RespondKind, String}
+    mock = MockFlags.new
+    mock.map_dir = map_dir
+    mock.strip_prefix = strip_prefix
+    mock.fallthrough = fallthrough
+    mock.fault = fault
+    mock.delay_ms = delay_ms
+    mock.hang_ms = hang_ms
+    mock_respond(op, mock, body_file)
+  end
+
+  def self.add_find_for_spec(respond : Store::RespondKind, find : String?, strip_prefix = "",
+                             from_flow : Int64? = nil) : {String?, Store::MatchKind}
+    mock = MockFlags.new
+    mock.strip_prefix = strip_prefix
+    mock.from_flow = from_flow
+    add_find(Store::RuleOp::ShortCircuit, respond, mock, find, Store::MatchKind::Literal)
+  end
+
+  def self.add_fill_for_spec(store : Store, flow_id : Int64, find : String?, host : String?,
+                             value : String?) : {String, Store::MatchKind, String, String}
+    mock = MockFlags.new
+    mock.from_flow = flow_id
+    add_fill(store, Store::RuleOp::ShortCircuit, mock, Store::RespondKind::Inline, "", "",
+      find, Store::MatchKind::Literal, host, value)
   end
 
   def self.check_ws_part_for_spec(op : Store::RuleOp, part : Store::RulePart, verb : String) : Nil
@@ -67,6 +96,16 @@ module Gori::CLI::Run
 
   def self.read_stub_response_for_spec(path : String) : String
     read_stub_response(path)
+  end
+
+  def self.rewriter_added_output_for_spec(store : Store, id : Int64, scope : Store::RuleScope,
+                                          format : Symbol) : String
+    rewriter_added_output(store, id, scope, format)
+  end
+
+  def self.extract_added_output_for_spec(store : Store, id : Int64, name : String,
+                                         kind : ExtractKind, format : Symbol) : String
+    extract_added_output(store, id, name, kind, format)
   end
 end
 
@@ -225,6 +264,27 @@ describe "gori run rewriter --format=json" do
     j.as_h.has_key?("default_enabled").should be_false
   end
 
+  it "shows the raw unknown labels and marks the row inert" do
+    rule = Gori::Store::MatchRule.new(12_i64, true,
+      Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+      "POST /pay", "HTTP/1.1 200 OK", Gori::Store::RuleOp::Replace,
+      Gori::Store::MatchKind::Literal, "future", "", "",
+      unknown_target: "future_side", unknown_part: "future_head",
+      unknown_op: "future_short_circuit", unknown_match_kind: "future_match")
+    j = JSON.parse(Gori::CLI::Run.rewriter_rule_json_for_spec(rule))
+    j["target"].as_s.should eq("future_side")
+    j["part"].as_s.should eq("future_head")
+    j["op"].as_s.should eq("future_short_circuit")
+    j["match"].as_s.should eq("future_match")
+    j["inert"].as_bool.should be_true
+    j["inert_reason"].as_s.should contain("unknown op \"future_short_circuit\"")
+
+    row = Gori::CLI::Run.rewriter_rule_row_for_spec(rule)
+    row.should contain("[?]")
+    row.should contain("future_short_circuit")
+    row.should contain("future_head")
+  end
+
   # `default_enabled` is read back out of the global library, so a rule this project has
   # switched OFF still reports the library's ON — that difference is the whole point of the
   # field, and a script that only read `enabled` could not tell an override from a default.
@@ -306,6 +366,66 @@ describe "gori run rewriter extract" do
     j["selector"].as_s.should eq("")
     j["pos_start"].as_i.should eq(3)
     j["pos_end"].as_i.should eq(9)
+    # The ORDER too: a script diffing `--format json` output against MCP `list_extract_rules`
+    # sees the same object, field for field.
+    j.as_h.keys.should eq(%w[id enabled name when host kind selector pos_start pos_end])
+  end
+end
+
+# `rewriter add --format json` and `extract add --format json` (#1117): the listing's object
+# for the rule just written, read back after the commit.
+describe "gori run rewriter add --format json" do
+  it "prints the new rule's listing object, id included" do
+    with_store do |store|
+      # `--op=add_header` with the default `--part`: `Rules.normalize_shape` rewrites the
+      # shape, and the object says what was STORED, which is what the listing will say.
+      id = Gori::Rules.load(store).create(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+        "X-Trace", "on", Gori::Store::RuleOp::AddHeader, name: "trace", enabled: false)
+      o = JSON.parse(Gori::CLI::Run.rewriter_added_output_for_spec(store, id,
+        Gori::Store::RuleScope::Project, :json))
+      o["id"].as_i64.should eq(id)
+      o["scope"].as_s.should eq("project")
+      o["enabled"].as_bool.should be_false
+      o["op"].as_s.should eq("add_header")
+
+      listed = JSON.parse(Gori::CLI::Run.rewriter_rule_json_for_spec(
+        Gori::Rules.merged(store).find! { |r| !r.global? && r.id == id }))
+      o.as_h.keys.should eq(listed.as_h.keys)
+      o.should eq(listed)
+    end
+  end
+
+  it "keeps both text sentences unchanged" do
+    with_store do |store|
+      Gori::CLI::Run.rewriter_added_output_for_spec(store, 3_i64, Gori::Store::RuleScope::Project, :text)
+        .should eq("Rule #3 added.")
+      Gori::CLI::Run.rewriter_added_output_for_spec(store, 3_i64, Gori::Store::RuleScope::Global, :text)
+        .should eq("Global rule #3 added — it applies in every project.")
+    end
+  end
+end
+
+describe "gori run rewriter extract add --format json" do
+  it "prints the new rule's listing object, with the state that landed" do
+    with_store do |store|
+      id = store.insert_extract_rule("SESSION", "status:200", Gori::ExtractKind::Cookie, "sid")
+      store.set_extract_rule_enabled(id, false).should be_true # what `--disabled` does next
+      o = JSON.parse(Gori::CLI::Run.extract_added_output_for_spec(store, id, "SESSION",
+        Gori::ExtractKind::Cookie, :json))
+      o["id"].as_i64.should eq(id)
+      o["enabled"].as_bool.should be_false
+
+      listed = JSON.parse(Gori::CLI::Run.extract_rule_json_for_spec(store.extract_rules.find! { |r| r.id == id }))
+      o.as_h.keys.should eq(listed.as_h.keys)
+      o.should eq(listed)
+    end
+  end
+
+  it "keeps the text sentence unchanged" do
+    with_store do |store|
+      Gori::CLI::Run.extract_added_output_for_spec(store, 2_i64, "SESSION", Gori::ExtractKind::Header, :text)
+        .should eq("Extract rule #2 added — #{Gori::Env.spell("SESSION", Gori::Env::Namespace::Bind)} binds from header.")
+    end
   end
 end
 
@@ -356,5 +476,78 @@ describe "gori run rewriter add — the refusals before a rule is stored" do
       Gori::Store::RuleOp::AddHeader, Gori::Store::RulePart::Head, "add").should be_nil
     Gori::CLI::Run.check_ws_part_for_spec(
       Gori::Store::RuleOp::ShortCircuit, Gori::Store::RulePart::Head, "preview").should be_nil
+  end
+end
+
+# #1237 — the mocking flags. The refusals abort (and so cannot run here); what is pinned is the
+# rule each accepted combination becomes, and the listing a script reads back.
+describe "gori run rewriter add — mocking (#1237)" do
+  it "turns each answer's flags into its sub-kind and stored args" do
+    sc = Gori::Store::RuleOp::ShortCircuit
+    Gori::CLI::Run.mock_respond_for_spec(sc, "").should eq({Gori::Store::RespondKind::Inline, ""})
+    Gori::CLI::Run.mock_respond_for_spec(sc, "/tmp/b.json").should eq({Gori::Store::RespondKind::File, ""})
+    Gori::CLI::Run.mock_respond_for_spec(sc, "", map_dir: "/srv", strip_prefix: "/static/", fallthrough: true)
+      .should eq({Gori::Store::RespondKind::Dir, %({"strip_prefix":"/static/","fallthrough":true})})
+    Gori::CLI::Run.mock_respond_for_spec(sc, "", fault: "RESET", delay_ms: 250)
+      .should eq({Gori::Store::RespondKind::Fault, %({"fault":"reset","delay_ms":250})})
+    Gori::CLI::Run.mock_respond_for_spec(sc, "", fault: "hang", hang_ms: 2000)
+      .should eq({Gori::Store::RespondKind::Fault, %({"fault":"hang","hang_ms":2000})})
+    Gori::CLI::Run.mock_respond_for_spec(Gori::Store::RuleOp::Replace, "")
+      .should eq({Gori::Store::RespondKind::Inline, ""})
+  end
+
+  it "claims a map-dir prefix on the request line when --find is left out" do
+    find, match = Gori::CLI::Run.add_find_for_spec(Gori::Store::RespondKind::Dir, nil, "/static/")
+    match.should eq(Gori::Store::MatchKind::Regex)
+    re = Regex.new(find.not_nil!)
+    re.matches?("GET /static/app.js HTTP/1.1\r\n").should be_true
+    re.matches?("GET /x HTTP/1.1\r\nReferer: https://a/static/\r\n").should be_false
+    # --from-flow may leave the match to the flow's draft.
+    Gori::CLI::Run.add_find_for_spec(Gori::Store::RespondKind::Inline, nil, from_flow: 7_i64)
+      .should eq({nil, Gori::Store::MatchKind::Literal})
+  end
+
+  it "fills an unsaid match, host and response from --from-flow, and keeps what was said" do
+    with_store do |store|
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "https", host: "acme.test", port: 443,
+        method: "GET", target: "/api/me", http_version: "HTTP/1.1",
+        head: "GET /api/me HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice, source: Gori::FlowSource::Kind::Proxy))
+      store.update_response(Gori::Store::CapturedResponse.new(
+        flow_id: id, status: 200, head: "HTTP/1.1 200 OK\r\n\r\n".to_slice, body: %({"a":1}).to_slice))
+      find, match, host, value = Gori::CLI::Run.add_fill_for_spec(store, id, nil, nil, nil)
+      find.should eq("\\AGET /api/me(\\?| )")
+      match.should eq(Gori::Store::MatchKind::Regex)
+      host.should eq("acme.test")
+      value.should eq("HTTP/1.1 200 OK\n\n{\"a\":1}")
+      Gori::CLI::Run.add_fill_for_spec(store, id, "/api/me", "*.acme.test", nil)
+        .should eq({"/api/me", Gori::Store::MatchKind::Literal, "*.acme.test", "HTTP/1.1 200 OK\n\n{\"a\":1}"})
+    end
+  end
+
+  it "lists a mock rule's answer, and prints its sub-kind in JSON" do
+    dir = Gori::Store::MatchRule.new(4_i64, true, Gori::Store::RuleTarget::Request,
+      Gori::Store::RulePart::Head, "GET /static/", "", Gori::Store::RuleOp::ShortCircuit,
+      body_file: "/srv/js", respond: Gori::Store::RespondKind::Dir,
+      respond_args: %({"strip_prefix":"/static/","fallthrough":true}))
+    Gori::CLI::Run.rewriter_rule_body_for_spec(dir).should eq("GET /static/ => /static/ → dir:/srv/js (fallthrough)")
+    json = JSON.parse(Gori::CLI::Run.rewriter_rule_json_for_spec(dir))
+    json["respond"].as_s.should eq("dir")
+    json["respond_args"]["strip_prefix"].as_s.should eq("/static/")
+    json["respond_args"]["fault"].raw.should be_nil
+    json["fallthrough"].as_bool.should be_true
+
+    fault = Gori::Store::MatchRule.new(5_i64, true, Gori::Store::RuleTarget::Request,
+      Gori::Store::RulePart::Head, "/pay", "", Gori::Store::RuleOp::ShortCircuit,
+      respond: Gori::Store::RespondKind::Fault, respond_args: %({"fault":"reset","delay_ms":500}))
+    Gori::CLI::Run.rewriter_rule_body_for_spec(fault).should eq("/pay => fault:reset +500ms")
+    JSON.parse(Gori::CLI::Run.rewriter_rule_json_for_spec(fault))["fallthrough"].as_bool.should be_false
+
+    # Args this binary cannot read print RAW — the row is inert and says why.
+    future = Gori::Store::MatchRule.new(6_i64, true, Gori::Store::RuleTarget::Request,
+      Gori::Store::RulePart::Head, "/x", "", Gori::Store::RuleOp::ShortCircuit,
+      respond: Gori::Store::RespondKind::Fault, respond_args: %({"fault":"reset","throttle":1}))
+    JSON.parse(Gori::CLI::Run.rewriter_rule_json_for_spec(future))["respond_args"].as_s
+      .should eq(%({"fault":"reset","throttle":1}))
   end
 end

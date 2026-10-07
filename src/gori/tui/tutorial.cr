@@ -3,11 +3,14 @@ require "./geometry"
 require "./screen"
 require "./theme"
 require "./frame"
+require "./chrome"
 require "./layout"
 require "./mascot"
 require "./notifications"
 require "./companion"
+require "./palette"
 require "../settings"
+require "../verb"
 
 module Gori::Tui
   # A guided, standalone tour of gori's TUI, shown right after the setup wizard
@@ -16,26 +19,52 @@ module Gori::Tui
   # so it fully captures input and can't disturb any real session.
   #
   # It teaches the four moves a new user reaches for most — moving between
-  # tabs/panes, the command palette (^P), the action menu (space), and edit mode
+  # tabs/panes, the action menu (space), the command palette (^P), and edit mode
   # (READ/INS) — each on a harmless MOCK of the real UI (nothing here is real),
-  # drawn with the same Screen/Frame/Theme primitives the app uses.
+  # drawn with the same Screen/Frame/Theme primitives the app uses. Then the traffic
+  # itself (#1382): where to point a client and trust the CA, the capture switch, and
+  # intercept — the lesson that also untangles `i` (INS in an editor, intercept elsewhere).
+  #
+  # The menu comes before the palette because the palette's hint column SPELLS menu paths
+  # (`Hotkeys.menu_path`, #1282): a search result tells you the letters that reach it next
+  # time, and those read as noise to someone who has not yet opened the menu once. The two
+  # mocks' rows are real verbs read from the registry, so their letters and keys are the
+  # app's, and move when the app's do.
   #
   # Flow: short explanation + looping demo on each lesson, with a soft "try it"
-  # goal so users press the real key at least once; then a hands-on Practice
-  # sandbox that encourages all four moves; finally a "first session" checklist.
+  # goal so users make the whole move at least once; the two traffic lessons; a
+  # hands-on Practice sandbox for the four UI moves; Help and quitting; finally a
+  # "first session" checklist.
   # Progression is never blocked — clickable Prev/Next buttons always work.
   class Tutorial
-    # The mock tab bar; mirrors the real top-level tabs the user will see.
-    TABS = %w[Project Target History Intercept Repeater Fuzzer Help]
+    # The mock tab bar: the real bar's first five NUMBERED SLOTS, in the order a default
+    # install has them (Chrome::DEFAULT_HIDDEN leaves Project·Target·History·Intercept·
+    # Repeater in slots 1-5).
+    #
+    # Five, not the nine the real bar holds, because a numbered chip costs two cells more
+    # than a bare one and the card is 78 columns at its widest: nine would overflow the
+    # strip and `tab_chip_rects` would drop the right-hand chips — a mock bar whose last
+    # digits point at nothing, in the lesson about the digits. Five fit at 80 columns with
+    # the focus badge beside them, which is the terminal the new users this tour exists for
+    # are most likely to be running.
+    TABS = %w[Project Target History Intercept Repeater]
 
-    # Short labels for the progress rail (keep narrow so 7 chips fit).
+    # The mock tab the menu and palette lessons stand on: their rows are History's, so the bar
+    # has to say History, not whichever tab the previous lesson left highlighted.
+    HISTORY_TAB = 2
+
+    # Short labels for the progress rail — keep them narrow: all ten chips fit at 80 columns
+    # (`rail_width`, spec-gated), below that the rail falls back to dots.
     STEP_RAIL = [
       {"intro", Step::Welcome},
       {"nav", Step::Navigate},
-      {"palette", Step::Palette},
       {"menu", Step::SpaceMenu},
+      {"palette", Step::Palette},
       {"edit", Step::Edit},
+      {"proxy", Step::Capture},
+      {"catch", Step::Intercept},
       {"try", Step::Practice},
+      {"exit", Step::Leave},
       {"done", Step::Done},
     ]
 
@@ -58,47 +87,324 @@ module Gori::Tui
     # GUTTER Companion.place already keeps clear of it, and ONE more for the plate strip
     # Companion.draw paints at `rect.x - 1`.
     #
-    # The card is NARROWED by this rather than the sprite being dropped when it doesn't
-    # fit beside a full-width card — which is what the project picker does, and copying
-    # that rule here would have been wrong. The picker's card is 50 columns, so 80 seats
-    # her beside it; the tour's is up to 78, so the same rule would not seat her until
-    # ~102 columns — absent on exactly the 80-column terminals the new users this tour
-    # exists for are most likely to be running. CARD_W is a CAP, not a requirement
-    # (step_card already floors the card at 40), so reserving her band before centring
-    # costs a few columns of mock and seats her from 80.
-    #
-    # Only when she is ON. A default install (Companion off) must render the tour exactly as it
-    # did before she existed — see #companion_band.
+    # She stands only where the card keeps its full CARD_W beside this band (#1381). She is
+    # on by default since #1096, and narrowing the card to seat her at 80 columns cost the
+    # lesson its own content there: the Navigate lines truncated, the mock bar lost its fifth
+    # chip while the footer still said "1-5", and the Done card fell back to its short form.
+    # The lesson outranks the mascot, so below ~94 columns she is simply not drawn.
     COMPANION_BAND = Companion::GUTTER + Mascot::W + 1
 
     # Fake palette rows used by the palette lesson + practice overlay: sigil, label, and the
     # fake tab index the row switches to (nil = the row only closes the palette). The action
     # rides its own slot so the label is free to be reworded or translated without the
     # practice step's "Go to …" quietly turning into a no-op.
+    #
+    # Every index here must name a chip the mock bar actually draws (spec-gated): a row
+    # pointing past TABS set @p_tab to a tab no chip matches, so the palette closed onto a
+    # bar with NOTHING highlighted. Help is the tab that lost its index — it starts off the
+    # bar now (Chrome::DEFAULT_HIDDEN), which is exactly why its row still reads "Open Help"
+    # and carries no number: the palette is one of the doors (`?`, `0`, ^P) that reach a tab
+    # no digit does.
+    #
+    # These are the APP half, the one an empty query browses. `Settings: Companion` is there so
+    # the lesson's query (PALETTE_DEMO_QUERY) finds a row in both groups, as it does in the app.
     PALETTE_ROWS = [
       {"»", "Go to Repeater", 4},
       {"≡", "Settings: Theme", nil},
+      {"≡", "Settings: Companion", nil},
       {"×", "Quit gori", nil},
-      {"→", "Go to History", 2},
-      {"?", "Open Help", 6},
+      {"»", "Go to History", 2},
+      {"?", "Open Help", nil},
     ]
 
-    # Fake space-menu rows (mnemonic key + label).
-    SPACE_ROWS = [{'o', "Open"}, {'r', "Repeater"}, {'y', "Copy"}, {'/', "Filter"}]
+    # The palette's THIS TAB half (#1282): real History verbs, read from the registry when the
+    # tour starts. Each row's hint is the one the real palette prints beside it — the direct
+    # key, else the space-menu path — so a rebind or a moved letter moves it here too. Send to
+    # Comparer comes first because it has NO key: its hint is the menu path, which is the
+    # lesson (search once, and the palette tells you the short route for next time).
+    PALETTE_TAB_VERBS = %w[history.compare history.fuzz history.repeater history.copy history.query]
 
-    FLOW_ROWS = [{"GET ", "/api/users", 200}, {"POST", "/login", 401}, {"GET ", "/admin", 500}]
+    # What the palette lesson asks the user to type, and what its demo types: it finds Send to
+    # Comparer under THIS TAB and a Settings row under APP, so both groups are on screen.
+    PALETTE_DEMO_QUERY = "comp"
+
+    # The mock space menu over History's list: its level-1 rows, and the second card that the
+    # Send flow to… family row opens (#1274). Verb ids, never letters — the letters come from
+    # the registry (`Tutorial.space_rows`), and a hand-typed one is what
+    # spec/verb/hint_token_expands_spec.cr exists to refuse.
+    SPACE_VERBS = %w[body.open history.repeater history.copy history.query]
+    SEND_VERBS  = %w[history.repeater history.fuzz history.compare]
+
+    # Where the family row sits among SPACE_VERBS: after the Repeater row, as in the real card's
+    # SEND group, and high enough to stay drawn when a short card clips the list.
+    SEND_ROW_AT = 2
+
+    # Cap on the mock menu's width: enough for the second card's `SPACE › SEND FLOW TO` title.
+    SPACE_MENU_W = 30
+
+    # One row of the mock space menu: the letter that runs it, the verb's title, the right-hand
+    # column (the direct key, or `›` on a row that opens a second card), and whether it opens
+    # one instead of running.
+    record MenuRow, key : Char, title : String, hint : String, opens : Bool = false
+
+    # One command of the mock palette: sigil, label, hint column, the fake tab a "Go to …" row
+    # switches to, and whether it is one of the focused tab's own actions (THIS TAB).
+    record PalRow, sigil : String, label : String, hint : String, tab : Int32?, this_tab : Bool
+
+    def self.space_rows(registry : Verb::Registry) : Array(MenuRow)
+      rows = SPACE_VERBS.compact_map { |id| level1_row(registry, id) }
+      fam = Verbs::SEND_FLOW
+      rows.insert({SEND_ROW_AT, rows.size}.min, MenuRow.new(fam.key, fam.title, "›", opens: true))
+    end
+
+    # The family's card, lettered by the family table (`Registry#l2_key`), which is the same on
+    # every tab — the thing worth seeing once.
+    def self.send_rows(registry : Verb::Registry) : Array(MenuRow)
+      SEND_VERBS.compact_map do |id|
+        next unless (v = registry[id]?) && (k = registry.l2_key(v))
+        MenuRow.new(k, v.title, chord_hint(registry, id, k))
+      end
+    end
+
+    # The second card's title, as the real one reads (`SPACE › SEND FLOW TO`).
+    def self.send_card_title : String
+      "SPACE › #{Verbs::SEND_FLOW.title.rchop('…').upcase}"
+    end
+
+    # The same column `PaletteState#fast_path` draws for a tab row: the chord's label, else the
+    # compact menu path.
+    def self.palette_tab_rows(registry : Verb::Registry) : Array(PalRow)
+      PALETTE_TAB_VERBS.compact_map do |id|
+        next unless v = registry[id]?
+        hint = Hotkeys.binding_for(registry, id).try(&.label) ||
+               Hotkeys.menu_path(registry, id, compact: true) || ""
+        PalRow.new("▸", v.title, hint, nil, true)
+      end
+    end
+
+    # The palette's commands for `query`, THIS TAB first. An empty query is the app-wide
+    # browse and lists no tab rows, as in the app.
+    def self.palette_matches(query : String, tab_rows : Array(PalRow)) : Array(PalRow)
+      app = PALETTE_ROWS.map { |(sig, label, tab)| PalRow.new(sig, label, "", tab, false) }
+      q = query.downcase
+      return app if q.empty?
+      (tab_rows + app).select(&.label.downcase.includes?(q))
+    end
+
+    # The drawn rows: a group header, or an index into `matches`. Grouped only when a tab row
+    # matched, the rule `PaletteState#display_rows` follows, so the browse stays a flat list.
+    def self.palette_display(matches : Array(PalRow)) : Array({String, Int32?})
+      tab = matches.count(&.this_tab)
+      rows = [] of {String, Int32?}
+      if tab > 0
+        rows << {PaletteState::TAB_HEADER, nil}
+        tab.times { |i| rows << {"", i} }
+        rows << {PaletteState::APP_HEADER, nil} if matches.size > tab
+        (tab...matches.size).each { |i| rows << {"", i} }
+      else
+        matches.each_index { |i| rows << {"", i} }
+      end
+      rows
+    end
+
+    private def self.level1_row(registry : Verb::Registry, id : String) : MenuRow?
+      return nil unless (v = registry[id]?) && (keys = registry.menu_keys(id)) && keys.size == 1
+      MenuRow.new(keys[0], v.title, chord_hint(registry, id, keys[0]))
+    end
+
+    # The rule `SpaceMenu#chord_hint` draws by: a chord equal to the row's own letter is not
+    # repeated beside it (the real card reads `y Copy flow`, never `y Copy flow y`).
+    private def self.chord_hint(registry : Verb::Registry, id : String, key : Char) : String
+      return "" unless c = Hotkeys.binding_for(registry, id)
+      label = Hotkeys.display_label(c)
+      label == key.to_s || label == key.to_s.upcase ? "" : label
+    end
+
+    # How to reach `id` from memory: its effective chord, else its menu path (`Hotkeys.route`),
+    # else the palette search that finds it (`^P → Open browser`). Read from the registry, so
+    # a rebind or a moved row moves every line of the tour that names it (#1380).
+    def self.reach(registry : Verb::Registry, id : String) : String
+      if chord = Hotkeys.binding_for(registry, id)
+        return Hotkeys.display_label(chord)
+      end
+      Hotkeys.route(registry, id) ||
+        "#{Hotkeys.binding_label(registry, "app.palette", "^P")} → #{registry[id]?.try(&.title) || id}"
+    end
+
+    # POST first, so the REQUEST pane a lesson opens on is a request with a body to type into.
+    FLOW_ROWS = [{"POST", "/login", 401}, {"GET ", "/api/users", 200}, {"GET ", "/admin", 500}]
+
+    # The mock tabs that carry a SUBTABS strip, and its chips: the real Project and Target
+    # sets. As in the app, a digit lands on the bar, ↓ on the strip, and ↓ again in the body
+    # (Runner#enter_content) — so the Navigate lesson, which starts on Target, passes one.
+    def self.strip_labels(tab : Int32) : Array(String)?
+      case tab
+      when 0 then ProjectView::PANE_LABELS
+      when 1 then TargetController::SUBS
+      end
+    end
+
+    # The Navigate lesson's looping demo: {tab, focus level, pane, the key shown}. It walks
+    # the path the lesson asks for — a digit onto Target, down through its strip into the
+    # body, and back up — on the two chips every card size draws (spec-gated).
+    NAV_DEMO = [
+      {0, :menu, 0, ""},
+      {1, :menu, 0, "2"},
+      {1, :strip, 0, "↓"},
+      {1, :body, 0, "↓"},
+      {1, :body, 1, "⇥"},
+      {1, :strip, 0, "esc"},
+      {1, :menu, 0, "esc"},
+      {0, :menu, 0, "1"},
+    ]
 
     enum Step
       Welcome
       Navigate
-      Palette
       SpaceMenu
+      Palette
       Edit
-      Practice # hands-on sandbox: the user drives the mock
+      Capture   # proxy address, CA trust, the capture switch
+      Intercept # hold, forward/drop, release
+      Practice  # hands-on sandbox: the user drives the mock
+      Leave     # Help, quitting, closing a project
       Done
     end
 
-    def initialize(@term : Termisu)
+    # The tour can lead to four different places. Its last card must describe the
+    # actual next screen, especially on first launch (wizard → tour → project picker
+    # or the --db session, with a picker fallback on open failure).
+    enum Handoff
+      Picker
+      Direct
+      Shell
+      Session
+    end
+
+    # Every key here is the registry's (`Tutorial.reach`), never a literal: a rebound chord, or
+    # a palette-only verb, is taught the way the app answers it now (#1380). Only the first
+    # line is prose, and it goes through `Hotkeys.retag` for its ^P.
+    def self.first_session_steps(handoff : Handoff, width : Int32,
+                                 registry : Verb::Registry = Verbs.registry) : Array(String)
+      browser, ca = reach(registry, "browser.open"), reach(registry, "ca.export")
+      cap, ins = reach(registry, "capture.toggle"), reach(registry, "editor.insert")
+      to_rep, send = reach(registry, "history.repeater"), reach(registry, "repeater.send")
+      help, tour = reach(registry, "tab.help"), reach(registry, "help.tour")
+      if width < 66
+        first = case handoff
+                when Handoff::Picker  then "New project → name → ↵ twice"
+                when Handoff::Direct  then "--db opens · picker if it fails"
+                when Handoff::Shell   then "gori → New project → name → ↵↵"
+                when Handoff::Session then "Back in session · ^P palette"
+                else                       raise "unknown tutorial handoff"
+                end
+        return [
+          Hotkeys.retag(first),
+          "#{browser} (trusts CA)",
+          "CA: #{ca}",
+          "#{cap} if off · visit site → History",
+          "Flow → #{to_rep} Repeater · #{ins} · #{send} send",
+          "#{help} Help · #{tour}",
+        ]
+      end
+      first = case handoff
+              when Handoff::Picker
+                "At the picker: New project → name → ↵ twice (description optional)"
+              when Handoff::Direct
+                "Open your --db project; if picker appears, choose a project"
+              when Handoff::Shell
+                "Run gori → New project → name → ↵ twice (description optional)"
+              when Handoff::Session
+                "Back in your session: open the command palette with ^P"
+              else
+                raise "unknown tutorial handoff"
+              end
+      [
+        Hotkeys.retag(first),
+        "#{browser} — proxied, and it already trusts gori's CA",
+        "Other clients: trust the CA — #{ca}",
+        "If capture is off, press #{cap} · visit a site you may test · History",
+        "Pick a flow · #{to_rep} → Repeater · edit (#{ins}) · #{send} send",
+        "#{help} for Help · #{tour} anytime",
+      ]
+    end
+
+    # The footer is the tour's exit route at the advertised 40-column floor. Its
+    # long lesson hints can be ellipsized there, so keep a short, truthful one for
+    # each state rather than losing the keys at the right-hand end.
+    def self.compact_footer_hint(step : Step, overlay : Symbol = :none,
+                                 insert : Bool = false, armed : Bool = false,
+                                 registry : Verb::Registry = Verbs.registry) : String
+      return "esc again to leave · any key stays" if armed
+      return "↵ run · esc close · then n next" unless overlay == :none
+      return "type · esc READ · then n next" if insert
+      compact_step_hint(step, registry)
+    end
+
+    # The live key handler checks this before its INS editor branch.
+    def self.practice_next_on_enter?(step : Step, completed : Bool,
+                                     key : Termisu::Input::Key) : Bool
+      step.practice? && completed && key.enter?
+    end
+
+    def self.practice_status_hint(overlay : Symbol, completed : Bool, insert : Bool,
+                                  tabs : String) : String
+      return "Overlay open · ↵ run · esc close" unless overlay == :none
+      return "✓ Nicely done — click Next or press ↵." if completed
+      return "INS mode — type, then esc back to READ." if insert
+      Hotkeys.retag("#{tabs}/←→ tabs · ↓ in · ↑/esc out · ⇥ panes · space · ^P · i in REQUEST")
+    end
+
+    def self.navigation_try_hint : String
+      "try 2, ↓ until BODY, ↑ until TABS · n next · b back"
+    end
+
+    private def self.compact_step_hint(step : Step, registry : Verb::Registry) : String
+      case step
+      when Step::Welcome   then "↵/n start · esc esc leave"
+      when Step::Navigate  then "2, ↓ until BODY, ↑ until TABS · n/b"
+      when Step::SpaceMenu then "space menu · n next · b back"
+      when Step::Palette   then Hotkeys.retag("^P palette · n next · b back")
+      when Step::Edit      then "i INS · n next · b back"
+      when Step::Capture   then "#{reach(registry, "capture.toggle")} capture · n next · b back"
+      when Step::Intercept then "#{reach(registry, "intercept.toggle")} hold · n next · b back"
+      when Step::Practice  then "n next · b back · keep trying"
+      when Step::Leave     then "↵/n next · b back · esc esc leave"
+      when Step::Done      then "↵/n finish · esc esc leave"
+      else                      raise "unknown tutorial step"
+      end
+    end
+
+    # No `i` here: outside an editor it is intercept, and a cheat-sheet line has no room to
+    # say which (#1380). The Intercept lesson is where that is taught.
+    def self.done_extra_lines(width : Int32, registry : Verb::Registry = Verbs.registry) : {String, String}
+      pal, help = reach(registry, "app.palette"), reach(registry, "tab.help")
+      if width < 50
+        {"Keys: 1-9 · space · #{pal} · #{help} help", "Re-run: gori tutorial"}
+      elsif width < 71
+        {"Keys: 1-9 tabs · space menu · #{pal} find · #{help} help", "Re-run: gori tutorial"}
+      else
+        {"Cheat-sheet: 1-9 tabs · space menu · #{pal} find · #{help} help · ^D ×2 quit",
+         "Re-run this tour anytime:  gori tutorial"}
+      end
+    end
+
+    # What the too-small screen says, shortened to what fits: its exit key is the one thing
+    # that must survive the cut (#1381).
+    def self.too_small_message(w : Int32) : String
+      ["terminal too small for tutorial — min 40x16, resize & retry (esc to leave)",
+       "too small — min 40x16 · esc leaves",
+       "40x16 · esc leaves"].find { |m| Screen.draw_width(m) <= w } || "esc"
+    end
+
+    # `registry` is the session's when the tour runs from inside one (Runner#open_tutorial), so
+    # the mock menus read the same letters and keys the user just left.
+    def initialize(@term : Termisu, @handoff : Handoff = Handoff::Shell,
+                   @registry : Verb::Registry = Verbs.registry)
+      registry = @registry
+      @space_rows = Tutorial.space_rows(registry)
+      @send_rows = Tutorial.send_rows(registry)
+      @pal_tab_rows = Tutorial.palette_tab_rows(registry)
       # Held as the base Backend: TermisuBackend is generic over the terminal type.
       @backend = TermisuBackend.new(@term).as(Backend)
       @step = Step::Welcome
@@ -106,20 +412,42 @@ module Gori::Tui
       @resized = false # forces a full repaint after a resize
       @running = false
 
-      # Soft per-lesson try-it flags (encouraged, not blocking — Next always works).
+      # Soft per-lesson try-it flags (encouraged, not blocking — Next always works). Each is set
+      # only by the WHOLE move its try line asks for, never by the first key of it (#1382).
       @tried_nav = false
       @tried_palette = false
       @tried_space = false
       @tried_edit = false
+      @tried_capture = false
+      @tried_intercept = false
+      @practice_completed = false # latched: Practice's goals reset each time it is entered
+
+      # The rail tells "been there" from "done that": a step is ✓ only when completed
+      # (#step_completed?), and merely visited otherwise (#1382).
+      @visited = Set{Step::Welcome}
+
+      # A one-line answer to a key the mock does not do what the app does with — `i` outside
+      # an editor, `0`, ↵ in INS — shown in the footer's hint row for ~3s (#nudge).
+      @nudge = nil.as(String?)
+      @nudge_until = 0
 
       # Shared live mock state (Navigate takeover + Practice sandbox).
-      @p_level = :menu # :menu (tab bar) | :body
+      @p_level = :menu # :menu (tab bar) | :strip (SUBTABS) | :body
       @p_tab = 0
       @p_pane = 0       # 0 = FLOWS, 1 = REQUEST
       @p_flow = 0       # selected row in FLOWS
+      @p_sub = 0        # selected chip on a SUBTABS strip
       @p_switch = false # switched tabs
-      @p_enter = false  # entered a tab's body
-      @p_up = false     # returned to the tab bar with esc
+      @p_enter = false  # reached a tab's body
+      @p_up = false     # climbed back to the tab bar with ↑ or esc
+
+      # The traffic lessons' mock: the capture switch, and an intercept with its held queue.
+      @m_capture = true
+      @m_cap_off = false # capture was switched off this lesson (the first half of its try)
+      @m_intercept = false
+      @m_held = 0
+      @m_held_on = false  # intercept was switched on this lesson
+      @m_released = false # a held request was forwarded or dropped with its own key
 
       # Practice-only goals for palette / space / edit (lessons use @tried_*).
       @p_palette = false
@@ -131,6 +459,7 @@ module Gori::Tui
       @pal_sel = 0
       @pal_query = "" # live filter string (palette lesson + practice)
       @space_sel = 0
+      @space_level = 1 # 1 = the menu, 2 = the Send flow to… card its family row opens
       @edit_insert = false
       @edit_typed = ""
       # Once the user touches keys on Navigate, stop the auto-demo and hand over.
@@ -147,6 +476,7 @@ module Gori::Tui
       @rail_hits = [] of {Rect, Int32} # progress-rail chip → step value
       @flows_rect = Rect.new(0, 0, 0, 0)
       @request_rect = Rect.new(0, 0, 0, 0)
+      @strip_rect = Rect.new(0, 0, 0, 0)
       @palette_rect = Rect.new(0, 0, 0, 0)
       @space_rect = Rect.new(0, 0, 0, 0)
 
@@ -164,11 +494,16 @@ module Gori::Tui
       @companion_said = Set(Symbol).new # goals she has already reacted to (rising edge, once each)
     end
 
+    # Whether the user left through Done's Finish, rather than esc/^C. `gori tutorial` prints
+    # its "next:" line only then.
+    getter? finished = false
+
     # Run the tour to completion (Done + Next/Finish) or until the user leaves
     # (esc). Returns when done; the caller continues after.
     def run : Nil
       @running = true
       loop do
+        @practice_completed ||= @step.practice? && practice_done?
         tick_companion
         render
         # Own event loop — fold ⌥P onto ^P so the "try the palette" goal below can be
@@ -197,10 +532,12 @@ module Gori::Tui
     # the user actually configured, exactly as the card titles do.
     COMPANION_LINES = [
       {:nav, "that's it — tab bar up top, body below"},
-      {:palette, "^P from anywhere, any tab"},
       {:space, "space acts on whatever's selected"},
+      {:palette, "type a name, and it shows you the key"},
       {:edit, "INS to type, esc back to READ"},
-      {:practice, "all four! you're ready"},
+      {:capture, "that dot is the recorder"},
+      {:intercept, "held, decided, released — nice"},
+      {:practice, "all six! you're ready"},
       {:done, "that's the tour — go break something"},
     ]
 
@@ -239,13 +576,15 @@ module Gori::Tui
 
     private def companion_goal_reached?(goal : Symbol) : Bool
       case goal
-      when :nav      then @tried_nav
-      when :palette  then @tried_palette
-      when :space    then @tried_space
-      when :edit     then @tried_edit
-      when :practice then practice_done?
-      when :done     then @step.done?
-      else                false
+      when :nav       then @tried_nav
+      when :palette   then @tried_palette
+      when :space     then @tried_space
+      when :edit      then @tried_edit
+      when :capture   then @tried_capture
+      when :intercept then @tried_intercept
+      when :practice  then practice_done?
+      when :done      then @step.done?
+      else                 false
       end
     end
 
@@ -307,9 +646,19 @@ module Gori::Tui
         return
       end
 
+      # The too-small screen paints no overlay, INS or footer, so esc there leaves at once,
+      # whatever is open underneath: the first press used to close an overlay nobody could
+      # see (#1381). Nothing on that screen is a lesson worth guarding with a second press.
+      if key.escape? && too_small?
+        @running = false
+        return
+      end
+
       # Anything but esc disarms the leave-the-tour confirmation (see #handle_escape). Set
-      # here rather than per-branch so a key handled deep in an overlay still counts.
+      # here rather than per-branch so a key handled deep in an overlay still counts. A nudge
+      # answers the key that raised it, so the next one clears it (and may raise its own).
       @esc_armed = false unless key.escape?
+      @nudge = nil
 
       # Tour navigation is independent of the mock — available so the user can
       # never get stuck (n/b, ⇧⇥). Letter keys are suppressed while typing.
@@ -321,6 +670,13 @@ module Gori::Tui
       # Overlay owns keys while open (esc/↵ close; ↑↓ move; type filters palette).
       return handle_overlay_key(ev) unless @overlay == :none
 
+      # Practice's completed state makes Enter the Next action, including when its last
+      # check left the mock editor in INS. Before completion, INS keeps its real-editor Enter.
+      if Tutorial.practice_next_on_enter?(@step, practice_done?, key)
+        advance
+        return
+      end
+
       # INS owns printables + esc (leave READ). Tour nav already handled above.
       if @edit_insert
         return handle_edit_key(ev)
@@ -331,13 +687,8 @@ module Gori::Tui
         return handle_escape
       end
 
-      # Practice / Navigate live: shell keys first. When practice goals are done,
-      # ↵ matches the Next button so the keyboard path isn't a dead end.
+      # Practice / Navigate live: shell keys first.
       if @step.practice?
-        if practice_done? && key.enter?
-          advance
-          return
-        end
         handle_live_shell_key(ev, practice: true)
         return
       end
@@ -350,21 +701,27 @@ module Gori::Tui
       case @step
       when Step::Navigate
         ch = Tutorial.bare_char(ev)
-        if nav_switch_key?(ev) || key.down? || key.enter? || ch == 'j'
+        if nav_switch_key?(ev) || digit_tab_key?(ev) || key.down? || key.enter? || ch == 'j' ||
+           ch == '0' || edit_enter_key?(ev)
           start_nav_live
           handle_live_shell_key(ev, practice: false)
+          return
+        end
+        # Opening either one is not the try-it: the ✓ waits for the move each lesson is about —
+        # a search that turns up THIS TAB rows and runs one, a second card or a row run
+        # (#run_overlay_selection, #open_send_card, #run_space_row).
+      when Step::SpaceMenu
+        if space_open_key?(ev)
+          open_space
+          return
+        end
+        if send_open_key?(ev)
+          open_send_card
           return
         end
       when Step::Palette
         if palette_open_key?(ev)
           open_palette
-          @tried_palette = true
-          return
-        end
-      when Step::SpaceMenu
-        if space_open_key?(ev)
-          open_space
-          @tried_space = true
           return
         end
       when Step::Edit
@@ -372,6 +729,13 @@ module Gori::Tui
           enter_insert
           return
         end
+      when Step::Capture
+        if verb_key?(ev, "capture.toggle")
+          toggle_mock_capture
+          return
+        end
+      when Step::Intercept
+        return if handle_intercept_key(ev)
       end
 
       # Enter advances when the mock is not capturing it (welcome / done / skip).
@@ -417,10 +781,8 @@ module Gori::Tui
     # ahead of this, and each owns its own esc (leave INS / close the overlay). This is the
     # rest: pop one level of the mock, or leave the tour.
     private def handle_escape : Nil
-      if live_shell? && @p_level == :body
-        @p_level = :menu
-        @p_up = true
-        mark_nav_tried
+      if live_shell? && @p_level != :menu
+        step_out
         return
       end
       # Top level, where esc leaves the tour — but only on a DELIBERATE second press.
@@ -436,8 +798,8 @@ module Gori::Tui
       #
       # `footer_hint` announces the armed state, and any other key disarms it (#handle_key,
       # #handle_mouse), so this can't strand anyone in a mode they can't see — which is also
-      # why the resize-and-retry screen, the one path that paints no footer, opts out.
-      return @running = false if too_small?
+      # why the resize-and-retry screen, the one path that paints no footer, opts out (in
+      # `handle_key`, ahead of every overlay and INS).
       if @esc_armed
         @running = false
       else
@@ -463,13 +825,24 @@ module Gori::Tui
       # Practice's "switch" goal. See Tutorial.bare_char.
       bare = Tutorial.bare_char(ev)
 
-      # Digit jump (real app: 1-9 from anywhere).
+      # Digit jump (real app: 1-9 from anywhere). A digit past the mock's last chip is
+      # SWALLOWED rather than passed on: on the real bar those slots exist, so the one thing
+      # it must not do is fall through to another binding and teach that `7` means something
+      # else. It lands on the BAR, as the app's does (a "select" gesture there too):
+      # ↓ is what goes in.
       if (ch = bare) && ch >= '1' && ch <= '9'
-        idx = ch.ord - '1'.ord
-        if idx < TABS.size
+        if idx = digit_tab(ch)
           @p_tab = idx
+          @p_sub = 0
+          @p_level = :menu
           mark_switch
         end
+        return
+      end
+      # `0` is the app's Go to tab… picker, which the mock has no tabs beyond these for. Say
+      # so, rather than let a key the lesson names do nothing at all (#1382).
+      if bare == '0'
+        nudge("#{reach("nav.goto")} opens Go to tab… in gori — this mock has only these")
         return
       end
 
@@ -483,10 +856,25 @@ module Gori::Tui
         @p_space = true if practice
         return
       end
-
-      if @p_level == :menu
-        practice_menu_key(ev)
+      # The bare family key opens its card from a pane, as in the app (#1295). Practice only:
+      # Navigate is about moving, and a card popping up there would be a lesson out of turn.
+      if practice && @p_level == :body && send_open_key?(ev)
+        open_send_card
+        @p_space = true
         return
+      end
+
+      # `i` is INS only in an editor; anywhere else in the app it is Global "hold all
+      # traffic". The mock has no intercept to turn on, so it says what the press would have
+      # done instead of doing nothing (#1380).
+      if edit_enter_key?(ev) && !(@p_level == :body && @p_pane == 1)
+        nudge("#{reach("intercept.toggle")} here = intercept on (holds traffic) · ⇥ to REQUEST first")
+        return
+      end
+
+      case @p_level
+      when :menu  then return practice_menu_key(ev)
+      when :strip then return strip_key(ev)
       end
 
       # --- body --------------------------------------------------------------
@@ -512,17 +900,13 @@ module Gori::Tui
         @p_flow = {@p_flow + 1, FLOW_ROWS.size - 1}.min if @p_pane == 0
         return
       end
-      # ↑ / k: REQUEST always returns to the tab bar. FLOWS moves the list first,
-      # and at the top row also returns to tabs (same focus-ring as real History).
+      # ↑ / k: REQUEST always climbs out. FLOWS moves the list first, and at the top row also
+      # climbs out (same focus-ring as real History).
       if key.up? || bare == 'k'
-        if @p_pane == 1
-          focus_tabs
-        elsif @p_pane == 0
-          if @p_flow > 0
-            @p_flow -= 1
-          else
-            focus_tabs
-          end
+        if @p_pane == 1 || @p_flow == 0
+          step_out
+        else
+          @p_flow -= 1
         end
         return
       end
@@ -536,10 +920,28 @@ module Gori::Tui
       end
     end
 
-    private def focus_tabs : Nil
-      @p_level = :menu
-      @p_up = true
-      mark_nav_tried
+    # One level up, as ↑ and esc climb in the app: body → the tab's strip (when it has one) →
+    # the tab bar. Reaching the bar from below is the Navigate lesson's last move.
+    private def step_out : Nil
+      if @p_level == :body && Tutorial.strip_labels(@p_tab)
+        @p_level = :strip
+      else
+        @p_level = :menu
+        @p_up = true
+        mark_nav_tried
+      end
+    end
+
+    # …and one level down: a tab with a strip stops on it first (Runner#enter_content).
+    private def step_in : Nil
+      if @p_level == :menu && Tutorial.strip_labels(@p_tab)
+        @p_level = :strip
+      else
+        @p_level = :body
+        @p_pane = 0
+        @p_enter = true
+        mark_nav_tried
+      end
     end
 
     private def practice_menu_key(ev : Termisu::Event::Key) : Nil
@@ -550,64 +952,113 @@ module Gori::Tui
       elsif key.right? || bare == 'l'
         switch_tab(1)
       elsif key.down? || key.enter? || bare == 'j'
-        @p_level = :body
-        @p_pane = 0
-        @p_enter = true
-        mark_nav_tried
+        step_in
+      end
+    end
+
+    # The strip owns ←/→ (its chips) and ↓/↑ (in and out), as Runner#handle_subtabs_key does.
+    private def strip_key(ev : Termisu::Event::Key) : Nil
+      key = ev.key
+      bare = Tutorial.bare_char(ev)
+      n = Tutorial.strip_labels(@p_tab).try(&.size) || 1
+      if key.left? || bare == 'h'
+        @p_sub = {@p_sub - 1, 0}.max
+      elsif key.right? || bare == 'l'
+        @p_sub = {@p_sub + 1, n - 1}.min
+      elsif key.down? || key.enter? || bare == 'j'
+        step_in
+      elsif key.up? || bare == 'k'
+        step_out
       end
     end
 
     private def switch_tab(delta : Int32) : Nil
       @p_tab = (@p_tab + delta) % TABS.size
+      @p_sub = 0
       mark_switch
     end
 
     private def mark_switch : Nil
       @p_switch = true
       mark_nav_tried
-      # Switching tabs while in the body keeps body focus (real app); stay put.
     end
 
-    # The two lesson try-it flags that more than one lesson can reach, gated to the lessons
-    # they belong to.
-    #
-    # @tried_nav is the Navigate lesson's ✓ (and Miss Ring's :nav line, "that's it — tab bar
-    # up top, body below"); @tried_edit is the Edit lesson's. Both were set unconditionally
-    # from shared code every lesson runs through — mark_switch, focus_tabs,
-    # handle_shell_click, handle_live_shell_key's INS branch — so a click on the EDIT
-    # lesson's REQUEST pane ticked NAVIGATE's try-it and had Miss Ring congratulate a move
-    # about tab bars on the lesson about typing, and entering INS during the Navigate lesson
-    # pre-✓'d Edit before the user reached it. Practice re-teaches both moves, so it counts
-    # for either; every other lesson counts for neither.
+    # The Navigate lesson's ✓ (and Miss Ring's :nav line): all three moves its try line asks
+    # for — switch a tab, reach the body, climb back to the bar — not the first of them
+    # (#1382). Gated to the lesson: the shared shell code that sets the three flags runs on
+    # Practice too, which keeps its own goals, and an Edit-lesson click is not a nav move.
     private def mark_nav_tried : Nil
-      @tried_nav = true if @step.navigate? || @step.practice?
+      @tried_nav = true if @step.navigate? && @p_switch && @p_enter && @p_up
     end
 
+    # The Edit lesson's ✓: the whole of "press i, type a username, esc back to READ" — leaving
+    # INS having typed something (#1382). Entering INS alone used to pass it.
     private def mark_edit_tried : Nil
-      @tried_edit = true if @step.edit? || @step.practice?
+      @tried_edit = true if (@step.edit? || @step.practice?) && !@edit_typed.empty?
     end
 
     # The three doors into the mock's INS mode — the Edit lesson's `i`/↵, the shared shell's
-    # `i`/↵ on the REQUEST pane, and a click on the Edit lesson's pane — spelled the same
-    # three lines each. One home, so they cannot disagree about the try-it flag the way they
-    # already did about the field.
+    # `i`/↵ on the REQUEST pane, and a click on the Edit lesson's NOR/INS chip — spelled the
+    # same three lines each. One home, so they cannot disagree about the field.
     private def enter_insert : Nil
       @edit_insert = true
       @edit_typed = ""
+    end
+
+    # …and one home for the way out, which `esc` and the chip take.
+    private def exit_insert : Nil
+      @edit_insert = false
       mark_edit_tried
+    end
+
+    # Show `msg` in the footer's hint row for ~3s (the loop polls at 50ms).
+    private def nudge(msg : String) : Nil
+      @nudge = msg
+      @nudge_until = @tick + 60
+    end
+
+    private def live_nudge : String?
+      (n = @nudge) && @tick < @nudge_until ? n : nil
+    end
+
+    private def reach(id : String) : String
+      Tutorial.reach(@registry, id)
+    end
+
+    # Whether `ev` is `id`'s effective chord — bare letters only, which is all the traffic
+    # lessons bind (c, i, f, d) — so a rebind moves the mock's key with the app's.
+    private def verb_key?(ev : Termisu::Event::Key, id : String) : Bool
+      return false unless ch = Tutorial.bare_char(ev)
+      return false unless chord = Hotkeys.binding_for(@registry, id)
+      !chord.ctrl && !chord.alt && !chord.shift && chord.key == ch.to_s
+    end
+
+    # The mock REQUEST card's NOR/INS chip, inverted at `render_request_pane`'s own three
+    # numbers — and behind its own `w < 8 || h < 3` bail — so the live cells are exactly the
+    # painted ones, and a card too small to draw a badge cannot answer for one.
+    private def edit_badge_hit?(mx : Int32, my : Int32) : Bool
+      r = @request_rect
+      return false if r.w < 8 || r.h < 3
+      Frame.mode_badge_hit(mx, my, r.y, r.right - 1, r.x + 10, @edit_insert)
+    end
+
+    # The chip is a TOGGLE, the way every real editor's is (`NotesController#handle_click`
+    # and its four siblings), rather than a one-way door into INS.
+    private def toggle_edit_insert : Nil
+      @edit_insert ? exit_insert : enter_insert
     end
 
     private def handle_edit_key(ev : Termisu::Event::Key) : Nil
       key = ev.key
       if key.escape?
-        @edit_insert = false
-        mark_edit_tried
+        exit_insert
         return
       end
+      # ↵ does NOT leave INS: in the real editor it types a newline, and a user who learned
+      # "↵ → READ" here broke their first request line (#1380). The mock body is one line, so
+      # it says so instead of inserting one.
       if key.enter?
-        # ↵ leaves INS (like leaving insert in many editors); Next advances the tour.
-        @edit_insert = false
-        mark_edit_tried
+        nudge("↵ types a newline in a real editor — esc leaves INS")
         return
       end
       if key.backspace?
@@ -616,7 +1067,6 @@ module Gori::Tui
       end
       if (ch = Tutorial.typed_char(ev)) && @edit_typed.size < 16
         @edit_typed += ch
-        mark_edit_tried
       end
     end
 
@@ -626,8 +1076,9 @@ module Gori::Tui
         @running = false
         return
       end
+      # esc steps back ONE level, as in the app: out of the second card to the menu, then shut.
       if key.escape?
-        close_overlay
+        @overlay == :space && @space_level == 2 ? space_back : close_overlay
         return
       end
       if key.enter?
@@ -664,31 +1115,43 @@ module Gori::Tui
         end
       when :space
         # Mnemonic FIRST, then the j/k fallback — the helix-leader order
-        # Runner#handle_space_menu_key spells out. No SPACE_ROWS key is j or k today, so
-        # this changes nothing now and cannot go wrong the day one is.
+        # Runner#handle_space_menu_key spells out. No menu row is lettered h/j/k/l
+        # (`Family::NAV_LETTERS`, checked at boot), so the fallback can never shadow a row.
+        rows = space_level_rows
         bare = Tutorial.bare_char(ev)
-        if bare && SPACE_ROWS.any? { |(k, _)| k == bare }
-          close_overlay # mnemonic runs the row
+        if bare && (row = rows.find { |r| r.key == bare })
+          run_space_row(row)
+        elsif key.backspace? && @space_level == 2
+          space_back # the app's other way back a level
         elsif key.up? || bare == 'k'
-          @space_sel = (@space_sel - 1) % SPACE_ROWS.size
+          @space_sel = Tutorial.wrap_sel(@space_sel, -1, rows.size)
         elsif key.down? || bare == 'j'
-          @space_sel = (@space_sel + 1) % SPACE_ROWS.size
+          @space_sel = Tutorial.wrap_sel(@space_sel, +1, rows.size)
         end
       end
     end
 
-    private def filtered_palette : Array({String, String, Int32?})
-      q = @pal_query.downcase
-      return PALETTE_ROWS if q.empty?
-      PALETTE_ROWS.select { |(_, label, _)| label.downcase.includes?(q) }
+    private def filtered_palette : Array(PalRow)
+      Tutorial.palette_matches(@pal_query, @pal_tab_rows)
     end
 
     private def run_overlay_selection : Nil
+      if @overlay == :space
+        if row = space_level_rows[@space_sel]?
+          run_space_row(row)
+        else
+          close_overlay
+        end
+        return
+      end
       if @overlay == :palette
         rows = filtered_palette
         if row = rows[@pal_sel]?
+          # The palette lesson's ✓ is its whole try line — a search that turned up this tab's
+          # own actions, then ↵ — not the first character typed (#1382).
+          @tried_palette = true if @step.palette? && rows.any?(&.this_tab)
           # Mirror a couple of real "Go to …" actions so the palette feels alive.
-          if tab = row[2]
+          if tab = row.tab
             @p_tab = tab
             mark_switch
           end
@@ -697,15 +1160,43 @@ module Gori::Tui
       close_overlay
     end
 
+    # The rows of the card on screen: the menu, or the second card its family row opened.
+    private def space_level_rows : Array(MenuRow)
+      @space_level == 2 ? @send_rows : @space_rows
+    end
+
+    # A row that opens a card opens it; any other row "runs", which in a mock means the menu
+    # closes, as the real one does after running a row.
+    private def run_space_row(row : MenuRow) : Nil
+      if row.opens
+        open_send_card
+      else
+        @tried_space = true if @step.space_menu?
+        close_overlay
+      end
+    end
+
     private def practice_done? : Bool
       @p_switch && @p_enter && @p_up && @p_palette && @p_space && @p_edit
     end
 
+    # Practice's goals and every lesson's live mock start from the same clean slate; the two
+    # differ only in where the mock stands.
     private def reset_practice : Nil
-      @p_level = :menu
+      reset_mock
       @p_tab = 0
+    end
+
+    private def reset_lesson_try : Nil
+      reset_mock
+      @p_tab = @step.space_menu? || @step.palette? ? HISTORY_TAB : 0
+    end
+
+    private def reset_mock : Nil
+      @p_level = :menu
       @p_pane = 0
       @p_flow = 0
+      @p_sub = 0
       @p_switch = false
       @p_enter = false
       @p_up = false
@@ -716,23 +1207,17 @@ module Gori::Tui
       @pal_sel = 0
       @pal_query = ""
       @space_sel = 0
+      @space_level = 1
       @edit_insert = false
       @edit_typed = ""
       @nav_live = false
-    end
-
-    private def reset_lesson_try : Nil
-      @overlay = :none
-      @pal_sel = 0
-      @pal_query = ""
-      @space_sel = 0
-      @edit_insert = false
-      @edit_typed = ""
-      @nav_live = false
-      @p_level = :menu
-      @p_tab = 0
-      @p_pane = 0
-      @p_flow = 0
+      @nudge = nil
+      @m_capture = true
+      @m_cap_off = false
+      @m_intercept = false
+      @m_held = 0
+      @m_held_on = false
+      @m_released = false
     end
 
     private def start_nav_live : Nil
@@ -742,6 +1227,56 @@ module Gori::Tui
       @p_tab = 0
       @p_pane = 0
       @p_flow = 0
+      @p_sub = 0
+    end
+
+    # --- traffic lessons -------------------------------------------------------
+
+    # The Capture lesson's switch. Its ✓ is the try line's whole ask: off, then back on — a
+    # user who leaves the lesson with capture off has learned the wrong half.
+    private def toggle_mock_capture : Nil
+      @m_capture = !@m_capture
+      if !@m_capture
+        @m_cap_off = true
+      elsif @m_cap_off
+        @tried_capture = true
+      end
+    end
+
+    # The Intercept lesson's keys: its mock stands on the Intercept tab, where the app answers
+    # `i` with Global intercept, `f`/`d` with the queue, and `c` with Catch direction — NOT
+    # capture, which is the one surprise on that tab worth saying out loud. True when the key
+    # was the lesson's.
+    private def handle_intercept_key(ev : Termisu::Event::Key) : Bool
+      if verb_key?(ev, "intercept.toggle")
+        toggle_mock_intercept
+      elsif verb_key?(ev, "intercept.forward") || verb_key?(ev, "intercept.drop")
+        if @m_held > 0
+          @m_held -= 1
+          @m_released = true
+        else
+          nudge("nothing is held — #{reach("intercept.toggle")} starts holding")
+        end
+      elsif verb_key?(ev, "intercept.direction")
+        nudge("on Intercept, #{reach("intercept.direction")} picks what to hold — not capture")
+      else
+        return false
+      end
+      @tried_intercept = true if @m_held_on && @m_released && !@m_intercept
+      true
+    end
+
+    # Turning intercept on queues the mock browser's next requests; turning it off sends every
+    # one still held, as the app does (Interceptor#toggle), and says so.
+    private def toggle_mock_intercept : Nil
+      @m_intercept = !@m_intercept
+      if @m_intercept
+        @m_held_on = true
+        @m_held = MOCK_HELD
+      elsif @m_held > 0
+        nudge("intercept off — the #{@m_held} still held went out unedited")
+        @m_held = 0
+      end
     end
 
     private def open_palette : Nil
@@ -753,12 +1288,31 @@ module Gori::Tui
 
     private def open_space : Nil
       @overlay = :space
+      @space_level = 1
       @space_sel = 0
       @edit_insert = false
     end
 
+    # The Send flow to… card — from its menu row, or straight from the pane on the bare family
+    # key. Reaching it is the space lesson's try-it: a second level is the one thing about the
+    # menu a user cannot guess from the first.
+    private def open_send_card : Nil
+      @overlay = :space
+      @space_level = 2
+      @space_sel = 0
+      @edit_insert = false
+      @tried_space = true if @step.space_menu?
+    end
+
+    # Back from the card to the menu, on the row that opened it.
+    private def space_back : Nil
+      @space_level = 1
+      @space_sel = @space_rows.index(&.opens) || 0
+    end
+
     private def close_overlay : Nil
       @overlay = :none
+      @space_level = 1
       @pal_query = ""
     end
 
@@ -771,12 +1325,38 @@ module Gori::Tui
       ch == 'h' || ch == 'l'
     end
 
+    # The tab a digit reaches, or nil — both for a bare `Char` and for a whole event, since
+    # the Navigate lesson has to recognise one BEFORE it hands the shell its first key (a
+    # digit is how the lesson now asks the user to move, so it has to be one of the presses
+    # that takes the demo live — see `handle_key`).
+    private def digit_tab(ch : Char) : Int32?
+      return nil unless '1' <= ch <= '9'
+      idx = ch.ord - '1'.ord
+      # The chips the strip actually PAINTED this frame, not TABS.size: a narrow card — Miss
+      # Ring's band at 80 columns, or a small terminal — packs fewer chips than the mock has,
+      # and a digit past the last one would move a highlight nobody can see while ticking the
+      # lesson's try-it on the way past. @tab_hits is rebuilt every frame by `render_tab_bar`,
+      # and empty on the lessons that draw no bar at all.
+      @tab_hits.any? { |(_, i)| i == idx } ? idx : nil
+    end
+
+    private def digit_tab_key?(ev : Termisu::Event::Key) : Bool
+      return false unless ch = Tutorial.bare_char(ev)
+      !digit_tab(ch).nil?
+    end
+
     private def palette_open_key?(ev : Termisu::Event::Key) : Bool
       ev.ctrl? && ev.key.lower_p?
     end
 
     private def space_open_key?(ev : Termisu::Event::Key) : Bool
       Tutorial.bare_char(ev) == ' '
+    end
+
+    # The Send flow to… family's own key (`Family#key`, the same as its chord), read from the
+    # family rather than spelled here.
+    private def send_open_key?(ev : Termisu::Event::Key) : Bool
+      Tutorial.bare_char(ev) == Verbs::SEND_FLOW.key
     end
 
     private def edit_enter_key?(ev : Termisu::Event::Key) : Bool
@@ -834,19 +1414,21 @@ module Gori::Tui
         # offset by the same scroll window `render_fake_palette` used, not by `rows.size`:
         # the two disagreed, so a click on the overlay's bottom border ran a command the user
         # could not see.
-        rows = filtered_palette
-        vis = Tutorial.palette_rows_visible(@palette_rect)
-        top = Tutorial.palette_scroll(@pal_sel.clamp(0, {rows.size - 1, 0}.max), rows.size, vis)
+        # A group header is not a command: a click on one does nothing.
+        display, top, vis = palette_window(@palette_rect, filtered_palette, @pal_sel)
         row = my - (@palette_rect.y + 3)
-        if row >= 0 && row < {vis, rows.size - top}.min
-          @pal_sel = top + row
+        if row >= 0 && row < {vis, display.size - top}.min && (idx = display[top + row][1])
+          @pal_sel = idx
           run_overlay_selection
         end
       when :space
+        rows = space_level_rows
+        vis = {@space_rect.h - 2, 0}.max
+        top = Tutorial.palette_scroll(@space_sel, rows.size, vis)
         row = my - (@space_rect.y + 1)
-        if row >= 0 && row < SPACE_ROWS.size
-          @space_sel = row
-          close_overlay
+        if row >= 0 && row < {vis, rows.size - top}.min
+          @space_sel = top + row
+          run_space_row(rows[@space_sel])
         end
       end
     end
@@ -859,18 +1441,24 @@ module Gori::Tui
       # on it used to fall through to the body-focus branch below — which `render_edit`
       # ignores entirely, since it always draws that pane focused and reads @edit_insert for
       # the mode — so the pointer did nothing at all, while still ticking the NAVIGATE
-      # lesson's try-it on the way past. Clicking into a field to type in it is what the
-      # pointer means here.
+      # lesson's try-it on the way past.
+      #
+      # What the pointer means here is what it means in the app it is teaching (#1124): a
+      # press on the card's NOR/INS chip toggles the mode, and a press anywhere else places a
+      # caret and changes no mode. This card has no caret to place, so the body is inert —
+      # which is the honest mock of "a click does not open the editor". The chip that used to
+      # be painted and dead is the live cell instead, and the lesson's ask is still `i`.
       if @step.edit?
-        enter_insert if @request_rect.contains?(mx, my) && !@edit_insert
+        toggle_edit_insert if edit_badge_hit?(mx, my)
         return
       end
 
       @tab_hits.each do |(rect, idx)|
         if rect.contains?(mx, my)
           @p_tab = idx
-          mark_switch
+          @p_sub = 0
           @p_level = :menu # clicking a tab focuses the bar (real app)
+          mark_switch
           return
         end
       end
@@ -881,6 +1469,11 @@ module Gori::Tui
       # screen, and the @p_flow it also moved left the REQUEST pane showing a flow the FLOWS
       # pane was not marking as selected.
       return unless live_shell?
+
+      if @strip_rect.contains?(mx, my)
+        @p_level = :strip
+        return
+      end
 
       if @flows_rect.contains?(mx, my)
         @p_level = :body
@@ -908,6 +1501,7 @@ module Gori::Tui
 
     private def advance : Nil
       if @step.done?
+        @finished = true
         @running = false
       else
         jump_to(Step.new(@step.value + 1))
@@ -922,7 +1516,9 @@ module Gori::Tui
     # Jump to an arbitrary lesson (progress-rail click or sequential next/prev).
     private def jump_to(step : Step) : Nil
       return if step == @step
+      @practice_completed ||= @step.practice? && practice_done?
       @step = step
+      @visited << step
       @tick = 0
       if @step.practice?
         reset_practice
@@ -946,6 +1542,7 @@ module Gori::Tui
       @rail_hits = [] of {Rect, Int32}
       @flows_rect = Rect.new(0, 0, 0, 0)
       @request_rect = Rect.new(0, 0, 0, 0)
+      @strip_rect = Rect.new(0, 0, 0, 0)
       @palette_rect = Rect.new(0, 0, 0, 0)
       @space_rect = Rect.new(0, 0, 0, 0)
 
@@ -955,7 +1552,7 @@ module Gori::Tui
       # work ~20x/second to answer a question whose inputs had not changed.
       box = step_card(w, h)
       if too_small?(w, h)
-        screen.text(0, 0, "terminal too small for tutorial — min 40x16, resize & retry (esc to leave)", Theme.red)
+        screen.text(0, 0, Tutorial.too_small_message(w), Theme.red, width: w)
         @term.hide_cursor
         flush
         return
@@ -967,10 +1564,13 @@ module Gori::Tui
       case @step
       when Step::Welcome   then render_welcome(screen, box)
       when Step::Navigate  then render_navigate(screen, box)
-      when Step::Palette   then render_palette(screen, box)
       when Step::SpaceMenu then render_spacemenu(screen, box)
+      when Step::Palette   then render_palette(screen, box)
       when Step::Edit      then render_edit(screen, box)
+      when Step::Capture   then render_capture(screen, box)
+      when Step::Intercept then render_intercept(screen, box)
       when Step::Practice  then render_practice(screen, box)
+      when Step::Leave     then render_leave(screen, box)
       when Step::Done      then render_done(screen, box)
       end
       render_footer(screen, w, h)
@@ -980,19 +1580,19 @@ module Gori::Tui
       flush
     end
 
-    # She paints LAST, over the card — anything she is allowed to occupy she occupies
-    # opaquely, so drawing her earlier would let a mock's pane border cut through her.
-    # step_card has already held her band back, so the sprite lands on bare background;
-    # only the BUBBLE floats over the card, for the few seconds she is talking, exactly as
-    # it does over the picker's card and a tab body in the session.
+    # She paints LAST — anything she is allowed to occupy she occupies opaquely, so drawing
+    # her earlier would let a mock's pane border cut through her. step_card has already held
+    # her band back, so the sprite lands on bare background, and her bubble never reaches the
+    # card (#companion_draw_stage): it used to float over it, and covered the palette lesson's
+    # `␣ > c` hint — the point of that lesson — and the Welcome card's tour-nav line (#1381).
     private def render_companion(screen : Screen, w : Int32, h : Int32) : Nil
       return unless Settings.companion?
-      # companion_draw_stage, NOT companion_stage: the bare stage seats her at every size Companion.place
-      # accepts, which includes the 40..51-column band companion_place stands her down in. That
-      # bug painted her over the mock tab bar at exactly those sizes.
-      return unless stage = Tutorial.companion_draw_stage(w, h)
+      # companion_draw_stage, NOT companion_stage: the bare stage seats her at every size
+      # Companion.place accepts, including the ones companion_place stands her down at.
+      return unless seat = Tutorial.companion_draw_stage(w, h)
       return unless frame = @companion.frame
-      Companion.draw(screen, stage, frame)
+      stage, speaks = seat
+      Companion.draw(screen, stage, speaks ? frame : frame.copy_with(bubble: nil))
     end
 
     private def flush : Nil
@@ -1043,14 +1643,6 @@ module Gori::Tui
       Rect.new(0, 0, w, h - FOOTER_ROWS)
     end
 
-    # Her stand, or nil when the terminal cannot seat her CLEAR OF THE CARD.
-    #
-    # Reserving her band is not enough on its own: step_card floors the card at 40 columns
-    # (a narrower one can't hold a legible mock), so below ~52 columns the floor wins and
-    # the card grows back over her stand. Layout.usable? admits terminals from 40 columns,
-    # so that range is reachable — and the failure would be a mascot painted on top of the
-    # tab-bar mock, not a missing one. She stands down instead, and #companion_band then returns
-    # 0 so the card takes the full width it would have had if she were off.
     # Move a wrapping selection by `delta` over `n` rows, and 0 when there are none.
     #
     # A class method rather than two inline expressions because the two arrows had already
@@ -1094,12 +1686,18 @@ module Gori::Tui
       { {sel - visible + 1, 0}.max, n - visible }.min
     end
 
+    # Her stand, or nil when the terminal cannot seat her BESIDE A FULL-WIDTH CARD: she stands
+    # down wherever her band would narrow it below CARD_W (~94 columns), and #companion_band
+    # then returns 0 so the card takes the full width it would have had if she were off.
     def self.companion_place(w : Int32, h : Int32) : Rect?
       return nil unless rect = Companion.place(companion_stage(w, h))
+      # COMPANION_BAND, not #companion_band: the card measured here is the one she would get if
+      # she stands, which is exactly what this decides. She never costs it its width (#1381).
+      card = step_card(w, h, COMPANION_BAND)
+      return nil if card.w < CARD_W
       # Her plate claims a column left of the sprite (Companion.draw), so that — not rect.x — is
-      # the edge the card has to clear. COMPANION_BAND, not #companion_band: the card measured here is
-      # the one she would get if she stands, which is exactly what this decides.
-      return nil if rect.x - 1 < step_card(w, h, COMPANION_BAND).right
+      # the edge the card has to clear.
+      return nil if rect.x - 1 < card.right
       rect
     end
 
@@ -1109,20 +1707,30 @@ module Gori::Tui
       companion_place(w, h) ? COMPANION_BAND : 0
     end
 
-    # The stage to hand Companion.draw, or nil when she must not be drawn at all.
+    # The stage to hand Companion.draw and whether she may speak on it, or nil when she must
+    # not be drawn at all.
     #
     # ONE function, so the render path cannot drift from the placement rule. Companion.draw
     # re-derives Companion.place from whatever rect it is handed and knows nothing about the
     # card, so handing it the bare stage seats her at every size Companion.place accepts —
-    # including the 40..51-column band companion_place deliberately rejects. Routing the render
-    # through this makes "may she be drawn" and "where does she stand" the same answer,
-    # and gives the spec something it can assert without a Screen.
-    def self.companion_draw_stage(w : Int32, h : Int32) : Rect?
+    # including the ones companion_place deliberately rejects. Routing the render through
+    # this makes "may she be drawn" and "where does she stand" the same answer, and gives the
+    # spec something it can assert without a Screen.
+    #
+    # Her BUBBLE may not reach the card either (#1381). Companion.bubble_box keeps it inside
+    # the stage, so when the columns right of the card can hold a stage (Companion::MIN_W) she
+    # gets exactly those, and speaks there; the sprite's seat is the same, since
+    # Companion.place measures from the stage's right and bottom edges. Narrower than that she
+    # stands silent — a reaction is encouragement, never the lesson.
+    def self.companion_draw_stage(w : Int32, h : Int32) : {Rect, Bool}?
       return nil unless companion_place(w, h)
-      companion_stage(w, h)
+      full = companion_stage(w, h)
+      right = step_card(w, h, COMPANION_BAND).right
+      return {full, false} if w - right < Companion::MIN_W
+      {Rect.new(right, full.y, w - right, full.h), true}
     end
 
-    # …and the live gate. Off by default, so a default install gets the full-width card.
+    # …and the live gate. While she is off, or stands down, the card takes the full width.
     private def companion_band(w : Int32, h : Int32) : Int32
       Settings.companion? ? Tutorial.companion_band(w, h) : 0
     end
@@ -1134,60 +1742,91 @@ module Gori::Tui
       screen.text({w - prog.size - 2, 0}.max, 0, prog, Theme.muted, Theme.bg)
     end
 
-    # Visual "where am I" rail under the brand line. Each chip is clickable
-    # (jump_to) so the tour itself can be browsed without finishing every try-it.
+    # Cells the labelled rail takes: each chip is ` ● label`, with one trailing cell so the
+    # current chip's highlight can close on a space. No connectors between chips — ten of
+    # them fit at 80 columns this way, and the connectors were what did not.
+    def self.rail_width : Int32
+      STEP_RAIL.sum { |(lab, _)| lab.size + 3 } + 1
+    end
+
+    # Visual "where am I" rail under the brand line. Each chip is clickable (jump_to) so the
+    # tour itself can be browsed without finishing every try-it. ✓ means COMPLETED, not
+    # passed: a lesson whose try-it was skipped reads ◐ (visited), so pressing n ten times no
+    # longer paints a rail of ticks (#1382).
     private def render_progress_rail(screen : Screen, w : Int32) : Nil
       y = 1
-      cur = @step.value
       @rail_hits = [] of {Rect, Int32}
-      # Prefer labelled chips when the terminal is wide enough; else plain dots.
-      labels = STEP_RAIL.map { |(lab, _)| lab }
-      labelled_w = labels.sum { |l| l.size + 4 } + (labels.size - 1) * 1
+      labelled_w = Tutorial.rail_width
       if labelled_w + 4 <= w
         cx = {(w - labelled_w) // 2, 2}.max
-        STEP_RAIL.each_with_index do |(lab, st), i|
-          done = i < cur
-          here = i == cur
-          mark = here ? "●" : (done ? "✓" : "○")
-          col = here ? Theme.accent : (done ? Theme.green : Theme.muted)
-          bg = here ? Theme.accent_bg : Theme.bg
-          chip = " #{mark} #{lab} "
-          hit = Rect.new(cx, y, chip.size, 1)
-          @rail_hits << {hit, st.value}
-          screen.fill(hit, bg) if here
-          screen.text(cx, y, chip, here ? Theme.text_bright : col, bg,
-            attr: here ? Attribute::Bold : Attribute::None)
-          cx += chip.size
-          if i < STEP_RAIL.size - 1
-            screen.text(cx, y, "─", Theme.muted, Theme.bg)
-            cx += 1
+        here_at = nil
+        STEP_RAIL.each do |(lab, st)|
+          chip = " #{rail_mark(st)} #{lab}"
+          @rail_hits << {Rect.new(cx, y, chip.size, 1), st.value}
+          if st == @step
+            here_at = {cx, "#{chip} "}
+          else
+            screen.text(cx, y, chip, rail_color(st), Theme.bg)
           end
+          cx += chip.size
+        end
+        # The current chip last, one cell wider, so its highlight is not cut by its neighbour.
+        if at = here_at
+          hx, chip = at
+          screen.fill(Rect.new(hx, y, chip.size, 1), Theme.accent_bg)
+          screen.text(hx, y, chip, Theme.text_bright, Theme.accent_bg, attr: Attribute::Bold)
         end
       else
-        # Compact dots: ● ● ● ○ ○ ○ ○ — each cell is still a jump target.
+        # Compact dots, each cell still a jump target: ● here, green ● completed, ◐ visited.
         unit = 2
         total_w = Step.values.size * unit - 1
         cx = {(w - total_w) // 2, 2}.max
-        Step.values.size.times do |i|
-          done = i < cur
-          here = i == cur
-          ch = here ? '●' : (done ? '●' : '○')
-          col = here ? Theme.accent : (done ? Theme.green : Theme.muted)
-          @rail_hits << {Rect.new(cx, y, unit, 1), i}
-          screen.cell(cx, y, ch, col, Theme.bg)
+        Step.values.each do |st|
+          ch = st == @step || step_completed?(st) ? '●' : rail_mark(st)[0]
+          @rail_hits << {Rect.new(cx, y, unit, 1), st.value}
+          screen.cell(cx, y, ch, rail_color(st), Theme.bg)
           cx += unit
         end
+      end
+    end
+
+    private def rail_mark(st : Step) : String
+      return "●" if st == @step
+      return "✓" if step_completed?(st)
+      @visited.includes?(st) ? "◐" : "○"
+    end
+
+    private def rail_color(st : Step) : Color
+      return Theme.accent if st == @step
+      step_completed?(st) ? Theme.green : Theme.muted
+    end
+
+    # A lesson is completed by its try-it, not by being passed. The prose steps (Welcome,
+    # Leave, Done) have none, so reading them is the step.
+    private def step_completed?(st : Step) : Bool
+      case st
+      when Step::Navigate  then @tried_nav
+      when Step::SpaceMenu then @tried_space
+      when Step::Palette   then @tried_palette
+      when Step::Edit      then @tried_edit
+      when Step::Capture   then @tried_capture
+      when Step::Intercept then @tried_intercept
+      when Step::Practice  then @practice_completed || (@step.practice? && practice_done?)
+      else                      @visited.includes?(st)
       end
     end
 
     private def card_title : String
       case @step
       when Step::Welcome   then "WELCOME"
-      when Step::Navigate  then "MOVE AROUND · tabs & panes"
+      when Step::Navigate  then "MOVE AROUND · 1-9, tabs & panes"
       when Step::Palette   then "COMMAND PALETTE · ^P"
       when Step::SpaceMenu then "ACTION MENU · space"
       when Step::Edit      then "EDIT MODE · READ / INS"
-      when Step::Practice  then "TRY IT · all four moves"
+      when Step::Capture   then "CONNECT & CAPTURE · proxy, CA, #{reach("capture.toggle")}"
+      when Step::Intercept then "INTERCEPT · #{reach("intercept.toggle")} hold, #{reach("intercept.forward")} forward"
+      when Step::Practice  then "TRY IT · four moves, six checks"
+      when Step::Leave     then "HELP & LEAVING · #{reach("tab.help")} · ^D"
       else                      "YOU'RE READY"
       end
     end
@@ -1208,6 +1847,7 @@ module Gori::Tui
 
     private def render_footer(screen : Screen, w : Int32, h : Int32) : Nil
       hint = footer_hint
+      hint = Tutorial.compact_footer_hint(@step, @overlay, @edit_insert, @esc_armed, @registry) if Screen.draw_width(hint) > w
       hy = h - 2
       screen.text({(w - Screen.draw_width(hint)) // 2, 0}.max, hy, hint, Theme.muted, Theme.bg)
 
@@ -1248,6 +1888,9 @@ module Gori::Tui
       # promising what one press does when it takes two is the defect this whole change is
       # about, just pointed the other way.
       return "esc again to leave the tour · any other key stays" if @esc_armed
+      if n = live_nudge
+        return n
+      end
       case @step
       when Step::Welcome
         "↵/n start · click Start · esc esc leave"
@@ -1272,36 +1915,66 @@ module Gori::Tui
         if @edit_insert
           # Reachable here, not just on Edit/Practice — see the note in `render_navigate`.
           "type · esc → READ · then n/Next"
-        elsif @nav_live
-          "←/→ tabs · ↓ body · ↑ tabs · ⇥ panes · #{tour}"
         elsif @tried_nav
           "✓ #{tour} · or keep exploring"
+        elsif @nav_live
+          # The try line's next move, one at a time, so the ✓ that waits for all three is
+          # never a mystery (#1382).
+          next_move = if !@p_switch
+                        "press 2"
+                      elsif !@p_enter
+                        "↓ until BODY"
+                      else
+                        "↑ or esc until TABS"
+                      end
+          "next: #{next_move} · #{tab_span} / ←→ tabs · ⇥ panes · #{tour}"
         else
-          "try ←/→ then ↓ · #{tour} to skip"
-        end
-      when Step::Palette
-        if @overlay == :palette
-          "type · ↑/↓ · ↵ run · esc close"
-        elsif @tried_palette
-          "✓ #{tour}"
-        else
-          Hotkeys.retag("try ^P · #{tour} to skip")
+          Tutorial.navigation_try_hint
         end
       when Step::SpaceMenu
         if @overlay == :space
-          "↑/↓ · letter · ↵ · esc close · then n/Next" # n/b belong to the menu here — see Practice
+          # n/b belong to the menu here — see Practice.
+          @space_level == 2 ? "letter runs · esc back a level · then n/Next" : "letter runs · › opens a card · esc close · then n/Next"
         elsif @tried_space
           "✓ #{tour}"
         else
-          "try space · #{tour} to skip"
+          "try space, then #{Verbs::SEND_FLOW.key} · #{tour} to skip"
+        end
+      when Step::Palette
+        if @overlay == :palette
+          "type a name · ↑/↓ · ↵ run · esc close"
+        elsif @tried_palette
+          "✓ #{tour}"
+        else
+          Hotkeys.retag("try ^P, then type #{PALETTE_DEMO_QUERY} · #{tour} to skip")
         end
       when Step::Edit
         if @edit_insert
-          "type · esc/↵ → READ · then n/Next"
+          "type · esc → READ · then n/Next"
         elsif @tried_edit
           "✓ #{tour}"
         else
           "try i · #{tour} to skip"
+        end
+      when Step::Capture
+        cap = reach("capture.toggle")
+        if @tried_capture
+          "✓ #{tour}"
+        elsif @m_cap_off
+          "capture is off — #{cap} again turns it back on"
+        else
+          "try #{cap} twice · #{tour} to skip"
+        end
+      when Step::Intercept
+        icpt = reach("intercept.toggle")
+        if @tried_intercept
+          "✓ #{tour}"
+        elsif !@m_intercept && !@m_released
+          "try #{icpt} · #{tour} to skip"
+        elsif !@m_released
+          "#{reach("intercept.forward")} forward · #{reach("intercept.drop")} drop the held request"
+        else
+          "#{icpt} again stops holding · #{tour}"
         end
       else
         "#{tour} · click Prev/Next · esc esc leave"
@@ -1359,16 +2032,17 @@ module Gori::Tui
       iw = {box.w - 4, 1}.max
       y = box.y + 2
       moves = [
-        "1.  tabs & panes     ←/→  ·  ↓  ·  esc  ·  ⇥",
-        Hotkeys.retag("2.  command palette  ^P   — jump to any action"),
-        "3.  action menu      space — commands for this pane",
+        "1.  tabs & panes     1-9  ·  ←/→  ·  ↓  ·  esc  ·  ⇥",
+        "2.  action menu      space — main actions for where you are",
+        Hotkeys.retag("3.  command palette  ^P   — search all actions here + app-wide"),
         "4.  edit mode        READ / INS — browse, then type",
+        "5.  traffic          proxy & CA · capture #{reach("capture.toggle")} · intercept #{reach("intercept.toggle")}",
       ]
       gaps = Tutorial.prose_gaps(box, moves.size + 4, 2)
       screen.text(ix, y, "Welcome to gori — a keyboard-driven HTTP/HTTPS proxy.", Theme.text_bright, Theme.panel, width: iw)
       y += 1
       y += 1 if gaps > 0
-      screen.text(ix, y, "You'll learn the four moves you'll use every session:", Theme.text, Theme.panel, width: iw)
+      screen.text(ix, y, "You'll learn the moves you'll use every session:", Theme.text, Theme.panel, width: iw)
       y += 1
       moves.each do |ln|
         screen.text(ix + 2, y, ln, Theme.text, Theme.panel, width: {iw - 2, 1}.max)
@@ -1385,11 +2059,14 @@ module Gori::Tui
       iw = {box.w - 4, 1}.max
       y = box.y + 2
       # Every key named here is one the real app binds the same way (Help → TABS & FOCUS).
-      # The second line names the SUBTABS level some tabs (Repeater, Notes) put between the
-      # bar and the body: a user taught two levels stalls on the first tab that has three.
+      # The LAST line names the SUBTABS level Project and Target (and Repeater, Notes…) put
+      # between the bar and the body — the tab in slot 1 has one, and the
+      # try line below passes through Target's. It is last because it is the line a short
+      # card drops first, and the mock shows the strip anyway.
       detail = [
-        "←/→ on the bar · 1-9 jump · Repeater/Notes add a SUBTABS strip first",
-        "↓ or ↵ into the body · ↑ back to tabs · ↓ list · esc · ⇥ panes",
+        "1-9 jump to a tab · ←/→ walk the bar · #{reach("nav.goto")} lists every tab, slot or not",
+        "↓ or ↵ steps in · ↑ or esc steps out · ↓ list · ⇥ panes",
+        "Project/Target put a SUBTABS strip between the bar and the body",
       ]
       keep, sy = Tutorial.lesson_split(box, fixed: 2, detail: detail.size)
       screen.text(ix, y, "Every screen is a tab; most tabs split into panes.", Theme.text_bright, Theme.panel, width: iw)
@@ -1398,51 +2075,21 @@ module Gori::Tui
         screen.text(ix, y, ln, Theme.muted, Theme.panel, width: iw)
         y += 1
       end
-      draw_try_line(screen, ix, y, iw, "Try: switch a tab, enter body, ↑ back to tabs.", @tried_nav)
+      # `2`, and only `2`, because a narrow card packs fewer chips than the mock has and the
+      # second is the last one drawn at every size the tour renders at. Target has a strip, so
+      # "↓ into the body" is two presses there, which the footer walks through (#1382).
+      draw_try_line(screen, ix, y, iw, "Try: press 2, ↓ into the body, then ↑ back up to the tabs.", @tried_nav)
 
       shell = Rect.new(box.x + 2, sy, box.w - 4, {box.bottom - 1 - sy, 3}.max)
       if @nav_live
         # INS included, because the SHARED shell handler can enter it here: ↵ or i on the
-        # REQUEST pane sets @edit_insert on this lesson exactly as it does on Practice. This
-        # used to draw `insert: false, typed: ""` regardless, so the user landed in an
-        # invisible INS mode — the badge still read READ, nothing showed what they typed,
-        # and `handle_key` routes every key to `handle_edit_key` while it is on, so n and b
-        # went dead with nothing on screen to explain why. The one thing `tour_nav_key?`
-        # exists to prevent.
-        render_shell(screen, shell, @p_tab, @p_level == :body, @p_pane, "",
-          flow: @p_flow, insert: @edit_insert, typed: @edit_typed)
+        # REQUEST pane sets @edit_insert on this lesson exactly as it does on Practice, and
+        # an invisible INS mode would swallow n and b with nothing on screen to say why.
+        render_shell(screen, shell, @p_tab, @p_level, @p_pane, "",
+          flow: @p_flow, insert: @edit_insert, typed: @edit_typed, sub: @p_sub)
       else
-        phase = (@tick // 12) % 5
-        active = phase == 0 ? 0 : 1
-        in_body = phase == 2 || phase == 3
-        pane = phase == 3 ? 1 : 0
-        keyhint = ["", "→", "↓", "⇥", "esc"][phase]
-        render_shell(screen, shell, active, in_body, pane, keyhint, flow: 0)
-      end
-    end
-
-    private def render_palette(screen : Screen, box : Rect) : Nil
-      ix = box.x + 2
-      iw = {box.w - 4, 1}.max
-      y = box.y + 2
-      keep, sy = Tutorial.lesson_split(box, fixed: 2, detail: 1)
-      screen.text(ix, y, "Jump to any action without hunting tabs or memorizing chords.", Theme.text_bright, Theme.panel, width: iw)
-      y += 1
-      if keep > 0
-        screen.text(ix, y, Hotkeys.retag("^P opens it · type to fuzzy-filter · ↑/↓ move · ↵ run · esc close"),
-          Theme.muted, Theme.panel, width: iw)
-        y += 1
-      end
-      draw_try_line(screen, ix, y, iw, Hotkeys.retag("Try: press ^P, filter, ↵ to run a command."), @tried_palette)
-
-      shell = Rect.new(box.x + 2, sy, box.w - 4, {box.bottom - 1 - sy, 3}.max)
-      render_shell(screen, shell, @p_tab, false, 0, "", flow: 0)
-      # Demo auto-overlay only until the user has tried — after they close it,
-      # leave a clean shell so it doesn't look like the palette is still open.
-      if @overlay == :palette
-        draw_palette_overlay(screen, shell, live: true)
-      elsif !@tried_palette
-        draw_palette_overlay(screen, shell, live: false)
+        active, level, pane, keyhint = NAV_DEMO[(@tick // 12) % NAV_DEMO.size]
+        render_shell(screen, shell, active, level, pane, keyhint, flow: 0)
       end
     end
 
@@ -1450,25 +2097,77 @@ module Gori::Tui
       ix = box.x + 2
       iw = {box.w - 4, 1}.max
       y = box.y + 2
-      keep, sy = Tutorial.lesson_split(box, fixed: 2, detail: 1)
-      screen.text(ix, y, "space opens actions for whatever area has focus.", Theme.text_bright, Theme.panel, width: iw)
+      fam = Verbs::SEND_FLOW
+      detail = [
+        "a letter runs its row · › opens a second card · esc goes back",
+        "the key on the right is the row's shortcut, for next time",
+      ]
+      keep, sy = Tutorial.lesson_split(box, fixed: 2, detail: detail.size)
+      screen.text(ix, y, "space lists the main actions for the place you're in.", Theme.text_bright, Theme.panel, width: iw)
       y += 1
-      if keep > 0
-        screen.text(ix, y, "each row has a mnemonic key — press it to run · ↑/↓ move · esc dismiss",
-          Theme.muted, Theme.panel, width: iw)
+      detail[0, keep].each do |ln|
+        screen.text(ix, y, ln, Theme.muted, Theme.panel, width: iw)
         y += 1
       end
-      draw_try_line(screen, ix, y, iw, "Try: press space, move with ↑/↓, run with a letter or ↵.", @tried_space)
+      draw_try_line(screen, ix, y, iw, "Try: space, then #{fam.key} for #{fam.title} — esc steps back.", @tried_space)
 
       shell = Rect.new(box.x + 2, sy, box.w - 4, {box.bottom - 1 - sy, 3}.max)
-      # @p_tab, not a hardcoded 0: `render_tab_bar` registers a hit rect for every chip it
-      # draws, so a click on one was already moving @p_tab — this lesson was the only one
-      # that then ignored it, leaving the chips looking clickable and behaving dead.
-      render_shell(screen, shell, @p_tab, true, 0, "", flow: 0)
-      if @overlay == :space
-        draw_space_overlay(screen, shell, live: true)
-      elsif !@tried_space
-        draw_space_overlay(screen, shell, live: false)
+      live = @overlay == :space
+      demo = live || @tried_space ? nil : space_demo_frame
+      # @p_tab, not a hardcoded tab: `render_tab_bar` registers a hit rect for every chip it
+      # draws, so a click on one moves @p_tab — this lesson used to ignore it, leaving the
+      # chips looking clickable and behaving dead.
+      render_shell(screen, shell, @p_tab, :body, 0, demo.try(&.[2]) || "", flow: 0)
+      if live
+        draw_space_overlay(screen, shell, @space_level, @space_sel, live: true)
+      elsif demo
+        draw_space_overlay(screen, shell, demo[0], demo[1], live: false)
+      end
+    end
+
+    # The space lesson's looping demo: {level, selected row, key shown}. It walks down to the
+    # family row, opens the card on the family's key, walks the card, and steps back on esc —
+    # the whole of what the menu has that a user cannot guess, in about four seconds.
+    private def space_demo_frame : {Int32, Int32, String}
+      fam = @space_rows.index(&.opens) || 0
+      last = {@send_rows.size - 1, 0}.max
+      phase = (@tick // 10) % 8
+      case phase
+      when 0    then {1, 0, "space"}
+      when 1, 2 then {1, {phase, fam}.min, ""}
+      when 3    then {2, 0, Verbs::SEND_FLOW.key.to_s}
+      when 7    then {1, fam, "esc"}
+      else           {2, {phase - 3, last}.min, ""}
+      end
+    end
+
+    private def render_palette(screen : Screen, box : Rect) : Nil
+      ix = box.x + 2
+      iw = {box.w - 4, 1}.max
+      y = box.y + 2
+      detail = [
+        "type to search here + app-wide; empty search browses app commands",
+        "each row shows its key or menu path (␣ means space)",
+      ]
+      keep, sy = Tutorial.lesson_split(box, fixed: 2, detail: detail.size)
+      screen.text(ix, y, Hotkeys.retag("^P searches every action available here, even ones space leaves out."), Theme.text_bright, Theme.panel, width: iw)
+      y += 1
+      detail[0, keep].each do |ln|
+        screen.text(ix, y, ln, Theme.muted, Theme.panel, width: iw)
+        y += 1
+      end
+      draw_try_line(screen, ix, y, iw, Hotkeys.retag("Try: press ^P, type #{PALETTE_DEMO_QUERY}, then ↵ to run it."), @tried_palette)
+
+      shell = Rect.new(box.x + 2, sy, box.w - 4, {box.bottom - 1 - sy, 3}.max)
+      # In the body, on History's list: the THIS TAB rows are History's, and the real palette
+      # finds a tab's actions from wherever in it you press ^P.
+      render_shell(screen, shell, @p_tab, :body, 0, "", flow: 0)
+      # Demo auto-overlay only until the user has tried — after they close it,
+      # leave a clean shell so it doesn't look like the palette is still open.
+      if @overlay == :palette
+        draw_palette_overlay(screen, shell, live: true)
+      elsif !@tried_palette
+        draw_palette_overlay(screen, shell, live: false)
       end
     end
 
@@ -1511,13 +2210,128 @@ module Gori::Tui
       screen.text(shell.x + {(shell.w - Screen.draw_width(kh)) // 2, 0}.max, shell.bottom - 1, kh, Theme.muted, Theme.bg)
     end
 
+    # Where to point a client, how HTTPS gets trusted, and the capture switch (#1382). The
+    # address is the global default bind; a project can pin its own, which is why the line
+    # sends the reader to the header chip for the live one.
+    private def render_capture(screen : Screen, box : Rect) : Nil
+      ix = box.x + 2
+      iw = {box.w - 4, 1}.max
+      y = box.y + 2
+      detail = [
+        "proxy: #{Tutorial.proxy_addr} — the header's ● chip shows the one in use",
+        "HTTPS: #{reach("browser.open")} opens one proxied and trusting the CA",
+        "other clients: gori ca (or #{reach("ca.export")}), then trust it",
+        "● green = capturing · grey and \"off\" = gori isn't listening",
+        "test only what you're authorized to · #{reach("scope.toggle-lens")} shows in-scope flows only",
+      ]
+      keep, sy = Tutorial.lesson_split(box, fixed: 2, detail: detail.size)
+      screen.text(ix, y, "Point a client's proxy at gori, and trust its CA for HTTPS.", Theme.text_bright, Theme.panel, width: iw)
+      y += 1
+      detail[0, keep].each do |ln|
+        screen.text(ix, y, ln, Theme.muted, Theme.panel, width: iw)
+        y += 1
+      end
+      cap = reach("capture.toggle")
+      draw_try_line(screen, ix, y, iw, "Try: press #{cap} twice — capture off, then back on.", @tried_capture)
+
+      shell = Rect.new(box.x + 2, sy, box.w - 4, {box.bottom - 1 - sy, 3}.max)
+      return if shell.h < 5
+      screen.fill(shell, Theme.bg)
+      # The session header's right end, as Chrome.listen_chip paints it.
+      screen.text(shell.x, shell.y, "gori · demo", Theme.muted, Theme.bg)
+      chip = @m_capture ? "● #{Tutorial.proxy_addr}" : "● #{Tutorial.proxy_addr} · off"
+      screen.text({shell.right - Screen.draw_width(chip), shell.x}.max, shell.y, chip,
+        @m_capture ? Theme.green : Theme.muted, Theme.bg)
+      note = @m_capture ? "capturing: each request lands in History" : "off: the listener is closed, so proxied clients can't connect"
+      screen.text(shell.x, shell.y + 1, note, @m_capture ? Theme.text : Theme.muted, Theme.bg, width: shell.w)
+      render_flows_pane(screen, Rect.new(shell.x, shell.y + 2, shell.w, shell.h - 2), false, 0)
+    end
+
+    # Hold, decide, release (#1382) — and the `i` collision the Edit lesson leaves open:
+    # outside an editor, `i` is this.
+    private def render_intercept(screen : Screen, box : Rect) : Nil
+      ix = box.x + 2
+      iw = {box.w - 4, 1}.max
+      y = box.y + 2
+      icpt, fwd, drop = reach("intercept.toggle"), reach("intercept.forward"), reach("intercept.drop")
+      detail = [
+        "#{icpt} turns it on from anywhere but an editor, where #{reach("editor.insert")} means INS",
+        "held requests wait on the Intercept tab: #{fwd} forward · #{drop} drop",
+        "it holds your own browser too — turn it off when you're done",
+      ]
+      keep, sy = Tutorial.lesson_split(box, fixed: 2, detail: detail.size)
+      screen.text(ix, y, "Intercept holds each request until you forward or drop it.", Theme.text_bright, Theme.panel, width: iw)
+      y += 1
+      detail[0, keep].each do |ln|
+        screen.text(ix, y, ln, Theme.muted, Theme.panel, width: iw)
+        y += 1
+      end
+      draw_try_line(screen, ix, y, iw, "Try: #{icpt} to hold, #{fwd} to forward one, then #{icpt} to stop.", @tried_intercept)
+
+      shell = Rect.new(box.x + 2, sy, box.w - 4, {box.bottom - 1 - sy, 3}.max)
+      return if shell.h < 5
+      screen.fill(shell, Theme.bg)
+      render_tab_bar(screen, shell.x, shell.y, Tutorial.bar_width(shell.w), 3, false)
+      chip = @m_intercept ? "intercept:on(#{@m_held})" : "intercept off"
+      screen.text({shell.right - Screen.draw_width(chip), shell.x}.max, shell.y + 1, chip,
+        @m_intercept ? Theme.red : Theme.muted, Theme.bg)
+      pane = Rect.new(shell.x, shell.y + 2, shell.w, shell.h - 2)
+      return if pane.w < 8 || pane.h < 3
+      Frame.card(screen, pane, "HELD", border: Frame.pane_border(true))
+      yy = pane.y + 1
+      if @m_held == 0
+        msg = @m_intercept ? "nothing held right now" : "off — requests go straight through"
+        screen.text(pane.x + 2, yy, msg, Theme.muted, Theme.panel, width: pane.w - 4)
+        return
+      end
+      Tutorial.held_rows(@m_held).each_with_index do |(method, path, _), i|
+        break if yy >= pane.bottom - 1
+        bg = Frame.row_band(screen, pane, yy, i == 0)
+        screen.text(pane.x + 3, yy, method, Theme.method_color(method.strip), bg)
+        screen.text(pane.x + 8, yy, "#{path}  · held", i == 0 ? Theme.text_bright : Theme.text, bg,
+          width: {pane.w - 10, 1}.max)
+        yy += 1
+      end
+    end
+
+    # The queue the mock's intercept holds: /api/users then /admin. Forward and drop decide the
+    # SELECTED (top) request as the app does, so the queue shrinks from the top — drawing it
+    # as a count from the first row made `f` look like it had sent /admin.
+    MOCK_HELD = 2
+
+    def self.held_rows(held : Int32) : Array({String, String, Int32})
+      FLOW_ROWS[1, MOCK_HELD][MOCK_HELD - held.clamp(0, MOCK_HELD)..]
+    end
+
+    # The address to point a client at: the global default bind, with a wildcard bind read as
+    # the loopback a local browser actually dials.
+    def self.proxy_addr : String
+      host = Settings.bind_host
+      host = "127.0.0.1" if host.empty? || host == "0.0.0.0" || host == "::"
+      host = "[#{host}]" if host.includes?(':')
+      "#{host}:#{Settings.bind_port}"
+    end
+
+    # "1-N" for the chips this card's mock bar draws — the digits that do something at this
+    # size (#1381). The shell every lesson draws is the card less its two-column margins.
+    private def tab_span : String
+      w, h = @backend.size
+      "1-#{Tutorial.chips_drawn(step_card(w, h).w - 4)}"
+    end
+
+    def self.chips_drawn(shell_w : Int32) : Int32
+      tab_chip_rects(tab_labels, 0, 0, bar_width(shell_w)).size
+    end
+
     private def render_practice(screen : Screen, box : Rect) : Nil
       ix = box.x + 2
       iw = {box.w - 4, 1}.max
       y = box.y + 2
+      # "1-N" is the chips this card's bar actually draws (#1381), and INS names where it
+      # works: `i` anywhere but the REQUEST pane is intercept in the app (#1380).
       goals = [
-        {"switch", @p_switch}, {"enter", @p_enter}, {"esc back", @p_up},
-        {Hotkeys.retag("^P"), @p_palette}, {"space", @p_space}, {"i INS", @p_edit},
+        {"#{tab_span} tab", @p_switch}, {"↓ body", @p_enter}, {"↑/esc tabs", @p_up},
+        {"space", @p_space}, {Hotkeys.retag("^P"), @p_palette}, {"⇥ i INS", @p_edit},
       ]
       # Practice carries two rows of prose the other lessons don't — the six goal chips — and
       # at the shortest card that costs the mock a FLOWS row, on the one step whose key line
@@ -1529,7 +2343,7 @@ module Gori::Tui
       pad = Tutorial.prose_gaps(box, fixed + SHELL_ROWS, 1)
       _, sy = Tutorial.lesson_split(box, fixed: fixed, detail: 0, pad: pad)
 
-      screen.text(ix, y, "Your turn — complete each move once (or Skip anytime).", Theme.text_bright, Theme.panel, width: iw)
+      screen.text(ix, y, "Try six checks · Skip anytime.", Theme.text_bright, Theme.panel, width: iw)
       y += 1
 
       per_row = one_row ? goals.size : 3
@@ -1540,24 +2354,16 @@ module Gori::Tui
       end
 
       shell = Rect.new(box.x + 2, sy, box.w - 4, {box.bottom - 1 - pad - sy, 3}.max)
-      render_shell(screen, shell, @p_tab, @p_level == :body, @p_pane, "",
-        flow: @p_flow, insert: @edit_insert, typed: @edit_typed)
+      render_shell(screen, shell, @p_tab, @p_level, @p_pane, "",
+        flow: @p_flow, insert: @edit_insert, typed: @edit_typed, sub: @p_sub)
 
       case @overlay
       when :palette then draw_palette_overlay(screen, shell, live: true)
-      when :space   then draw_space_overlay(screen, shell, live: true)
+      when :space   then draw_space_overlay(screen, shell, @space_level, @space_sel, live: true)
       end
 
       return if pad == 0
-      msg = if practice_done?
-              "✓ Nicely done — click Next or press ↵."
-            elsif @overlay != :none
-              "Overlay open — ↵ runs, esc closes, click outside dismisses."
-            elsif @edit_insert
-              "INS mode — type, then esc back to READ."
-            else
-              Hotkeys.retag("←/→ tabs · ↓ body · ↑ tabs · ↓ list · ⇥ panes · esc · ^P · space · i")
-            end
+      msg = Tutorial.practice_status_hint(@overlay, practice_done?, @edit_insert, tab_span)
       screen.text(ix, box.bottom - 2, msg, practice_done? ? Theme.green : Theme.muted, Theme.panel, width: iw)
     end
 
@@ -1574,58 +2380,92 @@ module Gori::Tui
       x + 2 + label.size
     end
 
+    # Help, quitting and closing a project (#1382): the doors out, and the one key that looks
+    # like one and is not (esc).
+    private def render_leave(screen : Screen, box : Rect) : Nil
+      ix = box.x + 2
+      iw = {box.w - 4, 1}.max
+      y = box.y + 2
+      rows = [
+        {reach("tab.help"), "Help: every key, by where you are"},
+        {reach("help.hotkeys"), "the same, as a popup"},
+        {"^D / ^C ×2", "quit — the first press only asks"},
+        {reach("app.back-key"), "on the tab bar: back to the project picker"},
+        {"esc", "one level up; never quits"},
+        {reach("help.tour"), "this tour, from inside a session"},
+      ]
+      gaps = Tutorial.prose_gaps(box, rows.size + 1, 1)
+      screen.text(ix, y, "In a gori session:", Theme.text_bright, Theme.panel, width: iw)
+      y += 1
+      y += 1 if gaps > 0
+      # One key column when the widest key and description fit side by side, else each
+      # description follows its own key.
+      kw = rows.max_of { |(key, _)| Screen.draw_width(key) }
+      aligned = 2 + kw + 2 + rows.max_of { |(_, desc)| Screen.draw_width(desc) } <= iw
+      rows.each do |(key, desc)|
+        kx = screen.text(ix + 2, y, key, Theme.accent, Theme.panel, width: {iw - 2, 1}.max)
+        dx = aligned ? ix + 2 + kw + 2 : kx + 2
+        screen.text(dx, y, desc, Theme.text, Theme.panel, width: {ix + iw - dx, 1}.max)
+        y += 1
+      end
+    end
+
     private def render_done(screen : Screen, box : Rect) : Nil
       ix = box.x + 2
       iw = {box.w - 4, 1}.max
       y = box.y + 2
-      # Step 2 names the HTTPS hurdle: a proxy that cannot read TLS is where a first session
-      # actually stalls, and neither the wizard nor this tour said so. `Open browser` is the
-      # path that needs nothing else; any other client has to trust the CA (`gori ca`).
-      steps = [
-        {"1.", "run  gori  — start the TUI (proxy on your bind address)"},
-        {"2.", "Project → Open browser (CA trusted for you) · other clients: gori ca"},
-        {"3.", "History — pick a captured flow"},
-        {"4.", "^R — send it to Repeater · edit (i) · send again"},
-        {"5.", Hotkeys.retag("Help tab — full cheat-sheet · re-open this tour: ^P → Guided tour")},
-      ]
+      # The command palette owns Open browser; Project is a numbered tab, not its
+      # entry point. The first line follows where this caller actually returns.
+      steps = Tutorial.first_session_steps(@handoff, iw - 3, @registry)
       gaps = Tutorial.prose_gaps(box, steps.size + 3, 2)
-      screen.text(ix, y, "That's the tour — here's a first real session:", Theme.text_bright, Theme.panel, width: iw)
+      destination = case @handoff
+                    when Handoff::Picker  then "project picker"
+                    when Handoff::Direct  then "--db project or picker"
+                    when Handoff::Shell   then "shell"
+                    when Handoff::Session then "current session"
+                    else                       raise "unknown tutorial handoff"
+                    end
+      screen.text(ix, y, "Finish → #{destination}", Theme.text_bright, Theme.panel, width: iw)
       y += 1
       y += 1 if gaps > 0
-      steps.each do |(num, desc)|
-        screen.text(ix, y, num, Theme.accent, Theme.panel, width: 3)
+      steps.each_with_index do |desc, i|
+        screen.text(ix, y, "#{i + 1}.", Theme.accent, Theme.panel, width: 3)
         screen.text(ix + 3, y, desc, Theme.text, Theme.panel, width: {iw - 3, 1}.max)
         y += 1
       end
       y += 1 if gaps > 1
-      screen.text(ix, y, Hotkeys.retag("Cheat-sheet:  ^P palette · space menu · i/↵ INS · esc READ/back"), Theme.muted, Theme.panel, width: iw)
+      extra = Tutorial.done_extra_lines(iw, @registry)
+      screen.text(ix, y, extra[0], Theme.muted, Theme.panel, width: iw)
       y += 1
-      screen.text(ix, y, "Re-run this tour anytime:  gori tutorial", Theme.muted, Theme.panel, width: iw)
+      screen.text(ix, y, extra[1], Theme.muted, Theme.panel, width: iw)
     end
 
     # --- mock UI -------------------------------------------------------------
 
-    private def render_shell(screen : Screen, rect : Rect, active : Int32, in_body : Bool,
+    # `level` is where focus sits — :menu (the tab bar), :strip (the tab's SUBTABS strip) or
+    # :body — and the badge names it the way the real one does (Runner's focus badge).
+    private def render_shell(screen : Screen, rect : Rect, active : Int32, level : Symbol,
                              pane : Int32, keyhint : String, *, flow : Int32 = 0,
-                             insert : Bool = false, typed : String = "") : Nil
+                             insert : Bool = false, typed : String = "", sub : Int32 = 0) : Nil
       return if rect.h < 5
       @shell_rect = rect
       screen.fill(rect, Theme.bg)
+      in_body = level == :body
       # The focus badge is painted AFTER the tab bar and would overwrite whatever chip
-      # happens to reach its columns, so reserve them first — otherwise the last tab that
-      # still fits gets sheared mid-word and reads as "Fuzzer" rendering as "F TABS".
-      # Only visible once the shell is narrow enough for the chips to reach that far,
-      # which is why Miss Ring's band (which narrows the card) is what surfaced it.
-      scol = in_body ? Theme.focus_gold : Theme.accent
-      slabel = " #{in_body ? "BODY" : "TABS"} "
-      sx = rect.right - slabel.size
+      # happens to reach its columns, so reserve them first (`bar_width`) — otherwise the
+      # last tab that still fits gets sheared mid-word.
+      scol = level == :menu ? Theme.accent : Theme.focus_gold
+      slabel = " #{Tutorial.focus_badge(level, insert)} "
+      sx = rect.right - Screen.draw_width(slabel)
       # ONE condition for both the reservation and the paint. Reserving columns the badge
       # then declines to use (sx <= rect.x, on a shell too narrow to hold it) would spend
       # the whole row on a chip that never appears.
-      badge = sx > rect.x
-      bar_w = badge ? {rect.w - slabel.size - 1, 1}.max : rect.w
-      render_tab_bar(screen, rect.x, rect.y, bar_w, active, !in_body)
+      badge = rect.w > BADGE_W + 1
+      render_tab_bar(screen, rect.x, rect.y, Tutorial.bar_width(rect.w), active, level == :menu)
       screen.text(sx, rect.y, slabel, Theme.ink_on(scol), scol, attr: Attribute::Bold) if badge
+      if labels = Tutorial.strip_labels(active)
+        render_strip(screen, Rect.new(rect.x, rect.y + 1, rect.w, 1), labels, sub, level == :strip)
+      end
 
       py = rect.y + 2
       ph = {rect.bottom - py, 3}.max
@@ -1639,11 +2479,52 @@ module Gori::Tui
       render_flows_pane(screen, flows, in_body && pane == 0, flow)
       render_request_pane(screen, req, in_body && pane == 1, insert: insert, typed: typed, flow: flow)
 
+      # Right-aligned, clear of the strip's chips on the same row.
       unless keyhint.empty?
         kh = " #{keyhint} "
-        screen.text(rect.x + {(rect.w - Screen.draw_width(kh)) // 2, 0}.max, rect.y + 1, kh,
+        screen.text({rect.right - Screen.draw_width(kh), rect.x}.max, rect.y + 1, kh,
           Theme.ink_on(Theme.accent), Theme.accent, attr: Attribute::Bold)
       end
+    end
+
+    # The badge's word per focus level, as the app's reads (EDITOR while INS is on).
+    def self.focus_badge(level : Symbol, insert : Bool = false) : String
+      case level
+      when :menu  then "TABS"
+      when :strip then "SUBTABS"
+      else             insert ? "EDITOR" : "BODY"
+      end
+    end
+
+    # The SUBTABS row under the bar: the tab's own chips, the selected one gold while the strip
+    # holds focus (as `TabController#render_subtab_strip` draws it), clipped to the row.
+    private def render_strip(screen : Screen, row : Rect, labels : Array(String), sel : Int32, focused : Bool) : Nil
+      @strip_rect = row
+      cx = row.x
+      labels.each_with_index do |name, i|
+        chip = " #{name} "
+        cw = Screen.draw_width(chip)
+        break if cx + cw > row.right
+        if i == sel
+          bg = focused ? Theme.focus_gold : Theme.elevated
+          screen.text(cx, row.y, chip, focused ? Theme.ink_on(Theme.focus_gold) : Theme.text, bg, attr: Attribute::Bold)
+        else
+          screen.text(cx, row.y, chip, Theme.muted, Theme.bg)
+        end
+        cx += cw
+      end
+    end
+
+    # Cells the tab strip gets once the focus badge has taken its own. The badge's widest word
+    # is ` SUBTABS `, reserved on every frame so the chips do not shift as focus moves, and a
+    # shell too narrow to seat it gives the whole row to the chips (`render_shell`'s `badge`).
+    #
+    # A class method because the lessons ask the same question before they draw: the footer's
+    # "1-N" (`chips_drawn`) and the spec that pins the Navigate demo to chips every size draws.
+    BADGE_W = 9
+
+    def self.bar_width(w : Int32) : Int32
+      w > BADGE_W + 1 ? {w - BADGE_W - 1, 1}.max : w
     end
 
     # The hit rect and index of each mock tab chip, laid left to right and measured in terminal
@@ -1663,17 +2544,34 @@ module Gori::Tui
       hits
     end
 
+    # Each chip wears its SLOT NUMBER, like the real bar (`Chrome.menu_layout`'s `numbered`,
+    # on by default). The digit is the key this lesson is about, and a chip that does not
+    # carry it leaves `1-9` as a line of prose the screen never confirms.
+    #
+    # Unconditional, not gated on `Settings.tab_numbers?`: the digits keep working when that
+    # switch is off — it only stops the bar from SAYING so — and a tour that silently drops
+    # the one affordance it is teaching, on a setting the reader has not met yet, teaches
+    # nothing in its place.
+    def self.tab_labels : Array(String)
+      TABS.map_with_index { |name, i| "#{i + 1}:#{name}" }
+    end
+
     private def render_tab_bar(screen : Screen, x : Int32, y : Int32, w : Int32,
                                active : Int32, focused : Bool) : Nil
-      @tab_hits = Tutorial.tab_chip_rects(TABS, x, y, w)
+      labels = Tutorial.tab_labels
+      @tab_hits = Tutorial.tab_chip_rects(labels, x, y, w)
       @tab_hits.each do |(rect, i)|
-        label = " #{TABS[i]} "
         if i == active
           bg = focused ? Theme.focus_gold : Theme.accent_bg
           fg = focused ? Theme.ink_on(Theme.focus_gold) : Theme.text_bright
-          screen.text(rect.x, y, label, fg, bg, attr: Attribute::Bold)
+          screen.text(rect.x, y, " #{labels[i]} ", fg, bg, attr: Attribute::Bold)
         else
-          screen.text(rect.x, y, label, Theme.muted, Theme.bg)
+          # The `N:` run a step dimmer than the name — Chrome.menu_number_ink, the same ink
+          # and the same rule the real bar paints an inactive numbered chip with, so the
+          # number reads as the lesser half of the label here too.
+          num = "#{i + 1}:"
+          screen.text(rect.x + 1, y, num, Chrome.menu_number_ink, Theme.bg)
+          screen.text(rect.x + 1 + num.size, y, TABS[i], Theme.muted, Theme.bg)
         end
       end
     end
@@ -1685,9 +2583,7 @@ module Gori::Tui
       FLOW_ROWS.each_with_index do |(method, path, status), i|
         break if yy >= rect.bottom - 1
         sel = focused && i == flow
-        bg = sel ? Theme.accent_bg : Theme.panel
-        screen.fill(Rect.new(rect.x + 1, yy, rect.w - 2, 1), bg)
-        screen.cell(rect.x + 1, yy, sel ? '▎' : ' ', Theme.accent, bg)
+        bg = Frame.row_band(screen, rect, yy, sel)
         screen.text(rect.x + 3, yy, method, Theme.method_color(method.strip), bg)
         px = rect.x + 8
         pw = {rect.right - 1 - 4 - px, 1}.max
@@ -1712,30 +2608,33 @@ module Gori::Tui
       # WAS HANDED, not @p_flow — its sibling `render_flows_pane` marks the row from the
       # parameter, and reading the field here meant the two panes could name different flows
       # on any lesson that draws the shell with a fixed one.
-      path = FLOW_ROWS[flow]?.try(&.[1]) || "/login"
-      ["GET #{path} HTTP/1.1", "Host: example.com", "Accept: */*"].each do |ln|
+      method, path, _ = FLOW_ROWS[flow]? || FLOW_ROWS[0]
+      method = method.strip
+      # A well-formed request, head then a BLANK line then the body (#1382): the mock used to
+      # glue `username=` straight under the headers, on a GET.
+      ["#{method} #{path} HTTP/1.1", "Host: example.com", ""].each do |ln|
         break if yy >= rect.bottom - 1
         screen.text(ix, yy, ln, Theme.text, Theme.panel, width: iw)
         yy += 1
       end
-      if yy < rect.bottom - 1
-        user = typed
-        if insert
-          px = screen.text(ix, yy, "username=#{user}", Theme.text_bright, Theme.panel, width: iw)
-          screen.cell({px, rect.right - 2}.min, yy, ' ', Theme.bg, Theme.accent)
-        elsif focused || !typed.empty? || @tried_edit
-          screen.text(ix, yy, "username=#{user}", Theme.text, Theme.panel, width: iw)
-        else
-          screen.text(ix, yy, "username=alice", Theme.muted, Theme.panel, width: iw)
-        end
+      return unless yy < rect.bottom - 1
+      # Only the POST carries a form body; on a GET the body row holds just what was typed.
+      prefix = method == "POST" ? "username=" : ""
+      if insert
+        px = screen.text(ix, yy, "#{prefix}#{typed}", Theme.text_bright, Theme.panel, width: iw)
+        screen.cell({px, rect.right - 2}.min, yy, ' ', Theme.bg, Theme.accent)
+      elsif !typed.empty? || (!prefix.empty? && (focused || @tried_edit))
+        screen.text(ix, yy, "#{prefix}#{typed}", Theme.text, Theme.panel, width: iw)
+      elsif !prefix.empty?
+        screen.text(ix, yy, "#{prefix}alice", Theme.muted, Theme.panel, width: iw)
       end
     end
 
     private def draw_palette_overlay(screen : Screen, shell : Rect, *, live : Bool) : Nil
-      pw = { {shell.w - 8, 36}.min, 24 }.max
-      # Tall enough for every row when the shell can spare it: border + query + divider +
-      # rows + border. The old cap of 8 was fixed at four rows short of PALETTE_ROWS, so the
-      # fifth was unreachable even on a 200-row terminal — see `palette_rows_visible`.
+      pw = { {shell.w - 8, 40}.min, 24 }.max
+      # Tall enough for the whole browse when the shell can spare it: border + query + divider
+      # + rows + border. Sized by the browse, not by the current matches, so the card does not
+      # jump as the query narrows; a longer list scrolls (`palette_rows_visible`).
       ph = { {shell.h - 1, PALETTE_ROWS.size + 4}.min, 6 }.max
       px = shell.x + {(shell.w - pw) // 2, 0}.max
       py = shell.y + {(shell.h - ph) // 2, 0}.max
@@ -1744,25 +2643,43 @@ module Gori::Tui
       render_fake_palette(screen, rect, live: live)
     end
 
-    private def draw_space_overlay(screen : Screen, shell : Rect, *, live : Bool) : Nil
-      mw = 16
-      mh = SPACE_ROWS.size + 2
-      mx = shell.right - mw - 1
-      # One row up from the shell's floor: the panes' bottom border sits on `shell.bottom - 1`,
-      # and a menu whose own border landed on that row drew `╰────╰────╯╯` — two frames
-      # fused where a popup should float clear of the pane it is over.
+    # The menu floats over the panes' bottom-right, as the real card floats over the pane.
+    # Clamped to the shell, one row clear of the floor: the panes' bottom border sits on
+    # `shell.bottom - 1`, and a menu whose own border landed on that row drew `╰────╰────╯╯` —
+    # two frames fused where a popup should float clear of the pane it is over. A short shell
+    # clips the list, which then scrolls with the selection (the family row sits high,
+    # SEND_ROW_AT, so it is drawn even at the smallest card).
+    private def draw_space_overlay(screen : Screen, shell : Rect, level : Int32, sel : Int32, *, live : Bool) : Nil
+      rows = level == 2 ? @send_rows : @space_rows
+      title = level == 2 ? Tutorial.send_card_title : "SPACE"
+      mw = {SPACE_MENU_W, shell.w - 3}.min
+      mh = {rows.size + 2, shell.h - 1}.min
+      mx = shell.right - mw - 2 # one column clear of the pane's right border
       my = {shell.bottom - mh - 1, shell.y}.max
-      return unless mx > shell.x
+      return unless mx > shell.x && mh >= 3
       rect = Rect.new(mx, my, mw, mh)
       @space_rect = rect if live
-      render_fake_space_menu(screen, rect, SPACE_ROWS, live: live)
+      render_fake_space_menu(screen, rect, title, rows, sel)
+    end
+
+    # The drawn rows, the first one on screen, and how many fit — ONE home for the draw loop
+    # and the click hit-test, which have drifted apart here before (see
+    # `palette_rows_visible`). The window scrolls by the selection's DRAWN row, so a group
+    # header above it counts, as in `PaletteState#ensure_visible`.
+    private def palette_window(rect : Rect, rows : Array(PalRow), sel : Int32) : {Array({String, Int32?}), Int32, Int32}
+      display = Tutorial.palette_display(rows)
+      sel_row = display.index { |(_, i)| i == sel } || 0
+      vis = Tutorial.palette_rows_visible(rect)
+      {display, Tutorial.palette_scroll(sel_row, display.size, vis), vis}
     end
 
     private def render_fake_palette(screen : Screen, rect : Rect, *, live : Bool) : Nil
       return if rect.w < 12 || rect.h < 4
       Frame.card(screen, rect, "COMMANDS", border: Theme.border_focus)
       screen.text(rect.x + 2, rect.y + 1, "›", Theme.accent, Theme.panel)
-      q = live ? @pal_query : ""
+      # The demo types the lesson's query a letter at a time, then holds it: an empty browse
+      # first, then the grouped result, which is the picture the lesson is about.
+      q = live ? @pal_query : PALETTE_DEMO_QUERY[0, ((@tick // 5) % 16 - 3).clamp(0, PALETTE_DEMO_QUERY.size)]
       qx = rect.x + 4
       qw = {rect.right - 2 - qx, 1}.max
       if q.empty?
@@ -1777,30 +2694,33 @@ module Gori::Tui
       end
       Frame.tee_divider(screen, rect, rect.y + 2)
 
-      rows = live ? filtered_palette : PALETTE_ROWS
-      sel = if live
-              rows.empty? ? 0 : @pal_sel.clamp(0, rows.size - 1)
-            else
-              (@tick // 10) % PALETTE_ROWS.size
-            end
-      vis = Tutorial.palette_rows_visible(rect)
-      top = Tutorial.palette_scroll(sel, rows.size, vis)
+      rows = live ? filtered_palette : Tutorial.palette_matches(q, @pal_tab_rows)
+      sel = live && !rows.empty? ? @pal_sel.clamp(0, rows.size - 1) : 0
+      display, top, vis = palette_window(rect, rows, sel)
       yy = rect.y + 3
-      rows[top, vis].each_with_index do |(sig, label), i|
-        s = top + i == sel
-        bg = s ? Theme.accent_bg : Theme.panel
-        screen.fill(Rect.new(rect.x + 1, yy, rect.w - 2, 1), bg)
-        screen.cell(rect.x + 1, yy, s ? '▎' : ' ', Theme.accent, bg)
-        screen.text(rect.x + 3, yy, sig, Theme.muted, bg)
-        screen.text(rect.x + 5, yy, label, s ? Theme.text_bright : Theme.text, bg,
-          width: {rect.right - 1 - (rect.x + 5), 1}.max)
+      display[top, vis].each do |(header, idx)|
+        unless idx
+          screen.fill(Rect.new(rect.x + 1, yy, rect.w - 2, 1), Theme.panel)
+          screen.text(rect.x + 3, yy, "─ #{header} ─", Theme.muted, Theme.panel)
+          yy += 1
+          next
+        end
+        row = rows[idx]
+        s = idx == sel
+        bg = Frame.row_band(screen, rect, yy, s)
+        screen.text(rect.x + 3, yy, row.sigil, Theme.muted, bg)
+        # The hint column is the lesson (the route to the row), so the label gives way to it.
+        hx = rect.right - 2 - Screen.draw_width(row.hint)
+        screen.text(rect.x + 5, yy, row.label, s ? Theme.text_bright : Theme.text, bg,
+          width: {hx - 1 - (rect.x + 5), 1}.max)
+        screen.text(hx, yy, row.hint, Theme.muted, bg) unless row.hint.empty?
         yy += 1
       end
       # A scrolled list says so, on the border row it is covering — otherwise a window showing
       # 2 of 5 reads as a palette with only 2 commands in it. Rows BELOW the window, not rows
       # hidden in total: it is painted at the bottom edge, so it can only be read as "more
       # that way", and it went on claiming "+3" with the user parked on the last row.
-      below = rows.size - top - vis
+      below = display.size - top - vis
       if vis > 0 && below > 0
         more = "+#{below}"
         screen.text({rect.right - 1 - more.size, rect.x + 1}.max, rect.bottom - 1, more, Theme.muted, Theme.panel)
@@ -1810,21 +2730,21 @@ module Gori::Tui
       end
     end
 
-    private def render_fake_space_menu(screen : Screen, rect : Rect,
-                                       rows : Array({Char, String}), *, live : Bool) : Nil
+    private def render_fake_space_menu(screen : Screen, rect : Rect, title : String,
+                                       rows : Array(MenuRow), sel : Int32) : Nil
       return if rect.w < 8 || rect.h < 3
-      Frame.card(screen, rect, "SPACE", border: Theme.border_focus)
-      sel = live ? @space_sel : (@tick // 10) % rows.size
+      Frame.card(screen, rect, title, border: Theme.border_focus)
+      vis = rect.h - 2
+      top = Tutorial.palette_scroll(sel, rows.size, vis)
       yy = rect.y + 1
-      rows.each_with_index do |(key, label), i|
-        break if yy >= rect.bottom - 1
-        s = i == sel
-        bg = s ? Theme.accent_bg : Theme.panel
-        screen.fill(Rect.new(rect.x + 1, yy, rect.w - 2, 1), bg)
-        screen.cell(rect.x + 1, yy, s ? '▎' : ' ', Theme.accent, bg)
-        screen.cell(rect.x + 3, yy, key, Theme.accent, bg, attr: Attribute::Bold)
-        screen.text(rect.x + 5, yy, label, s ? Theme.text_bright : Theme.text, bg,
-          width: {rect.right - 1 - (rect.x + 5), 1}.max)
+      rows[top, vis].each_with_index do |row, i|
+        s = top + i == sel
+        bg = Frame.row_band(screen, rect, yy, s)
+        screen.cell(rect.x + 3, yy, row.key, Theme.accent, bg, attr: Attribute::Bold)
+        hx = rect.right - 2 - Screen.draw_width(row.hint)
+        screen.text(rect.x + 5, yy, row.title, s ? Theme.text_bright : Theme.text, bg,
+          width: {hx - 1 - (rect.x + 5), 1}.max)
+        screen.text(hx, yy, row.hint, row.opens ? Theme.accent : Theme.muted, bg) unless row.hint.empty?
         yy += 1
       end
     end

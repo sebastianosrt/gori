@@ -60,7 +60,7 @@ describe Gori::MCP::Server do
       with_store do |store|
         store.insert_repeater("https://ex.test", "GET /x HTTP/1.1\nHost: ex.test\n\n".to_slice, false, true, nil, 0)
         id = store.repeaters_meta.last.id
-        store.update_repeater_response(id, "HTTP/1.1 400 Bad\r\n\r\n".to_slice, "nope".to_slice, nil, 99_i64)
+        store.update_repeater_response(id, "HTTP/1.1 400 Bad\r\n\r\n".to_slice, "nope".to_slice, nil, 99_i64, request_sha256: nil)
         call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_repeater_context","arguments":{}}})
         payload = mcp_tool_payload(mcp_drive(store, call)[0])
         payload["sessions"].as_a.size.should eq(1)
@@ -351,6 +351,34 @@ describe "MCP minimize_repeater" do
       r = tools.call("minimize_repeater", JSON.parse(%({"repeater_id":#{id}})))
       r.is_error.should be_true
       r.text.should contain("scope")
+      # The decision the gate made, as send_request reports it: a configured scope that does
+      # not cover the host is out_of_scope, not "unscoped".
+      r.details.not_nil!["scope_decision"].as_s.should eq("out_of_scope")
+    end
+  end
+
+  it "reports an unconfigured scope's refusal as unscoped" do
+    with_store do |store|
+      id = store.insert_repeater("https://acme.test/", "GET / HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice,
+        false, true, nil, 0)
+      r = tools_for(store).call("minimize_repeater", JSON.parse(%({"repeater_id":#{id}})))
+      r.error_code.should eq("SCOPE_BLOCKED")
+      r.details.not_nil!["scope_decision"].as_s.should eq("unscoped")
+    end
+  end
+
+  # Every candidate goes through Fuzz::Sender, which honours excludes: the pre-check must too,
+  # or the run is refused send by send and reported as an aborted minimize.
+  it "refuses an excluded target up front even under allow_unscoped" do
+    with_store do |store|
+      id = store.insert_repeater("https://acme.test/", "GET / HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice,
+        false, true, nil, 0)
+      scope = Gori::Scope.load(store)
+      scope.add("include", "host", "acme.test")
+      scope.add("exclude", "host", "acme.test")
+      r = tools_for(store).call("minimize_repeater", JSON.parse(%({"repeater_id":#{id},"allow_unscoped":true})))
+      r.error_code.should eq("SCOPE_BLOCKED")
+      r.details.not_nil!["scope_decision"].as_s.should eq("exclude")
     end
   end
 
@@ -409,10 +437,10 @@ describe "code-review follow-ups" do
       hit["matches_endpoint"].as_bool.should be_true
       hit.as_h.has_key?("warning").should be_false
 
-      # Sitemap.add drops a trailing slash, so /api/users/ is a key no node ever has.
-      miss = mcp_ok_json(tools, "set_sitemap_tag", %({"host":"acme.test","path":"/api/users/","tag":"typo"}))
-      miss["matches_endpoint"].as_bool.should be_false
-      miss["warning"].as_s.should contain("no captured endpoint")
+      # Sitemap.add drops a trailing slash, so this tag must share /api/users' node key.
+      slash = mcp_ok_json(tools, "set_sitemap_tag", %({"host":"acme.test","path":"/api/users/","tag":"slash"}))
+      slash["matches_endpoint"].as_bool.should be_true
+      slash.as_h.has_key?("warning").should be_false
     end
   end
 end
@@ -429,6 +457,51 @@ describe "MCP update_repeater" do
         %({"id":#{created["id"]},"request":"GET /a?token=s3cr3t-value HTTP/1.1\\r\\nHost: acme.test\\r\\n\\r\\n"}))
       updated["summary"].as_s.should_not contain "s3cr3t-value"
       updated["summary"].as_s.should contain "$TOKEN"
+    end
+  end
+end
+
+# #1244 — `create_repeater{curl}`: the importer every surface shares builds the request, and the
+# command answers target and http2 unless the caller did.
+describe "MCP create_repeater from a curl command" do
+  it "stores the request curl describes, with its origin as the target" do
+    with_store do |store|
+      tools = tools_for(store)
+      created = mcp_ok_json(tools, "create_repeater",
+        {curl: "curl 'https://api.test:8443/v1/items?x=1' -H 'X-A: 1' -b 'sid=2' -d 'q=1' -k"}.to_json)
+      rec = store.repeaters_mcp.find! { |r| r.id == created["id"].as_i64 }
+      rec.target.should eq("https://api.test:8443")
+      String.new(rec.request).should eq(
+        "POST /v1/items?x=1 HTTP/1.1\r\nHost: api.test:8443\r\nX-A: 1\r\nCookie: sid=2\r\n" \
+        "Content-Length: 3\r\nContent-Type: application/x-www-form-urlencoded\r\n\r\nq=1")
+      rec.http2?.should be_false
+      created["curl_notes"].as_a.map(&.as_s).join.should contain("-k")
+    end
+  end
+
+  it "takes http2 from --http2 unless the caller says otherwise, and keeps an explicit target" do
+    with_store do |store|
+      tools = tools_for(store)
+      a = mcp_ok_json(tools, "create_repeater", {curl: "curl --http2 https://api.test/p"}.to_json)
+      store.repeaters_mcp.find! { |r| r.id == a["id"].as_i64 }.http2?.should be_true
+      b = mcp_ok_json(tools, "create_repeater",
+        {curl: "curl --http2 https://api.test/p", http2: false, target: "https://10.0.0.5"}.to_json)
+      rec = store.repeaters_mcp.find! { |r| r.id == b["id"].as_i64 }
+      rec.http2?.should be_false
+      rec.target.should eq("https://10.0.0.5")
+    end
+  end
+
+  it "refuses curl beside request, and a command it cannot use, creating nothing" do
+    with_store do |store|
+      tools = tools_for(store)
+      r = tools.call("create_repeater", JSON.parse({curl: "curl https://a.test/", request: "GET / HTTP/1.1\r\n\r\n", target: "https://a.test"}.to_json))
+      r.is_error.should be_true
+      r.text.should contain("not both")
+      r = tools.call("create_repeater", JSON.parse({curl: "curl https://a.test/1 https://a.test/2"}.to_json))
+      r.is_error.should be_true
+      r.text.should contain("2 requests")
+      store.repeaters_mcp.should be_empty
     end
   end
 end

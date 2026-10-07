@@ -4,6 +4,7 @@ require "openssl"
 require "../settings"
 require "../host_overrides"
 require "./socket_tuning"
+require "./resolver_cache"
 require "./socks5"
 require "./tls/client_shape"
 
@@ -31,8 +32,52 @@ module Gori::Proxy
   # a TLS socket to the proxy, or (for an https origin through a TLS proxy) origin TLS nested
   # inside proxy TLS. Everything downstream already reads and writes an `IO`.
   module Upstream
-    CONNECT_TIMEOUT = 30.seconds
-    IO_TIMEOUT      = 30.seconds
+    # Run an operation while polling a cooperative stop predicate and closing only the IO it
+    # owns when that predicate becomes true. The watcher is joined before returning so a
+    # cancelled send cannot leave a fiber behind. TLS dials use this on the underlying socket
+    # while OpenSSL performs its handshake; send engines use it on the completed SSL socket.
+    class CancelWatch
+      def initialize(@io : IO, @cancel : Proc(Bool))
+        @stop = Channel(Nil).new(1)
+        @joined = Channel(Nil).new(1)
+        spawn do
+          loop do
+            if @cancel.call
+              @io.close rescue nil
+              break
+            end
+            select
+            when @stop.receive
+              break
+            when timeout(10.milliseconds)
+            end
+          end
+        rescue
+          # A broken predicate cannot safely leave an outbound operation running.
+          @io.close rescue nil
+        ensure
+          @joined.send(nil)
+        end
+      end
+
+      def stop : Nil
+        @stop.send(nil)
+        @joined.receive
+      end
+    end
+
+    def self.watch_cancel(io : IO, cancel : Proc(Bool)?) : CancelWatch?
+      cancel.try { |predicate| CancelWatch.new(io, predicate) }
+    end
+
+    def self.with_cancel(io : IO, cancel : Proc(Bool)?, & : -> T) : T forall T
+      watcher = watch_cancel(io, cancel)
+      begin
+        yield
+      ensure
+        watcher.try(&.stop)
+      end
+    end
 
     # Dial the origin (directly, or via the configured upstream proxy's CONNECT
     # tunnel). The returned socket is positioned at the start of the origin stream
@@ -42,9 +87,10 @@ module Gori::Proxy
                   io_timeout : Time::Span = Settings.io_timeout,
                   *, overrides : Gori::HostOverrides? = nil,
                   pin : String? = nil,
-                  apply_host_overrides : Bool = true) : IO?
+                  apply_host_overrides : Bool = true,
+                  origin_scheme : String = "http") : IO?
       dial_result(host, port, connect_timeout, io_timeout, overrides: overrides, pin: pin,
-        apply_host_overrides: apply_host_overrides)[0]
+        apply_host_overrides: apply_host_overrides, origin_scheme: origin_scheme)[0]
     end
 
     # Like `dial`, but also says WHY there is no socket. Every dial failure used to collapse
@@ -58,13 +104,14 @@ module Gori::Proxy
                          io_timeout : Time::Span = Settings.io_timeout,
                          *, overrides : Gori::HostOverrides? = nil,
                          pin : String? = nil,
-                         apply_host_overrides : Bool = true) : {IO?, DialError?}
+                         apply_host_overrides : Bool = true,
+                         origin_scheme : String = "http") : {IO?, DialError?}
       target, target_port = apply_host_overrides ? connect_target(host, port, overrides, pin) : {pin || host, port}
       # ONE decision point for "how do we reach this host": Settings.upstream_route folds the
-      # project pin, the rule table and the legacy scalar together. Resolved on the ORIGINAL
-      # host, not `target` — a rule is written against the name the operator sees, and a
-      # hostname override only changes where we dial (see connect_target).
-      route = Settings.upstream_route(host)
+      # project pin, the rule table, the legacy scalar, and its environment fallback together.
+      # Resolved on the ORIGINAL host, not `target` — a rule is written against the name the
+      # operator sees, and a hostname override only changes where we dial (see connect_target).
+      route = Settings.upstream_route(host, origin_scheme, port)
       if err = route.configuration_error
         {nil, DialError.new(DialErrorKind::Proxy, "#{err} — the origin was never contacted")}
       elsif route.direct?
@@ -149,12 +196,7 @@ module Gori::Proxy
       # port we will ACTUALLY dial — testing the request's port first would let an override
       # pointing at gori's own bind walk straight into the self-proxy loop this exists to stop.
       resolved, target_port = connect_target(host, port, overrides)
-      return false unless target_port == self_addr[1]
-      target = normalize_host(resolved)
-      bind = normalize_host(self_addr[0])
-      return true if target == bind
-      return true if local_host && target == normalize_host(local_host)
-      reaches_self?(target, bind)
+      addresses_self?(resolved, target_port, self_addr, local_host)
     end
 
     # True when the request LITERALLY targets gori's own listener `self_addr` — the
@@ -335,7 +377,9 @@ module Gori::Proxy
     private def self.direct_dial_result(host : String, port : Int32,
                                         connect_timeout : Time::Span = Settings.connect_timeout,
                                         io_timeout : Time::Span = Settings.io_timeout) : {TCPSocket?, DialError?}
-      sock = TCPSocket.new(bare_host(host), port, connect_timeout: connect_timeout)
+      # Not `TCPSocket.new(host, port)`: on macOS 27 it hands back a REFUSED address as
+      # connected (see `tcp_connect`).
+      sock = tcp_connect(bare_host(host), port, connect_timeout)
       begin
         sock.sync = true # flush writes immediately (P6)
         sock.tcp_nodelay = true
@@ -355,6 +399,73 @@ module Gori::Proxy
       {nil, DialError.new(DialErrorKind::Dns, cause: exception_cause(ex))}
     rescue
       {nil, DialError::ORIGIN_UNREACHABLE}
+    end
+
+    # `SO_ERROR`, which LibC does not bind on unix: 4 on Linux, 0x1007 on Darwin and the BSDs.
+    private SO_ERROR = {% if flag?(:linux) %} 4 {% else %} 0x1007 {% end %}
+
+    # `TCPSocket.new(host, port, connect_timeout:)`, except that each address's connect is
+    # judged by the socket's own pending error.
+    #
+    # Crystal's event loop finishes a non-blocking connect by calling `connect()` a second time
+    # and takes `EISCONN` as success (`Crystal::EventLoop::Polling#connect`, 1.21 and master).
+    # macOS 27 answers that second call with EISCONN even when the handshake was REFUSED, and
+    # leaves the ECONNREFUSED in SO_ERROR — so a refused address came back as a connected
+    # socket that is not one. Two things broke on it: `localhost` (::1 first) never fell through
+    # to 127.0.0.1, and a refused origin surfaced as a later option or read failure rather than
+    # a connect error. Reading SO_ERROR after the connect is correct on every platform; on one
+    # without the quirk it is 0 and costs one syscall per address.
+    #
+    # The addresses come from `ResolverCache` (a blocking `getaddrinfo` per dial stalled the
+    # scheduler). When none of them accepts, the answer is dropped so the next dial asks the
+    # resolver again rather than retrying a stale record until its TTL runs out. The error
+    # raised when every address fails is the one `Socket::Addrinfo.tcp`'s block form raised.
+    private def self.tcp_connect(host : String, port : Int32, timeout : Time::Span?) : TCPSocket
+      last = nil.as(Exception?)
+      ResolverCache.shared.resolve(host, port).each do |addrinfo|
+        # A family the host cannot open (IPv6 disabled, yet `localhost` still resolves ::1
+        # first) is one more address that failed, not the end of the walk.
+        sock = begin
+          TCPSocket.new(addrinfo.family)
+        rescue ex : ::Socket::Error
+          last = ex
+          next
+        end
+        if err = sock.connect(addrinfo, timeout: timeout) { |e| e }
+          sock.close
+          last = err
+          next
+        end
+        if errno = pending_error(sock)
+          sock.close
+          last = ::Socket::ConnectError.from_os_error("connect", errno)
+          next
+        end
+        return sock
+      end
+      ResolverCache.shared.forget(host, port)
+      case last
+      when ::Socket::ConnectError
+        raise ::Socket::ConnectError.from_os_error("Error connecting to '#{host}:#{port}'", last.os_error)
+      when Exception
+        raise last
+      else
+        raise ::Socket::ConnectError.new("connect: no address for #{host}")
+      end
+    end
+
+    # The error a non-blocking connect left on `sock`, or nil. A getsockopt that itself fails
+    # answers nil: it cannot tell us the connect failed, so it must not claim so.
+    private def self.pending_error(sock : ::Socket) : Errno?
+      {% if flag?(:win32) %}
+        # ConnectEx reports a refusal itself, and SO_ERROR there holds a WSA code, not an errno.
+        nil
+      {% else %}
+        err = 0
+        len = LibC::SocklenT.new(sizeof(Int32))
+        return nil unless LibC.getsockopt(sock.fd, LibC::SOL_SOCKET, SO_ERROR, pointerof(err), pointerof(len)) == 0
+        err == 0 ? nil : Errno.new(err)
+      {% end %}
     end
 
     # Connect to the upstream HTTP proxy and CONNECT-tunnel to the origin. Used for
@@ -518,8 +629,9 @@ module Gori::Proxy
     # read (a proxy that opens the tunnel and then goes silent is not a dial FAILURE — the dial
     # succeeded; the silence shows up later, on the first read) and needs to ask this question
     # directly.
-    def self.proxied_via(host : String) : String?
-      route = Settings.upstream_route(host)
+    def self.proxied_via(host : String, origin_scheme : String? = nil,
+                         origin_port : Int32? = nil) : String?
+      route = Settings.upstream_route(host, origin_scheme, origin_port)
       route.direct? ? nil : proxy_label(route)
     end
 
@@ -586,6 +698,8 @@ module Gori::Proxy
         sock.try(&.close) rescue nil
         sock = nil
       end
+      # No locally-resolved address got a tunnel: re-resolve next time (see tcp_connect).
+      ResolverCache.shared.forget(bare_host(host), port) unless route.remote_dns?
       if handshake_error
         return {nil, DialError.new(DialErrorKind::Proxy, "#{proxy_label(route)}: the SOCKS5 handshake failed")}
       end
@@ -603,7 +717,7 @@ module Gori::Proxy
       return [host] if route.remote_dns?
       bare = bare_host(host)
       return [bare] if parse_ip(bare)
-      addresses = Socket::Addrinfo.tcp(bare, port).map(&.ip_address.address)
+      addresses = ResolverCache.shared.resolve(bare, port).map(&.ip_address.address)
       addresses.uniq!
       addresses
     end
@@ -649,7 +763,7 @@ module Gori::Proxy
     private def self.socks5_connect(sock : TCPSocket, host : String, port : Int32) : Bool
       sock.write(Bytes[Socks5::VERSION, Socks5::CMD_CONNECT, 0_u8])
       return false unless socks5_write_address(sock, host)
-      sock.write(Bytes[(port >> 8).to_u8, (port & 0xFF).to_u8])
+      sock.write_bytes(port.to_u16, IO::ByteFormat::BigEndian)
       sock.flush
 
       return false unless (reply = Socks5.read_exactly(sock, 4)) && reply[0] == Socks5::VERSION
@@ -711,16 +825,32 @@ module Gori::Proxy
         return DialError.new(DialErrorKind::Proxy,
           "#{proxy_label(route)} closed the connection without answering CONNECT #{authority}")
       end
+      # `gets` with a limit hands an over-long line back in pieces, so a piece is a LINE only
+      # when the one before it ended in LF: the CRLF closing an exactly-limit-long header came
+      # back alone and read as the blank terminator, opening a tunnel on an incomplete reply.
+      unless status.ends_with?('\n')
+        return DialError.new(DialErrorKind::Proxy, status.bytesize >= MAX_CONNECT_LINE ? "#{proxy_label(route)} sent an oversized CONNECT status line (> #{MAX_CONNECT_LINE} bytes)" : "#{proxy_label(route)} sent an incomplete CONNECT reply before the terminating blank line: #{status_text(status)}")
+      end
       parts = status.chomp.split(' ', 3)
       code = parts.size >= 2 ? (parts[1].to_i? || 0) : 0
       read = 0
+      headers_complete = false
+      at_line_start = true
       while line = sock.gets('\n', MAX_CONNECT_LINE)
         read += line.bytesize
         if read > MAX_CONNECT_HEADERS
           return DialError.new(DialErrorKind::Proxy,
             "#{proxy_label(route)} sent an oversized CONNECT reply header section (> #{MAX_CONNECT_HEADERS} bytes)")
         end
-        break if line.chomp.empty?
+        if at_line_start && line.chomp.empty?
+          headers_complete = true
+          break
+        end
+        at_line_start = line.ends_with?('\n')
+      end
+      unless headers_complete
+        return DialError.new(DialErrorKind::Proxy,
+          "#{proxy_label(route)} sent an incomplete CONNECT reply before the terminating blank line: #{status_text(status)}")
       end
       return nil if (code // 100) == 2
       DialError.new(DialErrorKind::Proxy,
@@ -853,6 +983,10 @@ module Gori::Proxy
     # SSL_CERT_FILE/DIR, or a resolvable system CA path. Callers gate the startup warning
     # on this together with verify being on.
     def self.system_trust_available? : Bool
+      # Crystal's Windows OpenSSL context imports the Windows root store itself.
+      {% if flag?(:win32) %}
+        return true
+      {% end %}
       return true if env_ca_override?
       return true if openssl_default_store_populated?
       file, dir = resolve_ca_source
@@ -1099,9 +1233,10 @@ module Gori::Proxy
                       connect_timeout : Time::Span = Settings.connect_timeout,
                       io_timeout : Time::Span = Settings.io_timeout,
                       *, overrides : Gori::HostOverrides? = nil,
-                      pin : String? = nil, tls_preset : String? = nil) : OpenSSL::SSL::Socket::Client?
+                      pin : String? = nil, tls_preset : String? = nil,
+                      cancel : Proc(Bool)? = nil) : OpenSSL::SSL::Socket::Client?
       dial_tls_result(host, port, verify, alpn, sni, connect_timeout, io_timeout,
-        overrides: overrides, pin: pin, tls_preset: tls_preset)[0]
+        overrides: overrides, pin: pin, tls_preset: tls_preset, cancel: cancel)[0]
     end
 
     # Like `dial_tls` but also reports WHY the dial failed (see DialError) as the second
@@ -1112,8 +1247,10 @@ module Gori::Proxy
                              io_timeout : Time::Span = Settings.io_timeout,
                              *, overrides : Gori::HostOverrides? = nil,
                              pin : String? = nil,
-                             tls_preset : String? = nil) : {OpenSSL::SSL::Socket::Client?, DialError?}
-      tcp, dial_err = dial_result(host, port, connect_timeout, io_timeout, overrides: overrides, pin: pin)
+                             tls_preset : String? = nil,
+                             cancel : Proc(Bool)? = nil) : {OpenSSL::SSL::Socket::Client?, DialError?}
+      tcp, dial_err = dial_result(host, port, connect_timeout, io_timeout, overrides: overrides, pin: pin,
+        origin_scheme: "https")
       return {nil, dial_err || DialError::ORIGIN_UNREACHABLE} unless tcp
       # `hostname:` below is unaffected by `pin` on purpose: SNI and the verified name stay the
       # NAME. A pinned dial reaches the address the client actually connected to and then asks
@@ -1130,8 +1267,15 @@ module Gori::Proxy
       # construction — which is the whole safety property, because two sends with different
       # fingerprints sharing one SSL_CTX would answer the A/B with one handshake.
       tls_policy = Settings.outbound_tls_for(host, tls_preset)
-      ssl = OpenSSL::SSL::Socket::Client.new(tcp, context: client_context(verify, alpn, tls_policy),
-        sync_close: true, hostname: sni || host)
+      # TCP establishment stays outside the watcher: it has its own connect timeout and dial
+      # result. During the handshake, close the transport socket beneath any proxy TLS wrapper
+      # rather than calling SSL.close while OpenSSL is in SSL_connect. Once the SSL socket has
+      # been constructed, callers install their normal watcher on that socket for subsequent IO.
+      handshake_io = SocketTuning.underlying_socket(tcp) || tcp
+      ssl = with_cancel(handshake_io, cancel) do
+        OpenSSL::SSL::Socket::Client.new(tcp, context: client_context(verify, alpn, tls_policy),
+          sync_close: true, hostname: sni || host)
+      end
       ssl.sync = true
       {ssl, nil}
     rescue ex
@@ -1142,7 +1286,7 @@ module Gori::Proxy
       # per failed origin → fd exhaustion). `tcp` is non-nil here: `dial` never raises
       # (it returns nil), so the only raising step runs after the nil-guard above.
       tcp.try(&.close) rescue nil
-      {nil, tls_dial_error(ex, io_timeout, host)}
+      {nil, tls_dial_error(ex, io_timeout, host, port)}
     end
 
     # What actually broke inside the TLS attempt. This used to be a bare `rescue` that threw
@@ -1161,7 +1305,14 @@ module Gori::Proxy
     # came back", which is also exactly what an accept-then-close proxy produces. `TlsVerify` is
     # deliberately excluded: a certificate WAS exchanged and rejected, so real bytes crossed the
     # tunnel and the origin — not the proxy — earned that verdict.
-    private def self.tls_dial_error(ex : Exception, io_timeout : Time::Span, host : String) : DialError
+    #
+    # Public because `Gori::HttpTransport` wraps its own TLS by hand (gori's service traffic
+    # skips host overrides and the outbound-TLS policy, so it cannot go through
+    # `dial_tls_result`) and must reach the SAME six verdicts — the alternative is a second
+    # classifier that drifts, which is how OAST registration came to report every TLS failure
+    # as one unexplained sentence (#1020).
+    def self.tls_dial_error(ex : Exception, io_timeout : Time::Span, host : String,
+                            origin_port : Int32? = nil) : DialError
       # A read timeout is not a TLS verdict — nothing came back to judge. Naming the layer
       # TLS here is precisely what produced the certificate advice for a black hole, so it
       # gets its own kind and carries how long gori actually waited (the stall was otherwise
@@ -1169,7 +1320,7 @@ module Gori::Proxy
       if ex.is_a?(IO::TimeoutError)
         return DialError.new(DialErrorKind::Timeout,
           cause: "no TLS response within #{io_timeout.total_seconds.round(1)}s",
-          via_proxy: proxied_via(host))
+          via_proxy: proxied_via(host, "https", origin_port))
       end
       cause = exception_cause(ex)
       # OpenSSL says "certificate verify failed" for an untrusted chain, an expired leaf AND a
@@ -1177,7 +1328,7 @@ module Gori::Proxy
       # three. Everything else it raises is a protocol-level refusal, where offering a CA file
       # is the wrong advice.
       return DialError.new(DialErrorKind::TlsVerify, cause: cause) if cause.includes?("certificate verify failed")
-      DialError.new(DialErrorKind::Tls, cause: cause, via_proxy: proxied_via(host))
+      DialError.new(DialErrorKind::Tls, cause: cause, via_proxy: proxied_via(host, "https", origin_port))
     end
 
     # Longest library verdict worth carrying into a stored flow error. OpenSSL's are ~60 bytes.
@@ -1230,6 +1381,48 @@ module Gori::Proxy
       host = authority[0...idx]
       port = authority[(idx + 1)..].to_i? || default_port
       {host, port}
+    end
+
+    # CONNECT's authority is destination input, so a failed explicit port parse must not
+    # turn into the default port. Keep `split_host_port` permissive for its other projection
+    # callers; this strict sibling is only for opening a client-requested tunnel.
+    def self.split_connect_host_port(authority : String, default_port : Int32) : {String, Int32}
+      value = authority.strip
+      raise Gori::Error.new("CONNECT authority must name a host") if value.empty?
+
+      if value.starts_with?('[')
+        closing = value.index(']')
+        raise Gori::Error.new("CONNECT authority has an unterminated bracketed host") unless closing
+        host = value[1...closing]
+        raise Gori::Error.new("CONNECT authority must name a host") if host.empty?
+        suffix = value[(closing + 1)..]
+        return {host, default_port} if suffix.empty?
+        raise Gori::Error.new("CONNECT authority has an invalid port separator") unless suffix.starts_with?(':')
+        port = connect_authority_port(suffix[1..])
+        return {host, port}
+      end
+
+      return {value, default_port} if valid_ipv6?(value)
+      colon_count = value.count(':')
+      raise Gori::Error.new("CONNECT IPv6 literals must be bracketed") if colon_count > 1
+      return {value, default_port} if colon_count == 0
+
+      split = value.index!(':')
+      host = value[0...split]
+      raise Gori::Error.new("CONNECT authority must name a host") if host.empty?
+      port = connect_authority_port(value[(split + 1)..])
+      {host, port}
+    end
+
+    private def self.connect_authority_port(value : String) : Int32
+      if value.empty? || !value.each_char.all?(&.ascii_number?)
+        raise Gori::Error.new("CONNECT port must be a decimal number from 0 to 65535")
+      end
+      port = value.to_i?
+      unless port && port <= 65_535
+        raise Gori::Error.new("CONNECT port must be a decimal number from 0 to 65535")
+      end
+      port
     end
   end
 end

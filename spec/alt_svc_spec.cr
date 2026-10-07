@@ -17,7 +17,6 @@ describe Gori::AltSvc do
       # RFC 7838 §3: `clear` tells the client to FORGET the alternatives it cached. Stripping
       # it would leave a client holding an h3 route gori had just taken the invitation for.
       Gori::AltSvc.h3_evidence("clear").should be_nil
-      Gori::AltSvc.advertises_h3?("clear").should be_false
     end
 
     it "matches the protocol-id as a whole token, never a substring" do
@@ -31,7 +30,6 @@ describe Gori::AltSvc do
       # the second half — so gori removed a field advertising no HTTP/3 at all, while the flow
       # advisory claimed it had removed an h3 advertisement.
       Gori::AltSvc.h3_evidence(%(fake=":443"; p="a, h3=x")).should be_nil
-      Gori::AltSvc.advertises_h3?(%(fake=":443"; p="a, h3=x")).should be_false
       # A backslash escapes the next octet inside the quotes, so the run does not end early.
       Gori::AltSvc.h3_evidence(%(fake=":443"; p="a\\", h3=x")).should be_nil
       # …and the separators that ARE separators still separate.
@@ -208,12 +206,23 @@ describe Gori::AltSvc do
     end
 
     it "leaves a head with no CRLF alone — it has no header block to read" do
-      # The scan takes `parse_headers`' view, and by that view a bare-LF head has no headers at
-      # all. Reading lines on LF instead made this scan see fields the parser never did.
-      original = "HTTP/1.1 200 OK\nALT-SVC: h3=\":443\"\n\n".to_slice
+      # The scan takes `parse_headers`' view, and by that view a head with no CRLF that is not
+      # ended on a bare-LF blank line has no headers at all. Reading lines on LF instead made
+      # this scan see fields the parser never did.
+      original = "HTTP/1.1 200 OK\nALT-SVC: h3=\":443\"\nX: 1".to_slice
       stripped, removed = Gori::AltSvc.strip_h3(original)
       removed.should be_empty
       stripped.to_unsafe.should eq(original.to_unsafe)
+    end
+
+    it "reads a head ended on a bare-LF blank line on LF, as the parser does" do
+      # `parse_response_head` reads this head on LF, so the scan does too — the same view, and
+      # each surviving line keeps its own terminator.
+      original = "HTTP/1.1 200 OK\nX-A: 1\r\nALT-SVC: h3=\":443\"\nX-B: 2\n\n".to_slice
+      Gori::Proxy::Codec::Http1.parse_response_head(original).headers.get?("Alt-Svc").should_not be_nil
+      stripped, removed = Gori::AltSvc.strip_h3(original)
+      removed.size.should eq(1)
+      String.new(stripped).should eq("HTTP/1.1 200 OK\nX-A: 1\r\nX-B: 2\n\n")
     end
 
     it "does not reach inside a field value that smuggles a bare LF" do

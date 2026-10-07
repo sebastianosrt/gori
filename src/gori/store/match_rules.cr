@@ -7,19 +7,39 @@ module Gori
 
     def match_rules : Array(MatchRule)
       list = [] of MatchRule
-      @db.query("SELECT id, enabled, target, part, CAST(pattern AS BLOB) AS pattern, CAST(replacement AS BLOB) AS replacement, op, match_kind, name, host, body_file FROM match_rules ORDER BY position, id") do |rs|
+      @db.query("SELECT id, enabled, target, part, CAST(pattern AS BLOB) AS pattern, CAST(replacement AS BLOB) AS replacement, op, match_kind, name, host, body_file, respond, respond_args FROM match_rules ORDER BY position, id") do |rs|
         rs.each do
+          id = rs.read(Int64)
+          enabled = rs.read(Int32) != 0
+          target_label = rs.read(String)
+          part_label = rs.read(String)
+          pattern = String.new(rs.read(Bytes))
+          replacement = String.new(rs.read(Bytes))
+          op_label = rs.read(String)
+          match_kind_label = rs.read(String)
+          name = rs.read(String)
+          host = rs.read(String)
+          body_file = rs.read(String)
+          respond_label = rs.read(String)
+          respond_args = rs.read(String)
           list << MatchRule.new(
-            rs.read(Int64), rs.read(Int32) != 0,
-            RuleTarget.from_label(rs.read(String)), RulePart.from_label(rs.read(String)),
+            id, enabled,
+            RuleTarget.from_label(target_label), RulePart.from_label(part_label),
             # pattern/replacement are OPERATOR bytes and rewrite live traffic: an MCP
             # `create_rule` can carry a real NUL (JSON permits \u0000), and reading a TEXT
             # column through the driver's NUL-terminated pointer truncated it — so the rule
             # that rewrote traffic was not the rule that was created, and `list_rules`
             # echoed the truncated form, making the discrepancy invisible everywhere.
-            String.new(rs.read(Bytes)), String.new(rs.read(Bytes)),
-            RuleOp.from_label(rs.read(String)), MatchKind.from_label(rs.read(String)),
-            rs.read(String), rs.read(String), rs.read(String))
+            pattern, replacement,
+            RuleOp.from_label(op_label), MatchKind.from_label(match_kind_label),
+            name, host, body_file,
+            unknown_target: RuleTarget.from_label?(target_label) ? nil : target_label,
+            unknown_part: RulePart.from_label?(part_label) ? nil : part_label,
+            unknown_op: RuleOp.from_label?(op_label) ? nil : op_label,
+            unknown_match_kind: MatchKind.from_label?(match_kind_label) ? nil : match_kind_label,
+            respond: RespondKind.from_label?(respond_label) || RespondKind.implied(body_file),
+            respond_args: respond_args,
+            unknown_respond: RespondKind.from_label?(respond_label) ? nil : respond_label)
         end
       end
       list
@@ -31,12 +51,18 @@ module Gori
     def insert_rule(target : RuleTarget, part : RulePart, pattern : String, replacement : String,
                     op : RuleOp = RuleOp::Replace, match_kind : MatchKind = MatchKind::Literal,
                     name : String = "", host : String = "", enabled : Bool = true,
-                    body_file : String = "") : Int64
+                    body_file : String = "", respond : String = "inline",
+                    respond_args : String = "") : Int64
+      # A stale-grammar process must not mix two grammars into one database — see
+      # `store/env_write_guard.cr`. The `pattern` is a needle or a regex and nothing expands it, so
+      # only the `replacement` is re-spelled — and not even that for a stub, whose replacement is
+      # a response sent as authored (`RuleOp#expands_tokens?`).
+      (w = env_write) && op.expands_tokens? && (replacement = w.call(replacement, EnvMigration::Kind::Rule))
       exec_task ->(c : DB::Connection) {
         pos = c.query_one("SELECT COALESCE(MAX(position), -1) + 1 FROM match_rules", as: Int64)
-        c.exec("INSERT INTO match_rules (enabled, target, part, pattern, replacement, op, match_kind, name, host, body_file, position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        c.exec("INSERT INTO match_rules (enabled, target, part, pattern, replacement, op, match_kind, name, host, body_file, respond, respond_args, position) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
           enabled ? 1 : 0, target.label, part.label, pattern, replacement,
-          op.label, match_kind.label, name, host, body_file, pos)
+          op.label, match_kind.label, name, host, body_file, respond, respond_args, pos)
         nil
       }
     end
@@ -52,10 +78,12 @@ module Gori
     # Returns whether the write committed (false = store busy/locked/closing).
     def update_rule(id : Int64, target : RuleTarget, part : RulePart, pattern : String, replacement : String,
                     op : RuleOp = RuleOp::Replace, match_kind : MatchKind = MatchKind::Literal,
-                    name : String = "", host : String = "", body_file : String = "") : Bool
+                    name : String = "", host : String = "", body_file : String = "",
+                    respond : String = "inline", respond_args : String = "") : Bool
+      (w = env_write) && op.expands_tokens? && (replacement = w.call(replacement, EnvMigration::Kind::Rule))
       exec_task_ok ->(c : DB::Connection) {
-        c.exec("UPDATE match_rules SET target = ?, part = ?, pattern = ?, replacement = ?, op = ?, match_kind = ?, name = ?, host = ?, body_file = ? WHERE id = ?",
-          target.label, part.label, pattern, replacement, op.label, match_kind.label, name, host, body_file, id)
+        c.exec("UPDATE match_rules SET target = ?, part = ?, pattern = ?, replacement = ?, op = ?, match_kind = ?, name = ?, host = ?, body_file = ?, respond = ?, respond_args = ? WHERE id = ?",
+          target.label, part.label, pattern, replacement, op.label, match_kind.label, name, host, body_file, respond, respond_args, id)
         nil
       }
     end
@@ -69,15 +97,28 @@ module Gori
     # of two rules touching the same header wins, so a caller that reports a swap the store
     # dropped leaves the operator believing an order that reverts at next start.
     def move_rule(id : Int64, dir : Int32) : Bool
-      ids = [] of Int64
-      @db.query("SELECT id FROM match_rules ORDER BY position, id") { |rs| rs.each { ids << rs.read(Int64) } }
-      i = ids.index(id)
+      rules = match_rules
+      move_position("match_rules", id, dir, rules.map(&.id), frozen: rules.select(&.inert?).map(&.id))
+    end
+
+    # The swap-and-renumber behind `move_rule`, `move_color_rule` and `move_display_column`.
+    # `ids` is the table's rows in display order (read here when not given); a `frozen` row on
+    # either side of the swap refuses it. False = nothing moved, or the write did not commit.
+    private def move_position(table : String, id : Int64, dir : Int32, ids : Array(Int64)? = nil,
+                              *, frozen : Array(Int64) = [] of Int64) : Bool
+      order = ids || begin
+        list = [] of Int64
+        @db.query("SELECT id FROM #{table} ORDER BY position, id") { |rs| rs.each { list << rs.read(Int64) } }
+        list
+      end
+      i = order.index(id)
       return false unless i
       j = i + (dir < 0 ? -1 : 1)
-      return false unless 0 <= j < ids.size
-      ids.swap(i, j)
+      return false unless 0 <= j < order.size
+      return false if frozen.includes?(order[i]) || frozen.includes?(order[j])
+      order.swap(i, j)
       exec_task_ok ->(c : DB::Connection) {
-        ids.each_with_index { |rid, pos| c.exec("UPDATE match_rules SET position = ? WHERE id = ?", pos, rid) }
+        order.each_with_index { |rid, pos| c.exec("UPDATE #{table} SET position = ? WHERE id = ?", pos, rid) }
         nil
       }
     end
@@ -104,8 +145,25 @@ module Gori
     # DEFAULT is the operator's own global choice, not an escalation, and the alternative
     # (raising) would take down the Rewriter tab and the proxy's rule load with it.
     def rewriter_overrides : Hash(Int64, Bool)
+      global_overrides(REWRITER_OVERRIDES_KEY)
+    end
+
+    # Returns whether the write committed (false = store busy/locked/closing → the caller must
+    # not report the toggle as applied; the rule keeps rewriting whatever it was rewriting).
+    def set_rewriter_override(id : Int64, enabled : Bool) : Bool
+      set_global_override(REWRITER_OVERRIDES_KEY, id, enabled)
+    end
+
+    # Drop this project's disagreement, so the rule follows the global default again.
+    def clear_rewriter_override(id : Int64) : Bool
+      clear_global_override(REWRITER_OVERRIDES_KEY, id)
+    end
+
+    # The one implementation behind both override maps (this one and
+    # `COLORMARKER_OVERRIDES_KEY`), which differ only in the settings key they live under.
+    private def global_overrides(key : String) : Hash(Int64, Bool)
       map = {} of Int64 => Bool
-      raw = setting(REWRITER_OVERRIDES_KEY)
+      raw = setting(key)
       return map if raw.nil? || raw.strip.empty?
       JSON.parse(raw).as_h?.try &.each do |k, v|
         id = k.to_i64?
@@ -117,23 +175,22 @@ module Gori
       {} of Int64 => Bool
     end
 
-    # Returns whether the write committed (false = store busy/locked/closing → the caller must
-    # not report the toggle as applied; the rule keeps rewriting whatever it was rewriting).
-    def set_rewriter_override(id : Int64, enabled : Bool) : Bool
-      write_rewriter_overrides(rewriter_overrides.merge({id => enabled}))
+    private def set_global_override(key : String, id : Int64, enabled : Bool) : Bool
+      write_global_overrides(key, global_overrides(key).merge({id => enabled}))
     end
 
-    # Drop this project's disagreement, so the rule follows the global default again.
-    def clear_rewriter_override(id : Int64) : Bool
-      map = rewriter_overrides
+    private def clear_global_override(key : String, id : Int64) : Bool
+      map = global_overrides(key)
       return true unless map.has_key?(id)
       map.delete(id)
-      write_rewriter_overrides(map)
+      write_global_overrides(key, map)
     end
 
-    private def write_rewriter_overrides(map : Hash(Int64, Bool)) : Bool
-      return delete_setting(REWRITER_OVERRIDES_KEY) if map.empty?
-      set_setting(REWRITER_OVERRIDES_KEY, map.to_h { |id, on| {id.to_s, on} }.to_json)
+    # An EMPTY map deletes the key outright rather than storing "{}" — which is what makes
+    # "the override disappeared when the two agreed again" observable from outside.
+    private def write_global_overrides(key : String, map : Hash(Int64, Bool)) : Bool
+      return delete_setting(key) if map.empty?
+      set_setting(key, map.to_h { |id, on| {id.to_s, on} }.to_json)
     end
   end
 end

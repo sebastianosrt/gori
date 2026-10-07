@@ -148,6 +148,20 @@ private def reimport(har : String) : Gori::Store::FlowDetail
 end
 
 describe Gori::Export::Har do
+  # `iso_micros` raised on a `created_at` outside the years 1–9999 and cut the HAR off
+  # mid-document; `startedDateTime` is required, so it is clamped to the nearest end.
+  it "writes a startedDateTime for an instant Time cannot hold" do
+    with_store do |store|
+      far = capture_flow(store, created_at: 253_402_387_139_000_000_i64)
+      early = capture_flow(store, created_at: -62_135_683_140_000_000_i64)
+      har, report = export([far, early])
+      report.written.should eq(2)
+      entries = JSON.parse(har)["log"]["entries"].as_a
+      entries[0]["startedDateTime"].as_s.should eq("9999-12-31T23:59:59.999Z")
+      entries[1]["startedDateTime"].as_s.should eq("0001-01-01T00:00:00.000Z")
+    end
+  end
+
   it "writes a HAR 1.2 log with the fields a reader needs" do
     with_store do |store|
       har, report = export([capture_flow(store)])
@@ -212,6 +226,19 @@ describe Gori::Export::Har do
     end
   end
 
+  # An origin-written `Expires` that is well-formed but impossible has no instant to export:
+  # the attribute is left out rather than failing the whole document.
+  it "leaves out a response cookie's Expires it cannot read" do
+    with_store do |store|
+      head = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n" \
+             "Set-Cookie: sid=xyz; Expires=Sat, 31 Feb 2026 00:00:00 GMT; Path=/\r\n" \
+             "Content-Length: 9\r\n\r\n"
+      cookie = JSON.parse(export([capture_flow(store, resp_head: head)])[0])["log"]["entries"][0]["response"]["cookies"][0]
+      cookie["name"].as_s.should eq("sid")
+      cookie["expires"]?.should be_nil
+    end
+  end
+
   it "round-trips: a HAR gori writes imports back as the same flow" do
     with_store do |store|
       detail = capture_flow(store,
@@ -238,6 +265,26 @@ describe Gori::Export::Har do
       back.row.duration_us.should eq(detail.row.duration_us)
 
       # …and exporting the re-imported flow reproduces the identical document.
+      export([back])[0].should eq(har)
+    end
+  end
+
+  it "round-trips colonless request header lines through its raw-head extension" do
+    with_store do |store|
+      raw_head = "GET /fold HTTP/1.1\r\nHost: shop.test\r\nX-Note: a\r\n" \
+                 " folded-no-colon\r\nNoColonLine\r\nConnection: close\r\n\r\n"
+      raw_response_head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Note: a\r\n" \
+                          " folded-no-colon\r\nNoColonLine\r\nContent-Length: 9\r\n\r\n"
+      detail = capture_flow(store, req_head: raw_head, resp_head: raw_response_head,
+        target: "/fold", content_type: "text/plain")
+      har = export([detail])[0]
+      entry = JSON.parse(har)["log"]["entries"][0]
+
+      entry["request"]["_goriRawRequestHead"].as_s.should eq(Base64.strict_encode(raw_head.to_slice))
+      entry["response"]["_goriRawResponseHead"].as_s.should eq(Base64.strict_encode(raw_response_head.to_slice))
+      back = reimport(har)
+      back.request_head.should eq(raw_head.to_slice)
+      back.response_head.not_nil!.should eq(raw_response_head.to_slice)
       export([back])[0].should eq(har)
     end
   end

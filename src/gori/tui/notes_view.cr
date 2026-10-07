@@ -27,7 +27,8 @@ module Gori::Tui
   class NotesView
     DOCS_KEY = Notes::DOCS_KEY # JSON {"cur":Int32, "notes":[String, ...]}
 
-    # One note document: a title is derived from its first non-blank line, so
+    # One note document: a title is derived from its first line with text, Markdown
+    # heading marker removed (`Notes.title`), so
     # there's no separate rename mode — the tab label tracks what you type.
     class Note
       include SubtabRef # a sub-tab strip may hold a mark on this note (#683)
@@ -44,12 +45,16 @@ module Gori::Tui
         @area.wrap = true
       end
 
-      # Sub-tab label: the note's title (first non-blank line, trimmed) truncated
+      # Sub-tab label: the note's title (`Notes.title` — first line with text, trimmed,
+      # with any Markdown heading marker dropped) truncated
       # to the chip width, else a positional fallback so empty notes are still
       # addressable. The title rule itself lives in `Notes.title` — the single
       # source of truth the CLI listing reads too, so labels can't drift.
+      #
+      # Read off the editor's lines, not `@area.text`: the strip calls this for every chip
+      # several times a frame, and `text` joins the whole note to read its first line.
       def label(idx : Int32) : String
-        if t = Notes.title(@area.text)
+        if t = Notes.title(@area.each_line)
           t.size > 15 ? "#{t[0, 14]}…" : t
         else
           "note #{idx + 1}"
@@ -75,8 +80,24 @@ module Gori::Tui
       # OTHER note's links wait for `Notes.save`'s post-commit cleanup, which is what keeps a
       # refused save from destroying the evidence of a note that is still there.
       @unpersisted = Set(Int64).new
+      # Each note's text as this session last knew it to be PERSISTED (LF-normalized, as the
+      # buffer is): set by a merge from the store and by a committed save, per note. A save
+      # sends only the notes whose buffer differs from this, or that have none (new here).
+      # Sending every loaded note let an untouched one count as "an edit that wins" in
+      # `Notes.merge`, and since `reload` is skipped while dirty, that copy is stale exactly
+      # when a peer wrote during an edit: the save reverted the peer's note (#1415).
+      #
+      # The ctor's placeholder note starts with an empty baseline. Its id is the literal 1, which
+      # a real note can hold (`Notes.create` mints it), so a save made before any merge — the
+      # startup reload failed, and another tab writes a note — must not send it as an edit that
+      # empties that note. Typed into, it differs from "" and is sent like any other.
+      @baseline = {1_i64 => ""}
       @mode = InputMode::Read
       @read = TextReadState.new
+      # The two stored rows (DOCS_KEY, LEGACY_KEY) the note list was last merged FROM — see
+      # `reload`. nil until the first merge, and dropped by every save: after one the list is
+      # this session's own edits, not a merge of any row, so the next reload has to merge.
+      @merged_raw = nil.as({String?, String?}?)
     end
 
     # Allocate a cross-session-unique note id. A random 63-bit id (not a shared
@@ -86,7 +107,7 @@ module Gori::Tui
     # unlikely for any realistic note count.
     private def alloc_note_id : Int64
       id = Random::Secure.rand(1_i64..0x7fff_ffff_ffff_ffff_i64)
-      @next_id = {@next_id, id + 1}.max
+      @next_id = {@next_id, id &+ 1}.max
       @unpersisted << id
       id
     end
@@ -115,9 +136,27 @@ module Gori::Tui
     # unchanged — that preserves caret, scroll, and read-mode selection across
     # capture/ui_state writes that falsely look like "external" commits.
     # Dirty buffers are never touched (caller should also skip when dirty).
+    #
+    # Returns early when the stored rows are byte-for-byte the ones the list was last merged
+    # from: re-merging them would change nothing — `soft_merge_from` keeps every unchanged note
+    # as it is — and it is not cheap. This runs on every data_version tick while the tab is up
+    # (~1.3x a second during capture, every ~3 s idle), and the merge JSON-parses the whole set
+    # and re-joins each editor buffer to compare it; 4 notes of 750 KB was ~20 ms and 11 MB of
+    # garbage per tick for a set nobody had touched. The shortcut holds because the list only
+    # leaves "merged from `@merged_raw`" through a local change, which sets `@dirty` (and so
+    # returns above) until a save — and a save drops `@merged_raw`.
+    #
+    # The comparison runs in SQLite (`setting_is?`), so an unchanged set is not even copied
+    # out of the store.
     def reload(store : Store) : Nil
       return if @dirty
-      soft_merge_from(Notes.load(store))
+      if (m = @merged_raw) && store.setting_is?(Notes::DOCS_KEY, m[0]) &&
+         store.setting_is?(Notes::LEGACY_KEY, m[1])
+        return
+      end
+      raw = {store.setting(Notes::DOCS_KEY), store.setting(Notes::LEGACY_KEY)}
+      soft_merge_from(Notes.doc_from(raw[0], raw[1]))
+      @merged_raw = raw
     end
 
     # Apply a loaded Doc onto the live note list by stable note id.
@@ -126,6 +165,10 @@ module Gori::Tui
       @notes.each { |n| by_id[n.id] = n }
 
       merged = [] of Note
+      # A merge only runs on a clean list, so every buffer the document carried ends up holding
+      # its persisted text: that text is each note's new baseline. It is read off the buffer,
+      # not normalized from `e.text`, so it equals what `save` will compare it with.
+      baseline = {} of Int64 => String
       doc.notes.each do |e|
         if existing = by_id[e.id]?
           # Compare on a CRLF-normalized basis: the TextArea buffer is ALWAYS LF (set_text
@@ -135,15 +178,20 @@ module Gori::Tui
           # positional args / STDIN (piping a CRLF file, or `gori run flow N --raw`, stores
           # CRLF). Without normalizing, a CRLF note compares unequal on EVERY poll, so set_text
           # re-ran ~1.3×/s during capture and zeroed the caret + scroll and cleared undo.
-          if existing.area.text != TextArea.normalize_lf(e.text)
+          text = existing.area.text
+          if text != TextArea.normalize_lf(e.text)
             # Peer (or our own saved) content genuinely changed — replace body; caret resets
             # with set_text, which is correct here: the text under it is no longer the same.
             existing.area.set_text(e.text)
+            text = existing.area.text
           end
           # Same text → keep the TextArea object (caret/scroll/undo stack intact).
           merged << existing
+          baseline[e.id] = text
         else
-          merged << Note.new(e.id, e.text)
+          note = Note.new(e.id, e.text)
+          merged << note
+          baseline[e.id] = note.area.text
         end
       end
       if merged.empty?
@@ -161,8 +209,13 @@ module Gori::Tui
         end
       @next_id = {@next_id, doc.next_id}.max
       doc.notes.each { |e| @unpersisted.delete(e.id) }
+      @baseline = baseline
       @dirty = false
-      # Leave @mode / @read alone — soft merge must not force READ or drop selection.
+      # Leave @mode alone — soft merge must not force READ. `@read` is left alone too, and
+      # that is right for BOTH branches above only because of `TextReadState#bind`: the skip
+      # keeps the same buffer at the same revision, so the band survives; the `set_text`
+      # moves the editor's `edits`, so the band — whose anchor indexed the text that was just
+      # replaced — is dropped the next time the state is asked anything (#1123 in Issues).
     end
 
     def count : Int32
@@ -182,7 +235,7 @@ module Gori::Tui
       (0 <= idx < @notes.size) ? @notes[idx] : nil
     end
 
-    # The current note's sub-tab label (first non-blank line, or "note N") — used
+    # The current note's sub-tab label (`Notes.title`, or "note N") — used
     # by the Runner's close-confirmation message.
     def current_label : String
       current.label(@current.clamp(0, @notes.size - 1))
@@ -221,6 +274,11 @@ module Gori::Tui
       @mode == InputMode::Insert
     end
 
+    # The note buffer READ-mode edits run against (`TabController#editor_text_buffer`).
+    def read_edit_buffer : {TextArea, TextReadState}
+      {current.area, @read}
+    end
+
     def enter_insert! : Nil
       @mode = InputMode::Insert
       @read.sync_from(current.area)
@@ -252,7 +310,7 @@ module Gori::Tui
     end
 
     def selection? : Bool
-      insert_mode? ? current.area.selection? : @read.selection?
+      insert_mode? ? current.area.selection? : @read.selection?(current.area)
     end
 
     def select_line : Nil
@@ -374,24 +432,48 @@ module Gori::Tui
       true
     end
 
-    # Mouse: place the cursor at a click. `rect` is the framed interior the runner
-    # passes to render; re-apply render's 1-col side inset so the editor geometry matches.
-    def click_to_cursor(rect : Rect, mx : Int32, my : Int32) : Nil
-      enter_insert!
-      current.area.click_to_cursor(editor_rect(rect), mx, my)
+    # Mouse: place the cursor at a click, IN THE MODE THE PANE IS ALREADY IN. `rect` is the
+    # framed interior the runner passes to render; re-apply render's 1-col side inset so the
+    # editor geometry matches.
+    #
+    # The `enter_insert!` that used to lead this method is gone (#1124). A click is how you
+    # aim, not how you ask to type — and forcing INSERT here meant the next bare letter was
+    # typed instead of run, so `y` put a `y` in the note rather than copying, over whatever
+    # was selected. Every other read/insert editor in the TUI (the Repeater request pane, the
+    # Fuzzer template, the Decoder / JWT / Cookie inputs) already splits the click this way;
+    # this pane, the Issue notes card and the Project description were the three that did not.
+    # INSERT is now entered the way the keyboard enters it — `i` / ↵ — or by clicking the
+    # NOR/INS chip the card's own border draws.
+    def click_to_cursor(rect : Rect, mx : Int32, my : Int32, selecting : Bool = false) : Nil
+      inner = editor_rect(rect)
+      if insert_mode?
+        current.area.click_to_cursor(inner, mx, my, selecting: selecting)
+      else
+        # Through the read state, not the editor: `@read` owns the band this mode PAINTS, and
+        # its `click` is also what COLLAPSES a standing ⇧arrow selection (`sync_from` leaves
+        # the anchor alone on purpose — see `ReadCursor#sync`).
+        @read.click(current.area, inner, mx, my, selecting: selecting)
+      end
     end
 
-    # Mouse DRAG — extend the selection to the pointer. The click already put this pane in
-    # INSERT, so the selection is the editor's own (the band `TextArea#render` paints).
+    # Mouse DRAG — extend the selection to the pointer, through whichever selection model the
+    # current mode owns (INS: the editor's own anchor, painted by `TextArea#render`; READ:
+    # `@read`, painted by `paint_chrome`). One call, so the drag can never land on a different
+    # rect — or a different model — than the press it continues.
     def drag_to_cursor(rect : Rect, mx : Int32, my : Int32) : Nil
-      return unless insert_mode?
-      current.area.click_to_cursor(editor_rect(rect), mx, my, selecting: true)
+      click_to_cursor(rect, mx, my, selecting: true)
     end
 
-    # Mouse DOUBLE-CLICK — select the word under the pointer.
+    # Mouse DOUBLE-CLICK — select the word under the pointer, in the current mode. In READ
+    # that is a band `y` copies; it used to be unreachable here, because the gesture forced
+    # INSERT first and a bare `y` then typed over the word it had just selected.
     def select_word_at(rect : Rect, mx : Int32, my : Int32) : Bool
-      enter_insert!
-      current.area.select_word_at(editor_rect(rect), mx, my)
+      inner = editor_rect(rect)
+      if insert_mode?
+        current.area.select_word_at(inner, mx, my)
+      else
+        @read.select_word(current.area, inner, mx, my)
+      end
     end
 
     # render's 1-col side inset, applied once so click, drag and double-click share it.
@@ -456,14 +538,9 @@ module Gori::Tui
       @dirty = true
     end
 
-    # Close the current note. Returns the closed note's id (for link cleanup), or nil
-    # when nothing was removed. Always keeps at least one note open.
-    def close_note : Int64?
-      close_note_at(@current)
-    end
-
-    # Close note `idx` — the index-taking form, so a batch close (#683) can walk the marked
-    # chips instead of switching the active note to each one first. Always keeps ≥1 note.
+    # Close note `idx`. Returns the closed note's id (for link cleanup), or nil when nothing
+    # was removed. Index-taking, so a batch close (#683) can walk the marked chips instead of
+    # switching the active note to each one first. Always keeps ≥1 note open.
     def close_note_at(idx : Int32) : Int64?
       return nil unless 0 <= idx < @notes.size
       closed_id = @notes[idx].id
@@ -506,9 +583,17 @@ module Gori::Tui
     # write was attempted and rolled back. `NotesController#save_notes` says so on the status
     # line; the buffers and `@dirty` are left exactly as they were, so the text is still on
     # screen and the next save path (esc, a sub-tab switch, quit) is a real retry.
+    #
+    # Only the notes this session changed go into the merge — see `@baseline`. A note whose
+    # buffer still matches its baseline is not ours to write: the persisted copy (a peer's
+    # edit, or a peer's delete) stands.
     def save(store : Store) : Bool
       return true unless @dirty
-      mine = @notes.map { |n| Notes::NoteEntry.new(n.id, n.area.text) }
+      mine = [] of Notes::NoteEntry
+      @notes.each do |n|
+        text = n.area.text
+        mine << Notes::NoteEntry.new(n.id, text) unless @baseline[n.id]? == text
+      end
       # `Notes.save` runs that merge INSIDE the write transaction. Merging against a set read
       # by a separate statement kept the promise only until a peer wrote between the two: the
       # document we then committed was built before their row landed, so their note was gone
@@ -522,6 +607,12 @@ module Gori::Tui
       # newly-minted note persisted, so its id leaves `@unpersisted` here and nowhere else.
       @next_id = merged.next_id
       merged.notes.each { |n| @unpersisted.delete(n.id) }
+      # What we sent is what is on disk now. An unsent note keeps its old baseline even when
+      # the merged document carries a peer's newer text for it: the buffer still holds the old
+      # one until the next `reload`, and the two must agree or a later save would send it.
+      mine.each { |n| @baseline[n.id] = n.text }
+      # The list is our edits now, not a merge of any stored row — see `reload`.
+      @merged_raw = nil
       # …and `@dirty` only comes down on a write that COMMITTED. Clearing it regardless meant
       # a rolled-back write (project busy) silently dropped the operator's notes: the flag was
       # the only thing that would have made a later exit path try again. Same correction as
@@ -566,7 +657,7 @@ module Gori::Tui
     end
 
     # Sub-tab chip labels (one per note), sourced by the Runner's shared strip: each
-    # note's first non-blank line, with a positional fallback for empty notes.
+    # note's title (`Notes.title`), with a positional fallback for empty notes.
     def subtab_labels : Array(String)
       @notes.map_with_index { |note, i| "#{i + 1}:#{note.label(i)}" }
     end

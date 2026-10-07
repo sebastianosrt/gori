@@ -42,6 +42,25 @@ describe Gori::Tui::DecoderView do
     b.contains?("plain text").should be_true
   end
 
+  it "paints the rebound output-mode chord on the OUTPUT card" do
+    previous = Gori::Settings.keymap_overrides
+    begin
+      Gori::Settings.keymap_overrides = {"decoder.mode" => ["alt-x"]}
+      view = DecoderView.new
+      view.set_registry(Gori::Verbs.registry)
+      input = TextArea.new("plain text")
+      result = Gori::Decoder.run(REG, input.text.to_slice, "")
+      backend = MemoryBackend.new(80, 30)
+      view.render(Screen.new(backend), Rect.new(0, 0, 80, 30),
+        input: input, chain: "", chain_cx: 0, chain_pre: "",
+        result: result, pane: :output, focused: true, popup: ChainComplete.new)
+      backend.contains?("⌥X:AUTO").should be_true
+      backend.contains?("^X:AUTO").should be_false
+    ensure
+      Gori::Settings.keymap_overrides = previous
+    end
+  end
+
   it "renders a failed step in the pipeline without crashing" do
     b = render_decoder(input: "!!notbase64!!", chain: "base64-decode > sha256")
     b.contains?("✗").should be_true
@@ -63,6 +82,29 @@ describe Gori::Tui::DecoderView do
     b = render_decoder(input: "x", chain: "bas", pane: :chain, popup: popup)
     b.contains?("base64-encode").should be_true
     b.contains?("base64url-encode").should be_true
+  end
+
+  it "keeps the dropdown inside the body when a match is as wide as the card" do
+    # The dropdown starts two cells in (past the "› " prompt) but was clamped to the FIELD's
+    # full width, so a match as long as the card — `quoted-printable-encode` on a narrow body,
+    # or any saved chain the operator named at length — ran past the field and painted outside
+    # the body rect altogether.
+    body_w = 26
+    popup = ChainComplete.new
+    popup.set(["quoted-printable-encode"], 0, 0)
+    view = DecoderView.new
+    reg = Gori::Decoder.default_registry
+    backend = MemoryBackend.new(body_w + 8, 20) # a screen wider than the body, to see a spill
+    view.render(Screen.new(backend), Rect.new(0, 0, body_w, 20),
+      input: TextArea.new("x"), chain: "", chain_cx: 0, chain_pre: "",
+      result: Gori::Decoder.run(reg, "x".to_slice, ""), pane: :chain, focused: true, popup: popup)
+    (0...20).each do |y|
+      backend.row(y)[body_w..].strip.should be_empty, "row #{y} painted past the body"
+    end
+    backend.contains?("quoted-printable-enc").should be_true # ...and it is still readable
+    # The CHAIN card stays closed: the dropdown is clamped to the FIELD, so the card's own
+    # bottom-right corner is the one cell on that row it does not take.
+    backend.row(7).should end_with("╯#{" " * 8}")
   end
 
   # The save/load mini-prompt this view used to draw over the OUTPUT region is gone: naming
@@ -244,18 +286,12 @@ end
 describe "DecoderView OUTPUT control bytes" do
   # Decoding is precisely where raw control bytes surface — an unhex/base64 of a binary blob is
   # the whole point of the tab. The OUTPUT rows draw through `screen.text`, which gives every
-  # control char a cell, and the retired h-scroll clamp measured them with `display_width`, where
-  # those chars are 0 columns: its ceiling fell short of the real content and the tail of such a
-  # line could not be reached at all.
-  #
-  # The pane wraps now, so the clamp is gone and the same hazard lives in the WRAP measure
-  # instead — `Wrap.layout` breaks on `Screen.grapheme_cols`, the same ≥1-per-cluster measure
-  # the draw advances by. That is what this pins: a line of tabs must break at the pane's edge
-  # and its tail must land on a continuation row, not be counted as 14 columns and never wrap.
+  # A decoded tab is rendered as ⟨TAB⟩, and wrapping must count that badge's width to keep the
+  # tail reachable in the OUTPUT pane.
   it "wraps a decoded line containing control bytes so its end is reachable" do
     line = "STARTTOK#{"\t" * 100}ENDTOK"
-    Screen.display_width(line).should eq(14) # the raw measure: 60 tabs count for nothing
-    Screen.draw_width(line).should eq(114)   # what `text` paints: one cell per tab
+    Screen.display_width(line).should eq(514)
+    Screen.draw_width(line).should eq(514)
     input = line.to_slice.hexstring
     result = Gori::Decoder.run(REG, input.to_slice, "unhex")
     String.new(result.output.not_nil!).should eq(line) # the decode really produced the tabs
@@ -280,8 +316,7 @@ describe "DecoderView OUTPUT control bytes" do
     card = rows.join("\n")
     card.should contain("STARTTOK")
     card.should contain("ENDTOK") # the tail wrapped onto a later row rather than being clipped
-    # …and onto a DIFFERENT row: the tabs were measured at one cell each, so the 114-column
-    # line broke at the pane's edge instead of being called 14 columns wide and left unwrapped.
+    # …and onto a DIFFERENT row: the named badges are included in the wrap measure.
     start_row = rows.index { |r| r.includes?("STARTTOK") }.not_nil!
     end_row = rows.index { |r| r.includes?("ENDTOK") }.not_nil!
     end_row.should be > start_row

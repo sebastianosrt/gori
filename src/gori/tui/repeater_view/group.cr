@@ -34,20 +34,17 @@ class Gori::Tui::RepeaterView
 
   # "Minimize request" removes header/cookie/param lines from the plain-text request and
   # re-sends to verify the response is unchanged.
-  def minimizable? : Bool
-    minimize_refusal.nil?
-  end
-
-  # Why minimize cannot run on this buffer, or nil. Public and NAMED because these are three
-  # different problems and "not minimizable" answers none of them; `minimizable?` is defined
-  # in terms of it so the predicate and the sentence cannot drift.
+  #
+  # Why minimize cannot run on this buffer, or nil (nil = minimizable). Public and NAMED
+  # because these are three different problems and "not minimizable" answers none of them;
+  # the predicate and the sentence are one method, so they cannot drift.
   #
   # The `%%%` clause is the third whole-buffer reader on this branch. `repeater_minimize`
   # never calls `request_bytes` — it snapshots `request_text` and re-syncs Content-Length
   # over the whole buffer in its own `resolve` — so the framing `^R` now refuses ONCE, a
   # minimize did up to `Minimize::SEND_CAP` times in one keypress:
   #
-  #   pane     Content-Length: 3     minimizable?  true
+  #   pane     Content-Length: 3     minimize_refusal  nil
   #   resolve  Content-Length: 60    ×hundreds of probe sends
   #
   # Unlike `group_framing_refusal` this is NOT scoped to auto-CL: `Minimize.run` reads
@@ -142,14 +139,16 @@ class Gori::Tui::RepeaterView
   # Scoped to auto-CL ON, because that is exactly when gori has written a number of its
   # own. With `^L` off the pane, `^R` and `g` all carry the operator's numbers unchanged,
   # nothing is invented, and a literal `%%%` line in a body stays expressible — which is
-  # why the message names `^L` as the second remedy and not just `space ▸ g`.
+  # why the message names `^L` as the second remedy and not just Send group. The route to Send
+  # group is a `{space:…}` token: the view has no registry, so the controller that surfaces the
+  # refusal expands it (`RepeaterController#chain_refusal`) and the letter is never typed here.
   #
   # An EVIDENCE buffer whose capture merely CONTAINS `%%%` never reaches this: its separator
   # is not live (see `pipeline_live?`), nothing chunks, and `^R` sends it byte-exact.
   private def group_framing_refusal : String?
     return nil unless chunked_reflection?(@editor.wire_lines)
     "request holds a %%% separator, so its Content-Length describes the first request only — " \
-    "space ▸ g sends the group on one connection, or turn ^L off to send the buffer whole as one request"
+    "{space:repeater.send-group} sends the group on one connection, or turn ^L off to send the buffer whole as one request"
   end
 
   # Is the visible head carrying CHUNK-scoped Content-Lengths? The single predicate behind
@@ -182,12 +181,75 @@ class Gori::Tui::RepeaterView
   private def seed_draft_baselines : Nil
     wire = @editor.wire_text
     @evidence_pipeline_seps = pipeline_sep_count_in(wire)
-    @evidence_env_names = Env.token_names(wire).to_set
-    # Assigned unconditionally, including the empty set a draft gets: a loader can turn a
-    # tab that WAS evidence into one that isn't (load_blank after a ^R, a duplicate), and a
-    # stale literal set would keep painting resolvable tokens as unknown on a buffer that
-    # substitutes every one of them.
-    @editor.env_literal_names = @evidence ? @evidence_env_names : Set(String).new
+    adopt_evidence_env_seed(wire)
+  end
+
+  # Record the SEED BYTES every `$NAME` baseline is derived from, and derive them now — the
+  # env-var pass's names, the send seam's literal set, and the editor's painted one.
+  #
+  # The bytes rather than the name sets, because every derivation reads the token GRAMMAR and
+  # the operator can flip it mid-session (Project tab `s`, Settings env card `s`): a set computed
+  # under one grammar answers the wrong question under the other. Seeded namespaced and flipped
+  # to bare, a captured GraphQL `$id` was in NEITHER set — `token_names(ns: Env)` had found no
+  # namespaced token to name, so `vars_without({})` handed the send path the whole table and the
+  # capture's `$id` was substituted. Flipped the other way, the literal set held the bare `id`
+  # while the painter asks about `ENV.id`.
+  #
+  # Assigned unconditionally, including on a draft: a loader can turn a tab that WAS evidence
+  # into one that isn't (load_blank after a ^R, a duplicate), and a stale baseline would keep
+  # withholding substitution on a buffer that expands every token.
+  private def adopt_evidence_env_seed(wire : String) : Nil
+    @evidence_env_seed = wire
+    @evidence_env_rev = Env.highlight_rev
+    @evidence_env_names = derive_evidence_env_names(wire)
+    @evidence_send_literals = Env.literal_keys(wire)
+    # The EDITOR is keyed by what it PAINTS — a qualified `ENV.id` under the namespaced grammar
+    # and a bare `id` under the bare one — so it is handed the BYTES too and re-derives its own
+    # set on the same signal (`TextArea#env_literal_source=`).
+    @editor.env_literal_source = @evidence ? wire : nil
+  end
+
+  # BARE names in the ENV namespace: this set feeds `Env.vars_without`, which SUBTRACTS from a
+  # table keyed by bare name (see `operator_env_vars`). Qualified keys would subtract nothing and
+  # every captured `$id` would resolve again.
+  private def derive_evidence_env_names(wire : String) : Set(String)
+    Env.token_names(wire, ns: Env::Namespace::Env).to_set
+  end
+
+  # The baseline, re-derived from the seed bytes when the grammar moved under it. Read through
+  # this and never off the ivar: the one consumer that mattered is on the SEND path
+  # (`operator_env_vars`), where being one grammar behind means putting a project value into a
+  # request nobody captured.
+  protected def evidence_env_names : Set(String)
+    refresh_evidence_baselines
+    @evidence_env_names
+  end
+
+  # The capture's names as the SEND seam looks them up — `Repeater::PlanOptions#evidence_literals`,
+  # which decides which `$BIND`/`$GEN` tokens in an evidence tab are the operator's.
+  #
+  # Empty on a draft, where every token is the operator's, and the caller passes it only for an
+  # evidence tab (`RepeaterController#repeater_plan`) — a set is what turns the send pass back
+  # on down there, so handing one over for a draft would say something true about the names and
+  # nothing about provenance.
+  #
+  # `Env.literal_keys` and not `token_names`: this set is looked up by the QUALIFIED key under
+  # the namespaced grammar and the bare one under bare, which is what `literal_keys` stores and
+  # exactly what the editor is handed for painting (`TextArea#env_literal_source=`). One
+  # derivation for both, so the tokens the pane greys out as literal are the ones the socket
+  # gets literally.
+  def evidence_send_literals : Set(String)
+    refresh_evidence_baselines
+    @evidence_send_literals
+  end
+
+  # Both baselines answer the grammar's question, so they move together when it flips.
+  private def refresh_evidence_baselines : Nil
+    rev = Env.highlight_rev
+    return if @evidence_env_rev == rev
+    @evidence_env_rev = rev
+    @evidence_env_names = derive_evidence_env_names(@evidence_env_seed)
+    @evidence_send_literals = Env.literal_keys(@evidence_env_seed)
   end
 
   # The same count over raw text, for seeding the baseline at load/restore.

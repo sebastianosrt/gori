@@ -9,6 +9,14 @@ module Gori
   struct Project
     DB_FILE = "gori.db"
 
+    # The settings key holding the operator-written description — what the project is FOR,
+    # typed on the Project tab or handed to `create`/`create_project` at birth. One home,
+    # beside the DB filename, because it already had two spellings (the registry's write and
+    # the Project tab's read) and each surface that learns to report it would otherwise add
+    # another: a reader keyed on a typo is an empty description, which reads as a project
+    # that was never described.
+    DESCRIPTION_KEY = "description"
+
     getter name : String
     getter db_path : String
     getter? ephemeral : Bool
@@ -40,8 +48,8 @@ module Gori
     # a project opened in another window is listening, so it reported the wrong port, or a
     # live project with no address.
     #
-    # The canonical registry db keeps the legacy per-directory path, so the picker's
-    # `CaptureStatus.read(project.dir)` (and every existing marker on disk) is unchanged.
+    # The canonical registry db keeps the legacy per-directory path, so the picker's read of
+    # `CaptureStatus.path(project.dir)` (and every existing marker on disk) is unchanged.
     def capture_status_path : String
       sidecar_path(CaptureStatus.path(dir), ".capture.status")
     end
@@ -105,7 +113,7 @@ module Gori
     # moment the project was CREATED for the entire time it is open: the Project tab drew
     # `Activity` older than `Created`, and every peer reading a live project (MCP
     # `list_projects`, `gori run project list`, a second TUI's picker) saw the same stale
-    # value. `Store.captured_flows` already guards the OPPOSITE direction (a read-only
+    # value. `Store.project_census` already guards the OPPOSITE direction (a read-only
     # census's close checkpoints and would stamp a project "just active", so it puts the
     # mtime back); this is the direction that was never covered.
     #

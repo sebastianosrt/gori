@@ -222,9 +222,9 @@ describe "HistoryView — user-defined columns" do
     end
   end
 
-  # `flows.id` is a REUSABLE rowid: a clear restarts numbering, and the next capture lands on
-  # an id the memo may still be holding. Keying on the id alone painted the CLEARED flow's
-  # value on the new one's row — the one failure a display column must never have.
+  # `flows.id` was a REUSABLE rowid before V39: a clear restarted numbering, and the next
+  # capture landed on an id the memo may still be holding. Keying on the id alone painted the
+  # CLEARED flow's value on the new one's row — the one failure a display column must never have.
   it "does not serve a cleared flow's value to a new flow that reuses its rowid" do
     tmp_store do |store|
       old_id = add_flow(store, "before-clear")
@@ -239,6 +239,7 @@ describe "HistoryView — user-defined columns" do
       # own clear/delete paths, and this is the case those two cannot cover: a peer process
       # wiping the project. The `{id, created_at}` key is what has to hold here.
       store.clear_flows
+      reissue_rowids(store)
       new_id = add_flow(store, "after-clear")
       new_id.should eq(old_id) # the rowid really was reused — otherwise this proves nothing
 
@@ -327,6 +328,106 @@ describe "HistoryView — user-defined columns" do
       text = screen_text(view)
       text.should contain("RID")
       text.should_not contain("alpha-1")
+    end
+  end
+end
+
+# A flow with a chosen response head, so the CACHE column can read its cache headers.
+private def add_cache_flow(store, cache_lines : Array(String) = [] of String) : Int64
+  CLOCK[0] += 1000
+  id = store.insert_flow(Gori::Store::CapturedRequest.new(
+    created_at: CLOCK[0], scheme: "http", host: "h.test", port: 80,
+    method: "GET", target: "/x", http_version: "HTTP/1.1",
+    head: "GET /x HTTP/1.1\r\nHost: h.test\r\n\r\n".to_slice,
+    source: Gori::FlowSource::Kind::Proxy))
+  head = "HTTP/1.1 200 OK\r\n" + cache_lines.map { |l| "#{l}\r\n" }.join + "\r\n"
+  store.update_response(Gori::Store::CapturedResponse.new(
+    flow_id: id, status: 200, head: head.to_slice))
+  id
+end
+
+# The built-in CACHE column (#1247), read from the response head for on-screen rows only.
+describe "HistoryView — CACHE column" do
+  it "draws the CACHE header and the normalised signal, blank for a response with no cache headers" do
+    tmp_store do |store|
+      add_cache_flow(store, ["X-Cache: HIT", "Age: 30"])
+      add_cache_flow(store, ["CF-Cache-Status: DYNAMIC"])
+      add_cache_flow(store) # no cache headers → none → blank
+
+      view = HistoryView.new
+      view.set_column_store(store)
+      view.set_query("cache:hit OR cache:dynamic OR cache:none")
+      view.reload(store)
+
+      text = screen_text(view)
+      text.should contain("CACHE")
+      text.should contain("HIT")
+      text.should contain("DYN")
+    end
+  end
+
+  it "leaves the CACHE column hidden, and does not read response heads, by default" do
+    tmp_store do |store|
+      10.times { add_cache_flow(store, ["X-Cache: HIT"]) }
+      view = HistoryView.new
+      view.set_column_store(store)
+      view.reload(store)
+
+      store.reset_counts
+      text = screen_text(view)
+      text.should_not contain("CACHE")
+      store.get_flow_calls.should eq(0)
+    end
+  end
+
+  it "shows CACHE when an active saved view filters on cache status" do
+    tmp_store do |store|
+      add_cache_flow(store, ["X-Cache: HIT"])
+      view = HistoryView.new
+      view.set_column_store(store)
+      view.set_view(Gori::SavedViews::View.new("cache", "Cache hits", "cache:hit", "project"))
+      view.reload(store)
+
+      screen_text(view).should contain("CACHE")
+    end
+  end
+
+  it "reads the head only for rows on screen, and remembers what it read" do
+    tmp_store do |store|
+      40.times { add_cache_flow(store, ["X-Cache: HIT"]) }
+      view = HistoryView.new
+      view.set_column_store(store)
+      view.set_query("cache:hit")
+      view.reload(store)
+
+      store.reset_counts
+      screen_text(view)
+      drawn = store.get_flow_calls
+      drawn.should be > 0
+      drawn.should be < 20 # ~one per on-screen row, not the whole 40-row window
+
+      store.reset_counts
+      screen_text(view)
+      store.get_flow_calls.should eq(0) # memoised — a second frame re-reads nothing
+    end
+  end
+
+  it "shares its read with a user column — one get_flow per row feeds both" do
+    tmp_store do |store|
+      20.times { add_cache_flow(store, ["X-Cache: HIT"]) }
+      view = HistoryView.new
+      view.set_column_store(store)
+      view.set_columns([header_column]) # a user column that also reads the head
+      view.set_query("cache:hit")
+      view.reload(store)
+
+      store.reset_counts
+      text = screen_text(view)
+      per_row = store.get_flow_calls
+      per_row.should be > 0
+      per_row.should be < 20 # NOT doubled: the CACHE signal rides the column's own read
+      text.should contain("CACHE")
+      text.should contain("HIT")
     end
   end
 end

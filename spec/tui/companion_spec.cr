@@ -3,6 +3,11 @@ require "../support/memory_backend"
 
 include Gori::Tui
 
+# The three assembled art rows, from the `glyph` the draw path stamps cell by cell.
+private def mascot_rows(frame : Mascot::Frame) : Array(String)
+  (0..2).map { |row| String.build { |io| Mascot::W.times { |col| io << Mascot.glyph(frame, col, row) } } }
+end
+
 # Runs `block` with Miss Ring forced on/off (and a motion mode), restoring both.
 private def with_companion(enabled : Bool, motion : String = "lively", notices : Bool = true, &)
   prev = {Gori::Settings.companion?, Gori::Settings.companion_motion, Gori::Settings.companion_notices?}
@@ -15,6 +20,17 @@ private def with_companion(enabled : Bool, motion : String = "lively", notices :
     Gori::Settings.companion = prev[0]
     Gori::Settings.companion_motion = prev[1]
     Gori::Settings.companion_notices = prev[2]
+  end
+end
+
+# Runs `block` with the agent-reply bubble mode set, restoring it.
+private def with_replies(mode : String, &)
+  prev = Gori::Settings.companion_replies
+  Gori::Settings.companion_replies = mode
+  begin
+    yield
+  ensure
+    Gori::Settings.companion_replies = prev
   end
 end
 
@@ -421,8 +437,8 @@ describe Gori::Tui::Companion do
   # Scoped to the gesture poses on purpose: asserting this across all of POSES would forbid
   # a future pose that differs only by badge or mood.
   it "gives every idle gesture a face of its own" do
-    idle = Mascot.rows(Mascot::Frame.new)[1]
-    rows = Companion::GESTURES.flatten.uniq!.map { |p| Mascot.rows(Mascot::Frame.new(pose: p))[1] }
+    idle = mascot_rows(Mascot::Frame.new)[1]
+    rows = Companion::GESTURES.flatten.uniq!.map { |p| mascot_rows(Mascot::Frame.new(pose: p))[1] }
     rows.each(&.should_not(eq(idle)))
     rows.uniq.size.should eq(rows.size)
   end
@@ -733,6 +749,196 @@ describe Gori::Tui::Companion do
     end
   end
 
+  # --- an agent's reply is held ---------------------------------------------
+  #
+  # A reply (`reply_to_operator`) is the one notice written TO the operator, so under the
+  # default `replies: hold` it stays in the bubble until their next key or click instead of
+  # leaving with the few-second TTL everything else gets.
+
+  it "holds an addressed note past every TTL until input releases it" do
+    with_companion(true) do
+      with_replies("hold") do
+        notes = Notifications.new
+        companion = Companion.new(notes)
+        t0 = Time.instant
+        companion.tick(t0)
+        notes.push(:info, "claude-code: 3 endpoints checked, 1 IDOR", source: "agent", addressed: true)
+        companion.tick(t0 + Companion::BEAT)
+        beats(companion, t0, 60) # well past every bubble TTL
+        companion.frame.not_nil!.bubble.not_nil!.should contain("IDOR")
+
+        # A resize is the terminal moving, not the operator answering.
+        companion.wake_on_input(false)
+        beats(companion, t0 + Companion::BEAT * 60, 5)
+        companion.frame.not_nil!.bubble.not_nil!.should contain("IDOR")
+
+        later = t0 + Companion::BEAT * 70
+        companion.release_bubble(later)
+        companion.tick(later + Companion::BEAT)
+        companion.frame.not_nil!.bubble.should be_nil
+      end
+    end
+  end
+
+  # A key already on its way when the reply landed must not erase it unread: release lets
+  # the bubble go at the end of its ordinary TTL, never sooner.
+  it "never lets an early release cut a reply shorter than its ordinary TTL" do
+    with_companion(true) do
+      with_replies("hold") do
+        notes = Notifications.new
+        companion = Companion.new(notes)
+        t0 = Time.instant
+        companion.tick(t0)
+        notes.push(:info, "done", source: "agent", addressed: true)
+        companion.tick(t0 + Companion::BEAT)
+        companion.release_bubble(t0 + Companion::BEAT)
+        companion.tick(t0 + Companion::BEAT * 2)
+        companion.frame.not_nil!.bubble.should eq("done")
+        beats(companion, t0, 60)
+        companion.frame.not_nil!.bubble.should be_nil
+      end
+    end
+  end
+
+  it "lets a reply go on the ordinary TTL under replies: timed" do
+    with_companion(true) do
+      with_replies("timed") do
+        notes = Notifications.new
+        companion = Companion.new(notes)
+        t0 = Time.instant
+        companion.tick(t0)
+        notes.push(:info, "done", source: "agent", addressed: true)
+        companion.tick(t0 + Companion::BEAT)
+        companion.frame.not_nil!.bubble.should eq("done")
+        beats(companion, t0, 60)
+        companion.frame.not_nil!.bubble.should be_nil
+      end
+    end
+  end
+
+  # Switching the mode to `timed` while a reply is held must let that reply go too: no input
+  # has to arrive (the switch is made from a Preferences modal that hides her), and it leaves
+  # no sooner than its ordinary TTL.
+  it "releases a reply already held when replies switches to timed" do
+    with_companion(true) do
+      with_replies("hold") do
+        notes = Notifications.new
+        companion = Companion.new(notes)
+        t0 = Time.instant
+        companion.tick(t0)
+        notes.push(:info, "done", source: "agent", addressed: true)
+        companion.tick(t0 + Companion::BEAT)
+        companion.holding?.should be_true
+        Gori::Settings.companion_replies = "timed"
+        companion.tick(t0 + Companion::BEAT * 2)
+        companion.holding?.should be_false
+        companion.frame.not_nil!.bubble.should eq("done")
+        beats(companion, t0, 60)
+        companion.frame.not_nil!.bubble.should be_nil
+      end
+    end
+  end
+
+  # …and a reply held for longer than its TTL must not vanish the moment the mode changes:
+  # the switch is made behind a modal, so its TTL restarts from the switch.
+  it "restarts a long-held reply's TTL when replies switches to timed" do
+    with_companion(true) do
+      with_replies("hold") do
+        notes = Notifications.new
+        companion = Companion.new(notes)
+        t0 = Time.instant
+        companion.tick(t0)
+        notes.push(:info, "done", source: "agent", addressed: true)
+        companion.tick(t0 + Companion::BEAT)
+        beats(companion, t0, 60) # held well past its ordinary TTL
+        switch = t0 + Companion::BEAT * 61
+        Gori::Settings.companion_replies = "timed"
+        companion.tick(switch)
+        companion.tick(switch + Companion::BEAT)
+        companion.frame.not_nil!.bubble.should eq("done")
+        beats(companion, switch, 60)
+        companion.frame.not_nil!.bubble.should be_nil
+      end
+    end
+  end
+
+  # Holding exists so the reply gets read; a job result landing behind it would otherwise
+  # take the bubble and send the operator to the ring after all. A newer REPLY does take it.
+  it "keeps a held reply in front of later notices, but not of a later reply" do
+    with_companion(true) do
+      with_replies("hold") do
+        notes = Notifications.new
+        companion = Companion.new(notes)
+        t0 = Time.instant
+        companion.tick(t0)
+        notes.push(:info, "first reply", source: "agent", addressed: true)
+        companion.tick(t0 + Companion::BEAT)
+        notes.push(:error, "fuzzer: run failed", source: "fuzzer")
+        companion.tick(t0 + Companion::BEAT * 2)
+        f = companion.frame.not_nil!
+        f.bubble.should eq("first reply")
+        f.mood.should eq(:alarm) # the face still reacts to the result
+        notes.push(:info, "second reply", source: "agent", addressed: true)
+        companion.tick(t0 + Companion::BEAT * 3)
+        companion.frame.not_nil!.bubble.should eq("second reply")
+      end
+    end
+  end
+
+  # She reads only the newest note per tick; a reply and a result landing together must
+  # not leave her announcing the result and the reply never said.
+  it "picks the reply out of a tick that also brought a later note" do
+    with_companion(true) do
+      with_replies("hold") do
+        notes = Notifications.new
+        companion = Companion.new(notes)
+        t0 = Time.instant
+        companion.tick(t0)
+        notes.push(:info, "the reply", source: "agent", addressed: true)
+        notes.push(:error, "miner: failed", source: "miner")
+        companion.tick(t0 + Companion::BEAT)
+        f = companion.frame.not_nil!
+        f.bubble.should eq("the reply")
+        f.mood.should eq(:alarm) # the later note keeps its face, as it would a tick later
+        companion.holding?.should be_true
+      end
+    end
+  end
+
+  # `timed` changes how long a reply stays, not whether it is said.
+  it "still says a same-tick reply under replies: timed, without holding it" do
+    with_companion(true) do
+      with_replies("timed") do
+        notes = Notifications.new
+        companion = Companion.new(notes)
+        t0 = Time.instant
+        companion.tick(t0)
+        notes.push(:info, "the reply", source: "agent", addressed: true)
+        notes.push(:info, "probe: 2 issues", source: "probe")
+        companion.tick(t0 + Companion::BEAT)
+        companion.frame.not_nil!.bubble.should eq("the reply")
+        companion.holding?.should be_false
+      end
+    end
+  end
+
+  # The intercept bridge pushes `source: "agent"` notes too; those report what an agent did
+  # and go on the ordinary TTL. Only `addressed:` is held.
+  it "does not hold an agent note that was not addressed to the operator" do
+    with_companion(true) do
+      with_replies("hold") do
+        notes = Notifications.new
+        companion = Companion.new(notes)
+        t0 = Time.instant
+        companion.tick(t0)
+        notes.push(:info, "agent forwarded #3", source: "agent")
+        companion.tick(t0 + Companion::BEAT)
+        beats(companion, t0, 60)
+        companion.frame.not_nil!.bubble.should be_nil
+      end
+    end
+  end
+
   # The bar placement shares the status row's single text slot with the toast, and Runner
   # picks between them by recency — which needs a timestamp on her side of the comparison.
   it "stamps when the bubble was set, and clears it with the bubble" do
@@ -779,7 +985,7 @@ describe Gori::Tui::Companion do
       Mascot::WINKS.each do |wink|
         badges.each do |badge|
           frame = Mascot::Frame.new(pose: pose, wink: wink, badge: badge)
-          Mascot.rows(frame).each do |row|
+          mascot_rows(frame).each do |row|
             row.size.should eq(Mascot::W)               # single codepoint per cell
             Screen.draw_width(row).should eq(Mascot::W) # …and one column each
           end
@@ -792,7 +998,7 @@ describe Gori::Tui::Companion do
   # be six CELLS across or the hoop reads as an oval. That falls out of the half-block
   # walls, and a spec is the only thing that stops a future edit from widening it back.
   it "keeps the equator exactly as wide as the sprite is tall" do
-    row = Mascot.rows(Mascot::Frame.new)[1]
+    row = mascot_rows(Mascot::Frame.new)[1]
     row[0].should eq(Mascot::WALL_L) # ▐ — inks the RIGHT half, x[0.5,1]
     row[6].should eq(Mascot::WALL_R) # ▌ — inks the LEFT half,  x[6,6.5]
     # 6.5 - 0.5 = 6.0 cells wide; 3 rows x 2 units = 6.0 units tall.
@@ -811,7 +1017,7 @@ describe Gori::Tui::Companion do
         Mascot::POSES.each do |pose|
           frame = Mascot::Frame.new(pose: pose, badge: '!')
           pal = Mascot.palette(:info, Theme.bg)
-          rows = Mascot.rows(frame)
+          rows = mascot_rows(frame)
           Mascot::H.times do |r|
             Mascot::W.times do |c|
               next if rows[r][c] == ' ' # a blank cell is allowed to be plate-on-plate
@@ -848,7 +1054,7 @@ describe Gori::Tui::Companion do
     Mascot::POSES.each do |pose|
       {nil, '×', '!'}.each do |badge|
         frame = Mascot::Frame.new(pose: pose, badge: badge)
-        rows = Mascot.rows(frame)
+        rows = mascot_rows(frame)
         chip = Mascot.bar_label(frame)
         chip[0, Mascot::W - 1].should eq(rows[1][0, Mascot::W - 1]) # the equator, verbatim
         chip[Mascot::W - 1].should eq(rows[0][Mascot::W - 1])       # …and the badge cell
@@ -895,7 +1101,7 @@ describe Gori::Tui::Companion do
     left.should eq(right - (Mascot::W - 2)) # the equator, where draw_row put it
     row[right + 1].should eq('!')           # …and the borrowed badge cell beside it
 
-    args = {focus: "BODY", resource: "CPU 1%", time: "01:23 PM", companion: frame}
+    args = {focus: "BODY", hints: "hints here", resource: "CPU 1%", time: "01:23 PM", companion: frame}
     Chrome.status_bar_chip_at(rect, left, rect.y, **args).should eq(:companion)
     Chrome.status_bar_chip_at(rect, right + 1, rect.y, **args).should eq(:companion)
     # The clock to her left is not her, and neither is the edge past her.
@@ -1190,16 +1396,24 @@ describe Gori::Tui::Companion do
       end
     end
 
-    it "truncates a long bubble inside the body" do
+    it "wraps a long bubble across up to three rows, marking the tail, inside the body" do
       backend = MemoryBackend.new(80, 24)
       long = "probe " * 60
       Companion.draw(Screen.new(backend), body, Mascot::Frame.new(bubble: long))
       rect = Companion.place(body).not_nil!
-      text_row = rect.y - Companion::BUBBLE_H + 1
-      backend.row(text_row).should contain("…")
+      box = Companion.bubble_box(body, rect, long).not_nil!
+      box.h.should eq(Companion::BUBBLE_MAX_LINES + Companion::BUBBLE_CHROME) # grew to the ceiling
+      rows = (box.y + 1...box.bottom - 1).map { |y| backend.row(y) }
+      rows.join.should contain("…") # the cut is marked
       (0...24).each do |y|
         Screen.draw_width(backend.row(y).rstrip).should be <= body.right
       end
+    end
+
+    it "keeps a short bubble to one row" do
+      rect = Companion.place(body).not_nil!
+      box = Companion.bubble_box(body, rect, "done").not_nil!
+      box.h.should eq(1 + Companion::BUBBLE_CHROME)
     end
 
     # The width guard has to stay calibrated against what Layout can actually hand us:
@@ -1227,5 +1441,31 @@ describe Gori::Tui::Companion do
       Companion.draw(Screen.new(backend), Rect.new(0, 0, 20, 4), Mascot::Frame.new)
       backend.grid.each(&.all?(&.== ' ').should be_true)
     end
+  end
+end
+
+# #1376: she covers the SIZE/DUR end of a full list row, so a value she cut read as a shorter
+# real one (`160B` as `16`). With her plate as the Screen's occlusion, a run that continues
+# under her is ellipsized at her edge; a run that ends before her is untouched.
+describe "Screen#occlusion under Miss Ring" do
+  it "ellipsizes a run she cuts, and leaves the rest of the row alone" do
+    body = Rect.new(0, 0, 60, 20)
+    plate = Companion.hit_rect(body).not_nil!
+    b = MemoryBackend.new(60, 20)
+    screen = Screen.new(b)
+    screen.occlusion = plate
+    y = plate.y + 1
+    screen.text(plate.x - 2, y, "160B", Theme.text)
+    screen.text(plate.x - 10, y, "GET", Theme.text)
+    screen.text(plate.x - 2, plate.y - 1, "160B", Theme.text) # the row above her: no cut
+    b.row(y)[plate.x - 2, 2].should eq("1…")
+    b.row(y)[plate.x - 10, 3].should eq("GET")
+    b.row(plate.y - 1)[plate.x - 2, 4].should eq("160B")
+  end
+
+  it "changes nothing without an occlusion" do
+    b = MemoryBackend.new(20, 1)
+    Screen.new(b).text(0, 0, "160B", Theme.text)
+    b.row(0)[0, 4].should eq("160B")
   end
 end

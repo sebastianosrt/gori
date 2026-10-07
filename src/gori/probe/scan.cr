@@ -12,6 +12,7 @@ require "./group"
 # For `Analyzer::WS_MSG_CAP`: the headless WS read pages in the SAME batch size as the live
 # analyzer, so the two readers cannot drift into different coverage (see `scan_ws_frames`).
 require "./analyzer"
+require "../plural"
 
 module Gori
   module Probe
@@ -61,11 +62,37 @@ module Gori
         @exhausted = false
       end
 
+      # Opt-in write-back of a scan's findings into `probe_issues` (#1392) — the table the live
+      # Analyzer fills and triage (`probe_issues` / dismiss / promote) reads. A headless scan
+      # only REPORTS by default, so a project nobody opened in the TUI had findings in every
+      # scan and none to triage. Passed in by the caller and read back afterwards, the way
+      # `Budget` is, so `scan_all` keeps its return shape.
+      #
+      # The rows merge exactly as the Analyzer's do (`Store#upsert_probe_issues`): keyed by
+      # (code, host), `affected` deduplicated, severity raised to the max, a hard-deleted pair's
+      # suppression honoured, and a dismissed row left dismissed. `hit_count` counts
+      # OBSERVATIONS, so rescanning flows that were already persisted adds to it — the same
+      # thing a TUI restart's catch-up sweep does.
+      class Persist
+        # Detections handed to the store, and whether that write committed.
+        getter detections = 0
+        getter? committed = false
+        # False until `write` ran — a stopped scan never writes, and says so by this.
+        getter? attempted = false
+
+        def write(store : Store, dets : Array(Detection)) : Nil
+          @attempted = true
+          @detections = dets.size
+          # `with_source` normalises a synthetic flow id 0 to nil, as `Analyzer#persist` does.
+          @committed = store.upsert_probe_issues(dets.map { |d| Probe.with_source(d) })
+        end
+      end
+
       # The operator's Rules sub-tab config: built-ins turned off (by RuleInfo#id) + the merged
       # global+project custom match rules. A headless scan MUST honour both or it diverges from
       # what the same project shows in the TUI — a disabled built-in would come back, and a
-      # custom rule would never fire at all. Mirrors Analyzer#load_disabled / #load_custom,
-      # including their "a broken/locked DB degrades to the built-in defaults" rescue.
+      # custom rule would never fire at all. The Analyzer reads its config through this too,
+      # so both share the "a broken/locked DB degrades to the built-in defaults" rescue.
       # `degraded` is true when the disabled-rule set could NOT be read. It matters because
       # that set is the only thing standing between an ACTIVE rule the operator switched off
       # and a real request going out: the rescue below returns an EMPTY set, which reads as
@@ -77,11 +104,6 @@ module Gori
         def self.load(store : Store) : RuleConfig
           disabled, ok = load_disabled(store)
           new(disabled, load_custom(store), degraded: !ok)
-        end
-
-        # The "no config" default, for callers (specs) that scan without a Rules config.
-        def self.none : RuleConfig
-          new(Passive::NO_DISABLED, Passive::NO_CUSTOM)
         end
 
         # {the set, whether it was actually read}. The pair is the whole point — an empty set
@@ -120,7 +142,7 @@ module Gori
         # above was added to prevent.
         if filter.try(&.uses_fts?)
           if (pending = store.drain_fts!) > 0
-            raise Gori::Error.new("#{pending} flow#{pending == 1 ? "" : "s"} could not be indexed " \
+            raise Gori::Error.new("#{Gori.plural(pending, "flow")} could not be indexed " \
                                   "for free-text search (this project's writer is busy — another " \
                                   "gori is capturing it), so a body:/free-text scan would silently " \
                                   "skip them and under-report findings. Nothing was scanned; retry " \
@@ -133,29 +155,36 @@ module Gori
 
       # Analyze History flows + Repeater tabs. Returns {detections, repeater_count_scanned}.
       # `progress.call(i, total)` is invoked per flow so a CLI can draw a meter; MCP passes nil.
-      # `active_limit` caps how many flows receive an ACTIVE probe (network volume) WITHOUT
+      # `active_budget` caps how many flows receive an ACTIVE probe (network volume) WITHOUT
       # limiting the request-free PASSIVE scan — nil means no active cap (the CLI).
       # `on_error` (optional) is called once per SKIPPED item — "flow <id>" / "repeater <id>" /
       # a rule id — with the exception that caused it. A scan that hits one keeps going and
       # returns everything else, so the caller must report the count or a partial result reads
       # as a clean one.
+      #
+      # `stop` (optional — a caller with no way to cancel passes nothing) is polled between
+      # items, so a scan the caller abandoned stops reaching the target instead of riding
+      # the active budget out. Same spelling and same stance as `Retest.execute`'s own `stop:`
+      # and `Repeater::Minimize::Stop`: cooperative, read-only here, and NEVER a surface type
+      # — `Probe` does not know an MCP server exists (DESIGN.md §2.1). See `stopped?`.
       def scan_all(store : Store, ids : Array(Int64), *, active : Bool,
                    verify_upstream : Bool = true, scope : Scope? = nil, allow_unscoped : Bool = false,
-                   active_limit : Int32? = nil, opts : Active::Options = Active::Options::DEFAULT,
+                   opts : Active::Options = Active::Options::DEFAULT,
                    rules : RuleConfig? = nil,
                    progress : Proc(Int32, Int32, Nil)? = nil,
                    active_budget : Budget? = nil,
-                   overrides : Gori::HostOverrides? = nil,
-                   on_error : Proc(String, Exception, Nil)? = nil) : {Array(Detection), Int32}
+                   stop : Proc(Bool)? = nil,
+                   on_error : Proc(String, Exception, Nil)? = nil,
+                   persist : Persist? = nil) : {Array(Detection), Int32}
         # Read the Rules config ONCE per scan (not per flow) — same as the Analyzer, which
         # loads it at construction and only re-reads on an explicit rules reload.
         cfg = rules || RuleConfig.load(store)
         # …and the host overrides once too, here rather than in each half, so the two cannot
         # answer "where does this host live" differently within one scan.
-        ov = overrides_for(store, active, overrides)
+        ov = overrides_for(store, active, nil)
         # ONE budget across both halves — see `Budget`. Built here rather than passed down as a
         # number so the repeater half cannot spend the flow half's allowance again.
-        budget = active_budget || Budget.new(active_limit)
+        budget = active_budget || Budget.new(nil)
         if active && cfg.degraded
           on_error.try &.call("probe rules", Gori::Error.new(
             "the disabled-rule list could not be read (store busy or unwritable), so gori does " \
@@ -164,18 +193,30 @@ module Gori
         end
         detections = scan_flows(store, ids, active: active, verify_upstream: verify_upstream,
           scope: scope, allow_unscoped: allow_unscoped, opts: opts,
-          rules: cfg, progress: progress, active_budget: budget, overrides: ov, on_error: on_error)
+          rules: cfg, progress: progress, active_budget: budget, overrides: ov,
+          stop: stop, on_error: on_error)
         repeater_dets, repeater_n = scan_repeaters(store, active: active, verify_upstream: verify_upstream,
           scope: scope, allow_unscoped: allow_unscoped, opts: opts, rules: cfg,
-          active_budget: budget, overrides: ov, on_error: on_error)
+          active_budget: budget, overrides: ov, stop: stop, on_error: on_error)
         detections.concat(repeater_dets)
+        # BEFORE the out-of-band sweep below joins the list: the sweep writes its promotions
+        # itself, so persisting them here again would count every one twice. A stopped scan
+        # writes nothing, for the reason the sweep is skipped — its caller has walked away.
+        persist.try(&.write(store, detections)) unless stopped?(stop)
         # Promote any OUT-OF-BAND probe whose callback has landed since it was planted. This is
         # a headless surface, so it cannot wait for one: the probes this run plants are picked
         # up by whatever sweeps next (the TUI's timer, or the NEXT `gori run probe`), and what
         # this pass reports are the ones an earlier run planted. Unconditional — the promotion
         # is a read of already-collected evidence, so it costs nothing on a project with no OAST
         # probes and must not be gated on `active`, which authorises SENDING.
-        detections.concat(sweep_out_of_band(store))
+        #
+        # A STOPPED run skips it, which is the one thing this pass is conditional on. The
+        # promotion exists to put those findings in this run's report, and a stopped run has
+        # no report to put them in — the MCP caller that cancels is owed no response at all —
+        # while whatever sweeps next picks up exactly the same evidence, because the sweep
+        # holds no watermark. It also keeps a cancelled scan from writing `probe_issues` rows
+        # behind a caller that has walked away.
+        detections.concat(sweep_out_of_band(store)) unless stopped?(stop)
         {detections, repeater_n}
       end
 
@@ -248,6 +289,7 @@ module Gori
                      progress : Proc(Int32, Int32, Nil)? = nil,
                      active_budget : Budget? = nil,
                      overrides : Gori::HostOverrides? = nil,
+                     stop : Proc(Bool)? = nil,
                      on_error : Proc(String, Exception, Nil)? = nil) : Array(Detection)
         cfg = rules || RuleConfig.load(store)
         outbound = outbound_for(scope, allow_unscoped)
@@ -255,7 +297,18 @@ module Gori
         detections = [] of Detection
         budget = active_budget || Budget.new(active_limit)
         opts = with_oob(store, opts, active)
+        # Surfaces already probed in this scan (`Plan#dedup_key`s). Without it a project holding
+        # 200 captures of `GET /api/items?page=` sent every rule's probes 200 times, and — worse —
+        # spent 200 units of `active_limit` on one surface, so the distinct endpoints after it
+        # were never probed at all while the scan reported itself complete.
+        seen = Set(String).new
         ids.each_with_index do |id, i|
+          # Before the flow is READ, not merely before its active probes: a stop is the caller
+          # saying the whole scan is over, so it must cost the store nothing further either.
+          # The granularity is one flow — a probe already on the socket owns its own timeout,
+          # exactly as `Minimize::Stop` documents — so the guarantee is "at most one more
+          # flow's probes", which is the difference between 1 and `PROBE_ACTIVE_MAX_FLOWS`.
+          break if stopped?(stop)
           begin
             detail = store.get_flow(id)
             if detail && detail.response_head
@@ -263,18 +316,16 @@ module Gori
               detections.concat(Passive.analyze(detail, disabled: cfg.disabled, custom: cfg.custom))
               # WS frames come from `scan_ws_frames`, a page at a time, rather than as one array
               # handed to `Passive.analyze` above (the only rule that reads them is the WS one).
-              detections.concat(scan_ws_frames(store, detail, id, cfg)) if detail.row.status == 101
-              # `!cfg.degraded`: the disabled-rule set could not be read, so gori does not
-              # know which ACTIVE rules the operator switched off — see `RuleConfig`.
+              detections.concat(scan_ws_frames(store, detail, id, cfg)) if Probe.ws_transcript_possible?(detail)
               # Gate on the port-less scope URL Layer 2 / History / SQL already share —
               # `FlowRow#url` embeds a non-default port, so a string/regex include of
               # `https://acme.test/` would miss `https://acme.test:8443/…` and silently
               # skip every active probe on that origin while the lens still shows it in-scope.
-              if active && !cfg.degraded && allows_row?(outbound, detail.row) && budget.take?
+              if active_now?(active, cfg, outbound, detail.row, budget) { Active.fresh?(detail, opts, cfg.disabled, seen) }
                 detections.concat(Active.analyze(detail, verify_upstream, outbound: outbound,
                   overrides: ov, opts: opts,
                   disabled: cfg.disabled, on_error: on_error,
-                  on_oob: oob_sink(store, detail.row, id)))
+                  on_oob: oob_sink(store, detail.row, id), seen: seen))
               end
             end
           rescue ex : DB::Error | SQLite3::Exception
@@ -292,7 +343,7 @@ module Gori
         detections
       end
 
-      # EVERY captured frame of one 101 flow, a PAGE at a time — the shape `Analyzer#rescan_ws`
+      # EVERY captured frame of one socket, a PAGE at a time — the shape `Analyzer#rescan_ws`
       # already uses, and the only one of the three that is neither wrong bound. `ws_messages(id,
       # 200)` returns the NEWEST 200 (that limit exists to bound the detail VIEW), so a secret in
       # frame 20 of 5,000 was reported by the live analyzer and missed here; `ws_messages(id)`
@@ -301,19 +352,41 @@ module Gori
       # the oldest unscanned id covers every frame exactly once at a bounded cost.
       private def scan_ws_frames(store : Store, detail : Store::FlowDetail, flow_id : Int64,
                                  cfg : RuleConfig) : Array(Detection)
+        scan_ws_pages(detail, cfg) { |after, limit| store.ws_messages_after(flow_id, after, limit) }
+      end
+
+      # The same pass over a REPEATER tab's frames. It used to be one
+      # `ws_messages_for_repeater(rec.id, 200)` read handed straight to `Passive.analyze` — the
+      # NEWEST 200 rows, which is the wrong end for a scan for the reason spelled out above, so
+      # an early frame of a longer tab went unread. Pages forward from the oldest frame instead.
+      #
+      # What that reaches is the operator's authored SEND script and only that: see
+      # `Store#ws_messages_for_repeater_after` for why a repeater tab never holds the origin's
+      # answering frames at all. This half is therefore narrower than its flow twin by
+      # construction, not by this read.
+      private def scan_repeater_ws_frames(store : Store, detail : Store::FlowDetail,
+                                          repeater_id : Int64, cfg : RuleConfig) : Array(Detection)
+        scan_ws_pages(detail, cfg) { |after, limit| store.ws_messages_for_repeater_after(repeater_id, after, limit) }
+      end
+
+      # Page a socket's frames oldest-first and run the WS rules over each page. `fetch` is the
+      # only difference between a History flow and a Repeater tab, so both get identical
+      # coverage and identical folding from one body.
+      private def scan_ws_pages(detail : Store::FlowDetail, cfg : RuleConfig,
+                                &fetch : Int64, Int32 -> Array(Store::WsMessage)) : Array(Detection)
         dets = [] of Detection
         after = 0_i64
         loop do
-          msgs = store.ws_messages_after(flow_id, after, Analyzer::WS_MSG_CAP)
+          msgs = fetch.call(after, Analyzer::WS_MSG_CAP)
           break if msgs.empty?
           after = msgs.last.id # ordered asc ⇒ the last id is the newest scanned; page past it
           dets.concat(Passive.analyze_ws(detail, msgs, disabled: cfg.disabled))
           break if msgs.size < Analyzer::WS_MSG_CAP # a partial page ⇒ the log is drained
         end
         # `WsPayloads` dedups its type labels per Context, which is now per PAGE rather than per
-        # flow, and this array goes to `Probe.group` — which counts every observation into
+        # socket, and this array goes to `Probe.group` — which counts every observation into
         # hit_count. Fold here so paging changed coverage and memory only, not what an operator
-        # reads: one finding per (code, label) for the flow, exactly as the one-shot read gave.
+        # reads: one finding per (code, label), exactly as the one-shot read gave.
         dets.uniq! { |d| {d.code, d.evidence} }
         dets
       end
@@ -324,6 +397,7 @@ module Gori
                          opts : Active::Options = Active::Options::DEFAULT,
                          rules : RuleConfig? = nil, active_budget : Budget? = nil,
                          overrides : Gori::HostOverrides? = nil,
+                         stop : Proc(Bool)? = nil,
                          on_error : Proc(String, Exception, Nil)? = nil) : {Array(Detection), Int32}
         cfg = rules || RuleConfig.load(store)
         outbound = outbound_for(scope, allow_unscoped)
@@ -333,15 +407,23 @@ module Gori
         opts = with_oob(store, opts, active)
         n = 0
         store.repeaters.each do |rec|
+          # The flow half's twin, and the reason `scan_all` threads ONE `stop` into both: the
+          # budget is shared across the halves, so a stop that bound only one of them would
+          # let the second half spend what the first had left.
+          break if stopped?(stop)
           next unless detail = Probe.detail_from_repeater(rec)
           n += 1
           # Isolated per repeater tab, exactly like scan_flows isolates per flow.
           begin
-            ws = store.ws_messages_for_repeater(rec.id, 200)
-            Passive.analyze(detail, ws, disabled: cfg.disabled, custom: cfg.custom).each do |d|
+            Passive.analyze(detail, disabled: cfg.disabled, custom: cfg.custom).each do |d|
               detections << Probe.with_source(d, flow_id: rec.flow_id, repeater_id: rec.id)
             end
-            if active && !cfg.degraded && allows_row?(outbound, detail.row) && budget.take?
+            # WS frames come from `scan_repeater_ws_frames`, a page at a time, for the same
+            # reason the flow half pages (the only rule that reads them is the WS one).
+            scan_repeater_ws_frames(store, detail, rec.id, cfg).each do |d|
+              detections << Probe.with_source(d, flow_id: rec.flow_id, repeater_id: rec.id)
+            end
+            if active_now?(active, cfg, outbound, detail.row, budget) { true }
               Active.analyze(detail, verify_upstream, outbound: outbound, overrides: ov, opts: opts,
                 disabled: cfg.disabled, on_error: on_error,
                 on_oob: oob_sink(store, detail.row, rec.flow_id)).each do |d|
@@ -355,6 +437,40 @@ module Gori
           end
         end
         {detections, n}
+      end
+
+      # May this item receive ACTIVE probes? ONE home for the four-part gate both halves ask,
+      # which they had been spelling out twice — and the order inside it is load-bearing:
+      # `budget.take?` CHARGES, so it comes last. Asking it for an item the scope would have
+      # refused spends the cap on a send that never happens and makes `exhausted?` report a
+      # truncation that truncated nothing (see `Budget#exhausted?`).
+      #
+      # `!cfg.degraded`: the disabled-rule set could not be read, so gori does not know which
+      # ACTIVE rules the operator switched off — see `RuleConfig`.
+      #
+      # `fresh` answers "would this item send anything new?" and sits just before the charge, for
+      # the same reason: a flow that only repeats surfaces this scan already probed must not
+      # spend the cap. Repeater tabs pass `{ true }` — each is an operator-authored request,
+      # probed on its own terms rather than deduped against the flows. `budget.take?` stays LAST
+      # because it is what charges: asking it before the scope/fresh gates would spend a unit on
+      # a send that never happens and make `exhausted?` report a truncation that truncated
+      # nothing (see `Budget#exhausted?`).
+      private def active_now?(active : Bool, cfg : RuleConfig, outbound : Outbound,
+                              row : Store::FlowRow, budget : Budget, & : -> Bool) : Bool
+        active && !cfg.degraded && allows_row?(outbound, row) && yield && budget.take?
+      end
+
+      # Has the caller asked this scan to stop? ONE home, read from three loops, so a later
+      # call site cannot spell it `stop.try(&.call) == true` (a different answer once a
+      # predicate returns nil) or forget the nil case.
+      #
+      # WHAT IT CANNOT DO: interrupt a fiber. gori runs on the single-threaded cooperative
+      # scheduler, so whoever arms the predicate only runs when this loop YIELDS — which an
+      # active scan does on every send and a request-free one may never do. That is the honest
+      # bound, and it is bounded on the right side: passive spends the operator's own CPU,
+      # active spends a third party's server.
+      private def stopped?(stop : Proc(Bool)?) : Bool
+        !!stop.try(&.call)
       end
 
       # The scan's scope decision. Layer 1 is the strict ALLOWLIST (an active probe only ever

@@ -146,6 +146,26 @@ describe Gori::Tui::ProjectMarks do
     m.marked?("/p/gamma").should be_false
   end
 
+  # The Intercept queue's prune: a gone anchor is forgotten but the gesture is NOT ended, so
+  # the next plain arrow still hands back the range's surviving rows (`retain` would keep them).
+  it "keeps the surviving extent when `keep` drops the anchor" do
+    m = Marks(Int64).new
+    keys = [1_i64, 2_i64, 3_i64]
+    m.extend_range(nil, 0, 2) { |i| keys[i]? }
+    m.keep(Set{2_i64, 3_i64})
+    m.anchor.should be_nil
+    m.end_gesture.should eq(2)
+    m.empty?.should be_true
+  end
+
+  # A row with no key (a sitemap fold) inside the range is stepped over, not marked.
+  it "skips a keyless row inside a range" do
+    m = Marks(Int64).new
+    keys = [1_i64, nil, 3_i64]
+    m.extend_range(nil, 0, 2) { |i| keys[i]? }
+    m.to_a.should eq([1_i64, 3_i64])
+  end
+
   describe "marks the filter is hiding" do
     it "counts them" do
       m = ProjectMarks.new
@@ -165,24 +185,88 @@ end
 
 describe Gori::Tui::ProjectPicker do
   describe ".space_entries" do
-    it "is byte-identical to the old menu when nothing is marked" do
-      ProjectPicker.space_entries(0).map(&.label).should eq(["Open", "Rename", "Compress", "Delete"])
+    it "offers single-project archive actions when nothing is marked" do
+      ProjectPicker.space_entries(0).map(&.label).should eq([
+        "Open", "Rename", "Compress", "Export (cursor)", "Import archive", "Delete",
+      ])
     end
 
     # The AC of a batch menu: a delete opened over 3 marks must say it is about 3, and the
     # single-target verbs must say they are not.
     it "says what Delete will take, and marks the others cursor-only" do
       labels = ProjectPicker.space_entries(3).map(&.label)
-      labels.should eq(["Open (cursor)", "Rename (cursor)", "Compress (cursor)", "Delete 3 projects", "Clear marks"])
+      labels.should eq([
+        "Open (cursor)", "Rename (cursor)", "Compress (cursor)", "Export (cursor)",
+        "Import archive", "Clear marks", "Delete 3 projects",
+      ])
     end
 
-    it "keeps the mnemonics stable, and adds only 'n' for the mark-only entry" do
-      ProjectPicker.space_entries(2).map(&.key).should eq(['o', 'r', 'c', 'd', 'n'])
-      ProjectPicker.space_entries(2).map(&.action).should eq([:open, :rename, :compress, :delete, :mark_clear])
+    # #1274: the picker spoke its own dialect — rename `r`, export `e`, clear marks `n`.
+    # These are the app's letters: rename `e` (every sub-tab strip), export `E` (Issues,
+    # Notes, Sitemap), clear marks `N` (every marked list), delete `d`, open `o`.
+    it "uses the app's mnemonics" do
+      ProjectPicker.space_entries(0).map(&.key).should eq(['o', 'e', 'c', 'E', 'i', 'd'])
+      ProjectPicker.space_entries(2).map(&.key).should eq(['o', 'e', 'c', 'E', 'i', 'N', 'd'])
+      ProjectPicker.space_entries(2).map(&.action).should eq([
+        :open, :rename, :compress, :archive_export, :archive_import, :mark_clear, :delete,
+      ])
+    end
+
+    # A mark must not reorder the menu under the operator's hand: the marked menu is the
+    # unmarked one with Clear marks added, and Delete stays last in both.
+    it "keeps one entry order whether or not marks are set" do
+      unmarked = ProjectPicker.space_entries(0).map(&.action)
+      marked = ProjectPicker.space_entries(3).map(&.action)
+      (marked - [:mark_clear]).should eq(unmarked)
+      marked.last.should eq(:delete)
+    end
+
+    it "offers import from the empty picker search row" do
+      ProjectPicker::IMPORT_ONLY_ENTRIES.map(&.action).should eq([:archive_import])
     end
 
     it "does not pluralise a single mark" do
       ProjectPicker.space_entries(1).map(&.label).should contain("Delete 1 project")
+    end
+  end
+
+  describe ".space_key" do
+    it "is case-sensitive, as the in-app menu is" do
+      entries = ProjectPicker.space_entries(2)
+      ProjectPicker.space_key(entries, 'e').as(ProjectPicker::SpaceEntry).action.should eq(:rename)
+      ProjectPicker.space_key(entries, 'E').as(ProjectPicker::SpaceEntry).action.should eq(:archive_export)
+      ProjectPicker.space_key(entries, 'N').as(ProjectPicker::SpaceEntry).action.should eq(:mark_clear)
+      ProjectPicker.space_key(entries, 'n').should eq(:dismiss)
+      ProjectPicker.space_key(entries, 'D').should eq(:dismiss)
+    end
+
+    it "dismisses on an unmapped key, and keeps the app's j/k/h/l fallback" do
+      entries = ProjectPicker.space_entries(0)
+      ProjectPicker.space_key(entries, 'N').should eq(:dismiss) # no marks, no Clear marks
+      ProjectPicker.space_key(entries, 'x').should eq(:dismiss)
+      ProjectPicker.space_key(entries, 'j').should eq(:down)
+      ProjectPicker.space_key(entries, 'k').should eq(:up)
+      ProjectPicker.space_key(entries, 'h').should eq(:stay)
+      ProjectPicker.space_key(entries, 'l').should eq(:stay)
+    end
+
+    it "lets a bound mnemonic win over the vim fallback" do
+      entries = [ProjectPicker::SpaceEntry.new('k', "Keep", :open)]
+      ProjectPicker.space_key(entries, 'k').as(ProjectPicker::SpaceEntry).action.should eq(:open)
+    end
+  end
+
+  describe ".space_nav" do
+    # ←/→ answer 0 rather than nil: nil would fall through to the dismiss branch, and an
+    # arrow key must never close the menu the way an unmapped letter does.
+    it "moves on ↑/↓ and tab, and holds still on ←/→" do
+      ProjectPicker.space_nav(Termisu::Input::Key::Up).should eq(-1)
+      ProjectPicker.space_nav(Termisu::Input::Key::BackTab).should eq(-1)
+      ProjectPicker.space_nav(Termisu::Input::Key::Down).should eq(1)
+      ProjectPicker.space_nav(Termisu::Input::Key::Tab).should eq(1)
+      ProjectPicker.space_nav(Termisu::Input::Key::Left).should eq(0)
+      ProjectPicker.space_nav(Termisu::Input::Key::Right).should eq(0)
+      ProjectPicker.space_nav(Termisu::Input::Key::Escape).should be_nil
     end
   end
 

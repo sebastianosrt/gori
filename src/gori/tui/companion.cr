@@ -1,4 +1,5 @@
 require "./mascot"
+require "./wrap"
 require "./notifications"
 require "./frame"
 require "./geometry"
@@ -13,15 +14,20 @@ module Gori::Tui
   # always-animating widget would defeat the design it lives in. Three layers keep that
   # honest:
   #
-  #   1. She is OFF by default. A default install takes the first line of #tick and
-  #      returns false, exactly like a disabled ResourceMeter.
+  #   1. She can be switched OFF, and then #tick returns false on its first line, exactly
+  #      like a disabled ResourceMeter. She SHIPS ON now (Settings::DEFAULT_COMPANION), so
+  #      this is no longer the default install's path and 2 and 3 are what carry it —
+  #      but it is still the whole answer for anyone who says no, and motion "still" is
+  #      the same zero for someone who wants her face and none of the cost.
   #   2. She DOZES. After SLEEP_AFTER with no key, no click and no notification she
   #      freezes into one static frame and #tick returns false forever — an unattended
   #      gori is back to genuinely zero animation work. #poke re-arms her.
   #   3. Even awake, #tick reports a change only when the frame that would be DRAWN
   #      differs — roughly 1 repaint/second on "lively", 0.3 on "calm", each forwarding
-  #      a handful of changed cells through the backend's diff. Turning her on is an
-  #      explicit opt-in to that, and the settings hint says so.
+  #      a handful of changed cells through the backend's diff. That is what a default
+  #      install now pays while someone is at the keyboard, and it is small: .draw costs
+  #      7.8µs idle against the 218µs a body wipe already costs on the same frame
+  #      (bench/companion_draw_bench.cr, M-series, --release).
   #
   # SINGLE FIBER, NO LOCKS — the same invariant Notifications documents. #tick runs on
   # the render loop, #poke on the input handler, .draw on render; all the main fiber. The
@@ -137,15 +143,21 @@ module Gori::Tui
     # The vertical side needs no such term because the plate strips are left/right only.
     GUTTER = 3
     # …and TWO rows at the bottom, for the same reason. She occludes body content by
-    # design, but a chewed BORDER reads as a rendering bug rather than as a mascot, and
+    # design (a text run she cuts is ellipsized at her plate — Screen#occlusion — so a
+    # covered `160B` never reads as `16`), but a chewed BORDER reads as a rendering bug rather than as a mascot, and
     # tab bodies stack up to two rules there: the pane's own at body.bottom - 1, plus a
     # nested Frame.card's at body.bottom - 2 on the sub-tabbed tabs (Discover, Sitemap,
     # Repeater…). Clearing both is the difference between "───  ▝▄▄▄▄▄▘  ╯" and a mascot
     # sitting inside the pane.
     BOTTOM_MARGIN = 2
 
-    BUBBLE_H     =  3
     BUBBLE_MIN_W = 14 # narrower than this is unreadable — drop the bubble, keep the pose
+    # She may speak up to three rows now — an agent's reply is often a sentence, not a
+    # headline, and a one-line cap cut it with an '…' the operator then had to chase through
+    # the notification ring. Past three rows a bubble stops reading as speech and becomes a
+    # banner over the tab, so the ceiling holds there; a shorter body lowers it to fit.
+    BUBBLE_MAX_LINES = 3
+    BUBBLE_CHROME    = 2 # the card's top and bottom border rows
     # The bubble's cap is FLUID: it tracks the body, floored at BUBBLE_BASE_W and ceilinged
     # at BUBBLE_MAX_W. A flat cap sized for the narrow case truncated notices with an '…'
     # on terminals with columns to spare, which is where most of her lines actually get
@@ -191,6 +203,11 @@ module Gori::Tui
       @bubble = nil.as(String?)
       @bubble_at = nil.as(Time::Instant?)
       @bubble_until = nil.as(Time::Instant?)
+      # Non-nil while the bubble is HELD — an addressed note (an agent's reply) waiting for the
+      # operator's next key or click, with no @bubble_until of its own. The value is the
+      # earliest the bubble may leave once released: its ordinary TTL from when it landed, so
+      # a key that was already on its way when the reply arrived cannot erase it unread.
+      @bubble_floor = nil.as(Time::Instant?)
       @mood = :info
       @mood_beat = 0
       @mood_until = nil.as(Time::Instant?)
@@ -240,6 +257,11 @@ module Gori::Tui
       # as a single twitch), and the peak face held REACT_PEAK - 1 beats.
       stepped = step_beat(now)
       consume_note(now)
+      # A hold outlives nothing but the mode that asked for it: switched to `timed`, a reply
+      # already held leaves like one that had just landed under it — its ordinary TTL counted
+      # from NOW, since the switch is made in a Preferences modal that hides her, and a reply
+      # held for a minute would otherwise be gone before the modal closed.
+      release_bubble(now, restart: true) unless Settings.companion_holds_replies?
       expire_bubble(now)
       expire_mood(now)
       repaint(stepped)
@@ -272,10 +294,35 @@ module Gori::Tui
     end
 
     # Wake hook for the input path. Self-gated so a keystroke costs nothing at all while
-    # she's disabled — the run loop calls this on every key and click.
-    def wake_on_input : Nil
+    # she's disabled — the run loop calls this on every key and click. `acknowledge` is false
+    # for input that is not the operator answering anything (a resize): it wakes her, but a
+    # held reply stays up.
+    def wake_on_input(acknowledge : Bool = true) : Nil
       return unless Settings.companion?
-      poke(Time.instant)
+      now = Time.instant
+      release_bubble(now) if acknowledge
+      poke(now)
+    end
+
+    # Is a reply being held? The host's status row asks, in `bar`, where the bubble shares a
+    # slot with the toast.
+    def holding? : Bool
+      !@bubble_floor.nil?
+    end
+
+    # The operator has done something, so a held reply has had its chance: from here it
+    # leaves like any other bubble, at the end of its ordinary TTL or now, whichever is later.
+    # #expire_bubble does the clearing on the next tick.
+    #
+    # `restart` counts that TTL from `now` instead of from when the reply landed: for a
+    # release nobody watched happen (see #tick).
+    def release_bubble(now : Time::Instant, restart : Bool = false) : Nil
+      return unless floor = @bubble_floor
+      @bubble_floor = nil
+      if restart && (at = @bubble_at)
+        floor = now + (floor - at)
+      end
+      @bubble_until = {now, floor}.max
     end
 
     # Back to the state a freshly-constructed Companion is in. The BEAT-DERIVED deadlines have to
@@ -294,6 +341,7 @@ module Gori::Tui
       @bubble = nil
       @bubble_at = nil
       @bubble_until = nil
+      @bubble_floor = nil
       @mood = :info
       @mood_until = nil
       @restless = false
@@ -569,6 +617,7 @@ module Gori::Tui
       @bubble = GREETING
       @bubble_at = now
       @bubble_until = now + GREET_TTL
+      @bubble_floor = nil
       @restless = true
     end
 
@@ -593,6 +642,7 @@ module Gori::Tui
       @bubble = condense(message)
       @bubble_at = now
       @bubble_until = now + bubble_ttl(mood)
+      @bubble_floor = nil
       apply_mood(mood, now)
       @restless = true
       poke(now)
@@ -601,13 +651,38 @@ module Gori::Tui
     private def consume_note(now : Time::Instant) : Nil
       id = @notes.latest_id
       return if id <= @seen_id # empty, unchanged, or post-clear
+      seen = @seen_id
       @seen_id = id
-      return unless note = @notes.latest
+      return unless latest = @notes.latest
       return unless Settings.companion_notices?
+      # She reads one note per tick. A reply is the one worth reaching back for, in either
+      # replies mode: `timed` changes how long it stays, not whether it is said.
+      note = latest.addressed? ? latest : (@notes.latest_addressed_after(seen) || latest)
+      # A HELD reply outranks the notices that land behind it. Holding exists so the operator
+      # gets to read what an agent said to them; a fuzzer finishing thirty seconds later would
+      # otherwise take the bubble and leave the reply to be found in the ring after all. The
+      # later note still gets her face and the toast — only the words stay. A newer REPLY does
+      # take the bubble: between two things said to the operator, the newest is the one.
+      if @bubble_floor && !note.addressed?
+        apply_mood(mood_of(note.level), now)
+        @restless = true
+        poke(now)
+        return
+      end
       @bubble = condense(note.message)
       @bubble_at = now
-      @bubble_until = now + bubble_ttl(mood_of(note.level))
+      timed = now + bubble_ttl(mood_of(note.level))
+      if note.addressed? && Settings.companion_holds_replies?
+        @bubble_until = nil
+        @bubble_floor = timed
+      else
+        @bubble_until = timed
+        @bubble_floor = nil
+      end
       apply_mood(mood_of(note.level), now)
+      # A note that landed behind the reply in the same tick still gets her face, exactly as
+      # it would a tick later (the held branch above); #apply_mood keeps the higher rank.
+      apply_mood(mood_of(latest.level), now) unless latest.same?(note)
       @restless = true
       poke(now) # a result is worth waking up for
     end
@@ -736,12 +811,35 @@ module Gori::Tui
     def self.bubble_box(body : Rect, plate : Rect, msg : String) : Rect?
       cap = {bubble_cap(body.w), body.w - 4}.min
       return nil if cap < BUBBLE_MIN_W
-      want = {Screen.display_width(msg) + 4, BUBBLE_MIN_W}.max
-      w = {want, cap}.min
+      # How many text rows fit ABOVE the sprite, bounded by the three-line ceiling.
+      room = plate.y - body.y - BUBBLE_CHROME
+      return nil if room < 1
+      lines = bubble_lines(msg, cap - 4, {BUBBLE_MAX_LINES, room}.min)
+      return nil if lines.empty?
+      content = lines.max_of { |l| Screen.display_width(l) }
+      w = { {content + 4, BUBBLE_MIN_W}.max, cap }.min
+      h = lines.size + BUBBLE_CHROME
       x = {plate.right - w, body.x + 1}.max
-      y = plate.y - BUBBLE_H
+      y = plate.y - h
       return nil if y < body.y
-      Rect.new(x, y, w, BUBBLE_H)
+      Rect.new(x, y, w, h)
+    end
+
+    # The message split into at most `max` visual rows at `width` columns. Column-aware
+    # (via Wrap.layout), so a spaceless Korean run wraps by character and a spaced line by
+    # its grid; the last row is marked '…' when the message did not fit. Pure — the box math
+    # and the draw both call it, so they can never disagree about the line count.
+    def self.bubble_lines(msg : String, width : Int32, max : Int32) : Array(String)
+      return [] of String if width <= 0 || max < 1
+      lay = Wrap.layout(msg, width)
+      n = {lay.rows, max}.min
+      lines = Array(String).new(n) { |r| msg[lay.start_of(r)...lay.end_of(r)] }
+      if lay.rows > max && !lines.empty?
+        last = lines[-1]
+        cut = Screen.column_for(last, {width - 1, 1}.max)
+        lines[-1] = last[0, cut].rstrip + "…"
+      end
+      lines
     end
 
     def self.draw(screen : Screen, body : Rect, frame : Mascot::Frame) : Nil
@@ -776,10 +874,11 @@ module Gori::Tui
     private def self.draw_bubble(screen : Screen, box : Rect, msg : String,
                                  plate : Rect, pal : Mascot::Palette) : Nil
       Tui::Frame.card(screen, box, bg: Theme.elevated, border: pal.ring)
-      # Screen#text already does grapheme-aware truncation with a trailing '…' — hand-rolled
-      # clipping here is how the width bugs (#278/#285) happened in the first place.
-      screen.text(box.x + 2, box.y + 1, msg, Theme.text_bright, Theme.elevated,
-        width: box.w - 4)
+      # The same split the box was sized from, so a row can never render wider than it.
+      bubble_lines(msg, box.w - 4, box.h - BUBBLE_CHROME).each_with_index do |line, i|
+        screen.text(box.x + 2, box.y + 1 + i, line, Theme.text_bright, Theme.elevated,
+          width: box.w - 4)
+      end
       # Tail: one '─' of the bottom rule becomes '┬' over her cap, clamped inside the
       # corners so it can never eat a ╰ or ╯.
       tail = (plate.x + 4).clamp(box.x + 2, box.right - 3)

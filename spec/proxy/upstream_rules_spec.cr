@@ -11,6 +11,37 @@ private def reset_upstream : Nil
   Gori::Settings.project_upstream_auth_error = nil
 end
 
+private PROXY_ENV_KEYS = [
+  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+  "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+  # A suite run from inside `gori run shell` must not see its own markers (#1238).
+  "GORI_SHELL", "GORI_PROXY",
+  "GORI_SHELL_ORIG_HTTPS_PROXY", "GORI_SHELL_ORIG_HTTP_PROXY", "GORI_SHELL_ORIG_NO_PROXY",
+  "GORI_SHELL_ORIG_https_proxy", "GORI_SHELL_ORIG_http_proxy", "GORI_SHELL_ORIG_no_proxy",
+]
+
+private def with_proxy_environment(values : Hash(String, String), &)
+  previous = PROXY_ENV_KEYS.map { |key| {key, ENV[key]?} }
+  begin
+    PROXY_ENV_KEYS.each { |key| ENV.delete(key) }
+    values.each { |key, value| ENV[key] = value }
+    yield
+  ensure
+    previous.each do |key, value|
+      value ? (ENV[key] = value) : ENV.delete(key)
+    end
+  end
+end
+
+# What the platform resolver makes of a numeric spelling, or nil when it refuses one: Windows'
+# resolver reads no octal (`0177.0.0.1`), so there is nothing to agree with.
+private def resolved_ipv4(host : String) : String?
+  Socket::Addrinfo.resolve(host, 80, Socket::Family::INET, Socket::Type::STREAM)
+    .first.ip_address.address
+rescue Socket::Addrinfo::Error
+  nil
+end
+
 private def rule(host : String, kind : String, addr : String = "",
                  username : String = "", password_env : String = "") : Gori::Settings::UpstreamRule
   Gori::Settings::UpstreamRule.new(host, kind, addr, username, password_env)
@@ -193,6 +224,334 @@ describe "upstream rules" do
       reset_upstream
     end
 
+    it "uses HTTP_PROXY when gori's catch-all is blank" do
+      with_proxy_environment({"HTTP_PROXY" => "http://env-proxy.test:3128"}) do
+        route = Gori::Settings.upstream_route("origin.test", "http", 80)
+        {route.kind, route.host, route.port}.should eq({"http", "env-proxy.test", 3128})
+      end
+    ensure
+      reset_upstream
+    end
+
+    it "selects the proxy variable by origin scheme and falls back to ALL_PROXY" do
+      with_proxy_environment({
+        "HTTP_PROXY"  => "http://http-proxy.test:3128",
+        "HTTPS_PROXY" => "http://https-proxy.test:8443",
+        "ALL_PROXY"   => "socks5h://all-proxy.test:1080",
+      }) do
+        Gori::Settings.upstream_route("origin.test", "http", 80).host.should eq("http-proxy.test")
+        Gori::Settings.upstream_route("origin.test", "https", 443).host.should eq("https-proxy.test")
+
+        ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"].each { |key| ENV.delete(key) }
+        route = Gori::Settings.upstream_route("origin.test", "https", 443)
+        {route.kind, route.host, route.port}.should eq({"socks5h", "all-proxy.test", 1080})
+      end
+    ensure
+      reset_upstream
+    end
+
+    it "applies NO_PROXY host, domain, port, IPv6, and wildcard exceptions" do
+      with_proxy_environment({
+        "HTTP_PROXY" => "http://env-proxy.test:3128",
+        "NO_PROXY"   => "localhost,.internal.test,origin.test:8443,[::1]",
+      }) do
+        Gori::Settings.upstream_route("localhost", "http", 80).direct?.should be_true
+        Gori::Settings.upstream_route("api.internal.test", "http", 80).direct?.should be_true
+        Gori::Settings.upstream_route("origin.test", "http", 8443).direct?.should be_true
+        Gori::Settings.upstream_route("[::1]", "http", 80).direct?.should be_true
+        Gori::Settings.upstream_route("origin.test", "http", 8080).host.should eq("env-proxy.test")
+
+        ENV["NO_PROXY"] = "*"
+        Gori::Settings.upstream_route("anything.test", "http", 80).direct?.should be_true
+      end
+    ensure
+      reset_upstream
+    end
+
+    it "never sends localhost or a loopback literal to an environment proxy, NO_PROXY or not" do
+      with_proxy_environment({"HTTP_PROXY" => "http://env-proxy.test:3128"}) do
+        ["localhost", "LocalHost.", "127.0.0.1", "127.9.9.9", "::1", "[::1]", "::ffff:127.0.0.1",
+         "0.0.0.0", "::"].each do |host|
+          Gori::Settings.upstream_route(host, "http", 3000).direct?.should be_true, host
+        end
+        # The carve-out is the environment's, not the operator's: an explicit route to a local
+        # proxy is a decision and keeps winning.
+        Gori::Settings.upstream_route("10.0.0.1", "http", 80).host.should eq("env-proxy.test")
+        Gori::Settings.upstream_proxy = "127.0.0.1:1080"
+        Gori::Settings.upstream_route("localhost", "http", 3000).host.should eq("127.0.0.1")
+      end
+    ensure
+      reset_upstream
+    end
+
+    it "keeps legacy numeric IPv4 loopback spellings out of environment proxy routing" do
+      with_proxy_environment({"HTTP_PROXY" => "http://env-proxy.test:3128"}) do
+        ["127.1", "2130706433", "0x7f.1", "0177.1", "017700000001"].each do |host|
+          Gori::Settings.upstream_route(host, "http", 3000).direct?.should be_true, host
+        end
+        host = "0177.0.0.1"
+        if ip = resolved_ipv4(host)
+          ip.starts_with?("127.").should eq(Gori::Settings.upstream_route(host, "http", 3000).direct?)
+        end
+      end
+    ensure
+      reset_upstream
+    end
+
+    it "summarises the exported variables per origin scheme, without credentials" do
+      with_proxy_environment({"HTTP_PROXY" => "http://bob:hunter2@env-proxy.test:3128"}) do
+        proxies = Gori::Settings.environment_upstream_proxies
+        proxies.size.should eq(1)
+        proxies[0].name.should eq("HTTP_PROXY")
+        proxies[0].schemes.should eq(["http", "https"]) # one variable, both origins
+        Gori::Settings.environment_upstream_summary.should eq("HTTP_PROXY → http proxy env-proxy.test:3128")
+        Gori::Settings.environment_upstream_in_effect?.should be_true
+
+        ENV["https_proxy"] = "socks5h://[::1]:1080"
+        # Windows environment names are case-insensitive, so the upper-case spelling, asked first, finds it.
+        Gori::Settings.environment_upstream_summary.should eq(
+          "HTTP_PROXY → http proxy env-proxy.test:3128; #{{{ flag?(:win32) ? "HTTPS_PROXY" : "https_proxy" }}} → socks5h proxy [::1]:1080")
+
+        Gori::Settings.upstream_proxy = "global.test:8080"
+        Gori::Settings.environment_upstream_in_effect?.should be_false
+      end
+      Gori::Settings.environment_upstream_summary.should eq("")
+    ensure
+      reset_upstream
+    end
+
+    # The container/k8s profile shape. Every `/` entry used to be skipped in silence, so the
+    # excluded RFC 1918 target went through the proxy — and was disclosed to it (#1114).
+    it "applies NO_PROXY CIDR entries to IPv4 and IPv6 address literals" do
+      with_proxy_environment({
+        "HTTP_PROXY" => "http://env-proxy.test:3128",
+        "NO_PROXY"   => "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fd00::/8,[2001:db8::]/32,.svc",
+      }) do
+        ["10.1.2.3", "172.31.255.255", "192.168.0.1", "fd12::1", "[fd12::1]", "2001:db8:1::9",
+         "kube.svc"].each do |host|
+          Gori::Settings.upstream_route(host, "http", 8080).direct?.should be_true, host
+        end
+        ["11.0.0.1", "172.32.0.1", "192.169.0.1", "fe80::1", "2001:db9::1", "10.example.test"].each do |host|
+          Gori::Settings.upstream_route(host, "http", 8080).host.should eq("env-proxy.test"), host
+        end
+        # A malformed block is ignored, never a direct route (the forgiving convention).
+        ENV["NO_PROXY"] = "10.0.0.0/33,10.0.0.0/x,10.0.0/8,fd00::/129"
+        Gori::Settings.upstream_route("10.1.2.3", "http", 8080).host.should eq("env-proxy.test")
+        Gori::Settings.upstream_route("fd12::1", "http", 8080).host.should eq("env-proxy.test")
+      end
+    ensure
+      reset_upstream
+    end
+
+    it "matches NO_PROXY IPv4 CIDRs against legacy numeric destination spellings" do
+      with_proxy_environment({
+        "HTTP_PROXY" => "http://env-proxy.test:3128",
+        "NO_PROXY"   => "10.0.0.0/8",
+      }) do
+        ["10.1", "167772161", "0xa.1", "012.1", "01200000001"].each do |host|
+          Gori::Settings.upstream_route(host, "http", 8080).direct?.should be_true, host
+        end
+        host = "012.0.0.1"
+        if ip = resolved_ipv4(host)
+          ip.starts_with?("10.").should eq(Gori::Settings.upstream_route(host, "http", 8080).direct?)
+        end
+        Gori::Settings.upstream_route("11.1", "http", 8080).host.should eq("env-proxy.test")
+      end
+    ensure
+      reset_upstream
+    end
+
+    # "In effect" is not a global yes/no once rules exist. A `*` rule claims every host, so the
+    # environment is shadowed exactly as a non-blank scalar shadows it — and the banner used to
+    # say "no gori upstream proxy is set, so $HTTPS_PROXY routes https origins" over a table
+    # that sent everything to a jump host (#1114).
+    # A gori started inside `gori run shell` inherits the proxy variables pointing at the gori
+    # that opened the shell. Adopted as its own upstream, every request it makes would chain
+    # through the parent and be captured twice (#1238).
+    it "passes over the proxy a gori shell exported, and says so on the banner" do
+      injected = "http://127.0.0.1:8070"
+      with_proxy_environment({"HTTPS_PROXY" => injected, "https_proxy" => injected, "HTTP_PROXY" => injected,
+                              "GORI_SHELL" => "1", "GORI_PROXY" => "127.0.0.1:8070"}) do
+        Gori::Settings.upstream_route("a.test", "https", 443).direct?.should be_true
+        Gori::Settings.environment_upstream_summary.should eq("")
+        Gori::Settings.upstream_proxy_warnings.join("\n").should contain("running inside a gori shell")
+        # A proxy the operator exported on top of the shell's is a decision, and still routes.
+        ENV["ALL_PROXY"] = "http://corp.example:3128"
+        Gori::Settings.upstream_route("a.test", "https", 443).host.should eq("corp.example")
+      end
+    ensure
+      reset_upstream
+    end
+
+    # The shell replaced the terminal's own egress proxy, and recorded it. A gori started there
+    # still needs that egress — going direct fails on a proxy-only network, or leaks around it.
+    it "reaches the proxy the gori shell replaced, with the NO_PROXY exceptions that went with it" do
+      injected = "http://127.0.0.1:8070"
+      with_proxy_environment({"HTTPS_PROXY" => injected, "GORI_SHELL" => "1", "GORI_PROXY" => "127.0.0.1:8070",
+                              "GORI_SHELL_ORIG_HTTPS_PROXY" => "http://corp.example:3128",
+                              "GORI_SHELL_ORIG_NO_PROXY" => ".internal.test"}) do
+        Gori::Settings.upstream_route("a.test", "https", 443).host.should eq("corp.example")
+        Gori::Settings.upstream_route("svc.internal.test", "https", 443).direct?.should be_true
+        # NO_PROXY set again inside the shell is the operator's, and wins over the record.
+        ENV["NO_PROXY"] = "a.test"
+        Gori::Settings.upstream_route("a.test", "https", 443).direct?.should be_true
+      end
+    ensure
+      reset_upstream
+    end
+
+    it "keeps the same value as an upstream when no gori shell exported it" do
+      with_proxy_environment({"HTTPS_PROXY" => "http://127.0.0.1:8070"}) do
+        Gori::Settings.upstream_route("a.test", "https", 443).host.should eq("127.0.0.1")
+      end
+    ensure
+      reset_upstream
+    end
+
+    it "treats a catch-all rule as shadowing the environment entirely" do
+      with_proxy_environment({"HTTPS_PROXY" => "http://corp.example:3128"}) do
+        Gori::Settings.upstream_rules = [rule("*", "socks5", "jump.example:1080")]
+        Gori::Settings.upstream_route("a.test", "https", 443).kind.should eq("socks5")
+        Gori::Settings.environment_upstream_scope.none?.should be_true
+        Gori::Settings.environment_upstream_in_effect?.should be_false
+        Gori::Settings.environment_upstream_status.should eq("")
+        Gori::Settings.upstream_proxy_warnings.join("\n").should_not contain("_PROXY")
+        # …while the variables are still exported and reportable as such.
+        Gori::Settings.environment_upstream_summary.should eq("HTTPS_PROXY → http proxy corp.example:3128")
+      end
+    ensure
+      reset_upstream
+    end
+
+    it "says the environment reaches only the destinations a narrow rule table leaves unclaimed" do
+      with_proxy_environment({"HTTPS_PROXY" => "http://corp.example:3128"}) do
+        Gori::Settings.upstream_rules = [rule("*.corp.test", "direct")]
+        Gori::Settings.upstream_route("a.test", "https", 443).host.should eq("corp.example")
+        Gori::Settings.upstream_route("x.corp.test", "https", 443).direct?.should be_true
+        Gori::Settings.environment_upstream_scope.partial?.should be_true
+        Gori::Settings.environment_upstream_in_effect?.should be_true
+        Gori::Settings.environment_upstream_reach.should eq("destinations no upstream rule claims")
+        Gori::Settings.environment_upstream_status.should eq(
+          "HTTPS_PROXY → http proxy corp.example:3128 · destinations no upstream rule claims")
+        joined = Gori::Settings.upstream_proxy_warnings.join("\n")
+        joined.should contain("$HTTPS_PROXY routes https origins via http proxy corp.example:3128 " \
+                              "for destinations no upstream rule claims")
+        joined.should_not contain("no gori upstream proxy is set")
+
+        # The invalid-value warning carries the same qualifier.
+        ENV["HTTPS_PROXY"] = "http://"
+        Gori::Settings.upstream_proxy_warnings.join("\n")
+          .should contain("origin dial to destinations no upstream rule claims fails closed")
+      end
+    ensure
+      reset_upstream
+    end
+
+    it "words a narrowed project destination filter the same way, and a broken one as shadowing" do
+      with_proxy_environment({"HTTPS_PROXY" => "http://corp.example:3128"}) do
+        Gori::Settings.project_upstream_destination = "*.lab.test"
+        Gori::Settings.upstream_route("a.lab.test", "https", 443).host.should eq("corp.example")
+        Gori::Settings.upstream_route("a.test", "https", 443).direct?.should be_true
+        Gori::Settings.environment_upstream_reach.should eq("destinations the project destination filter admits")
+
+        Gori::Settings.upstream_rules = [rule("*.corp.test", "direct")]
+        Gori::Settings.environment_upstream_reach.should eq(
+          "destinations no upstream rule claims and the project destination filter admits")
+
+        # A filter that cannot compile refuses every dial before the environment is asked.
+        Gori::Settings.upstream_rules = [] of Gori::Settings::UpstreamRule
+        Gori::Settings.project_upstream_destination = "["
+        Gori::Settings.upstream_route("a.lab.test", "https", 443).invalid?.should be_true
+        Gori::Settings.environment_upstream_scope.none?.should be_true
+        Gori::Settings.environment_upstream_status.should eq("")
+
+        # No filter and no rules: the environment answers for everything, unqualified.
+        Gori::Settings.project_upstream_destination = nil
+        Gori::Settings.environment_upstream_scope.all?.should be_true
+        Gori::Settings.environment_upstream_reach.should be_nil
+        Gori::Settings.upstream_proxy_warnings.join("\n").should contain("no gori upstream proxy is set")
+      end
+    ensure
+      reset_upstream
+    end
+
+    it "keeps explicit gori routes ahead of the environment fallback" do
+      with_proxy_environment({"HTTP_PROXY" => "http://env-proxy.test:3128"}) do
+        Gori::Settings.upstream_proxy = "global.test:8080"
+        Gori::Settings.upstream_route("origin.test", "http", 80).host.should eq("global.test")
+
+        Gori::Settings.upstream_proxy = ""
+        Gori::Settings.upstream_rules = [rule("origin.test", "direct")]
+        Gori::Settings.upstream_route("origin.test", "http", 80).direct?.should be_true
+
+        Gori::Settings.upstream_rules = [] of Gori::Settings::UpstreamRule
+        Gori::Settings.project_upstream_proxy = ""
+        Gori::Settings.upstream_route("origin.test", "http", 80).direct?.should be_true
+
+        Gori::Settings.project_upstream_proxy = "project.test:9000"
+        Gori::Settings.upstream_route("origin.test", "http", 80).host.should eq("project.test")
+      end
+    ensure
+      reset_upstream
+    end
+
+    it "interprets an HTTPS environment proxy as TLS to the HTTP proxy" do
+      with_proxy_environment({"HTTPS_PROXY" => "https://user:pass@env-proxy.test:8443"}) do
+        route = Gori::Settings.upstream_route("origin.test", "https", 443)
+        {route.kind, route.host, route.port, route.username, route.password}.should eq(
+          {"http+tls", "env-proxy.test", 8443, "user", "pass"}
+        )
+      end
+    ensure
+      reset_upstream
+    end
+
+    # The environment grammar was MORE permissive than the persisted one: `http://` parsed to
+    # host "" on port 8080 while `parse_upstream_proxy("http://")` refused it (#1114).
+    it "fails an environment proxy URL with no host closed, as the scalar grammar does" do
+      ["http://", "http://:3128", "http://[]:3128", "https://", "socks5h://"].each do |value|
+        with_proxy_environment({"HTTP_PROXY" => value}) do
+          route = Gori::Settings.upstream_route("origin.test", "http", 80)
+          route.invalid?.should be_true, value
+          route.direct?.should be_false, value
+        end
+      end
+      Gori::Settings.parse_upstream_proxy("http://").invalid?.should be_true
+    ensure
+      reset_upstream
+    end
+
+    it "defaults a portless environment URL to the scheme's port: 80, 443, 1080 — never 8080" do
+      {
+        "http://noport.test"    => {"http", 80},
+        "https://noport.test"   => {"http+tls", 443},
+        "socks5://noport.test"  => {"socks5", 1080},
+        "socks5h://noport.test" => {"socks5h", 1080},
+      }.each do |value, expected|
+        with_proxy_environment({"HTTP_PROXY" => value}) do
+          route = Gori::Settings.upstream_route("origin.test", "http", 80)
+          {route.kind, route.port}.should eq(expected), value
+        end
+      end
+      # The bare host:port spelling and the persisted scalar keep their legacy 8080.
+      with_proxy_environment({"HTTP_PROXY" => "noport.test"}) do
+        Gori::Settings.upstream_route("origin.test", "http", 80).port.should eq(8080)
+      end
+      Gori::Settings.parse_upstream_proxy("http://noport.test").port.should eq(8080)
+    ensure
+      reset_upstream
+    end
+
+    it "does not echo environment proxy credentials when the value is invalid" do
+      with_proxy_environment({"HTTP_PROXY" => "http://alice:super-secret@env-proxy.test:bad"}) do
+        route = Gori::Settings.upstream_route("origin.test", "http", 80)
+        route.invalid?.should be_true
+        route.configuration_error.to_s.should_not contain("super-secret")
+      end
+    ensure
+      reset_upstream
+    end
+
     # Back-compat: a project that pinned its own upstream before rules existed must keep
     # going through it, whatever the global table now says.
     it "lets a project pin beat the rule table entirely" do
@@ -300,6 +659,53 @@ describe "upstream rules" do
       route.invalid?.should be_true
       route.direct?.should be_false
       route.configuration_error.to_s.should contain("invalid upstream rule host pattern")
+    ensure
+      reset_upstream
+    end
+  end
+
+  describe "environment proxy dialing" do
+    it "uses the origin scheme when reporting the selected environment proxy" do
+      with_proxy_environment({
+        "HTTP_PROXY"  => "http://http-proxy.test:3128",
+        "HTTPS_PROXY" => "http://https-proxy.test:8443",
+      }) do
+        Gori::Proxy::Upstream.proxied_via("example.test", "http", 80).should eq(
+          "upstream HTTP proxy http-proxy.test:3128"
+        )
+        Gori::Proxy::Upstream.proxied_via("example.test", "https", 443).should eq(
+          "upstream HTTP proxy https-proxy.test:8443"
+        )
+      end
+    ensure
+      reset_upstream
+    end
+
+    it "tunnels through HTTP_PROXY when gori's catch-all is blank" do
+      with_capturing_http_proxy do |pport, head|
+        with_proxy_environment({"HTTP_PROXY" => "http://127.0.0.1:#{pport}"}) do
+          sock = Gori::Proxy::Upstream.dial("example.test", 80)
+          sock.should_not be_nil
+          sent = head.receive
+          sock.try(&.close) rescue nil
+
+          sent.should contain("CONNECT example.test:80 HTTP/1.1")
+        end
+      end
+    ensure
+      reset_upstream
+    end
+
+    it "preserves a legacy numeric destination spelling in CONNECT when an explicit rule proxies it" do
+      with_capturing_http_proxy do |pport, head|
+        Gori::Settings.upstream_rules = [rule("*", "http", "127.0.0.1:#{pport}")]
+        sock = Gori::Proxy::Upstream.dial("127.1", 80)
+        sock.should_not be_nil
+        sent = head.receive
+        sock.try(&.close) rescue nil
+
+        sent.should contain("CONNECT 127.1:80 HTTP/1.1")
+      end
     ensure
       reset_upstream
     end

@@ -33,6 +33,9 @@ module Gori::Proxy::Codec
     def initialize(@limit : Int32, @hint : Int64 = 0_i64)
       @mem = nil.as(IO::Memory?)
       @sealed = false
+      # The capacity @mem was created with, until the one `grow_to_hint` decision has been
+      # made; Int32::MAX after it (IO::Memory's own growth from then on).
+      @reserved = 0
     end
 
     def write(slice : Bytes) : Nil
@@ -44,14 +47,19 @@ module Gori::Proxy::Codec
       # store first so the handed-out slice stays a stable copy — copy-on-write, paid only in
       # that adversarial case, never on the normal read-once path.
       reseat_after_seal if @sealed
-      mem = (@mem ||= IO::Memory.new(initial_capacity))
+      mem = @mem || begin
+        @reserved = initial_capacity
+        @mem = IO::Memory.new(@reserved)
+      end
       stored = mem.bytesize
       if stored < @limit
         room = @limit - stored
-        if slice.size <= room
+        take = slice.size <= room ? slice.size : room
+        mem = grow_to_hint(mem, stored + take) if stored + take > @reserved
+        if take == slice.size
           mem.write(slice)
         else
-          mem.write(slice[0, room])
+          mem.write(slice[0, take])
           @truncated = true
         end
       else
@@ -81,6 +89,27 @@ module Gori::Proxy::Codec
       return unless old
       fresh = IO::Memory.new(old.bytesize > 0 ? old.bytesize : 64)
       fresh.write(old.to_slice)
+      @mem = fresh
+      @reserved = Int32::MAX
+    end
+
+    # The body has outgrown the presize, so more than PRESIZE_CAP bytes REALLY arrived: now the
+    # declared length is worth one allocation that fits it (bounded by the capture limit),
+    # instead of IO::Memory doubling from 256 KiB — which allocated 256+512+1024+2048 KiB for a
+    # 1.5 MB body and kept it as a view into the 2 MiB block. A header that lies HIGH can force
+    # at most the capture limit, and only after PRESIZE_CAP bytes were sent; one that lies LOW
+    # (or no length at all) leaves IO::Memory's own growth in charge. Decided once per capture.
+    private def grow_to_hint(mem : IO::Memory, need : Int32) : IO::Memory
+      @reserved = Int32::MAX
+      target = @hint > @limit ? @limit : @hint.to_i
+      return mem if target < need
+      # The hint is the peer's unverified claim, and the limit can be raised to GiBs: a
+      # response that declares 1 TB, sends just past the presize and stalls must not reserve the
+      # whole limit. Jump only when the claim is within a few doublings of what really arrived;
+      # past that, IO::Memory's doubling keeps the allocation within 2x of the bytes received.
+      return mem if target // 8 > need
+      fresh = IO::Memory.new(target)
+      fresh.write(mem.to_slice)
       @mem = fresh
     end
 
@@ -194,8 +223,8 @@ module Gori::Proxy::Codec
       # obfuscated_header? on purpose — see Http1.framing_ambiguous?. RFC 7230 §3.2.4
       # explicitly sanctions refusing a message here rather than guessing.
       raise Gori::Error.new("ambiguous framing headers (a lenient recipient would frame this response differently)") if Http1.framing_ambiguous?(resp.raw_head, resp.headers)
-      # Allocation-free case-insensitive match (per response); `.upcase` allocated a String.
-      if request_method.compare("HEAD", case_insensitive: true) == 0
+      # Methods are case-sensitive tokens: `head` is an extension method, not HEAD.
+      if request_method == "HEAD"
         return {BodyFraming::None, 0_i64}
       end
       s = resp.status
@@ -203,10 +232,10 @@ module Gori::Proxy::Codec
       # (the tunnel is open). Non-2xx (407 Proxy Auth Required, 502, …) may carry an
       # entity the client must read; treating EVERY CONNECT reply as bodyless left that
       # entity on the wire to misframe the next message on a reused upstream.
-      if request_method.compare("CONNECT", case_insensitive: true) == 0 && (200..299).includes?(s)
+      if request_method == "CONNECT" && (200..299).includes?(s)
         return {BodyFraming::None, 0_i64}
       end
-      return {BodyFraming::None, 0_i64} if (s >= 100 && s < 200) || s == 204 || s == 304
+      return {BodyFraming::None, 0_i64} if !resp.malformed? && ((s >= 100 && s < 200) || s == 204 || s == 304)
 
       te = resp.headers.has?("Transfer-Encoding") ? resp.headers.get_all("Transfer-Encoding") : EMPTY_TE
       if chunked?(te)
@@ -232,11 +261,11 @@ module Gori::Proxy::Codec
     # followed by a keep-alive request without desyncing the peer).
     #
     # `buf` is the scratch copy buffer. When nil (Repeater/Fuzz/Miner callers) a body
-    # allocates a fresh 64 KiB slice, as before. A caller that forwards many bodies on
-    # one connection (ClientConn) passes ONE reused buffer so a keep-alive stream stops
-    # churning a large-object 64 KiB allocation per body — safe because a body is pumped
-    # one direction on one fiber, so the request and response bodies copy sequentially,
-    # never overlapping (the same argument copy_chunked already uses across its chunks).
+    # allocates a fresh 64 KiB slice, as before. ClientConn, which forwards many bodies,
+    # passes one borrowed from `Proxy::CopyBufPool` for the length of this call, so a
+    # keep-alive stream stops churning a large-object 64 KiB allocation per body — safe
+    # because a body is pumped one direction on one fiber and the buffer never leaves this
+    # call (the same argument copy_chunked already uses across its chunks).
     # A body-less frame (None) never touches the buffer, so a bodyless request never allocates.
     def self.stream(src : IO, dst : IO, framing : BodyFraming, length : Int64, tee : IO, buf : Bytes? = nil) : Bool
       complete =
@@ -296,8 +325,9 @@ module Gori::Proxy::Codec
     end
 
     # A capture buffer presized to a known Length body (bounded by PRESIZE_CAP); default
-    # growth for unknown-length (chunked / close-delimited) framings.
-    private def self.presized_capture(framing : BodyFraming, length : Int64) : IO::Memory
+    # growth for unknown-length (chunked / close-delimited) framings. Public for the h1 paths
+    # in `ClientConn` that buffer a whole response body (a body rule, a held response).
+    def self.presized_capture(framing : BodyFraming, length : Int64) : IO::Memory
       return IO::Memory.new unless framing.length? && length > 0
       cap = length > CaptureBuffer::PRESIZE_CAP ? CaptureBuffer::PRESIZE_CAP : length.to_i
       IO::Memory.new(cap)
@@ -319,10 +349,14 @@ module Gori::Proxy::Codec
     # Whether any non-empty transfer-coding token is present (an empty/blank
     # Transfer-Encoding header carries none, so it isn't "present" for framing).
     private def self.te_present?(transfer_encodings : Array(String)) : Bool
+      return false if transfer_encodings.empty? # EMPTY_TE: no header, nothing to tokenize
       transfer_encodings.any? { |v| v.split(',').any? { |t| !t.strip.empty? } }
     end
 
     private def self.chunked?(transfer_encodings : Array(String)) : Bool
+      # No Transfer-Encoding at all (EMPTY_TE) is the common message, and the pipeline below
+      # answers `false` for it after building three throwaway Arrays. Say so up front.
+      return false if transfer_encodings.empty?
       tokens = transfer_encodings.flat_map(&.split(',')).map(&.strip.downcase).reject(&.empty?)
       return false if tokens.empty?
       final_chunked = tokens.last == "chunked"
@@ -339,8 +373,58 @@ module Gori::Proxy::Codec
       raise Gori::Error.new("Transfer-Encoding and Content-Length both present")
     end
 
+    # The body length a Content-Length declares, or nil when there is no usable one.
+    #
+    # Split in two because the general answer is expensive and almost never needed. The
+    # conformant message — ONE Content-Length field line whose value is a plain run of ASCII
+    # digits — is answered by `plain_content_length` off the value's bytes, allocating nothing;
+    # `content_length_strict` below is the original implementation, reached verbatim for
+    # everything else, so every rejection and every raise it makes still happens exactly where
+    # it did. That matters more here than the speed: this is the CL half of CL/TE smuggling,
+    # and a fast path that answered differently from the strict one WOULD BE the desync.
     private def self.content_length(headers : HeaderList) : Int64?
-      return nil unless headers.has?("Content-Length")
+      lines = 0
+      only = ""
+      headers.each do |h|
+        next unless h.name.compare("Content-Length", case_insensitive: true) == 0
+        lines += 1
+        only = h.value
+      end
+      return nil if lines == 0
+      if lines == 1
+        plain = plain_content_length(only)
+        return plain if plain
+      end
+      content_length_strict(headers)
+    end
+
+    # `value` as an Int64 when it is nothing but ASCII whitespace around 1..18 ASCII digits —
+    # the shape `content_length_strict` would parse to the same number with no raise and no
+    # rejection. nil means "not that shape", NOT "no length": every other spelling (a comma
+    # list, a sign, a non-digit, Unicode whitespace, a value too long to be certain of Int64
+    # range) goes to the strict path to be parsed or refused there.
+    private def self.plain_content_length(value : String) : Int64?
+      # SP / HTAB / LF / VT / FF / CR — what `String#strip` takes off an ASCII string, which is
+      # what the strict path applies to each token. Anything else at an edge is left in place
+      # so the value fails the digit test below and the strict path decides.
+      bytes = AsciiBytes.trim(value.to_slice)
+      from = 0
+      to = bytes.size
+      # 18 digits is the widest run that cannot overflow Int64, so the accumulate below needs
+      # no overflow guard of its own — and is written with the CHECKED operators anyway, so a
+      # wrong bound here would raise rather than hand the framing loop a wrapped length.
+      return nil if to - from == 0 || to - from > 18
+      n = 0_i64
+      while from < to
+        b = bytes.unsafe_fetch(from)
+        return nil unless b >= 0x30_u8 && b <= 0x39_u8 # '0'..'9'
+        n = n * 10 + (b - 0x30_u8)
+        from += 1
+      end
+      n
+    end
+
+    private def self.content_length_strict(headers : HeaderList) : Int64?
       values = headers.get_all("Content-Length")
       return nil if values.empty?
       # A header line may itself be a comma list ("5, 5"); split + parse each token.
@@ -367,6 +451,16 @@ module Gori::Proxy::Codec
       n
     end
 
+    @@streamed = 0_i64
+
+    # Body bytes the copy loops below have moved, cumulative for the process. `IdleGc` reads its
+    # change between two ticks: a body streaming past the capture limit writes nothing to the
+    # Store and allocates nothing per chunk, but bytes still move. One add per read, on the
+    # fiber that already owns the loop (single-threaded scheduler).
+    def self.streamed : Int64
+      @@streamed
+    end
+
     # Copies exactly `n` bytes; returns false if the source EOF'd early (a
     # truncated Content-Length body), true once all `n` were transferred.
     # `buf` is the scratch copy buffer. When nil a fresh 64 KiB slice is allocated (one
@@ -382,6 +476,7 @@ module Gori::Proxy::Codec
         want = remaining < cap ? remaining.to_i : cap
         read = src.read(cbuf[0, want])
         break if read == 0 # premature EOF
+        @@streamed &+= read
         slice = cbuf[0, read]
         dst.write(slice)
         tee.write(slice)
@@ -393,6 +488,7 @@ module Gori::Proxy::Codec
     private def self.copy_until_eof(src : IO, dst : IO, tee : IO, buf : Bytes? = nil) : Nil
       cbuf = buf || Bytes.new(BUFSIZE)
       while (read = src.read(cbuf)) > 0
+        @@streamed &+= read
         slice = cbuf[0, read]
         dst.write(slice)
         tee.write(slice)
@@ -499,7 +595,30 @@ module Gori::Proxy::Codec
     # Parse a chunk-size line: hex digits before any ';' chunk-extension. Returns
     # nil for a malformed, signed, or out-of-range size so the caller can abort
     # (a fabricated 0 would be read as the terminating chunk and desync the body).
-    private def self.parse_chunk_size(line : Bytes) : Int64?
+    #
+    # The line nearly every peer sends is bare hex digits then CRLF (or LF), and that one is
+    # answered straight from the bytes. Anything else — an extension, whitespace, a sign, an
+    # empty size, 16+ digits — goes to `parse_chunk_size_strict` unchanged, so a malformed
+    # line is judged exactly as before (P7). The fast answer is the strict one by
+    # construction: the strict reader strips the same terminator, finds no ';', and parses
+    # the same all-hex token, and 15 hex digits cannot overflow Int64. Public (with the
+    # strict reader) only so the codec spec can hold the two to the same answers.
+    def self.parse_chunk_size(line : Bytes) : Int64?
+      stop = line.size
+      stop -= 1 if stop > 0 && line.unsafe_fetch(stop - 1) == 0x0a_u8 # LF
+      stop -= 1 if stop > 0 && line.unsafe_fetch(stop - 1) == 0x0d_u8 # CR
+      return parse_chunk_size_strict(line) unless 0 < stop <= 15
+      n = 0_i64
+      stop.times do |i|
+        digit = line.unsafe_fetch(i).unsafe_chr.to_i?(16).try(&.to_i64)
+        return parse_chunk_size_strict(line) unless digit
+        n = (n << 4) | digit
+      end
+      n
+    end
+
+    # The general reader `parse_chunk_size` falls back to.
+    def self.parse_chunk_size_strict(line : Bytes) : Int64?
       s = String.new(line).strip
       semi = s.index(';')
       hex = (semi ? s[0...semi] : s).strip

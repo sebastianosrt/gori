@@ -2,6 +2,7 @@ require "json"
 require "../../ql"
 require "../../scope"
 require "../../probe"
+require "../../plural"
 
 module Gori
   module MCP
@@ -15,15 +16,18 @@ module Gori
       # entry — so the list lives here, read by the reader's refusal AND by the schema.
       PROBE_RULE_KINDS = %w[passive active custom]
 
+      PROBE_SCAN_LIMIT = PageLimit.new(200, 2000)
+
       # probe_scan — the MCP surface for the Prism scanner (parity with `gori run probe`).
       # PASSIVE by default (zero outbound requests): scans captured History flows (optional
       # QL filter) + Repeater tabs and returns grouped issues. active:true also runs the
       # light-touch active checks that SEND requests — gated on write access AND project scope
       # (the same two-layer `Gori::Outbound` model as the CLI/TUI: an allowlist filter per flow
       # + a per-send Sandbox/exclude hard block inside the sender).
-      @[Tool("probe_scan")]
+      @[Tool("probe_scan", read_only: false, env_refresh: true, permission: "write")]
       private def probe_scan(h) : Result
-        filter = probe_scan_filter(h)
+        dropped = [] of String
+        filter = probe_scan_filter(h, dropped)
         return filter if filter.is_a?(Result)
 
         if e = bad_severity(str(h, "severity"))
@@ -33,12 +37,15 @@ module Gori
         return category if category.is_a?(Result)
 
         active = bool_arg(h, "active", false)
+        if refusal = probe_active_widening(active, dropped)
+          return refusal
+        end
         # Read up here, not in the result expression it feeds. `limit` only trims the REPORT,
         # so reading it last looked free — until an unreadable value became a refusal, at which
         # point `probe_scan{active:true, limit:"all"}` sent the whole active scan at the target
         # and then threw every detection away with an argument error. Same rule as
         # `send_request`'s `max_body_bytes` and `minimize_repeater`'s `apply`.
-        limit = clamp(optional_int_arg(h, "limit"), 200, 2000)
+        limit = clamp(optional_int_arg(h, "limit"), PROBE_SCAN_LIMIT)
         allow_unscoped = bool_arg(h, "allow_unscoped", false)
         # --aggressive implies unsafe (it also raises caps + widens bypass sets).
         aggressive = bool_arg(h, "aggressive", false)
@@ -46,6 +53,11 @@ module Gori
         gate = probe_active_gate(active, allow_unscoped)
         return gate if gate.is_a?(Result)
         scope, scope_configured = gate
+        # Refused up here, before a single flow is read, for the reason `limit` is read up
+        # here: a scan that ran and was then refused its write would have spent the work (and,
+        # under active:true, the sends) for nothing.
+        persist = probe_persist_arg(h)
+        return persist if persist.is_a?(Result)
 
         opts = Probe::Active::Options.new(allow_unsafe: unsafe, aggressive: aggressive)
         ids = Probe::Scan.flow_ids(store, filter)
@@ -62,8 +74,21 @@ module Gori
         # self-signed certificate is the ordinary case for a scan, and without this the active
         # checks simply failed there with a TLS error that named nothing actionable.
         verify_upstream = !bool_arg(h, "insecure", false) && @verify_upstream
+        # Loaded HERE and handed to the scan, rather than letting `scan_all` load its own: the
+        # out-of-band notice below has to describe the run that actually happened, and a config
+        # read a second time could disagree with it (a rule toggled between the two reads, or a
+        # busy store making only one of them `degraded`).
+        rules = Probe::Scan::RuleConfig.load(store)
+        # `stop:` is what makes a cancelled call stop SENDING (#1103). An active scan is the
+        # one tool here whose runaway cost is a third party's server, and a cancel used to buy
+        # only silence: the client stopped waiting and up to PROBE_ACTIVE_MAX_FLOWS flows of
+        # real probes went out anyway. Polled between flows, so the bound is "at most one more
+        # flow's probes". Nothing is written mid-scan, so a stopped scan leaves no partial
+        # state to reconcile — and it is owed no response, so there is no partial report to
+        # shape either.
         dets, repeater_n = Probe::Scan.scan_all(store, ids, active: active, verify_upstream: verify_upstream,
-          scope: scope, allow_unscoped: allow_unscoped, opts: opts, active_budget: budget,
+          scope: scope, allow_unscoped: allow_unscoped, opts: opts, active_budget: budget, rules: rules,
+          stop: cancel_signal, persist: persist,
           on_error: ->(_where : String, _ex : Exception) { scan_errors += 1; nil })
         capped = budget.exhausted?
 
@@ -77,7 +102,40 @@ module Gori
           groups = groups.select { |g| lens.host_in_scope?(g.host) }
         end
         Result.new(probe_scan_json(groups, ids.size, repeater_n, active, allow_unscoped,
-          scope_configured, capped, unsafe, aggressive, limit, scan_errors))
+          scope_configured, capped, unsafe, aggressive, limit, scan_errors,
+          oob_inert: oob_inert_rules(store, rules, active), persist: persist, dropped: dropped))
+      end
+
+      # `persist:true`'s writer, nil for a report-only scan, or the --read-only refusal.
+      private def probe_persist_arg(h) : Probe::Scan::Persist? | Result
+        return nil unless bool_arg(h, "persist", false)
+        return Probe::Scan::Persist.new if @allow_actions
+        err("persist:true writes the findings into the project (disabled by gori mcp --read-only); " \
+            "drop persist for a report-only scan", "TOOL_DISABLED", field: "persist")
+      end
+
+      # The enabled out-of-band rule ids this scan could NOT plant a payload for, or an empty
+      # list. An OOB rule closes its loop through a third-party interaction server rather than
+      # on the sending socket, so it needs an `oast_sessions` row to mint against
+      # (`Probe::OutOfBand::StoreMinter`); with none it plans nothing, sends nothing and finds
+      # nothing — and an agent reading an empty `issues` array records "no blind SSRF" for a
+      # check that never ran.
+      #
+      # `gori run probe` prints this as a notice and the TUI's Rules sub-tab badges it as
+      # "needs OAST". MCP was the one surface that stayed silent, and it is the surface where a
+      # clean-looking result is believed without a human reading the run. It joins
+      # `scan_errors` and `active_flows_capped` for the same reason: all three say the coverage
+      # was narrower than the empty result suggests.
+      #
+      # `available?` rather than `oast_sessions.empty?` — the same call `Scan.with_oob` makes,
+      # so this cannot claim a plant the scan could not perform (a row whose kind no longer
+      # parses is not a session either). Silent on a passive run (nothing plants), on a rule the
+      # operator switched OFF, and under a degraded config (which skips ACTIVE wholesale and
+      # reports that instead) — the same three gates the CLI's notice uses.
+      private def oob_inert_rules(store : Store, rules : Probe::Scan::RuleConfig,
+                                  active : Bool) : Array(String)
+        return [] of String if !active || rules.degraded || Probe::OutOfBand.available?(store)
+        Probe::OOB_RULE_IDS.select { |id| Probe.rule_enabled?(id, rules.disabled) }
       end
 
       # --- persisted probe issues + triage (parity with the TUI Probe tab) -------------------
@@ -85,6 +143,8 @@ module Gori
       # probe_scan is a STATELESS rescan; these read and mutate the `probe_issues` table the
       # live Analyzer fills — the same rows a human triages in the TUI. Without them an agent
       # could produce findings (probe_scan, send_request) but never dismiss or promote one.
+
+      PROBE_ISSUES_LIMIT = PageLimit.new(100, 500)
 
       # probe_issues — list persisted findings. Defaults to OPEN only, mirroring the TUI's
       # default open-only lens; include_closed:true is the `a` toggle.
@@ -97,10 +157,7 @@ module Gori
         return category if category.is_a?(Result)
 
         include_closed = bool_arg(h, "include_closed", false)
-        req_off = optional_int_arg(h, "offset")
-        req_lim = optional_int_arg(h, "limit")
-        offset = clamp_nonneg(req_off)
-        limit = clamp(req_lim, 100, 500)
+        pg = page_args(h, PROBE_ISSUES_LIMIT)
         # Page and total in SQL. This used to read EVERY matching row, filter `status.open?`
         # in Crystal (parsing each row's `affected` JSON on the way), and then slice a hundred
         # out of it — so answering a default `probe_issues` call on a wide crawl materialised
@@ -110,16 +167,11 @@ module Gori
         page, total = store.probe_issues_page(
           category.as(String?), str(h, "host").try(&.strip).presence,
           severity_from(str(h, "severity")),
-          open_only: !include_closed, limit: limit, offset: offset)
+          open_only: !include_closed, limit: pg.limit, offset: pg.offset)
         Result.new(JSON.build do |j|
           j.object do
             j.field("issues") { j.array { page.each { |i| Probe.issue_json(j, i) } } }
-            j.field "returned", page.size
-            j.field "offset", offset
-            j.field "limit", limit
-            emit_clamp(j, req_off, offset, req_lim, limit)
-            j.field "total", total
-            j.field "has_more", offset + page.size < total
+            emit_page(j, pg, page.size, total)
             j.field "include_closed", include_closed
           end
         end)
@@ -127,7 +179,7 @@ module Gori
 
       # probe_dismiss — mute a finding. Either one `id` (toggles dismissed ⇄ open, same rule as
       # the TUI's `c`), or a bulk `code`/`host` mute of every OPEN issue sharing it.
-      @[Tool("probe_dismiss", gated: true, agent_action: true)]
+      @[Tool("probe_dismiss", gated: true, agent_action: true, permission: "write")]
       private def probe_dismiss(h) : Result
         code = str(h, "code").try(&.strip).presence
         host = str(h, "host").try(&.strip).presence
@@ -156,14 +208,14 @@ module Gori
         issue = store.get_probe_issue(id)
         return not_found("no probe issue with id #{id}") unless issue
         landed = Probe::Triage.toggle_dismiss(store, issue)
+        return busy("dismiss NOT applied (store busy or unwritable); finding #{id} is unchanged") if landed == issue.status
         Result.new({"id" => issue.id, "status" => landed.label}.to_json)
       end
 
       # probe_promote — turn a machine finding into a human-confirmed Issue (the Issues report).
-      @[Tool("probe_promote", gated: true, agent_action: true)]
+      @[Tool("probe_promote", gated: true, agent_action: true, permission: "write")]
       private def probe_promote(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
+        id = required_id(h, "id")
         issue = store.get_probe_issue(id)
         return not_found("no probe issue with id #{id}") unless issue
         res = Probe::Triage.promote(store, issue)
@@ -187,7 +239,7 @@ module Gori
       # (code, host) suppression so the next scan does not immediately re-add it, whereas
       # all:true calls Store#clear_probe_issues, which wipes every suppression too — so a
       # rescan re-discovers everything. all:true is therefore gated on confirm:true.
-      @[Tool("probe_delete", gated: true, agent_action: true)]
+      @[Tool("probe_delete", gated: true, agent_action: true, permission: "write")]
       private def probe_delete(h) : Result
         id = int(h, "id")
         return Result.new(id_error(h, "id"), is_error: true) if id.nil? && present?(h, "id")
@@ -202,7 +254,7 @@ module Gori
         if all
           n = store.count_probe_issues
           unless bool_arg(h, "confirm", false)
-            return err("refusing to delete #{n} finding#{n == 1 ? "" : "s"} without confirm:true — this also clears every hard-delete suppression, so a rescan re-discovers them",
+            return err("refusing to delete #{Gori.plural(n, "finding")} without confirm:true — this also clears every hard-delete suppression, so a rescan re-discovers them",
               "CONFIRM_REQUIRED", field: "confirm", details: JSON.parse({"findings" => n}.to_json))
           end
           return busy("findings NOT cleared (store busy or unwritable); every one is still there") unless store.clear_probe_issues
@@ -240,10 +292,9 @@ module Gori
       # set_probe_rule_enabled — turn one rule on/off. Built-ins live in the project's
       # disabled-id set; a custom rule carries its own enabled flag (project rules only —
       # a GLOBAL custom rule lives in the user's settings.json, outside this project).
-      @[Tool("set_probe_rule_enabled", gated: true, agent_action: true)]
+      @[Tool("set_probe_rule_enabled", gated: true, agent_action: true, permission: "write")]
       private def set_probe_rule_enabled(h) : Result
-        id = str(h, "id").try(&.strip).presence
-        return err("missing required 'id' (see list_probe_rules)", "INVALID_ARGUMENT", field: "id") unless id
+        id = required_str(h, "id", "(see list_probe_rules)")
         enabled = optional_bool_arg(h, "enabled")
         return err("missing required 'enabled'", "INVALID_ARGUMENT", field: "enabled") if enabled.nil?
 
@@ -276,7 +327,7 @@ module Gori
 
       # create_probe_rule — add a PROJECT custom match rule (string/regex over one region of a
       # flow). Global rules are a settings.json concern and are not writable here.
-      @[Tool("create_probe_rule", gated: true, agent_action: true)]
+      @[Tool("create_probe_rule", gated: true, agent_action: true, permission: "write")]
       private def create_probe_rule(h) : Result
         fields = custom_rule_fields(h)
         return fields if fields.is_a?(Result)
@@ -290,10 +341,9 @@ module Gori
         Result.new({"id" => "custom_p_#{id}", "row_id" => id, "title" => title}.to_json)
       end
 
-      @[Tool("update_probe_rule", gated: true, agent_action: true)]
+      @[Tool("update_probe_rule", gated: true, agent_action: true, permission: "write")]
       private def update_probe_rule(h) : Result
-        id = str(h, "id").try(&.strip).presence
-        return err("missing required 'id' (see list_probe_rules)", "INVALID_ARGUMENT", field: "id") unless id
+        id = required_str(h, "id", "(see list_probe_rules)")
         row_id = custom_rule_row_id(id)
         return err("'#{id}' is not a project custom rule (only project custom rules are editable)",
           "INVALID_ARGUMENT", field: "id") unless row_id
@@ -313,10 +363,9 @@ module Gori
         Result.new({"id" => id, "title" => title}.to_json)
       end
 
-      @[Tool("delete_probe_rule", gated: true, agent_action: true)]
+      @[Tool("delete_probe_rule", gated: true, agent_action: true, permission: "write")]
       private def delete_probe_rule(h) : Result
-        id = str(h, "id").try(&.strip).presence
-        return err("missing required 'id' (see list_probe_rules)", "INVALID_ARGUMENT", field: "id") unless id
+        id = required_str(h, "id", "(see list_probe_rules)")
         row_id = custom_rule_row_id(id)
         return err("'#{id}' is not a project custom rule — a built-in can only be DISABLED (set_probe_rule_enabled), never deleted",
           "INVALID_ARGUMENT", field: "id") unless row_id
@@ -333,7 +382,7 @@ module Gori
 
       # set_probe_mode — the per-project scan mode. Raising it to active/aggressive arms the
       # AUTOMATIC probe pipeline for a live capture, so it is gated like any outbound action.
-      @[Tool("set_probe_mode", gated: true, agent_action: true)]
+      @[Tool("set_probe_mode", gated: true, agent_action: true, permission: "write")]
       private def set_probe_mode(h) : Result
         label = str(h, "mode").try(&.strip.downcase).presence
         return err("missing required 'mode' (off|passive|active|aggressive)", "INVALID_ARGUMENT", field: "mode") unless label
@@ -363,10 +412,8 @@ module Gori
 
       # Validate + normalize the shared create/update field set.
       private def custom_rule_fields(h) : {String, String, String, String, String, String, Store::Severity} | Result
-        title = str(h, "title").try(&.strip).presence
-        return err("missing required 'title'", "INVALID_ARGUMENT", field: "title") unless title
-        pattern = str(h, "pattern").try(&.strip).presence
-        return err("missing required 'pattern'", "INVALID_ARGUMENT", field: "pattern") unless pattern
+        title = required_str(h, "title")
+        pattern = required_str(h, "pattern")
 
         spec = custom_rule_match_spec(h, pattern)
         return spec if spec.is_a?(Result)
@@ -413,10 +460,20 @@ module Gori
       end
 
       # The QL filter (History only; blank/absent → nil = scan all), or a QUERY_SYNTAX Result.
-      private def probe_scan_filter(h) : QL::Filter? | Result
+      # An active scan SENDS probes for every selected flow, so a term that was dropped — and
+      # widened the selection — is refused before anything goes out. `ignored_terms` on the
+      # reply would name it only after the traffic had been sent.
+      private def probe_active_widening(active : Bool, dropped : Array(String)) : Result?
+        return nil unless active && !dropped.empty?
+        err("query term(s) #{dropped.join(", ")} cannot be used and would be dropped, widening " \
+            "an ACTIVE scan to more flows than asked — fix or remove them (ql_explain shows why)",
+          "QUERY_SYNTAX", field: "query")
+      end
+
+      private def probe_scan_filter(h, dropped : Array(String)) : QL::Filter? | Result
         query = str(h, "query").try(&.strip).presence
         return nil unless query
-        ql_filter_or_error(h, query)
+        ql_filter_or_error(h, query, dropped)
       end
 
       # The validated category slug (or nil), or an INVALID_ARGUMENT Result.
@@ -456,10 +513,14 @@ module Gori
       private def probe_scan_json(groups : Array(Probe::Group), flows_scanned : Int32, repeater_n : Int32,
                                   active : Bool, allow_unscoped : Bool, scope_configured : Bool,
                                   capped : Bool, unsafe : Bool, aggressive : Bool, limit : Int32,
-                                  scan_errors : Int32 = 0) : String
+                                  scan_errors : Int32 = 0,
+                                  oob_inert : Array(String) = [] of String,
+                                  persist : Probe::Scan::Persist? = nil,
+                                  dropped : Array(String) = [] of String) : String
         JSON.build do |j|
           j.object do
             j.field "flows_scanned", flows_scanned
+            emit_ignored_terms(j, dropped)
             j.field "repeaters_scanned", repeater_n
             # Only present when something was skipped: coverage is INCOMPLETE, so a clean-looking
             # empty result must not be read as "nothing found".
@@ -471,11 +532,50 @@ module Gori
               j.field "active_flows_capped", true if capped
               j.field "active_unsafe_methods", true if unsafe # POST/PUT/PATCH/DELETE re-sent
               j.field "active_aggressive", true if aggressive # raised caps + wider bypass sets
+              # The out-of-band rules that were ENABLED and still sent nothing — see
+              # `oob_inert_rules`. Present only when it happened, and carrying the sentence
+              # rather than only the ids: the whole hazard is a reader treating the empty
+              # `issues` array as an answer about blind vulnerabilities, and a bare id list
+              # invites exactly that reading.
+              unless oob_inert.empty?
+                j.field("out_of_band") do
+                  j.object do
+                    j.field "session", false
+                    j.field("inert_rules") { j.array { oob_inert.each { |id| j.string id } } }
+                    j.field "note", "#{oob_inert.join(", ")} #{oob_inert.size == 1 ? "is" : "are"} " \
+                                    "enabled but this project has no OAST session to mint payloads " \
+                                    "against, so no out-of-band probe was sent — an empty result is " \
+                                    "NOT evidence that no blind (out-of-band) vulnerability exists. " \
+                                    "Start a listener (oast_start with persist:true, or the TUI's " \
+                                    "OAST tab) and scan again."
+                  end
+                end
+              end
             end
             j.field "issue_count", groups.size
+            emit_probe_persisted(j, persist) if persist
             j.field("issues") { j.array { groups.first(limit).each { |g| Probe.group_json(j, g) } } }
             j.field "truncated", true if groups.size > limit
           end
+        end
+      end
+
+      # What `persist:true` wrote. The report is returned whether or not the write landed — the
+      # scan is the expensive half, and refusing it over a busy writer would throw it away — so
+      # a failed write is a field, carrying the retry, rather than an error. Every detection is
+      # written, before the severity/category/in_scope/limit lenses narrow the REPORT: those
+      # shape what this call shows, and triage is a separate read (`probe_issues`).
+      private def emit_probe_persisted(j : JSON::Builder, persist : Probe::Scan::Persist) : Nil
+        j.field "persisted", persist.committed?
+        unless persist.attempted?
+          # The scan was stopped before its findings would have been written — not a busy store.
+          j.field "persist_skipped", "the scan was stopped before its findings were written"
+          return
+        end
+        j.field "persisted_detections", persist.detections if persist.committed?
+        unless persist.committed?
+          j.field "persist_error", "the findings were NOT written (store busy or unwritable); the report " \
+                                   "below is complete — call again with persist:true to write them"
         end
       end
 
@@ -484,31 +584,42 @@ module Gori
       # here rather than around one long block, so a new write tool cannot be added on the
       # wrong side of it by landing in the wrong place in a 1,300-line method.
       private def list_probe_tools(j : JSON::Builder) : Nil
+        # Under a profile that serves the scan passive-only (`ToolFilter::RECON_WITHHELD`) the
+        # description drops the active half with the arguments, or it would advertise a mode
+        # the schema then refuses.
+        passive_only = !@tool_filter.try(&.withheld_args("probe_scan")).nil?
+        active_text =
+          if passive_only
+            "Served PASSIVE-only here (zero outbound requests). "
+          else
+            "PASSIVE by default (zero outbound requests). active:true also runs light-touch active " \
+            "checks that SEND requests (reflected params, CORS/host-header reflection, open redirect, " \
+            "CRLF injection, 403/path/header access-control bypass, nginx & parameter traversal, " \
+            "GraphQL introspection, SSTI) — requires write access and is scope-gated (per-flow scope " \
+            "include + a Sandbox/exclude hard-block). "
+          end
         tool j, "probe_scan",
           "Scan captured History flows (optional QL filter) + Repeater tabs for issues — the " \
-          "MCP equivalent of `gori run probe`. PASSIVE by default (zero outbound requests). " \
-          "active:true also runs light-touch active checks that SEND requests (reflected " \
-          "params, CORS/host-header reflection, open redirect, CRLF injection, 403/path/header " \
-          "access-control bypass, nginx & parameter traversal, GraphQL introspection, SSTI) — " \
-          "requires write access and is scope-gated (per-flow scope include + a Sandbox/exclude " \
-          "hard-block). Returns " \
+          "MCP equivalent of `gori run probe`. #{active_text}Returns " \
           "{flows_scanned, repeaters_scanned, issue_count, issues:[{code, category, host, " \
           "title, severity, hit_count, affected, affected_count, evidence, sample_flow_id, " \
           "sample_repeater_id, remediation, cwe, cwe_name}]}, highest-severity first. " \
           "`cwe`/`cwe_name` are OMITTED for a code with no meaningful CWE — a technology " \
-          "fingerprint, an informational jwt_in_* note, or a custom rule. Writes nothing." do |s|
+          "fingerprint, an informational jwt_in_* note, or a custom rule. Reports only, unless " \
+          "persist:true writes the findings into the project's triage list (probe_issues)." do |s|
           s.field "query", strprop("gori QL filter applied to History flows only; empty scans all (Repeater tabs are always scanned)")
-          s.field "strict", boolprop("reject the query if any term is unrecognized/invalid instead of silently dropping it (default false; use ql_explain to see which terms would drop)")
+          s.field "strict", boolprop("reject the query if any term is unrecognized/invalid (default false: the term is dropped, which BROADENS the result, and named in the reply's `ignored_terms`; ql_explain previews which terms would drop)")
           s.field "lenient", boolprop("search a `field:` QL does not implement as literal TEXT instead of refusing the query (default false) — the same escape hatch `gori run probe --lenient` spells")
           s.field "active", boolprop("also run active checks that SEND probe requests (default false = passive, request-free); requires write access + a configured scope")
           s.field "severity", enumprop("only return issues at/above this level", SEVERITIES)
           s.field "category", enumprop("only return issues in this category", Probe::FILTER_CATEGORIES)
-          s.field "in_scope", boolprop("only return issues on hosts in the project's configured scope (the TUI ⇧S lens; ALL flows are still scanned). Empty result when no scope rules exist. Independent of active/allow_unscoped. Default false")
+          s.field "in_scope", boolprop("only return issues on hosts in the project's configured scope (the TUI `s` lens; ALL flows are still scanned). Empty result when no scope rules exist. Independent of active/allow_unscoped. Default false")
           s.field "allow_unscoped", boolprop("with active:true, run even when a target host is outside — or without — a configured scope (default false)")
           s.field "unsafe", boolprop("with active:true, ALSO probe unsafe methods (POST/PUT/PATCH/DELETE) — re-sends may mutate server data (default false)")
           s.field "aggressive", boolprop("with active:true, raise per-rule caps + use wider bypass sets (implies unsafe) — authorized targets only (default false)")
           s.field "insecure", boolprop("with active:true, skip upstream TLS verification (default false) — mirrors `gori run probe -k`, for a lab/staging origin with a self-signed certificate")
-          s.field "limit", intprop("max issue groups to return (default 200, max 2000)")
+          s.field "limit", limitprop("max issue groups to return", PROBE_SCAN_LIMIT)
+          s.field "persist", boolprop("also WRITE every finding into the project's persisted findings — the list probe_issues reads and probe_promote/probe_dismiss act on — merging by (code, host) as the live scanner does (default false = report only; refused under --read-only). A dismissed finding stays dismissed; hit_count counts observations, so rescanning the same flows raises it")
         end
 
         tool j, "probe_issues",
@@ -521,7 +632,7 @@ module Gori
           s.field "severity", enumprop("only return findings at/above this level", SEVERITIES)
           s.field "category", enumprop("only return findings in this category", Probe::FILTER_CATEGORIES)
           s.field "host", strprop("only return findings for this exact host")
-          s.field "limit", intprop("max rows (default 100, max 500)")
+          s.field "limit", limitprop("max rows", PROBE_ISSUES_LIMIT)
           s.field "offset", intprop("start row (default 0)")
         end
 
@@ -547,7 +658,8 @@ module Gori
 
         tool j, "probe_promote",
           "Promote a probe finding (id from probe_issues) to a human-confirmed Issue in the " \
-          "Issues report, carrying its severity/host/sample evidence over. Marks the source " \
+          "Issues report: severity/host carry over, every affected URL's flow is linked as evidence, " \
+          "and the notes hold its CWE, detail, rule text and affected URLs. Marks the source " \
           "finding Confirmed so a repeat call cannot mint a duplicate — a second call returns " \
           "{promoted: false} rather than erroring." do |s|
           s.field "id", intprop("probe finding id"), required: true

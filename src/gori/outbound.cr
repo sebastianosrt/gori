@@ -18,9 +18,10 @@ module Gori
   # without (`Fuzz::Sender`, `Repeater::Sender`), so forgetting it is a compile error
   # rather than a security hole. It carries both layers of the gate:
   #
-  #   Layer 1 (`check`)        — the up-front include/allowlist decision, made ONCE before
-  #                              the first byte. Its strictness is the ONE thing that
-  #                              legitimately differs per surface (see `Gate`).
+  #   Layer 1 (`check`)        — the surface-selected include/allowlist decision, made
+  #                              before side effects. Its strictness is the ONE thing that
+  #                              legitimately differs per surface (see `Gate`); a Repeater
+  #                              sender repeats it on the final wire target.
   #   Layer 2 (`sweep_block` / — the per-send HARD gate: Sandbox mode (and, for automated
   #            `send_block`)     sweeps, explicit EXCLUDE rules). Identical on every
   #                              surface, and applied even when Layer 1 was waived.
@@ -66,6 +67,12 @@ module Gori
     # question stays with the callers that ask it.
     def self.permanent_refusal?(err : String?) : Bool
       err == SANDBOX_SWEEP_ERROR || err == EXCLUDE_SWEEP_ERROR
+    end
+
+    # Which Layer-2 gate a `sweep_block` refusal came from, as a `scope_decision` names it.
+    # Here because this is the one place the refusal strings are compared.
+    def self.refusal_decision(err : String) : String
+      err == EXCLUDE_SWEEP_ERROR ? "exclude" : "sandbox"
     end
 
     # A running job's rules would otherwise be a start-time snapshot. A per-send DB read is
@@ -148,10 +155,29 @@ module Gori
     # the "add a scope include rule" advice for a target an EXCLUDE rule matched, where no
     # include will ever help. `waiver` is the surface's own spelling of the override flag
     # (`--allow-unscoped`, `allow_unscoped:true`); nil when the surface has none.
-    def self.remedy(verdict : Verdict, waiver : String?) : String
-      return "delete or narrow the scope EXCLUDE rule that matches it (an include rule cannot override an exclude)" if verdict.excluded?
+    # `add_include: false` / `edit_exclude: false` is a reader that cannot make that fix
+    # itself (an agent whose scope tools are switched off): it is then the operator's, and for
+    # an excluded target, which no waiver lifts, the operator is the only fix offered.
+    def self.remedy(verdict : Verdict, waiver : String?, *, add_include : Bool = true,
+                    edit_exclude : Bool = true) : String
+      if verdict.excluded?
+        fix = "delete or narrow the scope EXCLUDE rule that matches it (an include rule cannot override an exclude)"
+        return edit_exclude ? fix : "ask the operator to #{fix}"
+      end
       base = "add a scope include rule"
-      waiver ? "#{base} or pass #{waiver}" : base
+      return (waiver ? "#{base} or pass #{waiver}" : base) if add_include
+      waiver ? "pass #{waiver}, or ask the operator to #{base}" : "ask the operator to #{base}"
+    end
+
+    # `Outbound.remedy` for a refusal a core engine phrases on this Outbound's behalf (a
+    # retest step, a session-slot refresh, a gRPC reflection), in the spelling of the surface
+    # that built it. All three default to what a surface that sets none has always printed.
+    property waiver : String? = nil
+    property? can_add_include : Bool = true
+    property? can_edit_exclude : Bool = true
+
+    def remedy(verdict : Verdict) : String
+      Outbound.remedy(verdict, @waiver, add_include: @can_add_include, edit_exclude: @can_edit_exclude)
     end
 
     getter scope : Scope?
@@ -214,7 +240,7 @@ module Gori
 
     # ── layer 1: the up-front decision ───────────────────────────────────────────
 
-    # The scope verdict for one target URL. Made ONCE, before anything is sent.
+    # The scope verdict for one target URL.
     #
     # `url` is the ALLOWLIST spelling — port-free, the one every url-level include was written
     # for. `port_url` is the same url WITH its port and is read by the EXCLUDE side only; pass
@@ -241,6 +267,15 @@ module Gori
     def check_request(scheme : String, host : String, target : String, port : Int32) : Verdict
       check(Outbound.scope_url(scheme, host, target), host,
         Outbound.exclude_url(scheme, host, target, port))
+    end
+
+    # Re-check a hand-authored send after its bytes have gone through the send seam. A
+    # Repeater path can contain a `$BIND.*` value that changes the request-target after a
+    # surface's preflight; scope must cover the target the socket will actually receive.
+    # The throttled reload also makes this final check observe mid-run scope changes.
+    def check_wire_request(scheme : String, host : String, target : String, port : Int32) : Verdict
+      refresh
+      check_request(scheme, host, target, port)
     end
 
     # Whether Layer 1 is enforced at all — for the log/audit line that records how a send

@@ -58,6 +58,22 @@ private def verdict_col(be : MemoryBackend, header_row : Int32) : Int32
 end
 
 describe AuthorizeView do
+  # A run re-labels every row, so a `/` lens on the verdict word reshuffles the visible list
+  # with no keypress. The cursor follows the request, not the row number — a later `d` acts on
+  # what is under it.
+  it "keeps the cursor on its request while a run reshuffles a verdict-word filter" do
+    v = AuthorizeView.new
+    ids = %w[/a /b /c /d].map { |p| v.add(flow(target: p)) }
+    ids.each { |id| v.apply_result(id, target(false)) }
+    v.filter.start
+    "enforced".each_char { |c| v.handle_filter_key(Termisu::Event::Key.new(Termisu::Input::Key::LowerA, char: c)) }
+    v.move_row(-1) # `add` left the cursor on /d
+    v.selected_entry.not_nil!.detail.row.target.should eq("/c")
+    v.mark_running(ids.to_set)
+    [ids[3], ids[0], ids[2]].each { |id| v.apply_result(id, target(false)) } # /b still running
+    v.selected_entry.not_nil!.detail.row.target.should eq("/c")
+  end
+
   # A master row and its detail pane must not contradict each other — the rule `settle_running`
   # states. The detail pane draws a trials table whenever a target is there, so a state that
   # means "no result" has to drop the one the run before it left.
@@ -115,6 +131,42 @@ describe AuthorizeView do
     end
   end
 
+  # HOST / PATH and Δ VS BASELINE were fixed at 38 and 22 columns, drawn with no width, so a
+  # narrow card ran the row over its own border and never drew VERDICT, while a wide one still
+  # cut every delta to its status half (#1433). The elastic column gives way to VERDICT now.
+  describe "column widths" do
+    it "keeps the request row's verdict inside a narrow card" do
+      v = AuthorizeView.new
+      v.add(flow("GET", "/api/v2/organisations/acme/projects/42/members/settings", "tenant.example.test"))
+      be = render_to(v, 56, 30)
+      be.row(2).index("pending").should eq(verdict_col(be, 1))
+    end
+
+    it "keeps the trial table's verdict inside a narrow card" do
+      v = AuthorizeView.new
+      id = v.add(flow)
+      v.apply_result(id, target(false))
+      be = render_to(v, 56, 30)
+      hdr = (0...30).find { |y| be.row(y).includes?("IDENTITY") }.not_nil!
+      be.row(hdr + 2).index("different").should eq(verdict_col(be, hdr))
+    end
+
+    it "draws a whole delta when the card has the room" do
+      v = AuthorizeView.new
+      id = v.add(flow)
+      delta = "Δ status 200 → 403 · size +1.2 KB · time +35 ms"
+      meta = Gori::Repeater::ExchangeMeta.of(403, 40_i64, 1_000_i64, nil)
+      v.apply_result(id, Gori::Authorize::Target.new(1_i64, "GET", "https://h.test/admin", [
+        trial("as-captured", true, 200, Gori::Authorize::Verdict::Baseline),
+        Gori::Authorize::Trial.new("anonymous", false, meta, Gori::Authorize::Verdict::Different, delta,
+          Gori::Authorize::ResponseSummary.new(403, 40_i64, 0_u64), "req".to_slice,
+          "HTTP/1.1 403 Forbidden\r\n\r\n".to_slice, "body".to_slice),
+      ]))
+      be = render_to(v, 140, 30)
+      be.contains?(delta).should be_true
+    end
+  end
+
   it "starts empty with the two built-in identities and renders the empty state" do
     v = AuthorizeView.new
     v.any_requests?.should be_false
@@ -143,7 +195,7 @@ describe AuthorizeView do
     v.apply_result(b, target(bypass: false))
     v.entry_by_id(a).not_nil!.verdict.should eq(:bypass)
     v.entry_by_id(b).not_nil!.verdict.should eq(:enforced)
-    v.bypass_total.should eq(1)
+    v.bypasses_in(v.entries.map(&.id).to_set).should eq(1)
     render(v)
   end
 
@@ -159,7 +211,7 @@ describe AuthorizeView do
     v.unanswered_in(Set{a}).should eq(1)
     v.unanswered_reason_in(Set{a}).should eq("connection refused")
     # …and it is not counted as a finding either way.
-    v.bypass_total.should eq(0)
+    v.bypasses_in(v.entries.map(&.id).to_set).should eq(0)
     render(v)
   end
 
@@ -224,7 +276,7 @@ describe AuthorizeView do
       pending.should contain(errored) # no verdict yet ⇒ unfinished work
       pending.should_not contain(finished)
       v.pending_count.should eq(2)
-      v.completed_count.should eq(1)
+      v.completed_in(v.entries.map(&.id).to_set).should eq(1)
     end
 
     it "excludes an in-flight entry from both pending and runnable" do
@@ -307,8 +359,8 @@ describe AuthorizeView do
       v.completed_in(batch).should eq(1)
       v.bypasses_in(batch).should eq(1)
       # the queue-wide totals still see both
-      v.completed_count.should eq(2)
-      v.bypass_total.should eq(2)
+      v.completed_in(v.entries.map(&.id).to_set).should eq(2)
+      v.bypasses_in(v.entries.map(&.id).to_set).should eq(2)
     end
 
     it "counts nothing for a batch whose entries never produced a result" do
@@ -591,7 +643,7 @@ describe AuthorizeView do
     only_baseline.uncompared?.should be_true
     v.apply_result(a, only_baseline)
     v.entry_by_id(a).not_nil!.verdict.should eq(:error)
-    v.bypass_total.should eq(0)
+    v.bypasses_in(v.entries.map(&.id).to_set).should eq(0)
     render(v)
   end
 end
@@ -612,8 +664,8 @@ describe AuthorizeView, "mouse geometry" do
     v.list_row_at(5, 4).should eq(2)
     v.list_row_at(5, 5).should be_nil # past the three rows
     v.list_contains?(5, 3).should be_true
-    v.detail_contains?(5, 20).should be_true
-    v.detail_contains?(5, 3).should be_false
+    v.@detail_rect.contains?(5, 20).should be_true
+    v.@detail_rect.contains?(5, 3).should be_false
     v.select_row(2)
     v.selected_entry.not_nil!.host_path.should contain("/three")
   end

@@ -379,7 +379,7 @@ module Gori::Proxy::Codec
     private def self.scan_chunks(body : Bytes, & : Bytes -> Bool) : Int32?
       pos = 0
       while pos < body.size
-        eol = index_of(body, 0x0a_u8, pos)
+        eol = body.index(0x0a_u8, pos)
         return nil unless eol
         line = String.new(body[pos, eol - pos]).strip
         pos = eol + 1
@@ -427,7 +427,7 @@ module Gori::Proxy::Codec
       pos = scan_chunks(body) { true } || return NO_TRAILERS
       out = [] of {String, String}
       while pos < body.size && out.size < MAX_TRAILERS
-        stop = index_of(body, 0x0a_u8, pos) || body.size
+        stop = body.index(0x0a_u8, pos) || body.size
         len = stop - pos
         len -= 1 if len > 0 && body[pos + len - 1] == 0x0d_u8 # the optional CR before the LF
         line = body[pos, len]
@@ -436,7 +436,7 @@ module Gori::Proxy::Codec
         # Split on the colon in BYTE space: a trailer VALUE is remote bytes and may not be
         # valid UTF-8, and a char-indexed split of such a String does not land where the
         # colon actually is.
-        colon = index_of(line, 0x3a_u8, 0)
+        colon = line.index(0x3a_u8)
         next unless colon # not a field line — skip it rather than guessing at its shape
         out << {String.new(line[0, colon]).strip, String.new(line[(colon + 1)..]).strip}
       end
@@ -454,13 +454,16 @@ module Gori::Proxy::Codec
       trailers(body)
     end
 
-    private def self.index_of(body : Bytes, byte : UInt8, from : Int32) : Int32?
-      i = from
-      while i < body.size
-        return i if body[i] == byte
-        i += 1
-      end
-      nil
+    # Where the trailer section of a chunked message starts in `body` — the byte after the
+    # terminating 0-chunk line — under the same `chunked` gate as `trailers`. nil for every
+    # other message, and for a body that never reached its 0-chunk. For a pager that pages the
+    # exact bytes and has to be able to stop short of the trailer fields.
+    def self.trailer_offset(head : Bytes?, body : Bytes?) : Int32?
+      return nil if head.nil? || body.nil? || body.empty?
+      return nil unless head_has_encoding?(head)
+      te_values, _ = encoding_headers(head)
+      return nil unless transfer_encoding_chunked?(te_values)
+      scan_chunks(body) { true }
     end
 
     # Collect the transfer-encoding AND content-encoding header values in ONE pass over the

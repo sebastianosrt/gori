@@ -1,5 +1,5 @@
 +++
-title = "Quick Start"
+title = "gori Quick Start"
 description = "A hands-on walkthrough: trust the CA, capture a real request, inspect it, and replay it in Repeater."
 weight = 20
 +++
@@ -12,7 +12,7 @@ Each step ends with a **Checkpoint**: what you should see before moving on. If s
 
 ## 1. Start gori
 
-With no subcommand, gori starts the proxy and opens the interface:
+With no subcommand, gori opens the project picker. The proxy starts when you open a project:
 
 ```bash
 gori
@@ -20,13 +20,17 @@ gori
 
 The first launch runs a short [setup wizard](#first-run-wizard) (global bind, theme, and the Miss Ring mascot), then offers a [guided UI tour](#guided-ui-tour). You can take the tour now or skip it and come back; this page covers the same ground against live traffic.
 
+At the picker, select **New project**, enter a name, then press `Enter` twice (the description is optional). The guided tour returns you to this picker when it finishes on first launch.
+
+To find which project captured something (a token, a host, an endpoint), press `Ctrl-F` at the picker and type it. gori searches the flows of every project by host and path, and by body text once you have typed three characters, then lists the hits under each project. `Enter` opens that project with the flow's detail showing. `Esc` stops a search that is still running, and closes the search once it has finished.
+
 By default the proxy listens on `127.0.0.1:8070`. Override it for a single run (a project's own bind still wins when set):
 
 ```bash
 gori --listen 0.0.0.0 --port 8080
 ```
 
-**Checkpoint.** You're looking at the gori TUI: a row of tabs down the side (Project, Target, History, …) and a top bar showing the proxy address, `127.0.0.1:8070`.
+**Checkpoint.** Your project session is open on **History**. The tab bar shows Project, Target, History, …, and the top bar shows the proxy address, `127.0.0.1:8070`.
 
 ## 2. Trust the CA and capture your first flow
 
@@ -60,6 +64,8 @@ curl -x http://127.0.0.1:8070 https://example.com
 
 gori mints per-host leaf certificates from the root on demand, so you trust the root only once.
 
+For command-line tools there is a shortcut: `gori run shell` (or **Open shell** in the palette) starts a shell whose curl, git, Python, Go and Node traffic already goes through the running gori and trusts its CA, without touching OS settings. `gori run shell -- curl https://example.com` runs one command that way. See [`gori run shell`](/reference/cli/#run-shell).
+
 > gori's private key is a machine secret, written with `0600` permissions, and never leaves your machine. Rotate it from the palette (**Regenerate CA certificate**) only when you mean to invalidate every prior trust.
 
 ### Option C: Install the CA on a phone or tablet
@@ -82,19 +88,24 @@ A phone can't read the CA off your filesystem, so gori serves it over the networ
 
 ## 3. Learn the two discovery surfaces
 
-Before memorizing tab-specific keys, learn the two places almost everything lives.
+You don't need to memorize tab-specific keys. Two keys reach every action:
 
 | Surface | Key | What it is for |
 |---------|-----|----------------|
-| **Command palette** | `Ctrl-P` | App-wide control: settings, Open browser, Export CA, jump actions, anything global |
-| **Space menu** | `Space` | Actions for whatever has focus right now (History row, detail pane, Repeater, …) |
+| **Space menu** | `Space` | What you do most in the pane you are in (a History row, a flow's detail, the Repeater editor, …), one letter per action |
+| **Command palette** | `Ctrl-P` | Every action, found by typing its name: the pane's own actions first, then app-wide ones such as settings and **Open browser** |
 
-The palette is the map of the whole tool. The space menu is the map of *this* pane. Both show key hints, so if you forget a chord, open one of them.
+Both show each action's shortcut beside it, so opening them is also how you learn the keys. Try it now on the flow you just captured:
+
+1. In **History**, press `↓` to select your flow, then `Space`. The letter on the left of a row runs it; the key on the right (`^R` beside **Repeater flow**) does the same without the menu. A row marked `›`, such as `>` **Send flow to…**, opens a second card; `Esc` steps back. Press `Esc` until the menu closes.
+2. Press `Ctrl-P` and type `send`. The History actions come first under `THIS TAB`, each with the key or menu path that reaches it (`␣ > c` means `Space`, `>`, `c`). Press `Esc`.
 
 <figure class="tui-shot">
-  <img src="/images/tui/command-palette.svg" alt="gori command palette open over the History tab, listing settings, navigation and export actions with a filter box">
-  <figcaption>The command palette (<kbd>Ctrl-P</kbd>): fuzzy-filter every app-wide action, from settings to <em>Open browser</em> to tab jumps.</figcaption>
+  <img src="/images/tui/command-palette.svg" alt="gori command palette over the History tab with the query send: THIS TAB lists the send actions with their keys or menu paths, then APP lists matching app commands">
+  <figcaption>The command palette (<kbd>Ctrl-P</kbd>) with <code>send</code> typed on History: the tab's own actions first, each with the shorter route to it, then app-wide commands.</figcaption>
 </figure>
+
+[Space Menu & Palette](/guide/space-menu-and-palette/) covers both in depth, including the `Z` **Display…** and `P` **Protocol…** cards and the actions that only the palette lists.
 
 Three global toggles are worth knowing from the start:
 
@@ -116,7 +127,7 @@ gori is a row of tabs. The default order starts Project → Target → **History
 | `Esc` | Pop focus back toward the tab bar |
 | `Tab` / `Shift-Tab` | Move focus between the tab bar and panes |
 
-Mouse works when enabled (Preferences → **Editor & Keys** → **Editor**): click a tab, click a row to select, click again to open. The **Help** tab is a full key cheatsheet inside the app when this page isn't open.
+Mouse works when enabled (Preferences → **Editor & Keys** → **Mouse**): click a tab, click a row to select, click again to open. The **Help** tab is a full key cheatsheet inside the app when this page isn't open.
 
 ## 5. Read a flow in History
 
@@ -134,7 +145,7 @@ Try each of these:
 | `↑` / `↓` (or `j` / `k`) | Move the selection |
 | `Enter` | Open request/response detail |
 | `/` | Filter with the [query language](/reference/query-language/) |
-| `f` | Toggle follow-newest (tail) |
+| `Space` `Z` `f` | Toggle follow-newest (tail) |
 | `y` | Copy the selected flow |
 
 Press `/` and type a filter, then `Enter`:
@@ -150,7 +161,7 @@ status:5xx
 method:POST body:password
 ```
 
-Now select your `example.com` flow and press `Enter`. In the detail view, scroll with `↑` / `↓`, copy with `y`, and toggle `x` / `b` / `p` for hex / whitespace / pretty bodies. `Esc` returns to the list.
+Now select your `example.com` flow and press `Enter`. In the detail view, scroll with `↑` / `↓`, copy with `y`, and toggle `Ctrl-X` / `b` / `p` for hex / whitespace / pretty bodies. `Esc` returns to the list.
 
 **Checkpoint.** You can filter History down to one host and open a flow to read its full request and response.
 
@@ -170,11 +181,11 @@ This is the loop you'll spend most of your time in: take a captured request, cha
 5. The response, its timing, and a diff against the previous reply appear on the right. `Tab` cycles target → request → response.
 
 <figure class="tui-shot">
-  <img src="/images/tui/repeater.svg" alt="gori Repeater tab showing an editable request pane beside the response pane, with a status line reading replayed 200 in 1152ms">
+  <img src="/images/tui/repeater.svg" alt="gori Repeater tab showing an editable request pane beside the response pane, with a status line reading sent → 200 in 114ms">
   <figcaption><strong>Repeater</strong> edits any part of a request and re-sends it; the response, timing, and a diff against the last reply sit side by side.</figcaption>
 </figure>
 
-**Checkpoint.** The Repeater status line reads something like `replayed 200 in … ms`, and you can re-send with `Ctrl-R` as many times as you like. That is the full capture → inspect → replay loop.
+**Checkpoint.** The Repeater status line reads something like `sent → 200 in … ms`, and you can re-send with `Ctrl-R` as many times as you like. That is the full capture → inspect → replay loop.
 
 ## 7. Where to go next
 
@@ -190,15 +201,17 @@ Keep this table nearby until the chords stick:
 
 | Key | Where | Action |
 |-----|--------|--------|
-| `Ctrl-P` | Anywhere | Command palette (settings, Match & Replace, notifications, …) |
+| `Space` | Focused pane | Space menu: this pane's actions, one letter each |
+| `Ctrl-P` | Anywhere | Command palette: type any action's name |
+| `?` | Anywhere | Help: the full key sheet |
 | `Ctrl-,` | Anywhere | Preferences (all settings in one modal) |
-| `Space` | Focused pane | Area action menu |
 | `c` / `i` / `s` | Anywhere | Capture / intercept / scope lens |
 | `[` `]` · `1`-`9` | Anywhere | Switch tabs |
 | `/` | History | Query-language filter |
 | `Enter` | History | Open flow detail |
 | `Ctrl-R` | History | → Repeater |
 | `Shift-I` | History | → Fuzzer |
+| `>` | History | Send flow to… any tool (`>` `c` → Comparer) |
 | `Ctrl-R` | Repeater / Fuzzer | Send request / run fuzz |
 | `Esc` | Most places | Back out one level |
 
@@ -210,24 +223,24 @@ Re-run the guided setup (global proxy bind default, then theme, then Miss Ring) 
 gori wizard
 ```
 
-The bind step sets the shared default in `settings.json`, the same layer as Preferences → **Network & Tabs** → **Network**. It is not a per-project lock; pin a different address per engagement from the Project tab when needed. If something already listens on the port you pick, the step says so; `Enter` again keeps it. `Esc` twice skips the wizard (the first press only arms it, so a stray `Esc` in a field cannot end setup).
+The listen IP defaults to `127.0.0.1` (this computer only); `0.0.0.0` lets other devices reach the proxy. The first `Enter` moves from IP to port, and the next continues. The choice becomes the shared default in `settings.json`; a project can pin a different address from its Project tab. If the port is busy, `Enter` again keeps it. `Esc` twice skips the wizard.
 
-The final **Review** step recaps what you picked and carries one editable row: **Shortcuts**, which `←`/`→` flips between `Ctrl` and `Option (⌥)` for gori's built-in chord family (`^P` `^N` `^W` `^1-9`). Choosing Option *adds* `⌥` aliases rather than replacing Ctrl, which is useful when your terminal or multiplexer never delivers the Ctrl form. See [Command modifier](/guide/hotkeys/#command-modifier) for the macOS Option-as-Meta requirement.
+The final **Review** step recaps what you picked, names your [editor keyset](/guide/hotkeys/#editor-keysets) and where to change it (the wizard never sets it), and carries one editable row: **Shortcuts**, which `←`/`→` flips between `Ctrl` and `Option (⌥)` for gori's built-in chord family (`^P` `^N` `^W` `^1-9`). Choosing Option *adds* `⌥` aliases rather than replacing Ctrl, which is useful when your terminal or multiplexer never delivers the Ctrl form. See [Command modifier](/guide/hotkeys/#command-modifier) for the macOS Option-as-Meta requirement.
 
 ## Guided UI tour
 
-A mock-UI walkthrough of tab/pane navigation, the palette, the space menu, and READ/INS edit mode. It is safe to run without a live proxy session. Each lesson shows a short demo and asks you to try the real key; the final step is a hands-on sandbox for all four moves, then a first-session checklist.
+A mock-UI walkthrough of tab/pane navigation, the space menu (including its second cards), the command palette's search, READ/INS edit mode, then the traffic itself: where to point a client and how to trust the CA, the capture switch, and intercept. It is safe to run without a live proxy session. Each lesson shows a short demo and asks you to try the real key; a hands-on sandbox covers the first four moves, and the tour ends with Help and quitting, then a first-session checklist. The mock menus use the same letters and keys as your install, rebinds included.
 
 ```bash
 gori tutorial
 ```
 
 <figure class="tui-shot">
-  <img src="/images/tui/tutorial.svg" alt="gori guided tour welcome card explaining the four core moves: tabs and panes, the command palette, the action menu, and edit mode">
-  <figcaption>The guided tour walks through tabs and panes, the palette, the space menu, and READ / INS edit mode. Try each key, then practice all four in a harmless sandbox.</figcaption>
+  <img src="/images/tui/tutorial.svg" alt="gori guided tour welcome card explaining the four core moves: tabs and panes, the action menu, the command palette, and edit mode">
+  <figcaption>The guided tour walks through tabs and panes, the space menu, the palette, and READ / INS edit mode. Try each key, then practice all four in a harmless sandbox.</figcaption>
 </figure>
 
-It is also offered at the end of the first-run wizard, and from inside a session as the palette command **Guided tour** (`Ctrl-P`), which brings you back to where you were when it ends.
+It is also offered at the end of the first-run wizard, and from inside a session as the palette command **Guided tour** (`Ctrl-P`). Its last card tells you whether finishing leads to the project picker, a `--db` session, the shell, or your current session.
 
 ## Next Steps
 
@@ -235,4 +248,5 @@ It is also offered at the end of the first-run wizard, and from inside a session
 - [Proxy & History](/guide/proxy/): capture, intercept, scope, import, match & replace
 - [Repeater & Fuzzer](/guide/repeater-and-fuzzer/): the testing workbench and env tokens
 - [Query Language](/reference/query-language/): full filter syntax
+- [Space Menu & Palette](/guide/space-menu-and-palette/): find any action without memorizing keys
 - [Hotkeys](/guide/hotkeys/): rebind any of the chords above

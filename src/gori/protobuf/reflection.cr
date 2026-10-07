@@ -3,6 +3,7 @@ require "../proxy/h2/grpc"
 require "../repeater/h2_engine"
 require "./encoder"
 require "./schema"
+require "../plural"
 
 module Gori::Protobuf
   # gRPC **server reflection** as a schema source (#827): ask the target what it serves,
@@ -211,7 +212,7 @@ module Gori::Protobuf
       # `host:port` as the cache keys it and as every surface prints it. The scheme rides
       # along because http (h2c) and https are different targets.
       def authority : String
-        Repeater::H2Engine.authority(@host, @port, @scheme)
+        Gori::Url.authority(@scheme, @host, @port)
       end
 
       # The cache key: scheme + authority, so `https://api.test` and `http://api.test` are
@@ -244,7 +245,7 @@ module Gori::Protobuf
       def refusal : String?
         if verdict = blocked_verdict
           return "#{@scheme}://#{authority} is #{verdict.decision} — " \
-                 "#{Gori::Outbound.remedy(verdict, nil)}"
+                 "#{@outbound.remedy(verdict)}"
         end
         # Layer 2, over BOTH paths for the reason `blocked_verdict` states.
         Reflection.scope_paths.each do |target_path|
@@ -312,7 +313,7 @@ module Gori::Protobuf
               return Outcome.new(service: service, services: listed, notes: notes,
                 error: failure.message, transport: failure.transport?)
             end
-            notes << "stopped after #{held.size} file#{held.size == 1 ? "" : "s"}: #{failure.message}"
+            notes << "stopped after #{Gori.plural(held.size, "file")}: #{failure.message}"
             break
           end
           # A round that produced nothing NEW ends the walk: asking the same question again
@@ -343,13 +344,13 @@ module Gori::Protobuf
         unless unresolved.empty?
           shown = unresolved.first(3).join(", ")
           shown += ", …" if unresolved.size > 3
-          notes << "#{unresolved.size} import#{unresolved.size == 1 ? "" : "s"} the server did " \
+          notes << "#{Gori.plural(unresolved.size, "import")} the server did " \
                    "not return (#{shown}) — types declared only there render schema-less"
         end
 
         if held.empty?
           return Outcome.new(service: service, services: listed, notes: notes,
-            error: "#{service} listed #{listed.size} service#{listed.size == 1 ? "" : "s"} but returned no descriptors")
+            error: "#{service} listed #{Gori.plural(listed.size, "service")} but returned no descriptors")
         end
 
         set = Reflection.descriptor_set(held.files.values)
@@ -452,6 +453,17 @@ module Gori::Protobuf
           notes << "#{dropped} descriptor file#{dropped == 1 ? "" : "s"} past the " \
                    "#{MAX_FILES}-file limit were dropped"
         end
+        # One reply per request, in order, on one stream — so fewer replies than requests is a
+        # stream cut short (the replay engine stops reading a body at its size cap), and every
+        # request past the last reply went unanswered. Named, because a service whose
+        # descriptors never arrived otherwise vanished from the schema without a word.
+        if replies.size < asked.size
+          missed = asked[replies.size..]
+          shown = missed.first(3).join(", ")
+          shown += ", …" if missed.size > 3
+          notes << "#{Gori.plural(missed.size, "request")} went unanswered — " \
+                   "the reply stream was cut short (#{shown})"
+        end
         added > 0
       end
     end
@@ -534,7 +546,7 @@ module Gori::Protobuf
         kind = code == UNIMPLEMENTED ? FailureKind::Unimplemented : FailureKind::Answered
         return {none, Failure.new("#{service}: #{text}", kind)}
       end
-      messages, residual = Proxy::H2::Grpc.scan_body(resp.headers.get?("content-type"), result.body || Bytes.new(0))
+      messages, residual = Proxy::H2::Grpc.scan_wire(result.head, result.body || Bytes.new(0))
       if messages.empty?
         text = residual > 0 ? "#{service} answered with #{residual} bytes that are not gRPC frames" : "#{service} answered with no message"
         return {none, Failure.new(text, FailureKind::Answered)}
@@ -557,7 +569,8 @@ module Gori::Protobuf
 
     # The HPACK field list for one ServerReflectionInfo stream. Written out in full rather
     # than derived from an h1 head: `send_fields` takes the fields verbatim, which is why
-    # `:authority` is here explicitly (see `H2Engine.authority`).
+    # `:authority` is here explicitly (`Gori::Url.authority`, the IPv6 bracketing and
+    # default-port rule `H2Engine` writes too).
     private def fields(client : Client, service : String) : Array({String, String})
       [
         {":method", "POST"},
@@ -578,7 +591,7 @@ module Gori::Protobuf
     # the same way here. nil when the server sent none, which is itself legal for a stream
     # gori cut short, and is then judged by whether messages arrived.
     private def grpc_status(resp : Proxy::Codec::RawResponse) : Int32?
-      resp.headers.get?("grpc-status").try(&.strip.to_i?)
+      resp.headers.get?("grpc-status").try { |v| Proxy::H2::Grpc.parse_status(v) }
     end
 
     # ErrorResponse (field 7) as a sentence, or nil when this reply is not one.
@@ -586,7 +599,10 @@ module Gori::Protobuf
       Schema.submessages(m, ERROR_RESPONSE).each do |e|
         code = Schema.int32(e, ERROR_CODE) || 2_i64
         message = Schema.text(e, ERROR_MESSAGE)
-        name = Proxy::H2::Grpc.status_name(code.to_i32)
+        # A code past the int32 range is the server's own malformed answer: named by the value
+        # it sent, not by the status its low 32 bits happen to spell (2^40 would read "OK").
+        raw = Schema.varint(e, ERROR_CODE)
+        name = raw && raw.to_i64! != code ? "CODE#{raw}" : Proxy::H2::Grpc.status_name(code.to_i32)
         return message && !message.empty? ? "#{name}: #{message}" : name
       end
       nil

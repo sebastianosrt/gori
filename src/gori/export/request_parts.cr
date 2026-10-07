@@ -49,18 +49,23 @@ module Gori
       #     `Export::Curl.unchunk` does — sending the chunk-framed bytes under the library's own
       #     framing would frame them twice), and its Transfer-Encoding token drops with it;
       #   * Content-Length is dropped (every library recomputes it from the body it is given);
-      #   * gori's synthesized h2 `MARKER_HEADERS` never reach generated code;
+      #   * gori's synthesized h2 `MARKER_HEADERS` never reach generated code, and neither does a
+      #     header the browser addressed to its proxy (`PROXY_ONLY_HEADERS`);
       #   * Host is dropped only when it is the URL's own authority — a Host that disagrees with
       #     the URL is the request (a Host-header test), so it rides.
       record Sendable, headers : Array({String, String}), body : String
 
       def self.sendable(parts : Parts) : Sendable
-        body, remaining_te = unchunk(parts)
+        # A head that declares chunked over bytes that are NOT chunk-framed (a hand-authored
+        # Repeater request, an import that stored the entity) keeps the operator's bytes, and
+        # curl's note about it has no reader here.
+        body, remaining_te = Curl.unchunk(Curl.transfer_codings(parts.headers), parts.body, [] of String)
+        remaining_te ||= ""
         kept = [] of {String, String}
         te_written = false
         parts.headers.each do |(name, value)|
           down = name.downcase
-          next if Curl::MARKER_HEADERS.includes?(down)
+          next if Curl::MARKER_HEADERS.includes?(down) || Curl::PROXY_ONLY_HEADERS.includes?(down)
           next if down == "content-length"
           next if down == "host" && Curl.host_is_url_authority?(value, parts.url)
           if down == "transfer-encoding"
@@ -75,22 +80,6 @@ module Gori
           kept << {name, value}
         end
         Sendable.new(kept, body)
-      end
-
-      # {entity, the Transfer-Encoding value to keep} — the final `chunked` coding peeled off,
-      # or {body, ""} untouched when nothing declared chunked framing over a non-empty body.
-      # Like `Curl.unchunk`, a head that declares chunked over bytes that are NOT chunk-framed
-      # (a hand-authored Repeater request, an import that stored the entity) keeps the operator's
-      # bytes rather than silently dropping them to nothing.
-      private def self.unchunk(parts : Parts) : {String, String}
-        return {parts.body, ""} if parts.body.empty?
-        codings = transfer_codings(parts.headers)
-        return {parts.body, ""} unless codings.last? == "chunked"
-        wire = parts.body.to_slice
-        entity = String.new(Proxy::Codec::ContentDecode.dechunk(wire))
-        complete = Proxy::Codec::ContentDecode.chunked_complete?(wire)
-        return {parts.body, ""} if !complete && entity.empty?
-        {entity, codings[0, codings.size - 1].join(", ")}
       end
 
       # The header names (original casing, first-seen order) that appear more than once,
@@ -110,21 +99,6 @@ module Gori
           dups << n
         end
         dups
-      end
-
-      # Every Transfer-Encoding coding across all TE lines, in wire order, lowercased — a
-      # repeated field is one comma-list (RFC 9110 §5.3), so the final coding is the last token
-      # of the last line.
-      private def self.transfer_codings(headers : Array({String, String})) : Array(String)
-        codes = [] of String
-        headers.each do |(name, value)|
-          next unless name.downcase == "transfer-encoding"
-          value.split(',').each do |tok|
-            t = tok.strip.downcase
-            codes << t unless t.empty?
-          end
-        end
-        codes
       end
     end
   end

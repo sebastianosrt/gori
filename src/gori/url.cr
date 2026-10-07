@@ -38,15 +38,22 @@ module Gori
       scheme_end = target.index("://")
       return target unless scheme_end
       auth = scheme_end + 3
-      slash = target.index('/', auth)
-      return target[slash..] if slash
+      # The authority ends at the FIRST of '/', '?' or '#' (RFC 3986 §3.2). Taking the first
+      # '/' alone read `http://acme.test?next=/x` as the path `/x`: the query's own slash.
+      cut = target.index('/', auth)
+      if (q = target.index('?', auth)) && (cut.nil? || q < cut)
+        cut = q
+      end
+      if (f = target.index('#', auth)) && (cut.nil? || f < cut)
+        cut = f
+      end
+      return "/" unless cut
       # No path, but a query or fragment can still follow the authority
       # (`http://acme.test?admin=1`). Returning a bare "/" there DROPPED them — and this
       # feeds `Outbound.scope_url`, so a scope EXCLUDE keyed on the query silently stopped
       # matching the url it was tested against. RFC 3986 §3.3: an empty path with a query
       # is `/` + the rest, so splice rather than discard.
-      mark = target.index('?', auth) || target.index('#', auth)
-      mark ? "/#{target[mark..]}" : "/"
+      target[cut] == '/' ? target[cut..] : "/#{target[cut..]}"
     end
 
     # "where this message went", as one string: the absolute-form target verbatim, else the
@@ -75,6 +82,22 @@ module Gori
     def self.url_path(target : String) : String
       return target if target.empty? || target.starts_with?('/')
       "/#{target}"
+    end
+
+    # Does this request-target's PATH hold a `.` or `..` segment — the ones curl collapses
+    # before it sends (RFC 3986 §5.2.4) unless told `--path-as-is`? The query and fragment are
+    # not a path and never collapse. One home for the two ends of the curl round trip (#1244):
+    # `Export::Curl` adds `--path-as-is` on this answer and `Import::Curl` notes it, so they
+    # cannot disagree about which paths curl would rewrite.
+    def self.dot_segments?(target : String) : Bool
+      path = target
+      if cut = path.byte_index('?')
+        path = path.byte_slice(0, cut)
+      end
+      if cut = path.byte_index('#')
+        path = path.byte_slice(0, cut)
+      end
+      path.split('/').any? { |seg| seg == "." || seg == ".." }
     end
 
     # The scope/`url:`-matching URL of a request, from its parts. The Crystal-side twin of

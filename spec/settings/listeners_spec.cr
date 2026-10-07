@@ -128,6 +128,15 @@ describe Gori::Settings do
       Gori::Settings.parse_origin("").should be_nil
     end
 
+    it "refuses an origin whose port overflows URI parsing" do
+      Gori::Settings.parse_origin("http://api.acme.test:99999999999/").should be_nil
+      with_listeners("127.0.0.1", 8070, [] of Gori::Settings::Listener) do
+        Gori::Settings.listener_error(listener("127.0.0.1", 9000, "reverse",
+          origin: "http://api.acme.test:99999999999/")).to_s
+          .should contain("absolute http(s) URL")
+      end
+    end
+
     it "requires an origin in reverse mode and refuses one outside it" do
       with_listeners("127.0.0.1", 8070, [] of Gori::Settings::Listener) do
         Gori::Settings.listener_error(listener("127.0.0.1", 9000, "reverse")).to_s
@@ -166,9 +175,29 @@ describe Gori::Settings do
       end
     end
 
-    it "covers a wildcard primary, which owns every address of its family on that port" do
+    it "covers a wildcard primary, which answers on loopback on that port" do
       with_listeners("0.0.0.0", 8070, [] of Gori::Settings::Listener) do
         Gori::Settings.listener_error(listener("127.0.0.1", 9000, "reverse", origin: "http://127.0.0.1:8070")).to_s
+          .should contain("points back at gori itself")
+        Gori::Settings.listener_error(listener("127.0.0.1", 9000, "reverse", origin: "http://localhost:8070")).to_s
+          .should contain("points back at gori itself")
+      end
+    end
+
+    # The bind de-duplication rule (a wildcard owns every address of its family) was reused for
+    # the DIAL question, so every origin sharing a wildcard socket's port read as a loop —
+    # hostnames included. The stock reverse shape was refused and then dropped by
+    # `valid_listeners`.
+    it "lets a wildcard socket forward to a remote origin on the same port" do
+      with_listeners("0.0.0.0", 8070, [] of Gori::Settings::Listener) do
+        Gori::Settings.listener_error(listener("0.0.0.0", 443, "reverse", origin: "https://api.example.com"))
+          .should be_nil
+        Gori::Settings.listener_error(listener("0.0.0.0", 443, "reverse", origin: "https://10.0.0.5"))
+          .should be_nil
+        Gori::Settings.listener_error(listener("127.0.0.1", 9000, "reverse", origin: "http://api.example.com:8070"))
+          .should be_nil
+        # …while its own loopback is still the loop it always was.
+        Gori::Settings.listener_error(listener("0.0.0.0", 443, "reverse", origin: "https://127.0.0.1")).to_s
           .should contain("points back at gori itself")
       end
     end
@@ -251,14 +280,6 @@ describe Gori::Settings do
         prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
         FileUtils.rm_rf(dir)
       end
-    end
-  end
-
-  describe "Listener#effective_target_port" do
-    it "uses the configured port, else the conventional one for the protocol" do
-      listener("127.0.0.1", 8443, "transparent", 8443).effective_target_port(true).should eq(8443)
-      listener("127.0.0.1", 8443, "transparent").effective_target_port(true).should eq(443)
-      listener("127.0.0.1", 8080, "transparent").effective_target_port(false).should eq(80)
     end
   end
 

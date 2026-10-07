@@ -113,8 +113,9 @@ describe "Gori::Tui::RepeaterView soft wrap" do
     view.apply(Gori::Repeater::Result.new(hdr.to_slice, payload.to_slice, nil, 1000_i64))
     view.toggle_resp_mode # response → diff
     view.render(Screen.new(MemoryBackend.new(80, 14)), rect)
-    # The diff's own line list: status, header, its blank separators, then the two body lines.
-    body_li = 5
+    # The diff's own line list (`Repeater::MessageLines`): status, header, the one blank
+    # separator, then the two body lines.
+    body_li = 3
     body_li.times { view.resp_move(1, 0) }
     view.resp_cursor.cy.should eq(body_li)
     view.resp_cursor.cx.should eq(0)
@@ -146,9 +147,9 @@ describe "Gori::Tui::RepeaterView soft wrap" do
     view.apply(Gori::Repeater::Result.new(hdr.to_slice, payload.to_slice, nil, 1000_i64))
     view.toggle_resp_mode
     view.render(Screen.new(MemoryBackend.new(80, 14)), rect)
-    body_li = 5
-    # Column 0 of that line's SECOND drawn row — the five short lines above it take one row
-    # each, so it is the sixth row of the pane.
+    body_li = 3
+    # Column 0 of that line's SECOND drawn row — the three short lines above it take one row
+    # each, so it is the fifth row of the pane.
     view.resp_click_to_cursor(rect, body.x + gw, body.y + body_li + 1)
     view.resp_cursor.cy.should eq(body_li)
     view.resp_cursor.cx.should eq(cw - 2) # the decoration ate two columns of this row
@@ -203,7 +204,7 @@ describe "Gori::Tui::RepeaterView soft wrap" do
     b = MemoryBackend.new(80, 20)
     view.render(Screen.new(b), rect)
     body = resp_body_rect(rect)
-    gw = Gori::Settings.show_gutter ? Gutter.width(view.resp_plain_lines.size) : 0
+    gw = Gori::Settings.show_gutter ? Gutter.width(resp_lines(view).size) : 0
     row = (0...20).find { |y| b.row(y).includes?("+ QQ") }.not_nil!
     # A click 4 columns into the row BELOW the "+ " one: that row carries no decoration, so
     # its first char is at (row 0's content width - 2) into the bare text.
@@ -255,11 +256,11 @@ describe "Gori::Tui::RepeaterView soft wrap" do
     view.render(Screen.new(b), rect)
     body = resp_body_rect(rect)
     row = (0...20).find { |y| b.row(y).includes?("WWWW") }.not_nil!
-    before = view.resp_plain_lines.size
+    before = resp_lines(view).size
     view.resp_click_to_cursor(rect, body.x + 6, row + 1) # a continuation row of the W line
-    view.resp_plain_lines.size.should eq(before)         # sanity: same transcript
+    resp_lines(view).size.should eq(before)              # sanity: same transcript
     # The caret must be on the W row, one wrapped row in — not on some other transcript row.
-    view.resp_plain_lines[view.resp_cursor.cy].should start_with("WWWW")
+    resp_lines(view)[view.resp_cursor.cy].should start_with("WWWW")
     view.resp_cursor.cx.should be > 0
   end
 end
@@ -303,7 +304,7 @@ describe "Gori::Tui::RepeaterView response read motion" do
     view = wrapped_head_view
     rect = Rect.new(0, 0, 80, 20)
     view.render(Screen.new(MemoryBackend.new(80, 20)), rect)
-    len = view.resp_plain_lines[0].size
+    len = resp_lines(view)[0].size
     len.should be > 300 # the status line really does wrap at this width
 
     view.resp_line_edge(1).should be_true
@@ -324,7 +325,7 @@ describe "Gori::Tui::RepeaterView response read motion" do
 
     view.resp_line_edge(1, selecting: true).should be_true
     view.resp_cursor.selection?.should be_true
-    view.resp_copy_text.should eq(view.resp_plain_lines[0])
+    view.resp_copy_text.should eq(resp_lines(view)[0])
   end
 
   # The page step is measured from THIS pane's drawn height, not the shell's body height:
@@ -351,5 +352,51 @@ describe "Gori::Tui::RepeaterView response read motion" do
     view.toggle_resp_hex
     view.resp_line_edge(1).should be_false
     view.resp_line_edge(-1).should be_false
+  end
+end
+
+describe "Gori::Tui::RepeaterView request insert focus" do
+  it "keeps ↑ at the first line inside INS mode" do
+    view = Gori::Tui::RepeaterView.new
+    view.load_blank
+    view.focus_pane(:request)
+    view.enter_request_insert!
+    view.at_top?.should be_false
+  end
+end
+
+# The diff pane's decorated line ("+ "/"- "/"  " + text) is memoised on the last line asked
+# for, since every drawn row of a wrapped line asks for it. The memo is keyed by the line's
+# own String and kind, so it must never hand one line's decoration to another: each line of a
+# mixed diff keeps its own prefix, a repeat frame is cell-identical, and a new send redraws.
+describe "Gori::Tui::RepeaterView diff pane decoration memo" do
+  it "draws every line with its own prefix, frame after frame, and follows a new send" do
+    view = Gori::Tui::RepeaterView.new
+    view.load_blank
+    view.focus_pane(:response)
+    hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
+    long = "W" * 150
+    view.apply(Gori::Repeater::Result.new(hdr.to_slice, "alpha\nkeep\n".to_slice, nil, 1000_i64))
+    view.apply(Gori::Repeater::Result.new(hdr.to_slice, "beta\nkeep\n#{long}".to_slice, nil, 1000_i64))
+    view.toggle_resp_mode # → diff
+    rect = Rect.new(0, 0, 80, 20)
+    frames = Array.new(3) do
+      fb = MemoryBackend.new(80, 20)
+      view.render(Screen.new(fb), rect)
+      fb
+    end
+    b = frames[0]
+    b.contains?("- alpha").should be_true
+    b.contains?("+ beta").should be_true
+    b.contains?("  keep").should be_true
+    b.contains?("+ WWW").should be_true
+    (0...20).count { |y| b.row(y).includes?("WWWW") }.should be > 1 # the long line wraps
+    frames.each { |f| (0...20).map { |y| f.row(y) }.should eq((0...20).map { |y| b.row(y) }) }
+
+    view.apply(Gori::Repeater::Result.new(hdr.to_slice, "gamma\nkeep\n".to_slice, nil, 1000_i64))
+    b2 = MemoryBackend.new(80, 20)
+    view.render(Screen.new(b2), rect)
+    b2.contains?("+ gamma").should be_true
+    b2.contains?("- WWW").should be_true # now on the baseline side, as a deletion
   end
 end

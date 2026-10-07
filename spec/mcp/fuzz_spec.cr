@@ -112,6 +112,200 @@ describe "MCP fuzz tools" do
     end
   end
 
+  it "stops on stop_on and reports condition_met with a stop_reason" do
+    port = start_origin
+    with_store do |store|
+      tools = tools_for(store)
+      start = call_json(tools, "fuzz_start", {
+        "template"       => "GET /?q=§x§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        "url"            => "http://127.0.0.1:#{port}",
+        "payloads"       => %([{"list":["a","b","c","d","e"]}]),
+        "match"          => %({"status":"200"}),
+        "stop_on"        => %({"after_matches":1}),
+        "allow_unscoped" => true,
+      }.to_json)
+      status = wait_fuzz_done(tools, start["job_id"].as_s)
+      status["status"].as_s.should eq("condition_met")
+      status["stop_reason"]?.should_not be_nil
+      status["incomplete_reason"].as_s.should eq("condition_met")
+      status["matched"].as_i.should be >= 1
+    end
+  end
+
+  it "rejects invalid stop_on configurations" do
+    with_store do |store|
+      tools = tools_for(store)
+      base = {
+        "template"       => "GET /?q=§x§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        "url"            => "http://127.0.0.1:80",
+        "payloads"       => %([{"list":["a"]}]),
+        "allow_unscoped" => true,
+      }
+
+      # Empty stop_on names no condition
+      res, err = call_raw(tools, "fuzz_start", base.merge({"stop_on" => %({})}).to_json)
+      err.should be_true
+      res.should contain("names no condition")
+
+      # Unknown key in stop_on
+      res, err = call_raw(tools, "fuzz_start", base.merge({"stop_on" => %({"body":"err"})}).to_json)
+      err.should be_true
+      res.should contain("unknown stop_on key")
+
+      # Unknown key in stop_on.match
+      res, err = call_raw(tools, "fuzz_start", base.merge({"stop_on" => %({"match":{"body":"err"}})}).to_json)
+      err.should be_true
+      res.should contain("unknown stop_on.match key")
+
+      # Empty match in stop_on
+      res, err = call_raw(tools, "fuzz_start", base.merge({"stop_on" => %({"match":{}})}).to_json)
+      err.should be_true
+      res.should contain("'stop_on.match' names no condition")
+
+      # Blank regex in stop_on
+      res, err = call_raw(tools, "fuzz_start", base.merge({"stop_on" => %({"match":{"regex":""}})}).to_json)
+      err.should be_true
+      res.should contain("cannot be empty")
+
+      # Unknown key in the run's own match is refused too, not silently dropped
+      res, err = call_raw(tools, "fuzz_start", base.merge({"match" => %({"body":"err"})}).to_json)
+      err.should be_true
+      res.should contain("unknown match key")
+
+      # after_matches <= 0
+      res, err = call_raw(tools, "fuzz_start", base.merge({"stop_on" => %({"after_matches":0})}).to_json)
+      err.should be_true
+      res.should contain("expected a positive integer")
+
+      res, err = call_raw(tools, "fuzz_start", base.merge({"stop_on" => %({"after_matches":-5})}).to_json)
+      err.should be_true
+      res.should contain("expected a positive integer")
+    end
+  end
+
+  it "rejects keep: interesting without save_results" do
+    with_store do |store|
+      tools = tools_for(store)
+      args = {
+        "template"       => "GET /?q=§x§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        "url"            => "http://127.0.0.1:80",
+        "payloads"       => %([{"list":["a"]}]),
+        "keep"           => "interesting",
+        "allow_unscoped" => true,
+      }.to_json
+      res, err = call_raw(tools, "fuzz_start", args)
+      err.should be_true
+      res.should contain("'keep' applies to the save_results archive")
+    end
+  end
+
+  it "stores and flags the unmatched row that triggered stop_on in fuzz_results" do
+    port = start_origin
+    with_store do |store|
+      tools = tools_for(store)
+      start = call_json(tools, "fuzz_start", {
+        "template"       => "GET /?q=§x§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        "url"            => "http://127.0.0.1:#{port}",
+        "payloads"       => %([{"list":["a","b","c"]}]),
+        "match"          => %({"status":"500"}),
+        "stop_on"        => %({"match":{"status":"200"}}),
+        "allow_unscoped" => true,
+      }.to_json)
+      job_id = start["job_id"].as_s
+      status = wait_fuzz_done(tools, job_id)
+      status["status"].as_s.should eq("condition_met")
+      status["stop_reason"]?.should_not be_nil
+
+      results = call_json(tools, "fuzz_results", {job_id: job_id}.to_json)
+      rows = results["results"].as_a
+      rows.size.should be >= 1
+      row = rows.first
+      row["matched"].as_bool.should be_false
+      row["stop_hit"].as_bool.should be_true
+    end
+  end
+
+  it "keep: interesting stores no archive rows for a run that matched nothing, but keeps whole-run counts" do
+    port = start_origin
+    with_store do |store|
+      tools = tools_for(store)
+      start = call_json(tools, "fuzz_start", {
+        "template"       => "GET /?q=§x§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        "url"            => "http://127.0.0.1:#{port}",
+        "payloads"       => %([{"list":["a","b","c"]}]),
+        "match"          => %({"status":"500"}), # the origin answers 200, so nothing matches
+        "save_results"   => true,
+        "keep"           => "interesting",
+        "allow_unscoped" => true,
+      }.to_json)
+      job_id = start["job_id"].as_s
+      status = wait_fuzz_done(tools, job_id)
+      status["status"].as_s.should eq("done")
+      status["sent"].as_i.should eq(3) # every request was still sent…
+      run_id = status["run_id"].as_i64
+      run = call_json(tools, "get_fuzz_run", {run_id: run_id}.to_json)["run"]
+      run["keep"].as_s.should eq("interesting")
+      run["filtered"].as_bool.should be_true
+      run["sent"].as_i.should eq(3)           # …the run's own count stays whole-run…
+      run["stored_results"].as_i.should eq(0) # …while the archive kept none of the 3 uninteresting rows
+    end
+  end
+
+  it "names the stop row live and on the saved run, for both stop_on shapes (#1270)" do
+    port = start_origin
+    with_store do |store|
+      tools = tools_for(store)
+      base = {
+        "template"       => "GET /?q=§x§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        "url"            => "http://127.0.0.1:#{port}",
+        "payloads"       => %([{"list":["a","b","c","d","e"]}]),
+        "concurrency"    => 1,
+        "save_results"   => true,
+        "allow_unscoped" => true,
+      }
+
+      # after_matches: the 2nd match trips it — a plain matched row that carries no stop_hit.
+      start = call_json(tools, "fuzz_start", base.merge({
+        "match" => %({"status":"200"}), "stop_on" => %({"after_matches":2}),
+      }).to_json)
+      status = wait_fuzz_done(tools, start["job_id"].as_s)
+      status["status"].as_s.should eq("condition_met")
+      status["stop_index"].as_i64.should eq(1_i64)
+      run_id = status["run_id"].as_i64
+
+      # A reader with no live job — the reopen — still names it, in the listing and the run.
+      reader = Gori::MCP::Tools.new(store, allow_actions: false, verify_upstream: false)
+      listed = call_json(reader, "list_fuzz_runs", %({"limit":10}))
+      listed["runs"].as_a.find! { |r| r["id"].as_i64 == run_id }["stop_index"].as_i64.should eq(1_i64)
+      page = call_json(reader, "get_fuzz_run", {run_id: run_id}.to_json)
+      page["run"]["stop_index"].as_i64.should eq(1_i64)
+      row = call_json(reader, "get_fuzz_run", {run_id: run_id, result_index: 1}.to_json)
+      row["result"]["matched"].as_bool.should be_true
+      row["run"]["stop_index"].as_i64.should eq(1_i64)
+
+      # The separate condition under keep: interesting: the stop row is UNMATCHED, kept only
+      # because it is the stop row, and it is the one the saved run points at.
+      start = call_json(tools, "fuzz_start", base.merge({
+        "match" => %({"status":"500"}), "stop_on" => %({"match":{"status":"200"}}),
+        "keep" => "interesting",
+      }).to_json)
+      status = wait_fuzz_done(tools, start["job_id"].as_s)
+      status["status"].as_s.should eq("condition_met")
+      status["stop_index"].as_i64.should eq(0_i64)
+      page = call_json(reader, "get_fuzz_run", {run_id: status["run_id"].as_i64}.to_json)
+      page["run"]["stop_index"].as_i64.should eq(0_i64)
+      page["results"].as_a.map(&.["index"].as_i64).should eq([0_i64])
+
+      # A run that did not end on its condition has none: absent live, null saved.
+      start = call_json(tools, "fuzz_start", base.merge({"match" => %({"status":"200"})}).to_json)
+      status = wait_fuzz_done(tools, start["job_id"].as_s)
+      status["status"].as_s.should eq("done")
+      status["stop_index"]?.should be_nil
+      page = call_json(reader, "get_fuzz_run", {run_id: status["run_id"].as_i64}.to_json)
+      page["run"]["stop_index"].raw.should be_nil
+    end
+  end
+
   it "permanently saves every row independently of the bounded selective live cache" do
     port = start_origin
     with_store do |store|
@@ -894,6 +1088,82 @@ describe "MCP fuzz tools" do
     end
   end
 
+  # Job ids restart at fz_1 in every `gori mcp` process, so another server's `fz_1` flow at
+  # the same History id carried this job's ref and was reported as this job's result.
+  it "does not credit a flow another server recorded under the same job id" do
+    port = start_origin
+    with_store do |store|
+      tools = tools_for(store)
+      start = call_json(tools, "fuzz_start",
+        {"template"       => "GET /?q=§x§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+         "url"            => "http://127.0.0.1:#{port}",
+         "payloads"       => %([{"list":["a"]}]),
+         "record_history" => "all",
+         "allow_unscoped" => true}.to_json)
+      job_id = start["job_id"].as_s
+      wait_fuzz_done(tools, job_id)
+      own = call_json(tools, "fuzz_results", {job_id: job_id}.to_json)["results"][0]["flow_id"].as_i64
+      own_ref = store.flow_row(own).not_nil!.source_ref.not_nil!
+      own_ref.should start_with("#{job_id}@")
+
+      store.clear_flows.should be_true
+      reissue_rowids(store)
+      # What the other process writes: the same job id and sequence, its own nonce.
+      foreign = own_ref.sub(/@[0-9a-f]+:/, "@000000:")
+      store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: Time.utc.to_unix_ms * 1000_i64, scheme: "http", host: "b.test", port: 80,
+        method: "GET", target: "/from-B", http_version: "HTTP/1.1",
+        head: "GET /from-B HTTP/1.1\r\nHost: b.test\r\n\r\n".to_slice,
+        source: Gori::FlowSource::Kind::Fuzzer, source_surface: Gori::FlowSource::Surface::Mcp,
+        source_ref: foreign)).should eq(own)
+      call_json(tools, "fuzz_results", {job_id: job_id}.to_json)["results"][0]["flow_id"]?.should be_nil
+    end
+  end
+
+  it "omits a recorded result's flow_id after History reuses it" do
+    port = start_origin
+    with_store do |store|
+      tools = tools_for(store)
+      start = call_json(tools, "fuzz_start",
+        {"template"       => "GET /?q=§x§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+         "url"            => "http://127.0.0.1:#{port}",
+         "payloads"       => %([{"list":["a"]}]),
+         "record_history" => "all",
+         "allow_unscoped" => true}.to_json)
+      job_id = start["job_id"].as_s
+      wait_fuzz_done(tools, job_id)
+      original_id = call_json(tools, "fuzz_results", {job_id: job_id}.to_json)["results"][0]["flow_id"].as_i64
+      original_ref = store.flow_row(original_id).not_nil!.source_ref.not_nil!
+      next_ref = "#{job_id}:#{original_ref.split(':').last.to_i + 1}"
+
+      store.clear_flows.should be_true
+      reissue_rowids(store)
+      reused_id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: Time.utc.to_unix_ms * 1000_i64, scheme: "http", host: "ref.test", port: 80,
+        method: "GET", target: "/same-job-result", http_version: "HTTP/1.1",
+        head: "GET /same-job-result HTTP/1.1\r\nHost: ref.test\r\n\r\n".to_slice,
+        source: Gori::FlowSource::Kind::Fuzzer, source_surface: Gori::FlowSource::Surface::Mcp,
+        source_ref: next_ref))
+      reused_id.should eq(original_id)
+      store.flow_row(reused_id).not_nil!.source_ref.should eq(next_ref)
+
+      result = call_json(tools, "fuzz_results", {job_id: job_id}.to_json)["results"][0]
+      result["flow_id"]?.should be_nil
+
+      store.clear_flows.should be_true
+      reissue_rowids(store)
+      reused_id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: Time.utc.to_unix_ms * 1000_i64, scheme: "http", host: "ref.test", port: 80,
+        method: "GET", target: "/unrelated", http_version: "HTTP/1.1",
+        head: "GET /unrelated HTTP/1.1\r\nHost: ref.test\r\n\r\n".to_slice,
+        source: Gori::FlowSource::Kind::Import, source_ref: "unrelated.har"))
+      reused_id.should eq(original_id)
+
+      result = call_json(tools, "fuzz_results", {job_id: job_id}.to_json)["results"][0]
+      result["flow_id"]?.should be_nil
+    end
+  end
+
   it "ends budget_exhausted (not done) when max_requests halts before all candidates" do
     port = start_origin
     with_store do |store|
@@ -923,6 +1193,31 @@ describe "MCP fuzz tools" do
         break
       end
       done.should be_true
+    end
+  end
+
+  # The size gate judges what the run can send: a caller cap at or below the ceiling bounds a
+  # draw from a larger set, so it is not refused for candidates it will never send (#1209).
+  it "lets max_requests satisfy the size gate for a candidate set past the ceiling" do
+    port = start_origin
+    with_store do |store|
+      tools = tools_for(store)
+      base = {"template" => "GET /?q=§x§ HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+              "url" => "http://127.0.0.1:#{port}", "payloads" => %([{"numbers":"1-200000"}]),
+              "allow_unscoped" => true}
+      text, err = call_raw(tools, "fuzz_start", base.to_json)
+      err.should be_true
+      text.should contain("too many requests (200000 > 100000)")
+      text.should contain("max_requests")
+      text, err = call_raw(tools, "fuzz_start", base.merge({"max_requests" => 150_000}).to_json)
+      err.should be_true
+      text.should contain("(150000 > 100000)")
+
+      start = call_json(tools, "fuzz_start", base.merge({"max_requests" => 2}).to_json)
+      start["budget_warning"].as_s.should contain("below the 200000 candidate total")
+      status = wait_fuzz_done(tools, start["job_id"].as_s)
+      status["status"].as_s.should eq("budget_exhausted")
+      status["requests"].as_i.should eq(2)
     end
   end
 
@@ -1284,6 +1579,7 @@ end
 # network, so a run wide enough to cross the sub-budget is still fast.
 describe "MCP fuzz — failures cannot crowd matches out of the stored set" do
   it "stops storing errored rows at the unmatched sub-budget, not at the total cap" do
+    posix_only!("an immediate connect-refused; Windows spends about two seconds refusing each loopback dial")
     probe = TCPServer.new("127.0.0.1", 0)
     port = probe.local_address.port
     probe.close
@@ -1317,6 +1613,119 @@ describe "MCP fuzz — failures cannot crowd matches out of the stored set" do
       st["sent"].as_i.should eq(cap + 5)
       st["stored_results"].as_i.should eq(cap) # …and NOT cap + 5
       st["results_truncated"].as_bool.should be_true
+    end
+  end
+end
+
+module Gori::MCP
+  class Tools
+    def __store_fuzz_result(fjob : FuzzJob, r : Fuzz::Result) : Nil
+      store_fuzz_result(fjob, r, nil, nil)
+    end
+
+    def __drain_fuzz_event(fjob : FuzzJob, ev : Fuzz::Event) : Nil
+      drain_fuzz_event(fjob, ev)
+    end
+
+    def __register_fuzz_job(fjob : FuzzJob) : Nil
+      @jobs[fjob.id] = fjob
+    end
+
+    def __db_path : String?
+      @db_path
+    end
+  end
+end
+
+private class NullFuzzBackend < Gori::Fuzz::Backend
+  def origin : Gori::Fuzz::Origin
+    Gori::Fuzz::Origin.new("http", "h", 80)
+  end
+
+  def send(bytes : Bytes) : Gori::Repeater::Result
+    raise "not sent"
+  end
+end
+
+describe "MCP fuzz — the stop row survives a spent unmatched budget" do
+  it "stores an unmatched stop_hit row after the unmatched sub-budget is full" do
+    with_store do |store|
+      tools = tools_for(store)
+      cfg = Gori::Fuzz::Config.new
+      gen = Gori::Fuzz::Generator.new(Gori::Fuzz::Template.parse("GET / HTTP/1.1\r\nHost: h\r\n\r\n"), [] of Gori::Fuzz::PayloadSet, cfg)
+      engine = Gori::Fuzz::Engine.new(gen, Gori::Fuzz::Matcher.new, NullFuzzBackend.new, cfg)
+      audit = Gori::MCP::Tools::JobAudit.new("http://h:80", nil, 1, nil, 0_i64)
+      fjob = Gori::MCP::Tools::FuzzJob.new("j", 1_i64, engine, :none, Gori::Fuzz::Origin.new("http", "h", 80), false, audit)
+      fjob.unmatched_stored = Gori::MCP::Tools::FUZZ_MAX_STORED_UNMATCHED
+
+      errored = Gori::Fuzz::Result.new(0_i64, ["a"], nil, nil, 0_i64, 0, 0, 1_i64, "refused", false, false, nil)
+      tools.__store_fuzz_result(fjob, errored)
+      fjob.results.should be_empty
+      fjob.truncated?.should be_true
+
+      stop = Gori::Fuzz::Result.new(1_i64, ["b"], nil, 200, 2_i64, 1, 1, 1_i64, nil, false, false, nil, stop_hit: true)
+      tools.__store_fuzz_result(fjob, stop)
+      fjob.results.map(&.index).should eq([1_i64])
+    end
+  end
+end
+
+describe "MCP fuzz — the live stop_index follows the terminal status (#1270)" do
+  it "names the stop row on condition_met and none on a job that landed :error" do
+    with_store do |store|
+      tools = tools_for(store)
+      job = ->(id : String) {
+        cfg = Gori::Fuzz::Config.new
+        gen = Gori::Fuzz::Generator.new(Gori::Fuzz::Template.parse("GET / HTTP/1.1\r\nHost: h\r\n\r\n"), [] of Gori::Fuzz::PayloadSet, cfg)
+        engine = Gori::Fuzz::Engine.new(gen, Gori::Fuzz::Matcher.new, NullFuzzBackend.new, cfg)
+        audit = Gori::MCP::Tools::JobAudit.new("http://h:80", nil, 1, nil, 0_i64)
+        Gori::MCP::Tools::FuzzJob.new(id, 3_i64, engine, :none, Gori::Fuzz::Origin.new("http", "h", 80), false, audit)
+      }
+      done = Gori::Fuzz::DoneEvent.new(Gori::Fuzz::Progress.new(2_i64, 3_i64, 2_i64, 0_i64), true,
+        "reached 2 matches on result 1 after 2 sent", 1_i64)
+
+      met = job.call("met")
+      tools.__drain_fuzz_event(met, done)
+      met.status.should eq(:condition_met)
+      met.stop_index.should eq(1_i64)
+
+      errored = job.call("errored")
+      tools.__drain_fuzz_event(errored, Gori::Fuzz::ErrorEvent.new("setup failed"))
+      tools.__drain_fuzz_event(errored, done)
+      errored.status.should eq(:error)
+      errored.stop_index.should be_nil
+    end
+  end
+end
+
+describe "MCP fuzz — a live job's results page in index order (#1432)" do
+  it "lists a concurrent run's rows by index, not as they completed" do
+    with_store do |store|
+      tools = tools_for(store)
+      cfg = Gori::Fuzz::Config.new
+      gen = Gori::Fuzz::Generator.new(Gori::Fuzz::Template.parse("GET / HTTP/1.1\r\nHost: h\r\n\r\n"), [] of Gori::Fuzz::PayloadSet, cfg)
+      engine = Gori::Fuzz::Engine.new(gen, Gori::Fuzz::Matcher.new, NullFuzzBackend.new, cfg)
+      audit = Gori::MCP::Tools::JobAudit.new("http://h:80", nil, 1, nil, 0_i64)
+      fjob = Gori::MCP::Tools::FuzzJob.new("fz_order", 8_i64, engine, :none,
+        Gori::Fuzz::Origin.new("http", "h", 80), false, audit, tools.__db_path)
+      tools.__register_fuzz_job(fjob)
+      [1, 2, 0, 4, 3, 6, 5, 7].each do |i|
+        # #4 is a failed send: kept for its fault, but not a match.
+        tools.__store_fuzz_result(fjob, Gori::Fuzz::Result.new(i.to_i64, ["p#{i}"], nil, 200, 1_i64,
+          1, 1, 1_i64, i == 4 ? "refused" : nil, i != 4, false, nil).tap { |r| fjob.clusters.add(r) })
+      end
+
+      page = ->(args : String) {
+        call_json(tools, "fuzz_results", args)["results"].as_a.map(&.["index"].as_i)
+      }
+      page.call(%({"job_id":"fz_order"})).should eq((0..7).to_a)
+      page.call(%({"job_id":"fz_order","offset":2,"limit":3})).should eq([2, 3, 4])
+      page.call(%({"job_id":"fz_order","matched_only":true})).should eq([0, 1, 2, 3, 5, 6, 7])
+
+      # One cluster's members page the same way.
+      shape = Gori::Fuzz::Shape.hex(Gori::Fuzz::Clusters.key(fjob.results.first)[0])
+      members = call_json(tools, "fuzz_results", %({"job_id":"fz_order","cluster":#{shape.to_json}}))
+      members["results"].as_a.map(&.["index"].as_i).should eq([0, 1, 2, 3, 5, 6, 7])
     end
   end
 end

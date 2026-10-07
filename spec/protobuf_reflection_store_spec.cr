@@ -106,6 +106,61 @@ describe "gRPC reflection cache" do
       end
     end
 
+    # "Applied either way" — every surface promises the lens stays live in this process when
+    # the write loses to a busy peer. The re-read after a failed write lacked the new row, so
+    # the fetch the operator had just run was thrown away.
+    it "keeps a fetch live in this process when its row does not commit" do
+      path = File.tempname("gori-reflect-busy", ".db")
+      store = Gori::Store.open(path, busy_timeout_ms: 200)
+      peer = DB.open("sqlite3:#{path}?busy_timeout=100")
+      cn = peer.checkout
+      begin
+        Schemas.load_project(store)
+        cn.exec("BEGIN IMMEDIATE") # a peer holding the write lock: the project is busy
+        set = Reflection.descriptor_set([demo_file_descriptor])
+        Schemas.adopt(store, "https://api.test:443", Reflection::SERVICE_V1, 1, 1, set).should be_false
+        Schemas.resolve("/demo.Users/GetUser", request: true).should_not be_nil
+      ensure
+        cn.exec("ROLLBACK")
+        cn.release
+        peer.close
+        Schemas.clear
+        store.close
+        File.delete?(path)
+        File.delete?("#{path}-wal")
+        File.delete?("#{path}-shm")
+      end
+    end
+
+    # A committed adopt used to reload the list from the store, which dropped what this
+    # process held only in memory: an earlier unpersisted adopt fell out of the lens, and an
+    # unpersisted forget came back into it.
+    it "keeps memory-only adopts and forgets when a later adopt commits" do
+      path = File.tempname("gori-reflect-mixed", ".db")
+      store = Gori::Store.open(path, busy_timeout_ms: 200)
+      peer = DB.open("sqlite3:#{path}?busy_timeout=100")
+      cn = peer.checkout
+      begin
+        Schemas.load_project(store)
+        set = Reflection.descriptor_set([demo_file_descriptor])
+        Schemas.adopt(store, "https://gone.test:443", Reflection::SERVICE_V1, 1, 1, set).should be_true
+        cn.exec("BEGIN IMMEDIATE")
+        Schemas.adopt(store, "https://a.test:443", Reflection::SERVICE_V1, 1, 1, set).should be_false
+        Schemas.forget(store, "https://gone.test:443").should be_false
+        cn.exec("ROLLBACK")
+        Schemas.adopt(store, "https://b.test:443", Reflection::SERVICE_V1, 1, 1, set).should be_true
+        Schemas.reflections.map(&.target).should eq(["https://a.test:443", "https://b.test:443"])
+      ensure
+        cn.release
+        peer.close
+        Schemas.clear
+        store.close
+        File.delete?(path)
+        File.delete?("#{path}-wal")
+        File.delete?("#{path}-shm")
+      end
+    end
+
     it "names the reflected target in the settings row's status" do
       with_store do |store|
         set = Reflection.descriptor_set([demo_file_descriptor])
@@ -151,6 +206,60 @@ describe "gRPC reflection cache" do
         Schemas.forget(store, "https://api.test:443").should be_true
         Schemas.resolve("/demo.Users/GetUser", request: true).should be_nil
         Schemas.status.should eq("no descriptor set loaded")
+      end
+    end
+
+    it "drops a target from memory even when deletion does not commit" do
+      path = File.tempname("gori-reflect-forget-busy", ".db")
+      store = Gori::Store.open(path, busy_timeout_ms: 200)
+      peer = DB.open("sqlite3:#{path}?busy_timeout=100")
+      cn = peer.checkout
+      begin
+        Schemas.load_project(store)
+        set = Reflection.descriptor_set([demo_file_descriptor])
+        Schemas.adopt(store, "https://api.test:443", Reflection::SERVICE_V1, 1, 1, set).should be_true
+        Schemas.resolve("/demo.Users/GetUser", request: true).should_not be_nil
+
+        cn.exec("BEGIN IMMEDIATE")
+        Schemas.forget(store, "https://api.test:443").should be_false
+        Schemas.resolve("/demo.Users/GetUser", request: true).should be_nil
+        Schemas.reflections.map(&.target).should_not contain("https://api.test:443")
+      ensure
+        cn.exec("ROLLBACK") rescue nil
+        cn.release rescue nil
+        peer.close rescue nil
+        Schemas.clear
+        store.close
+        File.delete?(path)
+        File.delete?("#{path}-wal")
+        File.delete?("#{path}-shm")
+      end
+    end
+
+    it "drops all targets from memory even when clear does not commit" do
+      path = File.tempname("gori-reflect-clear-busy", ".db")
+      store = Gori::Store.open(path, busy_timeout_ms: 200)
+      peer = DB.open("sqlite3:#{path}?busy_timeout=100")
+      cn = peer.checkout
+      begin
+        Schemas.load_project(store)
+        set = Reflection.descriptor_set([demo_file_descriptor])
+        Schemas.adopt(store, "https://api.test:443", Reflection::SERVICE_V1, 1, 1, set).should be_true
+        Schemas.resolve("/demo.Users/GetUser", request: true).should_not be_nil
+
+        cn.exec("BEGIN IMMEDIATE")
+        Schemas.forget(store, nil).should be_false
+        Schemas.resolve("/demo.Users/GetUser", request: true).should be_nil
+        Schemas.reflections.should be_empty
+      ensure
+        cn.exec("ROLLBACK") rescue nil
+        cn.release rescue nil
+        peer.close rescue nil
+        Schemas.clear
+        store.close
+        File.delete?(path)
+        File.delete?("#{path}-wal")
+        File.delete?("#{path}-shm")
       end
     end
 

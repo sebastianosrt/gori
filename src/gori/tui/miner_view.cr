@@ -13,6 +13,7 @@ require "./subtab_clone"
 require "./viewport"
 require "./row_filter"
 require "./subtab_marks"
+require "./seeded_session"
 
 module Gori::Tui
   # The view for ONE mining session (a sub-tab under the Miner tab). Read-only: the
@@ -22,6 +23,7 @@ module Gori::Tui
   # overlays a single finding. Mirrors FuzzerView's session shape, minus the editors.
   class MinerView
     include SubtabRef # a sub-tab strip may hold a mark on this view (#683)
+    include SeededSession
     PANE_ORDER = [:summary, :results]
 
     property name : String?
@@ -42,6 +44,7 @@ module Gori::Tui
       @sni = ""
       @evidence = false
       @config = Miner::Config.new
+      @macro_info = nil.as(Gori::RequestMacro::Info?)
       @last_synced_config = "" # last store config blob applied (reconcile equality)
       @name = nil.as(String?)
       @dirty = false
@@ -61,6 +64,7 @@ module Gori::Tui
       @focus = :summary
       @sel = 0
       @scroll = 0
+      @results_last_h = 0 # finding rows the last frame drew — the PgUp/PgDn step
       # The FINDING pane's row cursor, selection, scroll and draw-state. `line_select_only`: a row
       # is a label and a value in two columns, so selection is whole rows and the copy payload is
       # `"label  value"` (see `detail_plain`). The pane paints its own two columns, so
@@ -100,15 +104,7 @@ module Gori::Tui
     # Live cross-session request-side sync. Updates seed request/config WITHOUT
     # wiping focus, in-memory findings, scroll/selection, or a running job.
     def apply_peer_session(rec : Store::MinerSessionRecord) : Nil
-      @target = rec.target
-      @request = rec.request
-      @http2 = rec.http2?
-      @sni = rec.sni || ""
-      @evidence = !rec.flow_id.nil? # see restore
-      @name = rec.name
-      apply_config_json(rec.config)
-      @last_synced_config = rec.config
-      @dirty = false
+      restore(rec) # the request-side fields only — focus, results and a running job are untouched
     end
 
     def session_side_matches?(rec : Store::MinerSessionRecord) : Bool
@@ -141,61 +137,8 @@ module Gori::Tui
       @job_id = 0
     end
 
-    # --- persistence accessors ---
-    def request_bytes : Bytes
-      @request
-    end
-
-    def http2? : Bool
-      @http2
-    end
-
-    def sni_override : String?
-      s = @sni.strip
-      s.empty? ? nil : s
-    end
-
-    def same?(other : MinerView) : Bool
-      same?(other.object_id)
-    end
-
-    def same?(oid : UInt64) : Bool
-      object_id == oid
-    end
-
-    def dirty? : Bool
-      @dirty
-    end
-
-    def clear_dirty : Nil
-      @dirty = false
-    end
-
-    def mark_config_synced(config : String) : Nil
-      @last_synced_config = config
-    end
-
-    def request_line : String
-      String.new(@request[0, {@request.size, 256}.min]).each_line.first? || ""
-    end
-
-    # HTTP method from the request line — feeds the sub-tab filter's `method:`.
-    def request_method : String
-      request_line.strip.split(' ').first? || ""
-    end
-
     def summary(max : Int32 = 32) : String
-      parts = request_line.strip.split(' ')
-      s = "#{parts[0]?} #{parts[1]?}".strip
-      s = "request" if s.empty?
-      s.size > max ? "#{s[0, max - 1]}…" : s
-    end
-
-    def label(max : Int32 = 18) : String
-      if (n = @name) && !(t = n.strip).empty?
-        return t.size > max ? "#{t[0, max - 1]}…" : t
-      end
-      summary(max)
+      SeededSession.clip(SeededSession.request_summary(@request), max)
     end
 
     def target_origin : String
@@ -203,18 +146,12 @@ module Gori::Tui
       "#{scheme}://#{host}:#{port}"
     end
 
-    # The session target as stored (scheme://host[:port]) — feeds Repeater seeds.
-    def target : String
-      @target
-    end
-
     # Build a Repeater-ready request with the selected finding's parameter injected at
     # its discovered location. Uses the discovery canary when present (so a reflection
     # finding still echoes on re-send); otherwise a short non-empty probe value.
     def request_with_finding(f : Miner::Finding) : Bytes
       value = f.canary.presence || "1"
-      Miner::Inject.apply(@request, f.location, [{f.name, value}],
-        @config.add_content_length_when_missing?)
+      Miner::Inject.apply(@request, f.location, [{f.name, value}])
     end
 
     # --- focus ring ---
@@ -253,6 +190,11 @@ module Gori::Tui
       @sel = (@sel + d).clamp(0, n - 1)
     end
 
+    # The PgUp/PgDn step: the finding rows the last frame drew, minus two of overlap.
+    def results_page_rows : Int32
+      {@results_last_h - 2, 1}.max
+    end
+
     def open_detail : Nil
       return if visible.empty?
       @finding.reset
@@ -263,18 +205,12 @@ module Gori::Tui
     # A lens over `@results`: `visible` is the list the cursor, the draw loop and the
     # hit-tests walk; `@results` itself is what the engine appends to and what `found_count`
     # reports.
+    getter filter : RowFilter
+
     def filter_start : Nil
       close_detail if @focus == :detail
       focus_pane(:results)
       @filter.start
-    end
-
-    def filter_editing? : Bool
-      @filter.editing?
-    end
-
-    def filter_hint : String
-      @filter.hint
     end
 
     def handle_filter_key(ev : Termisu::Event::Key) : Bool
@@ -282,10 +218,6 @@ module Gori::Tui
       @filter.handle_key(ev)
       @sel = (prev && visible.index(prev)) || @sel.clamp(0, {visible.size - 1, 0}.max)
       true
-    end
-
-    def set_filter_preedit(text : String) : Bool
-      @filter.set_preedit(text)
     end
 
     private def visible : Array(Int32)
@@ -306,11 +238,6 @@ module Gori::Tui
       inner = res.inset(1, 1)
       return {nil, inner} unless @filter.shown? && inner.h > 0
       {Rect.new(inner.x, inner.y, inner.w, 1), Rect.new(inner.x, inner.y + 1, inner.w, inner.h - 1)}
-    end
-
-    # ↑/↓ (⇧ to select) walk the FINDING's fields; the wheel scrolls the viewport.
-    def detail_scroll(d : Int32) : Nil
-      with_finding { @finding.move(d, 0) }
     end
 
     def detail_move(d : Int32, selecting : Bool) : Nil
@@ -455,8 +382,13 @@ module Gori::Tui
     # pane). It has NO default on purpose: the Miner tab ignored them for as long as the
     # tab has existed (#367), which pinned a host to a staging IP everywhere except here,
     # so a call site that forgets them again has to be a compile error.
+    #
+    # `project` is the project the run's request-time macro reads its Repeater sessions from
+    # (#1350) — passed in like `overrides`, since only a surface can reach a store. Defaulted
+    # because most callers have no macro to read for.
     def build_engine(verify : Bool, scope : Gori::Scope,
-                     overrides : Gori::HostOverrides?) : {Miner::Engine?, String?}
+                     overrides : Gori::HostOverrides?,
+                     project : Gori::Store? = nil) : {Miner::Engine?, String?}
       # @request / @target keep their `$VAR` tokens (that is what gets persisted and what
       # the operator sees); Miner::Plan expands both exactly once, at build time — unless
       # these bytes are EVIDENCE, in which case it expands neither and refuses neither.
@@ -466,11 +398,17 @@ module Gori::Tui
       options = Miner::PlanOptions.new(String.new(@request), evidence: @evidence,
         target: @target, http2: @http2,
         locations: @config.locations, config: @config, verify: verify, sni: sni_override,
-        overrides: overrides)
+        overrides: overrides, project: project)
+      @macro_info = nil # a failed build must not leave the last run's macro
       plan = Miner::Plan.build(options, Gori::Outbound.interactive(scope))
+      @macro_info = plan.request_macro_info
       {plan.engine, nil}
     rescue ex : Miner::PlanError
       {nil, mine_plan_error(ex)}
+    rescue ex : Gori::Error
+      # `RequestMacro::Error` names its own step and remedy in words that read the same on every
+      # surface; a "config error:" prefix would only bury them.
+      {nil, ex.message || "the run could not be built"}
     rescue ex
       {nil, "config error: #{ex.message}"}
     end
@@ -482,7 +420,7 @@ module Gori::Tui
       in Miner::PlanError::Reason::NoTarget, Miner::PlanError::Reason::BadTarget
         "invalid target — use scheme://host[:port]/path"
       in Miner::PlanError::Reason::NoLocations
-        "no locations selected"
+        (why = ex.detail) ? "no selected location applies to this request — #{why}" : "no locations selected"
       in Miner::PlanError::Reason::Wordlist
         "wordlist error: #{ex.detail}"
       in Miner::PlanError::Reason::NoNames
@@ -513,8 +451,22 @@ module Gori::Tui
           if w = @config.user_wordlist
             j.field "user_wordlist", w
           end
+          # The request-time macro (#1350). Absent for a mine without one, so every older row
+          # and every macro-less session serialises byte-for-byte as before.
+          if m = @config.request_macro
+            j.field "request_macro" do
+              m.to_json(j)
+            end
+          end
         end
       end
+    end
+
+    # What the request-time macro does to the run just built (#1350) — the steps, the cadence,
+    # and the parallelism it leaves. nil for a mine with none. Read by the controller for the
+    # run-start line.
+    def macro_info : Gori::RequestMacro::Info?
+      @macro_info
     end
 
     private def apply_config_json(s : String) : Nil
@@ -542,6 +494,7 @@ module Gori::Tui
         end
       end
       any["user_wordlist"]?.try(&.as_s?).try { |w| @config.user_wordlist = w }
+      @config.request_macro = Gori::RequestMacro::Spec.from_json?(any["request_macro"]?)
     rescue
       # malformed persisted config → keep defaults
     end
@@ -571,12 +524,15 @@ module Gori::Tui
     end
 
     private def render_summary(screen : Screen, rect : Rect, focused : Bool) : Nil
-      Frame.card(screen, rect, "MINER", border: focused ? Theme.focus_gold : Theme.border, bg: Theme.bg)
+      # No border TITLE: this card is the tab itself, and the tab bar plus the sub-tab strip
+      # directly above it already say so — `MINER` here was the third printing of the word.
+      # The FINDINGS card below keeps its title: it names a pane, not the tab.
+      Frame.card(screen, rect, border: focused ? Theme.focus_gold : Theme.border, bg: Theme.bg)
       # Run control on the border: while mining a lit ` ^X:STOP `, otherwise a muted
       # ` ^R:MINE ` (run / re-run) — so both chords stay in view once findings fill the
       # pane. A state-swapping badge, not a boolean toggle: the chord itself changes.
       chord, name = @running ? {"^X", "STOP"} : {"^R", "MINE"}
-      Frame.toggle_badge(screen, rect.right - 1, rect.y, rect.x + "MINER".size + 4, chord, name, @running)
+      Frame.toggle_badge(screen, rect.right - 1, rect.y, rect.x + 2, chord, name, @running)
       x = rect.x + 2
       y = rect.y + 1
       # Guarded like every line below it: on a 1-2 row card `rect.y + 1` is the bottom
@@ -659,6 +615,7 @@ module Gori::Tui
       end
       header_row(screen, inner)
       cap = inner.h - 1
+      @results_last_h = cap
       ensure_visible(cap)
       cap.times do |i|
         idx = @scroll + i
@@ -818,7 +775,7 @@ module Gori::Tui
       sum, _ = pane_rects(rect)
       return nil if sum.empty?
       chord, name = @running ? {"^X", "STOP"} : {"^R", "MINE"}
-      Frame.right_badge_hit(mx, my, sum.y, sum.right - 1, sum.x + "MINER".size + 4,
+      Frame.right_badge_hit(mx, my, sum.y, sum.right - 1, sum.x + 2,
         [{:run, chord, name}] of {Symbol, String, String})
     end
   end

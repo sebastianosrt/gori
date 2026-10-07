@@ -1,14 +1,21 @@
 require "json"
 require "base64"
 require "../env"
+require "../local_time"
 require "../store"
 require "../display_columns"
 require "../issues_export"
 require "../repeater/engine"
 require "../fuzz"
+require "../discover"
+require "../miner"
 require "../proxy/codec/content_decode"
 require "../proxy/h2/grpc"
 require "../protobuf"
+require "../redact/wire"
+require "../redact/headers"
+require "../rules/stub"
+require "../settings"
 
 module Gori
   module MCP
@@ -26,14 +33,13 @@ module Gori
 
       # Header names whose VALUES carry credentials/session material. Redacted to
       # [REDACTED] in read-tool output (get_flow, get_repeater_context content)
-      # unless the caller opts in with include_sensitive:true. One canonical list
-      # so Flow and Repeater views share a single policy (send_request reuses
-      # `sensitive_header?` too).
-      SENSITIVE_HEADERS = {"authorization", "proxy-authorization", "cookie", "set-cookie",
-                           "x-api-key", "api-key", "x-auth-token"}
+      # unless the caller opts in with include_sensitive:true. The list lives in
+      # `Redact::SENSITIVE_HEADERS` (redact/headers.cr) so the SARIF export shares it
+      # without reaching into MCP; these are the names every MCP/CLI caller already uses.
+      SENSITIVE_HEADERS = Redact::SENSITIVE_HEADERS
 
       def self.sensitive_header?(name : String) : Bool
-        SENSITIVE_HEADERS.includes?(name.strip.downcase)
+        Redact.sensitive_header?(name)
       end
 
       # The auth schemes a credential header may carry in FRONT of its secret. Kept verbatim
@@ -241,7 +247,7 @@ module Gori
         j.object do
           j.field "id", row.id
           j.field "created_at", row.created_at
-          j.field "created_at_iso", unix_micros_iso(row.created_at)
+          j.field "created_at_iso", Gori.iso_micros(row.created_at)
           j.field "scheme", text(row.scheme)
           j.field "method", text(row.method)
           j.field "host", text(row.host)
@@ -258,6 +264,9 @@ module Gori
           # feed has no other way to tell a fabricated response from a real one, and an absent
           # field reads as "not applicable" rather than "false".
           j.field "short_circuited", row.short_circuited?
+          # The operator edited this request at Intercept (#1378): the stored request is what
+          # went upstream, not what the client sent. Every row, for `short_circuited`'s reason.
+          j.field "intercept_edited", row.intercept_edited?
           # Where this flow came from (`Gori::FlowSource`), and on EVERY row for
           # `short_circuited`'s reason: an agent reading this feed has no other way to tell a
           # request gori sent — including one IT sent through `send_request` — from traffic the
@@ -303,7 +312,7 @@ module Gori
         j.object do
           j.field "id", row.id
           j.field "created_at", row.created_at
-          j.field "created_at_iso", unix_micros_iso(row.created_at)
+          j.field "created_at_iso", Gori.iso_micros(row.created_at)
           j.field "source", text(row.source)
           j.field "kind", text(row.kind)
           j.field "level", text(row.level)
@@ -428,7 +437,7 @@ module Gori
           j.field "target", text(row.target)
           j.field "flow_id", row.flow_id if row.flow_id
           j.field "held_at_ms", row.held_at_ms
-          j.field "held_at_iso", unix_micros_iso(row.held_at_ms * 1000)
+          j.field "held_at_iso", Gori.iso_micros(row.held_at_ms * 1000)
           j.field "age_seconds", ((now_ms - row.held_at_ms) // 1000)
           # TRUE while the HUMAN operator has unsaved edits typed into this hold (mirrored from
           # `InterceptView#held_edit_id`). Nothing ever set it, so it answered false for every
@@ -577,6 +586,7 @@ module Gori
           j.field "ws_close_code", cc
         end
         j.field "extracted", text(r.extracted)
+        j.field "stop_hit", true if r.stop_hit?
         # This variation's request reached the origin TWICE: the keep-alive pool found its
         # parked socket closed and re-sent (see `Fuzz::Result#retried?`). Emitted only when
         # true — it is an exception, and a `false` on every row would bury the one that is
@@ -609,6 +619,50 @@ module Gori
         j.field "flow_id", flow_id if flow_id
       end
 
+      # --- discover / miner findings (MCP `*_results` and `gori run discover|mine --format json`)
+
+      def self.discover_finding(j : JSON::Builder, f : Discover::Finding, flow_id : Int64? = nil) : Nil
+        j.object do
+          # The captured exchange's row, for `get_flow`. Absent until its batch is flushed (see
+          # DISCOVER_PERSIST_INTERVAL), for a finding whose row was not saved (`unsaved_flows`),
+          # and on the CLI, which records no flow per finding.
+          j.field "flow_id", flow_id if flow_id
+          # A crawled URL is built from a page's own `<a href>` and `content_type` is a
+          # response header, so both are outside-origin. `Discover::Url.parse` percent-encodes
+          # the octets `<= 0x20` / `0x7F` (#394) but nothing above 0x7F, so a high byte reaches
+          # here intact.
+          j.field "url", text(f.url)
+          j.field "method", text(f.method)
+          j.field "status", f.status
+          j.field "length", f.length
+          j.field "content_type", text(f.content_type)
+          j.field "source", f.source.label
+          j.field "depth", f.depth
+          j.field "confidence", f.confidence.round(2)
+        end
+      end
+
+      def self.mine_finding(j : JSON::Builder, f : Miner::Finding) : Nil
+        j.object do
+          # name comes from a caller-supplied wordlist FILE (arbitrary bytes on disk).
+          j.field "name", text(f.name)
+          j.field "location", f.location.label
+          j.field "evidence", f.evidence.label
+          j.field "confidence", f.confidence.label
+          j.field "canary", text(f.canary)
+          j.field "status", f.status
+          j.field "delta", f.delta
+          # The gRPC CALL's outcome, from the confirming round's `grpc-status`/`grpc-message`
+          # trailers — `status` above is 200 for every gRPC response. Emitted only when the
+          # response actually carried it, so a non-gRPC run's rows are unchanged.
+          if gs = f.grpc_status
+            j.field "grpc_status", gs
+            j.field "grpc_status_name", Proxy::H2::Grpc.status_name(gs)
+          end
+          j.field "grpc_message", text(f.grpc_message) if f.grpc_message
+        end
+      end
+
       # Permanent fuzz-run metadata. `stored_results` is supplied by the caller so list/get
       # can use the same stable projection.
       def self.saved_fuzz_run(j : JSON::Builder, run : Store::FuzzRunRecord,
@@ -617,9 +671,9 @@ module Gori
           j.field "id", run.id
           j.field "session_id", run.session_id
           j.field "created_at", run.created_at
-          j.field "created_at_iso", unix_micros_iso(run.created_at)
+          j.field "created_at_iso", Gori.iso_micros(run.created_at)
           j.field "finished_at", run.finished_at
-          j.field "finished_at_iso", run.finished_at.try { |t| unix_micros_iso(t) }
+          j.field "finished_at_iso", run.finished_at.try { |t| Gori.iso_micros(t) }
           j.field "target", text(run.target)
           j.field "mode", text(run.mode)
           j.field "total", run.total
@@ -636,6 +690,15 @@ module Gori
           j.field "source_ref", text(run.source_ref)
           j.field "snapshot_version", run.snapshot_version
           j.field "legacy", run.legacy_snapshot?
+          # The result-capture policy this archive was written under (issue #1240), and whether
+          # it was filtered — so `stored_results` below reading under `sent` is a policy, not a
+          # lost run.
+          j.field "keep", text(run.keep)
+          j.field "filtered", run.filtered?
+          # The result this run's `stop_on` tripped on (issue #1270) — its `index`, which is the
+          # `result_index` get_fuzz_run takes. Null on every run that did not end
+          # `condition_met`, and on one saved before the column: null is "not recorded".
+          j.field "stop_index", run.stop_idx
         end
       end
 
@@ -745,23 +808,39 @@ module Gori
         end
       end
 
+      # What a SANITIZED projection has to say for itself (#1035): which profile ran, how much
+      # it replaced, and — stated rather than implied — what it did not look at. An agent
+      # quoting these bytes into a ticket has to be able to tell a body gori sanitized from one
+      # nobody has been through, and "0 replaced" is not the same claim as "not sanitized".
+      record RedactionNote,
+        profile : String,
+        bodies : Int32,
+        ws_frames : Int32,
+        decoded : Bool
+
       # --- full detail incl. heads + decoded bodies ---------------------------
       def self.flow_detail_json(detail : Store::FlowDetail,
                                 ws_msgs : Array(Store::WsMessage) = [] of Store::WsMessage,
                                 include_sensitive : Bool = false,
-                                body_cap : Int32 = MAX_TEXT, body_omit : Bool = false) : String
-        JSON.build { |j| flow_detail(j, detail, ws_msgs, include_sensitive, body_cap, body_omit) }
+                                body_cap : Int32 = MAX_TEXT, body_omit : Bool = false,
+                                redaction : RedactionNote? = nil, body_more : {String, String}? = nil,
+                                *, interims : Store::Interims? = nil) : String
+        JSON.build { |j| flow_detail(j, detail, ws_msgs, include_sensitive, body_cap, body_omit, redaction, body_more, interims: interims) }
       end
 
+      # `body_more` is the {request, response} pointer a display-capped body carries
+      # (`emit_body`'s `more`).
       def self.flow_detail(j : JSON::Builder, detail : Store::FlowDetail,
                            ws_msgs : Array(Store::WsMessage) = [] of Store::WsMessage,
                            include_sensitive : Bool = false,
-                           body_cap : Int32 = MAX_TEXT, body_omit : Bool = false) : Nil
+                           body_cap : Int32 = MAX_TEXT, body_omit : Bool = false,
+                           redaction : RedactionNote? = nil, body_more : {String, String}? = nil,
+                           *, interims : Store::Interims? = nil) : Nil
         row = detail.row
         j.object do
           j.field "id", row.id
           j.field "created_at", row.created_at
-          j.field "created_at_iso", unix_micros_iso(row.created_at)
+          j.field "created_at_iso", Gori.iso_micros(row.created_at)
           j.field "scheme", text(row.scheme)
           j.field "method", text(row.method)
           j.field "host", text(row.host)
@@ -772,6 +851,12 @@ module Gori
           j.field "state", row.state.to_s.downcase
           j.field "duration_us", row.duration_us
           j.field "content_type", text(row.content_type)
+          # The normalised cache signal (#1247), computed from the response head in hand — the
+          # same `Gori::CacheStatus` the QL `cache:` field runs in SQL, so `get_flow` and a
+          # `cache:hit` query cannot disagree about a flow. An agent chasing web-cache deception
+          # reads this to know whether a response was served from a shared cache (`hit`) before
+          # it re-requests without a session to confirm. `none` when no cache headers were sent.
+          j.field "cache", Gori::CacheStatus.classify(detail.response_head).token
           # `flow_row`'s field, on the DETAIL projection too, and for a sharper reason: this
           # is the call an agent makes to read a flow's BYTES before writing an issue, and
           # without it there is no way to tell a response gori fabricated from a
@@ -779,6 +864,7 @@ module Gori
           # "`stub:false` is what you want before treating History as evidence"; the list
           # projection said so and the detail one dropped it.
           j.field "short_circuited", row.short_circuited?
+          j.field "intercept_edited", row.intercept_edited?
           # `flow_row`'s provenance, on the DETAIL projection for the same sharpened reason: an
           # agent about to quote these bytes in an issue has to know whether the request was
           # the target's client's or gori's own — including one this very server sent through
@@ -804,21 +890,46 @@ module Gori
           # recovers the wire size by subtracting the head from the row total.
           emit_body(j, "request_body", detail.request_head, detail.request_body,
             detail.request_body_truncated?, body_cap, body_omit, include_sensitive,
-            source_size: detail.request_body_truncated? ? detail.request_wire_body_size : nil)
+            source_size: detail.request_body_truncated? ? detail.request_wire_body_size : nil,
+            more: body_more.try(&.[0]))
+          emit_interims(j, interims, include_sensitive) if interims
           j.field "response_head", redact_head_opt(head_text(detail.response_head), include_sensitive)
           emit_head_base64(j, "response_head", detail.response_head, include_sensitive)
           j.field "sensitive_headers_redacted", true unless include_sensitive
+          emit_redaction_note(j, redaction)
           emit_body(j, "response_body", detail.response_head, detail.response_body,
             detail.response_body_truncated?, body_cap, body_omit, include_sensitive,
-            source_size: detail.response_body_truncated? ? detail.response_wire_body_size : nil)
+            source_size: detail.response_body_truncated? ? detail.response_wire_body_size : nil,
+            more: body_more.try(&.[1]))
           emit_sse_events(j, detail)
           emit_ws_messages(j, ws_msgs)
           emit_grpc_messages(j, "request_grpc_messages", detail.request_head, detail.request_body,
             detail.row.target, request: true)
           emit_grpc_messages(j, "response_grpc_messages", detail.response_head, detail.response_body,
             detail.row.target, request: false)
-          emit_decoded(j, detail, ws_msgs)
+          emit_decoded(j, detail, ws_msgs, include_sensitive)
         end
+      end
+
+      # The interim 1xx responses the origin sent before `response_head` (`Store::Interims`),
+      # in wire order — the same `interim` / `interim_omitted` pair `gori run show --format json`
+      # emits, present only on a flow that had one, with `relayed: false` on a head the client
+      # never received (an HTTP/1.0 client). Each head gets `response_head`'s treatment:
+      # a 1xx is a header block like any other and may carry a cookie.
+      def self.emit_interims(j : JSON::Builder, interims : Store::Interims, include_sensitive : Bool) : Nil
+        j.field "interim" do
+          j.array do
+            interims.heads.each do |h|
+              j.object do
+                j.field "status", h.status
+                j.field "relayed", h.relayed?
+                j.field "head", redact_head_opt(head_text(h.head), include_sensitive)
+                emit_head_base64(j, "head", h.head, include_sensitive)
+              end
+            end
+          end
+        end
+        j.field "interim_omitted", interims.omitted if interims.omitted > 0
       end
 
       GRPC_MSGS_MAX  =  200 # cap gRPC messages serialised for an LLM client
@@ -845,10 +956,10 @@ module Gori
         return if head.nil? || body.nil? || body.empty?
         ct = MediaType.of(head)
         return unless Proxy::H2::Grpc.grpc?(ct)
-        # `scan_body`: grpc-web-text carries the frames base64-encoded, so scanning the raw
-        # bytes finds a length prefix built out of base64 characters — an agent reading this
-        # would be told a gRPC call had no messages.
-        msgs, residual = Proxy::H2::Grpc.scan_body(ct, body)
+        # `scan_wire`: grpc-web-text carries the frames base64-encoded, and any body may sit
+        # under a `Content-Encoding` — scanning the raw bytes finds a length prefix built out
+        # of base64 or gzip octets, and an agent would be told a gRPC call had no messages.
+        msgs, residual = Proxy::H2::Grpc.scan_wire(head, body)
         return if msgs.empty? && residual == 0
         binding = Protobuf::Schemas.resolve(target, request: request)
         j.field field_name do
@@ -869,7 +980,7 @@ module Gori
             # trailers, which reach the agent in this flow's response headers; grpc-web has
             # none, so without this an agent could only get it by hand-parsing a trailer frame's
             # `headers` map — and the HTTP status is 200 for a denial as much as for a grant.
-            gs, gm = Proxy::H2::Grpc.trailer_status(msgs)
+            gs, gm = Proxy::H2::Grpc.trailer_status(ct, msgs)
             if gs
               j.field "grpc_status", gs
               j.field "grpc_status_name", Proxy::H2::Grpc.status_name(gs)
@@ -953,7 +1064,7 @@ module Gori
                     j.field "opcode", m.opcode
                     j.field "type", ws_frame_type(m.opcode)
                     j.field "at", m.created_at
-                    j.field "at_iso", unix_micros_iso(m.created_at)
+                    j.field "at_iso", Gori.iso_micros(m.created_at)
                     # The V7 shape (FIN / RSV / masked / frame count) and a CLOSE's code and
                     # reason. `gori run show --format json` has emitted these since the shape
                     # existed; MCP did not, so the agent surface was the one place a captured
@@ -1003,12 +1114,28 @@ module Gori
       # Decoded-protocol projections (SAML / JWT / GraphQL / form params), bounded for
       # LLM use. Shares one emitter with `gori run show --format json` (DecodedView) so
       # the two surfaces never diverge; here every side is scanned and clipped.
+      #
+      # The decoders read the heads the redacted `request_head`/`response_head` above were
+      # cut from, so they get the same redaction: a JWT decoded out of `Authorization:` or a
+      # `Cookie:` is that header's value, and decoding is not redaction any more than base64
+      # is (`emit_head_base64`). A token in the target or a body still decodes, as it is
+      # still shown.
       def self.emit_decoded(j : JSON::Builder, detail : Store::FlowDetail,
-                            ws_msgs : Array(Store::WsMessage) = [] of Store::WsMessage) : Nil
+                            ws_msgs : Array(Store::WsMessage) = [] of Store::WsMessage,
+                            include_sensitive : Bool = false) : Nil
         DecodedView.emit_json(j, target: detail.row.target,
-          req_head: detail.request_head, req_body: detail.request_body,
-          resp_head: detail.response_head, resp_body: detail.response_body,
+          req_head: redact_head_bytes(detail.request_head, include_sensitive),
+          req_body: detail.request_body,
+          resp_head: redact_head_bytes(detail.response_head, include_sensitive),
+          resp_body: detail.response_body,
           clip: DECODE_TEXT_MAX, ws_messages: ws_msgs)
+      end
+
+      # `redact_head` over a head's octets, octets back: every byte but a sensitive value's
+      # survives as captured, so a decoder reading the result sees the head it would have.
+      def self.redact_head_bytes(head : Bytes?, include_sensitive : Bool) : Bytes?
+        return head if include_sensitive || head.nil?
+        redact_head(String.new(head), false).to_slice
       end
 
       SSE_EVENTS_MAX =  500 # cap events serialised for an LLM client
@@ -1042,14 +1169,237 @@ module Gori
         end
       end
 
+      # --- rewriter and colour rules --------------------------------------------
+
+      # One Match & Replace rule, as MCP `list_rules` and `gori run rewriter --format json` both
+      # print it. `enabled` is the EFFECTIVE state in this project; `default_enabled` and
+      # `overridden` only appear for a global rule, where the library's own default may differ
+      # (this project overrode it), so a caller can tell "off everywhere" from "off in this
+      # engagement". A project rule has one state, and printing two fields for it would invite
+      # the reader to look for a difference that cannot exist.
+      def self.match_rule(j : JSON::Builder, r : Store::MatchRule) : Nil
+        j.object do
+          j.field "id", r.id
+          j.field "scope", r.scope.label
+          j.field "enabled", r.enabled?
+          j.field "inert", r.inert?
+          if reason = r.inert_reason
+            j.field "inert_reason", reason
+          end
+          if r.global?
+            j.field "overridden", r.overridden?
+            j.field "default_enabled", Settings.rewriter_rules.find { |g| g.id == r.id }.try(&.enabled)
+          end
+          j.field "name", r.name
+          j.field "target", r.target_label
+          j.field "part", r.part_label
+          j.field "op", r.op_label
+          j.field "match", r.match_kind_label
+          j.field "host", r.host
+          j.field "pattern", r.pattern
+          j.field "replacement", r.replacement
+          j.field "body_file", r.body_file
+          RuleStub.respond_json_fields(j, r)
+        end
+      end
+
+      # One colour rule, as MCP `list_color_rules` and `gori run colormarker --format json` both
+      # print it; `enabled` / `overridden` / `default_enabled` as in `match_rule` above.
+      def self.color_rule(j : JSON::Builder, r : Store::ColorRule) : Nil
+        j.object do
+          j.field "id", r.id
+          j.field "scope", r.scope.label
+          j.field "enabled", r.enabled?
+          if r.global?
+            j.field "overridden", r.overridden?
+            j.field "default_enabled", Settings.colormarker_rules.find { |g| g.id == r.id }.try(&.enabled)
+          end
+          j.field "name", r.name
+          # "when", the same key settings.json writes and the MCP tools accept — one vocabulary
+          # across all three surfaces.
+          j.field "when", r.match_filter
+          j.field "color", r.color
+          j.field "style", r.style.label
+        end
+      end
+
+      # --- extract rules (#501) ------------------------------------------------
+
+      # One extract rule, as MCP `list_extract_rules` and `gori run rewriter extract --format
+      # json` both print it. `when`, not `match_filter`: the field mirrors the CLI flag
+      # (`--when`) and the MCP argument of the same name, which is what a caller has in front
+      # of them.
+      def self.extract_rule(j : JSON::Builder, r : Store::ExtractRule) : Nil
+        {
+          id:        r.id,
+          enabled:   r.enabled?,
+          name:      r.name,
+          when:      r.match_filter,
+          host:      r.host,
+          kind:      r.kind.label,
+          selector:  r.selector,
+          pos_start: r.pos_start,
+          pos_end:   r.pos_end,
+        }.to_json(j)
+      end
+
+      # --- frozen evidence (#1038) --------------------------------------------
+
+      # One frozen copy's provenance — `Issues::Export.evidence_fields`, the object every
+      # surface emits, plus the ISO spelling of the freeze time that every MCP timestamp gets.
+      def self.evidence_meta(j : JSON::Builder, m : Store::IssueEvidenceMeta) : Nil
+        Issues::Export.evidence_fields(j, m)
+        j.field "frozen_at_iso", Gori.iso_micros(m.created_at)
+      end
+
+      # The copy with its bytes, shaped like `flow_detail`: heads redacted unless
+      # `include_sensitive` (and flagged so, as `flow_detail` flags them), bodies through
+      # `emit_body` (decoded, capped, base64 for binary). The hashes are over the STORED
+      # bytes — the wire form for a flow, the tab's saved request for a Repeater — so a reader
+      # that wants to verify them asks for `include_sensitive` and the raw head; a redacted
+      # head cannot hash to them, and the field says so rather than leaving the reader to
+      # discover it.
+      def self.evidence_json(ev : Store::IssueEvidence, include_sensitive : Bool,
+                             body_cap : Int32 = MAX_TEXT, body_omit : Bool = false,
+                             redaction : RedactionNote? = nil) : String
+        m = ev.meta
+        JSON.build do |j|
+          j.object do
+            evidence_meta(j, m)
+            j.field "hashes_cover", "the stored bytes (head + body) — a flow's wire form, a Repeater tab's saved request; a redacted head or body does not reproduce them"
+            j.field "sensitive_headers_redacted", true unless include_sensitive
+            emit_redaction_note(j, redaction)
+            j.field "request_head", redact_head_opt(head_text(ev.request_head), include_sensitive)
+            emit_head_base64(j, "request_head", ev.request_head, include_sensitive)
+            emit_body(j, "request_body", ev.request_head, ev.request_body, m.request_truncated?,
+              body_cap, body_omit, include_sensitive)
+            j.field "response_head", redact_head_opt(head_text(ev.response_head), include_sensitive)
+            emit_head_base64(j, "response_head", ev.response_head, include_sensitive)
+            emit_body(j, "response_body", ev.response_head, ev.response_body, m.response_truncated?,
+              body_cap, body_omit, include_sensitive)
+          end
+        end
+      end
+
+      # --- issue retest (#1036) -----------------------------------------------
+      #
+      # Four shapes, shared by MCP and `gori run retest --format=json` so the two cannot
+      # drift: a CONFIGURED step (resolved against the project as it is now), a RUN summary,
+      # one stored RESULT row, and one just-produced result. Every captured string goes
+      # through `Issues::Export.one_line` for the reason `issue` below states — an unscrubbed
+      # wire byte breaks the whole JSON-RPC line's UTF-8 validity, not merely its display.
+
+      # One configured step plus what it WILL send: the method and URL resolved from its
+      # Repeater session, and `missing` when it cannot run at all. The resolved half is the
+      # point — a caller that only saw `{role, ref_id}` could not tell a step that will POST
+      # from one that will GET, which is exactly what it has to confirm before a run.
+      def self.retest_planned(j : JSON::Builder, pl : Retest::Planned) : Nil
+        s = pl.step
+        j.field "id", s.id
+        j.field "issue_id", s.issue_id
+        j.field "position", s.position
+        j.field "role", s.role.label
+        j.field "ref_kind", s.ref_kind.label
+        j.field "ref_id", s.target_id
+        # The step's session was deleted: it refuses as missing until it is removed and
+        # re-added, and `ref_id` is the id it had, not one that resolves (#1160).
+        j.field "ref_deleted", s.detached?
+        j.field "label", Issues::Export.one_line(pl.label)
+        j.field "method", pl.method
+        j.field "url", Issues::Export.one_line(pl.url)
+        j.field "assertion", s.assertion
+        j.field "expected", pl.assertion.describe
+        j.field "state_changing", pl.runnable? && pl.state_changing?
+        j.field "runnable", pl.runnable?
+        pl.missing.try { |m| j.field "unrunnable_reason", Issues::Export.one_line(m) }
+        j.field "created_at", s.created_at
+        j.field "created_at_iso", Gori.iso_micros(s.created_at)
+        j.field "updated_at", s.updated_at
+      end
+
+      def self.retest_tally(j : JSON::Builder, t : Retest::Tally) : Nil
+        j.field "total", t.total
+        j.field "passed", t.passed
+        j.field "failed", t.failed
+        j.field "inconclusive", t.inconclusive
+        j.field "errored", t.errored
+        j.field "blocked", t.blocked
+        j.field "skipped", t.skipped
+      end
+
+      def self.retest_run(j : JSON::Builder, r : Store::RetestRun) : Nil
+        j.field "run_id", r.id
+        j.field "issue_id", r.issue_id
+        j.field "verdict", r.verdict.label
+        j.field "surface", r.surface
+        j.field "started_at", r.started_at
+        j.field "started_at_iso", Gori.iso_micros(r.started_at)
+        j.field "finished_at", r.finished_at
+        j.field "duration_us", r.duration_us
+        retest_tally(j, Retest::Tally.new(r.total, r.passed, r.failed, r.inconclusive,
+          r.errored, r.blocked, r.skipped))
+        r.note.try { |n| j.field "note", Issues::Export.one_line(n) }
+      end
+
+      # A STORED result row. `label`/`method`/`url` are the copies taken at run time, never
+      # re-resolved — see `Store::RetestRunStep`.
+      def self.retest_run_step(j : JSON::Builder, s : Store::RetestRunStep) : Nil
+        j.field "position", s.position
+        j.field "role", s.role.label
+        j.field "ref_kind", s.ref_kind.label
+        j.field "ref_id", s.ref_id
+        j.field "label", Issues::Export.one_line(s.label)
+        j.field "method", s.method
+        j.field "url", Issues::Export.one_line(s.url)
+        j.field "assertion", s.assertion
+        j.field "outcome", s.outcome.label
+        j.field "detail", Issues::Export.one_line(s.detail)
+        j.field "status", s.status
+        j.field "duration_us", s.duration_us
+        j.field "bytes", s.bytes
+        # The History row THIS send wrote (`src:retest`). It is how a result row opens the
+        # exact response it reported, months after the Repeater tab moved on.
+        j.field "flow_id", s.flow_id
+      end
+
+      # A result the run just produced — the same fields, off the in-memory shape, so a
+      # `run_retest` reply and a later `get_retest_run` read alike.
+      def self.retest_step_result(j : JSON::Builder, r : Retest::StepResult) : Nil
+        pl = r.planned
+        s = pl.step
+        j.field "step_id", s.id
+        j.field "position", s.position
+        j.field "role", s.role.label
+        j.field "ref_kind", s.ref_kind.label
+        j.field "ref_id", s.target_id
+        j.field "label", Issues::Export.one_line(pl.label)
+        j.field "method", pl.method
+        j.field "url", Issues::Export.one_line(pl.url)
+        j.field "assertion", s.assertion
+        j.field "expected", pl.assertion.describe
+        j.field "outcome", r.outcome.label
+        j.field "detail", Issues::Export.one_line(r.detail)
+        j.field "status", r.observation.status
+        j.field "duration_us", r.observation.duration_us
+        j.field "bytes", r.observation.bytes
+        j.field "flow_id", r.observation.flow_id
+      end
+
       # --- issues -----------------------------------------------------------
-      def self.issue(j : JSON::Builder, f : Store::Issue, store : Store? = nil) : Nil
+      # `retest` is OPT-IN and off by default, because it costs two more per-row store reads
+      # and `list_issues` serializes a page of up to 500 issues through here. `get_issue` —
+      # the "read one finding" call the field's own argument is about — passes true; the
+      # listing does not, and an agent that wants the check for a row calls
+      # `list_retest_steps` for it. Same split `body_mode` makes between a listing and a
+      # detail: a per-row read belongs on the call that asked for one row.
+      def self.issue(j : JSON::Builder, f : Store::Issue, store : Store? = nil, *,
+                     retest : Bool = false) : Nil
         j.object do
           j.field "id", f.id
           j.field "created_at", f.created_at
-          j.field "created_at_iso", unix_micros_iso(f.created_at)
+          j.field "created_at_iso", Gori.iso_micros(f.created_at)
           j.field "updated_at", f.updated_at
-          j.field "updated_at_iso", unix_micros_iso(f.updated_at)
+          j.field "updated_at_iso", Gori.iso_micros(f.updated_at)
           # title/host/notes: same captured-data-can-be-invalid-UTF-8 gap `Issues::Export.json`
           # has (this IS that same JSON shape, just wrapped in a JSON-RPC tool response) — an
           # unscrubbed raw byte here breaks the whole response line's UTF-8 validity, a real
@@ -1060,11 +1410,41 @@ module Gori
           j.field "cvss", f.cvss.try { |c| Issues::Export.one_line(c) }
           j.field "cvss_score", f.cvss_score
           j.field "host", f.host.try { |h| Issues::Export.one_line(h) }
+          # The flow the issue was filed from — and the FIRST entry of `links` below, which is
+          # where an agent reads everything backing the issue. Kept as its own field for
+          # compatibility (`create_issue(flow_id:)` writes it, SARIF's webRequest reads it);
+          # it never names a flow `links` does not also carry.
           j.field "flow_id", f.flow_id
           # notes is multi-line by design — scrub only, don't collapse (mirrors Export.json).
           j.field "notes", Issues::Export.scrub_only(f.notes)
           j.field "links" do
             j.array { Issues::Export.append_links_json(j, f, store) if store }
+          end
+          # Frozen copies (#1038): provenance and hashes only, like the export — an agent that
+          # wants the bytes reads the flow it names while it still exists; the copy itself is
+          # not served over MCP.
+          j.field "evidence" do
+            j.array { Issues::Export.append_evidence_json(j, f, store) if store }
+          end
+          # The RETEST (#1036), and only when the issue has one — the state an agent needs to
+          # decide what to do next with a finding it just read: is there a reproducible check,
+          # and what did it say last time. Without it the only way to learn a check exists is
+          # `list_retest_steps` per issue, which nobody calls speculatively.
+          #
+          # Omitted entirely when there is none, the same rule the Issue detail's one-line
+          # summary follows: an issue with no retest says nothing rather than saying "0". Two
+          # indexed reads, beside the two `links`/`evidence` already make here.
+          emit_issue_retest(j, f, store) if retest && store
+        end
+      end
+
+      private def self.emit_issue_retest(j : JSON::Builder, f : Store::Issue, store : Store) : Nil
+        steps = store.count_retest_steps(f.id)
+        return if steps == 0
+        j.field("retest") do
+          j.object do
+            j.field "steps", steps
+            store.last_retest_run(f.id).try { |r| j.field("last_run") { j.object { retest_run(j, r) } } }
           end
         end
       end
@@ -1095,12 +1475,23 @@ module Gori
         j.field "#{field_name}_base64", Base64.strict_encode(head)
       end
 
-      # RFC3339 UTC for store timestamps (unix microseconds). Helps LLM clients
-      # that can't interpret raw microsecond integers.
-      def self.unix_micros_iso(us : Int64) : String
-        sec, micro = us.divmod(1_000_000)
-        t = Time.utc(1970, 1, 1) + sec.seconds + micro.microseconds
-        t.to_s("%Y-%m-%dT%H:%M:%S.%LZ")
+      # The `body_redaction` field, present only on a projection that actually went through a
+      # profile. Its absence is the signal that these are the captured bytes.
+      def self.emit_redaction_note(j : JSON::Builder, note : RedactionNote?) : Nil
+        n = note || return
+        j.field "body_redaction" do
+          j.object do
+            j.field "profile", n.profile
+            j.field "bodies_redacted", n.bodies
+            j.field "websocket_frames_redacted", n.ws_frames
+            j.field "transfer_decoded", true if n.decoded
+            j.field "applies_to", "request/response BODIES and WebSocket frame payloads. " \
+                                  "Heads, URLs and query strings are NOT redacted, and neither " \
+                                  "is any body this flow's other fields restate. A body that is " \
+                                  "not valid UTF-8, or is multipart, is withheld whole rather " \
+                                  "than sanitized."
+          end
+        end
       end
 
       # Emits a `field_name` field carrying a decoded-body summary. nil/empty body
@@ -1116,7 +1507,8 @@ module Gori
       def self.emit_body(j : JSON::Builder, field_name : String, head : Bytes?, body : Bytes?,
                          wire_truncated : Bool, cap : Int32 = MAX_TEXT, omit : Bool = false,
                          include_sensitive : Bool = false, source_size : Int64? = nil,
-                         source_truncated : Bool = false, preserve_empty : Bool = false) : Nil
+                         source_truncated : Bool = false, preserve_empty : Bool = false,
+                         more : String? = nil) : Nil
         if body.nil? || (body.empty? && !preserve_empty)
           j.field field_name, nil
           return
@@ -1156,6 +1548,9 @@ module Gori
             # distinguish a capture-time cut from a decode/de-chunk prefix cap.
             j.field "wire_truncated", true if wire_truncated
             j.field "decode_truncated", true if decode_truncated
+            # Where the rest is, when the DISPLAY cap (not the capture) cut this body and the
+            # caller has a place to page it from — the default `body_mode` (#1394).
+            j.field "more", more if more && cut && !omit
             j.field "note", note if note
             # Finding trailers requires walking to the 0-chunk. Once the preview cap stopped
             # the chunk walk, doing that second full-body pass defeats the bound.

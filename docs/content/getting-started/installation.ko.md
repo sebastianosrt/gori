@@ -1,6 +1,6 @@
 +++
-title = "설치"
-description = "curl, Homebrew, AUR, Nix, Docker, 사전 빌드 바이너리, 또는 소스에서 gori를 설치합니다."
+title = "gori 설치"
+description = "curl, Chocolatey, Homebrew, AUR, Snap, Nix, Docker, 사전 빌드 바이너리(Linux, macOS, Windows), 또는 소스에서 gori를 설치합니다."
 weight = 10
 +++
 
@@ -14,11 +14,11 @@ macOS와 Linux용 한 줄 명령입니다. OS/아키텍처를 감지해 알맞�
 curl -fsSL https://gori.hahwul.com/install.sh | bash
 ```
 
-`/usr/local`에 쓸 수 있으면 그 아래에, 아니면 `~/.local`에 설치합니다. `GORI_INSTALL_PREFIX`로 재정의할 수 있습니다. 설치 후에는 `gori update`가 바이너리를 스스로 업데이트합니다(설치를 담당하는 채널이 Homebrew / Snap / AUR인 경우 그쪽으로 안내합니다).
+`/usr/local`에 쓸 수 있으면 그 아래에, 아니면 `~/.local`에 설치합니다. `GORI_INSTALL_PREFIX`로 재정의할 수 있습니다. 설치 후에는 `gori update`가 바이너리를 스스로 업데이트합니다(설치를 담당하는 채널이 Chocolatey / Homebrew / Snap / AUR인 경우 그쪽으로 안내합니다).
 
 ### GitHub rate limit에 걸린 경우 {#rate-limit}
 
-설치 스크립트는 최신 릴리스가 무엇인지 GitHub API에 묻는데, 이 API는 **비인증 요청을 IP당 시간당 60회**만 허용합니다. 공용 CI나 NAT 뒤에서는 `403`이 돌아올 수 있습니다. 설치 스크립트와 `gori update` 모두 rate limit이 없는 릴리스 리다이렉트로 자동 폴백하므로 그대로 동작하며, `resolved v0.4.0 via ... (no API call)` 같은 줄이 보입니다.
+설치 스크립트는 최신 릴리스가 무엇인지 GitHub API에 묻는데, 이 API는 **비인증 요청을 IP당 시간당 60회**만 허용합니다. 공용 CI나 NAT 뒤에서는 `403`이 돌아올 수 있습니다. 설치 스크립트와 `gori update` 모두 rate limit이 없는 릴리스 리다이렉트로 자동 폴백하므로 그대로 동작하며, `resolved v0.8.0 via ... (no API call)` 같은 줄이 보입니다.
 
 인증 시 한도인 5000회/시간을 쓰려면 토큰을 먼저 export하세요. `curl` 앞에 붙이면 안 되고 반드시 export해야 합니다. 스크립트는 파이프로 연결된 `bash`에서 실행되므로 `curl`에만 걸린 변수는 상속되지 않습니다:
 
@@ -39,9 +39,12 @@ curl -fsSL -o gori https://github.com/hahwul/gori/releases/latest/download/gori-
 
 # macOS arm64 / x86_64: gori와 lib/이 담긴 tarball
 curl -fsSL -o gori.tar.gz https://github.com/hahwul/gori/releases/latest/download/gori-osx-arm64.tar.gz
+
+# Windows x86_64: 단독 실행 .exe
+curl -fsSL -o gori.exe https://github.com/hahwul/gori/releases/latest/download/gori-windows-x86_64.exe
 ```
 
-버전이 붙은 이름(`gori-v0.4.0-linux-x86_64`)도 그대로 유지되니, 특정 빌드에 고정하려면 그쪽을 쓰세요.
+버전이 붙은 이름(`gori-v0.8.0-linux-x86_64`)도 그대로 유지되니, 특정 빌드에 고정하려면 그쪽을 쓰세요.
 
 각 릴리스에는 두 이름 체계를 모두 담은 `SHA256SUMS`도 함께 올라갑니다. 설치 스크립트와 `gori update`는 이 파일로 자동 검증하며, 직접 받은 파일을 확인하려면:
 
@@ -68,6 +71,16 @@ brew install gori
 
 macOS 보틀은 링크된 모든 dylib를 바이너리 옆에 함께 번들한 자립형 tarball이고, Linux 보틀은 정적 빌드입니다. 어느 쪽도 추가 Homebrew 의존성을 끌어오지 않습니다.
 
+## Chocolatey (Windows) {#chocolatey}
+
+[Chocolatey 커뮤니티 저장소](https://community.chocolatey.org/packages/gori)에서 설치합니다:
+
+```powershell
+choco install gori
+```
+
+패키지는 v0.8.0부터 제공되는 Windows x86_64 바이너리를 설치합니다. `gori update`는 Chocolatey 설치를 인식해 `choco upgrade gori -y`를 안내합니다. Windows는 실행 중인 `gori.exe`를 교체하지 않으므로, gori를 닫고 관리자 셸에서 실행하세요.
+
 ## Arch Linux (AUR) {#arch-linux-aur}
 
 **x86_64**용 바이너리 패키지가 [AUR](https://aur.archlinux.org/packages/gori)에 게시되어 있습니다. 원하는 AUR 헬퍼로 설치하세요:
@@ -77,6 +90,16 @@ yay -S gori
 # or
 paru -S gori
 ```
+
+## Snap {#snap}
+
+릴리스마다 strict confinement 스냅이 Snap Store에 게시됩니다. **Linux x86_64**용입니다:
+
+```bash
+sudo snap install gori
+```
+
+strict confinement에서는 홈의 숨김 디렉터리에 접근할 수 없으므로, 스냅의 `GORI_HOME`(설정, 루트 CA, 프로젝트 데이터베이스)은 `~/.gori`가 아니라 `~/snap/gori/common`입니다. `gori update`는 스냅 설치를 알아보고 `snap refresh gori`를 출력합니다(`PATH`에 `snap` 명령이 있으면 `gori update --exec`가 바로 실행합니다).
 
 ## Nix {#nix}
 
@@ -142,9 +165,29 @@ docker run --rm -it -v gori:/data -p 8070:8070 -e TZ=Asia/Seoul \
   ghcr.io/hahwul/gori --listen 0.0.0.0
 ```
 
+### Apple container {#apple-container}
+
+Apple의 [`container`](https://github.com/apple/container)(macOS 26 이상, Apple Silicon)는 같은 이미지를 같은 플래그로 실행합니다. `-v gori:/data`는 네임드 볼륨을 알아서 만들고, `-it`는 TUI에 터미널을 주며, `gori mcp`에는 `-i`만 있으면 됩니다:
+
+```bash
+container run --rm -it \
+  -v gori:/data \
+  -p 8070:8070 \
+  ghcr.io/hahwul/gori --listen 0.0.0.0
+```
+
+컨테이너마다 호스트의 `vmnet` 네트워크에서 자기 IP를 받으므로 포트 게시는 선택입니다. `container ls`가 출력하는 주소를 클라이언트 프록시에 `<ip>:8070`으로 바로 지정해도 똑같이 동작합니다.
+
+`container build -f packaging/docker/Dockerfile -t gori:dev .`로 소스에서 이미지를 빌드할 수 있으며, `packaging/docker/Dockerfile.dockerignore`를 읽습니다. Dockerfile 옆의 무시 목록만 찾으므로, BuildKit과 달리 컨텍스트 루트의 `.dockerignore`로 되돌아가지 않습니다. 빌더는 자체 VM에서 동작하므로 호스트의 `HTTP_PROXY`를 상속하지 않으며, 기본값이 CPU 2개에 2 GB입니다(`container builder status`). 그 크기에서는 gori의 `--release` 빌드가 한 시간을 훌쩍 넘기므로, 먼저 늘려 두는 편이 좋습니다:
+
+```bash
+container builder stop
+container builder start --cpus 8 --memory 8g
+```
+
 ## 사전 빌드 바이너리 {#pre-built-binary}
 
-macOS와 Linux용 독립 실행 바이너리가 모든 [GitHub Release](https://github.com/hahwul/gori/releases/latest)에 첨부됩니다.
+macOS와 Linux용 독립 실행 바이너리가 모든 [GitHub Release](https://github.com/hahwul/gori/releases/latest)에 첨부되며, Windows(x86_64)용은 v0.8.0부터 제공됩니다. 플랫폼별 지원 등급과 Windows에서 알려진 한계는 [플랫폼 지원](/ko/reference/platform-support/)에 정리되어 있습니다.
 
 | 플랫폼 | 자산 |
 |----------|-------|
@@ -152,6 +195,7 @@ macOS와 Linux용 독립 실행 바이너리가 모든 [GitHub Release](https://
 | Linux arm64 | `gori-v*-linux-arm64` |
 | macOS Apple Silicon | `gori-v*-osx-arm64.tar.gz` |
 | macOS Intel | `gori-v*-osx-x86_64.tar.gz` |
+| Windows x86_64 | `gori-v*-windows-x86_64.exe` |
 
 ### Linux {#linux}
 
@@ -174,6 +218,18 @@ sudo ln -sf /usr/local/opt/gori/gori /usr/local/bin/gori
 ```
 
 > 바이너리는 ad-hoc 서명되어 있습니다. Gatekeeper가 다운로드를 차단하면 격리 플래그를 지우세요: `xattr -dr com.apple.quarantine /usr/local/opt/gori`. [Homebrew](#homebrew)로 설치하면 이 문제를 피할 수 있습니다.
+
+### Windows {#windows}
+
+Windows 바이너리는 정적 링크되어 있어 따로 설치할 것도, 옆에 둘 DLL도 없습니다. `gori.exe`로 이름을 바꿔 `PATH`에 있는 폴더에 두세요:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\Programs\gori" | Out-Null
+Move-Item gori-v*-windows-x86_64.exe "$env:LOCALAPPDATA\Programs\gori\gori.exe"
+# 그다음 그 폴더를 사용자 PATH에 추가합니다 (설정 → 환경 변수)
+```
+
+TUI는 Windows Terminal(또는 VT 시퀀스를 처리하는 콘솔, Windows 10 1809 이상이면 모두 해당)에서 실행하세요. `gori update`는 `.exe`를 제자리에서 교체합니다. `GORI_HOME`의 기본값은 `%USERPROFILE%\.gori`입니다.
 
 ## 소스에서 빌드 {#build-from-source}
 
@@ -216,13 +272,24 @@ shards build --release -Dwithout_native_codecs
 
 > 정의되지 않은 `BrotliDecoder*` 심볼 때문에 링크가 실패하면, `libbrotlidec`이 없거나 `pkg-config`가 찾지 못하는 것입니다. `brotli`를 설치하거나(위 참조) `-Dwithout_native_codecs`를 사용하세요.
 
+### Windows에서 빌드 {#building-on-windows}
+
+Crystal의 Windows 설치본에는 SQLite(FTS5 포함), Brotli, Zstd를 뺀 gori의 링크 라이브러리가 모두 들어 있습니다. 이 셋은 [vcpkg](https://vcpkg.io/)에서 정적 라이브러리로 받고, 정적 C 런타임이 맞도록 `--static`으로 빌드하세요:
+
+```bash
+vcpkg install --triplet x64-windows-static "sqlite3[fts5]" brotli zstd
+export CRYSTAL_LIBRARY_PATH="$(crystal env CRYSTAL_LIBRARY_PATH);C:\vcpkg\installed\x64-windows-static\lib"
+shards install
+crystal build src/main.cr -o bin/gori.exe --release --static
+```
+
 ## 설치 확인 {#verify-the-installation}
 
 ```bash
 gori --version
 ```
 
-`gori 0.4.0`이 표시되어야 합니다.
+`gori 0.8.0`이 표시되어야 합니다.
 
 ## 설치 없이 실행 {#run-without-installing}
 

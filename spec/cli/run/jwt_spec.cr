@@ -1,5 +1,6 @@
 require "../../spec_helper"
 require "json"
+require "../../support/jose_keys"
 
 # `gori run jwt` builds its JSON from the shared engine emitters (jwt/present.cr) so the
 # CLI and the MCP jwt_* tools stay byte-identical; the text formatter is CLI-only.
@@ -23,10 +24,132 @@ describe "gori run jwt" do
 
   it "decode_json carries nested header/payload objects + the signed flag" do
     j = JSON.parse(Gori::Jwt.decode_json(jwt))
+    j["type"].as_s.should eq("JWS")
     j["alg"].as_s.should eq("HS256")
     j["header"]["typ"].as_s.should eq("JWT")
     j["payload"]["sub"].as_s.should eq("1")
     j["signed"].as_bool.should be_true
+    # A plain 3-part token carries no extra-segment fields — the shape stays clean.
+    j["extra_segments"]?.should be_nil
+    j["note"]?.should be_nil
+  end
+
+  it "decode_json surfaces segments smuggled after a JWS instead of dropping them" do
+    # The text decoder WARNS on a >3-segment token (decoder_spec, fix #22) and `verify`
+    # REFUSES it, but `decode_json` used to report a clean {type:JWS, signed:true} and drop
+    # parts[3..] on the floor — so `gori run jwt --format json` / MCP `jwt_decode` hid data
+    # smuggled after a valid-looking JWS prefix. It now rides in `extra_segments` + `note`,
+    # keyed on presence the way a JWE is keyed on `type`.
+    smuggled = "#{jwt}.SMUGGLED"
+    j = JSON.parse(Gori::Jwt.decode_json(smuggled))
+    j["type"].as_s.should eq("JWS")
+    j["extra_segments"].as_a.map(&.as_s).should eq(["SMUGGLED"])
+    j["note"].as_s.should contain("4 dot-separated segments")
+
+    # A five-part blob that is not a decodable JWE (no `enc`) surfaces both extras too, and
+    # is NOT reported as a JWE (that discrimination lives in Jwe.parse).
+    five = "#{jwt}.extra.more"
+    j5 = JSON.parse(Gori::Jwt.decode_json(five))
+    j5["type"].as_s.should eq("JWS")
+    j5["extra_segments"].as_a.map(&.as_s).should eq(["extra", "more"])
+  end
+
+  it "decode_json flags an under-segmented blob instead of reporting a clean JWS" do
+    # The other end of the same divergence: a single dotted-less segment is "not a decodable
+    # JWT" to `verify` and the text decoder, but decode_json used to report a success-shaped
+    # {type:JWS, payload:null, signed:false}. It now carries a `note` (no extra_segments).
+    j = JSON.parse(Gori::Jwt.decode_json("eyJhbGciOiJIUzI1NiJ9"))
+    j["type"].as_s.should eq("JWS")
+    j["signed"].as_bool.should be_false
+    j["note"].as_s.should contain("not a decodable token")
+    j["extra_segments"]?.should be_nil
+  end
+
+  it "verify_json is {alg, verified, code, reason}, with both explanations on every no" do
+    # `--verify --format json` and MCP jwt_verify emit this same object. A script selects on
+    # `verified` and branches on `code`. A wrong key used to come back `reason: null`, which
+    # read the same as "nothing to explain" (#1370).
+    ok = JSON.parse(Gori::Jwt.verify_json(Gori::Jwt.verify(jwt, "k")))
+    ok.as_h.keys.should eq(%w[alg verified code reason])
+    ok["alg"].as_s.should eq("HS256")
+    ok["verified"].as_bool.should be_true
+    ok["code"].raw.should be_nil
+    ok["reason"].raw.should be_nil
+
+    no = JSON.parse(Gori::Jwt.verify_json(Gori::Jwt.verify(jwt, "wrong")))
+    no["verified"].as_bool.should be_false
+    no["code"].as_s.should eq("signature_mismatch")
+    no["reason"].as_s.should contain("does not verify under this key")
+
+    unsigned = Gori::Jwt.encode("{}", %({"s":1}), "none", "")
+    j = JSON.parse(Gori::Jwt.verify_json(Gori::Jwt.verify(unsigned, "k")))
+    j["verified"].as_bool.should be_false
+    j["code"].as_s.should eq("unsigned")
+    j["reason"].as_s.should contain("UNSIGNED")
+  end
+
+  it "refuses --verify with no key, but takes an explicit empty secret" do
+    # No flag used to verify against the empty secret and print a bare `verified: no`.
+    Gori::CLI::Run.jwt_key_refusal(:verify, nil, "").not_nil!.should contain("--secret '' to check the empty secret")
+    Gori::CLI::Run.jwt_key_refusal(:verify, nil, "  ").should_not be_nil # a blank --key names nothing
+    Gori::CLI::Run.jwt_key_refusal(:verify, "", "").should be_nil        # the empty secret, asked for
+    Gori::CLI::Run.jwt_key_refusal(:verify, "s", "").should be_nil
+    Gori::CLI::Run.jwt_key_refusal(:verify, nil, "./pub.pem").should be_nil
+    # --encode has always signed with the empty secret when given none.
+    Gori::CLI::Run.jwt_key_refusal(:encode, nil, "").should be_nil
+  end
+
+  it "refuses --secret beside --key, an explicit empty secret included" do
+    # `--secret ''` asks for the empty secret by name; beside a --key, the key silently won.
+    {:verify, :encode}.each do |action|
+      Gori::CLI::Run.jwt_key_refusal(action, "", "./pub.pem").not_nil!.should contain("two names for the same key")
+      Gori::CLI::Run.jwt_key_refusal(action, "s", "./pub.pem").should_not be_nil
+    end
+  end
+
+  it "exits 1 unless the token verifies, as cookie --verify does" do
+    Gori::CLI::Run.jwt_verify_status(Gori::Jwt.verify(jwt, "k")).should eq(0)
+    Gori::CLI::Run.jwt_verify_status(Gori::Jwt.verify(jwt, "wrong")).should eq(1)
+    Gori::CLI::Run.jwt_verify_status(Gori::Jwt.verify("#{jwt}.x", "k")).should eq(1)
+  end
+
+  it "says so when an HMAC token was checked against the empty secret" do
+    # `--secret "$UNSET"` must not read like a real secret that failed.
+    v = Gori::Jwt.verify(jwt, "")
+    Gori::CLI::Run.jwt_verify_lines(v, empty_secret: true).first.should eq("verified: no (alg HS256, empty secret)")
+    Gori::CLI::Run.jwt_verify_lines(v).first.should eq("verified: no (alg HS256)")
+    Gori::CLI::Run.jwt_verify_lines(v).last.should start_with("reason: the signature does not verify")
+    # An asymmetric token never reads the key as a secret, so the marker would be noise there.
+    rs = Gori::Jwt.encode("{}", %({"s":1}), "RS256", JoseKeys::RSA)
+    Gori::CLI::Run.jwt_verify_lines(Gori::Jwt.verify(rs, JoseKeys::RSA_PUB), empty_secret: true).first
+      .should eq("verified: yes (alg RS256)")
+  end
+
+  it "neutralizes the token's alg on BOTH verify lines, not just the reason" do
+    # `alg` is read straight off a captured header, so it is attacker-chosen text on its way
+    # to a terminal. The `verified:` line interpolated it raw: a header of
+    # {"alg":"<ESC>[2J<ESC>]0;pwn<BEL>"} cleared the screen and rewrote the window title.
+    esc = 27.chr
+    hostile = "#{esc}[2J#{esc}]0;pwn#{7.chr}HS256"
+    token = "#{Gori::Jwt.b64url({"alg" => hostile}.to_json)}.#{Gori::Jwt.b64url("{}")}.AAAA"
+    lines = Gori::CLI::Run.jwt_verify_lines(Gori::Jwt.verify(token, "k"))
+    lines.first.should contain("verified: no")
+    lines.each do |line|
+      line.should_not contain(esc)
+      line.should_not contain(7.chr)
+    end
+  end
+
+  it "attacks_json carries the alg-confusion rows when a public key is supplied" do
+    rs = Gori::Jwt.encode("{}", %({"sub":"a"}), "RS256", JoseKeys::RSA)
+    arr = JSON.parse(Gori::Jwt.attacks_json(Gori::Jwt.attacks(rs, JoseKeys::RSA_PUB))).as_a
+    rows = arr.select { |a| a["category"].as_s == "alg-confusion" }
+    rows.should_not be_empty
+    rows.each do |a|
+      a["name"].as_s.should contain("public key")
+      a["note"].as_s.should contain("HS256")
+      a["verified"].as_bool.should be_false # a payload to go try, never a finding
+    end
   end
 
   it "attacks_json is an array of {name, category, note, token}" do

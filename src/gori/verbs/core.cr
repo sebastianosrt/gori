@@ -64,13 +64,28 @@ module Gori
         "app.agents", "Attached agents", "List the MCP clients bound to this project (the mcp: chip)",
         Verb::Scope::Global, category: Verb::Category::System) { |ctx| ctx.open_agents; nil }
 
+      # Say something to one of those agents (#1090). Palette-only, and deliberately without a
+      # chord: every free Global letter is worth more to a verb the operator reaches mid-flow,
+      # and this one opens two cards before anything happens. Sits beside app.agents because
+      # the card above is where you find out who is listening.
+      r.register Verb::Definition.new(
+        "app.tell-agent", "Tell the agent…", "Send one line to an attached agent's session (delivery shows in the ring)",
+        Verb::Scope::Global, category: Verb::Category::Action) { |ctx| ctx.tell_agent; nil }
+
+      # …and the way back for a DECISION (#1324): the oldest `ask_operator` question waiting,
+      # on its answer card. Palette-only for tell-agent's reason, with the `ask:N` chip and the
+      # ring's ↵ as the other two ways in — the chip is how the operator learns one is waiting.
+      r.register Verb::Definition.new(
+        "app.answer-agent", "Answer the agent…", "Open the oldest question an attached agent asked (the ask: chip)",
+        Verb::Scope::Global, category: Verb::Category::Action) { |ctx| ctx.answer_agent_question; nil }
+
       # The ACTIVE session slot — which identity the next Repeater/Fuzzer/intercept-forward
       # send goes out as. Global and palette-only, with the `session:NAME` chip as the other
       # way in: it is a session-wide send context, not a tab's action, and it is deliberately
       # NOT the Authorize tab's `i` (that card edits the LIST — configuration — while this
       # picks the one pointer, which is memory-only and never persisted).
       r.register Verb::Definition.new(
-        "session.slot", "Session slot", "Choose the identity every send goes out as (header overlay + $NAME table)",
+        "session.slot", "Session slot", "Choose the identity every send goes out as (header overlay + binding table)",
         Verb::Scope::Global, category: Verb::Category::Action) { |ctx| ctx.open_session_slots; nil }
 
       r.register Verb::Definition.new(
@@ -110,6 +125,13 @@ module Gori
         "browser.open", "Open browser", "Launch a browser pre-trusting gori's CA, routed via the proxy",
         Verb::Scope::Global) { |ctx| ctx.open_browser_picker; nil }
 
+      # Palette-only, beside browser.open: its terminal counterpart (#1238). A shell whose tools
+      # go through the proxy and trust the CA, opened in place of the TUI or copied as export
+      # lines for another pane.
+      r.register Verb::Definition.new(
+        "shell.open", "Open shell", "Open a terminal proxied through gori and trusting its CA, or copy its env for another pane",
+        Verb::Scope::Global) { |ctx| ctx.open_shell_picker; nil }
+
       # Settings (config control). The generic entry opens the unified Preferences modal
       # at its group picker (same as Ctrl+, / the ⚙ top-bar chip); the per-section entries
       # below jump straight to one section. Both the palette list and the modal's groups
@@ -120,7 +142,7 @@ module Gori
       Tui::SettingsCatalog.all.each do |s|
         r.register Verb::Definition.new(
           s.id, "Settings: #{s.title}", s.desc,
-          Verb::Scope::Global, category: Verb::Category::Settings) { |ctx| ctx.open_settings(s.sym); nil }
+          Verb::Scope::Global, category: Verb::Category::Settings, keywords: s.keywords) { |ctx| ctx.open_settings(s.sym); nil }
       end
 
       # Palette-only (no chord — a mascot doesn't earn one of the scarce single-letter
@@ -155,36 +177,36 @@ module Gori
         # Batch-capable (#442): gates on the effective target set (marks if any, else the
         # cursor row) — which also aligns the gate with what the handler already acted on
         # (history_target_flow_id, i.e. the OPEN DETAIL's flow when one is up).
-        Verb::Scope::Body, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :history && !ctx.selected_flow_ids.empty? }, mnemonic: 'h', group: :scope) { |ctx| ctx.scope_add_host; nil }
+        Verb::Scope::Body, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :history && !ctx.selected_flow_ids.empty? }, intent: :scope_add, group: :scope) { |ctx| ctx.scope_add_host; nil }
 
       r.register Verb::Definition.new(
         "scope.toggle", "Toggle scope lens", "Filter History/Sitemap to in-scope flows on/off",
         # Menu-only: the Global `s` (scope.toggle-lens) reaches this pane already, and the ⇧S
         # twin was a second key for the same flip in the same tab.
         Verb::Scope::Body, [] of Verb::Chord,
-        available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :history }, mnemonic: 's', group: :scope) { |ctx| ctx.scope_toggle_lens; nil }
+        available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :history }, intent: :scope_lens, group: :scope) { |ctx| ctx.scope_toggle_lens; nil }
 
       # --- Project tab SCOPE pane: the rule-list action menu (space) + its a/e/d keys.
       # Project scope is unique to that pane, so no current_tab gate is needed. The lens
-      # toggle is menu-only (mnemonic 's') — it REPLACED the old direct space=toggle, which
+      # toggle is menu-only (menu 's') — it REPLACED the old direct space=toggle, which
       # now opens this menu instead; add/edit/delete keep their a/e/d direct chords.
       scope_rule = ->(ctx : Verb::ExecContext) { ctx.scope_rule_selected? }
       r.register Verb::Definition.new(
         "scope.lens-toggle", "Toggle scope lens", "Filter History/Sitemap to in-scope flows on/off",
-        Verb::Scope::Project, mnemonic: 's') { |ctx| ctx.scope_toggle_lens; nil }
+        Verb::Scope::Project, intent: :scope_lens) { |ctx| ctx.scope_toggle_lens; nil }
       r.register Verb::Definition.new(
         "scope.add-rule", "Add scope rule", "Open the popup to add an include/exclude rule",
-        Verb::Scope::Project, [Verb::Chord.new("a")]) { |ctx| ctx.scope_add_rule; nil }
+        Verb::Scope::Project, [Verb::Chord.new("a")], intent: :add) { |ctx| ctx.scope_add_rule; nil }
       r.register Verb::Definition.new(
         "scope.copy-rule", "Copy", "Copy the selected scope rule as `kind match-type pattern`",
-        Verb::Scope::Project, [Verb::Chord.new("y")], available: scope_rule) { |ctx| ctx.read_copy; nil }
+        Verb::Scope::Project, [Verb::Chord.new("y")], available: scope_rule, intent: :copy) { |ctx| ctx.read_copy; nil }
       r.register Verb::Definition.new(
         "scope.edit-rule", "Edit scope rule", "Open the popup to edit the selected scope rule",
-        Verb::Scope::Project, [Verb::Chord.new("e")], available: scope_rule) { |ctx| ctx.scope_edit_rule; nil }
+        Verb::Scope::Project, [Verb::Chord.new("e")], available: scope_rule, intent: :edit) { |ctx| ctx.scope_edit_rule; nil }
       r.register Verb::Definition.new(
         "scope.delete-rule", "Delete scope rule", "Remove the selected scope rule",
         Verb::Scope::Project, [Verb::Chord.new("d")], available: scope_rule,
-        group: :danger) { |ctx| ctx.scope_delete_rule; nil }
+        group: :danger, intent: :delete) { |ctx| ctx.scope_delete_rule; nil }
 
       # The single smart Copy (see repeater.copy in verbs/history.cr) — copy-all is gone.
       # Was `hidden: true` (the menu only ever showed "Copy description"); now that
@@ -212,8 +234,11 @@ module Gori
       end
       r.register Verb::Definition.new(
         "project.copy", "Copy", "Copy the selected description text, or the whole description if nothing is selected, to the clipboard",
-        Verb::Scope::ProjectDesc, [Verb::Chord.new("y", ctrl: true)],
-        available: in_project_desc_copy, mnemonic: 'y') { |ctx| ctx.read_copy; nil }
+        # Bare `y` beside the pinned `^Y`, the shape every other Copy verb has. It was
+        # ctrl-only because `ProjectController#handle_desc_read` claimed the letter itself and
+        # the chord could never fire; that arm is gone (KEY_AUDIT §2e).
+        Verb::Scope::ProjectDesc, [Verb::Chord.new("y"), Verb::Chord.new("y", ctrl: true)],
+        available: in_project_desc_copy, intent: :copy) { |ctx| ctx.read_copy; nil }
 
       # Match & Replace now lives in the Rewriter tab; this palette entry jumps there
       # (kept under the familiar "Match & Replace" name so a search still finds it).
@@ -239,7 +264,7 @@ module Gori
       r.register Verb::Definition.new(
         "intercept.drop", "Drop held", "Drop the marked held messages — or the selected one",
         Verb::Scope::Intercept, [Verb::Chord.new("d")],
-        available: intercept_selected, mnemonic: 'd') { |ctx| ctx.intercept_drop; nil }
+        available: intercept_selected, intent: :delete) { |ctx| ctx.intercept_drop; nil }
       # Deliberately NOT mark-aware: ⇧F stays "the whole queue, marks or not", so the pair
       # reads f = the target set / ⇧F = everything.
       r.register Verb::Definition.new(
@@ -255,15 +280,15 @@ module Gori
       r.register Verb::Definition.new(
         "intercept.mark-toggle", "Mark held", "Mark/unmark this held message and step down — forward/drop then act on every marked one",
         Verb::Scope::Intercept, [Verb::Chord.new("t")],
-        available: intercept_selected, mnemonic: 't') { |ctx| ctx.intercept_mark_toggle; nil }
+        available: intercept_selected, intent: :mark) { |ctx| ctx.intercept_mark_toggle; nil }
 
       # ⇧T is the queue's Ctrl+A. Chord.new("t", shift: true), NOT Chord.new("T") —
       # Keybind.from_event normalises a typed capital to shift+lowercase; menu_key skips shift
-      # chords, hence the explicit mnemonic (same reasoning as history.mark-all).
+      # chords, hence the intent's lexicon letter (same reasoning as history.mark-all).
       r.register Verb::Definition.new(
         "intercept.mark-all", "Mark all held", "Mark every message currently held in the queue",
         Verb::Scope::Intercept, [Verb::Chord.new("t", shift: true)],
-        available: intercept_selected, mnemonic: 'T') { |ctx| ctx.intercept_mark_all; nil }
+        available: intercept_selected, intent: :mark_all) { |ctx| ctx.intercept_mark_all; nil }
 
       # esc clears too (InterceptController#queue_escape shadows the pop-to-tab-bar only while
       # marks are set) — that's the reflex; this is the discoverable form.
@@ -271,7 +296,7 @@ module Gori
         "intercept.mark-clear", "Clear marks", "Drop every mark (esc does the same)",
         Verb::Scope::Intercept,
         available: ->(ctx : Verb::ExecContext) { ctx.marked_intercept_count > 0 },
-        mnemonic: 'N') { |ctx| ctx.intercept_mark_clear; nil }
+        intent: :mark_clear) { |ctx| ctx.intercept_mark_clear; nil }
 
       # ⇧↑/⇧↓ extend a contiguous range from the anchor — the keyboard form of a GUI
       # shift+click. These took ⇧↑/⇧↓ over from the read-only preview's vertical scroll, which
@@ -291,11 +316,11 @@ module Gori
       # driven (Intercept scope) so they're rebindable; the queue defers `c`/`/` to here,
       # while the held-bytes editor + condition bar still swallow them as literal text.
       r.register Verb::Definition.new(
-        "intercept.direction", "Catch direction", "Cycle which to hold: all / requests only / responses only",
+        "intercept.direction", "Catch direction", "Cycle which to hold: requests only (default) / responses only / all",
         Verb::Scope::Intercept, [Verb::Chord.new("c")]) { |ctx| ctx.intercept_cycle_direction; nil }
       r.register Verb::Definition.new(
         "intercept.filter", "Catch condition", "Only hold messages matching a query (host: method: path: status: scheme:)",
-        Verb::Scope::Intercept, [Verb::Chord.new("/")]) { |ctx| ctx.intercept_query; nil }
+        Verb::Scope::Intercept, [Verb::Chord.new("/")], intent: :filter) { |ctx| ctx.intercept_query; nil }
 
       # Tab/Shift-Tab are the focus ring (handled directly in the Runner); these
       # bracket chords remain a from-anywhere shortcut to cycle tabs.
@@ -307,15 +332,52 @@ module Gori
         "nav.prev-tab", "Previous tab", "Focus the previous tab", Verb::Scope::Global,
         [Verb::Chord.new("[")], category: Verb::Category::Navigation) { |ctx| ctx.cycle_tab(-1); nil }
 
-      # Positional tab jump: digit N focuses the Nth VISIBLE tab (the order on the bar) —
+      # Positional tab jump: digit N focuses the Nth SLOT on the bar (the order on the bar) —
       # so the numbers follow the user's settings:tabs order/visibility. Hidden, so the
       # keys exist but don't clutter the palette; the named "Go to …" verbs below are the
       # discoverable entries (and the way to reach a hidden tab by command).
+      #
+      # The bar is nine slots and the digits are the primary way to move between them, so the
+      # Runner claims this family BEFORE the per-focus handlers that return ahead of the
+      # keymap (the sub-tab strip, the drill-in details, each controller's body keys) — see
+      # `Runner#tab_digit_family?`. A digit is a character only where a space is.
       (1..9).each do |n|
         r.register Verb::Definition.new(
-          "nav.pos#{n}", "Go to tab #{n}", "Focus the #{n}th visible tab", Verb::Scope::Global,
+          "nav.pos#{n}", "Go to tab #{n}", "Focus the #{n}th slot on the tab bar", Verb::Scope::Global,
           [Verb::Chord.new(n.to_s)], hidden: true) { |ctx| ctx.focus_visible_tab(n); nil }
       end
+
+      # `0` — the tenth key of the family, and the only one that opens something. Nine slots
+      # cannot hold twenty-one tabs, so the rest live behind a type-to-filter picker over the
+      # WHOLE catalog (slotted and hidden alike): with twelve tabs off the bar, typing three
+      # letters beats walking a dropdown. NOT hidden — "Go to tab…" is a thing to find in the
+      # palette, unlike the nine positional jumps it fronts.
+      r.register Verb::Definition.new(
+        "nav.goto", "Go to tab…", "Filter and jump to any of the 21 tabs — on the bar or not",
+        Verb::Scope::Global, [Verb::Chord.new("0")],
+        category: Verb::Category::Navigation) { |ctx| ctx.open_tab_goto; nil }
+
+      # ⇧1-⇧9 / ⇧0 are the same family one level down: the sub-tab strip. Registered ONCE
+      # here rather than forked across the seven controllers that own a strip — the shell
+      # already routes `subtab_jump` to whichever controller is active, exactly as
+      # `subtab_search_open` has since the picker was generalised.
+      #
+      # The gate is "the active tab HAS a strip" (`subtab_search_count`), so on a tab without
+      # one the chord falls through to Global rather than firing into nothing. Terminals
+      # disagree about how a shifted digit arrives; `Tui::Keybind::SHIFTED_DIGITS` folds both
+      # spellings onto this chord.
+      has_subtabs = ->(ctx : Verb::ExecContext) { ctx.subtab_search_count >= 1 }
+      (1..9).each do |n|
+        r.register Verb::Definition.new(
+          "subtab.pos#{n}", "Go to sub-tab #{n}", "Jump to the #{n}th sub-tab of the active tab",
+          Verb::Scope::Global, [Verb::Chord.new(n.to_s, shift: true)],
+          hidden: true, available: has_subtabs) { |ctx| ctx.subtab_jump(n); nil }
+      end
+
+      r.register Verb::Definition.new(
+        "subtab.find", "Find sub-tab…", "Filter and jump to a sub-tab of the active tab",
+        Verb::Scope::Global, [Verb::Chord.new("0", shift: true)],
+        available: has_subtabs, category: Verb::Category::Navigation) { |ctx| ctx.subtab_search_open; nil }
 
       # Named tab jumps (no chord) — palette discoverability + the only by-command way to
       # reach a tab hidden in settings:tabs (focus_tab force-shows it while active). Keep
@@ -325,7 +387,7 @@ module Gori
         :project => "Project", :target => "Target", :history => "History", :intercept => "Intercept",
         :repeater => "Repeater", :fuzzer => "Fuzzer", :miner => "Miner", :oast => "OAST",
         :sequencer => "Sequencer", :decoder => "Decoder", :jwt => "JWT", :cookie => "Cookie",
-        :comparer => "Comparer",
+        :comparer => "Comparer", :evidence => "Evidence",
         :probe => "Probe", :authorize => "Authorize", :issues => "Issues", :notes => "Notes",
         :rewriter => "Rewriter", :colormarker => "Colormarker",
       }.each do |tab, label|

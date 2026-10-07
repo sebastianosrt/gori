@@ -4,11 +4,15 @@ module Gori
   class Store
     # --- read API (go straight through the pool; WAL allows concurrent reads) -
 
+    # Whether the operator edited this request at Intercept (V44): a primary-key probe into the
+    # side table, so the list still reads every other column from `idx_flows_list`.
+    INTERCEPT_EDITED = "EXISTS (SELECT 1 FROM intercept_originals o WHERE o.flow_id = flows.id)"
+
     SELECT_ROW = <<-SQL
       SELECT id, created_at, scheme, method, host, port, target, status,
              request_size, response_size, state, duration_us, content_type,
              short_circuited, advisory, request_content_type, connect_protocol,
-             source, source_surface, source_ref
+             source, source_surface, source_ref, #{INTERCEPT_EDITED}
       FROM flows
       SQL
 
@@ -136,10 +140,12 @@ module Gori
     # ~0.9 ms — so a tighter window buys nothing (5_000 measured SLOWER, once its extra
     # MAX/MIN lookup is counted) and costs correctness: any match below the window renders as
     # "no events match", which is a lie about the operator's own project. At the retention cap
-    # the bound cannot truncate a store that is being trimmed, and still bounds the one that is
-    # not — `trim_events` only runs off FLOW inserts, so an MCP-only process that writes events
-    # and captures nothing can grow this table past the cap indefinitely. That is the case this
-    # exists for, and there `next_before` says so rather than reporting the end of the feed.
+    # the bound cannot truncate a store that is being trimmed, and still bounds one that is over
+    # the cap: `trim_events` now runs off EVENT inserts as well as flow ones
+    # (`EVENTS_TRIM_INTERVAL`), so the overshoot is bounded by that cadence rather than
+    # unbounded — but a db carrying rows from a build before that, or one trimmed by a peer
+    # process while this one reads, can still hold more. There `next_before` says the scan
+    # stopped short rather than reporting the end of the feed.
     private def event_scan_window : Int32
       @events_retention
     end
@@ -152,10 +158,11 @@ module Gori
     # feed of agent rows would hand the pane an empty page while the matches sit two pages down.
     # So every narrowing here goes into the WHERE, and the scan is bounded instead.
     #
-    # `levels` is a SET, not a string, because the feed carries two spellings of one level:
-    # every producer writes "warn" except the Sequencer, whose `level.to_s` writes "warning"
-    # (`sequencer_controller.cr`). A filter that matched one would silently hide the other, and
-    # rows already written cannot be respelled.
+    # `levels` is a SET, not a string, because the feed carries two spellings of one level. Every
+    # producer writes "warn" now — `insert_event` normalizes the tray's `:warning` at the sink —
+    # but the Sequencer wrote "warning" straight through until that landed, and rows already
+    # stored cannot be respelled. A filter that matched one spelling would silently hide the
+    # other, so this stays for as long as those rows can still be in a feed.
     #
     # Does NOT rescue. `recent_agent_actions` degrades to `[]` because it garnishes a
     # notification that must go out either way; here the read IS the answer, so a swallowed
@@ -274,6 +281,27 @@ module Gori
       nil
     end
 
+    # One flow's REQUEST head and body, without the response: what a reader of request inputs
+    # alone needs (`ParamInventory.seed_names`), where `get_flow` would also materialize the
+    # response body BLOB only to drop it. nil when there is no such flow.
+    def request_parts(id : Int64) : {Bytes, Bytes?}?
+      @db.query("SELECT request_head, request_body FROM flows WHERE id = ?", id) do |rs|
+        return {rs.read(Bytes), rs.read(Bytes?)} if rs.move_next
+      end
+      nil
+    end
+
+    # The RESPONSE side's mirror of `request_parts`: head, body and the capture-truncation flag,
+    # without the request BLOBs — what a pager over one response body needs on every page,
+    # where `get_flow` would also materialize the request body only to drop it. The outer nil
+    # is "no such flow"; a flow with no response yet has a nil head and body.
+    def response_parts(id : Int64) : {Bytes?, Bytes?, Bool}?
+      @db.query("SELECT response_head, response_body, response_body_truncated FROM flows WHERE id = ?", id) do |rs|
+        return {rs.read(Bytes?), rs.read(Bytes?), rs.read(Int64) != 0} if rs.move_next
+      end
+      nil
+    end
+
     # Single-row projection, e.g. to refresh a row after an :inserted/:updated
     # event without re-reading the whole page.
     def flow_row(id : Int64) : FlowRow?
@@ -281,6 +309,24 @@ module Gori
         return read_row(rs) if rs.move_next
       end
       nil
+    end
+
+    # The same projection for a NAMED SET of ids, in one round trip — the read behind MCP
+    # `list_history{ids}`, which hands back the rows an operator marked in the TUI (#1091).
+    #
+    # Unordered, and deliberately uncapped: the caller's list IS the bound (the id-scoped
+    # `ids_matching` above documents the same contract), and the caller is the one that knows
+    # what order to put them back in — for a marked set that is the order the operator's own
+    # screen showed, which no `ORDER BY` here could reproduce.
+    def flow_rows(ids : Array(Int64)) : Array(FlowRow)
+      rows = [] of FlowRow
+      return rows if ids.empty?
+      args = ids.map(&.as(DB::Any))
+      placeholders = Array.new(ids.size, "?").join(',')
+      @db.query("#{SELECT_ROW} WHERE id IN (#{placeholders})", args: args) do |rs|
+        rs.each { rows << read_row(rs) }
+      end
+      rows
     end
 
     # A representative flow id for a (host, method, target) Sitemap node — prefers a
@@ -304,9 +350,18 @@ module Gori
     # ABSOLUTE-form rows (the only ones that can normalize to something else) and compare
     # through the very function that built the tree — one definition of "same endpoint",
     # used by both sides.
-    def representative_flow_id(host : String, method : String, target : String) : Int64?
-      @db.query("SELECT id FROM flows WHERE host = ? AND method = ? AND target = ? ORDER BY (status IS NOT NULL) DESC, id DESC LIMIT 1",
-        host, method, target) do |rs|
+    #
+    # `scheme`/`port` pin the lookup to one ORIGIN — a Sitemap root is one (#1371), and without
+    # them `/x` under `http://h:19022` resolved to whichever of `:19021`/`:19022`/`https:8443`
+    # answered it last. Both default to nil (any), for a caller holding only a host. They are
+    # equality predicates on `idx_flows_sitemap`'s own columns (host, target, method, scheme,
+    # port, …), so the fast path stays one index seek.
+    def representative_flow_id(host : String, method : String, target : String,
+                               scheme : String? = nil, port : Int32? = nil) : Int64?
+      origin_sql, origin_args = origin_predicate(scheme, port)
+      @db.query("SELECT id FROM flows WHERE host = ? AND method = ? AND target = ?#{origin_sql} " \
+                "ORDER BY (status IS NOT NULL) DESC, id DESC LIMIT 1",
+        args: [host, method, target] of DB::Any + origin_args) do |rs|
         return rs.read(Int64) if rs.move_next
       end
       # Capped like its sibling `flow_id_for_url` (URL_LOOKUP_SCAN_CAP), which was capped and
@@ -315,14 +370,30 @@ module Gori
       # row that host ever produced, on the TUI fiber, for a keypress. The ORDER BY puts
       # answered flows and the newest first, so the representative is in the first handful if
       # it is anywhere; scanning past that was finding nothing, slowly.
-      @db.query("SELECT id, target FROM flows WHERE host = ? AND method = ? AND instr(target, '://') > 0 ORDER BY (status IS NOT NULL) DESC, id DESC LIMIT #{URL_LOOKUP_SCAN_CAP}",
-        host, method) do |rs|
+      @db.query("SELECT id, target FROM flows WHERE host = ? AND method = ? AND instr(target, '://') > 0#{origin_sql} " \
+                "ORDER BY (status IS NOT NULL) DESC, id DESC LIMIT #{URL_LOOKUP_SCAN_CAP}",
+        args: [host, method] of DB::Any + origin_args) do |rs|
         rs.each do
           id = rs.read(Int64)
           return id if Sitemap.normalize_path(rs.read(String)) == target
         end
       end
       nil
+    end
+
+    # ` AND scheme = ? AND port = ?` (either half only when given) and its arguments.
+    private def origin_predicate(scheme : String?, port : Int32?) : {String, Array(DB::Any)}
+      sql = ""
+      args = [] of DB::Any
+      if scheme
+        sql += " AND scheme = ?"
+        args << scheme
+      end
+      if port
+        sql += " AND port = ?"
+        args << port
+      end
+      {sql, args}
     end
 
     # How many same-(host, target) rows the URL lookup below RETURNS. A URL polled every few
@@ -383,41 +454,53 @@ module Gori
       nil
     end
 
+    # The request as the client sent it before the operator edited it at Intercept (#1378), or
+    # nil when this flow was not edited there (`FlowRow#intercept_edited?`). The flow's own
+    # `request_head`/`request_body` are what went upstream.
+    def intercept_original(flow_id : Int64) : Bytes?
+      @db.query_one?("SELECT request FROM intercept_originals WHERE flow_id = ?", flow_id, as: Bytes)
+    end
+
+    # The interim 1xx responses the origin sent before this flow's final one (V45), in wire
+    # order, or nil when it sent none. A primary-key range read, asked only by the surfaces
+    # that show a flow's detail — `get_flow` itself stays one row.
+    def interims(flow_id : Int64) : Interims?
+      heads = [] of Interims::Head
+      omitted = 0
+      @db.query("SELECT status, head, relayed, omitted FROM flow_interims WHERE flow_id = ? ORDER BY seq", flow_id) do |rs|
+        rs.each do
+          heads << Interims::Head.new(rs.read(Int64).to_i32, rs.read(Bytes), rs.read(Int64) != 0)
+          omitted = rs.read(Int64).to_i32
+        end
+      end
+      heads.empty? ? nil : Interims.new(heads, omitted)
+    end
+
     # Full detail incl. raw BLOBs (the truth) for the detail view.
     # `body_max`, when set, caps request/response body BLOBs via SQLite `substr`
     # (byte-oriented on BLOBs) so list-preview paths never pull multi-MiB bodies
     # that they would immediately re-truncate. Heads stay whole (small). Pass
     # `body_max + 1` when the caller wants to detect "was larger than cap".
     def get_flow(id : Int64, *, body_max : Int32? = nil) : FlowDetail?
+      request_body, response_body = "request_body", "response_body"
+      args = [] of DB::Any
       if max = body_max
-        @db.query(<<-SQL, max, max, id) do |rs|
-          SELECT id, created_at, scheme, method, host, port, target, status,
-                 request_size, response_size, state, duration_us, content_type,
-                 short_circuited, advisory, request_content_type, connect_protocol,
-                 source, source_surface, source_ref,
-                 http_version, request_head,
-                 CASE WHEN request_body IS NULL THEN NULL ELSE substr(request_body, 1, ?) END,
-                 response_head,
-                 CASE WHEN response_body IS NULL THEN NULL ELSE substr(response_body, 1, ?) END,
-                 h2_conn_id, h2_stream_id, request_body_truncated, response_body_truncated, error,
-                 sni
-          FROM flows WHERE id = ?
-          SQL
-          return read_flow_detail(rs)
-        end
-      else
-        @db.query(<<-SQL, id) do |rs|
-          SELECT id, created_at, scheme, method, host, port, target, status,
-                 request_size, response_size, state, duration_us, content_type,
-                 short_circuited, advisory, request_content_type, connect_protocol,
-                 source, source_surface, source_ref,
-                 http_version, request_head, request_body, response_head, response_body,
-                 h2_conn_id, h2_stream_id, request_body_truncated, response_body_truncated, error,
-                 sni
-          FROM flows WHERE id = ?
-          SQL
-          return read_flow_detail(rs)
-        end
+        request_body = "CASE WHEN request_body IS NULL THEN NULL ELSE substr(request_body, 1, ?) END"
+        response_body = "CASE WHEN response_body IS NULL THEN NULL ELSE substr(response_body, 1, ?) END"
+        args << max << max
+      end
+      args << id
+      @db.query(<<-SQL, args: args) do |rs|
+        SELECT id, created_at, scheme, method, host, port, target, status,
+               request_size, response_size, state, duration_us, content_type,
+               short_circuited, advisory, request_content_type, connect_protocol,
+               source, source_surface, source_ref, #{INTERCEPT_EDITED},
+               http_version, request_head, #{request_body}, response_head, #{response_body},
+               h2_conn_id, h2_stream_id, request_body_truncated, response_body_truncated, error,
+               sni
+        FROM flows WHERE id = ?
+        SQL
+        return read_flow_detail(rs)
       end
       nil
     end
@@ -456,6 +539,23 @@ module Gori
       false
     end
 
+    # How many flows an earlier import stamped `source_ref = ref` — the basename of the file it
+    # read (`Import::Provenance`). `Import` asks before writing, so re-importing the same HAR
+    # can say it duplicated rows instead of doubling History silently.
+    #
+    # Neither column is indexed on its own, but both sit in `idx_flows_list` (V37), so this is
+    # a scan of that covering index — about 121 bytes a flow — and never a walk of the `flows`
+    # rows, whose late columns hide behind their bodies' overflow chains
+    # (spec/store/list_index_spec.cr pins the plan). 0 on a read error: the answer only ever
+    # adds a warning, so failing to ask must not fail the import.
+    IMPORT_REF_COUNT_SQL = "SELECT COUNT(*) FROM flows WHERE source = ? AND source_ref = ?"
+
+    def import_ref_count(ref : String) : Int64
+      @db.query_one(IMPORT_REF_COUNT_SQL, FlowSource::Kind::Import.token, ref, as: Int64)
+    rescue DB::Error | SQLite3::Exception
+      0_i64
+    end
+
     def count : Int64
       # Degrade like `data_version` rather than raise: this is a POLL reader (the Project
       # tab's periodic refresh, MCP `get_context`/`list_projects`), so a transient
@@ -476,10 +576,8 @@ module Gori
     end
 
     # Hard-delete one History flow and its captured dependents (WS messages, FTS row,
-    # entity_links that pointed at it, and its h2 frame log when no sibling flow still shares
-    # the connection). Issues/Probe/Repeater that referenced the id keep the dangling
-    # cross-ref — their resolvers already surface "gone". Writer-fiber only so it races
-    # cleanly with live capture.
+    # entity_links that pointed at it, detached references, and its h2 frame log when no sibling
+    # flow still shares the connection). Writer-fiber only so it races cleanly with live capture.
     # `exec_task_ok`, for `delete_flows`' reason below: a DELETE reports nothing through
     # last_insert_rowid, so a batch rolled back by an unrelated co-submitted write is
     # indistinguishable from success — and the CLI printed "Flow #N deleted." / MCP returned
@@ -487,15 +585,21 @@ module Gori
     # did not. Returns whether the delete actually committed.
     def delete_flow(id : Int64) : Bool
       exec_task_ok ->(c : DB::Connection) {
-        delete_flow_one(c, id)
+        delete_flow_set(c, [id])
         nil
       }
     end
 
     # Batch form of delete_flow — the History list's multi-select delete (#442). ONE
     # exec_task_ok, so 20 marked flows cost one transaction and one fsync instead of 20
-    # (P6 — never stall the data path). Same per-id cascade, so a batch of one is
-    # byte-identical to delete_flow.
+    # (P6 — never stall the data path). Same cascade, so a batch of one is byte-identical to
+    # delete_flow.
+    #
+    # SET-wise per ID_CHUNK, not per id: most of the columns `detach_flow_refs` nulls are
+    # unindexed (`events` up to EVENTS_RETENTION rows, `probe_issues` unbounded), so a per-id
+    # cascade was ~11 full scans PER FLOW while capture queued behind the writer — measured
+    # ~0.9 s for a 500-flow delete against 50k events + 20k probe findings, now one scan per
+    # table per chunk (bench/delete_flows_bench.cr).
     #
     # exec_task_OK, not exec_task: a DELETE reports nothing through last_insert_rowid, so a
     # batch rolled back by an unrelated co-submitted write (the writer loop batches ops into one
@@ -505,13 +609,13 @@ module Gori
     def delete_flows(ids : Array(Int64)) : Bool
       return true if ids.empty?
       exec_task_ok ->(c : DB::Connection) {
-        ids.each { |id| delete_flow_one(c, id) }
+        ids.each_slice(ID_CHUNK) { |slice| delete_flow_set(c, slice) }
         nil
       }
     end
 
-    # Wipe every captured History flow in this project (and their WS/FTS/h2 logs and
-    # flow entity_links). Repeater-owned WS rows (repeater_id set) and workbench sessions
+    # Wipe every captured History flow in this project (and their WS/FTS/h2 logs, flow
+    # entity_links and the JS references derived from their bodies). Repeater-owned WS rows (repeater_id set) and workbench sessions
     # are left intact, and so are `sitemap_tags`: a tag is the OPERATOR'S memo on a path, in
     # the same class as a note or an issue, and `history clear` clears captured traffic rather
     # than the operator's own annotations. It is keyed by `(host, path)` and not by a flow id,
@@ -531,32 +635,63 @@ module Gori
         c.exec("INSERT INTO flows_fts(flows_fts) VALUES('delete-all')")
         c.exec("DELETE FROM entity_links WHERE ref_kind = 'flow'")
         detach_flow_refs(c, nil)
+        c.exec("DELETE FROM js_refs")
+        c.exec("DELETE FROM js_ref_scans")
+        c.exec("DELETE FROM intercept_originals")
+        c.exec("DELETE FROM flow_interims")
         c.exec("DELETE FROM flows")
         c.exec("DELETE FROM h2_frames")
-        c.exec("DELETE FROM h2_connections")
+        # The `h2_connections` rows stay, as they do on an explicit delete (`delete_flow_set`):
+        # a browser's h2 connections outlive the clear and keep logging, and before V39 (no
+        # AUTOINCREMENT) the table emptied here handed the next connection id 1, which shared its
+        # frame log with the still-open one. The retention sweep's activity-gated reap drops each
+        # row once its connection goes quiet.
         # No index backlog bookkeeping to undo: a pending re-index is the row's own
         # `fts_dirty` flag, so deleting the rows deletes the backlog with them.
         nil
       }
     end
 
-    # Cascade for one flow id (writer connection). Shared by delete_flow.
-    private def delete_flow_one(conn : DB::Connection, id : Int64) : Nil
-      conn.exec("DELETE FROM ws_messages WHERE flow_id = ? AND repeater_id IS NULL", id)
-      conn.exec("DELETE FROM flows_fts WHERE rowid = ?", id)
-      conn.exec("DELETE FROM entity_links WHERE ref_kind = 'flow' AND ref_id = ?", id)
-      detach_flow_refs(conn, id)
-      # The h2 frame log (often the flow's bulk bytes) — capture the conn BEFORE deleting
-      # the flow row so we can reclaim it if this was the last flow on that connection.
-      h2_conn = conn.query_one?("SELECT h2_conn_id FROM flows WHERE id = ?", id, as: Int64?)
-      conn.exec("DELETE FROM flows WHERE id = ?", id)
+    # Cascade for a set of flow ids, at most ID_CHUNK of them (writer connection). Shared by
+    # delete_flow and delete_flows. Every statement is keyed by the whole set, so the end state
+    # is the one the old per-id loop reached — including the h2 reclaim below, which only ever
+    # asks whether any SURVIVING flow still names the connection.
+    private def delete_flow_set(conn : DB::Connection, ids : Array(Int64)) : Nil
+      marks = Array.new(ids.size, "?").join(", ")
+      args = ids.map(&.as(DB::Any))
+      conn.exec("DELETE FROM ws_messages WHERE flow_id IN (#{marks}) AND repeater_id IS NULL", args: args)
+      conn.exec("DELETE FROM flows_fts WHERE rowid IN (#{marks})", args: args)
+      conn.exec("DELETE FROM entity_links WHERE ref_kind = 'flow' AND ref_id IN (#{marks})", args: args)
+      detach_flow_refs(conn, ids)
+      conn.exec("DELETE FROM js_refs WHERE flow_id IN (#{marks})", args: args)
+      conn.exec("DELETE FROM js_ref_scans WHERE flow_id IN (#{marks})", args: args)
+      conn.exec("DELETE FROM intercept_originals WHERE flow_id IN (#{marks})", args: args)
+      conn.exec("DELETE FROM flow_interims WHERE flow_id IN (#{marks})", args: args)
+      # The h2 frame log (often the flow's bulk bytes) — capture the conns BEFORE deleting
+      # the flow rows so we can reclaim each one this set was the last user of.
+      h2_conns = [] of Int64
+      conn.query("SELECT DISTINCT h2_conn_id FROM flows WHERE id IN (#{marks}) AND h2_conn_id IS NOT NULL",
+        args: args) do |rs|
+        rs.each { h2_conns << rs.read(Int64) }
+      end
+      conn.exec("DELETE FROM flows WHERE id IN (#{marks})", args: args)
       # An HTTP/2 connection multiplexes many flows/streams, so only drop its log once NO
       # surviving flow still references it. The retention prune's activity gate would keep
       # a recent flow's log unreclaimed until later captures advance the floor, so an
-      # explicit user delete reclaims it directly here (no activity gate — this flow is gone).
-      if cid = h2_conn
-        conn.exec("DELETE FROM h2_frames WHERE conn_id = ? AND ? NOT IN (SELECT h2_conn_id FROM flows WHERE h2_conn_id IS NOT NULL)", cid, cid)
-        conn.exec("DELETE FROM h2_connections WHERE id = ? AND id NOT IN (SELECT h2_conn_id FROM flows WHERE h2_conn_id IS NOT NULL)", cid, cid)
+      # explicit user delete reclaims the frames directly here (no activity gate — this flow
+      # is gone).
+      #
+      # The `h2_connections` row itself stays, for the retention sweep's activity-gated reap.
+      # The connection may still be open and logging, and before V39 (no AUTOINCREMENT) dropping
+      # the row here let the next connection reuse its id and inherit every frame (and flow) the
+      # live one wrote afterwards.
+      #
+      # `NOT EXISTS` is a seek on idx_flows_h2_conn; the `? NOT IN (SELECT h2_conn_id …)` it
+      # replaces built the whole column into an ephemeral table twice per connection. Same
+      # answer: that subquery filtered `IS NOT NULL` and `cid` is never NULL, so NOT IN's
+      # three-valued trap (any NULL in the list makes it NULL, i.e. never delete) could not arise.
+      h2_conns.each do |cid|
+        conn.exec("DELETE FROM h2_frames WHERE conn_id = ? AND NOT EXISTS (SELECT 1 FROM flows WHERE h2_conn_id = ?)", cid, cid)
       end
     end
 
@@ -569,11 +704,31 @@ module Gori
       nil
     end
 
-    # Every table that cross-references a flow by id, in one place. `id` nil = every flow is
-    # going (a clear), so every reference is dangling.
+    # The highest flow id this project has ever issued, deleted or not: `sqlite_sequence`'s
+    # high-water mark for `flows` (V39), or `MAX(id)` where that row is missing — before the
+    # first insert, or on a table whose sequence was reset. 0 when no flow was ever captured. The
+    # sequence is CAST because it is only ever an integer when gori wrote it, so a crafted TEXT
+    # value still bounds by its number instead of failing the read. nil on a failed read. A forward
+    # cursor at or below it is still valid after a delete or a clear, because the next capture is
+    # issued above it; only one beyond it cannot come from here.
+    def flow_id_high_water : Int64?
+      @db.query_one?("SELECT MAX(COALESCE((SELECT CAST(seq AS INTEGER) FROM sqlite_sequence WHERE name = 'flows'), 0), " \
+                     "COALESCE((SELECT MAX(id) FROM flows), 0))", as: Int64)
+    rescue
+      nil
+    end
+
+    # Every table that cross-references a flow by id, in one place. `ids` nil = every flow is
+    # going (a clear), so every reference is dangling; otherwise at most ID_CHUNK ids, detached
+    # with one statement per table (see `delete_flows`).
     #
-    # `flows.id` is a plain `INTEGER PRIMARY KEY`, i.e. the rowid, which SQLite REUSES: delete
-    # the newest flow (or clear the project) and the next capture is handed the same id. These
+    # Not here, because they are DELETED rather than detached: `js_refs` and `js_ref_scans`
+    # (V35) are projections of the flow's own body, meaningless without it, so both callers
+    # delete them beside this call — and so do the two retention sweeps (`Store#prune`,
+    # `prune_old_flows`), which never reach this method.
+    #
+    # Until V39 `flows.id` was a plain `INTEGER PRIMARY KEY`, i.e. the rowid, which SQLite REUSES:
+    # delete the newest flow (or clear the project) and the next capture was handed the same id. These
     # columns were deliberately left dangling on the assumption that they would resolve to
     # "gone" — they do not, they re-point at whatever traffic takes the id next. Measured: a
     # probe finding promoted to an Issue after a clear cited a flow captured afterwards, and
@@ -585,18 +740,24 @@ module Gori
     # `entity_links` is DELETED rather than kept-and-marked-stale (`links.cr` renders a
     # dangling ref as `(stale)`, which reads better) for the same reason: while ids are
     # reusable, a kept pointer re-binds, and re-binding is strictly worse than losing the
-    # pointer. Marking stale becomes the right answer only once ids are monotonic — which
-    # needs a `flows` table rebuild, measured at 16.1 s on a 50k-flow project against a 5 s
-    # `busy_timeout`, i.e. a hard `database is locked` for every other gori process. That
-    # belongs in an opt-in maintenance command, not on open.
+    # pointer. Marking stale becomes the right answer once ids are monotonic, which V39 made
+    # them — by an in-place schema edit, not the table rebuild this comment once measured at
+    # 16.1 s and refused on open. Moving `entity_links` to kept-and-stale is its own change;
+    # until then the delete stays, and so does the NULLing, as defence in depth.
+    #
+    # `issue_retest_run_steps.flow_id` is nullable, so a saved result loses only its live link;
+    # the result row, verdict and copied observation stay intact. `issue_evidence.source_id` is
+    # NOT NULL because the snapshot keeps its original provenance, so its flow id is negated as
+    # the detached marker used by `RetestStep#detached?` (#1160). Positive ids still identify
+    # live sources; the negative value is never a valid History id.
     #
     # `ws_messages.flow_id` is NOT NULL, so a repeater-owned WS row (`repeater_id` set, which
-    # `delete_flow_one` deliberately spares) keeps its id. Its session is covered instead:
+    # `delete_flow_set` deliberately spares) keeps its id. Its session is covered instead:
     # `repeaters.flow_id` is nulled here, which is where a surface reads the provenance from.
     # `probe_oast_probes` belongs here even though nothing READS its `flow_id` for display: it
     # COPIES it into a new finding. An outstanding out-of-band probe deliberately outlives the
     # scan that planted it (that is the whole point of the table), so a `history clear` leaves the
-    # row while resetting the rowid counter — and when the payload finally calls home,
+    # row while (before V39) resetting the rowid counter — and when the payload finally calls home,
     # `Probe::OutOfBand.detection_for` passes `p.flow_id` into the `Detection`, which
     # `upsert_probe_issue` writes as `probe_issues.sample_flow_id`. So the very failure the note
     # above records as MEASURED — "a probe finding promoted to an Issue after a clear cited a flow
@@ -604,21 +765,30 @@ module Gori
     # does not help when the value is re-supplied afterwards from a row that kept it. This table
     # arrived in a later migration than the list, which is how it came to be missing from a
     # comment that says "every table".
-    private def detach_flow_refs(conn : DB::Connection, id : Int64?) : Nil
-      {"issues", "repeaters", "fuzz_sessions", "miner_sessions", "sequencer_sessions",
-       "events", "intercept_held", "probe_oast_probes"}.each do |table|
-        if fid = id
-          conn.exec("UPDATE #{table} SET flow_id = NULL WHERE flow_id = ?", fid)
-        else
+    private def detach_flow_refs(conn : DB::Connection, ids : Array(Int64)?) : Nil
+      if ids
+        marks = Array.new(ids.size, "?").join(", ")
+        args = ids.map(&.as(DB::Any))
+        FLOW_REF_TABLES.each do |table|
+          conn.exec("UPDATE #{table} SET flow_id = NULL WHERE flow_id IN (#{marks})", args: args)
+        end
+        conn.exec("UPDATE probe_issues SET sample_flow_id = NULL WHERE sample_flow_id IN (#{marks})", args: args)
+        # `source_id > 0` keeps a row from being negated twice (a repeated id in the set).
+        conn.exec("UPDATE issue_evidence SET source_id = -source_id " \
+                  "WHERE source_kind = 'flow' AND source_id IN (#{marks}) AND source_id > 0", args: args)
+      else
+        FLOW_REF_TABLES.each do |table|
           conn.exec("UPDATE #{table} SET flow_id = NULL WHERE flow_id IS NOT NULL")
         end
-      end
-      if fid = id
-        conn.exec("UPDATE probe_issues SET sample_flow_id = NULL WHERE sample_flow_id = ?", fid)
-      else
         conn.exec("UPDATE probe_issues SET sample_flow_id = NULL WHERE sample_flow_id IS NOT NULL")
+        conn.exec("UPDATE issue_evidence SET source_id = -source_id " \
+                  "WHERE source_kind = 'flow' AND source_id > 0")
       end
     end
+
+    # The tables whose `flow_id` column `detach_flow_refs` nulls.
+    private FLOW_REF_TABLES = {"issues", "repeaters", "fuzz_sessions", "miner_sessions", "sequencer_sessions",
+                               "issue_retest_run_steps", "events", "intercept_held", "probe_oast_probes"}
 
     # Distinct host values for History QL Tab-complete (`host:`). Prefix-filtered
     # (case-insensitive), hard-capped so a huge capture history never materialises
@@ -634,8 +804,10 @@ module Gori
         end
       else
         # Prefix match only (trailing %); escape LIKE metacharacters in the typed prefix.
+        # No `lower(host)` around the column: LIKE folds ASCII itself (see QL.contains_cond),
+        # and wrapping it only added a per-row allocation to a keystroke-rate query.
         pat = "#{QL.like_escape(prefix.downcase)}%"
-        controlled_query("SELECT DISTINCT host FROM flows WHERE lower(host) LIKE ? ESCAPE '\\' ORDER BY host LIMIT ?",
+        controlled_query("SELECT DISTINCT host FROM flows WHERE host LIKE ? ESCAPE '\\' ORDER BY host LIMIT ?",
           [pat, lim] of DB::Any, control) do |rs|
           rs.each { hosts << rs.read(String) }
         end
@@ -727,6 +899,12 @@ module Gori
     # `offset` is what makes the cut above a PAGE rather than a ceiling: the ordering is
     # total, so `offset` walks the whole set deterministically instead of leaving everything
     # past `limit` permanently out of reach.
+    #
+    # The GROUP BY is spelled in the ORDER BY's order, which is `idx_flows_sitemap`'s (V38):
+    # the planner then groups straight off the covering index and stops after the page. In
+    # the old order (`scheme, host, …`) it scanned the table and sorted every row twice. The
+    # group set is the same either way. The order inside `statuses` was never specified and
+    # follows whichever index the planner picks for the filter (ascending off this one).
     def sitemap_entries_detailed(filter : QL::Filter = QL::EMPTY, limit : Int32 = SITEMAP_MAX, *,
                                  offset : Int32 = 0,
                                  raise_on_error : Bool = false) : Array(SitemapEntry)
@@ -740,7 +918,7 @@ module Gori
             "SUM(CASE WHEN status = 0 OR status >= 400 THEN 1 ELSE 0 END), " \
             "MIN(created_at), MAX(created_at) " \
             "FROM flows WHERE #{filter.sql} " \
-            "GROUP BY scheme, host, port, http_version, method, target " \
+            "GROUP BY host, target, method, scheme, port, http_version " \
             "ORDER BY host, target, method, scheme, port, http_version LIMIT ? OFFSET ?"
       @db.query(sql, args: args) do |rs|
         rs.each do
@@ -790,6 +968,47 @@ module Gori
       [] of {String, String, String}
     end
 
+    # One distinct endpoint of the ORIGIN-keyed Sitemap tree (#1371): the (host, method,
+    # target) `sitemap_entries` returns plus the scheme and port it was sent over, so
+    # `http://h:19021/x` and `https://h:8443/x` stay two endpoints under two roots.
+    record SitemapOriginEntry, scheme : String, host : String, port : Int32,
+      method : String, target : String
+
+    # Distinct (scheme, host, port, method, target) endpoints — what the Sitemap tab and
+    # `gori run sitemap` build their tree from (`Sitemap.build`). Same contract as
+    # `sitemap_entries` just above (the filter, the cap, `offset`, `control`, the degrade),
+    # with the origin kept. `sitemap_entries` stays for the readers that ask about a HOST on
+    # purpose (MCP `collapse_transport`, the JS-reference "requested" check).
+    #
+    # The ORDER BY names every selected column in `idx_flows_sitemap`'s order (V38), so the
+    # LIMIT cut is deterministic and the planner reads the distinct set straight off the
+    # covering index (`spec/store/sitemap_index_spec.cr` pins the plan). The cap counts origin
+    # keys, which are at least as many as the host-level rows for the same history.
+    def sitemap_origin_entries(filter : QL::Filter = QL::EMPTY, limit : Int32 = SITEMAP_MAX, *,
+                               offset : Int32 = 0, raise_on_error : Bool = false,
+                               control : QueryControl? = nil) : Array(SitemapOriginEntry)
+      rows = [] of SitemapOriginEntry
+      args = filter.args.dup
+      args << limit
+      args << offset
+      controlled_query("SELECT DISTINCT host, target, method, scheme, port FROM flows WHERE #{filter.sql} " \
+                       "ORDER BY host, target, method, scheme, port LIMIT ? OFFSET ?", args, control) do |rs|
+        rs.each do
+          host, target, method = rs.read(String), rs.read(String), rs.read(String)
+          rows << SitemapOriginEntry.new(rs.read(String), host, rs.read(Int32), method, target)
+        end
+      end
+      rows
+    rescue ex : QueryCancelled
+      raise ex
+    rescue ex
+      # Same degrade as `sitemap_entries`: the live TUI never crashes over a bad `/` query, and
+      # the one-shot CLI passes raise_on_error so a failed read is not an empty tree.
+      raise ex if raise_on_error
+      ::Log.warn { "sitemap query failed: #{ex.message}" } # gori.log, not STDERR (see #search, #411)
+      [] of SitemapOriginEntry
+    end
+
     # One (endpoint, status, content-type) group — the unit the retest diff
     # (`Gori::Diff`) aggregates a snapshot from.
     #
@@ -822,7 +1041,8 @@ module Gori
     # ORDER BY names every GROUP BY column, so the ordering is TOTAL and the `LIMIT` cut is
     # deterministic — same reason as `sitemap_entries_detailed`, and the same consequence
     # if it were not: with no cursor on this read, a group that loses an arbitrary tiebreak
-    # is not on a later page, it is unreachable.
+    # is not on a later page, it is unreachable. It reads `idx_flows_sitemap` (V38) covered;
+    # the grouping still sorts, because that index keys the transport ahead of `status`.
     def endpoint_observations(filter : QL::Filter = QL::EMPTY, limit : Int32 = ENDPOINT_OBSERVATION_MAX, *,
                               raise_on_error : Bool = false) : Array(EndpointObservation)
       rows = [] of EndpointObservation
@@ -831,7 +1051,7 @@ module Gori
       sql = "SELECT host, method, target, status, content_type, COUNT(*), " \
             "MIN(response_size), MAX(response_size), MIN(created_at), MAX(created_at), MAX(id) " \
             "FROM flows WHERE #{filter.sql} " \
-            "GROUP BY host, method, target, status, content_type " \
+            "GROUP BY host, target, method, status, content_type " \
             "ORDER BY host, target, method, status, content_type LIMIT ?"
       @db.query(sql, args: args) do |rs|
         rs.each do
@@ -849,13 +1069,6 @@ module Gori
       raise ex if raise_on_error
       ::Log.warn { "endpoint observation query failed: #{ex.message}" }
       [] of EndpointObservation
-    end
-
-    # Passive-signal tags for a flow, fetched lazily per on-screen row (P8 pull,
-    # not push). No tag producer exists this milestone, so this is always empty;
-    # the call site is the seam.
-    def flags_for(id : Int64) : Array(String)
-      [] of String
     end
   end
 end

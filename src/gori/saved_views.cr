@@ -4,7 +4,7 @@ require "./settings"
 
 module Gori
   # A **view** is a named History query applied as a LENS: it ANDs over whatever is in the
-  # filter bar rather than replacing it, exactly the way the ⇧S scope lens does. That is the
+  # filter bar rather than replacing it, exactly the way the `s` scope lens does. That is the
   # whole point of the feature (#776) — `src:proxy` stops being a query the operator retypes
   # every session and becomes a mode that survives the next `/`.
   #
@@ -89,7 +89,7 @@ module Gori
 
       # What the History filter row's `v:` chip spells. A LABEL, not the name, for two reasons
       # that both belong to that row and to nowhere else: every chip beside it reads
-      # `f:follow` / `⇧S scope:off` / `3 marked`, so a Title-Case one is the only word on the
+      # `⌁follow` / `s scope:off` / `3 marked`, so a Title-Case one is the only word on the
       # bar shouting; and the chip is the narrowest place a view is ever printed, which is why
       # `CHIP_LABELS` exists at all.
       #
@@ -123,13 +123,13 @@ module Gori
     DEFAULT_ID = "proxy+repeater"
 
     # Short chip labels for builtins whose NAME does not fit the chip, keyed by id. Only one
-    # entry earns its place: `History + Repeater` is 18 columns against a 14-column budget
+    # entry earns its place: `History + Repeater` is 18 columns against a 16-column budget
     # (`HistoryView::VIEW_CHIP_NAME_MAX`), so the DEFAULT view — the one a fresh project opens
     # on and therefore the chip most operators look at all day — rendered as `v:History + Re…`.
     #
-    # `rptr` rather than `rep` because it is not a new abbreviation: the SRC column already
-    # teaches `PROXY · RPTR · FUZZ · CRAWL · IMPRT`, and `src:rptr` is typeable in the bar.
-    CHIP_LABELS = {DEFAULT_ID => "history+rptr"}
+    # Spelled out, not `rptr`: this is the first chip a newcomer reads, and an abbreviation
+    # there is jargon. The filter hint gives way before the chips do (`QuerySuggest.idle_hint`).
+    CHIP_LABELS = {DEFAULT_ID => "history+repeater"}
 
     BUILTINS = [
       View.new(ALL_ID, "All", "", "builtin"),
@@ -326,6 +326,42 @@ module Gori
     def self.set_active(store : Store, view : View?) : Bool
       v = view || all_view
       store.set_setting(ACTIVE_KEY, v.key)
+    end
+
+    # Point this project back at All when its SAVED pointer names `view`, and leave it alone
+    # otherwise. The saved setting, never a process's own lens — a peer may have pointed the
+    # project at this view since, or away from it. A project view's id is a rowid that the next
+    # view created can take, so a pointer left naming a deleted one would turn that view on.
+    # Returns false only when a needed write did not commit.
+    def self.clear_active_if(store : Store, view : View) : Bool
+      return true unless store.setting(ACTIVE_KEY) == view.key
+      set_active(store, nil)
+    end
+
+    # How `delete` ended, so every surface says the same thing about it.
+    enum DeleteOutcome
+      Deleted       # gone, and the project's pointer does not name it
+      NotDeleted    # the pointer could not be reset first, so nothing changed
+      RemoveRefused # the view stayed, and a pointer that named it now says All
+      PointerLeft   # gone, but a pointer a peer set during the delete still names it
+    end
+
+    # Delete `view` and keep this project's active pointer off it. The pointer is cleared BEFORE
+    # the delete, so a refused write deletes nothing and the same delete can be retried: cleared
+    # only after, a refusal left a pointer at the deleted id with no tool to reset it. It is
+    # checked again AFTER, because a peer can point the project at the view between the two.
+    def self.delete(store : Store, view : View) : DeleteOutcome
+      return DeleteOutcome::NotDeleted unless clear_active_if(store, view)
+      return DeleteOutcome::RemoveRefused unless remove(store, view)
+      clear_active_if(store, view) ? DeleteOutcome::Deleted : DeleteOutcome::PointerLeft
+    end
+
+    # After a move (`set_scope`) minted `to` a new id: point this project's SAVED pointer at it
+    # when it named `from`, which no longer resolves (and, for a project view, is a rowid the
+    # next view created can take). Returns false only when a needed write did not commit.
+    def self.repoint_active_if(store : Store, from : View, to : View) : Bool
+      return true unless store.setting(ACTIVE_KEY) == from.key
+      set_active(store, to)
     end
 
     # --- scope-aware CRUD --------------------------------------------------------------------

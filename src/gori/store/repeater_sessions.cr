@@ -26,21 +26,20 @@ module Gori
     # already-BLOB-storage value, so this never changes behavior for the common case.
     REQUEST_COL = "CAST(request AS BLOB) AS request"
 
+    # The request-side columns every projection below starts with, read by `read_head`.
+    HEAD_COLS = "id, target, #{REQUEST_COL}, http2, auto_content_length, flow_id, position"
+    # A whole row, response BLOBs included, read by `read_full`.
+    FULL_COLS = "#{HEAD_COLS}, response_head, response_body, response_error, response_duration_us, " \
+                "name, sni, tags, ws_keep_key, ws_http_only, tls_preset, response_request_sha256"
+
     # Full repeater rows INCLUDING the persisted response BLOBs. Used once at project
     # open to seed each tab's last response (V11). NOT for the recurring reconcile
     # poll — use `repeaters_meta` there to avoid re-materializing every tab's
     # (potentially multi-MB) response on each cross-session commit.
     def repeaters : Array(RepeaterRecord)
       list = [] of RepeaterRecord
-      @db.query("SELECT id, target, #{REQUEST_COL}, http2, auto_content_length, flow_id, position, response_head, response_body, response_error, response_duration_us, name, sni, tags, ws_keep_key, ws_http_only, tls_preset FROM repeaters ORDER BY position, id") do |rs|
-        rs.each do
-          list << RepeaterRecord.new(
-            rs.read(Int64), rs.read(String), rs.read(Bytes),
-            rs.read(Int32) != 0, rs.read(Int32) != 0, rs.read(Int64?), rs.read(Int32),
-            rs.read(Bytes?), rs.read(Bytes?), rs.read(String?), rs.read(Int64?), rs.read(String?), rs.read(String?),
-            tags: rs.read(String?), ws_keep_key: rs.read(Int32) != 0, ws_http_only: rs.read(Int32) != 0,
-            tls_preset: rs.read(String?))
-        end
+      @db.query("SELECT #{FULL_COLS} FROM repeaters ORDER BY position, id") do |rs|
+        rs.each { list << read_full(rs) }
       end
       list
     end
@@ -49,12 +48,8 @@ module Gori
     # which only converges target/request/flags/position and never reads the
     # response (responses are personal per session). Response fields stay nil.
     def get_repeater(id : Int64) : RepeaterRecord?
-      @db.query(
-        "SELECT id, target, #{REQUEST_COL}, http2, auto_content_length, flow_id, position, sni, name, ws_keep_key, ws_http_only, tls_preset FROM repeaters WHERE id = ?",
-        id) do |rs|
-        return RepeaterRecord.new(
-          rs.read(Int64), rs.read(String), rs.read(Bytes),
-          rs.read(Int32) != 0, rs.read(Int32) != 0, rs.read(Int64?), rs.read(Int32),
+      @db.query("SELECT #{HEAD_COLS}, sni, name, ws_keep_key, ws_http_only, tls_preset FROM repeaters WHERE id = ?", id) do |rs|
+        return RepeaterRecord.new(*read_head(rs),
           sni: rs.read(String?), name: rs.read(String?), ws_keep_key: rs.read(Int32) != 0,
           ws_http_only: rs.read(Int32) != 0, tls_preset: rs.read(String?)) if rs.move_next
       end
@@ -65,29 +60,17 @@ module Gori
     # for explicit, paged body reads; unlike `repeaters`, it never materializes all
     # repeater response BLOBs just to retrieve one continuation chunk.
     def get_repeater_full(id : Int64) : RepeaterRecord?
-      @db.query(
-        "SELECT id, target, #{REQUEST_COL}, http2, auto_content_length, flow_id, position, " \
-        "response_head, response_body, response_error, response_duration_us, name, sni, tags, ws_keep_key, ws_http_only, tls_preset " \
-        "FROM repeaters WHERE id = ?", id) do |rs|
-        if rs.move_next
-          return RepeaterRecord.new(
-            rs.read(Int64), rs.read(String), rs.read(Bytes),
-            rs.read(Int32) != 0, rs.read(Int32) != 0, rs.read(Int64?), rs.read(Int32),
-            rs.read(Bytes?), rs.read(Bytes?), rs.read(String?), rs.read(Int64?), rs.read(String?), rs.read(String?),
-            tags: rs.read(String?), ws_keep_key: rs.read(Int32) != 0, ws_http_only: rs.read(Int32) != 0,
-            tls_preset: rs.read(String?))
-        end
+      @db.query("SELECT #{FULL_COLS} FROM repeaters WHERE id = ?", id) do |rs|
+        return read_full(rs) if rs.move_next
       end
       nil
     end
 
     def repeaters_meta : Array(RepeaterRecord)
       list = [] of RepeaterRecord
-      @db.query("SELECT id, target, #{REQUEST_COL}, http2, auto_content_length, flow_id, position, sni, ws_keep_key, ws_http_only, tls_preset FROM repeaters ORDER BY position, id") do |rs|
+      @db.query("SELECT #{HEAD_COLS}, sni, ws_keep_key, ws_http_only, tls_preset FROM repeaters ORDER BY position, id") do |rs|
         rs.each do
-          list << RepeaterRecord.new(
-            rs.read(Int64), rs.read(String), rs.read(Bytes),
-            rs.read(Int32) != 0, rs.read(Int32) != 0, rs.read(Int64?), rs.read(Int32),
+          list << RepeaterRecord.new(*read_head(rs),
             sni: rs.read(String?), ws_keep_key: rs.read(Int32) != 0, ws_http_only: rs.read(Int32) != 0,
             tls_preset: rs.read(String?))
         end
@@ -100,18 +83,29 @@ module Gori
     def repeaters_mcp : Array(RepeaterRecord)
       list = [] of RepeaterRecord
       @db.query(
-        "SELECT id, target, #{REQUEST_COL}, http2, auto_content_length, flow_id, position, sni, " \
-        "name, tags, response_head, response_error, response_duration_us, ws_keep_key, ws_http_only, tls_preset FROM repeaters ORDER BY position, id") do |rs|
+        "SELECT #{HEAD_COLS}, sni, name, tags, response_head, response_error, response_duration_us, " \
+        "ws_keep_key, ws_http_only, tls_preset FROM repeaters ORDER BY position, id") do |rs|
         rs.each do
-          list << RepeaterRecord.new(
-            rs.read(Int64), rs.read(String), rs.read(Bytes),
-            rs.read(Int32) != 0, rs.read(Int32) != 0, rs.read(Int64?), rs.read(Int32),
+          list << RepeaterRecord.new(*read_head(rs),
             sni: rs.read(String?), name: rs.read(String?), tags: rs.read(String?),
             response_head: rs.read(Bytes?), response_error: rs.read(String?), response_duration_us: rs.read(Int64?),
             ws_keep_key: rs.read(Int32) != 0, ws_http_only: rs.read(Int32) != 0, tls_preset: rs.read(String?))
         end
       end
       list
+    end
+
+    # The `HEAD_COLS` of the current row, in order, as `RepeaterRecord.new`'s leading positionals.
+    private def read_head(rs : DB::ResultSet)
+      {rs.read(Int64), rs.read(String), rs.read(Bytes),
+       rs.read(Int32) != 0, rs.read(Int32) != 0, rs.read(Int64?), rs.read(Int32)}
+    end
+
+    private def read_full(rs : DB::ResultSet) : RepeaterRecord
+      RepeaterRecord.new(*read_head(rs),
+        rs.read(Bytes?), rs.read(Bytes?), rs.read(String?), rs.read(Int64?), rs.read(String?), rs.read(String?),
+        tags: rs.read(String?), ws_keep_key: rs.read(Int32) != 0, ws_http_only: rs.read(Int32) != 0,
+        tls_preset: rs.read(String?), response_request_sha256: rs.read(String?))
     end
 
     # The position a NEW tab appends at: one past the highest in use — the same
@@ -139,6 +133,14 @@ module Gori
                         auto_cl : Bool, flow_id : Int64?, position : Int32, sni : String? = nil,
                         ws_keep_key : Bool = false, ws_http_only : Bool = false,
                         tls_preset : String? = nil) : Int64
+      # A stale-grammar process must not mix two grammars into one database — see
+      # `store/env_write_guard.cr`. Skipped for an EVIDENCE row (`flow_id`): a capture expands
+      # nothing, so its `$id` is a byte the origin sent and re-spelling it would edit the record.
+      if flow_id.nil? && (w = env_write)
+        request = w.call(request, EnvMigration::Kind::Request)
+        target = w.call(target, EnvMigration::Kind::Dial)
+        sni = w.call(sni, EnvMigration::Kind::Dial)
+      end
       ts = now_us
       exec_task ->(c : DB::Connection) {
         c.exec("INSERT INTO repeaters (created_at, updated_at, target, request, http2, auto_content_length, flow_id, position, sni, ws_keep_key, ws_http_only, tls_preset) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -151,11 +153,42 @@ module Gori
     def update_repeater(id : Int64, target : String, request : Bytes, http2 : Bool, auto_cl : Bool,
                         sni : String? = nil, ws_keep_key : Bool = false,
                         ws_http_only : Bool = false, tls_preset : String? = nil) : Bool
-      exec_task_ok ->(c : DB::Connection) {
+      # Same guard as `insert_repeater`. The provenance has to be READ here (the caller does not
+      # pass it), which is why the grammar comparison comes first: on the overwhelmingly common
+      # write — this process and this database agreeing — `env_write` answers nil and no extra query
+      # is made at all.
+      if w = env_write
+        if repeater_flow_id(id).nil?
+          request = w.call(request, EnvMigration::Kind::Request)
+          target = w.call(target, EnvMigration::Kind::Dial)
+          sni = w.call(sni, EnvMigration::Kind::Dial)
+        end
+      end
+      # `exec_task_row`, not `exec_task_ok`: a minimize `--apply` (CLI and MCP) reads this row,
+      # spends seconds sending, and writes back — a peer that closed the tab in between must not
+      # be answered "applied". See `update_repeater_response` for the same window on a send.
+      exec_task_row ->(c : DB::Connection) {
         c.exec("UPDATE repeaters SET target = ?, request = ?, http2 = ?, auto_content_length = ?, sni = ?, ws_keep_key = ?, ws_http_only = ?, tls_preset = ?, updated_at = ? WHERE id = ?",
           target, request, http2 ? 1 : 0, auto_cl ? 1 : 0, sni, ws_keep_key ? 1 : 0, ws_http_only ? 1 : 0, tls_preset, now_us, id)
         nil
       }
+    end
+
+    # Does a session row with this id exist right now? A narrow read for a caller that was just
+    # answered false by one of the row-checked writes above and has to say WHICH of the two
+    # things happened — the store refused the write, or the row is gone.
+    def repeater_exists?(id : Int64) : Bool
+      !@db.query_one?("SELECT 1 FROM repeaters WHERE id = ?", id, as: Int64).nil?
+    rescue
+      false
+    end
+
+    # The `flow_id` of one tab, or nil for a draft (and for an id that is gone). A narrow read for
+    # the provenance question alone — `get_repeater` would pull the request blob with it.
+    private def repeater_flow_id(id : Int64) : Int64?
+      @db.query_one?("SELECT flow_id FROM repeaters WHERE id = ?", id, as: Int64?)
+    rescue
+      nil
     end
 
     # Set (or clear, with nil) a repeater tab's custom name — its own UPDATE, separate
@@ -217,12 +250,34 @@ module Gori
     # Persist a repeater tab's LAST send result (V11) so it survives a reopen. Kept
     # separate from update_repeater (the request side) — called once each send
     # completes. `head` is the response head bytes (empty on error), `error` is set
-    # only when the send failed. Via exec_task (writer connection), so this DOES
-    # bump the TUI data_version poll; Repeater reconcile soft-syncs around it.
-    def update_repeater_response(id : Int64, head : Bytes, body : Bytes?, error : String?, duration_us : Int64) : Nil
-      exec_task ->(c : DB::Connection) {
-        c.exec("UPDATE repeaters SET response_head = ?, response_body = ?, response_error = ?, response_duration_us = ?, updated_at = ? WHERE id = ?",
-          head, body, error, duration_us, now_us, id)
+    # only when the send failed. Via the writer connection, so this DOES bump the TUI
+    # data_version poll; Repeater reconcile soft-syncs around it.
+    #
+    # Answers whether THIS ROW now holds the response: false for a rolled-back batch (store
+    # busy/locked/closing) AND for an id no row has. The second half matters because every
+    # headless send closes the store, dials for as long as the origin takes, and reopens to
+    # write — `gori run repeater delete`, a TUI closing the tab or MCP `delete_repeater` can
+    # remove the row inside that window, and an `UPDATE … WHERE id = ?` that matched nothing
+    # used to commit and answer true, so the operator was told the response was on a tab that
+    # no longer existed. `repeater_exists?` tells the two apart when the caller has to say which.
+    #
+    # `request_sha256` (V28) is `Evidence.request_digest` of the SAVED request bytes this
+    # row held when the send went out — the request half of the pair this response completes.
+    # Every send surface saves the tab BEFORE it dials (the TUI's `save_repeater_tab`, and
+    # the CLI/MCP which send what the row already holds), so that digest is the row's own
+    # request at that instant; a later edit changes the request and not the response, which
+    # is exactly what `Evidence.from_repeater` reports as drift.
+    #
+    # KEYWORD-ONLY and WITHOUT a default, for the reason `Repeater::Result`'s tail states: a
+    # silently-defaulted nil here is a response whose request cannot be checked, and the
+    # failure mode is a freeze that says nothing rather than an error anyone sees. nil is
+    # still passable — and is the honest value for a caller that genuinely does not know the
+    # bytes — but it has to be written down.
+    def update_repeater_response(id : Int64, head : Bytes, body : Bytes?, error : String?,
+                                 duration_us : Int64, *, request_sha256 : String?) : Bool
+      exec_task_row ->(c : DB::Connection) {
+        c.exec("UPDATE repeaters SET response_head = ?, response_body = ?, response_error = ?, response_duration_us = ?, response_request_sha256 = ?, updated_at = ? WHERE id = ?",
+          head, body, error, duration_us, request_sha256, now_us, id)
         nil
       }
     end
@@ -230,21 +285,49 @@ module Gori
     # Returns whether the write committed (false = store busy/locked/closing).
     #
     # Cascades `entity_links`, unlike the deliberately-dangling FLOW case, and the difference
-    # is id REUSE. `repeaters.id` is `INTEGER PRIMARY KEY` without AUTOINCREMENT, and repeaters
-    # are routinely deleted at the TOP of the id space — closing the newest tab — which resets
-    # the counter immediately. So a link left pointing at repeater #1 read `#1 (gone)` for as
-    # long as it took to open one more tab, and then resolved, `stale: false`, to an
-    # UNRELATED request: an issue's evidence pointer confidently naming a different URL, in
-    # the TUI overlay, both exports and MCP `list_links`.
+    # was id REUSE. Until V40 `repeaters.id` was `INTEGER PRIMARY KEY` without AUTOINCREMENT,
+    # and repeaters are routinely deleted at the TOP of the id space — closing the newest tab —
+    # which reset the counter immediately. So a link left pointing at repeater #1 read
+    # `#1 (gone)` for as long as it took to open one more tab, and then resolved,
+    # `stale: false`, to an UNRELATED request: an issue's evidence pointer confidently naming a
+    # different URL, in the TUI overlay, both exports and MCP `list_links`. V40 made the id
+    # permanent; the cascades stay, because a pointer at a tab that is gone still points at
+    # nothing an operator can open.
     #
-    # Flows can afford to dangle because their ids never come back: both prune paths delete
-    # from the bottom (`WHERE id <= cutoff`), so `MAX(id)` always survives and the next insert
-    # is `max + 1`. "Gone" is genuinely more informative than absent THERE. Here it is a
-    # pointer that silently starts lying, which is worse than either.
+    # A flow link left dangling by retention pruning cannot re-bind: both prune paths delete
+    # from the bottom (`WHERE id <= cutoff`), so `MAX(id)` survives and the next insert is
+    # `max + 1`. Explicit History deletes and clears remove their links in the same transaction
+    # because those paths can reuse ids. "Gone" is genuinely more informative than absent
+    # THERE. Here it is a pointer that silently starts lying, which is worse than either.
+    #
+    # An issue's retest steps name repeaters with the same `ref_kind`/`ref_id` pair and had
+    # the same hole (#1160): the step read "repeater #1 no longer exists" until the next tab
+    # took id 1, then `retest run` sent that UNRELATED request and recorded a verdict on the
+    # issue. They are DETACHED here rather than deleted: a step carries the operator's role
+    # and assertion, and silently dropping one on a tab close shrinks the retest — a run of
+    # the steps left can then PASS an issue its missing step would have failed. A detached
+    # step keeps its row and keeps refusing as missing until it is removed and re-added; see
+    # `Store::RetestStep#detached?` for the encoding.
+    #
+    # A Probe finding raised by a Repeater send names its tab in `sample_repeater_id`, and
+    # promoting the finding links the new issue to that id. Left behind, it linked whatever tab
+    # took the id next; it is cleared here, and the finding keeps its host, URLs and evidence.
     def delete_repeater(id : Int64) : Bool
+      ts = now_us
       exec_task_ok ->(c : DB::Connection) {
         c.exec("DELETE FROM ws_messages WHERE repeater_id = ?", id)
         c.exec("DELETE FROM entity_links WHERE ref_kind = 'repeater' AND ref_id = ?", id)
+        c.exec("UPDATE probe_issues SET sample_repeater_id = NULL WHERE sample_repeater_id = ?", id)
+        c.exec("UPDATE issue_retest_steps SET ref_id = -ref_id, updated_at = ? " \
+               "WHERE ref_kind = 'repeater' AND ref_id = ? AND ref_id > 0", ts, id)
+        # A session slot's REFRESH steps (#1233) name repeaters by id too, and are detached the
+        # same way and in the same transaction: a refresh that re-bound to whatever tab took
+        # this id next would send an unrelated request as a login, automatically, before a
+        # send. The slot keeps the step in its place, negated, and refuses to run it.
+        raw = c.query_one?("SELECT value FROM settings WHERE key = ?", SESSION_SLOTS_KEY, as: String)
+        if detached = SessionSlot.detach_refresh(raw, id)
+          c.exec("UPDATE settings SET value = ? WHERE key = ?", detached, SESSION_SLOTS_KEY)
+        end
         c.exec("DELETE FROM repeaters WHERE id = ?", id)
         nil
       }

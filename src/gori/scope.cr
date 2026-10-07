@@ -90,9 +90,21 @@ module Gori
       # byte-identical to the 2-arg form. `url` (unlowered) is kept for the regex subject,
       # which scrubs but must not case-fold.
       def matches?(url : String, host : String, url_down : String) : Bool
+        matches?(url, host, url_down, nil)
+      end
+
+      # Same match again, but the caller ALSO supplies the host already reduced to the form
+      # `HostPattern::Compiled#matches_bare?` compares against (`HostPattern.normalize`).
+      # `host_match?` did that reduction itself — a lowercased copy plus a bracket/root-dot
+      # peel — once per HOST RULE, and a Scope evaluation runs every include and every
+      # exclude against the SAME host, so a scope with a handful of host rules re-normalized
+      # it that many times on every proxied request and every CONNECT. The evaluators
+      # normalize once and pass it here; nil keeps the 3-arg form (and the specs that call
+      # it) normalizing per rule, which is the same string either way.
+      def matches?(url : String, host : String, url_down : String, host_bare : String?) : Bool
         case @match_type
         when "host"
-          host_match?(host)
+          host_bare ? host_match_bare?(host_bare) : host_match?(host)
         when "string"
           url_down.includes?(@pattern_down)
         when "regex"
@@ -122,6 +134,11 @@ module Gori
       private def host_match?(host : String) : Bool
         !!@host_pattern.try(&.matches?(host))
       end
+
+      # The same test against an ALREADY-normalized host (see the 4-arg `matches?`).
+      private def host_match_bare?(host_bare : String) : Bool
+        !!@host_pattern.try(&.matches_bare?(host_bare))
+      end
     end
 
     getter rules : Array(Rule)
@@ -140,10 +157,18 @@ module Gori
     # a consistent {rules, includes, excludes} triple. `assign_rules` is the one writer.
     @includes : Array(Rule)
     @excludes : Array(Rule)
+    # Does ANY rule read `url_down`? Only a `string` rule does — `host` and `regex` ignore the
+    # argument entirely — so when no rule is one, `url.downcase` is a whole-URL copy minted per
+    # request for a value nothing reads. A host-only scope is the ordinary shape of an
+    # engagement, so that was the common case paying it. Derived in `assign_rules` beside the
+    # partition and read under the SAME @mutex, so the flag can never describe a rule list
+    # other than the one being walked.
+    @string_rules : Bool
 
     def initialize(@store : Store, @rules : Array(Rule), @enabled : Bool, @sandbox : Bool = false)
       @includes = @rules.select(&.include?)
       @excludes = @rules.select(&.exclude?)
+      @string_rules = @rules.any? { |r| r.match_type == "string" }
       # @rules/@enabled are read on the PROXY hot path (in_scope_url?/may_match_host?/
       # filter/active?) while the TUI fiber mutates them (add/remove/update/toggle).
       # Guard every cross-fiber access with a mutex — only the TUI mutates, so its own
@@ -200,14 +225,14 @@ module Gori
     end
 
     # Has any scope rule at all, REGARDLESS of the enabled flag — drives whether the
-    # Sitemap shows scope markers (targets are marked even with the ⇧S lens off). Kept
+    # Sitemap shows scope markers (targets are marked even with the `s` lens off). Kept
     # mutex-guarded so it shares the same discipline as the other rule readers.
     def configured? : Bool
       @mutex.synchronize { !@rules.empty? }
     end
 
     # Host-level scope membership evaluated against the rules REGARDLESS of the enabled
-    # flag, so the Sitemap can mark its targets even when the ⇧S lens is off. False when
+    # flag, so the Sitemap can mark its targets even when the `s` lens is off. False when
     # no rules exist (nothing to mark). Conservative on url-level (string/regex) includes
     # — a host can't be ruled out by a rule whose path we don't know here — same as
     # may_match_host?; host-type scoping (the common case) is precise.
@@ -226,10 +251,11 @@ module Gori
     # short-circuits its own inactive case before calling, so it never reaches the guard.
     private def host_in_scope_unlocked?(host : String) : Bool
       return false if @rules.empty?
+      bare = HostPattern.normalize(host) # once for the whole walk, not once per host rule
       inc_ok = @includes.empty? ||
-               @includes.any? { |r| r.host_type? && r.matches?("", host) } ||
+               @includes.any? { |r| r.host_type? && r.matches?("", host, "", bare) } ||
                @includes.any? { |r| !r.host_type? }
-      excluded = @excludes.any? { |r| r.host_type? && r.matches?("", host) }
+      excluded = @excludes.any? { |r| r.host_type? && r.matches?("", host, "", bare) }
       inc_ok && !excluded
     end
 
@@ -244,7 +270,14 @@ module Gori
       end
     end
 
-    # Evaluate include/exclude rules against a URL REGARDLESS of the ⇧S display lens.
+    # The Burp rule `in_scope_url?` applies, REGARDLESS of the `s` display lens: the row-by-row
+    # twin of `filter(force: true)`, for a listing asked for "in scope" explicitly. False with no
+    # rules at all — such a caller refuses an unconfigured scope first.
+    def listed_in_scope?(url : String, host : String) : Bool
+      @mutex.synchronize { matches_url_unlocked?(url, host) }
+    end
+
+    # Evaluate include/exclude rules against a URL REGARDLESS of the `s` display lens.
     # Used by Probe Active probes. Differs from the Burp display filter in one safety
     # way: at least one INCLUDE rule is required (excludes-only would otherwise mean
     # "probe the whole internet minus a few hosts" — too aggressive for an automatic
@@ -257,8 +290,16 @@ module Gori
     # scanner (Discover) applies in every containment mode, INDEPENDENT of includes and the
     # display lens. (matches_url? requires includes; this asks only "is it carved out?".)
     def excluded?(url : String, host : String) : Bool
-      url_down = url.downcase # once, OUTSIDE the hot-path lock — see Rule#matches?(_, _, url_down)
-      @mutex.synchronize { @excludes.any? { |r| r.matches?(url, host, url_down) } }
+      @mutex.synchronize do
+        return false if @excludes.empty?
+        # Both reductions happen ONCE for the whole walk — see Rule#matches?(_, _, _, _).
+        # They read @string_rules, which is swapped with @excludes, so they sit inside the
+        # lock with it rather than ahead of it; the section still has no yield point, and on
+        # the single-threaded scheduler (no -Dpreview_mt) nothing else can run inside it.
+        url_down = url_down_unlocked(url)
+        bare = HostPattern.normalize(host)
+        @excludes.any? { |r| r.matches?(url, host, url_down, bare) }
+      end
     end
 
     # The id of the first INCLUDE rule that matches — the audit trail the active-sender gate
@@ -268,8 +309,12 @@ module Gori
     # url once, like the allowlist evaluators, and reads under @mutex rather than off the bare
     # getter. @includes keeps @rules order, so the first match is the same rule as before.
     def matching_include_id(url : String, host : String) : Int64?
-      url_down = url.downcase
-      @mutex.synchronize { @includes.find { |r| r.matches?(url, host, url_down) }.try(&.id) }
+      @mutex.synchronize do
+        return nil if @includes.empty?
+        url_down = url_down_unlocked(url) # see `excluded?` for why both sit inside the lock
+        bare = HostPattern.normalize(host)
+        @includes.find { |r| r.matches?(url, host, url_down, bare) }.try(&.id)
+      end
     end
 
     # The ALLOWLIST evaluation (callers hold @mutex): true ⇔ at least one INCLUDE rule
@@ -281,9 +326,10 @@ module Gori
     # through — it's the whole internet minus a few hosts.
     private def allowlisted_unlocked?(url : String, host : String) : Bool
       return false if @includes.empty?
-      url_down = url.downcase
-      @includes.any? { |r| r.matches?(url, host, url_down) } &&
-        @excludes.none? { |r| r.matches?(url, host, url_down) }
+      url_down = url_down_unlocked(url)
+      bare = HostPattern.normalize(host)
+      @includes.any? { |r| r.matches?(url, host, url_down, bare) } &&
+        @excludes.none? { |r| r.matches?(url, host, url_down, bare) }
     end
 
     # Pure Burp evaluation (includes empty ⇒ match all; then carve excludes). Shared by
@@ -291,9 +337,10 @@ module Gori
     # requires that); still guards empty for defense-in-depth.
     private def matches_url_unlocked?(url : String, host : String) : Bool
       return false if @rules.empty?
-      url_down = url.downcase
-      inc_ok = @includes.empty? || @includes.any? { |r| r.matches?(url, host, url_down) }
-      inc_ok && @excludes.none? { |r| r.matches?(url, host, url_down) }
+      url_down = url_down_unlocked(url)
+      bare = HostPattern.normalize(host)
+      inc_ok = @includes.empty? || @includes.any? { |r| r.matches?(url, host, url_down, bare) }
+      inc_ok && @excludes.none? { |r| r.matches?(url, host, url_down, bare) }
     end
 
     # Conservative HOST-level check behind `Interceptor#intercepts_host?`, made BEFORE any
@@ -343,9 +390,10 @@ module Gori
     # host_in_scope_unlocked? but with the allowlist's empty-includes ⇒ false rule.
     private def host_allowlisted_unlocked?(host : String) : Bool
       return false if @includes.empty?
-      inc_ok = @includes.any? { |r| r.host_type? && r.matches?("", host) } ||
+      bare = HostPattern.normalize(host) # once for the whole walk — see host_in_scope_unlocked?
+      inc_ok = @includes.any? { |r| r.host_type? && r.matches?("", host, "", bare) } ||
                @includes.any? { |r| !r.host_type? }
-      excluded = @excludes.any? { |r| r.host_type? && r.matches?("", host) }
+      excluded = @excludes.any? { |r| r.host_type? && r.matches?("", host, "", bare) }
       inc_ok && !excluded
     end
 
@@ -392,7 +440,7 @@ module Gori
     # string/regex rules see is `scheme || '://' || host || target` — the same value
     # `in_scope_url?` builds in memory. Combined Burp-style:
     #   ( <includes OR'd, or 1 when none>  [AND NOT (<excludes OR'd>)] )
-    # `force: true` builds the include/exclude SQL even when the ⇧S display lens is OFF — the
+    # `force: true` builds the include/exclude SQL even when the `s` display lens is OFF — the
     # opt-in `gori run history --in-scope` uses it to apply the rules regardless of the persisted
     # flag, exactly as the TUI History lens applies `filter` when the flag is on. Still EMPTY
     # (match-all) when no rules exist, so a caller that wants "nothing when unconfigured" must
@@ -434,7 +482,7 @@ module Gori
     end
 
     # This project's scope as a QL `scope:in` / `scope:out` term sees it (see `QL::ScopeLens`):
-    # the include/exclude predicate REGARDLESS of the persisted ⇧S flag — same `force: true`
+    # the include/exclude predicate REGARDLESS of the persisted `s` flag — same `force: true`
     # reading `gori run history --in-scope` takes, because a filter term is the operator asking
     # a question and not a mode — or the UNCONFIGURED lens when there are no rules, which makes
     # both spellings match nothing rather than one of them matching every flow.
@@ -797,25 +845,54 @@ module Gori
       @rules = fresh
       @includes = fresh.select(&.include?)
       @excludes = fresh.select(&.exclude?)
+      @string_rules = fresh.any? { |r| r.match_type == "string" }
+    end
+
+    # The `url_down` the rule walk should be handed (callers hold @mutex). `url` itself when
+    # no `string` rule exists: every other match type ignores the argument, so the verdict is
+    # byte-identical and the copy is skipped. See @string_rules.
+    private def url_down_unlocked(url : String) : String
+      @string_rules ? url.downcase : url
     end
 
     # Flag writers: the in-memory field is swapped under @mutex (the hot path reads it
     # there), and the persisting write runs outside it. Callers hold @write_mutex, which is
     # what keeps a concurrent toggle from interleaving between the read and the write.
+    #
+    # Only a write that MOVED the flag is logged. `ConfigLog` is for changes — "recording an
+    # attempt as a change would put a rule in the audit trail that never gated a single request"
+    # is its own doc — and these two are written absolutely (`enable`, `enable_sandbox`, MCP
+    # `set_sandbox{enabled}`) rather than as flips, so the commonest call is one that asks for
+    # the state already in force. `Runner#scope_add_host` calls `enable` on EVERY batch add, so
+    # an operator scoping twelve hosts over a session filled the Activity feed with "scope lens
+    # turned on" lines for a lens that was already on — noise in the one place the operator goes
+    # to find out what actually changed.
+    #
+    # Against the PERSISTED row, not against `@enabled`/`@sandbox`. Those are process-local and
+    # a peer moves the flag without them (that is what `#reload`'s poll is for), so a memory
+    # comparison would call a write that really did flip the stored flag a no-op and say nothing
+    # — on the sandbox, silently, about the hard containment gate. The row is what every process
+    # re-reads, so it is what "did this change anything" has to mean. One extra indexed read per
+    # toggle, which is an operator gesture.
     private def set_enabled(value : Bool) : Bool
       @mutex.synchronize { @enabled = value }
+      was = @store.setting(SETTING_ENABLED) == "1" # nil ⇒ false, the spelling `Scope.load` reads
       ok = @store.set_setting(SETTING_ENABLED, value ? "1" : "0")
-      ConfigLog.record(@store, "scope_lens", "scope lens turned #{value ? "on" : "off"}") if ok
+      ConfigLog.record(@store, "scope_lens", "scope lens turned #{value ? "on" : "off"}") if ok && was != value
       ok
     end
 
     # The sandbox is the one setting here that changes what leaves the machine — it is the hard
     # containment gate, not a display lens — so it is the last one that should be able to move
-    # without the log saying who moved it.
+    # without the log saying who moved it. Which cuts both ways: a no-op must not be logged AS a
+    # move (a feed carrying "sandbox turned ON" three times for one enable is a feed an operator
+    # cannot read the gate's history off), and a move must never be missed — so the comparison is
+    # against the stored row, for the reason `set_enabled` above spells out.
     private def set_sandbox(value : Bool) : Bool
       @mutex.synchronize { @sandbox = value }
+      was = @store.setting(SETTING_SANDBOX) == "1"
       ok = @store.set_setting(SETTING_SANDBOX, value ? "1" : "0")
-      ConfigLog.record(@store, "sandbox", "sandbox turned #{value ? "ON — out-of-scope traffic is now blocked" : "off — out-of-scope traffic is no longer blocked"}") if ok
+      ConfigLog.record(@store, "sandbox", "sandbox turned #{value ? "ON — out-of-scope traffic is now blocked" : "off — out-of-scope traffic is no longer blocked"}") if ok && was != value
       ok
     end
 

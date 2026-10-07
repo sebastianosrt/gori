@@ -105,6 +105,48 @@ describe "config changes reach the event feed" do
     end
   end
 
+  # A write that changes nothing is not a change, and `ConfigLog`'s own doc says so ("recording
+  # an attempt as a change would put a rule in the audit trail that never gated a single
+  # request"). Both flags are written ABSOLUTELY — `enable`, `enable_sandbox`, MCP
+  # `set_sandbox{enabled}` — so asking for the state already in force is the commonest call
+  # there is: `Runner#scope_add_host` makes one on EVERY batch add. The feed filled with "scope
+  # lens turned on" for a lens that had been on since the first host.
+  it "does not record a lens or sandbox write that changes nothing" do
+    cfg_store do |store|
+      scope = Gori::Scope.load(store)
+      scope.enable.should be_true
+      scope.enable_sandbox.should be_true
+      before = config_events(store).size
+
+      3.times { scope.enable }
+      3.times { scope.enable_sandbox }
+
+      config_events(store).size.should eq(before)
+      # …and the flag that DOES move is still recorded, from the same setters.
+      scope.disable_sandbox.should be_true
+      config_events(store).map(&.kind).count("sandbox").should eq(2)
+    end
+  end
+
+  # "Changed" is asked of the STORED row, never of process-local memory. Two gori processes share
+  # a project (the peer setup `Scope#reload` exists for), so a peer moves the flag while this
+  # `Scope`'s field still holds the old value — and a memory comparison would then call a write
+  # that really did flip the persisted gate a no-op and say nothing about it. On the sandbox that
+  # is the hard containment gate moving with the audit trail's last word still reading the other
+  # way. Modelled here the way it actually happens: a second `Scope` over the same store.
+  it "records a write that moves the stored flag under a stale in-memory copy" do
+    cfg_store do |store|
+      stale = Gori::Scope.load(store) # both start at sandbox off
+      peer = Gori::Scope.load(store)
+      peer.enable_sandbox.should be_true # the peer turns the gate ON; `stale` never hears
+
+      before = config_events(store).map(&.kind).count("sandbox")
+      stale.disable_sandbox.should be_true # …and this really does turn it back off
+      config_events(store).map(&.kind).count("sandbox").should eq(before + 1)
+      Gori::Scope.load(store).sandbox?.should be_false
+    end
+  end
+
   it "records host override changes with both ends of the dial map" do
     cfg_store do |store|
       ov = Gori::HostOverrides.load(store)
@@ -215,18 +257,23 @@ describe "rewrite rule audit lines" do
 
   # `set_scope` moves a rule by copying it and deleting the original. Logging that delete put
   # "rule removed" in the trail for a rule that still exists, and the move was never recorded.
+  # In its own home, like the global-default example above: the move SAVES the rule into
+  # settings.json, and restoring memory alone left it on disk in the suite's shared home, where
+  # the next reload of that section (any MCP call, since #1215) read "movable" back in.
   it "records a scope move as a move, not as a removal" do
     cfg_store do |store|
-      rules = Gori::Rules.load(store)
-      rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head, "X-A", "X-B",
-        name: "movable").should be_true
-      rule = rules.rules.find { |r| r.name == "movable" }.not_nil!
-      rules.set_scope(rule, Gori::Store::RuleScope::Global).should be_true
-      store.flush
+      with_global_home do
+        rules = Gori::Rules.load(store)
+        rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head, "X-A", "X-B",
+          name: "movable").should be_true
+        rule = rules.rules.find { |r| r.name == "movable" }.not_nil!
+        rules.set_scope(rule, Gori::Store::RuleScope::Global).should be_true
+        store.flush
 
-      kinds = store.events_recent(50, source: Gori::ConfigLog::SOURCE).rows.map(&.kind)
-      kinds.should contain("rule_move")
-      kinds.should_not contain("rule_remove")
+        kinds = store.events_recent(50, source: Gori::ConfigLog::SOURCE).rows.map(&.kind)
+        kinds.should contain("rule_move")
+        kinds.should_not contain("rule_remove")
+      end
     end
   end
 end

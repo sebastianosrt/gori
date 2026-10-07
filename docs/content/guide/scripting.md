@@ -1,5 +1,5 @@
 +++
-title = "Scripting"
+title = "CLI Scripting with gori run"
 description = "Drive gori headless with gori run: the same project and engines as the TUI, shaped for pipelines and CI."
 weight = 80
 
@@ -24,8 +24,12 @@ Each project is its own SQLite database. Read subcommands resolve one in this or
 | Selector | Meaning |
 |----------|---------|
 | `--db=PATH` | A specific database file |
-| `--project=NAME` | Match by short id, directory slug, display name, or unique id prefix (case-insensitive) |
-| *(neither)* | The most-recently-active project |
+| `--project=NAME` | Match by short id, directory slug, display name, or unique id prefix (case-insensitive). A name that is one project's slug and another's display name, or two projects' shared display name, is refused with each candidate's slug and short id |
+| `GORI_PROJECT=NAME` | Set in the environment, the project a script's every command reads (same matching as `--project`) |
+| `gori run project switch NAME` | A standing pin, until `project switch --clear` |
+| *(none of these)* | The most-recently-active project |
+
+The last row is the one to avoid in a script: a single write to any other project (`notes create --project demo`) makes that project the most recently active, and every later `--project`-less command follows it. Set `GORI_PROJECT` at the top of the script instead. A `GORI_PROJECT` or pin that names no project is refused, never skipped, and the stderr notice says which rule chose the project (`gori run: using project demo (from GORI_PROJECT)`).
 
 The two selectors are alternatives, not a precedence: passing **both** is a usage error, not a
 silent win for `--db`. The same pair reaches destructive verbs (`history delete`, `history
@@ -34,6 +38,19 @@ clear`, `project delete`), and there an invisible winner decides which project g
 `gori run capture` differs on one point: it **creates or reopens** its target, where reads require a project that already exists.
 
 Read subcommands open the store read-only and never take the capture lock, so they are safe to run against a project a live TUI is capturing into; SQLite WAL keeps both readers and the writer happy. A `body:` query is the exception: answering it drains the search index, which is a write.
+
+Write subcommands use the same WAL database as the TUI and MCP and serialize through the Store
+writer. They may run while the TUI is open, but a capture commit can briefly own SQLite's writer
+slot. A short-lived subcommand gives its SQLite open/writer waits a one-second budget; when the
+slot stays busy, the required write exits non-zero and says the project is locked by another gori,
+with the workaround (retry, or read it with a read-only subcommand). A subcommand that keeps the
+project open for a whole run —
+`discover`, `fuzz`, `import`, `probe`, `retest run`, `oast listen`/`resume`, `intercept` — keeps
+the standard five-second wait, the same one the TUI's capture writer uses. A
+repeater send that already reached the network keeps its completed-send result even when its
+response or History write cannot be persisted: it prints a warning to STDERR, and `--format json`
+carries `response_saved` / `history_saved` with the reason, so a script can tell without asking a
+generic shell retry to send the request again solely because of that write failure.
 
 ```bash
 gori run history --project my-engagement -q 'status:5xx'
@@ -46,36 +63,52 @@ The JSON that `gori run` emits is a stable, documented shape meant to be parsed,
 
 **STDOUT is data, STDERR is diagnostics.** Warnings, counts, notes, and export confirmations go to STDERR, so `gori run … | jq` never has to filter chatter out of its input.
 
-**`--format` picks the shape.** Most subcommands take `text` (default) or `json`; some add `jsonl`, `raw`, `har`, `paths`, or `markdown`. Where a run streams, the two JSON shapes differ and the difference is worth knowing:
+**`--format` picks the shape.** Most subcommands take `text` (default) or `json`; some add `jsonl`, `raw`, `har`, `paths`, or `markdown`. `--json` is the same as `--format=json` everywhere `json` is offered. `json` is always **one JSON document** and `jsonl` always one object per line:
 
 | Subcommand | `--format json` | `--format jsonl` |
 |------------|-----------------|------------------|
-| `capture`, `history` | One JSON object per line | Alias for `json`, same output |
-| `fuzz`, `mine`, `discover` | Buffered; one JSON array at the end | One object per line, as each result lands |
+| `history` | One array, streamed | One object per line |
+| `capture` | One array, closed when the capture stops (`--for`, `--max`, Ctrl-C) | One object per flow, as it completes |
+| `fuzz`, `mine`, `discover`, `authorize`, `cache-deception` | One JSON array (`fuzz`'s in index order) | One object per line, as each result lands |
+| `sequence` | The single report | Each sample as it lands, then the report |
 
-Reach for `jsonl` when you want to consume a long sweep while it runs, and `json` when you want one document at the end.
+Reach for `jsonl` when you want to consume a long sweep while it runs, and `json` when you want one document at the end (`… --format json | jq length` counts the rows).
 
 **Exit codes are meaningful.**
 
 | Code | Meaning |
 |------|---------|
 | `0` | Success |
-| `1` | Error: a failed send, an unreadable project, a mutation that could not be applied |
-| `3` | `gori run fuzz --fail-if-no-matches` completed cleanly but nothing matched |
+| `1` | Error: a failed send, an unreadable project, a mutation that could not be applied, or a sweep (`fuzz`, `mine`, `discover`, `sequence`, `authorize`, `cache-deception`) in which no request got an answer |
+| `3` | A verdict gate: `gori run fuzz --fail-if-no-matches` completed cleanly but nothing matched (a `--stop-on` / `--stop-after-matches` that fired exits `0`), or `gori run probe --fail-on=LEVEL` reported an issue at or above LEVEL |
+| `130` | Interrupted by SIGINT/SIGTERM. `fuzz`, `mine`, `discover`, `sequence`, `authorize` and `repeater minimize` flush what they collected first, so `&& next-step` does not treat a truncated run as a finished one |
 
-A fuzz run where nothing matched *and* every send errored (target down, TLS failure, scope-blocked) exits `1`, not `3`, so a script can tell "no findings" apart from "never reached the target" without `--fail-if-no-matches`.
+A fuzz run where nothing matched *and* every send errored (target down, TLS failure, scope-blocked) exits `1`, so a script can tell "no findings" apart from "never reached the target" even without `--fail-if-no-matches` (with the flag, `3` wins).
 
 **A closed pipe is not an error.** `gori run history | head -5` exits `0` and stays quiet, the way any Unix filter should.
 
 ```bash
 # Every 5xx in the project, as JSON Lines, into jq
-gori run history -q 'status:5xx' --limit 500 --format json | jq -r '.url'
+gori run history -q 'status:5xx' --limit 500 --format jsonl | jq -r '.url'
 
 # Capture for five minutes into a named project, streaming to a file
 gori run capture --project ci-run --for 5m --format jsonl > flows.jsonl
 
 # Fail a CI job when the fuzzer finds a reflected marker
 gori run fuzz 42 --wordlist payloads.txt --mr 'gori-canary' --fail-if-no-matches
+
+# A create command's --format json is the new row, id included — no scraping prose
+id=$(gori run repeater create -t https://api.example.com -f req.http --format json | jq .id)
+rule=$(gori run project scope add --pattern=api.example.com --format json | jq .id)
+
+# One request per path, no session per path, status and headers only
+for p in /api/v1/items/{1..38}; do gori run send "https://api.example.com$p" --headers-only; done
+
+# curl's flags mean what they mean to curl: -d is the body, -b a cookie
+gori run send https://api.example.com/login -d 'user=a&pass=b' -b 'lang=en' --format json | jq '{status, error_kind, retryable}'
+
+# Fail a CI job on any finding of medium or worse (exit 3)
+gori run probe --fail-on medium
 ```
 
 ## Staying In Scope
@@ -86,7 +119,7 @@ When you fuzz a raw request with `--request` or STDIN and pass no `--project` / 
 
 ## Authenticated Sweeps
 
-Session bindings (`$SESSION` and friends) live in the memory of the gori process that observed them. They are never persisted, because a restored token is stale by construction. That is fine in the TUI, where one process holds both the send and the sweep that follows, but `gori run` is one-shot per process.
+Session bindings (`$BIND.SESSION` and friends) live in the memory of the gori process that observed them. They are never persisted, because a restored token is stale by construction. That is fine in the TUI, where one process holds both the send and the sweep that follows, but `gori run` is one-shot per process.
 
 `--bind-from FLOW-ID` closes the gap: it replays one captured flow first, so the response fills the bindings your fuzz, mine, sequence, or discover template reads in the same process.
 
@@ -115,8 +148,8 @@ whole extension surface, and it is the same primitive at four seams.
 gori run rewriter add --op=pipe --match=regex --part=body \
   --find='eyJ[A-Za-z0-9._-]+' --value='./resign.sh --key dev.pem'
 
-# Decode a base64 body, run it through your own parser, pretty-print the result.
-gori run decoder 'base64-decode > exec:./parse-envelope --json > json-pretty' "$BLOB"
+# Decode a base64 body and run it through your own parser.
+gori run decoder 'base64-decode > exec:./parse-envelope --json' "$BLOB"
 
 # Let a real detector decide, instead of a regex.
 gori run probe rules add --title 'envelope leak' --exec --pattern './detect-leak --stdin'
@@ -150,7 +183,10 @@ probe with a reason** rather than sending an unsigned request that the app would
 miner would then read as a clean negative. The timeout is the same `hooks.timeout_secs` budget,
 **per outbound request**, and a mine's request count is bounded by `--max-requests` and its own
 bucket/bisection/confirm tree, so the total hook cost is bounded with it. The miner is
-latency-bound (it counts round-trips), so a hook adds one fork-and-wait to each of them.
+latency-bound (it counts round-trips), so a hook adds one fork-and-wait to each of them. A hook
+is for a value your command can *compute*; a nonce or CSRF token the *server* hands out is fetched
+instead by a [request-time macro](/guide/repeater-and-fuzzer/#rotating-tokens-with-a-macro)
+(`--macro`), which replays a saved Repeater session before each probe.
 
 **Two things hooks are deliberately not wired into.** The MCP `decode` tool refuses an `exec:`
 step (saved chains included); it is exposed read-only and unbound, and stays pure compute; an
@@ -201,13 +237,14 @@ answerable in a script because there is no prompt.
 |------|------------|
 | Capture traffic in CI, headless | `capture` |
 | Query or export History (incl. HAR) | `history`, `show` |
+| Send one request, no session | `send` |
 | Replay and diff a request | `repeater`, `compare` |
 | Sweep payloads or hunt hidden params | `fuzz`, `mine` |
 | Crawl and brute-force endpoints | `discover`, `sitemap` |
 | Test access control across identities | `authorize` |
 | Scan and triage | `probe`, `issues`, `notes` |
 | Pure compute, no project needed | `decoder`, `jwt`, `cookie` |
-| Manage projects, scope, env, rules | `project`, `rewriter`, `colormarker` |
+| Manage projects, scope, env, network, rules | `project`, `rewriter`, `colormarker` |
 
 ## Next Steps
 

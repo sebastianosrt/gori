@@ -16,7 +16,7 @@ describe "Gori::Verbs.register_links" do
      "link.miner.attach"          => Gori::Verb::Scope::Miner,
     }.each do |id, scope|
       r[id].scope.should eq(scope)
-      r[id].menu_key.should eq('k')
+      r[id].menu_key.should eq('L') # the lexicon's :link, never the nav `k` (#1274)
       r[id].title.should eq("Link…")
       verb_intents(r, id).should eq([:link_attach])
     end
@@ -24,8 +24,32 @@ describe "Gori::Verbs.register_links" do
     ids = [] of String
     r.each { |d| ids << d.id if d.id.starts_with?("link.") }
     ids.sort.should eq(
-      ["link.fuzzer.attach", "link.history-detail.attach", "link.history.attach",
-       "link.miner.attach", "link.repeater.attach"])
+      ["link.fuzzer.attach", "link.history-detail.attach",
+       "link.history.attach", "link.miner.attach", "link.repeater.attach"])
+  end
+
+  it "has NO freeze twin any more — Link… freezes, and the picker says so per row" do
+    # The `Z` pair (#1038) is gone: offering both made the operator answer "pointer or
+    # bytes?" at the moment of filing, which is a question about the storage model asked
+    # while their attention is on the finding — and the answer was almost always "bytes".
+    # The remaining verb's DESCRIPTION has to carry that, because it is what the palette
+    # and the menu show before the card opens.
+    ids = [] of String
+    r.each { |d| ids << d.id if d.id.includes?("freeze") }
+    ids.should eq(["issue.freeze-link"]) # the RELATED row's `f`, which is a different act
+
+    r.each do |d|
+      d.title.should_not eq("Link & freeze…") if d.id.starts_with?("link.")
+    end
+    {"link.history.attach", "link.history-detail.attach", "link.repeater.attach"}.each do |id|
+      r[id].description.should contain("freezing")
+      r[id].menu_key.should eq('L')
+    end
+    # Not the Miner or the Fuzzer: a template plus a run is not one exchange
+    # (`Evidence.freezable?`), so their descriptions must not promise a copy.
+    {"link.miner.attach", "link.fuzzer.attach"}.each do |id|
+      r[id].description.should_not contain("freez")
+    end
   end
 
   it "gates on the LINK id, not the selection — a flow with no row cannot be linked" do

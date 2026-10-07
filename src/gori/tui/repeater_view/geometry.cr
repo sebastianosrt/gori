@@ -10,17 +10,6 @@ class Gori::Tui::RepeaterView
     Repeater::FlowRequest.parse_target(Env.expand(@target))
   end
 
-  # The TARGET card grows to a second content row (4 high vs 3) whenever an SNI
-  # override is set OR is being edited — so the override is always visible, and the
-  # input row only appears once you reach for it (^S).
-  private def sni_active? : Bool
-    !@sni.strip.empty? || (editing_sni? && @focus == :target)
-  end
-
-  private def target_card_h : Int32
-    sni_active? ? 4 : 3
-  end
-
   # The TARGET card row prefixes (marker + the field value 1 col to its right). Kept
   # as constants so render_target and the click→caret mapping agree on the value base.
   TARGET_PREFIX = "›"
@@ -35,22 +24,22 @@ class Gori::Tui::RepeaterView
     rect.x + 9
   end
 
-  # The TARGET band's `␣T` TLS-fingerprint chip label (#844). ONE definition, read by the
+  # The TARGET band's `␣Pt` TLS-fingerprint chip label (#844). ONE definition, read by the
   # draw and by the hit test — the two must invert each other exactly, and a chip whose label
   # width is computed twice is a click that lands on the wrong cell the first time the two
   # spellings drift (#839).
   #
-  # ALWAYS drawn, muted while nothing is set: it is the only thing on screen saying `␣T` has
+  # ALWAYS drawn, muted while nothing is set: it is the only thing on screen saying `␣Pt` has
   # anything to offer, and this band has no other home for the affordance. Deliberately does
   # NOT consult the target's SCHEME — that would put a `URI.parse` on every frame for a
   # question only the chip's COLOUR needs (`tls_preset_live?` asks it, and only when an
   # override is actually set).
   private def tls_chip_label : String
-    " ␣T:#{@tls_preset || "tls"} "
+    " #{menu_chip("repeater.cycle-tls-preset")}:TLS #{@tls_preset || "default"} "
   end
 
   # The TARGET band's right-to-left chrome after the READ/INS mode chip: the SNI marker, the
-  # `␣T` fingerprint chip, then the `^V` transport chip. Returns
+  # `␣Pt` fingerprint chip, then the `^V` transport chip. Returns
   # `{sni_x, tls_x, transport_right_edge}` — the first two nil when that piece is not shown or
   # does not fit. Pure geometry, shared by `render_target` and `chrome_hit`.
   #
@@ -76,8 +65,19 @@ class Gori::Tui::RepeaterView
     {sni_x, tls_x, edge}
   end
 
-  private def field_base(rect : Rect, prefix : String) : Int32
-    rect.x + 2 + prefix.size + 1
+  # Rows the request | response columns need before they are drawn at all: a card's two
+  # borders and one line inside them. A shorter strip is a card with nothing in it, which is
+  # what 17 rows used to draw (#1421).
+  COLUMNS_MIN_H = 3
+
+  # The rect under the TARGET card that the request | response columns split, or nil when it
+  # cannot hold them (`COLUMNS_MIN_H`). The ONE derivation: render, every hit-test and the
+  # focus fallback read it, so a click, a wheel or a keystroke can never act on a column the
+  # frame did not draw. It was spelled five times, each with its own `<= 0` floor.
+  private def columns_rect(rect : Rect) : Rect?
+    target_h = {rect.h, target_card_h}.min
+    content = Rect.new(rect.x, rect.y + target_h, rect.w, {rect.h - target_h, 0}.max)
+    content.h >= COLUMNS_MIN_H ? content : nil
   end
 
   # Inverts render's layout: a 3-row target band on top, then a half-width
@@ -86,8 +86,7 @@ class Gori::Tui::RepeaterView
     return nil unless @loaded && rect.contains?(mx, my)
     target_h = {rect.h, target_card_h}.min
     return :target if my < rect.y + target_h
-    content = Rect.new(rect.x, rect.y + target_h, rect.w, {rect.h - target_h, 0}.max)
-    return nil if content.h <= 0
+    content = columns_rect(rect) || return nil
     half = {(content.w - 1) // 2, 1}.max
     return :request if mx < content.x + half
     mx >= content.x + half + 1 ? :response : nil
@@ -124,9 +123,7 @@ class Gori::Tui::RepeaterView
   # The request half-pane (the whole left column, borders included) — render's own
   # derivation: the target band on top, then a half-width request|response split.
   private def request_col_rect(rect : Rect) : Rect?
-    target_h = {rect.h, target_card_h}.min
-    content = Rect.new(rect.x, rect.y + target_h, rect.w, {rect.h - target_h, 0}.max)
-    return nil if content.h <= 0
+    content = columns_rect(rect) || return nil
     half = {(content.w - 1) // 2, 1}.max
     Rect.new(content.x, content.y, half, content.h)
   end
@@ -208,9 +205,7 @@ class Gori::Tui::RepeaterView
   # The response half-pane (the whole right column, borders included) — render's own
   # derivation, factored out so the click, the drag and the wheel share it.
   private def response_col_rect(rect : Rect) : Rect?
-    target_h = {rect.h, target_card_h}.min
-    content = Rect.new(rect.x, rect.y + target_h, rect.w, {rect.h - target_h, 0}.max)
-    return nil if content.h <= 0
+    content = columns_rect(rect) || return nil
     half = {(content.w - 1) // 2, 1}.max
     Rect.new(content.x + half + 1, content.y, {content.w - half - 1, 1}.max, content.h)
   end

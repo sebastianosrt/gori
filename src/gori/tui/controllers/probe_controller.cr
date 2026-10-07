@@ -6,6 +6,7 @@ require "../../store"
 require "../../probe"
 require "../../settings"
 require "../../hotkeys"
+require "../../plural"
 
 module Gori::Tui
   # The Probe tab: the grouped scan-issue list + a per-issue detail (affected URLs,
@@ -28,6 +29,7 @@ module Gori::Tui
     def initialize(host : Host)
       super(host)
       @probe = ProbeView.new
+      @probe.set_registry(@host.session.registry)
       @probe.set_scope(@host.session.scope) # honour the lens + show its chip on the bar
       @rules = ProbeRulesView.new
       @sub_idx = 0 # 0 = Findings · 1 = Rules
@@ -54,6 +56,13 @@ module Gori::Tui
       @probe.detail_open? ? Verb::Scope::ProbeDetail : Verb::Scope::Probe
     end
 
+    # Display…'s row (#1295): whether dismissed and promoted issues are listed too.
+    def menu_state(verb_id : String) : String?
+      case verb_id
+      when "probe.toggle-closed" then SpaceMenu.on_off(@probe.show_closed?)
+      end
+    end
+
     # --- fixed sub-tab strip (no ^N/^W/rename) ---
     def subtab_labels : Array(String)
       SUBTABS
@@ -61,10 +70,6 @@ module Gori::Tui
 
     def subtab_index : Int32
       @sub_idx
-    end
-
-    def subtab_strip_shown? : Bool
-      true
     end
 
     def subtabs_fixed? : Bool
@@ -99,7 +104,19 @@ module Gori::Tui
     # the tab bar. The focus-ring hook — a `key.tab?` arm in `handle_body_key` never ran (the
     # Runner claims ⇥ for the ring first), so the `↹ preview` the hint promised was mouse-only.
     def pane_advance(dir : Int32) : Bool
-      return false if rules_tab? || @probe.detail_open? || !@probe.preview_enabled?
+      # An open detail walks its own two panes — AFFECTED URLS and DESCRIPTION — and never
+      # answers false. False is how a view hands focus to the tab bar, and `handle_body_key`'s
+      # detail arm below only ever runs with body focus, so one ⇥ would leave the detail fully
+      # drawn with every key dead (see `IssuesController#pane_advance`, the same trap). This
+      # arm SWALLOWED ⇥ while the detail held one pane; now there is somewhere for it to go.
+      #
+      # BEFORE the Rules-tab arm, not after: `move_subtab`/`jump_subtab` only move `@sub_idx`,
+      # so a detail opened on Findings is still open with Rules selected, and testing the
+      # sub-tab first handed that state the very answer the rest of this method exists to stop
+      # giving.
+      return @probe.step_detail_focus(dir) if @probe.detail_open?
+      return false if rules_tab?
+      return false unless @probe.preview_enabled?
       @probe.step_preview_focus(dir)
     end
 
@@ -110,7 +127,9 @@ module Gori::Tui
     end
 
     def body_badge : Symbol
-      :body # read-only/navigable list + detail (no inline text editor)
+      # No inline text editor anywhere in this tab, so the only split is list vs drill-in.
+      # `rules_tab?` has no detail of its own — its editor is a modal.
+      !rules_tab? && @probe.detail_open? ? :detail : :body
     end
 
     def body_hint(focus : Symbol) : String
@@ -136,28 +155,45 @@ module Gori::Tui
         #
         # `esc sub-tabs`, not `esc tabs`: escape goes to the strip (handle_body_key), and the
         # strip is always shown here, so `focus_pane` never downgrades it to the tab bar.
+        return @rules.filter.hint if @rules.filter.editing?
         edits = rules_custom_selected? ? " · ↵/e edit · {probe-rules.delete} delete" : ""
-        return keys("↑/↓ select · {probe-rules.toggle} on/off · {probe-rules.add} add#{edits} · space cmds · ↑ sub-tabs · esc sub-tabs")
+        return keys("↑/↓ select · {probe-rules.toggle} on/off · {probe-rules.add} add#{edits} · {probe-rules.filter} filter · space cmds · ↑ sub-tabs · esc sub-tabs")
       elsif @probe.detail_open?
-        # `↵ open` and `o flow` are two different destinations and both belong here — the
-        # caret's own affected URL, and the issue's sample evidence. The Issues detail names
-        # the same pair for the same reason (`↵ open` over its related links, `o flow`).
-        keys("↑/↓ URL · ↵ open · ⇧arrows select · {probe.copy} copy · {probe.open-flow} flow · {probe.repeater-flow} repeater · {probe.promote} promote · space cmds · ←/esc back")
+        # Two panes now, and they do not offer the same keys, so the hint splits with them.
+        # DESCRIPTION has no `↵` (there is no URL under the caret to open — `affected_url`
+        # answers nil there, which is what gates the verb) and its rows are wrapped prose
+        # rather than URLs, so naming "↑/↓ URL" over it would be the confident lie this line
+        # exists to avoid.
+        # Dropped whole when there is nowhere to step — see DrillIn::Host's `step_available?`.
+        step = @probe.step_available? ? "{probe.next-item}/{probe.prev-item} finding · " : ""
+        if @probe.desc_focused?
+          keys("↑/↓ read · ⇧arrows select · {probe.copy} copy · #{step}↹ urls · space cmds · ←/esc back")
+        else
+          # `↵ open` and `o flow` are two different destinations and both belong here — the
+          # caret's own affected URL, and the issue's sample evidence. The Issues detail names
+          # the same pair for the same reason (`↵ open` over its related links, `o flow`).
+          keys("↑/↓ URL · ↵ open · ⇧arrows select · {probe.copy} copy · #{step}{probe.open-flow} source · {probe.repeater-flow} repeater · ↹ description · space cmds · ←/esc back")
+        end
       elsif @probe.querying?
-        "type to filter · ↹ complete · ↵ apply · esc clear"
+        "type to filter · ↹ complete · ↓ list · ? reference · ↵ apply · esc clear"
       elsif @probe.mode.off?
         "#{mode} enable scanning · #{filt} filter · #{clear} clear · space cmds · esc tabs"
       elsif @probe.preview_enabled? && @probe.preview_focus == :preview
         "↑/↓ scroll preview · ↹ list · ↵ open full · #{clear} clear · space cmds · esc tabs"
       elsif @probe.preview_enabled?
-        "↑/↓ move · ↵ open · ↹ preview · #{clear} clear · #{mode} mode · #{filt} filter · space cmds"
+        "↑/↓ move · ↵ open · ↹ preview · #{clear} clear · #{mode} mode · #{filt} filter · space cmds · esc tabs"
       else
-        keys("↑/↓ move · ↵ open · {probe.open-evidence} flow · {probe.repeater-evidence} repeater · {probe.promote-selected} promote · {probe.dismiss-selected} dismiss · {probe.delete-selected} delete · #{clear} clear · #{mode} mode · #{filt} filter · space cmds")
+        # `esc tabs` — `probe.leave` is `focus_pane(:menu)`, the same destination the two
+        # shorter branches above already name. These two were the FINDINGS lines that did
+        # not, so the only two states an operator sits in for any length of time were the two
+        # with no exit on them. It rides the end, after the keys that clip first.
+        keys("↑/↓ move · ↵ open · {probe.open-evidence} source · {probe.repeater-evidence} repeater · {probe.promote-selected} promote · {probe.dismiss-selected} dismiss · {probe.delete-selected} delete · #{clear} clear · #{mode} mode · #{filt} filter · space cmds · esc tabs")
       end
     end
 
     def render_body(screen : Screen, rect : Rect, focus : Symbol) : Nil
       focused = focus == :body
+      @probe.step_keys = step_key_labels if @probe.detail_open?
       shell = BodyChrome.shell_focused(focus, multi_pane: false)
       @subtab_start = BodyChrome.framed_body(screen, rect, shell, focus == :subtabs, SUBTABS, @sub_idx, @subtab_start,
         find: subtab_find_shown?, find_lit: @host.subtab_find_focused?, marked: marked_chip_set) do |content|
@@ -165,10 +201,19 @@ module Gori::Tui
           @rules.render(screen, content, focused)
         else
           proxy = @host.session.proxy
+          @probe.sync_preview(@host.session.store) # the preview's URLs, only when the cursor moved
           @probe.render(screen, content, focused: focused,
             listen: {proxy.host, proxy.port}, capturing: @host.session.capturing?)
         end
       end
+    end
+
+    # The effective chords for the item step — see HistoryController#step_key_labels for why
+    # each half is read from its own verb rather than derived from the other.
+    private def step_key_labels : {String, String}
+      reg = @host.session.registry
+      {Hotkeys.binding_label(reg, "probe.next-item", DrillIn::NEXT_KEY),
+       Hotkeys.binding_label(reg, "probe.prev-item", DrillIn::PREV_KEY)}
     end
 
     def handle_click(rect : Rect, mx : Int32, my : Int32) : Bool
@@ -189,9 +234,29 @@ module Gori::Tui
         return true
       end
       if @probe.detail_open?
+        rail = @probe.rail_rect(content)
+        body = @probe.detail_body_rect(content)
+        # A rail row: open THAT finding, staying in the drill-in. The rail shows the list, so
+        # a click on it means what a click on the list means.
+        if i = DrillIn.rail_row_at(rail, mx, my)
+          @host.focus_body
+          probe_step_item(i - @probe.rail_cursor)
+          return true
+        end
+        # The crumb's `‹` — a real button now. Ahead of the pane hit-test, because it rides a
+        # row nothing else in the drill-in claims (the frame's top edge, or the rail's
+        # divider) and because "leave" must win over any stray column that also matches.
+        if (c = @probe.detail_crumb) && Frame.crumb_hit_rect(body, c).try(&.contains?(mx, my))
+          # Focus first, like the rail branch above and like History's and Issues' crumbs:
+          # with the tab bar holding the keyboard, returning to the list without taking it
+          # left ↑/↓ switching TABS over a list that looked focused.
+          @host.focus_body
+          probe_close
+          return true
+        end
         # The AFFECTED URLS list takes a caret from the pointer; the rest of the card is chrome.
         @host.focus_body
-        @probe.detail_click(content, mx, my)
+        @probe.detail_click(body, mx, my)
         return true
       end
       @host.focus_body
@@ -232,7 +297,7 @@ module Gori::Tui
       if @probe.preview_enabled? && @probe.preview_at?(content, mx, my)
         @probe.wheel_preview(step)
       else
-        @probe.move(step)
+        @probe.move_list(step)
       end
       true
     end
@@ -250,6 +315,11 @@ module Gori::Tui
 
     # Detail scroll + list preview Tab focus. List nav is verb-driven; when detail is
     # closed we claim Tab (preview) only. When open, ↑/↓ scroll the detail pane.
+    # The findings `/` query bar.
+    def body_takes_text? : Bool
+      querying? || list_filter_editing?
+    end
+
     def handle_body_key(ev : Termisu::Event::Key) : Bool
       key = ev.key
       if rules_tab?
@@ -267,6 +337,7 @@ module Gori::Tui
       end
       return false if ev.ctrl? || ev.alt?
       if @probe.detail_open?
+        return true if detail_cross_pane(ev)
         case
         when key.up?, key.lower_k?   then @probe.detail_move(-1, ev.shift?)
         when key.down?, key.lower_j? then @probe.detail_move(1, ev.shift?)
@@ -277,32 +348,63 @@ module Gori::Tui
       false
     end
 
+    # ↓ off the last AFFECTED URL, ↑ off the first DESCRIPTION row — the two edges where the
+    # key had nowhere else to go and so did nothing at all. ⇥ is the ring, but nobody reaches
+    # for ⇥ at the bottom of a list; they press ↓ again. Mirrors the crossings
+    # `IssuesController` gained between RELATED and NOTES.
+    #
+    # BARE presses only. A ⇧arrow is a selection gesture — handing it to the other pane would
+    # abandon the selection mid-extend — and `LineEdit`'s modified arrows are word motions.
+    # `j`/`k` are deliberately NOT crossings: they are the vim aliases for a step within a
+    # pane, and a `j` that silently changed which pane `y` copies would be the surprise this
+    # is meant to remove.
+    private def detail_cross_pane(ev : Termisu::Event::Key) : Bool
+      return false if ev.shift? || ev.ctrl? || ev.alt?
+      key = ev.key
+      if key.down? && !@probe.desc_focused? && @probe.affected_at_bottom?
+        @probe.focus_desc!
+        return true
+      end
+      if key.up? && @probe.desc_focused? && @probe.desc_at_top?
+        @probe.focus_affected!
+        return true
+      end
+      false
+    end
+
     # The `/` filter bar — a text sub-mode the shell claims before the focus ring (mirrors
     # Issues). Live filtering: every edit re-derives the visible list inside the view.
     def handle_query_key(ev : Termisu::Event::Key) : Bool
-      key = ev.key
-      c = ev.char || key.to_char
-      case
-      when key.enter?                  then @probe.stop_query
-      when key.escape?                 then @probe.cancel_query
-      when key.tab?                    then @probe.query_complete
-      when (act = LineEdit.action(ev)) then @probe.query_edit(act) # ⌃/⌥←→, Home/End, Delete, ⌥⌫ — before plain ⌫, which would swallow ⌥⌫
-      when key.backspace?              then @probe.query_backspace
-      when key.left?                   then @probe.query_move(-1)
-      when key.right?                  then @probe.query_move(1)
-      else
-        if c && !ev.ctrl? && !ev.alt?
-          @probe.query_insert(c)
-          @probe.query_set_preedit("")
-        end
-      end
-      true
+      handle_ql_bar_key(ev, @probe, :probe) { query_escape }
+    end
+
+    # esc closes the dropdown first, so opening the list to look at it never costs the typed
+    # query.
+    private def query_escape : Nil
+      return @probe.popup_close if @probe.popup_open?
+      @probe.cancel_query
     end
 
     def set_preedit(text : String) : Bool
+      return @rules.filter.set_preedit(text) if rules_tab?
       return false unless @probe.querying?
       @probe.query_set_preedit(text)
       true
+    end
+
+    # The RULES sub-tab's own `/` bar — the shared `RowFilter`, not the FINDINGS QL bar above.
+    # Three sections and ~40 rules, and the only way to reach one was to scroll past the other
+    # two.
+    def list_filter_editing? : Bool
+      rules_tab? && @rules.filter.editing?
+    end
+
+    def handle_list_filter_key(ev : Termisu::Event::Key) : Bool
+      @rules.handle_filter_key(ev)
+    end
+
+    def rules_filter : Nil
+      @rules.filter.start
     end
 
     def querying? : Bool
@@ -313,12 +415,26 @@ module Gori::Tui
       refresh_from_store
     end
 
+    # data_version moved: a commit landed — this process's own (a capture, every ~750 ms while
+    # capturing, or the intercept heartbeat) or a peer's. The finding list is re-read only when
+    # it actually moved (the fingerprint is what sees a peer's write); everything else on the
+    # tab is cheap and is refreshed on every commit, as before.
+    #
+    # A moved list takes the same spacing as the tick paths: during an active scan this tick
+    # and the generation poll see the same stream of writes. A peer's change that has to wait
+    # is remembered by the view (`issues_moved?` is sticky until a reload), so the poll lands it.
     def on_external_change : Nil
-      refresh_from_store
+      store = @host.session.store
+      if @probe.issues_moved?(store, peers: true)
+        reloaded, _ = refresh_if_moved
+        return if reloaded
+      end
+      @probe.reload_meta(store)
+      @rules.reload(store)
     end
 
-    # Re-query the issue list from the store. Called from on_enter, data_version
-    # soft-sync, IssueEvent drain, and Runner's per-tick Store#probe_generation poll.
+    # Re-query the issue list from the store, unconditionally. Called from on_enter, and by
+    # the two gated paths below once they know the list moved.
     # Returns whether the number of listed rows CHANGED. The caller uses that to decide
     # between a full terminal repaint and the cell diff: a row added or removed can leave a
     # stale tail the diff will not repair, but a row whose contents merely changed cannot.
@@ -329,6 +445,29 @@ module Gori::Tui
       @rules.reload(store)
       @probe.row_count != before
     end
+
+    # The live-refresh paths — the IssueEvent drain and the Runner's per-tick
+    # `probe_generation` poll. Both fire for the SAME commit (the analyzer bumps the generation
+    # and then sends its event), and the data_version tick is a third signal for it, so each
+    # used to re-read the whole list: up to three reloads per tick for one write. At most one
+    # reload per generation now. Returns {reloaded, row count changed}.
+    #
+    # And at most one per RELOAD_SPACING: an active scan commits a finding nearly every tick,
+    # and a reload per tick is a list read per 50 ms on the fiber the proxy shares. The first
+    # change after a quiet spell still lands at once (leading edge); the rest wait for the
+    # spacing, and because the Runner calls this every tick while the tab is up, the last one
+    # lands on the first tick past it (trailing edge) — no final state is ever dropped.
+    def refresh_if_moved(now : Time::Instant = Time.instant) : {Bool, Bool}
+      return {false, false} unless @probe.issues_moved?(@host.session.store)
+      if (at = @probe.loaded_at) && now - at < RELOAD_SPACING
+        return {false, false}
+      end
+      {true, refresh_from_store}
+    end
+
+    # See `refresh_if_moved`. Well under the data_version cadence (750 ms), and short enough
+    # that a list under an active scan still reads as live.
+    RELOAD_SPACING = 500.milliseconds
 
     # Drain the analyzer's events (called each main-loop tick from the Runner).
     # List data is primarily refreshed via Runner's Store#probe_generation poll
@@ -376,17 +515,12 @@ module Gori::Tui
           @host.status("Probe: #{ev.message}") if Settings.notify_toast?
         end
       end
-      refresh_from_store if needs_refresh && @host.active_tab == :probe
+      refresh_if_moved if needs_refresh && @host.active_tab == :probe
       drained
     end
 
     private def nonblocking_event(ch : Channel(Probe::Event)) : Probe::Event?
-      select
-      when e = ch.receive
-        e
-      else
-        nil
-      end
+      poll(ch)
     rescue Channel::ClosedError
       nil
     end
@@ -410,8 +544,22 @@ module Gori::Tui
       @probe.close_detail
     end
 
-    def probe_query : Nil
-      @probe.start_query
+    # `⇧N`/`⇧P` inside the drill-in: open the next/previous finding WITHOUT going back to the
+    # list. See HistoryController#detail_step_item for why the step exists at all. Nothing to
+    # persist here — this detail is read-only.
+    def probe_step_item(delta : Int32) : Nil
+      return unless @probe.detail_open?
+      # Anchored on the finding the detail HAS OPEN, and clamped BEFORE the list is touched —
+      # see IssuesController#issue_step_item for both.
+      here = @probe.detail_row_index || return
+      target = here + delta
+      return if target < 0 || target >= @probe.row_count
+      desc = @probe.desc_focused?
+      # `select_index`, not `move`: `move` routes to the PREVIEW pane whenever that side holds
+      # focus, and its focus survives opening the detail. A step would scroll a hidden pane.
+      @probe.select_index(target)
+      probe_open
+      @probe.focus_desc! if desc
     end
 
     def probe_delete : Nil
@@ -446,9 +594,10 @@ module Gori::Tui
     def probe_dismiss : Nil
       return unless @probe.target_issue
       st = @probe.toggle_dismiss(@host.session.store)
+      return @host.status("issue no longer exists") unless st
       # A synchronous user action → transient toast (the list updates in place too),
       # matching the rest of the app; the notification center is for async events.
-      @host.status(st.try(&.open?) ? "issue re-opened" : "issue dismissed")
+      @host.status(st.open? ? "issue re-opened" : "issue dismissed")
     end
 
     # `a`: flip the open-only ⇄ show-closed lens.
@@ -486,11 +635,11 @@ module Gori::Tui
       @host.confirm("DISMISS GROUP", "Dismiss all open issues on #{host}?", confirm_label: "dismiss", danger: false) do
         n = ProbeController.dismiss_open_by_host(@host.session.store, host)
         @probe.reload(@host.session.store)
-        @host.status("dismissed #{n} issue#{n == 1 ? "" : "s"} on #{host}")
+        @host.status("dismissed #{Gori.plural(n, "issue")} on #{host}")
       end
     end
 
-    # Mute every OPEN issue carrying `code`, honouring the ⇧S scope lens exactly as the
+    # Mute every OPEN issue carrying `code`, honouring the `s` scope lens exactly as the
     # visible list does: dismissing "all with this code" from a scoped view must not silently
     # mute issues on out-of-scope hosts the operator cannot see, and the returned count must
     # equal what was actually muted.
@@ -503,7 +652,7 @@ module Gori::Tui
     # rather than a number of rows it merely attempted.
     def self.dismiss_open_by_code(store : Store, scope : Scope?, code : String) : Int32
       lens = scope.try(&.active?) == true ? scope : nil
-      targets = store.probe_issues.select do |i|
+      targets = store.probe_issue_rows.select do |i|
         i.code == code && i.status.open? && (lens.nil? || lens.host_in_scope?(i.host))
       end
       targets.count { |i| store.update_probe_issue_status(i.id, Store::Status::FalsePositive) }
@@ -730,9 +879,16 @@ module Gori::Tui
       !rules_tab? && @probe.detail_open?
     end
 
+    # The DETAIL's rect inside the drill-in. `content_rect` alone stopped being the answer
+    # once the list rail could sit above it, and every detail hit-test here measures against
+    # THIS — a pane drawn under the rail and clicked as though it were not there is dead.
+    private def detail_inner(rect : Rect) : Rect
+      @probe.detail_body_rect(BodyChrome.content_rect(rect, strip: true))
+    end
+
     def handle_drag(rect : Rect, mx : Int32, my : Int32) : Nil
       return unless supports_drag?
-      @probe.detail_click(BodyChrome.content_rect(rect, strip: true), mx, my, selecting: true)
+      @probe.detail_click(detail_inner(rect), mx, my, selecting: true)
     end
 
     # RULES: a pair on a row opens its editor — what ↵ / `e` (`probe-rules.edit`) do, and the
@@ -751,7 +907,7 @@ module Gori::Tui
         return true
       end
       return false unless supports_drag?
-      @probe.detail_select_word(content, mx, my)
+      @probe.detail_select_word(detail_inner(rect), mx, my)
     end
 
     # --- READ-pane delegators (the detail's read verbs + the Runner's read_* ladders) ---
@@ -765,19 +921,19 @@ module Gori::Tui
       @probe.affected_url
     end
 
-    def probe_detail_selection_active? : Bool
+    def selection_active? : Bool
       @probe.detail_selection?
     end
 
-    def probe_detail_selection_text : String
+    def selection_text : String
       @probe.detail_copy_text
     end
 
-    def probe_detail_select_line : Nil
+    def select_line : Nil
       @probe.detail_select_line
     end
 
-    def probe_detail_clear_selection : Nil
+    def clear_selection : Nil
       @probe.detail_clear_selection
     end
 
@@ -789,7 +945,9 @@ module Gori::Tui
     # under the cursor as a report line with its affected URLs beneath (#964's shape).
     def probe_copy : Nil
       return probe_detail_copy if probe_detail_readable?
-      return unless (issue = @probe.selected_issue) && probe_issue_selected?
+      return unless @probe.selected_issue && probe_issue_selected?
+      # The list row carries only the URL COUNT; the copy wants the URLs, read fresh by id.
+      return @host.status("issue no longer exists") unless issue = @probe.fresh_target_issue(@host.session.store)
       head = "[#{issue.severity}] #{issue.title} · #{issue.host}"
       copy_text(issue.affected.empty? ? head : "#{head}\n#{issue.affected.join('\n')}", "issue")
     end
@@ -801,9 +959,7 @@ module Gori::Tui
       sel = @probe.detail_selection?
       text = sel ? @probe.detail_copy_text : @probe.detail_copy_all
       return if text.empty?
-      written = Clipboard.copy(text)
-      note = Clipboard.note(written, text)
-      @host.status(sel ? "copied #{written}b to clipboard#{note}" : "copied all (#{written}b)#{note}")
+      copy_text(text, sel ? nil : "all")
     end
   end
 end

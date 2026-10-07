@@ -1,5 +1,6 @@
 require "../spec_helper"
 require "../support/memory_backend"
+require "../support/tui_contract"
 
 private def rules_store(&)
   path = File.tempname("gori-rulesview", ".db")
@@ -39,7 +40,8 @@ describe Gori::Tui::ProbeRulesView do
     rules_store do |store|
       view = Gori::Tui::ProbeRulesView.new
       view.reload(store)
-      ["Blind SSRF (out-of-band)", "Blind OS command injection (out-of-band)", "XML external entity (out-of-band)"].each do |title|
+      ["Blind SSRF (out-of-band)", "Blind OS command injection (out-of-band)", "XML external entity (out-of-band)",
+       "Remote file inclusion (out-of-band)"].each do |title|
         row = find_row(view, title).not_nil!
         row.enabled?.should be_true # ships enabled — nothing to opt into
         row.note.should eq("needs OAST")
@@ -51,6 +53,7 @@ describe Gori::Tui::ProbeRulesView do
       find_row(view, "Blind SSRF (out-of-band)").not_nil!.note.should eq("")
       find_row(view, "Blind OS command injection (out-of-band)").not_nil!.note.should eq("")
       find_row(view, "XML external entity (out-of-band)").not_nil!.note.should eq("")
+      find_row(view, "Remote file inclusion (out-of-band)").not_nil!.note.should eq("")
     end
   end
 
@@ -80,6 +83,59 @@ describe Gori::Tui::ProbeRulesView do
       view.render(Gori::Tui::Screen.new(backend), Gori::Tui::Rect.new(0, 0, 80, 40), true)
       active_hdr = (0...40).map { |y| backend.row(y) }.find { |line| line.includes?("ACTIVE RULES") }.not_nil!
       active_hdr.should contain("req/flow enabled")
+    end
+  end
+
+  # The `/` bar (key audit, finding 2b). ~40 built-ins across three sections had no way to
+  # narrow at all — the one list in the app most in need of the key eleven others already
+  # bind. A LENS: nothing here writes, and `reload` rebuilds the source either way.
+  it "narrows the list to matching rules, and drops a section whose rows all went" do
+    rules_store do |store|
+      view = Gori::Tui::ProbeRulesView.new
+      view.reload(store)
+      before = all_rows(view).size
+      before.should be > 20
+
+      view.filter.start
+      view.filter.editing?.should be_true
+      "cors".each_char { |ch| view.handle_filter_key(TuiContract.plain(ch)) }
+      view.@filter.active?.should be_true
+
+      rows = all_rows(view)
+      rows.size.should be > 0
+      rows.size.should be < before
+      rows.each do |row|
+        "#{row.title} #{row.meta} #{row.note} #{row.desc} #{row.rule_id}".downcase.should contain("cors")
+      end
+
+      backend = MemoryBackend.new(100, 30)
+      view.render(Gori::Tui::Screen.new(backend), Gori::Tui::Rect.new(0, 0, 100, 30), true)
+      body = (0...30).map { |y| backend.row(y) }.join("\n")
+      backend.row(0).should contain("filter") # the bar takes the card's top row while shown
+      # A header with nothing under it would read as a broken list rather than an empty one:
+      # this project has no custom rules, so that section must not be drawn at all.
+      body.should_not contain("CUSTOM RULES")
+
+      # esc clears it and the whole list is back.
+      view.handle_filter_key(TuiContract.key(Termisu::Input::Key::Escape))
+      view.@filter.active?.should be_false
+      all_rows(view).size.should eq(before)
+    end
+  end
+
+  it "keeps the cursor on the same rule across a narrowing" do
+    rules_store do |store|
+      view = Gori::Tui::ProbeRulesView.new
+      view.reload(store)
+      target = all_rows(view).find(&.title.downcase.includes?("cors")).not_nil!
+      view.move(-1000)
+      while view.selected_row.try(&.rule_id) != target.rule_id
+        view.move(1)
+      end
+
+      view.filter.start
+      "cors".each_char { |ch| view.handle_filter_key(TuiContract.plain(ch)) }
+      view.selected_row.not_nil!.rule_id.should eq(target.rule_id)
     end
   end
 

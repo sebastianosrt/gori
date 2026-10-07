@@ -40,9 +40,8 @@ module Gori
         insecure = false
         timeout : Time::Span? = nil
         format = :text
-        url : String? = nil
 
-        parser = OptionParser.new do |p|
+        url = one_positional(args, "gori run grpc reflect", "URL") do |p|
           p.banner = "Usage: gori run grpc reflect URL\n\n" \
                      "Ask a gRPC target's server-reflection service for its descriptors and cache\n" \
                      "them in the project. `grpc.reflection.v1` is tried first, `v1alpha` second.\n" \
@@ -54,17 +53,11 @@ module Gori
           p.on("--allow-unscoped", "Send even when the target is outside the project scope") { allow_unscoped = true }
           p.on("-k", "--insecure-upstream", "Do not verify the upstream TLS certificate") { insecure = true }
           p.on("--timeout=SECONDS", "Per-operation timeout (default: the project's io timeout)") do |v|
-            n = v.to_f?
-            abort "gori run grpc reflect: invalid --timeout '#{v}'" if n.nil? || n <= 0
-            timeout = n.seconds
+            timeout = grpc_timeout(v) || abort("gori run grpc reflect: invalid --timeout '#{v}'")
           end
-          p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| url = one_positional(before, after, "gori run grpc reflect", "URL") }
-          p.invalid_option { |f| abort "gori run grpc reflect: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run grpc reflect: missing value for #{f}" }
+          format_flag(p, [:text, :json], "Output: text (default) | json") { |f| format = f }
         end
-        parser.parse(args)
+        refresh_verify_upstream(!insecure)
 
         raw = url
         abort "gori run grpc reflect: a target URL is required (e.g. https://api.test:443)" if raw.nil? || raw.empty?
@@ -74,11 +67,17 @@ module Gori
         # The gate first, and its store separately from the one the cache is written through:
         # `project_outbound` hands its READ connection to the Outbound so the scope keeps
         # reloading, and that connection cannot take the write.
-        outbound = project_outbound(project_name, db_path, allow_unscoped)
+        #
+        # The project is resolved ONCE: the scope that gates the fetch and the project the
+        # schema is cached into must be the same one, not two reads of "most recently active".
+        project = resolve_read_project(project_name, db_path)
+        outbound = project_outbound(project, allow_unscoped)
+        # Routed as `repeater send` and `send` route: by the resolved project's overrides, named
+        # or defaulted — a defaulted one used to dial real DNS and cache that answer into it.
+        overrides = (with_store(project, read_only: true) { |store| Gori::HostOverrides.load(store) } rescue nil)
         client = Gori::Protobuf::Reflection::Client.new(outbound,
           scheme: parts.scheme, host: parts.host, port: parts.port,
-          verify: !insecure, timeout: timeout,
-          overrides: cli_host_overrides(project_name, db_path, nil))
+          verify: !insecure, timeout: timeout, overrides: overrides)
         outcome = begin
           client.fetch
         ensure
@@ -96,12 +95,9 @@ module Gori
         # the condition worth avoiding), and there is nothing to write on that path anyway.
         committed = true
         if (set = outcome.descriptor_set) && outcome.ok?
-          store = open_store(resolve_read_project(project_name, db_path))
-          begin
+          with_store(project) do |store|
             committed = Gori::Protobuf::Schemas.adopt(store, client.target, outcome.service,
               outcome.services.size, outcome.files, set)
-          ensure
-            store.close
           end
         end
 
@@ -134,31 +130,38 @@ module Gori
           puts "schema: #{Gori::Protobuf::Schemas.status}"
           puts "  ! not saved (project busy); it reverts when you reopen this project" unless committed
         end
-        exit(outcome.ok? ? 0 : 1)
+        # The cached reflection is this one-shot process's only lasting effect, so a write that
+        # did not commit fails the command (as `probe --persist` does), whatever it fetched.
+        exit(outcome.ok? && committed ? 0 : 1)
+      end
+
+      # A positive timeout that Time::Span can represent, or nil for a clean usage refusal.
+      # `String#to_f?` accepts NaN and infinities, and `Float64#seconds` raises OverflowError
+      # for those and for a finite value outside Time::Span's range. That exception otherwise
+      # escapes both CLI rescue layers and prints a Crystal backtrace for ordinary argv.
+      def self.grpc_timeout(v : String) : Time::Span?
+        n = v.to_f?
+        return nil unless n && n.finite? && n > 0
+        span = n.seconds
+        span > Time::Span.zero ? span : nil
+      rescue OverflowError
+        nil
       end
 
       private def self.cmd_grpc_schema(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         format = :text
-        leftover = [] of String
 
-        parser = OptionParser.new do |p|
+        leftover = parse_args(args, "gori run grpc schema") do |p|
           p.banner = "Usage: gori run grpc [schema]\n\n" \
                      "What .proto schema this project has loaded, and where each piece came from —\n" \
                      "a descriptor-set file, or a reflection fetch against a target.\n\n" \
                      "Or run with a subcommand:\n" \
                      "  gori run grpc reflect URL   fetch descriptors by server reflection (ACTIVE)\n" \
                      "  gori run grpc forget TARGET drop a cached reflection result (`rm` is accepted)"
-          p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
-          p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| leftover = before + after }
-          p.invalid_option { |f| abort "gori run grpc schema: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run grpc schema: missing value for #{f}" }
+          project_options(p, proj, "read")
+          format_flag(p, [:text, :json], "Output: text (default) | json") { |f| format = f }
         end
-        parser.parse(args)
         # The flag-first route (`gori run grpc --project=X reflect …`) hands the READ command
         # the verb it discarded. Refusing it is what keeps a mutation from no-op'ing with a
         # success status — the twelfth-plus caller of the seam that exists for exactly that.
@@ -166,8 +169,8 @@ module Gori
 
         # `open_store` already published this project's schema (`Schemas.load_project`), so
         # what is printed here is exactly what every other surface renders through.
-        store = open_store(resolve_read_project(project_name, db_path), read_only: true)
-        reflections = store.grpc_reflections
+        store = open_store(resolve_read_project(proj.name, proj.db), read_only: true)
+        reflections = Gori::Protobuf::Schemas.reflections(store)
         store.close
 
         sources = Gori::Protobuf::Schemas.sources
@@ -229,9 +232,8 @@ module Gori
         db_path : String? = nil
         project_name : String? = nil
         all = false
-        target : String? = nil
 
-        parser = OptionParser.new do |p|
+        target = one_positional(args, "gori run grpc forget", "TARGET") do |p|
           p.banner = "Usage: gori run grpc forget TARGET | --all\n\n" \
                      "Drop a cached reflection result. TARGET is the value `gori run grpc schema`\n" \
                      "prints (scheme://host:port). Nothing else is touched — a descriptor-set FILE\n" \
@@ -239,12 +241,7 @@ module Gori
           p.on("--project=NAME", "Project to use (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file") { |v| db_path = v }
           p.on("--all", "Forget every cached reflection target") { all = true }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| target = one_positional(before, after, "gori run grpc forget", "TARGET") }
-          p.invalid_option { |f| abort "gori run grpc forget: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run grpc forget: missing value for #{f}" }
         end
-        parser.parse(args)
 
         chosen = target
         if all
@@ -253,21 +250,20 @@ module Gori
           abort "gori run grpc forget: a TARGET (or --all) is required" if chosen.nil? || chosen.empty?
         end
 
-        store = open_store(resolve_read_project(project_name, db_path))
-        begin
-          known = store.grpc_reflections.map(&.target)
+        committed = with_store(resolve_read_project(project_name, db_path)) do |store|
+          known = Gori::Protobuf::Schemas.reflections(store).map(&.target)
           if (t = chosen) && !known.includes?(t)
             # A typo'd target must not print "forgotten" — that reads as "the schema is gone"
             # while the lens is still in place.
             abort "gori run grpc forget: no cached reflection for '#{t}'#{known.empty? ? "" : " (have: #{known.join(", ")})"}"
           end
-          committed = Gori::Protobuf::Schemas.forget(store, chosen)
+          saved = Gori::Protobuf::Schemas.forget(store, chosen)
           puts chosen ? "forgot #{chosen}" : "forgot #{known.size} reflected target(s)"
           puts "schema: #{Gori::Protobuf::Schemas.status}"
-          puts "  ! not saved (project busy); it comes back when you reopen this project" unless committed
-        ensure
-          store.close
+          puts "  ! not saved (project busy); it comes back when you reopen this project" unless saved
+          saved
         end
+        exit 1 unless committed
       end
     end
   end

@@ -57,7 +57,7 @@ describe Gori::Probe::Active do
   it "builds a canary probe from existing query params and detects reflection" do
     with_store do |store|
       detail = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/search?q=hello", content_type: nil)
-      plan = Gori::Probe::Active.plan(detail).not_nil!
+      plan = Gori::Probe::Active::PRIMARY.plan(detail).not_nil!
       plan.params.size.should eq(1)
       plan.params.first.name.should eq("q")
       canary = plan.params.first.canary
@@ -65,12 +65,12 @@ describe Gori::Probe::Active do
 
       reflected = Gori::Repeater::Result.new(
         "HTTP/1.1 200 OK\r\n\r\n".to_slice, "<p>you searched #{canary}</p>".to_slice, nil, 1_i64)
-      dets = Gori::Probe::Active.detections(plan, reflected, detail)
+      dets = Gori::Probe::Active::PRIMARY.detections(plan, reflected, detail)
       dets.size.should eq(1)
       dets.first.code.should eq("reflected_param")
 
       not_reflected = Gori::Repeater::Result.new("HTTP/1.1 200 OK\r\n\r\n".to_slice, "<p>nothing</p>".to_slice, nil, 1_i64)
-      Gori::Probe::Active.detections(plan, not_reflected, detail).should be_empty
+      Gori::Probe::Active::PRIMARY.detections(plan, not_reflected, detail).should be_empty
     end
   end
 
@@ -112,7 +112,7 @@ describe Gori::Probe::Active do
   it "has no probe for a request without parameters" do
     with_store do |store|
       detail = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/static/app.js", content_type: nil)
-      Gori::Probe::Active.plan(detail).should be_nil
+      Gori::Probe::Active::PRIMARY.plan(detail).should be_nil
     end
   end
 
@@ -122,7 +122,7 @@ describe Gori::Probe::Active do
       # the origin, so its request line must be origin-form (some origins reject absolute-form).
       detail = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", scheme: "http", host: "target.com",
         target: "http://target.com/search?q=hello", content_type: nil)
-      plan = Gori::Probe::Active.plan(detail).not_nil!
+      plan = Gori::Probe::Active::PRIMARY.plan(detail).not_nil!
       line = String.new(plan.request).each_line.first
       line.should start_with("GET /search?q=")
       line.should_not contain("http://target.com")
@@ -171,6 +171,29 @@ describe Gori::Probe::Active do
           target: c[:target], method: c[:method], req_headers: c[:rh], req_body: c[:rb], content_type: nil)
         reflected.dedup_key(d).should eq(reflected.plan(d).try(&.dedup_key)), "reflected_param #{c[:target]} #{c[:method]}"
         cors.dedup_key(d).should eq(cors.plan(d).try(&.dedup_key)), "cors #{c[:target]} #{c[:method]}"
+      end
+    end
+  end
+
+  # A server emits ACAO only when the REQUEST carried an Origin, and a browser sends none on a
+  # same-origin GET — so gating on ACAO alone skipped the reflecting endpoint nobody had happened
+  # to drive cross-origin, and mostly re-confirmed CORS the capture already showed. `Vary: Origin`
+  # is the standing advertisement of the very behaviour this rule tests.
+  it "gates cors_reflection on Vary: Origin as well as ACAO, and keeps both paths in step" do
+    with_store do |store|
+      cors = Gori::Probe::Active::CorsReflection.new
+      vary_only = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nVary: Accept-Encoding, Origin\r\n\r\n"
+      d = probe_capture_flow(store, vary_only, host: "t.example", target: "/api/items?q=1")
+      cors.plan(d).should_not be_nil
+      cors.dedup_key(d).should eq(cors.plan(d).try(&.dedup_key))
+      # Whole TOKEN, not substring: a Vary naming some other origin-ish header is not a CORS
+      # endpoint, and neither is a response with no Vary at all.
+      ["HTTP/1.1 200 OK\r\nVary: X-Origin-Hint\r\n\r\n",
+       "HTTP/1.1 200 OK\r\nVary: Accept-Encoding\r\n\r\n",
+       "HTTP/1.1 200 OK\r\n\r\n"].each do |resp|
+        nd = probe_capture_flow(store, resp, host: "t.example", target: "/api/items?q=1")
+        cors.plan(nd).should be_nil
+        cors.dedup_key(nd).should be_nil
       end
     end
   end
@@ -228,7 +251,7 @@ describe Gori::Probe::Active do
       # origin_form dropped the query to "/", so plan() found no params and returned nil.
       detail = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", scheme: "http", host: "target.com",
         target: "http://target.com?name=hello", content_type: nil)
-      plan = Gori::Probe::Active.plan(detail).not_nil!
+      plan = Gori::Probe::Active::PRIMARY.plan(detail).not_nil!
       plan.params.map(&.name).should eq(["name"])
       line = String.new(plan.request).each_line.first
       line.should start_with("GET /?name=")
@@ -242,18 +265,18 @@ describe "Gori::Probe::Active (safety + coverage)" do
     with_store do |store|
       post = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/comment", method: "POST",
         req_headers: "Content-Type: application/x-www-form-urlencoded\r\n", req_body: "text=hi", content_type: nil)
-      Gori::Probe::Active.plan(post).should be_nil # automatic pipeline (default opts) never mutates
+      Gori::Probe::Active::PRIMARY.plan(post).should be_nil # automatic pipeline (default opts) never mutates
       # The manual opt-in / AGGRESSIVE mode probes the reflectable form params on the POST.
-      Gori::Probe::Active.plan(post, Gori::Probe::Active::Options.new(allow_unsafe: true)).should_not be_nil
+      Gori::Probe::Active::PRIMARY.plan(post, Gori::Probe::Active::Options.new(allow_unsafe: true)).should_not be_nil
       get = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/s?q=hi", content_type: nil)
-      Gori::Probe::Active.plan(get).should_not be_nil
+      Gori::Probe::Active::PRIMARY.plan(get).should_not be_nil
     end
   end
 
   it "keys the dedup signature by method and parameter location" do
     with_store do |store|
       detail = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/s?q=hi", content_type: nil)
-      key = Gori::Probe::Active.plan(detail).not_nil!.dedup_key
+      key = Gori::Probe::Active::PRIMARY.plan(detail).not_nil!.dedup_key
       key.should contain("GET")
       key.should contain("q@query")
     end
@@ -339,6 +362,59 @@ describe "Gori::Probe::Active (safety + coverage)" do
     end
   end
 
+  # --- surface dedup across one scan (`seen:`) --------------------------------------------
+
+  it "probes a surface once per `seen` set, whatever its parameter values" do
+    with_store do |store|
+      first = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/s?q=one", content_type: nil)
+      again = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/s?q=two", content_type: nil)
+      other = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/t?q=one", content_type: nil)
+      fake = CountingBackend.new(Gori::Fuzz::Origin.new(first.row.scheme, first.row.host, first.row.port))
+      seen = Set(String).new
+      Gori::Probe::Active.analyze(first, outbound: ungated_outbound, overrides: nil, backend: fake, seen: seen)
+      once = fake.sent
+      once.should be > 0
+      seen.should_not be_empty
+      # Same method, path and parameter NAMES: every rule's dedup key is already in the set.
+      Gori::Probe::Active.fresh?(again, Gori::Probe::Active::Options::DEFAULT, Set(String).new, seen).should be_false
+      Gori::Probe::Active.analyze(again, outbound: ungated_outbound, overrides: nil, backend: fake, seen: seen)
+      fake.sent.should eq(once)
+      # A different path is a different surface.
+      Gori::Probe::Active.fresh?(other, Gori::Probe::Active::Options::DEFAULT, Set(String).new, seen).should be_true
+      Gori::Probe::Active.analyze(other, outbound: ungated_outbound, overrides: nil, backend: fake, seen: seen)
+      fake.sent.should be > once
+    end
+  end
+
+  it "reports a short-circuited flow as not fresh (so it never spends the active budget)" do
+    with_store do |store|
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "https", host: "acme.test", port: 443,
+        method: "GET", target: "/s?q=hi", http_version: "HTTP/1.1",
+        head: "GET /s?q=hi HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice, body: nil,
+        short_circuited: true, source: Gori::FlowSource::Kind::Proxy))
+      store.update_response(Gori::Store::CapturedResponse.new(
+        flow_id: id, status: 200, head: "HTTP/1.1 200 OK\r\n\r\n".to_slice))
+      detail = store.get_flow(id).not_nil!
+      # A rule WOULD apply to this surface — the only reason it is not fresh is the stub —
+      # so this proves the short-circuit guard, not a missing insertion point.
+      Gori::Probe::Active.fresh?(detail, Gori::Probe::Active::Options::DEFAULT,
+        Set(String).new, Set(String).new).should be_false
+    end
+  end
+
+  it "keeps probing every flow in isolation when no `seen` set is passed" do
+    with_store do |store|
+      first = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/s?q=one", content_type: nil)
+      again = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/s?q=two", content_type: nil)
+      fake = CountingBackend.new(Gori::Fuzz::Origin.new(first.row.scheme, first.row.host, first.row.port))
+      Gori::Probe::Active.analyze(first, outbound: ungated_outbound, overrides: nil, backend: fake)
+      once = fake.sent
+      Gori::Probe::Active.analyze(again, outbound: ungated_outbound, overrides: nil, backend: fake)
+      fake.sent.should eq(once * 2)
+    end
+  end
+
   # --- per-rule error isolation (the headless path used to have none) ---------------------
   #
   # The TUI analyzer has always wrapped each rule in its own rescue (execute_active), so a rule
@@ -398,12 +474,12 @@ describe "Gori::Probe::Active (safety + coverage)" do
   it "detects a canary reflected ONLY in a response header (e.g. Location)" do
     with_store do |store|
       detail = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/go?url=here", content_type: nil)
-      plan = Gori::Probe::Active.plan(detail).not_nil!
+      plan = Gori::Probe::Active::PRIMARY.plan(detail).not_nil!
       canary = plan.params.first.canary
       result = Gori::Repeater::Result.new(
         "HTTP/1.1 302 Found\r\nLocation: https://site/?url=#{canary}\r\n\r\n".to_slice,
         Bytes.empty, nil, 1_i64)
-      dets = Gori::Probe::Active.detections(plan, result, detail)
+      dets = Gori::Probe::Active::PRIMARY.detections(plan, result, detail)
       dets.size.should eq(1)
       dets.first.code.should eq("reflected_param")
     end
@@ -414,7 +490,7 @@ describe "Gori::Probe::Active (safety + coverage)" do
   it "grades a reflection by which marker characters survived" do
     with_store do |store|
       detail = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/s?q=hi", content_type: nil)
-      plan = Gori::Probe::Active.plan(detail).not_nil!
+      plan = Gori::Probe::Active::PRIMARY.plan(detail).not_nil!
       canary = plan.params.first.canary
       raw = Gori::Probe::Active::ReflectedParam.probe_value(canary)
       html_head = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
@@ -423,24 +499,24 @@ describe "Gori::Probe::Active (safety + coverage)" do
       end
 
       # `<` came back raw in HTML → tag injection possible → the historic Medium.
-      d = Gori::Probe::Active.detections(plan, res.call(html_head, "<p>#{raw}</p>"), detail).first
+      d = Gori::Probe::Active::PRIMARY.detections(plan, res.call(html_head, "<p>#{raw}</p>"), detail).first
       d.severity.should eq(Gori::Store::Severity::Medium)
       d.title.should contain("unencoded")
 
       # Same raw echo in a JSON body: not an HTML sink → Low.
       json_head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
-      Gori::Probe::Active.detections(plan, res.call(json_head, %({"q":"#{raw}"})), detail)
+      Gori::Probe::Active::PRIMARY.detections(plan, res.call(json_head, %({"q":"#{raw}"})), detail)
         .first.severity.should eq(Gori::Store::Severity::Low)
 
       # Quotes survived but `<` was escaped → attribute context only → Low.
       attr_echo = %(<a title="#{canary}"'&lt;&gt;">x</a>)
-      d2 = Gori::Probe::Active.detections(plan, res.call(html_head, attr_echo), detail).first
+      d2 = Gori::Probe::Active::PRIMARY.detections(plan, res.call(html_head, attr_echo), detail).first
       d2.severity.should eq(Gori::Store::Severity::Low)
       d2.title.should contain("attribute context")
 
       # Everything escaped → a reflection POINT, not a vulnerability → Info, not Medium.
       escaped = "<p>#{canary}&quot;&#39;&lt;&gt;</p>"
-      d3 = Gori::Probe::Active.detections(plan, res.call(html_head, escaped), detail).first
+      d3 = Gori::Probe::Active::PRIMARY.detections(plan, res.call(html_head, escaped), detail).first
       d3.severity.should eq(Gori::Store::Severity::Info)
       d3.title.should contain("escaped or filtered")
     end
@@ -451,12 +527,12 @@ describe "Gori::Probe::Active (safety + coverage)" do
   it "grades on the weakest sink when the value is reflected more than once" do
     with_store do |store|
       detail = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/s?q=hi", content_type: nil)
-      plan = Gori::Probe::Active.plan(detail).not_nil!
+      plan = Gori::Probe::Active::PRIMARY.plan(detail).not_nil!
       canary = plan.params.first.canary
       raw = Gori::Probe::Active::ReflectedParam.probe_value(canary)
       # Escaped in the page text FIRST, raw inside a later script block.
       body = "<p>#{canary}&quot;&#39;&lt;&gt;</p><script>var q=\"#{raw}\";</script>"
-      d = Gori::Probe::Active.detections(plan,
+      d = Gori::Probe::Active::PRIMARY.detections(plan,
         Gori::Repeater::Result.new("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n".to_slice,
           body.to_slice, nil, 1_i64), detail).first
       d.severity.should eq(Gori::Store::Severity::Medium)
@@ -468,11 +544,11 @@ describe "Gori::Probe::Active (safety + coverage)" do
   it "grades on the weakest sink across the response head and body" do
     with_store do |store|
       detail = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/s?q=hi", content_type: nil)
-      plan = Gori::Probe::Active.plan(detail).not_nil!
+      plan = Gori::Probe::Active::PRIMARY.plan(detail).not_nil!
       canary = plan.params.first.canary
       raw = Gori::Probe::Active::ReflectedParam.probe_value(canary)
       head = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nX-Echo: #{canary}\r\n\r\n"
-      d = Gori::Probe::Active.detections(plan,
+      d = Gori::Probe::Active::PRIMARY.detections(plan,
         Gori::Repeater::Result.new(head.to_slice, "<p>#{raw}</p>".to_slice, nil, 1_i64), detail).first
       d.severity.should eq(Gori::Store::Severity::Medium)
     end
@@ -482,7 +558,7 @@ describe "Gori::Probe::Active (safety + coverage)" do
   it "sends the marker URL-encoded in the query and JSON-escaped in a body" do
     with_store do |store|
       detail = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/s?q=hi", content_type: nil)
-      plan = Gori::Probe::Active.plan(detail).not_nil!
+      plan = Gori::Probe::Active::PRIMARY.plan(detail).not_nil!
       canary = plan.params.first.canary
       req = String.new(plan.request)
       req.should contain("q=#{canary}%22%27%3C%3E")
@@ -512,16 +588,22 @@ describe "Gori::Probe::Active (manual run estimate)" do
       r = rule.requests_per_flow
       r.begin.should be >= 1
       r.end.should be >= r.begin
-      # Nothing floods a single flow with probes. The ONE exception is the OFF-BY-DEFAULT,
-      # opt-in request-smuggling detector: it legitimately spends more (2 baselines + 3 variants
-      # × 2 timing probes + a 2-member differential group) because it runs only when the operator
-      # explicitly enables it AND opts into unsafe/aggressive — see Probe::DEFAULT_DISABLED_RULES.
-      r.end.should be <= (rule.info.id == "request_smuggling" ? 10 : 8)
+      # Nothing floods a single flow with probes. The exceptions are the OFF-BY-DEFAULT, opt-in
+      # rules, which run only when the operator explicitly enables them: request_smuggling (2
+      # baselines + 3 variants × 2 timing probes + a 2-member differential group) and
+      # sqli_time_based (2 baselines + 2 families × 2 delays × 2 params) — see
+      # Probe::DEFAULT_DISABLED_RULES.
+      r.end.should be <= (rule.info.id.in?("request_smuggling", "sqli_time_based") ? 10 : 8)
     end
     by_id = Gori::Probe::Active::RULES.to_h { |rule| {rule.info.id, rule.requests_per_flow} }
     # BackslashPowered: TWO baselines (the second proves the endpoint is stable enough to diff
     # against) plus a `\`/`\\` pair per param, capped at 3 params → 4..8.
     by_id["backslash_powered"].should eq(4..8)
+    # BooleanBlindSqli: TWO baselines + a true/false pair per param (one default breakout), capped
+    # at 3 params → 4..8. TimeBlindSqli (off-by-default): TWO baselines + 2 delays × 2 families × 2
+    # params → 6..10.
+    by_id["sqli_boolean_based"].should eq(4..8)
+    by_id["sqli_time_based"].should eq(6..10)
     # The bypass family each carry a control leg, so none of them is a single request:
     # forbidden_bypass probe+control, url_rewrite_bypass probe+control+control2,
     # path_normalization_bypass 5-6 variants + the canonical-path control.
@@ -548,10 +630,12 @@ describe "Gori::Probe::Active (manual run estimate)" do
         Channel(Gori::Store::FlowEvent).new(1), Gori::Probe::Mode::Passive, true)
       est = a.active_estimate(detail)
       # reflected_param, cors_reflection, backslash_powered all apply — plus crlf_injection, ssti,
-      # and sqli_error_based, which reuse the same reflectable-query-param gate.
-      est.map(&.info.id).sort!.should eq(["backslash_powered", "cors_reflection", "crlf_injection", "reflected_param", "sqli_error_based", "ssti"])
-      # reflected_param (1) + cors_reflection (1) + backslash_powered (≤8) + crlf_injection (1) + ssti (2) + sqli_error_based (≤5) = 18
-      est.sum(&.requests.end).should eq(18)
+      # sqli_error_based and sqli_boolean_based, which reuse the same reflectable-query-param gate;
+      # insecure_http_methods applies to any flow (it sends its own OPTIONS/TRACE, deduped per host).
+      # sqli_time_based also gates on the query param but is off-by-default, so the estimate omits it.
+      est.map(&.info.id).sort!.should eq(["backslash_powered", "cors_reflection", "crlf_injection", "insecure_http_methods", "reflected_param", "sqli_boolean_based", "sqli_error_based", "ssti"])
+      # reflected_param (1) + cors_reflection (1) + backslash_powered (≤8) + crlf_injection (1) + ssti (2) + sqli_error_based (≤5) + sqli_boolean_based (≤8) + insecure_http_methods (2) = 28
+      est.sum(&.requests.end).should eq(28)
     end
   end
 
@@ -564,25 +648,28 @@ describe "Gori::Probe::Active (manual run estimate)" do
       a = Gori::Probe::Analyzer.new(store, Gori::Scope.load(store),
         Channel(Gori::Store::FlowEvent).new(1), Gori::Probe::Mode::Passive, true)
       # RULES order (cors_reflection disabled): reflected_param, backslash_powered, sqli_error_based,
-      # then the other reflectable-query-param rules crlf_injection and ssti.
-      a.active_estimate(detail).map(&.info.id).should eq(["reflected_param", "backslash_powered", "sqli_error_based", "crlf_injection", "ssti"])
+      # sqli_boolean_based, then the other reflectable-query-param rules crlf_injection and ssti,
+      # then the host-level insecure_http_methods (last in the registry, applies to any flow).
+      # sqli_time_based sits in the registry between them but is off-by-default, so it is omitted.
+      a.active_estimate(detail).map(&.info.id).should eq(["reflected_param", "backslash_powered", "sqli_error_based", "sqli_boolean_based", "crlf_injection", "ssti", "insecure_http_methods"])
     end
   end
 
-  it "estimates zero for an unsafe-method / paramless / non-CORS flow" do
+  it "estimates only the host-level check for an unsafe-method / paramless / non-CORS flow" do
     with_store do |store|
       a = Gori::Probe::Analyzer.new(store, Gori::Scope.load(store),
         Channel(Gori::Store::FlowEvent).new(1), Gori::Probe::Mode::Passive, true)
-      # POST is never probed under the default (safe-only) estimate…
+      # No param/CORS/denied signal ⇒ only insecure_http_methods (OPTIONS/TRACE, path/param- and
+      # method-independent) applies; the targeted param checks do not.
       post = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/x?q=1", method: "POST")
-      a.active_estimate(post).should be_empty
+      a.active_estimate(post).map(&.info.id).should eq(["insecure_http_methods"])
       # …but the allow_unsafe estimate (the run popup's opt-in) surfaces the reflectable-param check.
       unsafe_est = a.active_estimate(post, Gori::Probe::Active::Options.new(allow_unsafe: true))
       unsafe_est.map(&.info.id).should contain("reflected_param")
-      # GET with no params + no ACAO has nothing to test, opt-in or not.
+      # GET with no params + no ACAO has nothing param-shaped to test, opt-in or not.
       bare = probe_capture_flow(store, "HTTP/1.1 200 OK\r\n\r\n", target: "/nothing")
-      a.active_estimate(bare).should be_empty
-      a.active_estimate(bare, Gori::Probe::Active::Options.new(allow_unsafe: true)).should be_empty
+      a.active_estimate(bare).map(&.info.id).should eq(["insecure_http_methods"])
+      a.active_estimate(bare, Gori::Probe::Active::Options.new(allow_unsafe: true)).map(&.info.id).should eq(["insecure_http_methods"])
     end
   end
 
@@ -665,7 +752,7 @@ describe "Gori::Probe::Scan rules config parity" do
   it "gates every probe rule through Probe.rule_disabled?, never a bare set lookup" do
     root = File.join(__DIR__, "..", "src", "gori", "probe")
     offenders = [] of String
-    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+    glob_files(root, "**", "*.cr").sort.each do |path|
       File.read(path).lines.each_with_index do |line, i|
         next if line.lstrip.starts_with?('#') # a comment may name the old shape; code may not
         next unless line.matches?(/\bdisabled\.includes\?\(/)
@@ -702,7 +789,10 @@ describe "Gori::Probe::Scan rules config parity" do
       baseline.sent.should be > 0
 
       # Disabling every active rule must stop the sends at the source, not just drop findings.
-      all_ids = Gori::Probe::Active::RULES.map(&.info.id).to_set
+      # The stored set records the DEVIATION from default, so "everything off" is every default-ON
+      # id present MINUS the default-OFF ids (whose absence already means off — including their id
+      # would FLIP them on). See Probe::DEFAULT_DISABLED_RULES.
+      all_ids = Gori::Probe::Active::RULES.map(&.info.id).to_set - Gori::Probe::DEFAULT_DISABLED_RULES
       muted = CountingBackend.new(origin)
       Gori::Probe::Active.analyze(detail, outbound: ungated_outbound, overrides: nil, backend: muted, disabled: all_ids)
       muted.sent.should eq(0)

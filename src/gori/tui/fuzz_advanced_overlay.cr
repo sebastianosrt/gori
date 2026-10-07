@@ -29,7 +29,26 @@ module Gori::Tui
     # above it are: every construction site that predates it keeps compiling, and a caller
     # that does not know about it cannot silently clear it.
     m_time : String = "",
-    f_time : String = ""
+    f_time : String = "",
+    # `stop_on` (issue #1240): stop once the matchers have hit N times (`stop_after`), and/or
+    # when a SEPARATE condition holds (`stop_on`, one DIM:SPEC term — regex:admin, status:200,
+    # !regex:Invalid password). `keep_interesting` is the archive filter (on = keep only the
+    # interesting rows). All DEFAULTED so every construction site that predates them keeps
+    # compiling and none can silently clear them.
+    stop_after : String = "",
+    stop_on : String = "",
+    keep_interesting : Bool = false,
+    # The request-time macro (#1350) — `gori run fuzz --macro*` and MCP `macro_*`. Raw text, as the
+    # operator typed it: `steps` is a comma list of Repeater session ids or tab names, `every` is
+    # `request` | `off` | a number (blank = request), `expect` a comma list of binding names, and
+    # `on_failure` is `skip` | `stop` (blank = skip). Turned into a `RequestMacro::Spec` by the
+    # view at build time, where a value that does not read is named rather than dropped. All
+    # DEFAULTED, so every construction site that predates them keeps compiling and none can
+    # silently clear them.
+    macro_steps : String = "",
+    macro_every : String = "",
+    macro_expect : String = "",
+    macro_on_failure : String = ""
 
   # The full-area popup for the Fuzzer's advanced run settings. Every engine / match
   # / filter knob gets its OWN labeled row (no more horizontal fields walked by ↑/↓,
@@ -59,7 +78,7 @@ module Gori::Tui
       # body length; OFF sends the header exactly as the template declares it.
       #
       # ON also ADDS the header to a body that declares none, which is what makes this the
-      # Repeater's ^L rather than half of it (`Fuzz::Config#add_content_length_when_missing`).
+      # Repeater's ^L rather than half of it (`Fuzz::Config#update_content_length`).
       # OFF therefore leaves such a body UNFRAMED, and an origin reads it as zero-length —
       # `Plan#unframed_body?` is what says so on the run-start line instead of letting it go
       # quiet.
@@ -100,7 +119,7 @@ module Gori::Tui
       # Race was appended after the matchers: it renumbers no row a spec reaches by index. Two
       # examples still moved with it — the ones pinning WHICH row is last and the arithmetic of
       # a click on a scrolled list — because those are facts about the table's end, not about a
-      # row's number. The field NAMES for a flow are the ones the Repeater's ␣E:FIELDS form and
+      # row's number. The field NAMES for a flow are the ones the Repeater's ␣Pf:FIELDS form and
       # the History protobuf tree already show for it, so this row is typed, not browsed.
       {:grpc_fields, "gRPC field(s)", :text},
       # The run's TLS fingerprint (#844) — the same knob `gori run fuzz --tls-preset` and MCP
@@ -125,6 +144,29 @@ module Gori::Tui
       # this is the one position that renumbers none of them.
       {:m_time, "Match time (ms)", :text},
       {:f_time, "Filter time (ms)", :text},
+      # `stop_on` (issue #1240) — `gori run fuzz --stop-after-matches` / `--stop-on`, MCP
+      # `stop_on`. `Stop after N hits` ends the run once the matchers have hit N times (1 = first
+      # hit); `Stop on` is a SEPARATE condition, one DIM:SPEC term (regex:admin, status:200,
+      # !regex:Invalid password — ! negates to a filter, "stop when the body no longer carries
+      # it"). A run either fires lands `condition_met`, not `stopped`. Appended LAST, like the
+      # rows above them, so no spec-indexed row is renumbered.
+      {:stop_after, "Stop after N hits", :text},
+      {:stop_on, "Stop on (DIM:SPEC)", :text},
+      # The result-capture filter for a saved run (Shift-E) / the private spool: on keeps only
+      # the interesting rows (matched + error/re-send/incomplete/stop), so a huge sweep does not
+      # spool one row per request. The pane, the counters and `idx` are unaffected. A toggle
+      # because the policy is exactly two-valued (all / interesting).
+      {:keep_interesting, "Keep interesting only", :toggle},
+      # The request-time macro (#1350): Repeater sessions replayed BEFORE a candidate so a
+      # rotating CSRF token or nonce is fresh when the candidate resolves its `$BIND.NAME`.
+      # Blank steps = no macro, which is every sweep that came before. The four rows are one
+      # feature and are text rows like their neighbours; a value that does not read is named by
+      # `FuzzerView#build_engine` when the run starts, never applied-as-nothing. Appended LAST for
+      # the reason every row above was: it renumbers no row a spec reaches by index.
+      {:macro_steps, "Macro steps", :text},
+      {:macro_every, "Macro cadence", :text},
+      {:macro_expect, "Macro must rebind", :text},
+      {:macro_on_failure, "Macro on failure", :text},
     ]
     LABEL_W = 22 # value column offset (widest label "gRPC reframe (unary)" + padding)
 
@@ -136,25 +178,32 @@ module Gori::Tui
       @keep_alive = snap.keep_alive
       @update_cl = snap.update_cl
       @reframe_grpc = snap.reframe_grpc
+      @keep_interesting = snap.keep_interesting
       @fields = {
-        :conc         => TextField.new(snap.conc),
-        :rate         => TextField.new(snap.rate),
-        :timeout      => TextField.new(snap.timeout),
-        :retries      => TextField.new(snap.retries),
-        :max_requests => TextField.new(snap.max_requests),
-        :race         => TextField.new(snap.race),
-        :m_status     => TextField.new(snap.m_status),
-        :m_size       => TextField.new(snap.m_size),
-        :m_words      => TextField.new(snap.m_words),
-        :m_regex      => TextField.new(snap.m_regex),
-        :f_status     => TextField.new(snap.f_status),
-        :f_size       => TextField.new(snap.f_size),
-        :f_words      => TextField.new(snap.f_words),
-        :f_regex      => TextField.new(snap.f_regex),
-        :grpc_fields  => TextField.new(snap.grpc_fields),
-        :tls_preset   => TextField.new(snap.tls_preset),
-        :m_time       => TextField.new(snap.m_time),
-        :f_time       => TextField.new(snap.f_time),
+        :conc             => TextField.new(snap.conc),
+        :rate             => TextField.new(snap.rate),
+        :timeout          => TextField.new(snap.timeout),
+        :retries          => TextField.new(snap.retries),
+        :max_requests     => TextField.new(snap.max_requests),
+        :race             => TextField.new(snap.race),
+        :m_status         => TextField.new(snap.m_status),
+        :m_size           => TextField.new(snap.m_size),
+        :m_words          => TextField.new(snap.m_words),
+        :m_regex          => TextField.new(snap.m_regex),
+        :f_status         => TextField.new(snap.f_status),
+        :f_size           => TextField.new(snap.f_size),
+        :f_words          => TextField.new(snap.f_words),
+        :f_regex          => TextField.new(snap.f_regex),
+        :grpc_fields      => TextField.new(snap.grpc_fields),
+        :tls_preset       => TextField.new(snap.tls_preset),
+        :m_time           => TextField.new(snap.m_time),
+        :f_time           => TextField.new(snap.f_time),
+        :stop_after       => TextField.new(snap.stop_after),
+        :stop_on          => TextField.new(snap.stop_on),
+        :macro_steps      => TextField.new(snap.macro_steps),
+        :macro_every      => TextField.new(snap.macro_every),
+        :macro_expect     => TextField.new(snap.macro_expect),
+        :macro_on_failure => TextField.new(snap.macro_on_failure),
       }
     end
 
@@ -223,11 +272,12 @@ module Gori::Tui
 
     private def toggle_current : Nil
       case current[0]
-      when :follow       then @follow = !@follow
-      when :calibrate    then @calibrate = !@calibrate
-      when :keep_alive   then @keep_alive = !@keep_alive
-      when :update_cl    then @update_cl = !@update_cl
-      when :reframe_grpc then @reframe_grpc = !@reframe_grpc
+      when :follow           then @follow = !@follow
+      when :calibrate        then @calibrate = !@calibrate
+      when :keep_alive       then @keep_alive = !@keep_alive
+      when :update_cl        then @update_cl = !@update_cl
+      when :reframe_grpc     then @reframe_grpc = !@reframe_grpc
+      when :keep_interesting then @keep_interesting = !@keep_interesting
       end
     end
 
@@ -254,15 +304,16 @@ module Gori::Tui
         f_words: @fields[:f_words].value, f_regex: @fields[:f_regex].value,
         grpc_fields: @fields[:grpc_fields].value,
         tls_preset: @fields[:tls_preset].value,
-        m_time: @fields[:m_time].value, f_time: @fields[:f_time].value)
+        m_time: @fields[:m_time].value, f_time: @fields[:f_time].value,
+        stop_after: @fields[:stop_after].value, stop_on: @fields[:stop_on].value,
+        keep_interesting: @keep_interesting,
+        macro_steps: @fields[:macro_steps].value, macro_every: @fields[:macro_every].value,
+        macro_expect: @fields[:macro_expect].value, macro_on_failure: @fields[:macro_on_failure].value)
     end
 
     # --- rendering ----------------------------------------------------------
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 60}.min
-      h = {area.h - 2, ROWS.size + 4}.min
-      return nil if w < 30 || h < 8
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      area.card?(60, ROWS.size + 4, 30, 8)
     end
 
     # Rows the card can actually draw. The last two interior lines are spoken for — the hint
@@ -297,6 +348,19 @@ module Gori::Tui
       # entirely, so the two lines on screen disagreed about what the form could do.
     end
 
+    # A toggle row's current state, by field key — pulled out of `render_row` so that method
+    # stays under the complexity ceiling as the toggle set grows.
+    private def toggle_on?(key : Symbol) : Bool
+      case key
+      when :follow           then @follow
+      when :keep_alive       then @keep_alive
+      when :update_cl        then @update_cl
+      when :reframe_grpc     then @reframe_grpc
+      when :keep_interesting then @keep_interesting
+      else                        @calibrate
+      end
+    end
+
     private def render_row(screen : Screen, box : Rect, ri : Int32, y : Int32, vx : Int32) : Nil
       key, label, kind = ROWS[ri]
       foc = ri == @sel
@@ -304,14 +368,7 @@ module Gori::Tui
       screen.fill(Rect.new(box.x + 1, y, box.w - 2, 1), bg) if foc
       screen.text(box.x + 2, y, label, foc ? Theme.text_bright : Theme.muted, bg)
       if kind == :toggle
-        on = case key
-             when :follow       then @follow
-             when :keep_alive   then @keep_alive
-             when :update_cl    then @update_cl
-             when :reframe_grpc then @reframe_grpc
-             else                    @calibrate
-             end
-        screen.text(vx, y, on ? "‹ on ›" : "‹ off ›", foc ? Theme.text_bright : Theme.text, bg)
+        screen.text(vx, y, toggle_on?(key) ? "‹ on ›" : "‹ off ›", foc ? Theme.text_bright : Theme.text, bg)
       else
         vw = {box.right - 2 - vx, 1}.max
         @fields[key].render(screen, vx, y, vw, foc, foc ? Theme.text_bright : Theme.text, bg)

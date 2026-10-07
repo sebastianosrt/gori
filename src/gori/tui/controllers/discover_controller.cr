@@ -5,6 +5,7 @@ require "../../discover/adapters"
 require "../../discover/plan"
 require "../../outbound"
 require "../../store"
+require "../../plural"
 
 module Gori::Tui
   # The Discover sub-tab (under the Target parent tab). Spider + directory brute-force runs
@@ -24,6 +25,7 @@ module Gori::Tui
     def initialize(host : Host)
       super(host)
       @view = DiscoverView.new
+      @view.set_registry(host.session.registry)
       @discover_events = Channel({DiscoverRun, Discover::Event}).new(256)
       @persist_buf = [] of {Store::CapturedRequest, Store::CapturedResponse?}
       # Which findings row each buffered pair came from, same order as @persist_buf, so the
@@ -51,8 +53,11 @@ module Gori::Tui
     end
 
     def body_hint(focus : Symbol) : String
-      return "start from Sitemap/History (space → \"Discover here\")" if @view.empty?
-      return @view.filter_hint if querying?
+      # The empty line ends in `esc sub-tabs` like the two below it. `discover.to-menu` has
+      # always bound escape here; the one state where the tab has nothing else to say was the
+      # one that did not say it.
+      return "#{@view.start_hint} · esc sub-tabs" if @view.empty?
+      return @view.filter.hint if querying?
       if @view.focus == :runs
         keys("↑/↓ runs · ↵/tab findings · {discover.run} run · {discover.stop} stop · {discover.pause} pause · {discover.dismiss} dismiss · space cmds · esc sub-tabs")
       else
@@ -62,7 +67,7 @@ module Gori::Tui
 
     # --- the FINDINGS `/` filter (a text sub-mode the shell claims ahead of the focus ring) ---
     def querying? : Bool
-      @view.filter_editing?
+      @view.filter.editing?
     end
 
     def handle_query_key(ev : Termisu::Event::Key) : Bool
@@ -70,12 +75,12 @@ module Gori::Tui
     end
 
     def set_preedit(text : String) : Bool
-      @view.set_filter_preedit(text)
+      @view.filter.set_preedit(text)
     end
 
     # `/` — narrow the FINDINGS table by status / source / URL. Refused with nothing to filter.
     def discover_filter : Nil
-      return @host.status("no run selected — start from Sitemap/History (space → \"Discover here\")") unless @view.current
+      return @host.status("no run selected — #{@view.start_hint}") unless @view.current
       @view.filter_start
     end
 
@@ -123,6 +128,11 @@ module Gori::Tui
     end
 
     # --- input ---
+    # The FINDINGS `/` filter bar (a RowFilter, like Miner's and Authorize's).
+    def body_takes_text? : Bool
+      querying?
+    end
+
     def handle_body_key(ev : Termisu::Event::Key) : Bool
       return handle_empty_key(ev) if @view.empty?
       if ev.key.space? && !ev.ctrl? && !ev.alt?
@@ -226,7 +236,7 @@ module Gori::Tui
     def discover_run : Nil
       run = @view.current
       unless run
-        @host.status("no run selected — start from Sitemap/History (space → \"Discover here\")")
+        @host.status("no run selected — #{@view.start_hint}")
         return
       end
       if run.running?
@@ -299,7 +309,7 @@ module Gori::Tui
     # Runner#discover_open_flow, which is `sitemap_open_flow`'s hop from the same parent tab).
     def open_flow_target : Int64?
       if @view.empty?
-        @host.status("no runs yet — start from Sitemap/History (space → \"Discover here\")")
+        @host.status("no runs yet — #{@view.start_hint}")
         return nil
       end
       unless @view.selected_finding
@@ -336,10 +346,6 @@ module Gori::Tui
       @view.add(run)
       start_run(run)
       run
-    end
-
-    def select_run(id : Int32) : Nil
-      @view.select_run_by_id(id)
     end
 
     def reveal_session(id : Int64) : Nil
@@ -416,7 +422,7 @@ module Gori::Tui
       # exactly one caller in the tree (`gori run discover`); this is the second.
       if unsafe = Discover::Headers.unsafe_expanded(run.config.headers).first?
         return {nil, "header #{unsafe.inspect} rejected — its value contains CR or LF after " \
-                     "$VAR expansion, which would splice extra headers into every probe"}
+                     "env expansion, which would splice extra headers into every probe"}
       end
       options = Discover::PlanOptions.new(run.target, config: run.config,
         verify: !session.config.insecure_upstream?, overrides: session.host_overrides)
@@ -432,7 +438,7 @@ module Gori::Tui
     private def discover_plan_error(ex : Discover::PlanError) : String
       case ex.reason
       in Discover::PlanError::Reason::NoTarget
-        "no target — start from Sitemap/History (space → \"Discover here\")"
+        "no target — #{@view.start_hint}"
       in Discover::PlanError::Reason::BadTarget
         "invalid target — use scheme://host[:port][/path]"
       in Discover::PlanError::Reason::NoTechnique
@@ -448,7 +454,7 @@ module Gori::Tui
     def drain_events : Bool
       applied = false
       n = 0
-      while n < DRAIN_CAP && (pair = nonblocking_event)
+      while n < DRAIN_CAP && (pair = poll(@discover_events))
         n += 1
         run, ev = pair
         next unless @view.runs.any?(&.same?(run)) # run gone → drop
@@ -457,15 +463,6 @@ module Gori::Tui
       end
       flush_persist if applied
       applied
-    end
-
-    private def nonblocking_event : {DiscoverRun, Discover::Event}?
-      select
-      when p = @discover_events.receive
-        p
-      else
-        nil
-      end
     end
 
     private def apply_event(run : DiscoverRun, ev : Discover::Event) : Nil
@@ -522,7 +519,7 @@ module Gori::Tui
              else
                ""
              end
-      msg = "Discover: #{n} endpoint#{n == 1 ? "" : "s"} on #{run.target}#{tail}"
+      msg = "Discover: #{Gori.plural(n, "endpoint")} on #{run.target}#{tail}"
       level = n > 0 ? :success : :info
       log_event(run, level, msg)
       push_notification(run, level, msg)
@@ -534,7 +531,7 @@ module Gori::Tui
     end
 
     private def log_event(run : DiscoverRun, level : Symbol, msg : String) : Nil
-      @host.session.store.insert_event("discover", "job_done", level.to_s, msg,
+      @host.session.store.insert_event("discover", "job_done", level, msg,
         goto_tab: "target", goto_session_id: run.id.to_i64)
     end
 

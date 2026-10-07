@@ -38,6 +38,29 @@ module Gori
       h.ends_with?('.') ? h.rstrip('.') : h
     end
 
+    # `host` lowercased — returning `host` ITSELF when lowering it would change nothing.
+    #
+    # `String#downcase` builds a fresh String unconditionally, and this runs on the proxy hot
+    # path once per host rule per request (`Compiled#matches?`) — a captured host is very
+    # nearly always already lowercase, so that copy was pure garbage. The scan answers the
+    # same question the copy would: an ASCII byte outside `A-Z` is its own lowercase, so a
+    # string holding neither an ASCII capital nor a byte >= 0x80 is unchanged by `downcase`,
+    # and anything else (including every non-ASCII case-folding rule) falls through to it.
+    def self.down(host : String) : String
+      host.each_byte do |b|
+        return host.downcase if (0x41_u8 <= b <= 0x5a_u8) || b >= 0x80_u8
+      end
+      host
+    end
+
+    # The form `Compiled#matches_bare?` compares against, for a caller testing ONE host
+    # against several patterns (a Scope evaluation walks every include and every exclude).
+    # `Compiled#matches?` does exactly this per pattern; hoisting it means the lowering and
+    # the peel happen once per request rather than once per rule.
+    def self.normalize(host : String) : String
+      bare(down(host))
+    end
+
     # One pattern with its derived forms precomputed: the lowercased text, its bracket-free
     # host form, and whether it is a glob. Built once per pattern (a Scope::Rule is rebuilt
     # rather than edited in place; the passthrough list recompiles on assignment), so
@@ -50,12 +73,16 @@ module Gori
       def initialize(@raw : String)
         @down = @raw.downcase
         @bare = HostPattern.bare(@down)
+        # The subdomain suffix, built ONCE. `matches_bare?` used to interpolate `".#{@bare}"`
+        # on every call, so a non-glob host rule minted a String per request it was tested
+        # against — on the proxy hot path, times every host rule in the scope.
+        @dot_bare = ".#{@bare}"
         @glob = @down.includes?('*')
       end
 
       # Match `host` in any form (mixed case, bracketed IPv6).
       def matches?(host : String) : Bool
-        matches_bare?(HostPattern.bare(host.downcase))
+        matches_bare?(HostPattern.normalize(host))
       end
 
       # Match a host ALREADY lowercased and bracket-stripped — the form to use when testing
@@ -71,35 +98,24 @@ module Gori
             false
           end
         else
-          host == @bare || host.ends_with?(".#{@bare}")
+          host == @bare || host.ends_with?(@dot_bare)
         end
       end
     end
 
     # Compile a list of raw patterns, dropping blanks. The caller keeps the result and
-    # matches against it with `matches_any?`.
+    # matches against it with `match`.
     def self.compile(patterns : Enumerable(String)) : Array(Compiled)
       patterns.compact_map { |p| p.strip.presence.try { |s| Compiled.new(s) } }
     end
 
-    # True when `host` matches any compiled pattern. Normalizes the host ONCE for the
-    # whole list (see Compiled#matches_bare?).
-    def self.matches_any?(compiled : Array(Compiled), host : String) : Bool
-      return false if compiled.empty?
-      h = bare(host.downcase)
-      compiled.any?(&.matches_bare?(h))
-    end
-
-    # The FIRST pattern `host` matches, or nil. Same walk as `matches_any?`, but it keeps
-    # the winner — for a caller that has to NAME the rule that fired, not just know one
-    # did (Settings.tls_passthrough? records it so the TUI can point at the rule to remove).
-    #
-    # Deliberately NOT the implementation of `matches_any?`: Scope evaluates that per
-    # captured row and only ever asks the Bool question, so it keeps the predicate that
-    # says exactly what it needs.
+    # The FIRST pattern `host` matches, or nil. Normalizes the host ONCE for the whole list
+    # (see Compiled#matches_bare?), and keeps the winner — for a caller that has to NAME the
+    # rule that fired, not just know one did (Settings.tls_passthrough? records it so the TUI
+    # can point at the rule to remove).
     def self.match(compiled : Array(Compiled), host : String) : Compiled?
       return nil if compiled.empty?
-      h = bare(host.downcase)
+      h = normalize(host)
       compiled.find(&.matches_bare?(h))
     end
   end

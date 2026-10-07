@@ -36,6 +36,25 @@ module Gori
       Discover
       Authorize
       Probe
+      # An issue's retest (#1036) replaying its Repeater steps in order. Its own member and
+      # not `Repeater`, because the two answer different questions about the SAME bytes: a
+      # `repeater` row is a request an operator drove by hand, a `retest` row is one step of
+      # a check gori ran to decide whether a finding is still there. A report reads the
+      # difference, and `source_ref` carries `issue #N step M` so the row names WHICH check.
+      Retest
+      # A session slot's refresh (#1233) replaying its Repeater steps to re-authenticate the
+      # slot — by hand, or on its own before a send when the slot's policy said the token was
+      # about to expire. Its own member because it is traffic an operator may never have typed
+      # at that moment, and "log freely" is the half of the rule that makes that acceptable:
+      # `source_ref` carries `slot NAME step N`.
+      Refresh
+      # A Fuzzer or Miner run's request-time macro (#1350): a saved Repeater session replayed
+      # before a candidate to mint a fresh CSRF token or nonce. Its own member for the reason
+      # `Refresh` is — it is traffic nobody typed at that moment, so it has to be
+      # distinguishable — and not `Refresh`, because the two answer different questions: a
+      # `refresh` row re-authenticates a SLOT, a `macro` row belongs to one RUN and is sent as
+      # the slot that is active for it, overlay included. `source_ref` carries `macro step N`.
+      Macro
       # Read out of a file someone else captured (HAR, Burp, `--urls`, an OpenAPI document).
       # Deliberately NOT `sent_by_gori?`: gori never put these on a wire, and calling them its
       # own traffic would answer "is this evidence about the target?" the wrong way.
@@ -62,6 +81,9 @@ module Gori
         in Discover  then "CRAWL"
         in Authorize then "AUTHZ"
         in Probe     then "PROBE"
+        in Retest    then "RTEST"
+        in Refresh   then "RFRSH"
+        in Macro     then "MACRO"
         in Import    then "IMPRT"
         end
       end
@@ -73,8 +95,9 @@ module Gori
       # member joins that filter by existing rather than by remembering to edit a SQL string.
       def sent_by_gori? : Bool
         case self
-        in Proxy, Import                                                  then false
-        in Repeater, Fuzzer, Miner, Sequencer, Discover, Authorize, Probe then true
+        in Proxy, Import then false
+        in Repeater, Fuzzer, Miner, Sequencer, Discover, Authorize, Probe, Retest, Refresh, Macro
+          true
         end
       end
 
@@ -112,8 +135,9 @@ module Gori
       # double-counts, which is what this predicate exists to prevent.
       def self_scanned? : Bool
         case self
-        in Repeater, Fuzzer                                            then true
-        in Proxy, Miner, Sequencer, Discover, Authorize, Probe, Import then false
+        in Repeater, Fuzzer then true
+        in Proxy, Miner, Sequencer, Discover, Authorize, Probe, Retest, Refresh, Macro, Import
+          false
         end
       end
 
@@ -159,10 +183,6 @@ module Gori
 
       def token : String
         to_s.underscore
-      end
-
-      def label : String
-        token.upcase
       end
 
       def self.parse?(value : String) : Surface?

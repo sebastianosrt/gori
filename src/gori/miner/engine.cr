@@ -5,7 +5,9 @@ require "./fingerprint"
 require "./baseline"
 require "../fuzz/engine"
 require "../fuzz/matcher"
+require "../request_macro/lane"
 require "../pacing"
+require "wait_group"
 
 module Gori::Miner
   # Refusals no retry can change: the request budget is spent, or Layer 2 says no. Both are
@@ -20,6 +22,9 @@ module Gori::Miner
   # the call. Both loops ask this; neither names a refusal constant of its own.
   def self.permanent_refusal?(err : String?) : Bool
     return true if err.try(&.starts_with?(HookBackend::HOOK_ERROR_PREFIX))
+    # A failed request-time macro (#1350): the probe was never sent, and a retry would only run
+    # the same failing steps against the endpoint that just refused them.
+    return true if Gori::RequestMacro.failed?(err)
     err == Fuzz::CappedBackend::CAP_ERROR || Gori::Outbound.permanent_refusal?(err)
   end
 
@@ -37,7 +42,7 @@ module Gori::Miner
   # Single-threaded fiber scheduler (no -Dpreview_mt): plain ivar increments and array
   # appends never yield mid-op, so the counters and per-round outcome array need no locks.
   class Engine
-    # Outbound rate limiting (rps / throttle_ms / jitter_ms) over `@last_dispatch`.
+    # Outbound rate limiting (rps / throttle_ms) over `@last_dispatch`.
     include Gori::Pacing
 
     MAX_CONCURRENCY = 100
@@ -57,20 +62,13 @@ module Gori::Miner
     # unaffected and buckets exactly as before.
     MAX_JSON_INJECT_BYTES = 128 * 1024
 
-    enum State : UInt8
-      Running
-      Paused
-      Stopped
-    end
-
     # One unit of work: test these names at this location (a bucket, or a bisection half).
     record Task, location : Location, names : Array(String)
 
     getter events : Channel(Event)
 
     @concurrency : Int32
-    @state : State
-    @wake : Channel(Nil)
+    @stopped = false
     @backend : Fuzz::CappedBackend
     @report : Baseline::Report?
     @seen : Set({Location, String})
@@ -126,14 +124,25 @@ module Gori::Miner
     # set means the run produced no verdict at all — it was refused, not answered.
     getter successful_sends : Int64 = 0_i64
 
+    # Named locations this request cannot carry, which `Plan.build` dropped from
+    # `config.locations` — held here only so a live surface polling the engine can report them
+    # beside `skipped_names` (MCP's `not-applicable` rows).
+    getter inapplicable : Array(Location)
+
+    # The run's request-time macro (#1350), or nil. The engine does not gate sends with it —
+    # `MacroBackend` is in the backend chain for that — it only binds it to this run's budget,
+    # rate and stop flag, and ends the run when the macro has.
+    getter request_macro : Gori::RequestMacro::Lane?
+    @macro_abort_sent = false
+
     def initialize(@base : Bytes, @http2 : Bool, @names : Array(String),
-                   backend : Fuzz::Backend, @config : Config)
+                   backend : Fuzz::Backend, @config : Config,
+                   @inapplicable : Array(Location) = [] of Location,
+                   @request_macro : Gori::RequestMacro::Lane? = nil)
       # Wrap the backend so max_requests is enforced at every real send (baseline,
       # bucket, and confirm), not just as a racy pre-dispatch check.
       @backend = Fuzz::CappedBackend.new(backend, @config.max_requests)
       @concurrency = @config.concurrency.clamp(1, MAX_CONCURRENCY)
-      @state = State::Running
-      @wake = Channel(Nil).new(1)
       @events = Channel(Event).new(256)
       @report = nil
       @seen = Set({Location, String}).new
@@ -149,6 +158,15 @@ module Gori::Miner
       @carriable = Hash(Location, Array(String)).new
       @valid = Hash(Location, Array(String)).new
       @encoded = Hash(String, Int32).new
+      # The macro's steps are this run's traffic: charged to its budget (the same
+      # `CappedBackend` every probe goes through), held to its rate, and stopped with it.
+      @request_macro.try(&.attach(@backend, -> { pace(pace_interval) }, -> { @stopped }))
+    end
+
+    # The worker count the engine actually runs at, after the deepest-point clamp — what a
+    # macro's `Info#concurrency` is bounded by.
+    def concurrency : Int32
+      @concurrency
     end
 
     # The number of distinct (name × location) tests this run will perform — the stable
@@ -170,31 +188,17 @@ module Gori::Miner
     end
 
     def stop : Nil
-      @state = State::Stopped
-      poke
-      # The dispatcher has TWO park points and `poke` only reaches one: `park_if_paused`
-      # waits on @wake, `wait_for_worker` waits on @idle. A stop arriving while it is parked
-      # on @idle was therefore invisible until a worker finished an in-flight bucket — which
-      # against a dead origin is `retries × retry_pause` long. Releasing @idle too is safe by
+      @stopped = true
+      # The dispatcher parks in `wait_for_worker` on @idle. A stop arriving while it is parked
+      # there was therefore invisible until a worker finished an in-flight bucket — which
+      # against a dead origin is `retries × retry_pause` long. Releasing @idle is safe by
       # construction: `wait_for_worker`'s own comment says a wake means "look again", never
-      # "one task finished", and the loop re-reads @state on the next iteration.
-      select
-      when @idle.send(nil)
-      else
-      end
-    end
-
-    def pause : Nil
-      @state = State::Paused
-    end
-
-    def resume : Nil
-      @state = State::Running
-      poke
+      # "one task finished", and the loop re-reads @stopped on the next iteration.
+      offer(@idle, nil)
     end
 
     def stopped? : Bool
-      @state == State::Stopped
+      @stopped
     end
 
     # ── orchestration ───────────────────────────────────────────────────────────────
@@ -205,7 +209,7 @@ module Gori::Miner
       # engine and the TUI's ^X reaches it immediately) — and calibration is real requests at
       # the target, so opening with the stability wave would be a burst dispatched entirely
       # after the operator asked to stop. `drain` re-reads the flag for the same reason.
-      if @state.stopped?
+      if @stopped
         @events.send(DoneEvent.new(snapshot, true))
         return
       end
@@ -214,11 +218,15 @@ module Gori::Miner
       # eight names wide answers a question about eight names, and the run then sends 128.
       widths = Hash(Location, Int32).new
       @config.locations.each { |loc| widths[loc] = bucket_width(loc) }
-      report = Baseline.new(@backend, @base, @config, -> { @state.stopped? }).calibrate(@config.locations, widths)
+      report = Baseline.new(@backend, @base, @config, -> { @stopped }).calibrate(@config.locations, widths)
       # A stop that landed DURING calibration, which the check above cannot catch: the predicate
       # handed to `Baseline` kept the remaining probes off the wire, so `report` describes a wave
       # that never finished. Publishing it would claim a baseline was established.
-      if @state.stopped?
+      #
+      # …or the macro ended the run in there (#1350): a baseline whose probes never carried a
+      # fresh value describes nothing, and the macro's own sentence is the reason.
+      note_macro_abort
+      if @stopped
         @events.send(DoneEvent.new(snapshot, true))
         return
       end
@@ -239,18 +247,25 @@ module Gori::Miner
         # `mine_all_refused?` prints, and "every request failed — baseline unreachable —
         # blocked by sandbox" says the same thing three times.
         @first_error ||= report.error
+        # …and COUNTED. Calibration sends never reach `@errors` (a failed stability round only
+        # thins the baseline), so a run refused here ended on `10 sent · 0 errors` — on every
+        # surface, since `snapshot` is what `gori run mine`, MCP `mine_status` and the TUI all
+        # print (#1385). Nothing but calibration has gone out yet, and no stability round
+        # answered, so every attempt so far is a failure (a control that answered while every
+        # round did not would be the one over-count, and is not a shape a live target has).
+        @errors += @backend.sent
         @events.send(ErrorEvent.new(report.warning || "baseline unreachable"))
-        @events.send(DoneEvent.new(snapshot, @state.stopped?))
+        @events.send(DoneEvent.new(snapshot, @stopped))
         return
       end
 
       work = Deque(Task).new
       @config.locations.each { |loc| initial_buckets(loc, valid_names_for(loc)).each { |t| work << t } }
       drain(work)
-      @events.send(DoneEvent.new(snapshot, @state.stopped?))
+      @events.send(DoneEvent.new(snapshot, @stopped))
     rescue ex
       @events.send(ErrorEvent.new(ex.message || "miner error"))
-      @events.send(DoneEvent.new(snapshot, @state.stopped?))
+      @events.send(DoneEvent.new(snapshot, @stopped))
     ensure
       # Every worker has left `drain` by here, so no fiber can be holding a checked-out
       # socket: release the keep-alive pool's parked ones instead of waiting for GC to
@@ -298,7 +313,7 @@ module Gori::Miner
       # UNBUFFERED on purpose: a send parks until a worker actually TAKES the task, which is
       # what keeps `@inflight` bounded by the pool size instead of by the queue's length.
       jobs = Channel(Task).new
-      finished = Channel(Nil).new(workers)
+      finished = WaitGroup.new(workers)
       interval = pace_interval
       @inflight = 0
 
@@ -308,7 +323,7 @@ module Gori::Miner
             begin
               # Children are queued BEFORE the task is counted out, so the "queue empty and
               # nothing in flight" test below is a true end-of-work and never races a child in.
-              process_bucket(task).each { |child| work << child } unless @state.stopped?
+              process_bucket(task).each { |child| work << child } unless @stopped
             rescue ex
               # Every received task MUST count itself out, or the mine hangs — the same
               # invariant `Discover::Engine#worker_loop` states for its Outcome. Without this
@@ -323,25 +338,20 @@ module Gori::Miner
               @inflight -= 1
               # Non-blocking: a worker must never park reporting completion (the dispatcher
               # only listens while it is idle). Dropping a poke is safe — see `wait_for_worker`.
-              select
-              when @idle.send(nil)
-              else
-              end
+              offer(@idle, nil)
             end
           end
         ensure
-          finished.send(nil)
+          finished.done
         end
       end
 
-      until @state.stopped?
+      until @stopped
         if task = work.shift?
-          park_if_paused
-          break if @state.stopped?
           # Early-out once the hard cap is hit — the CappedBackend also refuses any
           # send that slips past this racy check, so the network count never exceeds it.
           break if @backend.cap_reached?
-          pace(interval)
+          break unless pace(interval)
           @inflight += 1
           jobs.send(task)
         elsif @inflight > 0
@@ -351,7 +361,7 @@ module Gori::Miner
         end
       end
       jobs.close
-      workers.times { finished.receive }
+      finished.wait
     end
 
     # Park until a worker reports a finished bucket.
@@ -382,8 +392,7 @@ module Gori::Miner
       # to the live credential and leaves gori for the target, the run reporting `0 errors`.
       # Resolved ONCE for the send: the padding, the byte delta and the decision all need it.
       ref = report.reference_for(task.location)
-      bytes, spans = Inject.apply_with_spans(@base, task.location, pad_pairs(pairs, ref),
-        @config.add_content_length_when_missing?)
+      bytes, spans = Inject.apply_with_spans(@base, task.location, pad_pairs(pairs, ref))
       # Nothing was injected, so this location cannot carry candidates in THIS request — e.g.
       # a request line that is not METHOD SP TARGET SP VERSION, which `inject_query` bails on
       # unmodified rather than rewrite the operator's bytes (P7, and it is right to). Sending
@@ -407,15 +416,7 @@ module Gori::Miner
         return [] of Task
       end
       raw = send_with_retries(bytes, spans)
-      if err = raw.error
-        # A max-requests cap refusal isn't a network error — don't let it inflate @errors.
-        unless err == Fuzz::CappedBackend::CAP_ERROR
-          @errors += 1
-          @first_error ||= err
-        end
-        mark_done(task.names.size) # keep the bar monotonic; this bucket is inconclusive
-        return [] of Task
-      end
+      return [] of Task if bucket_untested?(raw, task)
 
       probe = Fingerprint.probe(raw)
       decision = Miner.decide(report, probe, pairs, task.location, ref, byte_delta(pairs, ref, task.location))
@@ -429,7 +430,7 @@ module Gori::Miner
         # was, so a stop landed while ten workers were inside this loop still let hundreds of
         # requests out per worker. The progress bar is left short on purpose — a stopped run
         # did not finish these names, and saying it did would be a lie.
-        break if @state.stopped?
+        break if @stopped
         confirmed = confirm(name, task.location, Evidence::Reflection, canary)
         record_finding(confirmed) if confirmed
         mark_done(1)
@@ -534,15 +535,15 @@ module Gori::Miner
         # ~120 requests to a third party AFTER the operator pressed stop. Breaking with
         # `hits == 0` returns nil — no finding — which is the honest answer for a candidate
         # whose confirmation never ran.
-        break if @state.stopped?
+        #
+        # `pace` is that read: false once stopped, during its wait or before it. A confirm round
+        # is also a REQUEST for the rate — only the bucket send that produced this candidate was
+        # paced by the dispatch loop, so these ran on top of the operator's rate, up to
+        # `confirm_rounds` extra unpaced requests for every candidate that shows signal.
+        break unless pace(interval)
         c = Canary.fresh
         # Same span-protection as the main loop — the confirm re-send injects the same name.
-        bytes, spans = Inject.apply_with_spans(@base, location, pad_pairs([{name, c}], ref),
-          @config.add_content_length_when_missing?)
-        # A confirm round is a REQUEST. Only the bucket send that produced this candidate was
-        # paced by the dispatch loop, so these ran on top of the operator's rate — up to
-        # `confirm_rounds` extra unpaced requests for every candidate that shows signal.
-        pace(interval)
+        bytes, spans = Inject.apply_with_spans(@base, location, pad_pairs([{name, c}], ref))
         raw = send_with_retries(bytes, spans)
         if err = raw.error
           # A confirm round is a REQUEST like any other, and this was the one send path that
@@ -575,7 +576,7 @@ module Gori::Miner
           # above is 200 for every gRPC call, so for a gRPC target this — not `last_status` —
           # is the isolated candidate's real outcome. nil/nil for a non-gRPC response, at the
           # cost of one allocation-free byte scan.
-          last_grpc_status, last_grpc_message = Fuzz::GrpcVerdict.response(raw.head, raw.body)
+          last_grpc_status, last_grpc_message = Fuzz::GrpcVerdict.response_wire(raw.head, raw.body)
           break if hits >= majority
         end
       end
@@ -842,27 +843,44 @@ module Gori::Miner
     end
 
     private def emit_progress : Nil
-      ev = ProgressEvent.new(snapshot)
-      select
-      when @events.send(ev)
-      else
-      end
+      offer(@events, ProgressEvent.new(snapshot))
     end
 
     private def snapshot : Progress
-      Progress.new(@names_total, @names_done, @backend.sent, @found, @errors)
+      Progress.new(@names_total, @names_done, @backend.sent, @found, @errors, @request_macro.try(&.tally))
     end
 
     # ── sending / pacing ────────────────────────────────────────────────────────────
 
+    # An errored probe ends the bucket. A stop that landed while it waited at the macro gate
+    # sent nothing, so the names stay untested and uncounted — the bar is left short on purpose.
+    # A cap refusal is not a network error. Anything else is counted, then marked done so the
+    # bar stays monotonic for an inconclusive bucket.
+    private def bucket_untested?(raw : Repeater::Result, task : Task) : Bool
+      return false unless err = raw.error
+      unless Gori::RequestMacro.stopped_unsent?(err)
+        unless err == Fuzz::CappedBackend::CAP_ERROR
+          @errors += 1
+          @first_error ||= err
+        end
+        mark_done(task.names.size)
+      end
+      true
+    end
+
     private def send_with_retries(bytes : Bytes, verbatim : Array({Int32, Int32})?) : Repeater::Result
       attempts = 0
+      failed = nil.as(Repeater::Result?)
       loop do
         raw = @backend.send(bytes, verbatim)
+        # A retry the budget refused sent nothing: answer with the failure it was retrying
+        # (see `Sequencer::Engine#send_with_retries`).
+        return failed if failed && raw.error == Fuzz::CappedBackend::CAP_ERROR
         if raw.error.nil?
           @successful_sends += 1
           return raw
         end
+        note_macro_abort if Gori::RequestMacro.failed?(raw.error)
         # A PERMANENT refusal is not worth a retry. All three siblings exempt the cap
         # explicitly (`Fuzz::Engine#run_one`, `Discover`'s `send_with_retries`,
         # `Sequencer`'s), and miner had no exemption at all — so once `--max-requests` tripped,
@@ -870,7 +888,8 @@ module Gori::Miner
         # change. A Layer-2 refusal is permanent for the same reason: the scope did not move
         # between the two calls, and each attempt is charged to the cap a second time
         # (`CappedBackend#send` increments AFTER the cap check but BEFORE the gate's).
-        return raw if permanent_refusal?(raw.error) || attempts >= @config.retries
+        return raw if Miner.permanent_refusal?(raw.error) || attempts >= @config.retries
+        failed = raw
         # A STOP ends the retry chain. It was honoured everywhere else in the run — the
         # dispatcher breaks, a worker skips the bucket it just took — and invisible only here,
         # where a retry is a NEW request: measured, a `stop` on the first errored bucket put
@@ -879,28 +898,22 @@ module Gori::Miner
         # to 1000 requests and ~8 minutes EACH. Checked on BOTH sides of the pause, so neither a
         # stop that arrived during the send nor one during the pause costs another. Same shape,
         # same reason, as `Sequencer::Engine#send_with_retries` and `Fuzz::Engine#run_one`.
-        return raw if @state.stopped?
+        return raw if @stopped
         attempts += 1
         sleep @config.retry_pause
-        return raw if @state.stopped?
+        return raw if @stopped
       end
     end
 
-    private def permanent_refusal?(err : String?) : Bool
-      Miner.permanent_refusal?(err)
-    end
-
-    private def park_if_paused : Nil
-      while @state == State::Paused
-        @wake.receive
-      end
-    end
-
-    private def poke : Nil
-      select
-      when @wake.send(nil)
-      else
-      end
+    # End the run when the macro has ended it: a failure under `stop`, or too many in a row. The
+    # ErrorEvent is what turns the run's verdict into `error` on every surface, so a mine the
+    # macro killed can never finish as a clean one; `stop` lets what is in flight complete.
+    private def note_macro_abort : Nil
+      return if @macro_abort_sent
+      return unless (lane = @request_macro) && (reason = lane.abort_reason)
+      @macro_abort_sent = true
+      stop
+      @events.send(ErrorEvent.new(reason))
     end
   end
 end

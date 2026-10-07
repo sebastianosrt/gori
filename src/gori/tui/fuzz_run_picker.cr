@@ -71,11 +71,7 @@ module Gori::Tui
 
     def overlay_box(area : Rect) : Rect?
       return nil if @rows.empty?
-      w = {area.w - 4, 96}.min
-      h = {@rows.size + 2, 4}.max
-      h = {h, area.h - 2}.min
-      return nil if w < 42 || h < 4
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      area.card?(96, {@rows.size + 2, 4}.max, 42, 4)
     end
 
     def row_at(box : Rect, mx : Int32, my : Int32) : Int32?
@@ -104,11 +100,13 @@ module Gori::Tui
 
     private def draw_row(screen : Screen, box : Rect, y : Int32,
                          row : Store::FuzzRunRecord, active : Bool) : Nil
-      bg = active ? Theme.accent_bg : Theme.panel
-      screen.fill(Rect.new(box.x + 1, y, box.w - 2, 1), bg)
-      screen.cell(box.x + 1, y, active ? '▎' : ' ', Theme.accent, bg)
+      bg = Frame.row_band(screen, box, y, active)
       proto = row.proto_label
-      label = "##{row.id}  #{row.status.upcase} · #{proto} · #{row.mode}"
+      # A filtered archive (issue #1240) says so, so a small stored count reads as a policy.
+      keep = row.filtered? ? " · keep:#{row.keep}" : ""
+      # The result a `condition_met` run tripped on (issue #1270), the row a load lands beside.
+      stop = FuzzerView.stop_chip(row.stop_idx)
+      label = "##{row.id}  #{row.status.upcase}#{stop} · #{proto} · #{row.mode}#{keep}"
       stats = "#{row.matched}/#{row.sent} hit"
       sx = box.right - 2 - stats.size
       screen.text(box.x + 3, y, label, active ? Theme.text_bright : Theme.text, bg,

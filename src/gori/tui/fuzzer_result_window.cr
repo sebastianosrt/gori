@@ -39,8 +39,9 @@ module Gori::Tui
           charge = self.class.result_bytes(result)
         end
       end
-      @rows << result
-      @charges << charge
+      at = insertion_point(result.index)
+      @rows.insert(at, result)
+      @charges.insert(at, charge)
       @projected_indices.add(result.index) if projected
       @bytes += charge
 
@@ -48,12 +49,32 @@ module Gori::Tui
       while @rows.size > @row_cap || @bytes > @byte_cap
         removed = @rows.shift
         @bytes -= @charges.shift
-        unless @rows.any? { |row| row.index == removed.index }
+        # The scan only matters for an index that is marked: unmarked, the delete is a no-op
+        # whatever the other rows hold. Most rows never are, and scanning the full window on
+        # every eviction past the cap made each append O(ROW_CAP) for the rest of the run.
+        if @projected_indices.includes?(removed.index) && @rows.none? { |row| row.index == removed.index }
           @projected_indices.delete(removed.index)
         end
         evicted += 1
       end
       evicted
+    end
+
+    # Where `append` puts a row with this index: after every row whose index is not greater, so
+    # `rows` stays in index order — the order `o:index` promises and a saved run is read back
+    # in (`ORDER BY idx, id`) — however a concurrent run's results arrive (#1432). A resend's
+    # repeated index lands after the earlier copy, as `id` breaks that tie in the Store.
+    #
+    # Scanned from the tail: a result is late by at most about the run's concurrency, so the
+    # walk is that short, and an in-order arrival (every serial run) is a plain push.
+    def insertion_point(index : Int64) : Int32
+      # Older than the whole window (a straggler a full window evicts at once): no walk.
+      return 0 if (first = @rows.first?) && index < first.index
+      at = @rows.size
+      while at > 0 && @rows[at - 1].index > index
+        at -= 1
+      end
+      at
     end
 
     def projected?(index : Int64) : Bool
@@ -161,7 +182,8 @@ module Gori::Tui
         result.matched?, result.incomplete?, extracted, nil, nil, nil,
         result.retried?, chain_error, result.grpc_status, grpc_message,
         result.timed_out?, result.resent_count, nil,
-        ws_close_code: result.ws_close_code, ws_frames_in: result.ws_frames_in)
+        ws_close_code: result.ws_close_code, ws_frames_in: result.ws_frames_in,
+        shape: result.shape)
     end
   end
 end

@@ -8,7 +8,7 @@ module Gori
       # <id>` is the top-level `gori run show <id>`, spelled the way the History tab reads.
       @[Subcommand("history", "ls", help: [
         {"history (ls)", "List / QL-query captured flows"},
-        {"history delete", "Hard-delete one captured flow by id, or every match of -q QL (needs --yes)"},
+        {"history delete", "Hard-delete captured flows by id (one or more), or every match of -q QL (needs --yes)"},
         {"history clear", "Delete ALL captured flows in the project (needs --yes)"},
       ])]
       private def self.cmd_history(args : Array(String)) : Nil
@@ -31,32 +31,25 @@ module Gori
       # `history clear --yes`, and a delete that quietly widened to the whole project because
       # an argument went missing from a script is the one failure this file must not have.
       private def self.cmd_history_delete(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         query : String? = nil
         yes = false
-        positional = [] of String
 
-        parser = OptionParser.new do |p|
-          p.banner = "Usage: gori run history delete <id>\n" \
-                     "       gori run history delete -q QL --yes\n\n" \
-                     "Hard-delete one captured flow, or every flow a QL query matches. " \
-                     "This can't be undone."
-          p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
-          p.on("-qQL", "--query=QL", "Delete every flow matching this QL query (host: status:>=500 method: …)") { |v| query = v }
-          p.on("--yes", "Actually delete the query's matches (required — there is no interactive prompt here)") { yes = true }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = before + after }
-          p.invalid_option { |f| abort "gori run history delete: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run history delete: missing value for #{f}" }
-        end
         # Same two pre-passes the listing runs, for the same reason: `-q` with a separate
         # value, and QL negation terms ("-status:200"), which OptionParser would otherwise
         # abort as unknown options before they could join the query.
         args = normalize_query_flag(args)
         neg_terms, opt_args = split_ql_negations(args)
-        parser.parse(opt_args)
+        positional = parse_args(opt_args, "gori run history delete") do |p|
+          p.banner = "Usage: gori run history delete <id>…\n" \
+                     "       gori run history delete -q QL --yes\n\n" \
+                     "Hard-delete the captured flows named by id (every id must exist, or nothing is " \
+                     "deleted), or every flow a QL query matches. " \
+                     "This can't be undone."
+          project_options(p, proj, "update")
+          p.on("-qQL", "--query=QL", "Delete every flow matching this QL query (host: status:>=500 method: …)") { |v| query = v }
+          p.on("--yes", "Actually delete the query's matches (required — there is no interactive prompt here)") { yes = true }
+        end
         query, dropped = Run.compose_history_query(query, [] of String, neg_terms)
         Run.warn_dropped_query_terms("history delete", dropped)
 
@@ -64,9 +57,9 @@ module Gori
           abort "gori run history delete: #{err}"
         end
         if q = query
-          delete_by_query(q, yes, project_name, db_path)
+          delete_by_query(q, yes, proj.name, proj.db)
         else
-          delete_by_id(positional, project_name, db_path)
+          delete_by_id(positional, proj.name, proj.db)
         end
       end
 
@@ -90,27 +83,29 @@ module Gori
         end
       end
 
-      # `history delete <id>` — the single, explicit form.
+      # `history delete <id>…` — the explicit form, one id or several (#1388).
+      #
+      # It took exactly one, and refused `1 2 3` so as not to delete only #1 and exit 0 — right
+      # at the time, and still the half that matters: every id is checked BEFORE anything is
+      # deleted, and one that names no flow refuses the whole command, so a typo in a list
+      # never becomes "two of three gone, success". The rest go in ONE transaction
+      # (`Store#delete_flows`), so a busy project deletes all of them or none.
       private def self.delete_by_id(positional : Array(String), project_name : String?,
                                     db_path : String?) : Nil
-        # `take_flow_id`, not a hand-rolled `first?`: it supplies the too-many-arguments abort
-        # this one path was missing, so `history delete 1 2 3` no longer deletes ONLY flow #1
-        # and exits 0 with nothing said about #2 and #3. The TUI has multi-select delete and the
-        # store exposes `delete_flows`, so trying the list form is natural — and an operator who
-        # believes three captures are gone when two are still on disk has been told a lie by a
-        # destructive command. Every sibling id-taking delete (project, scope, env,
-        # host-override, `history show`) already goes through this helper.
-        id = take_flow_id(positional, "history delete")
+        ids = positional.map { |v| parse_flow_id(v, "gori run history delete") }.uniq!
 
-        store = open_store(resolve_read_project(project_name, db_path))
-        begin
+        with_store(resolve_read_project(project_name, db_path)) do |store|
           # flow_row is the row-only read; get_flow would materialize both BLOBs to answer
           # "does this exist?" — a 40 MB response would be read and discarded.
-          abort "gori run history delete: no flow with id #{id}" unless store.flow_row(id)
-          abort "gori run history delete: flow ##{id} NOT deleted (project busy) — try again" unless store.delete_flow(id)
-          puts "Flow ##{id} deleted."
-        ensure
-          store.close
+          missing = ids.reject { |id| store.flow_row(id) }
+          unless missing.empty?
+            abort "gori run history delete: no flow with id #{missing.join(", ")}" \
+                  "#{ids.size > 1 ? " — nothing was deleted" : ""}"
+          end
+          unless store.delete_flows(ids)
+            abort "gori run history delete: #{ids.size == 1 ? "flow ##{ids[0]}" : "flows"} NOT deleted (project busy) — try again"
+          end
+          puts ids.size == 1 ? "Flow ##{ids[0]} deleted." : "#{ids.size} flows deleted (#{ids.map { |id| "##{id}" }.join(", ")})."
         end
       end
 
@@ -130,8 +125,7 @@ module Gori
         # costs no store open is worth keeping.
         lens = Scope.ql_lens(store)
         if err = delete_scope_error(q, lens)
-          store.close
-          abort "gori run history delete: #{err}"
+          abort_closing(store, "gori run history delete: #{err}")
         end
         filter = QL.parse(q, scope: lens)
         # A `body:`/free-text delete drains the trigram index first, because an under-reporting
@@ -141,14 +135,12 @@ module Gori
         if err = fts_backlog_error(store, filter,
              "#{q.inspect} cannot see all of them and this delete would silently spare some. " \
              "NOTHING was deleted;")
-          store.close
-          abort "gori run history delete: #{err}"
+          abort_closing(store, "gori run history delete: #{err}")
         end
         ids = begin
           matching_flow_ids(store, filter)
         rescue ex
-          store.close
-          abort "gori run history delete: query #{q.inspect} failed: #{ex.message}"
+          abort_closing(store, "gori run history delete: query #{q.inspect} failed: #{ex.message}")
         end
 
         begin
@@ -165,12 +157,12 @@ module Gori
           # counted, so a mid-run failure reports what actually went rather than all-or-nothing.
           ids.each_slice(DELETE_BATCH) do |chunk|
             unless store.delete_flows(chunk)
-              abort "gori run history delete: stopped after #{deleted} flow#{deleted == 1 ? "" : "s"} " \
+              abort "gori run history delete: stopped after #{Gori.plural(deleted, "flow")} " \
                     "(project busy) — the rest are still there; re-run to continue"
             end
             deleted += chunk.size
           end
-          puts "Deleted #{deleted} flow#{deleted == 1 ? "" : "s"} matching #{q.inspect}."
+          puts "Deleted #{Gori.plural(deleted, "flow")} matching #{q.inspect}."
         ensure
           store.close
         end
@@ -200,7 +192,7 @@ module Gori
       # which is the same decision one scope wider.
       private def self.delete_confirmation_error(q : String, count : Int32, yes : Bool) : String?
         return nil if yes
-        "refusing to delete #{count} flow#{count == 1 ? "" : "s"} matching #{q.inspect} without --yes"
+        "refusing to delete #{Gori.plural(count, "flow")} matching #{q.inspect} without --yes"
       end
 
       # Drain the off-commit trigram index for a `body:`/free-text query, and return the refusal
@@ -225,7 +217,7 @@ module Gori
         return nil unless filter.uses_fts?
         pending = store.drain_fts!
         return nil if pending.zero?
-        "#{pending} flow#{pending == 1 ? "" : "s"} could not be indexed for free-text search " \
+        "#{Gori.plural(pending, "flow")} could not be indexed for free-text search " \
         "(this project's writer is busy — another gori is capturing it), so #{consequence} " \
         "Retry in a moment."
       end
@@ -315,80 +307,60 @@ module Gori
       # this; headless, --yes is that confirm — without it we print the count and refuse, so
       # a mistyped command can't empty a capture session.
       private def self.cmd_history_clear(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         yes = false
-        leftover = [] of String
 
-        parser = OptionParser.new do |p|
+        parse_no_positionals(args, "gori run history clear",
+          "this deletes ALL flows, not those ids. To delete one flow: `gori run history delete <id>`") do |p|
           p.banner = "Usage: gori run history clear --yes\n\n" \
                      "Delete ALL captured flows in the project. This can't be undone."
-          p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
+          project_options(p, proj, "update")
           p.on("--yes", "Actually do it (required — there is no interactive prompt here)") { yes = true }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| leftover = before + after }
-          p.invalid_option { |f| abort "gori run history clear: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run history clear: missing value for #{f}" }
-        end
-        parser.parse(args)
-        unless leftover.empty?
-          abort "gori run history clear: unexpected argument#{leftover.size == 1 ? "" : "s"} " \
-                "#{leftover.join(" ").inspect} — this deletes ALL flows, not those ids. " \
-                "To delete one flow: `gori run history delete <id>`"
         end
 
-        store = open_store(resolve_read_project(project_name, db_path))
-        begin
+        with_store(resolve_read_project(proj.name, proj.db)) do |store|
           n = store.count?
           abort "gori run history clear: could not count the flows (project busy) — nothing deleted" unless n
           unless yes
-            abort "gori run history clear: refusing to delete #{n} flow#{n == 1 ? "" : "s"} without --yes"
+            abort "gori run history clear: refusing to delete #{Gori.plural(n, "flow")} without --yes"
           end
           abort "gori run history clear: NOT cleared (project busy) — every flow is still there" unless store.clear_flows
-          puts "Deleted #{n} flow#{n == 1 ? "" : "s"}."
-        ensure
-          store.close
+          puts "Deleted #{Gori.plural(n, "flow")}."
         end
       end
 
       private def self.cmd_history_list(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         query : String? = nil
         limit = 50
         format = :text
         lenient = false
         in_scope = false
+        hide_static = false
+        include_sensitive = false
         view_name : String? = nil
         column_specs = [] of String
         no_columns = false
-        positional = [] of String
+        redaction = RedactFlags.new
 
-        parser = OptionParser.new do |p|
+        args = normalize_query_flag(args)
+        neg_terms, opt_args = split_ql_negations(args)
+        positional = parse_args(opt_args, "gori run history") do |p|
           p.banner = "Usage: gori run history [QL query] [options]   (alias: ls)\n\n" \
                      "Subcommands: history show <id> · history delete <id> · history clear --yes"
-          p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
+          project_options(p, proj, "read")
           p.on("-qQL", "--query=QL", "Filter with a QL query (host: status:>=500 size:>10000 dur:>500 header: body~rx …)") { |v| query = v }
           p.on("-nN", "--limit=N", "Max rows, newest first (default 50)") { |v| limit = parse_count(v, "--limit") }
           p.on("--view=NAME", "Apply a saved History view — ANDed with -q, like the TUI's `v` picker (see `gori run views`)") { |v| view_name = v }
-          p.on("--in-scope", "Only flows in the project's configured scope (the TUI's ⇧S lens; capture still records everything)") { in_scope = true }
+          p.on("--in-scope", "Only flows in the project's configured scope (the TUI's `s` lens; capture still records everything)") { in_scope = true }
+          p.on("--hide-static", "Leave out static assets — images, fonts, media (the TUI's hide-static lens; same as -q -static:true)") { hide_static = true }
           p.on("--lenient", "Don't refuse a query naming an unknown field — search that token as text (old behaviour)") { lenient = true }
           p.on("--column=SPEC", "Show an extracted value per row: [LABEL=][req|res:]kind:selector — e.g. header:x-request-id, RID=jsonpath:data.id, position:0:32 (repeatable; replaces this project's configured History columns)") { |v| column_specs << v }
           p.on("--no-columns", "Don't draw this project's configured History columns (see the TUI's Columns… on the History tab)") { no_columns = true }
-          p.on("--format=FMT", "Output: text (default) | json | jsonl (both emit JSON-Lines) | har (one HAR 1.2 log)") do |v|
-            format = parse_format(v, [:text, :json, :jsonl, :har])
-            format = :json if format == :jsonl # this listing's json IS JSON-Lines; accept the standard name too
-          end
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = before + after }
-          p.invalid_option { |f| abort "gori run history: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run history: missing value for #{f}" }
+          format_flag(p, [:text, :json, :jsonl, :har], "Output: text (default) | json (one array) | jsonl (one object per line) | har (one HAR 1.2 log)") { |f| format = f }
+          p.on("--include-sensitive", "Emit Authorization/Cookie/Set-Cookie/API-key values in --format json's per-row headers instead of [REDACTED]") { include_sensitive = true }
+          redact_options(p, redaction)
         end
-        args = normalize_query_flag(args)
-        neg_terms, opt_args = split_ql_negations(args)
-        parser.parse(opt_args)
         # `--project=X delete 42` lands here because the dispatcher keys on args.first?.
         # `delete` is not QL; it is the discarded verb. Refuse it rather than search
         # for the free-text "delete 42" and exit 0 with the flow still on disk.
@@ -415,6 +387,27 @@ module Gori
         end
         ad_hoc = DisplayColumns.parse_specs(column_specs)
         abort "gori run history: #{ad_hoc}" if ad_hoc.is_a?(String)
+        # A flag that does nothing says so, keyed off the FLAG and not off derived state — the
+        # same discipline as the `--column is not carried by --format har` note below. Below the
+        # `--column` abort, though, and not beside the refusals above it: the note describes a
+        # run, and narrating a flag on an invocation that then aborts is noise.
+        #
+        # It says only which format the flag changes. It used to add "the text listing prints
+        # no header values", which is FALSE — a `header:`/`cookie:` History column prints its
+        # value on the text row too, and the configured set is drawn by default. `--format har`
+        # is untouched on purpose (an interchange document has to carry the message in full to
+        # be replayable), but that is a paragraph for the docs, not a claim to make here.
+        if include_sensitive && !format.in?(:json, :jsonl)
+          STDERR.puts "gori run history: --include-sensitive only changes --format json/jsonl"
+        end
+        # Refused rather than ignored. A profile redacts BODIES, and `--format har` is the only
+        # listing format that carries one — so `--redact` on the text/json listing would hand
+        # back a document that is identical to the unredacted one while saying it was sanitized,
+        # which is the single most dangerous thing this feature could do.
+        if !redaction.mode.nil? && format != :har
+          abort "gori run history: --redact/--no-redact apply to bodies, which only --format har " \
+                "carries — pass --format har, or use `gori run show <id> --redact` for one flow"
+        end
 
         # `body:` drains FTS, which is a write. Everything else is a read (#752).
         #
@@ -423,10 +416,9 @@ module Gori
         # lives in this database). Opening read-only and discovering that afterwards would leave
         # the listing silently short of whatever the off-commit index had not caught up on —
         # exactly what `fts_backlog_error` refuses to let a one-shot answer do.
-        store = open_store(resolve_read_project(project_name, db_path),
-          read_only: !query_uses_fts?(query) && view_name.nil?)
-        begin
-          # The scope lens, opt-in and independent of the persisted ⇧S flag — the same per-flow
+        with_store(resolve_read_project(proj.name, proj.db),
+          read_only: !query_uses_fts?(query) && view_name.nil?) do |store|
+          # The scope lens, opt-in and independent of the persisted `s` flag — the same per-flow
           # include/exclude filter the TUI History lens applies, so `--in-scope` here shows the
           # same set. Capture is untouched; this narrows only the VIEW. Empty (nothing in scope)
           # when no scope rules are configured, matching `sitemap --in-scope`.
@@ -449,19 +441,20 @@ module Gori
           if vn = view_name
             unless view = SavedViews.resolve_by_name(store, vn)
               known = SavedViews.names(store).join(", ")
-              store.close
-              abort "gori run history: no view named #{vn.inspect} (known: #{known})"
+              abort_closing(store, "gori run history: no view named #{vn.inspect} (known: #{known})")
             end
             # A view whose query compiles to nothing is REFUSED, not applied. `QL.and` folds an
             # EMPTY side away, so applying it would list EVERY flow while the command line says
             # a view is narrowing — the same failure the query refusal below exists to stop.
-            unless f = SavedViews.filter(view, scope: lens)
-              store.close
-              abort "gori run history: view #{view.name.inspect} is not a usable query (#{view.query.inspect}) — fix it with `gori run views set`"
-            end
+            f = SavedViews.filter(view, scope: lens) || abort_closing(store, "gori run history: view #{view.name.inspect} is not a usable query (#{view.query.inspect}) — fix it with `gori run views set`")
             view_filter = f
             view_label = view.name if view.narrowing?
           end
+
+          # `--hide-static`: the one compiled spelling every surface ANDs (`QL.hide_static`). Like
+          # `--in-scope`, explicit — never read from the TUI's persisted toggle, so a script's
+          # answer does not change because somebody pressed a key in the TUI.
+          static_filter = hide_static ? QL.hide_static : QL::EMPTY
 
           scope_unconfigured = false
           scope_filter = QL::EMPTY
@@ -488,10 +481,11 @@ module Gori
               # yields the match-all EMPTY filter — silently dumping every flow,
               # the opposite of what the user asked. Refuse it instead.
               if !q.strip.empty? && filter == QL::EMPTY
-                store.close
-                abort "gori run history: query #{q.inspect} did not match any field (check syntax, e.g. status:>=500 host:example.com method:POST)"
+                abort_closing(store, "gori run history: query #{q.inspect} did not match any field (check syntax, e.g. status:>=500 host:example.com method:POST)")
               end
-              combined = QL.and(QL.and(scope_filter, view_filter), filter)
+              # The hide-static lens LAST, after the operator's own terms, the way the TUI and MCP
+              # order it: a cheap `host LIKE` rejects a row before the lens is consulted.
+              combined = QL.and(QL.and(QL.and(scope_filter, view_filter), filter), static_filter)
               # Trigram indexing is off-commit (Store V4), so a `body:`/free-text query run
               # right after a capture — or against a db a killed process left behind — would
               # under-report until the backlog drains. A one-shot answer must be exact, so
@@ -502,27 +496,24 @@ module Gori
               # answer — a caveat on STDERR is gone the moment the rows are piped to a file.
               if err = fts_backlog_error(store, combined,
                    "#{q.inspect} would silently omit them. Nothing was listed;")
-                store.close
-                abort "gori run history: #{err}"
+                abort_closing(store, "gori run history: #{err}")
               end
               begin
                 store.search(combined, limit_probe(limit), raise_on_error: true)
               rescue ex
-                store.close
-                abort "gori run history: query #{q.inspect} failed: #{ex.message}"
+                abort_closing(store, "gori run history: query #{q.inspect} failed: #{ex.message}")
               end
-            elsif in_scope || view_filter != QL::EMPTY
+            elsif in_scope || view_filter != QL::EMPTY || hide_static
               # `view_filter` belongs in this condition and not only in the AND above: without
               # it a `--view` with no `-q` and no `--in-scope` falls through to `recent_flows`,
               # which takes no filter at all — the command would accept the view and list
               # everything.
-              combined = QL.and(scope_filter, view_filter)
+              combined = QL.and(QL.and(scope_filter, view_filter), static_filter)
               # Same drain-or-refuse the query branch runs, for the same reason: a view is free
               # to use `body:`, and this listing IS the answer.
               if err = fts_backlog_error(store, combined,
                    "the #{view_name.inspect} view would silently omit them. Nothing was listed;")
-                store.close
-                abort "gori run history: #{err}"
+                abort_closing(store, "gori run history: #{err}")
               end
               # Same rescue the query branch has: a view can hold a regex or an OR chain that
               # PARSES but SQLite still refuses to run (hand-edited settings.json, a peer's
@@ -530,8 +521,7 @@ module Gori
               begin
                 store.search(combined, limit_probe(limit), raise_on_error: true)
               rescue ex
-                store.close
-                abort "gori run history: view #{view_name.inspect} failed: #{ex.message}"
+                abort_closing(store, "gori run history: #{view_name ? "view #{view_name.inspect}" : "listing"} failed: #{ex.message}")
               end
             else
               store.recent_flows(limit_probe(limit))
@@ -566,8 +556,8 @@ module Gori
             # `--format har` run in any project that has a column, which is stderr noise in a
             # script rather than a warning about anything they did.
             STDERR.puts "gori run history: --column is not carried by --format har (the values are in each entry's headers/content)" unless column_specs.empty?
-            emit_har(store, rows, query, view_label, limit, truncated)
-          elsif format == :json
+            emit_har(store, rows, query, view_label, limit, truncated, redaction, hide_static)
+          elsif format.in?(:json, :jsonl)
             # Said on STDERR in the streaming formats too, for the reason the empty note below
             # gives: STDOUT is a pipe, and the consumer reading it cannot see the flags the
             # command was invoked with.
@@ -577,34 +567,83 @@ module Gori
             # traffic" and "a standing --view/--in-scope lens excluded all of it" read identically
             # to the one consumer that cannot see the flags it was invoked with. STDOUT stays a
             # pure stream either way (this is STDERR), so a pipe is unaffected.
-            STDERR.puts empty_listing_note(query, view_label, in_scope) if rows.empty?
+            STDERR.puts empty_listing_note(query, view_label, in_scope, hide_static) if rows.empty?
             # One extra read per row for the head the projection does not carry — that is what
-            # buys `url` and `headers` on the JSON-Lines row (`Output.flow_row_fields`). Heads
-            # are small and this streams row by row, so a large `-n` costs queries, not memory.
-            rows.each { |r| puts CLI::Output.flow_row_json(r, store.request_head(r.id), row_columns(store, r, prepared)) }
+            # buys `url` and `headers` on the row (`Output.flow_row_fields`). Heads are small and
+            # this streams row by row, so a large `-n` costs queries, not memory.
+            #
+            # `json` is ONE array and `jsonl` one object per line (#1386). `json` used to be
+            # JSON-Lines here and an array everywhere else, so `history --format json | jq
+            # length` measured each row instead of counting them. The array is still streamed,
+            # element by element, rather than built whole. Each row is encoded before its
+            # separator and the array closes in `ensure`, so a read that raises mid-stream still
+            # leaves the rows before it as one valid document, as the fuzz stream does.
+            array = format == :json
+            print '[' if array
+            begin
+              rows.each_with_index do |r, i|
+                cols, cols_redacted = row_columns(store, r, prepared, include_sensitive) || {nil, false}
+                line = CLI::Output.flow_row_json(r, store.request_head(r.id), cols,
+                  include_sensitive: include_sensitive, columns_redacted: cols_redacted)
+                print ',' if array && i > 0
+                array ? print(line) : puts(line)
+              end
+            ensure
+              if array
+                begin
+                  puts ']'
+                rescue IO::Error # a closed pipe: nothing is reading the close either
+                end
+              end
+            end
           elsif rows.empty?
-            STDERR.puts empty_listing_note(query, view_label, in_scope)
+            STDERR.puts empty_listing_note(query, view_label, in_scope, hide_static)
           else
             (note = history_truncation_note(truncated, limit)) && STDERR.puts("gori run history: #{note}")
-            rows.each { |r| puts CLI::Output.flow_row_text(r, row_columns(store, r, prepared)) }
+            # `include_sensitive: true` on purpose — the text listing is out of #1002's scope
+            # (it is the interactive read, not the feed a script or an agent captures) and the
+            # note above promises the flag changes `--format json` alone. Stated at the call
+            # site rather than defaulted, so the choice is visible where it is made.
+            rows.each { |r| puts CLI::Output.flow_row_text(r, row_columns(store, r, prepared, include_sensitive: true).try(&.[0])) }
           end
-        ensure
-          store.close
         end
       end
 
-      # One row's user-column values as `{label, value}` pairs, or nil when no column is defined.
+      # One row's user-column values as `{label, value}` pairs plus whether any value was
+      # withheld, or nil when no column is defined.
       #
       # ONE capped read per PRINTED row and none at all for a set that reads only heads — the
       # same P8 discipline the TUI row loop keeps, applied to a listing that is already bounded
       # by `--limit`. A flow a peer deleted between the search and this read yields blanks rather
       # than dropping the row: the row matched, and the listing has to say so.
+      #
+      # A column extracting a sensitive header (`Output.sensitive_column?`) is `[REDACTED]`
+      # under the same `--include-sensitive` the `headers` block obeys, and for a reason the
+      # `headers` block alone could not fix: the project's CONFIGURED columns are drawn by
+      # default, so a `req:header:authorization` set once in the TUI printed the credential on
+      # every later `--format json` run — in the same object as the
+      # `sensitive_headers_redacted: true` the redacted `headers` block had just asserted. Only
+      # an EMPTY value is left alone, so a column that found nothing still reads as nothing
+      # rather than claiming a secret was there.
+      #
+      # Applied here, where the column DESCRIPTORS are: `Output.columns_json` sees only
+      # `{label, value}` and cannot tell a header column from a jsonpath one.
       private def self.row_columns(store : Store, row : Store::FlowRow,
-                                   prepared : DisplayColumns::Prepared) : Array({String, String})?
+                                   prepared : DisplayColumns::Prepared,
+                                   include_sensitive : Bool) : {Array({String, String}), Bool}?
         return nil if prepared.empty?
         detail = store.get_flow(row.id, body_max: prepared.body_scoped? ? DisplayColumns::BODY_CAP : 0)
         values = detail ? prepared.values(detail) : Array.new(prepared.size, "")
-        prepared.columns.map_with_index { |c, i| {c.label, values[i]? || ""} }
+        redacted = false
+        pairs = prepared.columns.map_with_index do |c, i|
+          v = values[i]? || ""
+          if !include_sensitive && !v.empty? && CLI::Output.sensitive_column?(c)
+            redacted = true
+            v = "[REDACTED]"
+          end
+          {c.label, v}
+        end
+        {pairs, redacted}
       end
 
       # The sentence an empty listing prints. It names EVERY lens that narrowed the answer, not
@@ -620,10 +659,13 @@ module Gori
       #
       # Public for the reason `view_row` is: the command ends in `exit`, so the printed shape is
       # the only part of it a spec can pin.
-      def self.empty_listing_note(query : String?, view : String?, in_scope : Bool) : String
+      def self.empty_listing_note(query : String?, view : String?, in_scope : Bool,
+                                  hide_static : Bool = false) : String
         scoped = in_scope ? " in scope" : ""
         viewed = view ? " in the #{view.inspect} view" : ""
-        "no flows#{query ? " match #{query.inspect}" : ""}#{scoped}#{viewed}"
+        static = hide_static ? " (static assets hidden)" : ""
+        hint = query.try { |q| QL.missing_colon_hint(q) }.try { |h| " (#{h})" }
+        "no flows#{query ? " match #{query.inspect}" : ""}#{scoped}#{viewed}#{static}#{hint}"
       end
 
       # The sentence a listing cut by `--limit` prints, or nil when the page WAS the whole
@@ -663,8 +705,9 @@ module Gori
       # `gori run history:` prefix, and both lenses for the same reason as above: an export that
       # is empty because a standing view excluded everything must not read like one taken against
       # a project with no traffic.
-      def self.empty_har_note(query : String?, view : String?) : String
-        why = [query ? "query #{query.inspect}" : nil, view ? "view #{view.inspect}" : nil].compact
+      def self.empty_har_note(query : String?, view : String?, hide_static : Bool = false) : String
+        why = [query ? "query #{query.inspect}" : nil, view ? "view #{view.inspect}" : nil,
+               hide_static ? "static assets hidden" : nil].compact
         "no flows written to the HAR#{why.empty? ? "" : " (#{why.join(", ")})"}"
       end
 
@@ -679,9 +722,44 @@ module Gori
       # STDOUT stays a pure HAR document (pipe it straight to a file); every caveat — flows
       # skipped, bodies capped — goes to STDERR, because a silently short export is exactly
       # the failure this file keeps having to fix.
+      # The HAR writer's transcript lookup: under a profile, the sanitized copy made beside the
+      # flow's report (never a second store read); otherwise the store's.
+      private def self.har_ws_lookup(store : Store, matcher : Redact::Matcher?,
+                                     clean_ws : Hash(Int64, Array(Store::WsMessage))) : Int64 -> Array(Store::WsMessage)
+        return ->(id : Int64) { store.ws_messages(id) } unless matcher
+        ->(id : Int64) { clean_ws.delete(id) || [] of Store::WsMessage }
+      end
+
       private def self.emit_har(store : Store, rows : Array(Store::FlowRow), query : String?,
-                                view : String?, limit : Int32, truncated : Bool) : Nil
-        details = rows.reverse.each.compact_map { |r| store.get_flow(r.id) }
+                                view : String?, limit : Int32, truncated : Bool,
+                                redaction : RedactFlags = RedactFlags.new,
+                                hide_static : Bool = false) : Nil
+        # Resolved (and refused) while the store is still open, exactly as `cmd_show` does: the
+        # project's own profiles live on a settings row in this database.
+        choice = redact_choice(store, redaction)
+        if err = choice.error
+          abort_closing(store, "gori run history: #{err}")
+        end
+        matcher = choice.matcher
+        # The per-flow reports, kept so the ONE line at the end can total them. Reports, not
+        # whole flows: a report is a handful of `Hit`s, and holding the sanitized bodies of a
+        # 5000-flow export in memory is what `details` streams to avoid.
+        reports = [] of {Int64?, Redact::Report}
+        # A flow's sanitized transcript, made beside its report so the count includes the
+        # frames, and handed to the writer's lookup below (which takes it back out). Under a
+        # profile that lookup never goes back to the store, so there is still one transcript
+        # read per flow; a preview keeps only the hits, since nothing is written.
+        clean_ws = {} of Int64 => Array(Store::WsMessage)
+        details = rows.reverse.each.compact_map do |r|
+          d = store.get_flow(r.id)
+          next nil if d.nil?
+          next d unless m = matcher
+          clean, report = Redact::Wire.flow(d, m)
+          frames, hits = Redact::Wire.ws_messages(store.ws_messages(r.id), m)
+          clean_ws[r.id] = frames unless frames.empty? || redaction.preview?
+          reports << {r.id.as(Int64?), report.copy_with(frames: hits)}
+          clean
+        end
         # The transcript lookup. `Export::Har.log` calls this for EVERY flow, including the
         # ones that are plainly HTTP — deliberately, and it is the point of #742: "does this
         # flow have a transcript" is a question only the rows can answer, and the status test
@@ -699,11 +777,19 @@ module Gori
         # it back, and it does not pay: the count is the same index read, 3.6 ms of that 32 ms
         # on 20k flows, and it costs a SECOND query for every flow that IS a socket. One
         # unconditional query is both cheaper overall and the shape with no predicate in it.
-        report = Export::Har.log(STDOUT, details, ws: ->(id : Int64) { store.ws_messages(id) })
+        if matcher && redaction.preview?
+          # A preview writes rows, not a HAR, so the document is never built: `details` is a
+          # lazy iterator and forcing it here is what fills `reports`.
+          details.each { }
+          print_redact_preview(reports, choice, "history")
+          return
+        end
+        report = Export::Har.log(STDOUT, details, ws: har_ws_lookup(store, matcher, clean_ws))
         STDOUT.puts
+        redact_notes(reports, choice, "history")
         report.notes.each { |n| STDERR.puts "gori run history: #{n}" }
         if report.written == 0
-          STDERR.puts "gori run history: #{empty_har_note(query, view)}"
+          STDERR.puts "gori run history: #{empty_har_note(query, view, hide_static)}"
           # ...and, if the page was CUT, that the export never saw the rest. An empty HAR is
           # normally "this project has nothing exportable", and for a project of imported URLs
           # or in-flight flows the newest `-n` can all lack a response while older ones carry
@@ -721,7 +807,7 @@ module Gori
           # `--format har -n 123` against a project holding exactly 123 flows told its
           # operator to raise `-n` for flows that do not exist. The listing over-reads by one
           # row (`limit_probe`), which answers it outright.
-          STDERR.puts "gori run history: stopped at the --limit of #{limit} flow#{limit == 1 ? "" : "s"}; raise -n to export more"
+          STDERR.puts "gori run history: stopped at the --limit of #{Gori.plural(limit, "flow")}; raise -n to export more"
         end
       end
 
@@ -731,27 +817,29 @@ module Gori
         {"show <id>", "Print a flow's request/response (text, json, raw bytes, HAR, curl/python/fetch/go/httpie, or a CSRF PoC)"},
       ])]
       private def self.cmd_show(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         format = :text
         req_only = false
         resp_only = false
-        positional = [] of String
+        redaction = RedactFlags.new
+        headers_only = false
+        max_body : Int32? = nil
 
-        parser = OptionParser.new do |p|
+        positional = parse_args(args, "gori run show") do |p|
           p.banner = "Usage: gori run show <flow-id> [options]"
-          p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
-          p.on("--format=FMT", "Output: text (default) | json | raw (exact bytes) | har (a one-entry HAR 1.2 log) | curl | python | fetch | go | httpie (the request as runnable client code) | csrf (a self-submitting HTML CSRF PoC)") { |v| format = parse_format(v, [:text, :json, :raw, :har, :curl, :python, :fetch, :go, :httpie, :csrf]) }
+          project_options(p, proj, "read")
+          format_flag(p, [:text, :json, :raw, :har, :curl, :python, :fetch, :go, :httpie, :csrf], "Output: text (default) | json | raw (exact bytes) | har (a one-entry HAR 1.2 log) | curl | python | fetch | go | httpie (the request as runnable client code) | csrf (a self-submitting HTML CSRF PoC)") { |f| format = f }
           p.on("--request-only", "Only the request side") { req_only = true }
           p.on("--response-only", "Only the response side") { resp_only = true }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = before + after }
-          p.invalid_option { |f| abort "gori run show: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run show: missing value for #{f}" }
+          p.on("--headers-only", "text/json: print the request line/status line and headers only — each body is replaced by a line naming its size, and the sections derived from bodies (decoded views, gRPC messages, WebSocket frames, SSE events) are left out, named with their counts where they have one") { headers_only = true }
+          p.on("--max-body=BYTES", "text/json: print at most BYTES of each decoded body, then a marker naming its full size; the sections derived from bodies are left out as with --headers-only") { |v| max_body = parse_count(v, "--max-body") }
+          redact_options(p, redaction)
         end
-        parser.parse(args)
         if err = show_side_error(format, req_only, resp_only)
+          abort "gori run show: #{err}"
+        end
+        cap = body_cap(headers_only, max_body, "gori run show")
+        if err = show_cap_error(format, cap)
           abort "gori run show: #{err}"
         end
         id = take_flow_id(positional, "show")
@@ -759,19 +847,35 @@ module Gori
         # Close the store before any abort (abort/exit skip ensure blocks); get_flow
         # has already loaded the BLOBs we need. A WebSocket flow also carries a ws_messages
         # log — fetch it now while the store is open (`show_ws_messages`).
-        store = open_store(resolve_read_project(project_name, db_path), read_only: true)
-        detail, ws_msgs = begin
+        #
+        # The redaction choice is resolved in here too, and for the same reason: it reads this
+        # project's own profiles off the settings row, and its refusal ("no profile named …")
+        # has to be reported AFTER the close.
+        detail, ws_msgs, choice, interims = with_store(resolve_read_project(proj.name, proj.db), read_only: true) do |store|
           d = store.get_flow(id)
-          {d, show_ws_messages(store, d)}
-        ensure
-          store.close
+          {d, show_ws_messages(store, d), redact_choice(store, redaction), d.try { store.interims(id) }}
         end
         abort "gori run show: no flow ##{id}" unless detail
+        detail, ws_msgs, redact_report, previewed = show_redaction(detail, ws_msgs, choice, redaction)
+        return if previewed
 
         show_request = !resp_only
         show_response = !req_only
+        show_format(format, detail, show_request, show_response, ws_msgs, cap, interims)
+        # After the document, like every other caveat this command reports, and on STDERR so
+        # `--format har > evidence.har` still writes a pure HAR.
+        redact_notes(redact_one(redact_report), choice, "show")
+      end
+
+      # `--format` to the writer for it. Split out of `cmd_show` so the command body stays
+      # argument handling, and so every writer below is reached from exactly one place — which
+      # is what makes sanitizing the detail ONCE, before this call, cover all ten of them.
+      private def self.show_format(format : Symbol, detail : Store::FlowDetail,
+                                   show_request : Bool, show_response : Bool,
+                                   ws_msgs : Array(Store::WsMessage),
+                                   cap : BodyCap = BodyCap.new, interims : Store::Interims? = nil) : Nil
         case format
-        when :raw    then show_raw(detail, show_request, show_response)
+        when :raw    then show_raw(detail, show_request, show_response, interims)
         when :har    then show_har(detail, ws_msgs)
         when :curl   then show_curl(detail, ws_msgs)
         when :python then show_code(detail, ws_msgs, :python)
@@ -779,9 +883,37 @@ module Gori
         when :go     then show_code(detail, ws_msgs, :go)
         when :httpie then show_code(detail, ws_msgs, :httpie)
         when :csrf   then show_code(detail, ws_msgs, :csrf)
-        when :json   then puts show_json(detail, show_request, show_response, ws_msgs)
-        else              show_text(detail, show_request, show_response, ws_msgs)
+        when :json   then puts show_json(detail, show_request, show_response, ws_msgs, cap, interims)
+        else              show_text(detail, show_request, show_response, ws_msgs, cap, interims)
         end
+      end
+
+      # Apply the invocation's redaction choice to the flow that is about to be printed.
+      #
+      # Sanitizing happens ONCE, here, and every format below renders from the result. The
+      # alternative — a redaction step inside each of the nine `show_*` writers — is nine
+      # chances to forget, on the one feature where forgetting means printing the secret.
+      #
+      # Returns the detail to render, the report to report (nil when this invocation is not
+      # redacting), and whether the command is DONE: `--redact-preview` prints its rows from
+      # here, because there is no document left to build.
+      #
+      # The WebSocket transcript goes through the same profile: every writer below prints it,
+      # and a login frame carries the credential an HTTP body would (MCP `get_flow` already did).
+      private def self.show_redaction(detail : Store::FlowDetail, ws_msgs : Array(Store::WsMessage),
+                                      choice : Redact::Policy::Choice,
+                                      flags : RedactFlags) : {Store::FlowDetail, Array(Store::WsMessage), Redact::Report?, Bool}
+        # After the store closed (`abort` skips `ensure`), which is why the resolve above hands
+        # its refusal back rather than aborting where it is made.
+        abort "gori run show: #{choice.error}" if choice.error
+        matcher = choice.matcher
+        return {detail, ws_msgs, nil, false} unless matcher
+        clean, report = Redact::Wire.flow(detail, matcher)
+        frames, hits = Redact::Wire.ws_messages(ws_msgs, matcher)
+        report = report.copy_with(frames: hits)
+        return {clean, frames, report, false} unless flags.preview?
+        print_redact_preview(redact_one(report), choice, "show")
+        {clean, frames, report, true}
       end
 
       # The flow's REQUEST as a runnable `curl` command — headless "Copy as → cURL".
@@ -908,6 +1040,14 @@ module Gori
       # Both formats below write a shape that is not per-side, so a silently ignored flag would
       # hand back a document the operator did not ask for and has no way to tell apart from the
       # one they did.
+      # `--headers-only` / `--max-body` shape the two READING views. Every other format is a
+      # document with a contract of its own — `raw` is the exact bytes, `har` a whole entry, the
+      # code formats a request that has to run — and a cut body would break each of them quietly.
+      def self.show_cap_error(format : Symbol, cap : BodyCap) : String?
+        return nil if cap.whole? || format.in?(:text, :json)
+        "#{cap.flag} applies to --format text and json — --format #{format} writes the whole message"
+      end
+
       private def self.show_side_error(format : Symbol, req_only : Bool, resp_only : Bool) : String?
         return "--request-only and --response-only are mutually exclusive" if req_only && resp_only
         # A HAR entry is a request AND its response; there is no half-entry shape to emit.
@@ -979,23 +1119,36 @@ module Gori
       # the origin's. Every sibling format already says so — `show_text` inline, `show_har`
       # and the code formats on STDERR — and this one is the one an operator pipes into a
       # file and diffs. On STDERR, like those, so STDOUT stays byte-pure.
-      private def self.show_raw(detail : Store::FlowDetail, req : Bool, resp : Bool) : Nil
+      #
+      # An interim 1xx the origin sent before the final response (`Store::Interims`) is written
+      # ahead of it, in wire order, when gori relayed it: those octets reached the client first.
+      # One the client never received (an HTTP/1.0 client) is left out of the bytes and named on
+      # STDERR; `--format json` lists it with `relayed: false`.
+      private def self.show_raw(detail : Store::FlowDetail, req : Bool, resp : Bool,
+                                interims : Store::Interims? = nil) : Nil
+        write_raw(STDOUT, detail, req, resp, interims)
+        STDOUT.flush
+        raw_truncation_notes(detail, req, resp, interims).each { |n| STDERR.puts "gori run show: #{n}" }
+      end
+
+      # The octets `--format raw` prints, in the order they crossed the wire.
+      private def self.write_raw(io : IO, detail : Store::FlowDetail, req : Bool, resp : Bool,
+                                 interims : Store::Interims?) : Nil
         if req
-          STDOUT.write(detail.request_head)
+          io.write(detail.request_head)
           if b = detail.request_body
-            STDOUT.write(b)
+            io.write(b)
           end
         end
         if resp
+          io.write(interims.relayed_wire) if interims
           if h = detail.response_head
-            STDOUT.write(h)
+            io.write(h)
           end
           if b = detail.response_body
-            STDOUT.write(b)
+            io.write(b)
           end
         end
-        STDOUT.flush
-        raw_truncation_notes(detail, req, resp).each { |n| STDERR.puts "gori run show: #{n}" }
       end
 
       # What `--format raw` left out, one line per side, or empty when the bytes are whole.
@@ -1004,20 +1157,32 @@ module Gori
       #
       # Keyed on the side actually PRINTED — `--request-only` on a flow whose response was
       # capped must not warn about bytes it did not write.
-      private def self.raw_truncation_notes(detail : Store::FlowDetail, req : Bool, resp : Bool) : Array(String)
+      private def self.raw_truncation_notes(detail : Store::FlowDetail, req : Bool, resp : Bool,
+                                            interims : Store::Interims? = nil) : Array(String)
         notes = [] of String
+        if resp && (note = interims.try(&.unrelayed_note))
+          notes << "flow ##{detail.row.id}: #{note}; they are not in these bytes (--format json lists them)"
+        end
+        if resp && (note = interims.try(&.omitted_note))
+          notes << "flow ##{detail.row.id}: #{note}"
+        end
         {"request"  => req && detail.request_body_truncated?,
          "response" => resp && detail.response_body_truncated?}.each do |side, capped|
           next unless capped
           notes << "flow ##{detail.row.id}'s #{side} body was truncated at the capture cap — " \
                    "these bytes are the stored prefix, not the whole body " \
-                   "(--format json reports the true size)"
+                   "(--format json reports the whole body's size as source_size)"
         end
         notes
       end
 
+      # `cap` (`--headers-only` / `--max-body`) is a COMPACT view: the heads and the capped bodies,
+      # and nothing derived from the bodies — the point of the flag is a flow that prints in a
+      # screen, and an SSE stream's events or a socket's frames are the same bulk again. A derived
+      # section with a count is still NAMED, so its absence is never read as "there was none".
       private def self.show_text(detail : Store::FlowDetail, req : Bool, resp : Bool,
-                                 ws_msgs : Array(Store::WsMessage)) : Nil
+                                 ws_msgs : Array(Store::WsMessage), cap : BodyCap = BodyCap.new,
+                                 interims : Store::Interims? = nil) : Nil
         # FIRST, above the bytes it is about: what gori DID to this exchange that the bytes
         # cannot show — a Match&Replace rule it could not run, a request the origin invented.
         # The WebSocket half of this has been readable here since #518 (`[gori] …` rows in the
@@ -1030,33 +1195,58 @@ module Gori
         end
         if req
           puts "=== REQUEST (#{detail.http_version}) ==="
-          print_message_text(detail.request_head, display_body(detail.request_head, detail.request_body), detail.request_body)
+          print_message_text(detail.request_head, display_body(detail.request_head, detail.request_body), detail.request_body, cap)
           puts "  [request body truncated]" if detail.request_body_truncated?
         end
         if resp
           puts "" if req
+          if interims
+            print_interims_text(interims)
+            puts ""
+          end
           puts "=== RESPONSE ==="
           if err = detail.error
             puts "error: #{err}"
           end
           if h = detail.response_head
-            print_message_text(h, display_body(h, detail.response_body), detail.response_body)
+            print_message_text(h, display_body(h, detail.response_body), detail.response_body, cap)
             puts "  [response body truncated]" if detail.response_body_truncated?
           elsif detail.error.nil?
             puts "(no response captured)"
           end
           unless ws_msgs.empty?
             puts ""
-            puts "=== WEBSOCKET MESSAGES (#{ws_msgs.size}) ==="
-            ws_msgs.each { |m| puts ws_message_text(m) }
+            if cap.whole?
+              puts "=== WEBSOCKET MESSAGES (#{ws_msgs.size}) ==="
+              ws_msgs.each { |m| puts ws_message_text(m) }
+            else
+              puts "=== WEBSOCKET MESSAGES (#{ws_msgs.size}) — not printed under #{cap.flag} ==="
+            end
           end
           if (events = sse_events_of(detail)) && !events.empty?
             puts ""
-            puts "=== SSE EVENTS (#{events.size}) ==="
-            events.each_with_index { |e, i| puts sse_event_text(e, i) }
+            if cap.whole?
+              puts "=== SSE EVENTS (#{events.size}) ==="
+              events.each_with_index { |e, i| puts sse_event_text(e, i) }
+            else
+              puts "=== SSE EVENTS (#{events.size}) — not printed under #{cap.flag} ==="
+            end
           end
         end
-        print_decoded_text(detail, req, resp, ws_msgs)
+        print_decoded_text(detail, req, resp, ws_msgs) if cap.whole?
+      end
+
+      # The interim 1xx heads that preceded the response, above it and in wire order.
+      private def self.print_interims_text(interims : Store::Interims) : Nil
+        interims.heads.each_with_index do |h, i|
+          puts "" if i > 0
+          relayed = h.relayed? ? "" : ", not relayed to the client"
+          puts "=== INTERIM #{h.status} (#{i + 1} of #{interims.heads.size}#{relayed}) ==="
+          print_message_text(h.head, nil)
+        end
+        if note = interims.omitted_note
+          puts "  [#{note}]"
+        end
       end
 
       # Parsed SSE events when the response is a text/event-stream, else nil. Like
@@ -1120,6 +1310,17 @@ module Gori
           puts CLI::Output.term_safe("=== GRAPHQL over WEBSOCKET (#{GraphqlWs.summary(ws_ops)}) ===")
           puts CLI::Output.term_safe_multiline(GraphqlWs.display(ws_ops).scrub)
         end
+        # …and every other real-time framing the transcript carries (Socket.IO / SignalR /
+        # STOMP / SockJS / Action Cable). Same reason, same source: the envelope is in the
+        # FRAMES, so a headless reader that only ever saw heads and bodies saw none of it.
+        # The negotiated subprotocol is a hint only, and is read from whichever head is
+        # included — `--response-only` still decodes, it just decodes without the hint.
+        ws_frames = WsProto.from_messages(ws_msgs, WsProto.subprotocols(rh, sh))
+        unless ws_frames.empty?
+          puts ""
+          puts CLI::Output.term_safe("=== WEBSOCKET PROTOCOL (#{WsProto.summary(ws_frames)}) ===")
+          puts CLI::Output.term_safe_multiline(WsProto.display(ws_frames).scrub)
+        end
         if fields = FormData.from_flow(tgt, rh, rb)
           puts ""
           puts "=== PARAMS (#{fields.size}) ==="
@@ -1160,8 +1361,9 @@ module Gori
         return if head.nil? || body.nil? || body.empty?
         ct = MediaType.of(head)
         return unless Proxy::H2::Grpc.grpc?(ct)
-        # `scan_body`: grpc-web-text carries the frames base64-encoded on the wire.
-        msgs, residual = Proxy::H2::Grpc.scan_body(ct, body)
+        # `scan_wire`: grpc-web-text carries the frames base64-encoded on the wire, and any
+        # body may sit under a `Content-Encoding`.
+        msgs, residual = Proxy::H2::Grpc.scan_wire(head, body)
         return if msgs.empty? && residual == 0
         binding = Protobuf::Schemas.resolve(target, request: request)
         j.field "grpc_messages" do
@@ -1183,7 +1385,7 @@ module Gori
             # none, so without this the one fact that separates a granted call from a denied one
             # (the HTTP status is 200 for both) was reachable only by hand-parsing a trailer
             # frame's `headers` map further down.
-            gs, gm = Proxy::H2::Grpc.trailer_status(msgs)
+            gs, gm = Proxy::H2::Grpc.trailer_status(ct, msgs)
             if gs
               j.field "grpc_status", gs
               j.field "grpc_status_name", Proxy::H2::Grpc.status_name(gs)
@@ -1253,88 +1455,152 @@ module Gori
         end
       end
 
+      # `cap` makes the same compact view as `show_text`: capped body objects, and the sections
+      # derived from bodies left out — except that a transcript's COUNT stays, as an object with
+      # `omitted: true`, so a script can still tell "had frames" from "had none".
       private def self.show_json(detail : Store::FlowDetail, req : Bool, resp : Bool,
-                                 ws_msgs : Array(Store::WsMessage)) : String
+                                 ws_msgs : Array(Store::WsMessage), cap : BodyCap = BodyCap.new,
+                                 interims : Store::Interims? = nil) : String
         JSON.build do |j|
           j.object do
             j.field "flow" do
               CLI::Output.flow_row_fields(j, detail.row)
             end
             j.field "http_version", detail.http_version
+            # The normalised cache signal (#1247), from the response head in hand — the same
+            # `Gori::CacheStatus` classifier the QL `cache:` field and MCP `get_flow` use, so a
+            # `gori run history -q cache:hit` listing and `gori run show` agree about a flow.
+            j.field "cache", Gori::CacheStatus.classify(detail.response_head).token
             # `Serialize.flow_detail` wraps this same field in `text()`; here it was raw. A
             # capture failure's text quotes bytes the origin sent (a malformed status line, a
             # header the codec refused), so it is captured data — see `Output.json_captured`.
             CLI::Output.json_captured(j, "error", detail.error)
-            emit_decoded_json(j, detail, req, resp, ws_msgs)
+            emit_decoded_json(j, detail, req, resp, ws_msgs) if cap.whole?
             if req
               j.field "request" do
                 j.object do
                   j.field "head", scrub(detail.request_head)
-                  emit_body_json(j, "body", detail.request_head, detail.request_body, detail.request_body_truncated?)
-                  emit_grpc_messages_json(j, detail.request_head, detail.request_body,
-                    detail.row.target, request: true)
+                  emit_lossy_head_json(j, detail.request_head)
+                  emit_body_json(j, "body", detail.request_head, detail.request_body, detail.request_body_truncated?, cap,
+                    source_size: detail.request_body_truncated? ? detail.request_wire_body_size : nil)
+                  if cap.whole?
+                    emit_grpc_messages_json(j, detail.request_head, detail.request_body,
+                      detail.row.target, request: true)
+                  end
                 end
               end
             end
             if resp
               j.field "response" do
                 j.object do
+                  emit_interims_json(j, interims) if interims
                   j.field "head", scrub(detail.response_head)
-                  emit_body_json(j, "body", detail.response_head, detail.response_body, detail.response_body_truncated?)
-                  emit_grpc_messages_json(j, detail.response_head, detail.response_body,
-                    detail.row.target, request: false)
+                  emit_lossy_head_json(j, detail.response_head)
+                  emit_body_json(j, "body", detail.response_head, detail.response_body, detail.response_body_truncated?, cap,
+                    source_size: detail.response_body_truncated? ? detail.response_wire_body_size : nil)
+                  if cap.whole?
+                    emit_grpc_messages_json(j, detail.response_head, detail.response_body,
+                      detail.row.target, request: false)
+                  end
                 end
               end
-              unless ws_msgs.empty?
-                j.field "ws_messages" do
+              emit_show_ws_json(j, ws_msgs, cap)
+              emit_show_sse_json(j, detail, cap)
+            end
+          end
+        end
+      end
+
+      # The interim 1xx heads before the final response — the same `interim` / `interim_omitted`
+      # pair MCP `get_flow` emits, present only on a flow that had one. `relayed` is false for a
+      # head the client never received.
+      private def self.emit_interims_json(j : JSON::Builder, interims : Store::Interims) : Nil
+        j.field "interim" do
+          j.array do
+            interims.heads.each do |h|
+              j.object do
+                j.field "status", h.status
+                j.field "relayed", h.relayed?
+                j.field "head", scrub(h.head)
+              end
+            end
+          end
+        end
+        j.field "interim_omitted", interims.omitted if interims.omitted > 0
+      end
+
+      # A WebSocket flow's transcript for `show --format json`. Under `--headers-only` /
+      # `--max-body` only its count, with `omitted: true` — the frames are the same bulk the flag
+      # exists to keep out, and a missing key would read as "no frames".
+      private def self.emit_show_ws_json(j : JSON::Builder, ws_msgs : Array(Store::WsMessage), cap : BodyCap) : Nil
+        return if ws_msgs.empty?
+        unless cap.whole?
+          j.field("ws_messages") { j.object { j.field "count", ws_msgs.size; j.field "omitted", true } }
+          return
+        end
+        j.field "ws_messages" do
+          j.object do
+            j.field "count", ws_msgs.size
+            j.field "truncated", false
+            j.field "messages" do
+              j.array do
+                ws_msgs.each do |m|
                   j.object do
-                    j.field "count", ws_msgs.size
-                    j.field "truncated", false
-                    j.field "messages" do
-                      j.array do
-                        ws_msgs.each do |m|
-                          j.object do
-                            j.field "direction", m.direction
-                            j.field "opcode", m.opcode
-                            m.emit_shape_json(j)
-                            if m.text?
-                              j.field "text", String.new(m.payload).scrub
-                              # See emit_ws_result: JSON cannot carry a byte that is not valid
-                              # UTF-8, and those bytes are the §8.1/§5.6 test case.
-                              j.field "base64", Base64.strict_encode(m.payload) unless String.new(m.payload).valid_encoding?
-                            else
-                              j.field "binary", true
-                              j.field "size", m.payload.size
-                              j.field "base64", Base64.strict_encode(m.payload)
-                            end
-                          end
-                        end
-                      end
+                    j.field "direction", m.direction
+                    j.field "opcode", m.opcode
+                    m.emit_shape_json(j)
+                    if m.text?
+                      j.field "text", String.new(m.payload).scrub
+                      # See emit_ws_result: JSON cannot carry a byte that is not valid
+                      # UTF-8, and those bytes are the §8.1/§5.6 test case.
+                      j.field "base64", Base64.strict_encode(m.payload) unless String.new(m.payload).valid_encoding?
+                    else
+                      j.field "binary", true
+                      j.field "size", m.payload.size
+                      j.field "base64", Base64.strict_encode(m.payload)
                     end
                   end
                 end
               end
-              if (events = sse_events_of(detail)) && !events.empty?
-                j.field "sse_events" do
+            end
+          end
+        end
+      end
+
+      # A head that is not valid UTF-8 loses its 8-bit octets to `scrub` above, so the exact
+      # bytes ride beside it in the `<field>_lossy` + `<field>_base64` shape `get_flow` and
+      # `gori run repeater --format json` already use.
+      private def self.emit_lossy_head_json(j : JSON::Builder, head : Bytes?) : Nil
+        return if head.nil? || String.new(head).valid_encoding?
+        j.field "head_lossy", true
+        j.field "head_base64", Base64.strict_encode(head)
+      end
+
+      # An event-stream response's parsed events for `show --format json`; count-only under a
+      # cap, like the WebSocket transcript above.
+      private def self.emit_show_sse_json(j : JSON::Builder, detail : Store::FlowDetail, cap : BodyCap) : Nil
+        events = sse_events_of(detail)
+        return if events.empty?
+        unless cap.whole?
+          j.field("sse_events") { j.object { j.field "count", events.size; j.field "omitted", true } }
+          return
+        end
+        j.field "sse_events" do
+          j.object do
+            j.field "count", events.size
+            # Same cap/expression as the MCP serializer (mcp/serialize.cr
+            # `emit_sse_events`) — was hardcoded `false` here, so a caller
+            # reading only `sse_events` (the point of --format json) had no
+            # signal the array was clipped.
+            j.field "truncated", events.size > MCP::Serialize::SSE_EVENTS_MAX
+            j.field "events" do
+              j.array do
+                events.each do |e|
                   j.object do
-                    j.field "count", events.size
-                    # Same cap/expression as the MCP serializer (mcp/serialize.cr
-                    # `emit_sse_events`) — was hardcoded `false` here, so a caller
-                    # reading only `sse_events` (the point of --format json) had no
-                    # signal the array was clipped.
-                    j.field "truncated", events.size > MCP::Serialize::SSE_EVENTS_MAX
-                    j.field "events" do
-                      j.array do
-                        events.each do |e|
-                          j.object do
-                            j.field "type", e.type
-                            j.field "id", e.id
-                            j.field "retry", e.retry
-                            j.field "data", e.data.scrub
-                          end
-                        end
-                      end
-                    end
+                    j.field "type", e.type
+                    j.field "id", e.id
+                    j.field "retry", e.retry
+                    j.field "data", e.data.scrub
                   end
                 end
               end

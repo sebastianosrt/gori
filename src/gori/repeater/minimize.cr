@@ -1,4 +1,6 @@
 require "json"
+require "../raw_json"
+require "../json_spans"
 require "./engine"
 require "./flow_request"
 require "../media_type"
@@ -8,6 +10,7 @@ require "../fuzz/engine"
 require "../fuzz/matcher"
 require "../miner/inject"
 require "../miner/fingerprint"
+require "../plural"
 
 module Gori::Repeater
   # Squash-style request minimizer: strips the noise out of a request (cosmetic headers,
@@ -92,6 +95,12 @@ module Gori::Repeater
     # calls `#stop` from another fiber; `run` reads `stopped?` immediately before every network
     # send and returns a partial Report instead of issuing it.
     #
+    # A caller that cannot FLIP a flag hands a PREDICATE instead (`Stop.new(-> { … })`). That
+    # is the MCP server: a `notifications/cancelled` is recorded by its reader fiber into a set
+    # keyed by JSON-RPC id, which the tools layer neither holds nor should learn — so it asks
+    # the question rather than answering it. Both arms are read at the same three points, so
+    # `run` cannot tell which way a stop was armed.
+    #
     # A cap is not a stop. `SEND_CAP` bounds a run, but "bounded" is not "over": an operator who
     # closes the repeater tab or leaves the project believes they disconnected from the target,
     # and up to SEND_CAP further probes against that origin is the one thing a pentest tool must
@@ -104,7 +113,7 @@ module Gori::Repeater
     # `@stop_requested` and `Discover::Engine#stop`: fibers here are cooperative and the flag is
     # only ever written by the stopper and read by the run.
     class Stop
-      def initialize
+      def initialize(@ask : Proc(Bool)? = nil)
         @stopped = false
       end
 
@@ -113,7 +122,7 @@ module Gori::Repeater
       end
 
       def stopped? : Bool
-        @stopped
+        @stopped || !!@ask.try(&.call)
       end
     end
 
@@ -200,6 +209,12 @@ module Gori::Repeater
         # nothing further, and there is no partial result worth one more round-trip.
         break if stop.try(&.stopped?)
         r = backend.send(resolve.call(base_text))
+        # A scope sandbox or exclude refusal is permanent and put nothing on the wire: said as
+        # what it is, on every surface, not as an origin that never answered.
+        if (why = r.error) && Outbound.permanent_refusal?(why)
+          return Report.new(restore_eol(base_text, crlf), [] of Removed, sends, true,
+            "refused: #{why} — request left unchanged (#{sends} sends)")
+        end
         sends += 1
         if r.error.nil? && !r.incomplete?
           metrics << Miner::Fingerprint.probe(r).metrics
@@ -239,6 +254,9 @@ module Gori::Repeater
         # counted here either — counting it made `sends` report SEND_CAP + 1, in the note and
         # in every surface's `sends` field.
         return Report.new(restore_eol(working, crlf), removed, sends, false, cap_note(removed, sends)) if r.error == Fuzz::CappedBackend::CAP_ERROR
+        # A variant the scope refuses (a removal that moved the path under an exclude) was not
+        # sent either; it is kept, since it was never tested.
+        next if Outbound.permanent_refusal?(r.error)
         sends += 1
         if unchanged?(r, baseline)
           working = variant
@@ -347,7 +365,7 @@ module Gori::Repeater
       return false if head_lines.any? { |l| l.lstrip[0, 18]?.try(&.downcase) == "transfer-encoding:" }
       cl = head_lines.select { |l| l.lstrip.downcase.starts_with?("content-length:") }
       return true if cl.empty?
-      cl.size == 1 && FlowRequest.rewritable_length_header?(cl[0])
+      cl.size == 1 && Proxy::Codec::Http1.rewritable_length_header?(cl[0])
     end
 
     private def self.header_candidate(line : String) : Candidate
@@ -426,9 +444,7 @@ module Gori::Repeater
         return nil unless sep
         new_body = body
         removed = false
-        loop do
-          spliced, hit = json_splice_key(new_body, key)
-          break unless hit
+        while spliced = json_splice_key(new_body, key)
           new_body = spliced
           removed = true
         end
@@ -439,122 +455,26 @@ module Gori::Repeater
 
     # Removes the FIRST top-level member whose (decoded) key equals `key` from a JSON object
     # `body`, splicing the ORIGINAL bytes so everything kept — duplicate keys, `\/`, `\uXXXX`,
-    # `1.50`, interior whitespace — is preserved byte-for-byte. Returns {new_body, true} on a
-    # removal, {body, false} when the object is malformed or the key is absent (caller then
-    # keeps the candidate, the safe direction). Parses ONLY to find the member's byte range.
-    private def self.json_splice_key(body : String, key : String) : {String, Bool}
+    # `1.50`, interior whitespace — is preserved byte-for-byte. nil when the object is malformed
+    # or the key is absent (caller then keeps the candidate, the safe direction). `JsonSpans`
+    # parses ONLY to find the member's byte range.
+    private def self.json_splice_key(body : String, key : String) : String?
       bytes = body.to_slice
-      n = bytes.size
-      i = json_skip_ws(bytes, 0, n)
-      return {body, false} unless i < n && bytes[i] == 0x7B_u8 # not a `{` object
-      i += 1
-      prev_comma = -1 # byte index of the comma before the current member, if any
-      first = true
-      while i < n
-        i = json_skip_ws(bytes, i, n)
-        break if i < n && bytes[i] == 0x7D_u8 # end of object, key not found
-        return {body, false} unless i < n
-        unless first
-          return {body, false} unless bytes[i] == 0x2C_u8 # members are comma-separated
-          prev_comma = i
-          i = json_skip_ws(bytes, i + 1, n)
-        end
-        first = false
-        return {body, false} unless i < n && bytes[i] == 0x22_u8 # a key is a `"`-string
-        key_start = i
-        key_end = json_string_end(bytes, i, n)
-        return {body, false} unless key_end
-        this_key = (String.from_json(body.byte_slice(key_start, key_end - key_start)) rescue nil)
-        i = json_skip_ws(bytes, key_end, n)
-        return {body, false} unless i < n && bytes[i] == 0x3A_u8 # `:` between key and value
-        i = json_skip_ws(bytes, i + 1, n)
-        value_end = json_value_end(bytes, i, n)
-        return {body, false} unless value_end
-        if this_key == key
-          # Cut the member plus exactly ONE adjacent comma so the survivors stay valid JSON
-          # and untouched. A trailing comma (there's a next member) is preferred; else the
-          # leading comma (this is the last member); else it was the sole member.
-          k = json_skip_ws(bytes, value_end, n)
-          if k < n && bytes[k] == 0x2C_u8
-            return {body.byte_slice(0, key_start) + body.byte_slice(k + 1, n - (k + 1)), true}
-          elsif prev_comma >= 0
-            return {body.byte_slice(0, prev_comma) + body.byte_slice(value_end, n - value_end), true}
-          else
-            return {body.byte_slice(0, key_start) + body.byte_slice(value_end, n - value_end), true}
-          end
-        end
-        i = value_end
-      end
-      {body, false}
-    end
-
-    # JSON insignificant whitespace (RFC 8259 §2): space, tab, LF, CR.
-    private def self.json_ws?(b : UInt8) : Bool
-      b == 0x20_u8 || b == 0x09_u8 || b == 0x0A_u8 || b == 0x0D_u8
-    end
-
-    # First byte offset at or after `i` that is not JSON whitespace (or `n` if none).
-    private def self.json_skip_ws(bytes : Bytes, i : Int32, n : Int32) : Int32
-      while i < n && json_ws?(bytes[i])
-        i += 1
-      end
-      i
-    end
-
-    # Byte offset just PAST the JSON string that starts at `bytes[i] == '"'`, honoring `\"`
-    # (and every other `\`-escape by skipping the escaped byte). nil if it is unterminated.
-    private def self.json_string_end(bytes : Bytes, i : Int32, n : Int32) : Int32?
-      j = i + 1
-      while j < n
-        c = bytes[j]
-        if c == 0x5C_u8 # backslash: the next byte is escaped, skip both
-          j += 2
-          next
-        end
-        return j + 1 if c == 0x22_u8 # closing quote
-        j += 1
-      end
-      nil
-    end
-
-    # Byte offset just PAST the JSON value beginning at the first non-ws byte `bytes[i]`. Skips
-    # a string (escape-aware), balances an object/array while honoring nested strings, or reads
-    # a literal (number/true/false/null) up to the next structural byte or whitespace. nil when
-    # the value is malformed/unterminated. Only structural ASCII bytes are inspected, so
-    # multi-byte UTF-8 inside a string passes through opaquely.
-    private def self.json_value_end(bytes : Bytes, i : Int32, n : Int32) : Int32?
-      return nil unless i < n
-      case bytes[i]
-      when 0x22_u8 # string
-        json_string_end(bytes, i, n)
-      when 0x7B_u8, 0x5B_u8 # object `{` or array `[`
-        depth = 0
-        j = i
-        while j < n
-          c = bytes[j]
-          if c == 0x22_u8
-            e = json_string_end(bytes, j, n)
-            return nil unless e
-            j = e
-            next
-          elsif c == 0x7B_u8 || c == 0x5B_u8
-            depth += 1
-          elsif c == 0x7D_u8 || c == 0x5D_u8
-            depth -= 1
-            return j + 1 if depth == 0
-          end
-          j += 1
-        end
-        nil
-      else # number / true / false / null — up to a structural byte or whitespace
-        j = i
-        while j < n
-          c = bytes[j]
-          break if c == 0x2C_u8 || c == 0x7D_u8 || c == 0x5D_u8 || json_ws?(c)
-          j += 1
-        end
-        j == i ? nil : j
-      end
+      return nil unless members = JsonSpans.root_object(bytes).try(&.members)
+      return nil unless idx = members.index { |mem| mem.key == key }
+      mem = members[idx]
+      # Cut the member plus exactly ONE adjacent comma so the survivors stay valid JSON and
+      # untouched. A trailing comma (there's a next member) is preferred; else the leading comma
+      # (this is the last member); else it was the sole member. Between a value and its comma
+      # there is only whitespace, so the first `,` after the value is that comma.
+      cut_from, cut_to = if idx + 1 < members.size
+                           {mem.key_start, bytes.index!(0x2C_u8, mem.value_end) + 1}
+                         elsif idx > 0
+                           {bytes.index!(0x2C_u8, members[idx - 1].value_end), mem.value_end}
+                         else
+                           {mem.key_start, mem.value_end}
+                         end
+      body.byte_slice(0, cut_from) + body.byte_slice(cut_to, bytes.size - cut_to)
     end
 
     # ── comparison ─────────────────────────────────────────────────────────────────────
@@ -710,7 +630,8 @@ module Gori::Repeater
     end
 
     private def self.json_keys(body : String) : Array(String)
-      (JSON.parse(body).as_h?.try(&.keys) rescue nil) || [] of String
+      # `RawJson.members`: an oversized number in any member no longer hides every key (#1200).
+      (RawJson.members(body).try(&.map(&.[0]).uniq!) rescue nil) || [] of String
     end
 
     private def self.looks_json?(body : String) : Bool
@@ -740,7 +661,7 @@ module Gori::Repeater
     # spent exactly `SEND_CAP`) and is stated anyway, because the alternative — the CLI
     # appending the count itself — made the other two read `… (11 sends) · 11 sends`.
     private def self.cap_note(removed : Array(Removed), sends : Int32) : String
-      "send cap reached — kept #{removed.size} removal#{removed.size == 1 ? "" : "s"} " \
+      "send cap reached — kept #{Gori.plural(removed.size, "removal")} " \
       "so far (partial, #{sends} sends)"
     end
 
@@ -748,7 +669,7 @@ module Gori::Repeater
     # finished one ran to the end, but "how many requests did the origin actually get before
     # it stopped" is the whole question the operator pressed stop to ask.
     private def self.stop_note(removed : Array(Removed), sends : Int32) : String
-      "stopped — kept #{removed.size} removal#{removed.size == 1 ? "" : "s"} (#{sends} sends)"
+      "stopped — kept #{Gori.plural(removed.size, "removal")} (#{sends} sends)"
     end
   end
 end

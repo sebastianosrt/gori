@@ -32,7 +32,31 @@ describe "Gori::Verbs.register_sitemap" do
      "sitemap.repeater"          => :sitemap_repeater,
      "sitemap.open-flow"         => :sitemap_open_flow,
      "sitemap.scope-add"         => :sitemap_scope_add,
+     "sitemap.export"            => :sitemap_export,
+     "sitemap.js-scan"           => :sitemap_js_scan,
+     "sitemap.toggle-js-refs"    => :sitemap_toggle_js_refs,
     }.each { |id, intent| verb_intents(r, id).should eq([intent]) }
+  end
+
+  # #1243: the scan sends nothing and the toggle only shows what a scan stored, so both are
+  # menu entries, on letters that name them rather than bare keys the tree has already spent.
+  # The toggle is a Display… row (`Z J`) since #1274; the scan keeps its own `J`.
+  it "offers the JavaScript scan and its toggle from the menu only" do
+    {"sitemap.js-scan" => ['J'], "sitemap.toggle-js-refs" => ['Z', 'J']}.each do |id, keys|
+      r[id].chords.should be_empty
+      r.menu_keys(id).should eq(keys)
+    end
+  end
+
+  # #1241: ⇧E is the export key on every tab that has one (Issues, Sequencer, Evidence).
+  it "exports OpenAPI on ⇧E, with the shared export letter in the menu" do
+    verb = r["sitemap.export"]
+    verb.chords.should eq([typed_chord("e", shift: true)])
+    verb.hidden?.should be_false
+    verb.menu_key.should eq('E')
+    r["issues.export-key"].chords.should eq(verb.chords)
+    keys = r.select(&.scope.sitemap?).compact_map(&.menu_key)
+    keys.size.should eq(keys.uniq.size)
   end
 
   # The tree is where you SEE what is worth scoping, but the rule editor lived only in the
@@ -57,11 +81,9 @@ describe "Gori::Verbs.register_sitemap" do
     verb.chords.should eq([typed_chord("g", shift: true)])
     r["sitemap.toggle-grouping"].chords.should eq([typed_chord("g")]) # unchanged
     verb.hidden?.should be_false                                      # else it reaches neither the space menu nor Help
-    # A shift chord yields no menu key, so the mnemonic is what the action menu renders —
-    # and it must not collide with the id toggle's chord-derived 'g'.
-    verb.menu_key.should eq('Q')
-    keys = r.select(&.scope.sitemap?).compact_map(&.menu_key)
-    keys.size.should eq(keys.uniq.size)
+    # Both are Display… rows (#1274): `Z g` folds ids and `Z q` queries.
+    r.menu_keys("sitemap.toggle-grouping").should eq(['Z', 'g'])
+    r.menu_keys(verb.id).should eq(['Z', 'q'])
   end
 
   # #539: the action existed nowhere — no chord, no registry entry — so the space menu could
@@ -71,9 +93,12 @@ describe "Gori::Verbs.register_sitemap" do
     verb.chords.should eq([typed_chord("o")])
     verb.hidden?.should be_false # else it reaches neither the space menu nor Help
     verb.menu_key.should eq('o') # what for_scope+SpaceMenu need to render a row
-    # Same chord as the two siblings that make the same jump, so `o` means one thing.
-    r["issue.open-flow"].chords.should eq([typed_chord("o")])
-    r["probe.open-flow"].chords.should eq([typed_chord("o")])
+    # `o` on the Sitemap is the `↵` ALIAS — "open this row's own detail" — which is the one
+    # meaning the key audit's F2 left it. Probe's sample-flow jump is not that: it opens a
+    # DIFFERENT tab, so it moved to `s` = go to source with the Evidence tab and the Issues
+    # detail's RELATED card, and `o` is unbound in both Probe scopes.
+    r["sitemap.open-flow"].chords.should eq([typed_chord("o")])
+    r["probe.open-flow"].chords.should eq([typed_chord("s")])
   end
 
   # The space menu filters on available? while validate_menu_keys! does not, so an entry can
@@ -88,6 +113,17 @@ describe "Gori::Verbs.register_sitemap" do
     verb = r["sitemap.scope-toggle"]
     verb.chords.should be_empty # the ⇧S twin of the Global lens toggle is gone
     verb.menu_key.should eq('s')
+  end
+
+  # The hide-static lens (#1239) is shared with History and has no chord on either tab: this
+  # tab has no `v` picker, so the menu row is its door.
+  it "keeps the hide-static toggle a Display… row (`Z s`), shared with History" do
+    verb = r["sitemap.toggle-static"]
+    verb.chords.should be_empty
+    r.menu_keys(verb.id).should eq(['Z', 's'])
+    r.menu_keys("history.toggle-static").should eq(['Z', 's'])
+    verb.hidden?.should be_false
+    verb_intents(r, "sitemap.toggle-static").should eq([:toggle_static_assets])
   end
 
   it "escapes back to the Sitemap/Discover strip, not the tab bar" do
@@ -129,21 +165,22 @@ describe "Gori::Verbs.register_sitemap" do
     clear.available?(ctx).should be_true
   end
 
-  it "gives `t` to marking and leaves ⇧T unbound, with tagging menu-only" do
-    # The lists agree on `t` = mark. ⇧T is where they STOPPED agreeing: History, Issues and
-    # Intercept all read it as "mark all", so a hand that learnt the `t`/⇧T pair there opened
-    # a text prompt here. Tagging is a space-menu entry now, like `sitemap.mark-clear`, and
-    # ⇧T is deliberately left free rather than reassigned — a tree has no useful "mark every
-    # row" today (see sitemap.mark-toggle), and this keeps the letter for the day it does.
+  it "spells the `t` / ⇧T mark pair the way every other list tab does, with tagging menu-only" do
+    # The lists agree on `t` = mark. ⇧T is where they used to STOP agreeing: History, Issues
+    # and Intercept all read it as "mark all", so a hand that learnt the pair there opened a
+    # text prompt here. Both keys are the family's now, and the tree's own objection to a
+    # mark-all — that it would sweep hosts and folders in beside the endpoints — is answered
+    # in `SitemapView#mark_all_visible`, which marks only rows carrying a method.
     r["sitemap.mark-toggle"].chords.should eq([typed_chord("t")])
     r["sitemap.mark-toggle"].menu_key.should eq('t')
+    r["sitemap.mark-all"].chords.should eq([shift_chord('T')])
+    r["sitemap.mark-all"].menu_key.should eq('T')
+    verb_intents(r, "sitemap.mark-all").should eq([:sitemap_mark_all])
+    # Tagging kept the 'T' menu letter for a while after losing the chord, which was the same
+    # lie one tier down: the letter beside a chord has to name what the chord does.
     tag = r["sitemap.tag"]
     tag.chords.should be_empty
-    tag.menu_key.should eq('T')
-    shift_t = typed_chord("t", shift: true)
-    sitemap_verbs = [] of Gori::Verb::Definition
-    r.each { |v| sitemap_verbs << v if v.scope.sitemap? }
-    sitemap_verbs.none? { |v| v.chords.includes?(shift_t) }.should be_true
+    tag.menu_key.should eq('m')
   end
 
   it "extends the range on ⇧arrows without shadowing plain tree nav" do

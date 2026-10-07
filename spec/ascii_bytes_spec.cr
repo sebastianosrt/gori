@@ -13,6 +13,22 @@ private def starts?(hay : String, needle : String) : Bool
 end
 
 describe Gori::AsciiBytes do
+  describe ".index" do
+    it "finds the first exact occurrence at or after the offset" do
+      Gori::AsciiBytes.index(bytes("a\r\nb\r\n\r\nc\r\n\r\n"), bytes("\r\n\r\n")).should eq(4)
+      Gori::AsciiBytes.index(bytes("a\r\nb\r\n\r\nc\r\n\r\n"), bytes("\r\n\r\n"), 5).should eq(9)
+      Gori::AsciiBytes.index(bytes("xxab"), bytes("ab")).should eq(2) # match ending at the last byte
+      Gori::AsciiBytes.index(bytes("Ab"), bytes("ab")).should be_nil  # exact: no folding
+    end
+
+    it "returns nil for an empty needle, a short hay, or a first byte that never completes" do
+      Gori::AsciiBytes.index(bytes("abc"), Bytes.empty).should be_nil
+      Gori::AsciiBytes.index(bytes("ab"), bytes("abc")).should be_nil
+      Gori::AsciiBytes.index(bytes("aXaYa"), bytes("ab")).should be_nil
+      Gori::AsciiBytes.index(Bytes[0xff, 0x00, 0xc3], Bytes[0x00, 0xc3]).should eq(1) # not UTF-8
+    end
+  end
+
   describe ".contains_ci?" do
     describe "empty and size boundaries" do
       it "returns true for an empty needle regardless of hay" do
@@ -188,6 +204,37 @@ describe Gori::AsciiBytes do
       Gori::AsciiBytes.starts_with_ci?(hay, "http://".to_slice).should be_false
       Gori::Store::FlowRow.absolute_form?(String.new(hay)).should be_false
       Gori::Store::FlowRow.absolute_form?(String.new(Bytes[0x48, 0x54, 0x54, 0x50, 0x3a, 0x2f, 0x2f, 0x80])).should be_true
+    end
+  end
+
+  describe ".ascii_only?" do
+    it "is true for empty and pure-ASCII input, false for any byte >= 0x80 wherever it sits" do
+      Gori::AsciiBytes.ascii_only?(Bytes.empty).should be_true
+      Gori::AsciiBytes.ascii_only?(Bytes.new(300) { |i| (i % 128).to_u8 }).should be_true
+      [0, 1, 7, 8, 31, 32, 299].each do |at|
+        Gori::AsciiBytes.ascii_only?(Bytes.new(300) { |i| i == at ? 0x80_u8 : 0x41_u8 }).should be_false
+      end
+    end
+  end
+
+  describe ".range_eq_ci?" do
+    it "folds A-Z only and requires the exact length" do
+      h = "xContent-TYPEx".to_slice
+      Gori::AsciiBytes.range_eq_ci?(h, 1, 13, "content-type".to_slice).should be_true
+      Gori::AsciiBytes.range_eq_ci?(h, 1, 12, "content-type".to_slice).should be_false
+      Gori::AsciiBytes.range_eq_ci?(h, 0, 13, "content-type".to_slice).should be_false
+      Gori::AsciiBytes.range_eq_ci?("[]".to_slice, 0, 2, "{}".to_slice).should be_false
+    end
+  end
+
+  describe ".each_head_field" do
+    it "yields trimmed name/value offsets per colon line and stops at the blank line" do
+      h = "GET / HTTP/1.1\r\n A :  b \r\nnocolon\r\nC:\r\n\r\nD: e\r\n".to_slice
+      seen = [] of {String, String}
+      Gori::AsciiBytes.each_head_field(h) do |na, nz, va, vz|
+        seen << {String.new(h[na, nz - na]), String.new(h[va, vz - va])}
+      end
+      seen.should eq([{"A", "b"}, {"C", ""}])
     end
   end
 end

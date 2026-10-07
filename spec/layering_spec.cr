@@ -26,11 +26,13 @@ describe "layering contract" do
     # written. It is a core engine layer with all three surfaces hanging off it — exactly
     # the shape this contract governs — and it is clean today, so this is the one moment
     # adding it costs nothing.
-    subsystems = %w[store proxy probe fuzz miner discover sequencer oast authorize]
+    # `sitemap` likewise: the tree model and its `tag:` filter (`sitemap/tag_filter.cr`), which
+    # the TUI Sitemap bar, `gori run sitemap` and MCP `list_sitemap` all call.
+    subsystems = %w[store proxy probe fuzz miner discover sequencer oast authorize sitemap]
 
     paths = [] of String
     subsystems.each do |name|
-      paths.concat(Dir.glob(File.join(root, "src", "gori", name, "**", "*.cr")))
+      paths.concat(glob_files(root, "src", "gori", name, "**", "*.cr"))
     end
     # The module files that sit alongside those directories. There is no `src/gori/proxy.cr`
     # — the proxy is directory-only — so it is absent from this half of the set.
@@ -41,8 +43,12 @@ describe "layering contract" do
     # Top-level engine files with no directory of their own. The session layer is exactly the
     # shape this contract governs — the binding table is read by all three surfaces and by the
     # proxy response path, and session slots are the send context every one of them selects —
-    # so they are held to it even though they never grew a subdirectory.
-    %w[bindings session_slot session_slots].each do |name|
+    # so they are held to it even though they never grew a subdirectory. `project_search` is the
+    # picker's cross-project search engine (#1229), kept out of `tui/` so a CLI or MCP adapter
+    # can reuse it — which only holds while it knows nothing of the surface that calls it.
+    # `js_refs` is the JavaScript reference scan behind the Sitemap's unrequested nodes (#1243),
+    # which all three surfaces call.
+    %w[bindings session_slot session_slots project_search js_refs].each do |name|
       path = File.join(root, "src", "gori", "#{name}.cr")
       paths << path if File.exists?(path)
     end

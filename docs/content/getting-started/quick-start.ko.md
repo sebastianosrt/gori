@@ -1,5 +1,5 @@
 +++
-title = "Quick Start"
+title = "gori 빠른 시작"
 description = "직접 따라 하는 튜토리얼: CA를 신뢰하고, 실제 요청을 캡처해 살펴본 뒤 Repeater에서 재전송합니다."
 weight = 20
 +++
@@ -12,7 +12,7 @@ weight = 20
 
 ## 1. gori 시작하기 {#1-start-gori}
 
-하위 명령 없이 실행하면 gori는 프록시를 시작하고 인터페이스를 엽니다:
+하위 명령 없이 실행하면 프로젝트 선택 화면이 열립니다. 프로젝트를 열면 프록시가 시작됩니다:
 
 ```bash
 gori
@@ -20,13 +20,17 @@ gori
 
 첫 실행 시 짧은 [설정 마법사](#first-run-wizard)(전역 바인드, 테마, Miss Ring 마스코트)가 실행되고, 이어서 [가이드 UI 투어](#guided-ui-tour)를 제안합니다. 투어는 지금 해도 되고 건너뛰었다가 나중에 돌아와도 됩니다. 이 페이지는 같은 내용을 실제 트래픽으로 다룹니다.
 
+프로젝트 선택 화면에서 **New project**를 고르고 이름을 입력한 뒤 `Enter`를 두 번 누르세요(설명은 선택 사항). 첫 실행에서 가이드 투어를 마치면 이 화면으로 돌아옵니다.
+
+어떤 프로젝트가 토큰, 호스트, 엔드포인트 같은 무언가를 캡처했는지 찾으려면 프로젝트 선택 화면에서 `Ctrl-F`를 누르고 입력하세요. gori가 모든 프로젝트의 플로우를 호스트와 경로로 검색하고, 세 글자 이상 입력하면 본문 텍스트로도 검색한 뒤 결과를 프로젝트별로 보여 줍니다. `Enter`를 누르면 해당 프로젝트가 그 플로우의 상세 화면이 열린 상태로 열립니다. `Esc`는 아직 진행 중인 검색을 멈추고, 검색이 끝난 뒤에는 검색 창을 닫습니다.
+
 기본적으로 프록시는 `127.0.0.1:8070`에서 수신합니다. 한 번의 실행에 대해서만 재정의할 수 있습니다(프로젝트 자체 바인드가 설정되어 있으면 여전히 그쪽이 우선합니다):
 
 ```bash
 gori --listen 0.0.0.0 --port 8080
 ```
 
-**확인.** gori TUI가 보입니다. 한쪽에 늘어선 탭들(Project, Target, History, …)과 프록시 주소 `127.0.0.1:8070`을 보여주는 상단 바입니다.
+**확인.** 프로젝트 세션이 **History** 탭에서 열렸습니다. Project, Target, History, … 탭과 프록시 주소 `127.0.0.1:8070`을 보여주는 상단 바가 보입니다.
 
 ## 2. CA 신뢰 후 첫 플로우 캡처 {#2-trust-the-ca-and-capture-your-first-flow}
 
@@ -60,6 +64,8 @@ curl -x http://127.0.0.1:8070 https://example.com
 
 gori는 요청 시 루트로부터 호스트별 리프 인증서를 발급하므로, 루트만 한 번 신뢰하면 됩니다.
 
+커맨드라인 도구에는 지름길이 있습니다. `gori run shell`(또는 팔레트의 **Open shell**)은 OS 설정을 건드리지 않고, curl, git, Python, Go, Node 트래픽이 실행 중인 gori를 거치며 그 CA를 신뢰하는 셸을 엽니다. `gori run shell -- curl https://example.com`은 명령 하나만 그렇게 실행합니다. [`gori run shell`](/ko/reference/cli/#run-shell)을 참고하세요.
+
 > gori의 개인 키는 머신 비밀입니다. `0600` 권한으로 기록되며 머신을 절대 벗어나지 않습니다. 이전의 모든 신뢰를 무효화할 의도가 있을 때만 팔레트(**Regenerate CA certificate**)에서 교체하세요.
 
 ### Option C: 휴대폰이나 태블릿에 CA 설치하기 {#option-c-install-the-ca-on-a-phone-or-tablet}
@@ -82,19 +88,24 @@ gori는 요청 시 루트로부터 호스트별 리프 인증서를 발급하므
 
 ## 3. 두 가지 탐색 표면 익히기 {#3-learn-the-two-discovery-surfaces}
 
-탭별 단축키를 외우기 전에, 거의 모든 것이 있는 두 곳을 먼저 익히세요.
+탭별 단축키를 외울 필요는 없습니다. 두 개의 키로 모든 동작에 닿습니다.
 
 | 표면 | 키 | 용도 |
 |---------|-----|----------------|
-| **커맨드 팔레트** | `Ctrl-P` | 앱 전역 제어: 설정, Open browser, Export CA, 이동 동작 등 전역적인 모든 것 |
-| **space 메뉴** | `Space` | 지금 포커스를 가진 대상에 대한 동작(History 행, 상세 패널, Repeater, …) |
+| **space 메뉴** | `Space` | 지금 있는 패널(History 행, 플로우 상세, Repeater 편집기, …)에서 가장 자주 하는 동작, 동작마다 글자 하나 |
+| **커맨드 팔레트** | `Ctrl-P` | 모든 동작을 이름을 입력해 찾기: 그 패널의 동작이 먼저, 이어서 설정이나 **Open browser** 같은 앱 전역 동작 |
 
-팔레트는 도구 전체의 지도입니다. space 메뉴는 *이* 패널의 지도입니다. 둘 다 키 힌트를 보여주니, 키 조합이 기억나지 않으면 둘 중 하나를 여세요.
+둘 다 동작 옆에 그 단축키를 보여주므로, 열어 보는 것 자체가 키를 익히는 방법입니다. 방금 캡처한 플로우로 바로 해 보세요.
+
+1. **History**에서 `↓`로 플로우를 고른 뒤 `Space`를 누릅니다. 행 왼쪽 글자는 그 행을 실행하고, 오른쪽 키(**Repeater flow** 옆의 `^R`)는 메뉴 없이 같은 일을 합니다. `>` **Send flow to…**처럼 `›`가 붙은 행은 두 번째 카드를 열고, `Esc`는 한 단계 뒤로 갑니다. 메뉴가 닫힐 때까지 `Esc`를 누르세요.
+2. `Ctrl-P`를 누르고 `send`를 입력합니다. History의 동작이 `THIS TAB` 아래 먼저 나오고, 각각 닿는 키나 메뉴 경로가 함께 보입니다(`␣ > c`는 `Space`, `>`, `c` 순서). `Esc`를 누릅니다.
 
 <figure class="tui-shot">
-  <img src="/images/tui/command-palette.svg" alt="History 탭 위에 열린 gori 커맨드 팔레트로, 필터 상자와 함께 설정, 이동, 내보내기 동작을 나열한다">
-  <figcaption>커맨드 팔레트(<kbd>Ctrl-P</kbd>): 설정부터 <em>Open browser</em>, 탭 이동까지 앱 전역의 모든 동작을 퍼지 필터로 찾습니다.</figcaption>
+  <img src="/images/tui/command-palette.svg" alt="History 탭 위에서 send를 입력한 gori 커맨드 팔레트. THIS TAB 아래 보내기 동작이 키나 메뉴 경로와 함께 나오고, 이어서 APP 아래 일치하는 앱 명령이 나온다">
+  <figcaption>History에서 <code>send</code>를 입력한 커맨드 팔레트(<kbd>Ctrl-P</kbd>): 그 탭의 동작이 더 빠른 길과 함께 먼저 나오고, 앱 전역 명령이 뒤따릅니다.</figcaption>
 </figure>
+
+[space 메뉴와 팔레트](/ko/guide/space-menu-and-palette/)에서 `Z` **Display…**, `P` **Protocol…** 카드와 팔레트에만 있는 동작까지 자세히 다룹니다.
 
 처음부터 알아 두면 좋은 전역 토글 세 가지입니다:
 
@@ -116,7 +127,7 @@ gori의 화면은 한 줄로 늘어선 탭입니다. 기본 순서는 Project �
 | `Esc` | 포커스를 탭 바 쪽으로 되돌림 |
 | `Tab` / `Shift-Tab` | 탭 바와 패널 사이로 포커스 이동 |
 
-마우스는 활성화하면(Preferences → **Editor & Keys** → **Editor**) 동작합니다. 탭 클릭, 행 클릭으로 선택, 다시 클릭으로 열기. **Help** 탭은 이 페이지가 열려 있지 않을 때 쓸 수 있는 앱 안의 완전한 키 치트시트입니다.
+마우스는 활성화하면(Preferences → **Editor & Keys** → **Mouse**) 동작합니다. 탭 클릭, 행 클릭으로 선택, 다시 클릭으로 열기. **Help** 탭은 이 페이지가 열려 있지 않을 때 쓸 수 있는 앱 안의 완전한 키 치트시트입니다.
 
 ## 5. History에서 플로우 읽기 {#5-read-a-flow-in-history}
 
@@ -134,7 +145,7 @@ History가 활성화되어 있는지 확인하세요(`3`). 모든 요청/응답�
 | `↑` / `↓` (또는 `j` / `k`) | 선택 이동 |
 | `Enter` | 요청/응답 상세 열기 |
 | `/` | [쿼리 언어](/ko/reference/query-language/)로 필터 |
-| `f` | 최신 따라가기(tail) 토글 |
+| `Space` `Z` `f` | 최신 따라가기(tail) 토글 |
 | `y` | 선택한 플로우 복사 |
 
 `/`를 누르고 필터를 입력한 뒤 `Enter`를 누르세요:
@@ -150,7 +161,7 @@ status:5xx
 method:POST body:password
 ```
 
-이제 `example.com` 플로우를 선택하고 `Enter`를 누르세요. 상세 화면에서는 `↑` / `↓`로 스크롤하고 `y`로 복사하며, hex / whitespace / pretty 본문은 `x` / `b` / `p`로 토글합니다. `Esc`로 목록에 돌아옵니다.
+이제 `example.com` 플로우를 선택하고 `Enter`를 누르세요. 상세 화면에서는 `↑` / `↓`로 스크롤하고 `y`로 복사하며, hex / whitespace / pretty 본문은 `Ctrl-X` / `b` / `p`로 토글합니다. `Esc`로 목록에 돌아옵니다.
 
 **확인.** History를 호스트 하나로 필터하고, 플로우를 열어 전체 요청과 응답을 읽을 수 있습니다.
 
@@ -165,14 +176,16 @@ method:POST body:password
    X-Gori-Test: 1
    ```
 4. `Esc`로 편집 모드를 벗어난 뒤 `Ctrl-R`로 **전송**합니다.
+
+   편집 중 복사하기: `Shift`+화살표는 두 모드 모두에서 선택하지만, 복사 키는 다릅니다. READ에서는 `y`이고, INS에서 `y`는 리터럴 문자라 선택 위에 입력하면 선택을 *덮어씁니다*. 그러니 **`Ctrl-Y`**를 쓰세요. `Esc`도 선택을 INS 밖으로 들고 나오므로 `Esc` 뒤 `y`도 됩니다. 어떤 키 입력이 선택을 먹어 버렸다면, `Ctrl-Z`가 한 번에 되돌립니다.
 5. 응답과 타이밍, 이전 응답 대비 diff가 오른쪽에 나타납니다. `Tab`으로 target → request → response를 순회합니다.
 
 <figure class="tui-shot">
-  <img src="/images/tui/repeater.svg" alt="편집 가능한 요청 패널이 응답 패널 옆에 있고, replayed 200 in 1152ms라는 상태 줄이 보이는 gori Repeater 탭">
+  <img src="/images/tui/repeater.svg" alt="편집 가능한 요청 패널이 응답 패널 옆에 있고, sent → 200 in 114ms라는 상태 줄이 보이는 gori Repeater 탭">
   <figcaption><strong>Repeater</strong>는 요청의 어느 부분이든 편집해 재전송합니다. 응답, 타이밍, 그리고 마지막 응답 대비 diff가 나란히 놓입니다.</figcaption>
 </figure>
 
-**확인.** Repeater 상태 줄에 `replayed 200 in … ms` 같은 문구가 보이고, `Ctrl-R`로 원하는 만큼 재전송할 수 있습니다. 이것이 완전한 캡처 → 검사 → 리플레이 루프입니다.
+**확인.** Repeater 상태 줄에 `sent → 200 in … ms` 같은 문구가 보이고, `Ctrl-R`로 원하는 만큼 재전송할 수 있습니다. 이것이 완전한 캡처 → 검사 → 리플레이 루프입니다.
 
 ## 7. 다음으로 갈 곳 {#7-where-to-go-next}
 
@@ -188,15 +201,17 @@ method:POST body:password
 
 | 키 | 위치 | 동작 |
 |-----|--------|--------|
-| `Ctrl-P` | 어디서나 | 커맨드 팔레트(설정, Match & Replace, 알림, …) |
+| `Space` | 포커스된 패널 | space 메뉴: 이 패널의 동작, 동작마다 글자 하나 |
+| `Ctrl-P` | 어디서나 | 커맨드 팔레트: 아무 동작이나 이름으로 찾기 |
+| `?` | 어디서나 | Help: 전체 키 목록 |
 | `Ctrl-,` | 어디서나 | Preferences(모든 설정을 담은 하나의 모달) |
-| `Space` | 포커스된 패널 | 영역 동작 메뉴 |
 | `c` / `i` / `s` | 어디서나 | 캡처 / 인터셉트 / 스코프 렌즈 |
 | `[` `]` · `1`-`9` | 어디서나 | 탭 전환 |
 | `/` | History | 쿼리 언어 필터 |
 | `Enter` | History | 플로우 상세 열기 |
 | `Ctrl-R` | History | → Repeater |
 | `Shift-I` | History | → Fuzzer |
+| `>` | History | Send flow to…로 아무 도구에나 보내기(`>` `c` → Comparer) |
 | `Ctrl-R` | Repeater / Fuzzer | 요청 전송 / 퍼즈 실행 |
 | `Esc` | 대부분의 곳 | 한 단계 뒤로 |
 
@@ -208,24 +223,24 @@ method:POST body:password
 gori wizard
 ```
 
-바인드 단계는 `settings.json`의 공유 기본값을 설정합니다. Preferences → **Network & Tabs** → **Network**와 같은 계층입니다. 프로젝트별 잠금이 아니며, 필요하면 Project 탭에서 평가마다 다른 주소를 고정하세요. 고른 포트에 이미 다른 프로세스가 열려 있으면 이 단계가 알려 주며, `Enter`를 한 번 더 누르면 그대로 유지합니다. `Esc`는 두 번 눌러야 마법사를 건너뜁니다(첫 번째는 예고만 하므로 입력 필드에서 실수로 누른 `Esc`가 설정을 끝내지 않습니다).
+수신 IP의 기본값 `127.0.0.1`은 이 컴퓨터에서만 접속할 수 있고, `0.0.0.0`을 고르면 다른 기기에서도 접속할 수 있습니다. 첫 `Enter`는 IP에서 포트로 이동하고 다음 `Enter`는 계속 진행합니다. 이 값은 `settings.json`의 공유 기본값이며, 프로젝트별 주소는 Project 탭에서 따로 고정할 수 있습니다. 포트가 이미 사용 중이면 `Enter`를 한 번 더 눌러 그대로 유지할 수 있습니다. `Esc`를 두 번 누르면 마법사를 건너뜁니다.
 
-마지막 **Review** 스텝은 선택한 값을 요약하며, 편집 가능한 행이 하나 있습니다. **Shortcuts**입니다. `←`/`→`로 gori 내장 키 조합 패밀리(`^P` `^N` `^W` `^1-9`)의 모디파이어를 `Ctrl`과 `Option (⌥)` 사이에서 전환합니다. Option을 고르면 Ctrl을 대체하는 게 아니라 `⌥` 별칭이 *추가*됩니다. 터미널이나 멀티플렉서가 Ctrl 형태를 전달하지 않을 때 유용합니다. macOS의 Option-as-Meta 요구사항은 [커맨드 모디파이어](/ko/guide/hotkeys/#command-modifier)를 참고하세요.
+마지막 **Review** 스텝은 선택한 값을 요약하고, 현재 [에디터 키셋](/ko/guide/hotkeys/#editor-keysets)과 바꾸는 곳을 알려 줍니다(마법사는 키셋을 바꾸지 않습니다). 편집 가능한 행이 하나 있습니다. **Shortcuts**입니다. `←`/`→`로 gori 내장 키 조합 패밀리(`^P` `^N` `^W` `^1-9`)의 모디파이어를 `Ctrl`과 `Option (⌥)` 사이에서 전환합니다. Option을 고르면 Ctrl을 대체하는 게 아니라 `⌥` 별칭이 *추가*됩니다. 터미널이나 멀티플렉서가 Ctrl 형태를 전달하지 않을 때 유용합니다. macOS의 Option-as-Meta 요구사항은 [커맨드 모디파이어](/ko/guide/hotkeys/#command-modifier)를 참고하세요.
 
 ## 가이드 UI 투어 {#guided-ui-tour}
 
-탭/패널 이동, 팔레트, space 메뉴, READ/INS 편집 모드를 목업 UI로 따라가는 안내입니다. 실제 프록시 세션 없이 안전하게 실행할 수 있습니다. 각 레슨은 짧은 데모를 보여주고 실제 키를 눌러 보도록 요청하며, 마지막 단계는 네 가지 동작 모두를 직접 해보는 실습 샌드박스와 첫 세션 체크리스트입니다.
+탭/패널 이동, space 메뉴(두 번째 카드 포함), 커맨드 팔레트 검색, READ/INS 편집 모드에 이어, 트래픽 자체를 다룹니다: 클라이언트를 어디로 향하게 하고 CA를 어떻게 신뢰시키는지, 캡처 스위치, 인터셉트. 모두 목업 UI에서 따라가며, 실제 프록시 세션 없이 안전하게 실행할 수 있습니다. 각 레슨은 짧은 데모를 보여주고 실제 키를 눌러 보도록 요청합니다. 앞의 네 가지 동작은 실습 샌드박스에서 직접 해보고, 투어는 도움말과 종료 방법, 첫 세션 체크리스트로 끝납니다. 목업 메뉴는 재지정한 키를 포함해 설치된 gori와 같은 글자와 키를 씁니다.
 
 ```bash
 gori tutorial
 ```
 
 <figure class="tui-shot">
-  <img src="/images/tui/tutorial.svg" alt="탭과 패널, 커맨드 팔레트, 동작 메뉴, 편집 모드라는 네 가지 핵심 동작을 설명하는 gori 가이드 투어 환영 카드">
-  <figcaption>가이드 투어는 탭과 패널, 팔레트, space 메뉴, 그리고 READ / INS 편집 모드를 안내합니다. 각 키를 눌러 본 뒤, 안전한 샌드박스에서 네 가지를 모두 연습하세요.</figcaption>
+  <img src="/images/tui/tutorial.svg" alt="탭과 패널, 동작 메뉴, 커맨드 팔레트, 편집 모드라는 네 가지 핵심 동작을 설명하는 gori 가이드 투어 환영 카드">
+  <figcaption>가이드 투어는 탭과 패널, space 메뉴, 팔레트, 그리고 READ / INS 편집 모드를 안내합니다. 각 키를 눌러 본 뒤, 안전한 샌드박스에서 네 가지를 모두 연습하세요.</figcaption>
 </figure>
 
-이 투어는 첫 실행 마법사의 마지막에도 제안되며, 세션 안에서는 팔레트 명령 **Guided tour**(`Ctrl-P`)로 열 수 있습니다. 끝나면 원래 화면으로 돌아옵니다.
+이 투어는 첫 실행 마법사의 마지막에도 제안되며, 세션 안에서는 팔레트 명령 **Guided tour**(`Ctrl-P`)로 열 수 있습니다. 마지막 카드에는 투어를 마치면 프로젝트 선택 화면, `--db` 세션, 셸, 현재 세션 중 어디로 이어지는지 안내합니다.
 
 ## 다음 단계 {#next-steps}
 
@@ -233,4 +248,5 @@ gori tutorial
 - [Proxy & History](/ko/guide/proxy/): 캡처, 인터셉트, 스코프, 가져오기, match & replace
 - [Repeater & Fuzzer](/ko/guide/repeater-and-fuzzer/): 테스트 워크벤치와 env 토큰
 - [Query Language](/ko/reference/query-language/): 전체 필터 문법
+- [space 메뉴와 팔레트](/ko/guide/space-menu-and-palette/): 키를 외우지 않고 모든 동작 찾기
 - [Hotkeys](/ko/guide/hotkeys/): 위의 키 조합을 원하는 대로 재지정

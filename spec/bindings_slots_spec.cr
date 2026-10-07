@@ -508,7 +508,7 @@ describe "Bindings × session slots" do
   end
 
   # `candidates` runs a CLAIMED rule only while the slot claiming it is active. That is the
-  # namespacing decision and it stands — but until `unasked` existed, nothing could say so, so
+  # namespacing decision and it stands — but until `scoped_out` existed, nothing could say so, so
   # `--bind-from` reported "no extract rule matched its response … check the rule's host glob,
   # condition and selector" about a rule that matched all three and was simply not asked.
   describe "rules a slot has scoped OUT of this send context" do
@@ -522,47 +522,36 @@ describe "Bindings × session slots" do
 
         # No slot active — the pre-slot playbook's send context, and the `--bind-from` one.
         b.observe(login("TOK"), subject).should be_empty
-        b.unasked(subject).should eq([{"SESSION", ["idA", "idB"]}])
-        b.claiming_slots("SESSION").should eq(["idA", "idB"])
+        b.scoped_out.should eq([{"SESSION", ["idA", "idB"]}])
 
         # A slot that does not claim it is active: same story.
         slots.activate("anon")
-        b.unasked(subject).should eq([{"SESSION", ["idA", "idB"]}])
-
-        # …and the subject-free half, for the caller with no message in hand (`--bind-from`).
-        slots.activate(nil)
-        b.scoped_out.should eq([{"SESSION", ["idA", "idB"]}])
-        slots.activate("anon")
+        b.observe(login("TOK"), subject).should be_empty
         b.scoped_out.should eq([{"SESSION", ["idA", "idB"]}])
 
         # Either claiming slot: the rule IS asked, so there is nothing to explain.
         slots.activate("idB")
-        b.unasked(subject).should be_empty
         b.scoped_out.should be_empty
 
         # The right one, and there is nothing left to explain.
         slots.activate("idA")
-        b.unasked(subject).should be_empty
+        b.scoped_out.should be_empty
         b.observe(login("TOK"), subject).should eq(["SESSION"])
       end
     end
 
-    it "stays silent about a rule that genuinely did not match" do
-      # The distinction is the whole point: `unasked` must not blame the slots for a host glob
-      # that missed, or the diagnostic swaps one wrong answer for another.
+    it "ignores the host glob, and never names an unclaimed rule" do
       with_store do |store|
         slots = Gori::SessionSlots.load(store)
         slots.save([Slot.new("idA", rules: ["SESSION"])])
         b = Gori::Bindings.load(store, slots)
         b.add("SESSION", "", Gori::ExtractKind::Cookie, "sid", host: "other.test")
-        b.unasked(subject).should be_empty
-        b.claiming_slots("SESSION").should eq(["idA"])
         # `scoped_out` does NOT know about the host glob and must not pretend to: it answers
         # "this rule cannot be asked here at all", which stays true on any message.
         b.scoped_out.should eq([{"SESSION", ["idA"]}])
         # …and an unclaimed rule is never scoped out, whatever is active.
         b.add("CSRF", "", Gori::ExtractKind::Header, "x-csrf")
-        b.unasked(subject).should be_empty
+        b.scoped_out.should eq([{"SESSION", ["idA"]}])
       end
     end
 
@@ -570,9 +559,7 @@ describe "Bindings × session slots" do
       with_store do |store|
         b = Gori::Bindings.load(store)
         b.add("SESSION", "", Gori::ExtractKind::Cookie, "sid")
-        b.unasked(subject).should be_empty
         b.scoped_out.should be_empty
-        b.claiming_slots("SESSION").should be_empty
       end
     end
   end
@@ -594,7 +581,7 @@ describe "Bindings × session slots" do
         slots.activate("idA")
 
         with_layer(b) do
-          Gori::Env.unbound_in_slot(slots.find("idA").not_nil!).should eq(["SESSION"])
+          Gori::Env.slot_literals(slots.find("idA").not_nil!).map(&.name).should eq(["SESSION"])
           sent = String.new(Gori::Env.overlay_slot("GET / HTTP/1.1\r\nHost: h\r\n\r\n".to_slice))
           # A REPORT, not a refusal: the bytes still go, so a half-configured slot cannot kill
           # a run (the #525 shape — a guard with no exit costs more than the loss it prevents).
@@ -639,7 +626,7 @@ describe "Bindings × session slots" do
         b.add("SESSION", "", Gori::ExtractKind::Cookie, "sid")
         slots.activate("idA")
         with_layer(b) do
-          Gori::Env.unbound_in_slot(slots.find("idA").not_nil!).should be_empty
+          Gori::Env.slot_literals(slots.find("idA").not_nil!).map(&.name).should be_empty
           sent = String.new(Gori::Env.overlay_slot("GET / HTTP/1.1\r\nHost: h\r\n\r\n".to_slice))
           sent.should contain("X-A: $SESSION")
           sent.should contain("X-B: $NOSUCH")
@@ -663,9 +650,9 @@ describe "Bindings × session slots" do
         slots.activate(nil)
 
         with_layer(b) do
-          admin = Gori::Authorize.resolve(slots.find("admin").not_nil!)
+          admin = Gori::Authorize.resolve(slots.find("admin").not_nil!, Gori::Env::Generation.new)
           admin.set_headers.should eq([{"Cookie", "sid=ADMINTOKEN"}])
-          user = Gori::Authorize.resolve(slots.find("user").not_nil!)
+          user = Gori::Authorize.resolve(slots.find("user").not_nil!, Gori::Env::Generation.new)
           # Nothing bound for `user`: the literal goes out and THAT is what must be said, or
           # the 401 it draws reads as access control working.
           user.set_headers.should eq([{"Cookie", "sid=$SESSION"}])

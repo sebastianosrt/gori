@@ -6,37 +6,30 @@ require "../../env"
 module Gori
   module MCP
     class Tools
+      ISSUES_LIMIT = PageLimit.new(100, 500)
+
       @[Tool("list_issues")]
       private def list_issues(h) : Result
-        req_off = optional_int_arg(h, "offset")
-        req_lim = optional_int_arg(h, "limit")
-        offset = clamp_nonneg(req_off)
-        limit = clamp(req_lim, 100, 500)
+        pg = page_args(h, ISSUES_LIMIT)
         all = store.issues
-        page = all[offset, limit]? || [] of Store::Issue
+        page = all[pg.offset, pg.limit]? || [] of Store::Issue
         Result.new(JSON.build do |j|
           j.object do
             j.field("issues") { j.array { page.each { |f| Serialize.issue(j, f, store) } } }
-            j.field "returned", page.size
-            j.field "offset", offset
-            j.field "limit", limit
-            emit_clamp(j, req_off, offset, req_lim, limit)
-            j.field "total", all.size
-            j.field "has_more", offset + page.size < all.size
+            emit_page(j, pg, page.size, all.size)
           end
         end)
       end
 
       @[Tool("get_issue")]
       private def get_issue(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
+        id = required_id(h, "id")
         f = store.get_issue(id)
         return not_found("no issue with id #{id}") unless f
-        Result.new(JSON.build { |j| Serialize.issue(j, f, store) })
+        Result.new(JSON.build { |j| Serialize.issue(j, f, store, retest: true) })
       end
 
-      @[Tool("create_issue", gated: true, agent_action: true)]
+      @[Tool("create_issue", gated: true, agent_action: true, permission: "write")]
       private def create_issue(h) : Result
         title = str(h, "title")
         return Result.new("missing required 'title'", is_error: true) if title.nil? || title.empty?
@@ -75,7 +68,14 @@ module Gori
         end
 
         host = str(h, "host").try { |hst| Env.mask_secrets(hst) }
-        id = store.insert_issue(masked_title, severity, host, flow_id, cvss: cvss)
+        # The body, written by the SAME insert as the issue — the atomicity `gori run issues
+        # create --notes/--notes-file` already advertises. Without it an agent filing findings
+        # in bulk had to follow every create with an `update_issue(notes:)`: two writes, and an
+        # issue that exists bodiless in between. `|| ""` is the column's own default, not a
+        # fallback that loses anything — no `notes` argument still creates a bodiless issue.
+        # Masked like the title and host beside it, and like update_issue's own `notes`.
+        notes = str(h, "notes").try { |n| Env.mask_secrets(n) } || ""
+        id = store.insert_issue(masked_title, severity, host, flow_id, cvss: cvss, notes: notes)
         # insert_issue returns 0 (never raises) when the write batch fails — e.g.
         # the cross-process SQLite lock couldn't be acquired (a TUI capturing into
         # the same project) or the disk is full. Don't report a phantom success.
@@ -92,10 +92,9 @@ module Gori
         end)
       end
 
-      @[Tool("update_issue", gated: true, agent_action: true)]
+      @[Tool("update_issue", gated: true, agent_action: true, permission: "write")]
       private def update_issue(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
+        id = required_id(h, "id")
         return not_found("no issue with id #{id}") unless store.get_issue(id)
         # A blank severity/status means "leave unchanged"; only a present,
         # non-blank, unrecognised value is an error.
@@ -150,13 +149,12 @@ module Gori
       # Remove an issue outright (the TUI Issues tab's delete). Distinct from status
       # "resolved"/"false-positive", which keep it in the report — this drops it, along with
       # its entity links (Store#delete_issue clears those in the same transaction).
-      @[Tool("delete_issue", gated: true, agent_action: true)]
+      @[Tool("delete_issue", gated: true, agent_action: true, permission: "write")]
       private def delete_issue(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
+        id = required_id(h, "id")
         return not_found("no issue with id #{id}") unless store.get_issue(id)
         return busy("issue NOT deleted (store busy or unwritable); it is unchanged") unless store.delete_issue(id)
-        Result.new(JSON.build { |j| j.object { j.field "id", id; j.field "deleted", true } })
+        Result.new({id: id, deleted: true}.to_json)
       end
 
       # The tools/list schemas for the issue tools, kept beside the handlers that
@@ -166,23 +164,32 @@ module Gori
       private def list_issues_tools(j : JSON::Builder) : Nil
         tool j, "list_issues",
           "List triage issues (severity + status), newest/most-severe first. " \
-          "Returns an object {issues, returned, offset, total} — not a bare array." do |s|
-          s.field "limit", intprop("max rows (default 100, max 500)")
+          "Returns an object {issues, returned, offset, total} — not a bare array. " \
+          "Each issue's `links` lists everything backing it, the flow it was filed from first; " \
+          "`flow_id` is that first linked flow." do |s|
+          s.field "limit", limitprop("max rows", ISSUES_LIMIT)
           s.field "offset", intprop("start row (default 0)")
         end
 
-        tool j, "get_issue", "Get one issue by id." do |s|
+        tool j, "get_issue",
+          "Get one issue by id. `links` lists everything backing it, the flow it was filed " \
+          "from first; `flow_id` is that first linked flow. `evidence` holds the frozen copies." do |s|
           s.field "id", intprop("issue id"), required: true
         end
 
         return unless @allow_actions
 
-        tool j, "create_issue", "Record a new issue in the project." do |s|
+        # The description says the body can ride the create, because that is the surface an
+        # agent reads when CHOOSING a tool — #1076 was filed over a create+update_issue habit
+        # formed when nothing here said otherwise, and a per-property description (below) is
+        # only read once this tool has already been picked.
+        tool j, "create_issue", "Record a new issue in the project, with its notes body, in one transaction." do |s|
           s.field "title", strprop("issue title"), required: true
           s.field "severity", enumprop("issue severity (default: derived from cvss, else info)", SEVERITIES)
           s.field "cvss", strprop("optional CVSS vector or numeric score (e.g. 9.8 or CVSS:3.1/...)")
+          s.field "notes", strprop("optional free-form notes — the issue's body, written with the issue in one transaction")
           s.field "host", strprop("optional host the issue concerns")
-          s.field "flow_id", intprop("optional flow id this issue links to")
+          s.field "flow_id", intprop("optional flow this issue is filed from — it becomes the issue's first linked flow")
           s.field "repeater_id", intprop("optional repeater id this issue links to")
         end
 

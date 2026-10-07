@@ -28,13 +28,25 @@ module Gori
         "diff.pick-b", "Pick newer (B)", "Choose the newer engagement (defaults to the open project)",
         Verb::Scope::Diff, [Verb::Chord.new("b")]) { |ctx| ctx.diff_pick(:b); nil }
 
+      # `w` — sWap. It was `s`, and `s` is the Global scope lens: a scoped chord always beats
+      # the Global fallback, so this tab silently cost an operator the lens key. `s` reduces to
+      # two meanings now (key audit, F7): GO TO SOURCE where a row has one, and the Global lens
+      # everywhere it is not shadowed. `w` is free in this scope and names the action.
+      #
+      # The MENU letter stays 's': a space-menu letter is its own keyspace (it is reached after
+      # `space`), and `w` there is Close in every workbench menu in the app.
       r.register Verb::Definition.new(
         "diff.swap", "Swap A ⇄ B", "Swap the two snapshots — a diff reads before → after",
-        Verb::Scope::Diff, [Verb::Chord.new("s")]) { |ctx| ctx.diff_swap; nil }
+        Verb::Scope::Diff, [Verb::Chord.new("w")], intent: :swap) { |ctx| ctx.diff_swap; nil }
 
+      # `^R`, the Run chord in the nine other scopes that have one — Authorize, Body,
+      # Discover, Fuzzer, the History detail, Miner, OAST, Repeater and Sequencer. This was
+      # the ONE Run on a bare letter, and the letter it was on is the one bare `r` earns
+      # everywhere else: "send this to the Repeater" (key audit, F6). The menu keeps 'r',
+      # spelled out because a ctrl chord derives no menu letter.
       r.register Verb::Definition.new(
         "diff.run", "Run the diff", "Re-read both projects and rebuild the report",
-        Verb::Scope::Diff, [Verb::Chord.new("r")]) { |ctx| ctx.diff_run; nil }
+        Verb::Scope::Diff, [Verb::Chord.new("r", ctrl: true)], intent: :run) { |ctx| ctx.diff_run; nil }
 
       # A lens, not a filter bar: the five verdicts are a closed set, so a ring is the whole
       # vocabulary. The COUNTS on the header always cover all five whatever the lens shows.
@@ -55,12 +67,21 @@ module Gori
       rows_shown = ->(ctx : Verb::ExecContext) { ctx.diff_rows_shown? }
       r.register Verb::Definition.new(
         "diff.copy", "Copy", "Copy the selected row — endpoint, verdict, and what moved — as one line",
-        Verb::Scope::Diff, [Verb::Chord.new("y")], available: rows_shown, mnemonic: 'y') { |ctx| ctx.read_copy; nil }
+        Verb::Scope::Diff, [Verb::Chord.new("y")], available: rows_shown, intent: :copy) { |ctx| ctx.read_copy; nil }
+      # `↵`/`→`, and an explicit 'o' menu letter where the dropped chord used to derive it.
+      # `o` is the `↵` ALIAS in the four scopes that keep it ("open this row's own detail");
+      # here it opened a DIFFERENT tab, which is the split the key audit's F2 closes.
+      #
+      # `→` rather than nothing beside `↵`: a lone `enter` would make this verb rebindable
+      # (`Hotkeys.rebindable?` counts chords) and a bare `enter` default is refused as
+      # terminal-reserved, which is the trade the comment above spells out. `→` is also the
+      # app's own drill-in grammar — it goes one layer deeper, which is exactly what handing
+      # the pair to the Comparer is — so the alias pair costs no bare letter at all.
       r.register Verb::Definition.new(
         "diff.to-comparer", "Compare the two captures",
         "Send this endpoint's capture from each side to the Comparer for the byte-level diff",
-        Verb::Scope::Diff, [Verb::Chord.new("o"), Verb::Chord.new("enter")],
-        available: rows_shown, group: :send) { |ctx| ctx.diff_to_comparer; nil }
+        Verb::Scope::Diff, [Verb::Chord.new("enter"), Verb::Chord.new("right")],
+        available: rows_shown, mnemonic: 'o', group: :send) { |ctx| ctx.diff_to_comparer; nil }
 
       # The retest's EXIT. ⇧F is History's and OAST's `issue.create` chord deliberately —
       # "file what I'm looking at" is one gesture across the app, and `Keymap#lookup` is
@@ -69,14 +90,14 @@ module Gori
       # normalises a typed capital to shift+lowercase, so an "F" chord would never fire —
       # and `menu_key` skips shift chords, hence the explicit mnemonic.
       #
-      # That mnemonic is 'i', not the 'a' its siblings use: `diff.pick-a`'s chord already
-      # claims 'a' in this scope, and `Registry#validate_menu_keys!` raises at BOOT on the
-      # collision rather than silently dropping one of the two from the space menu.
+      # That mnemonic is 'F', its own chord, not the 'a' its siblings use: `diff.pick-a`'s
+      # chord already claims 'a' in this scope. Never 'i': the tab does not bind it, so a
+      # dropped space would reach Global and hold all traffic (#1295).
       r.register Verb::Definition.new(
         "diff.issue", "Add issue",
         "File this endpoint as an Issue — prefilled with both projects, both sides' answers and what moved",
         Verb::Scope::Diff, [Verb::Chord.new("f", shift: true)],
-        available: rows_shown, mnemonic: 'i', group: :triage) { |ctx| ctx.diff_issue; nil }
+        available: rows_shown, mnemonic: 'F', group: :triage) { |ctx| ctx.diff_issue; nil }
 
       # The lighter exit, and the one a retest actually leans on: most rows are worth
       # MENTIONING, not filing. One keystroke, no form — a modal per row would cost more
@@ -86,6 +107,17 @@ module Gori
         "Record this endpoint in a Note — the same text as the Issue, without the form",
         Verb::Scope::Diff, [Verb::Chord.new("n")],
         available: rows_shown, group: :triage) { |ctx| ctx.diff_note; nil }
+
+      # The way back UP, which this scope did not have. Sitemap and Discover — the two other
+      # sub-tabs under Target — each register their own, because `body.to-menu` lives in
+      # `Verb::Scope::Body` and the resolver's chain is Editor → this scope → Global: a tab
+      # with its own scope never reaches it. Diff was the one of the three that never got the
+      # verb, so `esc` resolved to nothing and the body kept focus. ↑ and ← are body keys
+      # here (`diff.up`, and → is `diff.to-comparer`), so ⇧⇥ to the tab bar was the only way
+      # out of the sub-tab at all.
+      r.register Verb::Definition.new(
+        "diff.to-menu", "Back to sub-tabs", "Move focus up to the Sitemap/Discover/Diff strip",
+        Verb::Scope::Diff, [Verb::Chord.new("escape")], hidden: true) { |ctx| ctx.focus_pane(:subtabs); nil }
     end
   end
 end

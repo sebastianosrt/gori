@@ -26,12 +26,18 @@ private def links_for(store, owner_id : Int64) : LinksOverlay
   lo
 end
 
+private def runner_remove_link_body : String
+  source = File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui", "runner", "links.cr"))
+    .lines.reject(&.lstrip.starts_with?('#')).join('\n')
+  source[/private def remove_selected_link.*?(?=  private def refresh_link_owners)/m].not_nil!
+end
+
 describe Gori::Tui::LinksOverlay do
   it "names itself after its owner and carries both mode hints" do
     lo = LinksOverlay.new(Gori::Store::LinkOwnerKind::Issue, 7_i64)
     OverlayHarness.new(lo).assert_chrome(OverlayKind::Links, "LINKS — ISSUE #7")
     LinksOverlay.new(Gori::Store::LinkOwnerKind::Note, 3_i64).title.should eq("LINKS — NOTE #3")
-    lo.hint.should eq("↑/↓ · ↵/o open · a add · d remove · esc close")
+    lo.hint.should eq("↑/↓ · ↵/o open · a add · f freeze · d remove · esc close")
   end
 
   it "swaps the hint when `a` arms adding (was a ternary in the Runner's ladder)" do
@@ -85,8 +91,8 @@ describe Gori::Tui::LinksOverlay do
     # onto the terse bottom-row pair silently drops the only z=fuzz / m=miner legend.
     lo = LinksOverlay.new(Gori::Store::LinkOwnerKind::Issue, 1_i64)
     h = OverlayHarness.new(lo)
-    h.rendered?("↑/↓ select · ↵/o open · a add · d remove · esc close").should be_true
-    lo.hint.should eq("↑/↓ · ↵/o open · a add · d remove · esc close")
+    h.rendered?("↑/↓ select · ↵/o open · a add · f freeze · d remove · esc close").should be_true
+    lo.hint.should eq("↑/↓ · ↵/o open · a add · f freeze · d remove · esc close")
 
     h.press(Termisu::Input::Key::LowerA, 'a')
     h.rendered?("add: f flow · r repeater · z fuzz · m miner · esc back").should be_true
@@ -115,6 +121,49 @@ describe Gori::Tui::LinksOverlay do
       esc = OverlayHarness.new(lo)
       esc.press(Termisu::Input::Key::Escape).should eq(:closed)
       esc.commits.should eq(0)
+    end
+  end
+
+  # `entity_links.id` is a rowid: after a peer removed the link on screen and added another, the
+  # stale row id names the new one. MCP `remove_link` and `gori run links rm` remove by the pair.
+  it "removes the link by what it links, not by its row id" do
+    runner_remove_link_body.should_not contain("remove_link(link.id)")
+    with_store do |store|
+      issue = store.insert_issue("t", Gori::Store::Severity::Low, nil, nil)
+      shown = store.add_link(Gori::Store::LinkOwnerKind::Issue, issue, Gori::Store::LinkRefKind::Flow, 7_i64).not_nil!
+      stale = store.list_links(Gori::Store::LinkOwnerKind::Issue, issue).first
+      # A peer removes it…
+      store.remove_link(Gori::Store::LinkOwnerKind::Issue, issue, Gori::Store::LinkRefKind::Flow, 7_i64).should be_true
+      store.add_link(Gori::Store::LinkOwnerKind::Issue, issue, Gori::Store::LinkRefKind::Flow, 8_i64).should eq(shown)
+      store.remove_link(stale.owner_kind, stale.owner_id, stale.ref_kind, stale.ref_id).should be_true
+      store.list_links(Gori::Store::LinkOwnerKind::Issue, issue).map(&.ref_id).should eq([8_i64])
+    end
+  end
+
+  it "does not claim a link was removed when the store refused the write" do
+    # A closed writer is the deterministic stand-in for the same `exec_task_ok == false`
+    # contract a cross-process SQLite busy/lock takes. The lower layer proves the trigger;
+    # the Runner source check pins the branch because Runner.new owns a real terminal.
+    path = File.tempname("gori-link-remove-busy", ".db")
+    begin
+      store = Gori::Store.open(path)
+      issue = store.insert_issue("t", Gori::Store::Severity::Low, nil, nil)
+      store.add_link(Gori::Store::LinkOwnerKind::Issue, issue,
+        Gori::Store::LinkRefKind::Flow, 7_i64).should_not be_nil
+      store.close
+      store.remove_link(Gori::Store::LinkOwnerKind::Issue, issue, Gori::Store::LinkRefKind::Flow, 7_i64).should be_false
+
+      body = runner_remove_link_body
+      refusal = body.index("unless @session.store.remove_link(link.owner_kind, link.owner_id, link.ref_kind, link.ref_id)").not_nil!
+      reload = body.index("lo.reload(@session.store)").not_nil!
+      success = body.index(%(@toast = "link removed")).not_nil!
+      refusal.should be < reload
+      reload.should be < success
+      body.should contain(%(@toast = "link NOT removed (project busy) — it is unchanged"))
+    ensure
+      File.delete?(path)
+      File.delete?("#{path}-wal")
+      File.delete?("#{path}-shm")
     end
   end
 
@@ -303,5 +352,50 @@ describe "LinksOverlay — the add hand-off (Overlay#on_close nested-modal seam)
     h.press(Termisu::Input::Key::LowerZ, 'z').should eq(:closed)
     lo.pending_add.should eq('z')
     opened.should be_empty # the add path must not also trigger the open path
+  end
+
+  # `f` (#1038) freezes the highlighted link's current exchange as issue evidence. The
+  # freeze may raise a byte-cost confirm, so like the add hand-off it cannot run from inside
+  # this card's key handler: the key arms `pending_freeze` and drops the card, and the
+  # Runner's on_close does the work and puts the card back.
+  it "arms a freeze on `f` and hands off through on_close — but only with a row to freeze" do
+    with_store do |store|
+      id = store.insert_issue("t", Gori::Store::Severity::Low, nil, nil)
+      # Empty card: `f` is inert, the card stays, nothing is armed.
+      empty = links_for(store, id)
+      h = OverlayHarness.new(empty)
+      h.press(Termisu::Input::Key::LowerF, 'f').should eq(:open)
+      empty.pending_freeze?.should be_false
+
+      store.add_link(Gori::Store::LinkOwnerKind::Issue, id, Gori::Store::LinkRefKind::Flow, 5_i64)
+      lo = links_for(store, id)
+      h = OverlayHarness.new(lo)
+      h.press(Termisu::Input::Key::LowerF, 'f').should eq(:closed)
+      lo.pending_freeze?.should be_true
+      lo.pending_add.should be_nil
+      h.closes.should eq(1)
+      h.commits.should eq(0)
+
+      # ^F is not `f` — the same guard `d` has, so a chord cannot arm a write.
+      lo2 = links_for(store, id)
+      h2 = OverlayHarness.new(lo2)
+      h2.press(Termisu::Input::Key::LowerF, 'f', ctrl: true).should eq(:open)
+      lo2.pending_freeze?.should be_false
+    end
+  end
+
+  it "neither advertises nor arms `f` on a NOTE's card — a note owns no frozen evidence" do
+    with_store do |store|
+      lo = LinksOverlay.new(Gori::Store::LinkOwnerKind::Note, 3_i64)
+      lo.hint.should eq("↑/↓ · ↵/o open · a add · d remove · esc close")
+      h = OverlayHarness.new(lo)
+      h.rendered?("↑/↓ select · ↵/o open · a add · d remove · esc close").should be_true
+      h.rendered?("f freeze").should be_false
+      # Even with a row under the cursor the key is inert: the card stays, nothing is armed.
+      store.add_link(Gori::Store::LinkOwnerKind::Note, 3_i64, Gori::Store::LinkRefKind::Flow, 5_i64)
+      lo.reload(store)
+      h.press(Termisu::Input::Key::LowerF, 'f').should eq(:open)
+      lo.pending_freeze?.should be_false
+    end
   end
 end

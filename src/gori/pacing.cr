@@ -3,16 +3,14 @@ module Gori
   # Miner and Sequencer.
   #
   # It is one policy, not four. Each engine had carried a byte-identical private copy of both
-  # methods, and the drift that pattern invites had already happened in the comments: the
-  # Fuzzer's copy alone records why the jitter `sleep` sits OUTSIDE the `if interval` guard
-  # (gating it behind a base rate silently dropped jitter unless rps/throttle was also set),
-  # while the other three carried the fixed code with no trace of the lesson. Anyone reading
-  # the Miner's copy would have seen an unexplained line begging to be tidied back into the
-  # branch. Sharing the code shares the reasoning with it.
+  # methods, and the drift that pattern invites had already happened in the comments: one
+  # copy alone recorded a lesson the other three carried with no trace of it. Sharing the
+  # code shares the reasoning with it.
   #
-  # The including class supplies two things, which is the whole contract:
-  #   `@config`         — responds to `rps`, `throttle_ms` and `jitter_ms`
+  # The including class supplies three things, which is the whole contract:
+  #   `@config`         — responds to `rps` and `throttle_ms`
   #   `@last_dispatch`  — a `Time::Instant` it also initialises
+  #   `stopped?`        — true once the run was asked to stop; ends a wait in progress
   #
   # `@last_dispatch` is deliberately the includer's own ivar rather than state owned here:
   # each engine keeps ONE clock for its whole run. It is shared across the orchestrator and
@@ -41,7 +39,7 @@ module Gori
       end
     end
 
-    # Wait out the remaining gap before the next request, then apply jitter.
+    # Wait out the remaining gap before the next request.
     #
     # A TICKET, not a "sleep until the last one was long enough ago": each caller claims the
     # next slot by advancing `@last_dispatch` and only then sleeps until its own slot. The
@@ -58,16 +56,45 @@ module Gori
     # `{.., now}.max` floors the claim at the present: after an idle stretch the stored
     # instant is far in the past, and without the floor a burst of callers would all compute
     # a target already elapsed and go out at once — the opposite of a rate limit.
-    private def pace(interval : Time::Span?) : Nil
+    #
+    # Returns false when the run was stopped during the wait: the slot it waited for is not
+    # a send to make, and every caller skips it. Sending anyway let a stop release all the
+    # held slots at once, unpaced.
+    private def pace(interval : Time::Span?) : Bool
       if interval
         now = Time.instant
         target = {@last_dispatch, now}.max
         @last_dispatch = target + interval # claim it before sleeping — no yield in between
-        sleep(target - now) if now < target
+        nap(target - now) if now < target
       end
-      # Jitter applies on its own — don't gate it behind a base rate, which silently
-      # dropped jitter unless rps/throttle was also set.
-      sleep(rand(@config.jitter_ms).milliseconds) if @config.jitter_ms > 0
+      !stopped?
+    end
+
+    NAP_SLICE = 250.milliseconds
+
+    # `sleep`, in slices that re-check `stopped?`. A gap can be MAX_INTERVAL_SECONDS (a
+    # `--rate` of 1e-9) or a ten-minute throttle, and one unsliced sleep held the run
+    # "running" through a stop for that long — while MCP refused to switch or delete the
+    # project until it ended.
+    private def nap(span : Time::Span) : Nil
+      deadline = Time.instant + span
+      until stopped?
+        left = deadline - Time.instant
+        break unless left.positive?
+        sleep({left, NAP_SLICE}.min)
+      end
+    end
+
+    # A non-blocking channel send: deliver `value` if the buffer has room, drop it otherwise.
+    # The droppable events these engines emit — a progress nudge, an idle/wake poke — carry no
+    # state a receiver cannot re-derive from the counters, so a full buffer means the decision
+    # the dropped one would have triggered has already been made. Blocking here instead would
+    # let a slow consumer stall the hot send loop (P6).
+    private def offer(channel : Channel(T), value : T) : Nil forall T
+      select
+      when channel.send(value)
+      else
+      end
     end
   end
 end

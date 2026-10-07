@@ -1,4 +1,6 @@
+require "digest/sha256"
 require "../proxy/codec/content_decode"
+require "../env"
 
 module Gori
   module Repeater
@@ -29,6 +31,12 @@ module Gori
       # Without it, an errored flow has no head/body at all and this returns an empty array,
       # so a diff against it renders as an unexplained "response removed" — every line of the
       # OTHER side deleted, with no hint why — instead of showing the actual, more useful fact.
+      #
+      # A source holding the request as ONE wire blob (a Repeater send, a fuzz row) splits it
+      # with `Env.split_head_body` first, or its body reaches here as part of the HEAD and skips
+      # the binary / UTF-8 handling. That split is deliberately NOT applied in here: a captured
+      # head that simply has no body can hold a bare-LF blank line INSIDE it (the proxy ends a
+      # head only at CRLFCRLF), and splitting there would misread the rest of it as a body.
       def of(head : Bytes?, body : Bytes?, *, decode : Bool, error : String? = nil) : Array(String)
         b = decode ? display_body(head, body) : body
         lines = error ? ["error: #{error}"] : [] of String
@@ -42,12 +50,28 @@ module Gori
           # lines — both of them blank — over byte-identical requests.
           lines << "" unless lines.last?.try(&.empty?)
           if binary?(b)
-            lines << "— binary body (#{b.size} bytes) — not shown as text —"
+            lines << "— binary body (#{b.size} bytes, sha256 #{short_digest(b)}) — not shown as text —"
           else
-            lines.concat(bytes_to_lines(b))
+            text = String.new(b)
+            lines.concat(text_lines(text))
+            # `.scrub` maps every invalid byte to the same U+FFFD, so two bodies differing only
+            # in those bytes would split to identical lines. The digest line is what tells them
+            # apart; a valid-UTF-8 body never gets one.
+            unless text.valid_encoding?
+              lines << "— body is not valid UTF-8 (shown with �), sha256 #{short_digest(b)} —"
+            end
           end
         end
         lines
+      end
+
+      # These lines are a DISPLAY projection, and every diff consumer (Comparer, CLI/MCP
+      # `compare`) decides equality on them. So wherever the projection drops bytes — a binary
+      # body collapsed to one placeholder, invalid UTF-8 scrubbed to U+FFFD — the line has to
+      # carry the bytes' identity, or two different bodies of one size compare as "no
+      # differences" (#1162). 16 hex digits: an identity for a diff, not a security claim.
+      private def short_digest(bytes : Bytes) : String
+        Digest::SHA256.hexdigest(bytes)[0, 16]
       end
 
       # The head's lines, WITHOUT the empty trailing field `split` leaves behind for its final
@@ -76,10 +100,14 @@ module Gori
 
       def bytes_to_lines(bytes : Bytes?) : Array(String)
         return [] of String unless bytes
-        # `.scrub` maps invalid UTF-8 to U+FFFD (width 1) so a stray non-UTF-8 byte in
-        # an otherwise-text body can't smuggle a wide/emoji grapheme that desyncs the
-        # terminal cursor (the same guard the History detail view applies).
-        String.new(bytes).scrub.split('\n').map(&.rstrip('\r'))
+        text_lines(String.new(bytes))
+      end
+
+      # `.scrub` maps invalid UTF-8 to U+FFFD (width 1) so a stray non-UTF-8 byte in
+      # an otherwise-text body can't smuggle a wide/emoji grapheme that desyncs the
+      # terminal cursor (the same guard the History detail view applies).
+      private def text_lines(text : String) : Array(String)
+        text.scrub.split('\n').map(&.rstrip('\r'))
       end
     end
   end

@@ -1,21 +1,22 @@
 +++
-title = "테마"
+title = "TUI 테마"
 description = "gori의 내장 컬러 테마를 전환하거나, 직접 만든 테마를 넣습니다."
 weight = 100
 
 [extra]
 group = "커스터마이즈"
+shot = "theme-dancheong"
 +++
 
-gori는 30개의 내장 컬러 테마를 제공합니다: `goridark`(기본값), `goriday`, `latte`, `espresso`, `tokyonight`, `gruvbox`, `nord`, `dracula`, `solarized_light`, `rosepine_dawn`, `catppuccin_mocha`, `monokai`, `everforest`, `onedark`, `kanagawa`, `github_dark`, `zenburn`, `synthwave84`, `cyberpunk`, `matrix`, `cobalt2`, `high_contrast`, `github_light`, `gruvbox_light`, `one_light`, `ayu_light`, `rosepine`, `tokyonight_day`, `dancheong`, `hanji`.
+gori는 32개의 내장 컬러 테마를 제공합니다: `goridark`(기본값), `goriday`, `dancheong`, `hanji`, `latte`, `espresso`, `tokyonight`, `gruvbox`, `nord`, `dracula`, `solarized_light`, `rosepine_dawn`, `catppuccin_mocha`, `monokai`, `everforest`, `onedark`, `kanagawa`, `github_dark`, `zenburn`, `synthwave84`, `cyberpunk`, `matrix`, `cobalt2`, `high_contrast`, `github_light`, `gruvbox_light`, `one_light`, `ayu_light`, `rosepine`, `tokyonight_day`, `solarized_dark`, `everforest_light`.
 
 ## 테마 전환 {#switching-themes}
 
-`Ctrl-,`(또는 상단 바의 `⚙` 칩)로 Preferences를 열고 **Appearance**로 이동한 뒤 **Theme** 행에서 `↵`를 누릅니다. 이 행은 현재 테마를 인라인으로 미리 보여줍니다. 이름과 팔레트 스와치가 함께 표시됩니다. `Ctrl-P` → **`settings:theme`**로 같은 선택기를 한 번에 열 수도 있습니다.
+`Ctrl-,`(또는 상단 바의 `⚙` 칩)로 Preferences를 열고 **Appearance**로 이동한 뒤 **Theme** 행에서 `↵`를 누릅니다. 이 행은 현재 테마를 인라인으로 미리 보여줍니다. 이름과 팔레트 스와치가 함께 표시됩니다. `Ctrl-P` → **Settings: Theme**으로 같은 선택기를 한 번에 열 수도 있습니다.
 
 선택기는 세로로 스크롤되는 목록입니다. 각 행은 테마 고유 팔레트의 작은 스와치를 보여주며, 행을 선택하면 실시간으로 미리보기가 나타납니다. `Enter`는 선택을 적용하고 유지하며, `Esc`는 되돌립니다.
 
-`Ctrl-,`는 프로젝트 선택기에서도 동작하므로, 프로젝트를 열기 전 첫 실행에서 테마를 정할 수 있습니다. 그곳에서 편집할 수 있는 섹션은 Theme뿐이고, 나머지는 프로젝트를 열어야 합니다.
+`Ctrl-,`는 프로젝트 선택기에서도 동작하므로, 프로젝트를 열기 전 첫 실행에서 테마를 정할 수 있습니다. 폼 섹션은 모두 그곳에서도 편집할 수 있고, 오프너 중에서는 Theme만 동작합니다. 나머지 오프너(Tabs, Env, Hotkeys, 호스트네임 오버라이드, User-Agents)는 프로젝트를 열어야 합니다.
 
 같은 History 뷰를 내장 테마 여섯 개에서 나란히 본 모습입니다.
 
@@ -97,7 +98,9 @@ gori는 30개의 내장 컬러 테마를 제공합니다: `goridark`(기본값),
   "syn_header":    "#82a8c4",
   "syn_string":    "#8fb87a",
   "syn_number":    "#ca9b6a",
-  "syn_literal":   "#b08ec2"
+  "syn_literal":   "#b08ec2",
+  "syn_comment":   "#6f8172",
+  "syn_keyword":   "#d08c9a"
 }
 ```
 
@@ -123,9 +126,12 @@ gori는 30개의 내장 컬러 테마를 제공합니다: `goridark`(기본값),
 | `syn_string` | 따옴표 문자열 |
 | `syn_number` | 숫자, 태그 속성 이름 |
 | `syn_literal` | `true` / `false` / `null` |
+| `syn_comment` | 주석(GraphQL `#`, JSONC `//`, HTML `<!-- -->`) |
+| `syn_keyword` | 언어 키워드, 인증 스킴 |
 
 ### 참고 {#notes}
 
+- `"base"`는 내장 테마 이름이어야 합니다. 커스텀 테마를 다른 커스텀 테마의 base로 쓸 수 없고, 알 수 없는 base는 `goridark`로 폴백합니다.
 - 파일 이름은 소문자 `a-z 0-9 - _`로 정규화되며, 다른 문자는 제거됩니다(`My Theme!.json` → `mytheme`).
 - 이름이 내장 테마와 충돌하는 파일(예: `goridark.json`)은 무시됩니다. 내장 테마는 재정의할 수 없습니다.
 - 로딩은 너그럽습니다: 읽을 수 없는 파일, 잘못된 JSON, 객체가 아닌 것은 건너뛰며, 잘못된 색 하나는 테마 전체를 버리는 대신 `base` 값으로 폴백합니다. 깨진 테마 파일이 TUI를 죽이는 일은 없습니다.

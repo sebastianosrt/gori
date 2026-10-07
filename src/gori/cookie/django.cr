@@ -1,3 +1,5 @@
+require "crypto/subtle"
+
 module Gori
   module Cookie
     # Django's `django.core.signing` signed cookie (the cookie-session backend + the generic
@@ -12,9 +14,9 @@ module Gori
     #               key, NOT an HMAC-derived one (that's Flask's scheme).
     #
     # salt defaults to "django.core.signing"; the cookie-session backend uses
-    # "django.contrib.sessions.backends.signed_cookies" (SESSION_SALT below) — which, as of
-    # Django 6.0, also wraps the secret with a fixed prefix before deriving the key (see
-    # `derive_key`). algorithm defaults to SHA-256 (Django ≥ 3.1); older apps used SHA-1.
+    # "django.contrib.sessions.backends.signed_cookies" (SESSION_SALT below) through the same
+    # plain `signing.dumps`/`loads` (see `derive_key`). algorithm defaults to SHA-256
+    # (Django ≥ 3.1); older apps used SHA-1.
     # Both salt and algorithm are pinned to golden vectors from real Django in the spec.
     module Django
       extend self
@@ -61,46 +63,23 @@ module Gori
       def verify(cookie : String, secret : String,
                  salt : String = DEFAULT_SALT, algorithm : String = DEFAULT_ALGO) : Bool
         p = parse(cookie)
-        Cookie.secure_compare(compute_sig(signing_input(p), secret, salt, algorithm), p.signature)
+        Crypto::Subtle.constant_time_compare(compute_sig(signing_input(p), secret, salt, algorithm), p.signature)
       end
 
       def crack(cookie : String, secrets,
                 salt : String = DEFAULT_SALT, algorithm : String = DEFAULT_ALGO) : String?
         p = parse(cookie)
         input = signing_input(p)
-        secrets.each do |s|
-          return s if Cookie.secure_compare(compute_sig(input, s, salt, algorithm), p.signature)
-        end
-        nil
-      end
-
-      # Re-sign the SAME payload + timestamp — byte-identical when the secret/salt/algo match.
-      def resign(cookie : String, secret : String,
-                 salt : String = DEFAULT_SALT, algorithm : String = DEFAULT_ALGO) : String
-        p = parse(cookie)
-        "#{signing_input(p)}:#{compute_sig(signing_input(p), secret, salt, algorithm)}"
+        Cookie.first_signing(secrets, p.signature) { |s| compute_sig(input, s, salt, algorithm) }
       end
 
       # Mint a fresh cookie from JSON payload + secret (uncompressed; always verifies).
       def forge(payload_json : String, secret : String, timestamp : Int64,
                 salt : String = DEFAULT_SALT, algorithm : String = DEFAULT_ALGO) : String
-        payload_seg = Cookie.b64url(compact_json(payload_json))
+        payload_seg = Cookie.b64url(Cookie.compact_json(payload_json))
         ts_seg = Cookie.base62_encode(timestamp)
         input = "#{payload_seg}:#{ts_seg}"
         "#{input}:#{compute_sig(input, secret, salt, algorithm)}"
-      end
-
-      def payload_pretty(p : Parsed) : String
-        JSON.parse(String.new(payload_bytes(p))).to_pretty_json
-      rescue
-        "(undecodable payload)"
-      end
-
-      def payload_bytes(p : Parsed) : Bytes
-        compressed = p.payload_seg.starts_with?('.')
-        seg = compressed ? p.payload_seg[1..] : p.payload_seg
-        raw = Cookie.b64decode(seg)
-        compressed ? Cookie.zlib_inflate(raw) : raw
       end
 
       def decode_text(cookie : String) : String
@@ -109,7 +88,7 @@ module Gori
         String.build do |io|
           io << "// format: django (django.core.signing)\n"
           io << "// payload" << (p.payload_seg.starts_with?('.') ? " (zlib-compressed)\n" : "\n")
-          io << payload_pretty(p) << "\n\n"
+          io << Cookie.payload_pretty(p.payload_seg) << "\n\n"
           io << "// timestamp: " << (ts ? Cookie.unix_to_s(ts) : "(invalid base62 #{p.ts_seg.inspect})") << "\n"
           io << "// signature (not verified): " << p.signature
         end
@@ -120,7 +99,7 @@ module Gori
         JSON.build do |j|
           j.object do
             j.field "format", "django"
-            j.field "payload" { j.raw(payload_json_or_null(p)) }
+            j.field "payload" { j.raw(Cookie.payload_json_or_null(p.payload_seg)) }
             j.field "compressed", p.payload_seg.starts_with?('.')
             j.field "timestamp", Cookie.base62_decode(p.ts_seg)
             j.field "signature", p.signature
@@ -130,19 +109,15 @@ module Gori
 
       # --- internals ----------------------------------------------------------
 
-      # Django 6.0 added a purpose-specific wrap around the secret, but only for
-      # `django.core.signing.get_cookie_signer()` — the factory `signed_cookies`
-      # (SESSION_SALT) calls internally to build its Signer: `key = b"django.http.cookies"
-      # + secret_key`, and THAT wrapped key is what feeds the normal salt+"signer"
-      # derivation below. The generic `signing.dumps()`/`Signer` API (any other salt,
-      # including DEFAULT_SALT) never goes through `get_cookie_signer` and is unaffected.
-      # Confirmed byte-for-byte against real Django 6.0.8 — see
-      # `django.core.signing._cookie_signer_key`.
-      COOKIE_SIGNER_PREFIX = "django.http.cookies"
-
+      # The session backend (`contrib/sessions/backends/signed_cookies.py`) signs with plain
+      # `signing.dumps(salt=SESSION_SALT)`, so its key is the ordinary salt+"signer"+secret.
+      # Django 6.0's `b"django.http.cookies" + secret` wrap (`_cookie_signer_key`) belongs to
+      # `get_cookie_signer()` alone — `set_signed_cookie`, under a `django.http.cookies.v2:`
+      # salt — which the session backend never calls. Wrapping SESSION_SALT here made every
+      # real session cookie read as "bad key" (checked against Django 6.0.8 and 6.1.1; the
+      # golden vector is in spec/cookie_spec.cr).
       private def derive_key(salt : String, secret : String, algorithm : String) : Bytes
-        key = salt == SESSION_SALT ? "#{COOKIE_SIGNER_PREFIX}#{secret}" : secret
-        material = "#{salt}signer#{key}"
+        material = "#{salt}signer#{secret}"
         case algorithm
         when "sha1"   then Digest::SHA1.digest(material)
         when "sha256" then Digest::SHA256.digest(material)
@@ -156,18 +131,6 @@ module Gori
         when "sha256" then OpenSSL::Algorithm::SHA256
         else               raise CookieError.new("unsupported algorithm #{algorithm.inspect} (use #{SUPPORTED_ALGOS.join('/')})")
         end
-      end
-
-      private def payload_json_or_null(p : Parsed) : String
-        JSON.parse(String.new(payload_bytes(p))).to_json
-      rescue
-        "null"
-      end
-
-      private def compact_json(json : String) : String
-        JSON.parse(json).to_json
-      rescue ex : JSON::ParseException
-        raise CookieError.new("invalid payload JSON: #{ex.message}")
       end
     end
   end

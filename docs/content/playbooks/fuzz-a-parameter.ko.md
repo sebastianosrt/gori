@@ -46,21 +46,23 @@ gori run fuzz <flow-id> --auto --mode sniper
 
 ## 3. 페이로드 붙이기 {#3-attach-payloads}
 
-페이로드 세트는 마커에 치환되는 것입니다. 파일 없이 빠르게 첫 패스를 돌리려면 내장 프리셋(`sqli`, `xss`, `traversal`, `format-string`, `bad-strings`, `command-injection`)으로 시작하거나, 워드리스트·명시적 목록·숫자 범위·브루트포스 문자 집합을 지정하세요.
+페이로드 세트는 마커에 치환되는 것입니다. 파일 없이 빠르게 첫 패스를 돌리려면 내장 프리셋(`sqli`, `xss`, `traversal`, `format-string`, `bad-strings`, `command-injection`, `cache-delimiters`)으로 시작하거나, 워드리스트·명시적 목록·숫자 범위·브루트포스 문자 집합을 지정하세요.
 
-실행 전에 알아 둘 것 하나: **쿼리 문자열이나 form-urlencoded 본문 값에 치환되는 페이로드는 gori가 URL 인코딩해 줍니다.** 그 자리의 원시 공백이나 `<`는 요청 타깃을 끊거나 프레이밍을 깨뜨리므로 퍼센트 인코딩합니다. `--encode url`이 늘 하던 그 일을, 이제 기억하지 않아도 됩니다. 그 밖의 자리는 쓰인 그대로 나갑니다: 경로 세그먼트, JSON이나 원시 본문, 헤더, 쿠키 값. 트래버설 탐침의 `%2F`는 표시한 것과 다른 시험이기 때문입니다. 원시 바이트 자체가 페이로드일 때는 `--no-encode`로 기본값을 끕니다. 페이로드가 이미 퍼센트 이스케이프일 때도 그렇습니다. `%`도 예외 없이 인코딩되므로 `%00`은 `%2500`으로 나가고, origin의 디코더 자체를 겨눈 널바이트·overlong-UTF-8 탐침은 그냥 텍스트로 도착합니다. 프로세서는 나가는 길에 각 페이로드를 변환합니다(접두/접미, URL·base64·hex 인코딩, 대소문자 접기, 해싱, 또는 정규식 치환). 그리고 그중 `--encode`는 기본 인코딩 위에 겹치는 대신 그것을 대체합니다. 나머지는 대체하지 않습니다: 접두·대소문자 접기·해싱·정규식 치환은 페이로드가 무엇인지를 말할 뿐 와이어가 그것을 어떻게 적는지는 말하지 않으므로, 쿼리나 form 위치라면 그 출력도 인코딩됩니다. 마커 안에 커서를 두고 `Ctrl-Y`를 누르면 그 프로세서 체인이 열리며, 요청 하나가 나가기 전에 값이 모든 단계를 거친 결과를 미리 보여 줍니다.
+실행 전에 알아 둘 것 하나: **쿼리 문자열이나 form-urlencoded 본문 값에 치환되는 페이로드는 gori가 URL 인코딩해 줍니다.** 그 자리의 원시 공백이나 `<`는 요청 타깃을 끊거나 프레이밍을 깨뜨리므로 퍼센트 인코딩합니다. `--encode url`이 늘 하던 그 일을, 이제 기억하지 않아도 됩니다. 그 밖의 자리는 쓰인 그대로 나갑니다: 경로 세그먼트, JSON이나 원시 본문, 헤더, 쿠키 값. 트래버설 탐침의 `%2F`는 표시한 것과 다른 시험이기 때문입니다. 원시 바이트 자체가 페이로드일 때는 `--no-encode`로 기본값을 끕니다. 페이로드가 이미 퍼센트 이스케이프일 때도 그렇습니다. `%`도 예외 없이 인코딩되므로 `%00`은 `%2500`으로 나가고, origin의 디코더 자체를 겨눈 널바이트·overlong-UTF-8 탐침은 그냥 텍스트로 도착합니다. 프로세서는 나가는 길에 각 페이로드를 변환합니다(접두/접미, URL·base64·hex 인코딩, 대소문자 접기, 해싱, 또는 정규식 치환). 그리고 그중 `--encode`는 기본 인코딩 위에 겹치는 대신 그것을 대체합니다. 나머지는 대체하지 않습니다: 접두·대소문자 접기·해싱·정규식 치환은 페이로드가 무엇인지를 말할 뿐 와이어가 그것을 어떻게 적는지는 말하지 않으므로, 쿼리나 form 위치라면 그 출력도 인코딩됩니다. TUI에는 프로세서 행이 없고, 마커별로 그 역할을 하는 것은 Decoder 체인입니다. 마커 안에 커서를 두고 `Ctrl-Q`를 눌러 체인을 적으면(`base64-encode > url-encode` 등) 전송할 때 모든 페이로드에 적용되고, `--encode`처럼 그 위치의 기본 URL 인코딩을 대체합니다. 편집기는 요청 하나가 나가기 전에 그 마커의 값이 각 단계를 거친 결과를 미리 보여 줍니다.
 
 ```bash
 gori run fuzz <flow-id> --auto --mode sniper --wordlist params.txt
 ```
 
-**체크포인트.** CONFIG에 페이로드 세트가 나열되고, `Ctrl-Y`는 각 페이로드가 실제로 나가는 모습을 보여 줍니다. `gori run fuzz`도 첫 요청 전에 몇 개의 쿼리/폼 위치를 인코딩하는지 한 번 알려 줍니다.
+다시 쓸 목록은 [wordlist 카탈로그](/ko/guide/repeater-and-fuzzer/#wordlist-catalog)(`~/.gori/wordlists`)에 두세요. 한 번 저장하면(`gori run wordlist save params.txt --from params.txt`, 또는 Fuzzer의 List 페이로드 에디터에서 `Ctrl-S`) 어느 디렉터리에서든 `--wordlist params.txt`가 이름으로 찾습니다. 프로젝트도 페이로드 출처가 됩니다. `--payload-from 'host:api.example.com param-values'`는 앱의 클라이언트가 이미 보낸 값으로 세트를 만들고(`param-names`, `path-segments`, `js-endpoints`는 다른 조각을 읽습니다), TUI에서는 **Project** 페이로드 타입입니다. 프로젝트를 읽을 뿐 아무것도 보내지 않으며, 자격 증명처럼 보이는 값은 명시적으로 허용하지 않는 한 빠집니다. [프로젝트에서 가져오는 페이로드](/ko/guide/repeater-and-fuzzer/#payloads-from-the-project)를 참고하세요.
+
+**체크포인트.** CONFIG에 페이로드 세트가 나열되고, 마커에 체인을 붙였다면 `Ctrl-Q` 미리보기가 그 마커의 값이 체인을 거친 결과를 보여 줍니다. `gori run fuzz`도 첫 요청 전에 몇 개의 쿼리/폼 위치를 인코딩하는지 한 번 알려 줍니다.
 
 ## 4. 매처 설정하고 실행하기 {#4-set-a-matcher-and-run}
 
-매처는 어떤 응답이 주목할 값어치가 있는지 정하므로, 결과 표는 모든 응답이 아니라 신호를 드러냅니다. status, size, words, lines, 또는 본문 정규식으로 필터링하고(ffuf 스타일), **자동 보정(auto-calibration)**을 켜서 노이즈 기준선(소프트 404, 뭐든 받아 주는 200)이 진짜 히트를 묻어 버리지 않게 하세요. `Ctrl-R`로 실행합니다.
+매처는 어떤 응답이 주목할 값어치가 있는지 정하므로, 결과 표는 모든 응답이 아니라 신호를 드러냅니다. status, size, words, 왕복 시간, 또는 본문 정규식으로 필터링하고(ffuf 스타일. lines, 응답 헤드 부분 문자열, gRPC status는 헤드리스 전용), **자동 보정(auto-calibration)**을 켜서 노이즈 기준선(소프트 404, 뭐든 받아 주는 200)이 진짜 히트를 묻어 버리지 않게 하세요. `Ctrl-R`로 실행합니다.
 
-헤드리스에서 매처 플래그는 `--mc`/`--fc`(status), `--ms`/`--fs`(size), `--mw`/`--fw`(words), `--ml`/`--fl`(lines), `--mt`/`--ft`(왕복 시간, ms), `--mr`/`--fr`(본문 정규식), 그리고 자동 보정용 `--ac`입니다:
+헤드리스에서 매처 플래그는 `--mc`/`--fc`(status), `--ms`/`--fs`(size), `--mw`/`--fw`(words), `--ml`/`--fl`(lines), `--mt`/`--ft`(왕복 시간, ms), `--mr`/`--fr`(본문 정규식), `--mh`/`--fh`(응답 헤드의 대소문자 무시 부분 문자열), `--mg`/`--fg`(gRPC status), 그리고 자동 보정용 `--ac`입니다:
 
 ```bash
 gori run fuzz <flow-id> \
@@ -71,6 +73,10 @@ gori run fuzz <flow-id> \
   --fs 0 \
   --ac
 ```
+
+원하는 것을 얻으면 실행이 스스로 멈추게 할 수도 있습니다. `--stop-after-matches 1`은 첫 매처 히트에서 실행을 끝내고, `--stop-on`은 별도의 조건을 지정합니다(`status:500`, 또는 본문에서 그 문자열이 처음 사라지는 순간을 잡는 `'!regex:Invalid password'`). 어느 쪽이든 실행은 `condition_met`으로 끝나고, 멈추게 한 행이 기록됩니다. TUI에서는 둘 다 CONFIG 창의 **Advanced** 행으로 여는 **ADVANCED** 카드에 있는 행입니다.
+
+첫 후보는 `200`인데 그 뒤로는 전부 `403`이라면, 요청에 앱이 한 번만 받아 주는 CSRF 토큰이나 nonce가 실려 있는 것입니다. 후보마다 앞서 새 값을 가져오는 요청 시점 매크로를 실행에 붙이세요. [세션 이어 가기](/ko/playbooks/carry-a-session/#6-fetch-a-fresh-token-for-every-request)에서 차례로 다룹니다.
 
 ### 차이가 시계뿐일 때 {#when-the-only-difference-is-the-clock}
 
@@ -95,7 +101,9 @@ gori run fuzz <flow-id> --auto -w sleep-payloads.txt --mt '>=4500' --timeout 15
 
 발견은 이웃과 어울리지 않는 행입니다. 나머지가 `404`인데 혼자 뜬금없는 `200`이나 `500`, 또는 페이로드 하나가 다르게 안착하며 길이가 튀는 곳. 그 행은 결론이 아니라 실마리입니다. 결과에서 `Space` 메뉴로 **Repeater**에 넘기거나 **Comparer**로 기준선과 diff를 떠서, 튀어나온 그 페이로드 하나를 손으로 계속 파고드세요.
 
-실행 전체를 남기려면, 끝난 뒤 에디터를 READ 모드에 둔 채 **`Shift-S`**를 누르세요. 스윕이 도는 동안 gori는 완전한 요청/와이어/응답 행을 전부 디스크에 비공개로 스풀하고, 화면은 5,000행 / 64 MiB로 제한된 창을 유지합니다. Shift-S는 그 완전한 스풀을 프로젝트로 승격시킵니다. 마지막으로 성공한 실행은 해당 Fuzzer 세션과 함께 제한된 창으로 자동으로 다시 열리고, **Space → Run history**로 더 오래된 실행을 고를 수 있으며, CLI/MCP는 아카이브 전체를 페이지 단위로 읽습니다. 헤드리스에서는 영구 저장을 명시하고 id로 들여다봅니다:
+수천 행짜리 스윕은 정렬만으로는 감당이 안 됩니다. **Group by shape**(`Space` → `Z` **Display…**, 그다음 **Group by shape**)는 RESULTS를 서로 다른 응답마다 한 행으로 접습니다. 페이로드 반사, id, 숫자, 타임스탬프, 응답마다 바뀌는 헤더는 무시하고 드문 모양부터 나열하므로, 혼자 다르게 반응한 응답이 7,312번째 행이 아니라 맨 위에 옵니다. `→`는 클러스터를 펼쳐 구성원을 보여 주고 `←`는 다시 접습니다. 헤드리스에서는 저장된 실행에 `gori run fuzz show RUN_ID --clusters`로 같은 질문을 합니다. [응답 모양으로 결과 묶기](/ko/guide/repeater-and-fuzzer/#grouping-results-by-response-shape)를 참고하세요.
+
+실행 전체를 남기려면, 끝난 뒤 에디터를 READ 모드에 둔 채 **`Shift-E`**를 누르세요. 스윕이 도는 동안 gori는 완전한 요청/와이어/응답 행을 전부 디스크에 비공개로 스풀하고, 화면은 5,000행 / 64 MiB로 제한된 창을 유지합니다. Shift-E는 그 완전한 스풀을 프로젝트로 승격시킵니다. 마지막으로 성공한 실행은 해당 Fuzzer 세션과 함께 제한된 창으로 자동으로 다시 열리고, `Ctrl-P`에서 **Run history**로 더 오래된 실행을 고를 수 있으며, CLI/MCP는 아카이브 전체를 페이지 단위로 읽습니다. 헤드리스에서는 영구 저장을 명시하고 id로 들여다봅니다:
 
 ```bash
 gori run fuzz save <flow-id> --auto --wordlist params.txt --mc 200,302
@@ -103,6 +111,8 @@ gori run fuzz list
 gori run fuzz show RUN_ID
 gori run fuzz show RUN_ID RESULT_INDEX --format json
 ```
+
+긴 스윕이라면 `--keep interesting`(ADVANCED 카드의 **Keep interesting only**)이 모든 행 대신 매칭된 행, 결함이 있는 행(오류, 재전송, 잘린 응답), 그리고 실행을 멈추게 한 행만 저장합니다.
 
 원래의 `gori run fuzz …`는 계속 일회성이므로, 업그레이드했다고 기존 스크립트가 갑자기 프로젝트 데이터베이스를 불리기 시작하지는 않습니다.
 

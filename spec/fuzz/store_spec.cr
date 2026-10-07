@@ -21,6 +21,38 @@ private def fuzz_write(idx : Int64, request : Bytes? = nil, response_head : Byte
 end
 
 describe "Gori::Store fuzz persistence" do
+  it "migrates a V41 project: its saved results gain a NULL shape and cluster approximately" do
+    path = File.tempname("gori-fuzz-v42", ".db")
+    begin
+      store = Gori::Store.open(path, retention_flows: 0)
+      run = store.insert_fuzz_run(nil, "http://h", "sniper", 2_i64)
+      store.@db.exec("ALTER TABLE fuzz_results DROP COLUMN shape")
+      store.@db.exec("INSERT INTO fuzz_results (run_id, idx, payloads, status, length, words, lines, duration_us, matched) " \
+                     "VALUES (?, 0, '[\"a\"]', 200, 5, 1, 1, 10, 0), (?, 1, '[\"b\"]', 200, 5, 1, 1, 10, 0)", run, run)
+      store.@db.exec("PRAGMA user_version = 41")
+      store.close
+
+      store = Gori::Store.open(path, retention_flows: 0)
+      begin
+        store.@db.scalar("PRAGMA user_version").as(Int64).should eq(Gori::Store::Schema::VERSION.to_i64)
+        rows = [] of Gori::Store::FuzzResultRecord
+        store.each_fuzz_result_summary(run) { |r| rows << r }
+        rows.map(&.shape).should eq([nil, nil])
+        clusters = Gori::Fuzz::Clusters.new
+        rows.each { |r| clusters.add(Gori::Fuzz::Persistence.result(r)) }
+        clusters.size.should eq(1)
+        clusters.sorted.first.approximate?.should be_true
+      ensure
+        store.close
+      end
+    ensure
+      File.delete?(path)
+      File.delete?("#{path}-wal")
+      File.delete?("#{path}-shm")
+      File.delete?("#{path}.open.lock")
+    end
+  end
+
   it "round-trips a fuzz session" do
     with_store do |store|
       id = store.insert_fuzz_session("http://h", "GET /?x=§1§ HTTP/1.1\r\n\r\n", false, nil,
@@ -83,13 +115,58 @@ describe "Gori::Store fuzz persistence" do
       r.total.should eq(3_i64)
       r.snapshot_version.should eq(1)
 
-      all = store.fuzz_results(run)
+      all = fuzz_result_page(store, run)
       all.map(&.idx).should eq([0_i64, 1, 2])
       all[1].matched?.should be_true
       all[1].extracted.should eq("tok")
 
-      store.fuzz_results(run, limit: 2, offset: 1).map(&.idx).should eq([1_i64, 2])
+      fuzz_result_page(store, run, limit: 2, offset: 1).map(&.idx).should eq([1_i64, 2])
       store.fuzz_result_counts([run, 99_999_i64]).should eq({run => 3_i64})
+    end
+  end
+
+  it "round-trips the keep policy, defaulting a run written without one to all" do
+    with_store do |store|
+      default_run = store.insert_fuzz_run(nil, "http://h", "sniper", 3_i64)
+      store.get_fuzz_run(default_run).not_nil!.keep.should eq("all")
+      store.get_fuzz_run(default_run).not_nil!.filtered?.should be_false
+
+      filtered = store.insert_fuzz_run(nil, "http://h", "sniper", 100_i64, keep: "interesting")
+      rec = store.get_fuzz_run(filtered).not_nil!
+      rec.keep.should eq("interesting")
+      rec.filtered?.should be_true
+    end
+  end
+
+  it "records the stop row only on a condition_met finish, and only when the archive holds it" do
+    with_store do |store|
+      row = ->(idx : Int64) {
+        Gori::Store::FuzzResultWrite.new(idx, %(["p#{idx}"]), nil, 200, 1_i64, 1, 1, 1_i64,
+          nil, false, false, nil)
+      }
+      met = store.insert_fuzz_run(nil, "http://h", "sniper", 9_i64)
+      store.insert_fuzz_results(met, [row.call(0_i64), row.call(4_i64)]).should be_true
+      store.finish_fuzz_run(met, 5_i64, 0_i64, 0_i64, "condition_met", stop_idx: 4_i64).should be_true
+      store.get_fuzz_run(met).not_nil!.stop_idx.should eq(4_i64)
+      store.fuzz_runs.find! { |r| r.id == met }.stop_idx.should eq(4_i64) # the listing reads it too
+
+      # Any other ending has no stop row, whatever the caller passed.
+      stopped = store.insert_fuzz_run(nil, "http://h", "sniper", 9_i64)
+      store.insert_fuzz_results(stopped, [row.call(0_i64)]).should be_true
+      store.finish_fuzz_run(stopped, 1_i64, 0_i64, 0_i64, "stopped", stop_idx: 0_i64).should be_true
+      store.get_fuzz_run(stopped).not_nil!.stop_idx.should be_nil
+
+      # A pointer at a row this run's archive does not hold is not recorded: it would name
+      # evidence that is not there. (`met` holds an idx 4; that row is not this run's.)
+      missing = store.insert_fuzz_run(nil, "http://h", "sniper", 9_i64)
+      store.insert_fuzz_results(missing, [row.call(0_i64)]).should be_true
+      store.finish_fuzz_run(missing, 4_i64, 0_i64, 0_i64, "condition_met", stop_idx: 4_i64).should be_true
+      store.get_fuzz_run(missing).not_nil!.stop_idx.should be_nil
+
+      # A run finished without one reads nil — "not recorded".
+      plain = store.insert_fuzz_run(nil, "http://h", "sniper", 1_i64)
+      store.finish_fuzz_run(plain, 1_i64, 0_i64, 0_i64, "condition_met").should be_true
+      store.get_fuzz_run(plain).not_nil!.stop_idx.should be_nil
     end
   end
 
@@ -140,7 +217,7 @@ describe "Gori::Store fuzz persistence" do
         request: "GET / HTTP/1.1\r\n\r\n".to_slice,
         response_head: "HTTP/1.1 500\r\n\r\n".to_slice,
         response_body: "boom".to_slice)
-      r = store.fuzz_results(run).first
+      r = fuzz_result_page(store, run).first
       r.request.should_not be_nil
       String.new(r.response_body.as(Bytes)).should eq("boom")
     end
@@ -213,7 +290,7 @@ describe "Gori::Store fuzz persistence" do
         "FROM fuzz_results WHERE run_id = ? AND idx = 1", run,
         as: {String, String, String, String}).should eq({"blob", "blob", "blob", "blob"})
 
-      rows = store.fuzz_results(run)
+      rows = fuzz_result_page(store, run)
       {rows[0].request, rows[0].response_head, rows[0].response_body, rows[0].wire}
         .should eq({nil, nil, nil, nil})
       rows[1].request.not_nil!.should be_empty
@@ -310,7 +387,7 @@ describe "Gori::Store fuzz persistence" do
       store.get_fuzz_run(stale).should be_nil
 
       store.finish_fuzz_run(run, 1_i64, 1_i64, 0_i64, "done").should be_true
-      store.delete_fuzz_run(run).should be_true # retained compatibility wrapper
+      store.delete_fuzz_run_result(run).deleted?.should be_true
       store.delete_fuzz_run_result(run).status.should eq(Gori::Store::FuzzRunDeleteStatus::NotFound)
     end
   end

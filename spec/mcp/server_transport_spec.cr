@@ -141,7 +141,10 @@ describe Gori::MCP::Server do
     # and rebuilt. These pin the two things the copy has to keep doing: the MCP object shape
     # (an array payload is wrapped under `items`), and the refusal to emit anything that is
     # not exactly one JSON document — a raw copy of a half-JSON text would break the frame.
-    it "wraps an array tool payload under items in structuredContent" do
+    # oast_presets answered a bare array until #1395; it now answers `{items}` itself, which is
+    # the shape the wrapper gave it, so its structuredContent is unchanged. The wrapper itself is
+    # pinned on `spec_structured` in the next example.
+    it "keeps an {items} tool payload's structuredContent the shape the array wrapper gave it" do
       with_store do |store|
         call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"oast_presets","arguments":{}}})
         sc = mcp_drive(store, call)[0]["result"]["structuredContent"]
@@ -186,6 +189,19 @@ describe Gori::MCP::Server do
         # The cancel is read (and recorded) by the reader before the worker gets to id 7.
         out = mcp_drive(store, call, cancel, %({"jsonrpc":"2.0","id":8,"method":"ping"}))
         out.map(&.["id"].as_i).should eq([8]) # 7's answer suppressed, 8 still served
+      end
+    end
+
+    it "never runs a request cancelled while it was still queued" do
+      with_store do |store|
+        call = %({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"create_note",) +
+               %("arguments":{"text":"cancelled-before-start"}}})
+        cancel = %({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}})
+        list = %({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"list_notes","arguments":{}}})
+        # Suppressing the reply alone left the note written with nothing telling the client so.
+        out = mcp_drive(store, call, cancel, list)
+        out.map(&.["id"].as_i).should eq([8])
+        out[0]["result"]["content"][0]["text"].as_s.should_not contain("cancelled-before-start")
       end
     end
 
@@ -234,10 +250,12 @@ describe Gori::MCP::Server do
       end
     end
 
-    it "falls back to our version for an unsupported/garbage protocolVersion" do
+    # The rest of the era negotiation — the modern `_meta` path, `server/discover`, the
+    # version refusal — lives in spec/mcp/protocol_spec.cr beside the module that owns it.
+    it "falls back to the newest handshake revision for an unsupported/garbage protocolVersion" do
       with_store do |store|
         line = %({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1999-01-01"}})
-        mcp_drive(store, line)[0]["result"]["protocolVersion"].as_s.should eq(Gori::MCP::Server::PROTOCOL_VERSION)
+        mcp_drive(store, line)[0]["result"]["protocolVersion"].as_s.should eq(Gori::MCP::Protocol::LEGACY_LATEST)
       end
     end
 
@@ -408,6 +426,26 @@ describe Gori::MCP::Server do
       end
     end
 
+    # A wrong id is worse than none: it resolves some other request the client is waiting on.
+    it "recovers no id from a longer or fractional number than it can echo" do
+      with_store do |store|
+        [%({"jsonrpc":"2.0","id":12345678901234567890,"method":"ping"}),
+         %({"jsonrpc":"2.0","id":1.5,"method":"x","params":{bad),
+         %({"jsonrpc":"2.0","id":1.5,"x":{"id":3},"method":"x","params":{bad)].each do |line|
+          out = mcp_drive(store, line)
+          out.size.should eq(1)
+          out[0]["id"].raw.should be_nil
+        end
+      end
+    end
+
+    it "recovers a 19-digit id that still fits Int64" do
+      with_store do |store|
+        out = mcp_drive(store, %({"jsonrpc":"2.0","id":9007199254740993123,"method":"x","params":{bad))
+        out[0]["id"].as_i64.should eq(9007199254740993123_i64)
+      end
+    end
+
     it "answers a parse error with id null and keeps serving" do
       with_store do |store|
         # Correlated by id, not by position: `ping` is answered by the READER, ahead of a
@@ -428,24 +466,32 @@ describe Gori::MCP::Server do
       end
     end
 
-    it "returns isError (not a protocol error) for an unknown tool" do
+    # An unknown tool is a PROTOCOL error, which is where the spec puts it by name
+    # ("Protocol Errors … Unknown tool"): the call never reached a tool, so there is no tool
+    # result to carry. It used to come back `isError` — the full reasoning, and the line
+    # between this and a tool that ran and failed, is in spec/mcp/protocol_spec.cr.
+    it "returns -32602 for an unknown tool, in either era" do
       with_store do |store|
         call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nope","arguments":{}}})
         resp = mcp_drive(store, call)[0]
-        resp["result"]["isError"].as_bool.should be_true
-        resp["error"]?.should be_nil
+        resp["result"]?.should be_nil
+        resp["error"]["code"].as_i.should eq(-32602)
+        resp["error"]["message"].as_s.should contain("nope")
       end
     end
   end
 
   describe "structured error contract" do
-    it "codes an unknown tool UNKNOWN_TOOL with a structured error object" do
+    # UNKNOWN_TOOL is still the tools-layer code — `Tools#call` answers it, and the
+    # registry spec drives every name through that path — but it no longer reaches the wire
+    # as a tool result: the server maps it to `-32602` above. The structured-error contract
+    # covers the codes that DO, which is every one that came out of a tool that ran.
+    it "codes an unknown tool UNKNOWN_TOOL at the tools layer" do
       with_store do |store|
-        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nope","arguments":{}}})
-        err = mcp_drive(store, call)[0]["result"]["structuredContent"]
-        err["error_code"].as_s.should eq("UNKNOWN_TOOL")
-        err["message"].as_s.should contain("nope")
-        err["retryable"].as_bool.should be_false
+        r = tools_for(store).call("nope", JSON.parse("{}"))
+        r.error_code.should eq("UNKNOWN_TOOL")
+        r.text.should contain("nope")
+        r.retryable.should be_false
       end
     end
 

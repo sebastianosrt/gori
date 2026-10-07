@@ -71,6 +71,65 @@ describe "FuzzerView sorted-view throttle" do
   end
 end
 
+describe "FuzzerView live index order" do
+  # A concurrent run reports results as they COMPLETE; `o:index` listed them that way while
+  # the same run reopened from Run history read #0..#7 (#1432).
+  it "lists a concurrent run's results in index order under o:index" do
+    view = loaded_fuzzer
+    view.begin_run(nil)
+    [1, 2, 0, 4, 3, 6, 5, 7].each { |i| view.append_result(fuzz_result(i, 200, 10)) }
+    seen = (0...8).map do |i|
+      view.select_result_row(i)
+      view.selected_result.try(&.index)
+    end
+    seen.should eq((0_i64..7_i64).to_a)
+  end
+
+  it "keeps the selected row selected when an earlier index lands above it" do
+    view = loaded_fuzzer
+    view.begin_run(nil)
+    [1, 3, 4].each { |i| view.append_result(fuzz_result(i, 200, 10)) }
+    view.results_move(1) # on #3
+    view.append_result(fuzz_result(0, 200, 10))
+    view.append_result(fuzz_result(2, 200, 10))
+    view.selected_result.try(&.index).should eq(3_i64)
+    view.append_result(fuzz_result(5, 200, 10)) # lands below: no move
+    view.selected_result.try(&.index).should eq(3_i64)
+  end
+
+  it "does not move the selection for a late row a full window evicts at once" do
+    view = FuzzerView.new(FuzzerResultWindow.new(2, 10_000_i64))
+    view.load_request("https://h", "GET /?x=1 HTTP/1.1\r\nHost: h\r\n\r\n", false, "")
+    view.begin_run(nil)
+    [1, 2].each { |i| view.append_result(fuzz_result(i, 200, 10)) }
+    view.results_move(1) # on #2
+    view.append_result(fuzz_result(0, 200, 10))
+    view.selected_result.try(&.index).should eq(2_i64)
+  end
+
+  it "keeps the selected hit selected under matched-only when an earlier hit lands above it" do
+    view = loaded_fuzzer
+    view.begin_run(nil)
+    view.toggle_matched_only
+    [1, 3, 4].each { |i| view.append_result(fuzz_result(i, 200, 10, matched: true)) }
+    view.finish_run # no throttle, so every read below rebuilds
+    view.results_move(1)
+    view.selected_result.try(&.index).should eq(3_i64)
+    view.append_result(fuzz_result(0, 200, 10, matched: true))
+    view.append_result(fuzz_result(2, 200, 10)) # not a hit: hidden by the lens
+    view.selected_result.try(&.index).should eq(3_i64)
+    view.append_result(fuzz_result(2, 200, 10, matched: true))
+    view.selected_result.try(&.index).should eq(3_i64)
+  end
+
+  it "selects the first row of an empty pane rather than skipping it" do
+    view = loaded_fuzzer
+    view.begin_run(nil)
+    view.append_result(fuzz_result(1, 200, 10))
+    view.selected_result.try(&.index).should eq(1_i64)
+  end
+end
+
 # A view with its RESULT detail open on a three-line response body — two marker words on
 # separate lines, so a hit-test that lands a row off is visible in what gets copied.
 private def detail_open_fuzzer : FuzzerView
@@ -125,6 +184,37 @@ private def body_start(s : String) : Int32
 end
 
 describe Gori::Tui::FuzzerView do
+  it "paints live bindings on the template and results chips" do
+    previous = Gori::Settings.keymap_overrides
+    begin
+      Gori::Settings.keymap_overrides = {
+        "fuzz.run"             => ["alt-r"],
+        "fuzz.pretty-template" => ["alt-p"],
+        "fuzz.dist"            => ["alt-v"],
+        "fuzz.matched"         => ["alt-m"],
+        "fuzz.sort"            => ["alt-o"],
+      }
+      view = loaded_fuzzer
+      view.set_registry(Gori::Verbs.registry)
+      rect = Rect.new(0, 0, 120, 34)
+      backend = MemoryBackend.new(rect.w, rect.h)
+      view.render(Screen.new(backend), rect)
+      backend.contains?("⌥R:RUN").should be_true
+      backend.contains?("⌥P:PRETTY").should be_true
+      backend.contains?("^R:RUN").should be_false
+
+      view.append_result(fuzz_result(0, 200, 10))
+      view.focus_pane(:results)
+      backend = MemoryBackend.new(rect.w, rect.h)
+      view.render(Screen.new(backend), rect)
+      backend.contains?("⌥V:DIST").should be_true
+      backend.contains?("⌥M:MATCH").should be_true
+      backend.contains?("⌥O:").should be_true
+    ensure
+      Gori::Settings.keymap_overrides = previous
+    end
+  end
+
   describe "decoded response detail" do
     it "shows a gzip response as its decoded entity without changing retained evidence" do
       plain = %({"decoded_response":true})
@@ -140,6 +230,22 @@ describe Gori::Tui::FuzzerView do
       lines.should contain("Content-Encoding: gzip")
       lines.should contain(plain)
       view.selected_result.not_nil!.body.should eq(wire)
+    end
+
+    # One blank row between the head and the body, as History draws it — the head's own
+    # terminator used to stack two more on top of the separator this pane adds (#1433).
+    it "separates the head from the body with exactly one blank line" do
+      ["HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n", "HTTP/1.1 200 OK\nContent-Type: text/plain\n\n"].each do |raw_head|
+        view = loaded_fuzzer
+        view.append_result(Gori::Fuzz::Result.new(
+          0_i64, ["p0"], nil, 200, 4_i64, 1, 0, 1000_i64,
+          nil, true, false, nil, raw_head.to_slice, "BODY".to_slice))
+        view.open_detail
+
+        lines = view.detail_plain_lines
+        ct = lines.index("Content-Type: text/plain").not_nil!
+        lines[ct + 1..ct + 2].should eq(["", "BODY"])
+      end
     end
 
     it "falls back to captured bytes when the declared encoding cannot be decoded" do
@@ -177,7 +283,7 @@ describe Gori::Tui::FuzzerView do
     end
 
     # The DISPLAY window dropped the bytes, the RUN did not. `FuzzerResultWindow` projects a
-    # row past its byte ceiling down to metrics, and the spool (and, after ⇧S, the archive)
+    # row past its byte ceiling down to metrics, and the spool (and, after ⇧E, the archive)
     # still holds every byte — so "not retained by this run" tells the operator the evidence
     # does not exist at the moment gori is about to save it. The request pane has always drawn
     # the distinction (`display_omitted`); this pane read a nil head as the retention policy
@@ -480,6 +586,20 @@ describe Gori::Tui::FuzzerView do
       view.load_request("https://h", "GET /?x=§1§ HTTP/1.1\r\nHost: h\r\n\r\n", false, "")
       view.apply_set(nil, Gori::Tui::SetSpec.new(:file, "/nonexistent/gori-spec-wordlist"))
       view.run_request_count.should be_nil # File.info? → nil → unknown, never a blocking read
+    end
+
+    # A list the completion inserted by NAME (#1353) is counted like any other: the estimate
+    # stats the file the engine will open (`WordlistCatalog.resolve_path`), not the bare word,
+    # which does not exist in the working directory.
+    it "run_request_count counts a wordlist chosen by its catalog name" do
+      with_wordlist_home do |wl|
+        Dir.mkdir_p(wl)
+        File.write(File.join(wl, "common.txt"), "a\nb\nc\n")
+        view = FuzzerView.new
+        view.load_request("https://h", "GET /?x=§1§ HTTP/1.1\r\nHost: h\r\n\r\n", false, "")
+        view.apply_set(nil, Gori::Tui::SetSpec.new(:file, "common.txt"))
+        view.run_request_count.should eq(3_i64)
+      end
     end
 
     it "advanced_snapshot round-trips through apply_advanced" do
@@ -1127,24 +1247,64 @@ describe Gori::Tui::PathComplete do
     end
   end
 
-  it "completes bare names from ~/.gori/wordlists with an ABSOLUTE insert (G1)" do
-    home = File.tempname("gori_home")
-    wl = File.join(home, "wordlists")
-    Dir.mkdir_p(wl)
-    File.write(File.join(wl, "rockyou.txt"), "")
-    old = ENV["GORI_HOME"]?
-    ENV["GORI_HOME"] = home
+  # Windows refuses to stat a file another process holds open (`D:\DumpStack.log.tmp` at a
+  # drive root), and `File.directory?` raises instead of answering. A readable directory without
+  # search permission is the POSIX shape of the same refusal: it lists, but its children do not stat.
+  it "lists a child it cannot stat as a plain file instead of raising" do
+    posix_only!("a directory that lists but does not stat its children (chmod)")
+    root = File.tempname("gori_pc")
+    Dir.mkdir_p(File.join(root, "locked", "sub"))
+    File.chmod(File.join(root, "locked"), 0o600)
     begin
       pc = PathComplete.new
-      pc.refresh("rock")
-      hit = pc.entries.find { |e| e.label.starts_with?("rockyou.txt") }.not_nil!
-      # The engine opens wordlist paths relative to CWD, so a wordlists-dir-only name
-      # MUST resolve absolutely — a bare "rockyou.txt" insert would fail at run time.
-      hit.insert.should eq(File.join(wl, "rockyou.txt"))
-      hit.label.should contain("·~/.gori")
+      pc.refresh("#{root}/locked/")
+      pc.entries.map { |e| {e.label, e.dir} }.should eq([{"sub", false}])
     ensure
-      old ? (ENV["GORI_HOME"] = old) : ENV.delete("GORI_HOME")
-      FileUtils.rm_rf(home)
+      File.chmod(File.join(root, "locked"), 0o700)
+      FileUtils.rm_rf(root)
+    end
+  end
+
+  # A list in the global catalog is inserted by NAME (#1353): the engine resolves a bare name
+  # against the working directory and then the catalog, so the name is enough (it used to have to
+  # be the absolute path, because a wordlists-dir-only name failed at run time). The one case a
+  # name is NOT enough is a same-named file in the working directory, which a bare name would
+  # read instead — there the absolute path is inserted.
+  it "completes bare names from ~/.gori/wordlists, inserting the bare name (G1)" do
+    with_wordlist_home do |wl|
+      Dir.mkdir_p(wl)
+      File.write(File.join(wl, "rockyou.txt"), "")
+      pc = PathComplete.new
+      pc.refresh("rock")
+      hit = pc.entries.find(&.label.starts_with?("rockyou.txt")).not_nil!
+      hit.insert.should eq("rockyou.txt")
+      hit.label.should contain("·~/.gori")
+    end
+  end
+
+  it "inserts the absolute path for a catalog list a same-named file in the working directory shadows" do
+    with_wordlist_home do |wl|
+      Dir.mkdir_p(wl)
+      File.write(File.join(wl, "rockyou.txt"), "")
+      File.write("rockyou.txt", "cwd copy\n")
+      pc = PathComplete.new
+      pc.refresh("rock")
+      global = pc.entries.find(&.label.includes?("·~/.gori")).not_nil!
+      global.insert.should eq(File.join(wl, "rockyou.txt"))
+      # …while the working directory's own file is offered as the bare name it resolves to.
+      pc.entries.find { |e| e.label == "rockyou.txt" }.not_nil!.insert.should eq("rockyou.txt")
+    end
+  end
+
+  it "keeps the absolute path for a catalog file whose name the catalog cannot address" do
+    posix_only!("Windows strips a trailing dot from a file name")
+    with_wordlist_home do |wl|
+      Dir.mkdir_p(wl)
+      File.write(File.join(wl, "trailing.dot."), "")
+      pc = PathComplete.new
+      pc.refresh("trail")
+      hit = pc.entries.find(&.label.starts_with?("trailing.dot.")).not_nil!
+      hit.insert.should eq(File.join(wl, "trailing.dot."))
     end
   end
 
@@ -1235,6 +1395,126 @@ describe Gori::Tui::PathComplete do
       old_home ? (ENV["GORI_HOME"] = old_home) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(home)
       FileUtils.rm_rf(cwd)
+    end
+  end
+
+  describe "the global wordlist catalog picker (#1353)" do
+    it "lists the catalog under its own heading after favorites and recents, sized, inserting names" do
+      with_wordlist_home do
+        Gori::WordlistCatalog.save_values("common.txt", ["a"] * 10)
+        Gori::WordlistCatalog.save_values("api.txt", ["x"])
+        Gori::Settings.fuzz_favorite_wordlists = ["/elsewhere/fav.txt"]
+        Gori::Settings.fuzz_recent_wordlists = ["/elsewhere/recent.txt"]
+        begin
+          pc = PathComplete.new(wordlist_history: true)
+          pc.refresh("")
+          pc.entries.map(&.label).should eq(["★ Favorites", "/elsewhere/fav.txt", "🕒 Recent", "/elsewhere/recent.txt",
+                                             "📚 Wordlists (~/.gori)", "api.txt  2B", "common.txt  20B"])
+          pc.entries.last.insert.should eq("common.txt")
+          pc.entries.last.dir.should be_false
+          pc.entries.count(&.header).should eq(3)
+        ensure
+          Gori::Settings.fuzz_favorite_wordlists = [] of String
+          Gori::Settings.fuzz_recent_wordlists = [] of String
+        end
+      end
+    end
+
+    it "shows a catalog list once, under the first heading that claims it, whatever spelling was stored" do
+      with_wordlist_home do |wl|
+        Gori::WordlistCatalog.save_values("common.txt", ["a"])
+        Gori::WordlistCatalog.save_values("api.txt", ["a"])
+        # an entry an OLDER gori stored as the absolute path completion used to insert
+        Gori::Settings.fuzz_favorite_wordlists = [File.join(wl, "common.txt")]
+        Gori::Settings.fuzz_recent_wordlists = ["common.txt", "api.txt"]
+        begin
+          pc = PathComplete.new(wordlist_history: true)
+          pc.refresh("")
+          pc.entries.map(&.label).should eq(["★ Favorites", "common.txt", "🕒 Recent", "api.txt"])
+          pc.entries[1].insert.should eq("common.txt")
+        ensure
+          Gori::Settings.fuzz_favorite_wordlists = [] of String
+          Gori::Settings.fuzz_recent_wordlists = [] of String
+        end
+      end
+    end
+
+    it "drops a favorite or recent that pointed into the catalog and no longer exists" do
+      with_wordlist_home do |wl|
+        Gori::WordlistCatalog.save_values("kept.txt", ["a"])
+        Gori::Settings.fuzz_favorite_wordlists = [File.join(wl, "deleted.txt"), "/elsewhere/gone.txt"]
+        Gori::Settings.fuzz_recent_wordlists = [File.join(wl, "kept.txt")]
+        begin
+          pc = PathComplete.new(wordlist_history: true)
+          pc.refresh("")
+          labels = pc.entries.map(&.label)
+          labels.should_not contain(File.join(wl, "deleted.txt"))
+          labels.should_not contain("deleted.txt")
+          labels.should contain("/elsewhere/gone.txt") # a path outside the catalog is shown as stored, present or not
+          labels.should contain("kept.txt")
+        ensure
+          Gori::Settings.fuzz_favorite_wordlists = [] of String
+          Gori::Settings.fuzz_recent_wordlists = [] of String
+        end
+      end
+    end
+
+    it "shows a bare-name history entry that the working directory's own file answers exactly as stored" do
+      with_wordlist_home do
+        Gori::WordlistCatalog.save_values("common.txt", ["a"])
+        File.write("common.txt", "cwd copy\n")
+        Gori::Settings.fuzz_recent_wordlists = ["common.txt"]
+        begin
+          pc = PathComplete.new(wordlist_history: true)
+          pc.refresh("")
+          # `common.txt` here is the working directory's file: not a catalog entry, shown as stored
+          pc.entries.map(&.label).should contain("common.txt")
+          pc.entries.find(&.label.starts_with?("common.txt")).not_nil!.insert.should eq("common.txt")
+        ensure
+          Gori::Settings.fuzz_recent_wordlists = [] of String
+        end
+      end
+    end
+
+    # The completion inserts the PATH for a catalog list a working-directory file shadows, and the
+    # set is applied with that path. Remembering it as the bare name would lose the reason: next
+    # time the entry would insert `common.txt`, which reads the working directory's file.
+    it "remembers a shadowed catalog pick as its path, so picking it again reads the catalog list" do
+      with_wordlist_home do |wl|
+        Gori::WordlistCatalog.save_values("common.txt", ["a"])
+        File.write("common.txt", "cwd copy\n")
+        Gori::Settings.fuzz_recent_wordlists = [] of String
+        Gori::Settings.fuzz_favorite_wordlists = [] of String
+        begin
+          Gori::Settings.record_recent_wordlist(File.join(wl, "common.txt"))
+          Gori::Settings.fuzz_recent_wordlists.should eq([File.join(wl, "common.txt")])
+          pc = PathComplete.new(wordlist_history: true)
+          pc.refresh("")
+          hit = pc.entries.find { |e| !e.header && e.label.starts_with?("common.txt") }
+          hit.try(&.insert).should eq(File.join(wl, "common.txt"))
+          # the ★ toggle remembers it the same way, and reads back as the same entry
+          Gori::Settings.toggle_favorite_wordlist(File.join(wl, "common.txt")).should be_true
+          Gori::Settings.fuzz_favorite_wordlists.should eq([File.join(wl, "common.txt")])
+          Gori::Settings.favorite_wordlist?(File.join(wl, "common.txt")).should be_true
+        ensure
+          Gori::Settings.fuzz_recent_wordlists = [] of String
+          Gori::Settings.fuzz_favorite_wordlists = [] of String
+        end
+      end
+    end
+
+    it "does not show the catalog to an instance that did not opt into wordlist history" do
+      with_wordlist_home do
+        Gori::WordlistCatalog.save_values("common.txt", ["a"])
+        Gori::Settings.fuzz_recent_wordlists = ["/elsewhere/recent.txt"]
+        begin
+          pc = PathComplete.new
+          pc.refresh("")
+          pc.entries.map(&.label).should_not contain("📚 Wordlists (~/.gori)")
+        ensure
+          Gori::Settings.fuzz_recent_wordlists = [] of String
+        end
+      end
     end
   end
 
@@ -1343,15 +1623,10 @@ describe "FuzzerView#template_click_to_cursor / #target_click_to_cursor" do
     view.target.should eq("httXps://h")
   end
 
-  # The TARGET caret was measured with display_width while BOTH of its counterparts —
-  # paint_char_span_bg (the selection tint, in the same render) and Screen.column_for (the
-  # click inverse, in target_click_to_cursor) — floor each codepoint to ≥1. On a target
-  # holding a zero-width char the three disagreed: the caret sat a column left of its
-  # glyph and a click came back one character off. A URL carrying U+200B is not exotic
-  # here; it is a stock filter-bypass payload, i.e. exactly what gets pasted into a fuzz
-  # target. Pin the round trip: caret column → click at that column → the same index.
+  # A hidden codepoint expands to a named badge; target caret and click mapping must use the
+  # badge's complete display width while the target string retains its source codepoint.
   it "keeps the target caret and click-to-cursor agreeing across a zero-width char" do
-    target = "https://h/a\u{200B}b" # ZWSP: display_width 0, column_width 1, one drawn cell
+    target = "https://h/a\u{200B}b" # ZWSP displays as a six-column badge
     view = FuzzerView.new
     view.load_request(target, "GET / HTTP/1.1\r\nHost: h\r\n\r\n", false, "")
     rect = Rect.new(0, 0, 100, 30)
@@ -1363,12 +1638,14 @@ describe "FuzzerView#template_click_to_cursor / #target_click_to_cursor" do
       view.target_click_to_cursor(rect, col, rect.y + 1)
       b = MemoryBackend.new(100, 30)
       view.render(Screen.new(b), rect)
-      # The caret is the single cell painted on an accent background in the field.
+      # The block caret highlights its current visible grapheme: one cell for ASCII, the
+      # whole badge when parked on the source ZWSP.
       caret = (base...(base + 24)).select do |x|
         bg = b.bg_at(x, rect.y + 1)
         bg == Theme.accent || bg == Theme.accent_bg
       end
-      caret.should eq([col]) # click column → caret column, with nothing left over
+      cursor_width = cx < target.size ? Screen.grapheme_cols(target[cx].to_s) : 1
+      caret.should eq((col...col + cursor_width).to_a) # click column → visible caret grapheme
     end
 
     # …and the click lands on the right CHARACTER, not merely the right column: index 12
@@ -1379,9 +1656,8 @@ describe "FuzzerView#template_click_to_cursor / #target_click_to_cursor" do
     fresh.target_insert('X')
     fresh.target.should eq("#{target[0, 12]}X#{target[12..]}")
 
-    # Concretely: past the ZWSP the old measure was one column short of the drawn glyph.
-    Screen.display_width(target).should eq(12)
-    Screen.draw_width(target).should eq(13)
+    Screen.display_width(target).should eq(18)
+    Screen.draw_width(target).should eq(18)
   end
 
   # Same round trip over a MULTI-CODEPOINT cluster, where the retired per-codepoint
@@ -1412,9 +1688,10 @@ describe "FuzzerView#template_click_to_cursor / #target_click_to_cursor" do
       caret.should eq([col]) # (cx=#{cx})
     end
 
-    # The per-codepoint measure over-counted by one for every combining mark.
+    # Measuring the composed cluster together keeps it narrower than measuring its isolated
+    # combining mark as a named badge.
     Screen.draw_width(target).should eq(15)
-    target.each_char.sum { |c| Screen.draw_width(c.to_s) }.should eq(16)
+    target.each_char.sum { |c| Screen.draw_width(c.to_s) }.should eq(23)
   end
 end
 
@@ -1648,6 +1925,19 @@ describe "Gori::Tui::FuzzerView durable run state" do
     view.results_saveable?.should be_true
   end
 
+  # `buffer_error` accepts anything `to_i64?` reads; a value past Int32 must clamp, not fall
+  # back to the default while the row still shows what was typed.
+  it "clamps Advanced numbers past Int32 rather than dropping them" do
+    view = loaded_fuzzer
+    view.apply_advanced(view.advanced_snapshot.copy_with(
+      conc: "99999999999", retries: "99999999999", race: "3000000000", timeout: "2147483648"))
+    view.config_json
+    view.config.concurrency.should eq(1000)
+    view.config.retries.should eq(1000)
+    view.config.race_count.should eq(Gori::Fuzz::Engine::MAX_RACE_SIZE)
+    view.config.timeout.should eq(Int32::MAX.seconds)
+  end
+
   it "marks a max-requests cutoff as budget_exhausted" do
     view = loaded_fuzzer
     view.@config.max_requests = 3_i64
@@ -1685,7 +1975,7 @@ describe "Gori::Tui::FuzzerView durable run state" do
 
       view = loaded_fuzzer # its editable session points at https://h
       view.load_saved_run(store.get_fuzz_run(saved.run_id).not_nil!,
-        store.fuzz_results(saved.run_id))
+        fuzz_result_page(store, saved.run_id))
       view.result_target_origin.should eq("https://old.example:8443")
       view.result_http2?.should be_true
       view.result_sni.should eq("edge.old.example")
@@ -1868,5 +2158,119 @@ describe "Gori::Tui::FuzzerController fuzz → Comparer slot" do
     slot.lines(:request).should_not be_empty
     slot.lines(:response).should be_empty
     slot.meta.status.should eq(404) # …and the row's own numbers survive
+  end
+end
+
+# The run's stop row (issue #1270). The view marks it by INDEX against the run's own record —
+# the live `DoneEvent#stop_index` or a reopened run's `stop_idx` — never by `stop_hit?`, which
+# an `after_matches` stop does not set and several in-flight rows can carry.
+describe "Gori::Tui::FuzzerView stop row" do
+  it "keeps a stop row only for a condition_met ending, and a new run clears it" do
+    view = loaded_fuzzer
+    view.begin_run(3_i64)
+    3.times { |i| view.append_result(fuzz_result(i, 200, 10, matched: true)) }
+    view.finish_run("stopped", stop_idx: 1_i64)
+    view.run_stop_idx.should be_nil
+
+    view.begin_run(3_i64)
+    3.times { |i| view.append_result(fuzz_result(i, 200, 10, matched: true)) }
+    view.finish_run("condition_met", stop_idx: 1_i64)
+    view.run_stop_idx.should eq(1_i64)
+    view.results_count_label.should contain("stop #1")
+
+    view.begin_run(3_i64)
+    view.run_stop_idx.should be_nil
+    view.results_count_label.should_not contain("stop #")
+  end
+
+  it "marks the stop row in the list, and only that row — even when it carries no stop_hit" do
+    view = loaded_fuzzer
+    view.focus_pane(:results)
+    view.begin_run(3_i64)
+    # Rows 0 and 2 met the condition too (in flight); row 1 is where the run stopped.
+    view.append_result(Gori::Fuzz::Result.new(0_i64, ["p0"], nil, 200, 1_i64, 1, 1, 1_i64,
+      nil, false, false, nil, stop_hit: true))
+    view.append_result(fuzz_result(1, 200, 10, matched: true))
+    view.append_result(Gori::Fuzz::Result.new(2_i64, ["p2"], nil, nil, 0_i64, 0, 0, 1_i64,
+      "refused", false, false, nil, stop_hit: true))
+    view.finish_run("condition_met", stop_idx: 1_i64)
+    backend = MemoryBackend.new(160, 30)
+    view.render(Screen.new(backend), Rect.new(0, 0, 160, 30))
+    marked = (0...30).select { |y| backend.row(y).includes?(FuzzerView::STOP_ROW_MARK) }
+      .map { |y| backend.row(y) }
+    marked.size.should eq(1)
+    marked.first.should contain("p1")
+  end
+
+  it "keeps the marker ahead of an error, whose text runs to the border" do
+    view = loaded_fuzzer
+    view.focus_pane(:results)
+    view.begin_run(1_i64)
+    view.append_result(fuzz_result(0, nil, 0, error: "connection refused " * 8))
+    view.finish_run("condition_met", stop_idx: 0_i64)
+    backend = MemoryBackend.new(120, 30)
+    view.render(Screen.new(backend), Rect.new(0, 0, 120, 30))
+    (0...30).any? { |y| backend.row(y).includes?("#{FuzzerView::STOP_ROW_MARK} · connection refused") }
+      .should be_true
+  end
+
+  it "notes the stop row in its detail, including one opened before the run finished" do
+    view = loaded_fuzzer
+    view.begin_run(1_i64)
+    view.append_result(Gori::Fuzz::Result.new(0_i64, ["p0"], nil, 200, 2_i64, 1, 1, 1_i64, nil,
+      true, false, nil, "HTTP/1.1 200 OK\r\n\r\n".to_slice, "ok".to_slice))
+    view.open_detail
+    rect = Rect.new(0, 0, 140, 30)
+    before = MemoryBackend.new(rect.w, rect.h)
+    view.render(Screen.new(before), rect) # caches the row's lines while it is not yet the stop row
+    before.contains?("stop_on tripped on this result").should be_false
+
+    view.finish_run("condition_met", stop_idx: 0_i64)
+    after = MemoryBackend.new(rect.w, rect.h)
+    view.render(Screen.new(after), rect)
+    after.contains?("stop_on tripped on this result").should be_true
+  end
+end
+
+describe "Gori::Tui::FuzzerView stop row of a loaded run" do
+  it "drops a loaded run's stop row with the run when a peer deletes it" do
+    view = loaded_fuzzer
+    run = Gori::Store::FuzzRunRecord.new(5_i64, 2_i64, 3_i64, 4_i64, "https://h", "sniper",
+      2_i64, 2_i64, 1_i64, 0_i64, "condition_met", snapshot_version: 1, stop_idx: 1_i64)
+    view.load_saved_run(run, [fuzz_result(0, 200, 10), fuzz_result(1, 200, 10, matched: true)])
+    view.run_stop_idx.should eq(1_i64)
+    view.forget_saved_run(5_i64)
+    view.run_stop_idx.should be_nil
+    view.results_count_label.should_not contain("stop #")
+  end
+end
+
+class Gori::Tui::FuzzerView
+  def detail_styled_for_spec : Array(Gori::Tui::Highlight::Line)
+    r = selected_result.not_nil!
+    detail_styled(r, detail_lines(r))
+  end
+end
+
+describe "Gori::Tui::FuzzerView detail notes" do
+  # A note is prepended ABOVE the message, and the message highlighter reads line 0 as the
+  # start line: the note used to take that colour and push the real status line into header
+  # styling. The stop row's note put it on every stop row (#1270); `incomplete` already had it.
+  it "styles the status line under a note exactly as it would be styled without one" do
+    head = "HTTP/1.1 200 OK\r\nX-A: b\r\n\r\n"
+    view = loaded_fuzzer
+    view.begin_run(1_i64)
+    view.append_result(Gori::Fuzz::Result.new(0_i64, ["p0"], nil, 200, 2_i64, 1, 1, 1_i64, nil,
+      true, true, nil, head.to_slice, "ok".to_slice))
+    view.finish_run("condition_met", stop_idx: 0_i64)
+    view.open_detail
+    styled = view.detail_styled_for_spec
+    plain = view.detail_plain_lines
+    plain[0].should contain("stop_on tripped on this result")
+    plain[1].should contain("incomplete")
+    plain[2].should eq("HTTP/1.1 200 OK")
+    bare = Gori::Tui::Highlight.from_lines(plain[2..], request: false)
+    styled[2..].should eq(bare)
+    styled.size.should eq(plain.size)
   end
 end

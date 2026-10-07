@@ -70,6 +70,8 @@ private class RaceOrigin
       conn << "HTTP/1.1 200 OK\r\nContent-Length: #{body.bytesize}\r\n\r\n" << body
       conn.flush
     end
+  rescue IO::Error
+    # The same abandoned connection, noticed on the answer instead (Windows: WSASend aborted).
   ensure
     conn.close rescue nil
   end
@@ -135,6 +137,7 @@ describe "Fuzz::Sender#send_race" do
   end
 
   it "excludes a connection that fails to dial, and still races the rest" do
+    posix_only!("a closed listener refuses the next dial; Windows has already queued it in the backlog")
     origin = RaceOrigin.new(max_accepts: 4)
     n = 5
     results = race_sender(origin).send_race(race_jobs(n))
@@ -197,6 +200,19 @@ describe "Fuzz::Sender#send_race" do
     results.count { |r| r.error.try(&.starts_with?("race: dial failed")) }.should be >= 1
     results.count(&.error.nil?).should be >= 1
     capped.sent.should eq(n) # charged per job, network-independent — stays exact
+    origin.close
+  end
+
+  it "refuses, whole and before any dial, a group that would end over the cap (#1204)" do
+    origin = RaceOrigin.new
+    capped = F::CappedBackend.new(race_sender(origin), 2_i64)
+    results = capped.send_race(race_jobs(3))
+    results.all? { |r| r.error == F::CappedBackend::CAP_ERROR }.should be_true
+    # Warm-ups count toward what the group puts on the wire: 2 connections × 2 > 2.
+    warmup = "GET /warmup HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_slice
+    capped.send_race(race_jobs(2), warmup: warmup).all? { |r| r.error == F::CappedBackend::CAP_ERROR }.should be_true
+    capped.sent.should eq(0)
+    origin.events.should be_empty
     origin.close
   end
 

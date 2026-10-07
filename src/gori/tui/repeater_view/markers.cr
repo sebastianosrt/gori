@@ -86,7 +86,7 @@ class Gori::Tui::RepeaterView
     @editor.set_text_keeping_eols(Fuzz::Template.auto_mark(@editor.text))
     @dirty = true
     n = Fuzz::Template.parse(@editor.text).position_count
-    "auto-marked #{n} position#{n == 1 ? "" : "s"}"
+    "auto-marked #{Gori.plural(n, "position")}"
   end
 
   def mark_word : String
@@ -113,7 +113,7 @@ class Gori::Tui::RepeaterView
       "marker opened — move the cursor and mark again to close the region#{note}"
     else
       n = Fuzz::Template.parse(@editor.text).position_count
-      "marked point — #{n} position#{n == 1 ? "" : "s"}#{note}"
+      "marked point — #{Gori.plural(n, "position")}#{note}"
     end
   end
 
@@ -344,7 +344,7 @@ class Gori::Tui::RepeaterView
   #
   # Empty while the markers are INERT (see `markers_live?`), which is the one place that
   # decision has to live: every consumer — the send (`request_bytes`), the Content-Length
-  # reflection, the tint/conceal paint, `minimizable?`, the editor's delimiter guards —
+  # reflection, the tint/conceal paint, `minimize_refusal`, the editor's delimiter guards —
   # reads it, and they must not be able to disagree about whether a `§` in this buffer is
   # syntax or data.
   private def marker_regions : Array({Int32, Int32, Int32})

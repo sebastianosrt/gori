@@ -160,14 +160,16 @@ describe "Gori::Verbs.register_issues" do
       end
     end
 
-    it "cycles severity from the space menu only — `[` / `]` are the Global tab chords" do
-      {"issue.severity-up"   => {:issue_severity, "1", '+'},
-       "issue.severity-down" => {:issue_severity, "-1", '-'},
-      }.each do |id, (intent, delta, key)|
+    it "steps severity from the palette only — `[` / `]` are the Global tab chords" do
+      # A symmetric pair, both palette-only (#1282): no key, and the palette's search finds them.
+      {"issue.severity-up"   => {:issue_severity, "1"},
+       "issue.severity-down" => {:issue_severity, "-1"},
+      }.each do |id, (intent, delta)|
         verb = r[id]
-        verb.hidden?.should be_false # a menu row now, so it has to show there
+        verb.hidden?.should be_false # a listed row, so it has to show
         verb.chords.should be_empty
-        verb.menu_key.should eq(key)
+        verb.menu_key.should be_nil
+        verb.palette_only?.should be_true
         ctx = FakeExecContext.new
         verb.call(ctx)
         ctx.args_for(intent).should eq([delta])
@@ -179,7 +181,7 @@ describe "Gori::Verbs.register_issues" do
       r["issue.set-severity"].chords.should be_empty
       r["issue.set-severity"].menu_key.should eq('s')
       r["issue.set-status"].chords.should be_empty
-      r["issue.set-status"].menu_key.should eq('c')
+      r["issue.set-status"].menu_key.should eq('C') # never `c`: a dropped space stops capture (#1295)
       verb_intents(r, "issue.set-severity").should eq([:issue_set_severity])
       verb_intents(r, "issue.set-status").should eq([:issue_set_status])
     end
@@ -215,15 +217,24 @@ describe "Gori::Verbs.register_issues" do
     end
 
     it "routes the detail actions to their own intents" do
-      {"issue.close"         => :issue_close,
-       "issue.edit-notes"    => :issue_edit_notes,
-       "issue.edit-title"    => :issue_edit_title,
-       "issue.open-flow"     => :issue_open_flow,
-       "issue.repeater-flow" => :issue_repeater_flow,
-       "issue.delete"        => :issues_delete,
-       "issue.links"         => :issue_links,
-       "issue.open-link"     => :issue_open_link,
+      {"issue.close"           => :issue_close,
+       "issue.edit-notes"      => :issue_edit_notes,
+       "issue.edit-title"      => :issue_edit_title,
+       "issue.repeater-flow"   => :issue_repeater_flow,
+       "issue.delete"          => :issues_delete,
+       "issue.links"           => :issue_links,
+       "issue.open-link"       => :issue_open_link,
+       "issue.freeze-link"     => :issue_freeze_link,
+       "issue.evidence-delete" => :issue_evidence_delete,
       }.each { |id, intent| verb_intents(r, id).should eq([intent]) }
+
+      # `o` went with the primary flow's meta row: it opened "the linked flow" in History,
+      # which is `s` on RELATED's first row now that the primary flow IS that row.
+      r["issue.open-flow"]?.should be_nil
+      # And `r` is a ROW verb now, banded and titled like `sitemap.repeater`, its sibling on
+      # the same letter.
+      r["issue.repeater-flow"].title.should eq("Send to Repeater")
+      r["issue.repeater-flow"].group.should eq(:send)
 
       ctx = FakeExecContext.new
       r["issue.link-down"].call(ctx)
@@ -231,6 +242,30 @@ describe "Gori::Verbs.register_issues" do
       ctx = FakeExecContext.new
       r["issue.link-up"].call(ctx)
       ctx.args_for(:issue_link_move).should eq(["-1"])
+    end
+
+    # Frozen evidence (#1038): `f` copies the selected LIVE History/Repeater row's exchange;
+    # the delete is menu-only, danger-banded, and offered only on a FROZEN row. Each gates
+    # on the row under the RELATED cursor, so neither can fire against the wrong kind.
+    it "gates freeze on a freezable live row and delete on a frozen one" do
+      ctx = FakeExecContext.new
+      ctx.current_tab = :issues
+      r["issue.freeze-link"].available?(ctx).should be_false
+      r["issue.evidence-delete"].available?(ctx).should be_false
+      ctx.issue_related_freezable = true
+      r["issue.freeze-link"].available?(ctx).should be_true
+      r["issue.evidence-delete"].available?(ctx).should be_false
+      ctx.issue_related_freezable = false
+      ctx.issue_related_frozen = true
+      r["issue.evidence-delete"].available?(ctx).should be_true
+      r["issue.freeze-link"].available?(ctx).should be_false
+
+      keymap = Gori::Verb::Keymap.build(r)
+      keymap.lookup(typed_chord("f"), Gori::Verb::Scope::IssuesDetail).should eq("issue.freeze-link")
+      r["issue.freeze-link"].menu_key.should eq('f')
+      r["issue.evidence-delete"].chords.should be_empty
+      r["issue.evidence-delete"].menu_key.should eq('D')
+      r["issue.evidence-delete"].group.should eq(:danger)
     end
   end
 

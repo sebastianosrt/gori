@@ -50,16 +50,17 @@ private class Rig
   # `:authority` may differ from (RFC 9113 §9.1.1). `indexing` makes the stand-in client encoder
   # insert into its dynamic table, i.e. behave like a browser rather than like gori's own
   # literal-only encoder.
-  def initialize(@ic : Gori::Interceptor, host : String = "api.example.com", indexing : Bool = false)
+  def initialize(@ic : Gori::Interceptor, host : String = "api.example.com", indexing : Bool = false,
+                 port : Int32 = 443)
     @sink = RecSink.new
     @upstream = IO::Memory.new
     @client = IO::Memory.new
     @enc_out = HPACK::Encoder.new(indexing: indexing)
-    @assembler = Gori::Proxy::H2::Assembler.new(@sink, host, 443, 1_i64)
+    @assembler = Gori::Proxy::H2::Assembler.new(@sink, host, port)
     @heads_out = Gori::Proxy::H2::HeadRewrite.new("out", nil, @assembler, host)
     @heads_in = Gori::Proxy::H2::HeadRewrite.new("in", nil, @assembler, host)
-    @c2s = Gate.new("out", @upstream, 1_i64, @sink, @assembler, host, 443, @ic, @heads_out)
-    @s2c = Gate.new("in", @client, 1_i64, @sink, @assembler, host, 443, @ic, @heads_in)
+    @c2s = Gate.new("out", @upstream, 1_i64, @sink, @assembler, host, port, @ic, @heads_out)
+    @s2c = Gate.new("in", @client, 1_i64, @sink, @assembler, host, port, @ic, @heads_in)
     @c2s.peer = @s2c
     @s2c.peer = @c2s
   end
@@ -300,6 +301,8 @@ describe Gori::Proxy::H2::StreamGate do
       ic.forward(ic.pending.first.id)
       settle
       HPACK::Decoder.new.decode(rig.to_origin.first.payload).should eq(request("/held"))
+      # Forwarded as held: nothing was edited, so History keeps no original (#1378).
+      rig.sink.requests.first.intercept_original.should be_nil
       # A block arriving AFTER the latch is re-encoded too, never passed through.
       rig.c2s.accept(headers(3_u32, rig.enc_out.encode(request("/later")), Frame::END_HEADERS))
       HPACK::Decoder.new.decode(rig.to_origin.last.payload).should eq(request("/later"))
@@ -359,6 +362,9 @@ describe Gori::Proxy::H2::StreamGate do
       head = head_of(rig.to_origin, 1_u32).not_nil!
       head.find { |(n, _)| n == ":path" }.not_nil![1].should eq("/after")
       head.find { |(n, _)| n == "x-probe" }.not_nil![1].should eq("1")
+      # History records the edit, and keeps the request as it was held beside it (#1378).
+      rig.sink.requests.first.target.should eq("/after")
+      rig.sink.requests.first.intercept_original.should eq(item.raw)
     end
   end
 
@@ -384,7 +390,7 @@ describe Gori::Proxy::H2::StreamGate do
       settle
       item = ic.pending.first
       item.head_only?.should be_true
-      # What `InterceptView#forward_bytes` would produce for an edit that adds a body.
+      # What `InterceptView#pending_edit` would produce for an edit that adds a body.
       ic.forward(item.id, "POST /p HTTP/2\r\nHost: api.example.com\r\nContent-Length: 5\r\n\r\nhello".to_slice)
       settle
 
@@ -504,6 +510,8 @@ describe Gori::Proxy::H2::StreamGate do
       ic.forward(ic.pending.first.id, "GET /p HTTP/2\r\nHost api.example.com\r\n\r\n".to_slice)
       settle
       head_of(rig.to_origin, 1_u32).not_nil!.should eq(request("/p"))
+      # A refused edit sent the peer's own head, so the flow is not an edited one.
+      rig.sink.requests.first.intercept_original.should be_nil
     end
   end
 
@@ -520,6 +528,32 @@ describe Gori::Proxy::H2::StreamGate do
       rig.s2c.accept(headers(1_u32, rig.enc_in.encode(response("200")), Frame::END_HEADERS))
       settle
       ic.pending_count.should eq(1)
+    end
+  end
+
+  # An h2 origin's 103 is an extra HEADERS frame ahead of the final one (Node's
+  # `res.writeEarlyHints`). The relay always passed it through; the capture replaced it with the
+  # final head and kept nothing, so the record now carries it — and the relay is untouched.
+  it "records an interim 103 HEADERS with the flow and forwards its block unchanged" do
+    with_ic(intercept: false) do |ic|
+      rig = Rig.new(ic)
+      rig.c2s.accept(headers(1_u32, rig.enc_out.encode(request("/page"))))
+      hint = rig.enc_in.encode([{":status", "103"}, {"link", "</style.css>; rel=preload"}])
+      rig.s2c.accept(headers(1_u32, hint, Frame::END_HEADERS))
+      rig.s2c.accept(headers(1_u32, rig.enc_in.encode(response("200")), Frame::END_HEADERS))
+      rig.s2c.accept(data(1_u32, "ok", Frame::END_STREAM))
+      settle
+
+      sent = rig.to_client.select { |f| f.frame_type == Frame::Type::Headers }
+      sent.size.should eq(2)
+      sent.first.payload.should eq(hint) # the origin's own block, relayed as it arrived
+
+      resp = rig.sink.responses.first
+      resp.status.should eq(200)
+      String.new(resp.head).should start_with("HTTP/2 200")
+      interims = resp.interims.not_nil!
+      interims.heads.map(&.status).should eq([103])
+      String.new(interims.heads.first.head).should eq("HTTP/2 103\r\nlink: </style.css>; rel=preload\r\n\r\n")
     end
   end
 
@@ -599,6 +633,7 @@ describe Gori::Proxy::H2::StreamGate do
 
       head_of(rig.to_origin, 1_u32).not_nil!.find { |(n, _)| n == "x-probe" }.not_nil![1].should eq("1")
       data_payloads(rig.to_origin, 1_u32).should eq(["he", "llo"]) # not re-framed
+      rig.sink.requests.first.intercept_original.should eq(item.raw)
     end
   end
 
@@ -947,6 +982,7 @@ describe Gori::Proxy::H2::StreamGate do
 
   it "completes cross-direction drops in both directions at once (the lock is never nested)" do
     with_ic do |ic|
+      ic.set_direction(Gori::Interceptor::Direction::Both)
       rig = Rig.new(ic)
       # Stream 1: a held REQUEST (drop crosses out→in). Stream 3: an open exchange whose
       # RESPONSE is held (drop crosses in→out). Both dropped before either releases.
@@ -1003,6 +1039,50 @@ describe Gori::Proxy::H2::StreamGate do
       # Visible in History under h1's own string for a blocked request (`client_conn.cr:1249`).
       rig.sink.requests.map(&.target).should eq(["/admin"])
       rig.sink.responses.first.error.should eq(Gate::SANDBOX_REASON)
+    end
+  end
+
+  it "resets malformed sandboxed request headers with PROTOCOL_ERROR" do
+    with_ic(intercept: false) do |ic, scope|
+      scope.add("include", "host", "api.example.com")
+      scope.add("exclude", "string", "/blocked")
+      scope.enable_sandbox
+      rig = Rig.new(ic)
+      cases = [
+        {1_u32, request("/allowed") + [{":path", "/blocked"}]},
+        {3_u32, request("/allowed") + [{":method", "POST"}]},
+        {5_u32, request("/allowed") + [{":scheme", "http"}]},
+        {7_u32, request("/allowed") + [{":authority", "evil.example.com"}]},
+        {9_u32, request("/allowed") + [{"host", "evil.example.com"}]},
+        {11_u32, request("/allowed") + [{"host", "api.example.com"}, {"host", "api.example.com"}]},
+      ]
+
+      cases.each do |(stream_id, fields)|
+        rig.c2s.accept(headers(stream_id, rig.enc_out.encode(fields)))
+      end
+
+      rig.to_origin.should be_empty
+      resets = rig.to_client
+      resets.map(&.stream_id).should eq([1_u32, 3_u32, 5_u32, 7_u32, 9_u32, 11_u32])
+      resets.each do |reset|
+        reset.frame_type.should eq(Frame::Type::RstStream)
+        IO::ByteFormat::BigEndian.decode(UInt32, reset.payload).should eq(Gate::PROTOCOL_ERROR)
+      end
+      rig.sink.responses.map(&.error).should eq(Array.new(cases.size, Gate::SANDBOX_PROTOCOL_ERROR_REASON))
+    end
+  end
+
+  it "preserves duplicate pseudo-header bytes when the sandbox is off (P7)" do
+    with_ic(intercept: false) do |ic, _scope|
+      rig = Rig.new(ic)
+      block = rig.enc_out.encode(request("/allowed") + [{":path", "/blocked"}])
+
+      rig.c2s.accept(headers(1_u32, block))
+
+      sent = rig.to_origin
+      sent.map(&.frame_type).should eq([Frame::Type::Headers])
+      sent.first.payload.should eq(block)
+      rig.to_client.should be_empty
     end
   end
 
@@ -1110,6 +1190,24 @@ describe Gori::Proxy::H2::StreamGate do
       rig.c2s.accept(data(1_u32, "A" * 500))
       rig.to_origin.map(&.frame_type).should contain(Frame::Type::Data)
       rig.to_client.select { |f| f.frame_type == Frame::Type::WindowUpdate }.should be_empty
+    end
+  end
+
+  # The connection test was skipped whenever the stream named the connection's own HOST, so a
+  # stream claiming `:443` on a tunnel CONNECTed to `:8443` was judged on the port it claimed,
+  # while its bytes went to 8443 — past an exclude that names that port.
+  it "tests the connection's own port when a stream claims another one" do
+    with_ic(intercept: false) do |ic, scope|
+      scope.add("include", "host", "api.example.com")
+      scope.add("exclude", "string", "https://api.example.com:8443/")
+      scope.enable_sandbox
+      rig = Rig.new(ic, port: 8443)
+      rig.c2s.accept(headers(1_u32, rig.enc_out.encode(request("/admin", "api.example.com:443"))))
+      rig.to_origin.should be_empty
+      # The same stream on a connection to 443 is in scope.
+      ok = Rig.new(ic)
+      ok.c2s.accept(headers(1_u32, ok.enc_out.encode(request("/admin", "api.example.com:443"))))
+      ok.to_origin.map(&.frame_type).should contain(Frame::Type::Headers)
     end
   end
 

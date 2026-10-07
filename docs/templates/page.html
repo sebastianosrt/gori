@@ -7,14 +7,14 @@
      only under html.js, so a no-script visit renders everything visible. */
   document.documentElement.classList.add("js");
 </script>
-<link rel="preload" as="image" type="image/webp" href="{{ base_url }}/images/hero-orbits.webp" fetchpriority="high">
+<link rel="preload" as="image" type="image/webp" href="{{ base_url }}/images/wallpaper.webp" fetchpriority="high">
 <main id="main" class="home-main">
   <section class="home-hero" aria-labelledby="home-title">
     <div class="hero-copy">
       <p class="home-kicker">{{ "home.kicker" | t }}</p>
       {# Three spans so the emphasized word carries the serif-italic gilding;
          locales place the emphasis where their grammar puts the word. #}
-      <h1 id="home-title">{{ "home.title_pre" | t }}<em class="hero-em">{{ "home.title_em" | t }}</em>{{ "home.title_post" | t }}</h1>
+      <h1 id="home-title">{{ "home.title_pre" | t }}<em class="gild hero-em">{{ "home.title_em" | t }}</em>{{ "home.title_post" | t }}</h1>
       <p class="hero-lede">{{ "home.lede" | t }}</p>
       <div class="home-actions" aria-label="Primary links">
         <a class="button button-primary" href="{{ base_url }}{{ lang_prefix }}/getting-started/">{{ "home.cta_start" | t }}</a>
@@ -24,6 +24,7 @@
         <div class="install-tabs" role="group" aria-label="{{ "home.install_pick_aria" | t }}">
           <button type="button" class="install-tab" aria-pressed="true" data-cmd="curl -fsSL https://gori.hahwul.com/install.sh | bash">curl</button>
           <button type="button" class="install-tab" aria-pressed="false" data-cmd="brew install hahwul/gori/gori">brew</button>
+          <button type="button" class="install-tab" aria-pressed="false" data-cmd="choco install gori">choco</button>
           <button type="button" class="install-tab" aria-pressed="false" data-cmd="yay -S gori">AUR</button>
           <button type="button" class="install-tab" aria-pressed="false" data-cmd="nix profile install github:hahwul/gori">nix</button>
           <button type="button" class="install-tab" aria-pressed="false" data-cmd="docker run --rm -it -v gori:/data -p 8070:8070 ghcr.io/hahwul/gori --listen 0.0.0.0">docker</button>
@@ -65,19 +66,40 @@
         <span class="showcase-bar-dim">·</span>
         <span class="showcase-live"><i></i>localhost:8070</span>
       </div>
+      {# The strip IS gori's bar, so it has gori's shape: NINE numbered slots and the `0:Tabs`
+         stop. The digit is painted a step under its name the way the real bar paints it
+         (Chrome::MENU_NUMBER_DIM), and the stop opens the same list the `0` key opens —
+         including the way a tab reached through it rides the far right of the bar, without a
+         number, until you leave it (`showcaseTemp`, filled by home.js). #}
       <div class="showcase-tabs" id="showcaseTabs" role="group" aria-label="{{ "home.showcase_tabs_aria" | t }}">
-        <button type="button" aria-pressed="false" data-shot="project" data-alt="{{ "home.showcase_alt_project" | t }}">Project</button>
-        <button type="button" aria-pressed="false" data-shot="sitemap" data-alt="{{ "home.showcase_alt_sitemap" | t }}">Target</button>
-        <button type="button" aria-pressed="true" data-shot="history" data-alt="{{ "home.showcase_alt" | t }}">History</button>
-        <button type="button" aria-pressed="false" data-shot="intercept" data-alt="{{ "home.showcase_alt_intercept" | t }}">Intercept</button>
-        <button type="button" aria-pressed="false" data-shot="repeater" data-alt="{{ "home.showcase_alt_repeater" | t }}">Repeater</button>
-        <button type="button" aria-pressed="false" data-shot="fuzzer" data-alt="{{ "home.showcase_alt_fuzzer" | t }}">Fuzzer</button>
-        <button type="button" aria-pressed="false" data-shot="oast" data-alt="{{ "home.showcase_alt_oast" | t }}">OAST</button>
-        <button type="button" aria-pressed="false" data-shot="decoder" data-alt="{{ "home.showcase_alt_decoder" | t }}">Decoder</button>
-        <button type="button" aria-pressed="false" data-shot="jwt" data-alt="{{ "home.showcase_alt_jwt" | t }}">JWT</button>
-        <button type="button" aria-pressed="false" data-shot="sequencer" data-alt="{{ "home.showcase_alt_sequencer" | t }}">Sequencer</button>
-        <button type="button" aria-pressed="false" data-shot="probe" data-alt="{{ "home.showcase_alt_probe" | t }}">Probe</button>
-        <button type="button" aria-pressed="false" data-shot="issues" data-alt="{{ "home.showcase_alt_issues" | t }}">Issues</button>
+        <button type="button" aria-pressed="false" data-shot="project" data-alt="{{ "home.showcase_alt_project" | t }}"><i>1:</i>Project</button>
+        <button type="button" aria-pressed="false" data-shot="sitemap" data-alt="{{ "home.showcase_alt_sitemap" | t }}"><i>2:</i>Target</button>
+        <button type="button" aria-pressed="true" data-shot="history" data-alt="{{ "home.showcase_alt" | t }}"><i>3:</i>History</button>
+        <button type="button" aria-pressed="false" data-shot="intercept" data-alt="{{ "home.showcase_alt_intercept" | t }}"><i>4:</i>Intercept</button>
+        <button type="button" aria-pressed="false" data-shot="repeater" data-alt="{{ "home.showcase_alt_repeater" | t }}"><i>5:</i>Repeater</button>
+        <button type="button" aria-pressed="false" data-shot="fuzzer" data-alt="{{ "home.showcase_alt_fuzzer" | t }}"><i>6:</i>Fuzzer</button>
+        <button type="button" aria-pressed="false" data-shot="probe" data-alt="{{ "home.showcase_alt_probe" | t }}"><i>7:</i>Probe</button>
+        <button type="button" aria-pressed="false" data-shot="issues" data-alt="{{ "home.showcase_alt_issues" | t }}"><i>8:</i>Issues</button>
+        <button type="button" aria-pressed="false" data-shot="notes" data-alt="{{ "home.showcase_alt_notes" | t }}"><i>9:</i>Notes</button>
+        <button type="button" class="showcase-temp" id="showcaseTemp" aria-pressed="true" hidden></button>
+        <button type="button" class="showcase-more" id="showcaseMore" aria-expanded="false" aria-controls="showcaseGoto"><i>0:</i>Tabs</button>
+      </div>
+      <div class="showcase-goto-anchor">
+      <div class="showcase-goto" id="showcaseGoto" role="group" aria-label="{{ "home.showcase_goto_aria" | t }}" hidden>
+        <button type="button" aria-pressed="false" data-shot="oast" data-alt="{{ "home.showcase_alt_oast" | t }}">
+          <b>OAST</b><span>{{ "home.showcase_sum_oast" | t }}</span>
+        </button>
+        <button type="button" aria-pressed="false" data-shot="sequencer" data-alt="{{ "home.showcase_alt_sequencer" | t }}">
+          <b>Sequencer</b><span>{{ "home.showcase_sum_sequencer" | t }}</span>
+        </button>
+        <button type="button" aria-pressed="false" data-shot="decoder" data-alt="{{ "home.showcase_alt_decoder" | t }}">
+          <b>Decoder</b><span>{{ "home.showcase_sum_decoder" | t }}</span>
+        </button>
+        <button type="button" aria-pressed="false" data-shot="jwt" data-alt="{{ "home.showcase_alt_jwt" | t }}">
+          <b>JWT</b><span>{{ "home.showcase_sum_jwt" | t }}</span>
+        </button>
+        <p>{{ "home.showcase_goto_rest" | t }}</p>
+      </div>
       </div>
       <div class="showcase-screen">
         <img id="showcaseShot" src="{{ base_url }}/images/tui/history.svg" alt="{{ "home.showcase_alt" | t }}">
@@ -88,7 +110,7 @@
 
   <section class="home-paths rv" aria-label="Documentation paths">
     <div class="path-grid">
-      <a class="path-link path-link-lead" href="{{ base_url }}{{ lang_prefix }}/getting-started/">
+      <a class="path-link" href="{{ base_url }}{{ lang_prefix }}/getting-started/">
         <span>{{ "home.path_start_kicker" | t }}</span>
         <h2>{{ "home.path_start_title" | t }}</h2>
         <p>{{ "home.path_start_desc" | t }}</p>
@@ -113,58 +135,55 @@
     <div class="structure-copy">
       <h2 id="structure-title">{{ "home.structure_title" | t }}</h2>
       <p>{{ "home.structure_lede" | t }}</p>
-      <div class="structure-grid" aria-label="{{ "home.structure_grid_aria" | t }}">
-        <div>
-          <strong>{{ "home.structure_1_title" | t }}</strong>
-          <span>{{ "home.structure_1_desc" | t }}</span>
-        </div>
-        <div>
-          <strong>{{ "home.structure_2_title" | t }}</strong>
-          <span>{{ "home.structure_2_desc" | t }}</span>
-        </div>
-        <div>
-          <strong>{{ "home.structure_3_title" | t }}</strong>
-          <span>{{ "home.structure_3_desc" | t }}</span>
-        </div>
+    </div>
+    <div class="structure-grid" aria-label="{{ "home.structure_grid_aria" | t }}">
+      <div>
+        <strong>{{ "home.structure_1_title" | t }}</strong>
+        <span>{{ "home.structure_1_desc" | t }}</span>
+      </div>
+      <div>
+        <strong>{{ "home.structure_2_title" | t }}</strong>
+        <span>{{ "home.structure_2_desc" | t }}</span>
+      </div>
+      <div>
+        <strong>{{ "home.structure_3_title" | t }}</strong>
+        <span>{{ "home.structure_3_desc" | t }}</span>
       </div>
     </div>
   </section>
 
-  <section class="home-flow rv" aria-labelledby="flow-title">
-    <h2 id="flow-title">{{ "home.flow_title" | t }}</h2>
-    <div class="flow-list">
-      <div class="rv">
-        <div class="flow-copy">
-          <span>{{ "home.flow_1_label" | t }}</span>
-          <p>{{ "home.flow_1_desc" | t }}</p>
-        </div>
-        <figure class="flow-shot">
-          <img src="{{ base_url }}/images/tui/response-detail.svg" alt="{{ "home.flow_1_alt" | t }}">
-        </figure>
-      </div>
-      <div class="rv">
-        <div class="flow-copy">
-          <span>{{ "home.flow_2_label" | t }}</span>
-          <p>{{ "home.flow_2_desc" | t }}</p>
-        </div>
-        <figure class="flow-shot">
-          <img src="{{ base_url }}/images/tui/fuzzer.svg" alt="{{ "home.flow_2_alt" | t }}">
-        </figure>
-      </div>
-      <div class="rv">
-        <div class="flow-copy">
-          <span>{{ "home.flow_3_label" | t }}</span>
-          <p>{{ "home.flow_3_desc" | t }}</p>
-        </div>
-        <figure class="flow-shot">
-          <img src="{{ base_url }}/images/tui/issues.svg" alt="{{ "home.flow_3_alt" | t }}">
-        </figure>
-      </div>
+  {# Sticky walkthrough: the title and the three steps park on the left while
+     the captures scroll past on the right; home.js lights the step whose
+     capture crosses the middle of the viewport. The left list is a visual
+     index only (aria-hidden): each figure carries its own step as a caption,
+     which is also what the stacked narrow layout shows. #}
+  <section class="home-flow" aria-labelledby="flow-title">
+    <div class="flow-rail rv">
+      <h2 id="flow-title">{{ "home.flow_title_pre" | t }}<em class="gild">{{ "home.flow_title_em" | t }}</em>{{ "home.flow_title_post" | t }}</h2>
+      <ol class="flow-steps" aria-hidden="true">
+        <li data-step="1" class="is-active"><span>{{ "home.flow_1_label" | t }}</span><p>{{ "home.flow_1_desc" | t }}</p></li>
+        <li data-step="2"><span>{{ "home.flow_2_label" | t }}</span><p>{{ "home.flow_2_desc" | t }}</p></li>
+        <li data-step="3"><span>{{ "home.flow_3_label" | t }}</span><p>{{ "home.flow_3_desc" | t }}</p></li>
+      </ol>
+    </div>
+    <div class="flow-shots">
+      <figure class="flow-shot is-active" data-step="1">
+        <figcaption><span>{{ "home.flow_1_label" | t }}</span> {{ "home.flow_1_desc" | t }}</figcaption>
+        <div class="flow-shot-frame"><img src="{{ base_url }}/images/tui/response-detail.svg" alt="{{ "home.flow_1_alt" | t }}" loading="lazy"></div>
+      </figure>
+      <figure class="flow-shot" data-step="2">
+        <figcaption><span>{{ "home.flow_2_label" | t }}</span> {{ "home.flow_2_desc" | t }}</figcaption>
+        <div class="flow-shot-frame"><img src="{{ base_url }}/images/tui/fuzzer.svg" alt="{{ "home.flow_2_alt" | t }}" loading="lazy"></div>
+      </figure>
+      <figure class="flow-shot" data-step="3">
+        <figcaption><span>{{ "home.flow_3_label" | t }}</span> {{ "home.flow_3_desc" | t }}</figcaption>
+        <div class="flow-shot-frame"><img src="{{ base_url }}/images/tui/issues.svg" alt="{{ "home.flow_3_alt" | t }}" loading="lazy"></div>
+      </figure>
     </div>
   </section>
 
   <section class="home-agent rv" aria-labelledby="agent-title">
-    <h2 id="agent-title">{{ "home.agent_title" | t }}</h2>
+    <h2 id="agent-title">{{ "home.agent_title_pre" | t }}<em class="gild">{{ "home.agent_title_em" | t }}</em>{{ "home.agent_title_post" | t }}</h2>
     <p class="agent-intro">{{ "home.agent_intro" | t }}</p>
     <figure class="agent-seam" aria-label="{{ "home.agent_seam_aria" | t }}">
       <div class="seam-node">

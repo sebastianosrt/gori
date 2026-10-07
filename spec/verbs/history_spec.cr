@@ -48,6 +48,8 @@ describe "Gori::Verbs.register_history" do
        "history.discover" => :history_discover,
        "history.compare"  => :comparer_add_selected,
        "history.delete"   => :history_delete,
+       # #1237 — single-target: one captured response becomes one draft rule.
+       "history.mock-response" => :mock_response_from_flow,
       }.each do |id, intent|
         r[id].available?(empty).should be_false
         r[id].available?(picked).should be_true
@@ -128,22 +130,26 @@ describe "Gori::Verbs.register_history" do
     end
 
     it "binds direct destructive shortcuts while preserving the danger menu keys" do
-      # Bare `d` deletes from the list even though Space→d remains Discover; the explicit
-      # menu mnemonic keeps the two actions distinct there. ⇧X wipes the tab — the chord and
-      # the menu letter every clear-all verb in the app now spells the same way (the family is
-      # asserted as a set in spec/verbs/activity_spec.cr).
+      # Bare `d` deletes from the list, and Space→d is the same delete now that Discover sits in
+      # Send flow to… (#1274). ⇧X wipes the tab — the chord and the menu letter every clear-all
+      # verb in the app now spells the same way (the family is asserted as a set in
+      # spec/verbs/activity_spec.cr).
       #
-      # `C` is not available for either half: this tab spends it on the column editor, and the
-      # other `C` in the registry is Send to Comparer.
+      # `C` is not available for either half: this tab spends it on the column editor.
       r["history.delete"].chords.should eq([typed_chord("d")])
-      r["history.delete"].menu_key.should eq('D')
+      r["history.delete"].menu_key.should eq('d')
       r["history.clear"].chords.should eq([shift_chord('X')])
       r["history.clear"].menu_key.should eq('X')
       r["probe.clear"].menu_key.should eq('X')
-      r["history.columns"].menu_key.should eq('C')
-      r["repeater.compare"].menu_key.should eq('C')
-      r["history.clear"].menu_key.should_not eq(r["repeater.compare"].menu_key)
-      r["detail.delete"].chords.should be_empty # the shortcut is list-only
+      r.menu_keys("history.columns").should eq(['Z', 'c']) # Display… (#1274)
+      # The hide-static lens (#1239): menu-only, a Display… row — its first door is the `v` picker.
+      r["history.toggle-static"].chords.should be_empty
+      r.menu_keys("history.toggle-static").should eq(['Z', 's'])
+      verb_intents(r, "history.toggle-static").should eq([:toggle_static_assets])
+      r["history.toggle-static"].available?(on(:history)).should be_true
+      r["history.toggle-static"].available?(on(:project)).should be_false # Body is shared
+      r.menu_keys("repeater.compare").should eq(['>', 'c'])               # Send flow to… → Comparer
+      r["detail.delete"].chords.should be_empty                           # the shortcut is list-only
       r["history.probe-active"].menu_key.should eq('A')
       verb_intents(r, "history.probe-active").should eq([:probe_active_selected])
     end
@@ -155,17 +161,21 @@ describe "Gori::Verbs.register_history" do
     # over the destination tab. Order is the whole point of the assertion.
     it "closes the detail before jumping to another tab" do
       verb_intents(r, "detail.repeater").should eq([:close_detail, :repeater_selected])
-      verb_intents(r, "detail.issue").should eq([:close_detail, :issue_create])
       verb_intents(r, "detail.fuzz").should eq([:close_detail, :fuzz_selected])
       verb_intents(r, "detail.mine").should eq([:close_detail, :mine_selected])
       verb_intents(r, "detail.sequence").should eq([:close_detail, :sequence_selected])
-      verb_intents(r, "detail.probe-active").should eq([:close_detail, :probe_active_selected])
     end
 
+    # A verb that only raises a card stays on History, so the card opens OVER the flow and
+    # esc lands back on it (`Overlay#over_detail?`); closing first dropped the operator on
+    # the list instead.
     it "keeps the in-place actions from closing the detail" do
+      verb_intents(r, "detail.issue").should eq([:issue_create])
+      verb_intents(r, "detail.probe-active").should eq([:probe_active_selected])
+      verb_intents(r, "detail.mock-response").should eq([:mock_response_from_flow])
       verb_intents(r, "detail.compare").should eq([:comparer_add_selected])
       verb_intents(r, "detail.copy").should eq([:detail_copy])
-      verb_intents(r, "detail.copy-flow").should eq([:copy_selection])
+      r["detail.copy-flow"]?.should be_nil # Copy as… → Raw request (#1274)
       verb_intents(r, "detail.copy-as").should eq([:copy_as_open])
       verb_intents(r, "detail.add-host").should eq([:scope_add_host])
       verb_intents(r, "detail.delete").should eq([:history_delete])
@@ -190,21 +200,25 @@ describe "Gori::Verbs.register_history" do
 
     it "leaves the view toggles visible so they front the detail's space menu" do
       # The palette is Global-only, so un-hiding them cannot leak them there.
-      %w[detail.toggle-hex detail.toggle-ws detail.toggle-pretty].each do |id|
+      %w[detail.toggle-hex detail.toggle-ws detail.toggle-pretty detail.toggle-unicode].each do |id|
         r[id].hidden?.should be_false
         r[id].scope.should eq(Gori::Verb::Scope::HistoryDetail)
       end
-      r["detail.toggle-hex"].menu_key.should eq('e') # ^X has no menu key; plain 'x' is select-line
+      # Display… rows (#1274): hex is `Z x` here and in both Repeater panes.
+      %w[detail.toggle-hex detail.toggle-ws detail.toggle-pretty detail.toggle-unicode]
+        .map { |id| r.menu_keys(id) }.should eq([['Z', 'x'], ['Z', 'b'], ['Z', 'p'], ['Z', 'u']])
       verb_intents(r, "detail.toggle-hex").should eq([:toggle_detail_hex])
       verb_intents(r, "detail.toggle-ws").should eq([:toggle_reveal])
       verb_intents(r, "detail.toggle-pretty").should eq([:toggle_pretty])
+      r["detail.toggle-unicode"].chords.should eq([Gori::Verb::Chord.new("u")])
+      verb_intents(r, "detail.toggle-unicode").should eq([:toggle_unicode_escapes])
     end
   end
 
   describe "Repeater workbench" do
     it "gates every Repeater verb on the Repeater tab" do
       ctx = on(:history)
-      %w[repeater.send repeater.new repeater.minimize repeater.insert-marker
+      %w[repeater.send repeater.new repeater.paste-curl repeater.minimize repeater.insert-marker
         repeater.auto-mark repeater.toggle-hex repeater.toggle-http2
         repeater.send-group repeater.toggle-diff].each do |id|
         r[id].available?(ctx).should be_false
@@ -215,6 +229,8 @@ describe "Gori::Verbs.register_history" do
     it "routes send / new / minimize / group-send to their own intents" do
       verb_intents(r, "repeater.send").should eq([:repeater_send])
       verb_intents(r, "repeater.new").should eq([:repeater_new])
+      verb_intents(r, "repeater.paste-curl").should eq([:repeater_paste_curl])
+      r["repeater.paste-curl"].menu_key.should eq('U')
       verb_intents(r, "repeater.minimize").should eq([:repeater_minimize])
       verb_intents(r, "repeater.send-group").should eq([:repeater_send_group])
     end
@@ -265,13 +281,27 @@ describe "Gori::Verbs.register_history" do
       {"repeater.toggle-diff"     => :repeater_toggle_resp_diff,
        "repeater.toggle-resp-hex" => :repeater_toggle_resp_hex,
        "repeater.toggle-pretty"   => :toggle_pretty,
+       "repeater.toggle-unicode"  => :repeater_toggle_unicode_escapes,
       }.each do |id, intent|
         r[id].section.should eq(:response)
         verb_intents(r, id).should eq([intent])
       end
+      r["repeater.toggle-unicode"].chords.should eq([Gori::Verb::Chord.new("u")])
 
       r["repeater.toggle-sni"].section.should eq(:target)
       verb_intents(r, "repeater.toggle-sni").should eq([:repeater_toggle_sni])
+    end
+
+    it "leaves bare `d` off the Repeater — diff is ⇧D on the chord, `Z d` in the menu" do
+      # The one scope where `d` was not "delete the selected thing". The reflex now finds
+      # nothing bound rather than a display toggle. The MENU letter followed the chord to the
+      # capital: `d` is Duplicate on all nine sub-tab strips (#1055) and the SUB-TABS bucket
+      # renders inside the :response view, so the plain letter was no longer this verb's to
+      # keep — which leaves the row and the keyboard spelling it the same way.
+      r["repeater.toggle-diff"].chords.should eq([shift_chord('D')])
+      r.menu_keys("repeater.toggle-diff").should eq(['Z', 'd']) # Display… (#1274)
+      bare_d = typed_chord("d")
+      r.select { |v| v.scope == Gori::Verb::Scope::Repeater && v.chords.includes?(bare_d) }.should be_empty
     end
 
     it "gates Link… on the session having been persisted" do
@@ -326,7 +356,7 @@ describe "Gori::Verbs.register_history" do
       r["fuzz.save-results"].available?(ctx).should be_false
       ctx.fuzzer_results_saveable = true
       r["fuzz.save-results"].available?(ctx).should be_true
-      r["fuzz.save-results"].chords.should eq([typed_chord("s", shift: true)])
+      r["fuzz.save-results"].chords.should eq([typed_chord("e", shift: true)])
       verb_intents(r, "fuzz.save-results").should eq([:fuzz_save_results])
     end
 

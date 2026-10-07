@@ -75,38 +75,8 @@ module Gori::Tui
       @scroll = 0
     end
 
-    # A centred card filling most of the body area (stable height). nil when there
-    # isn't room to draw.
-    def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 96}.min
-      h = area.h - 2
-      return nil if w < 30 || h < 8
-      x = area.x + (area.w - w) // 2
-      y = area.y + (area.h - h) // 2
-      Rect.new(x, y, w, h)
-    end
-
-    # Row index under (mx, my), mirroring render's list loop; nil outside the list.
-    def row_at(box : Rect, mx : Int32, my : Int32) : Int32?
-      list_h = list_height(box)
-      i = my - (box.y + LIST_OFFSET)
-      return nil if i < 0 || i >= list_h
-      return nil if mx < box.x + 1 || mx >= box.right - 1
-      ri = @scroll + i
-      ri < @filtered.size ? ri : nil
-    end
-
     def render(screen : Screen, area : Rect) : Nil
-      box = overlay_box(area)
-      unless box
-        Overlay.too_small(screen, area, "picker needs a larger window")
-        return
-      end
-      Frame.card(screen, box, @title, border: Theme.border_focus)
-
-      list_top = render_filter(screen, box, idle_hint)
-      list_h = list_height(box)
-      ensure_visible(list_h)
+      box, list_top, list_h = render_card(screen, area, @title, idle_hint) || return
 
       if @filtered.empty?
         msg = @rows.empty? ? "no sub-tabs open" : "no sub-tabs match"
@@ -114,10 +84,8 @@ module Gori::Tui
         return
       end
 
-      (0...list_h).each do |i|
-        ri = @scroll + i
-        break if ri >= @filtered.size
-        draw_row(screen, box, list_top + i, @filtered[ri], ri == @selected)
+      each_visible_row(list_top, list_h, @filtered.size) do |ry, ri|
+        draw_row(screen, box, ry, @filtered[ri], ri == @selected)
       end
     end
 

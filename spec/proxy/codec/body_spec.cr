@@ -60,6 +60,76 @@ describe Gori::Proxy::Codec::CaptureBuffer do
     cap.total.should eq(4)
   end
 
+  describe "growth past the presize" do
+    presize = CaptureBuffer::PRESIZE_CAP
+    pattern = ->(n : Int32) { Bytes.new(n) { |i| (i % 251).to_u8 } }
+    # Streamed in 64 KiB reads, the way the proxy tees a Content-Length body.
+    tee = ->(cap : CaptureBuffer, body : Bytes) {
+      src = IO::Memory.new(body, writable: false)
+      Body.stream(src, IO::Memory.new, BodyFraming::Length, body.size.to_i64, cap).should be_true
+    }
+    capacity = ->(cap : CaptureBuffer) { cap.@mem.not_nil!.@capacity }
+
+    [100 * 1024, presize - 1, presize, presize + 1, 1_500_000, Body::CAPTURE_MAX].each do |n|
+      it "captures a #{n}-byte body with a true length byte-exact, in one right-sized block" do
+        body = pattern.call(n)
+        cap = CaptureBuffer.new(Body::CAPTURE_MAX, n.to_i64)
+        tee.call(cap, body)
+        cap.to_slice.should eq(body)
+        cap.truncated?.should be_false
+        cap.total.should eq(n)
+        capacity.call(cap).should eq(n) # sized to the declared length, never a doubling past it
+      end
+    end
+
+    it "a length that lies HIGH forces at most the capture limit, and only once bytes past the presize arrived" do
+      body = pattern.call(presize + 10)
+      cap = CaptureBuffer.new(Body::CAPTURE_MAX, 1_i64 << 40)
+      cap.write(body[0, presize])
+      capacity.call(cap).should eq(presize) # nothing past the presize yet: no jump
+      cap.write(body[presize, 10])
+      capacity.call(cap).should eq(Body::CAPTURE_MAX)
+      cap.to_slice.should eq(body)
+      cap.truncated?.should be_false
+    end
+
+    # The operator can raise the limit to GiBs; a peer that claims 1 TB and stalls just past the
+    # presize must not reserve all of it.
+    it "does not jump to a raised limit on a claim far past the bytes that arrived" do
+      body = pattern.call(presize + 10)
+      cap = CaptureBuffer.new(256 * 1024 * 1024, 1_i64 << 40)
+      cap.write(body[0, presize])
+      cap.write(body[presize, 10])
+      capacity.call(cap).should be <= 2 * (presize + 10)
+      cap.to_slice.should eq(body)
+    end
+
+    it "a length that lies LOW falls back to ordinary growth, byte-exact" do
+      body = pattern.call(1_000_000)
+      cap = CaptureBuffer.new(Body::CAPTURE_MAX, (presize + 1).to_i64)
+      off = 0
+      while off < body.size
+        k = Math.min(65536, body.size - off)
+        cap.write(body[off, k])
+        off += k
+      end
+      cap.to_slice.should eq(body)
+      cap.truncated?.should be_false
+      cap.total.should eq(body.size)
+    end
+
+    it "truncates at the capture limit when the declared length is past it" do
+      limit = 1024 * 1024
+      body = pattern.call(1_500_000)
+      cap = CaptureBuffer.new(limit, body.size.to_i64)
+      tee.call(cap, body)
+      cap.to_slice.should eq(body[0, limit])
+      cap.truncated?.should be_true
+      cap.total.should eq(body.size)
+      capacity.call(cap).should eq(limit)
+    end
+  end
+
   it "keeps an already-returned slice stable across a later write (copy-on-write)" do
     cap = CaptureBuffer.new(64)
     cap.write("first".to_slice)
@@ -163,6 +233,18 @@ describe Gori::Proxy::Codec::Body do
       Body.response_framing(ok, "HEAD").should eq({BodyFraming::None, 0_i64})
     end
 
+    it "frames lowercase extension methods as ordinary responses" do
+      ok = Http1.parse_response_head("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n".to_slice)
+      Body.response_framing(ok, "head").should eq({BodyFraming::Length, 4_i64})
+      Body.response_framing(ok, "connect").should eq({BodyFraming::Length, 4_i64})
+    end
+
+    it "uses explicit framing for a malformed status instead of assuming a bodyless status" do
+      malformed = Http1.parse_response_head(
+        "HTTP/1.1 204x Odd\r\nContent-Length: 4\r\n\r\n".to_slice)
+      Body.response_framing(malformed, "GET").should eq({BodyFraming::Length, 4_i64})
+    end
+
     it "treats a 2xx CONNECT response as bodyless but frames a non-2xx CONNECT entity" do
       # RFC 7230 §3.3.3 / RFC 9112 §6.3: only a successful CONNECT is bodyless.
       ok = Http1.parse_response_head("HTTP/1.1 200 Connection Established\r\n\r\n".to_slice)
@@ -202,6 +284,37 @@ describe Gori::Proxy::Codec::Body do
       # — a stricter downstream peer would interpret it differently, a smuggling primitive.
       req = Http1.parse_request_head("POST / HTTP/1.1\r\nContent-Length: +5\r\n\r\n".to_slice)
       expect_raises(Gori::Error) { Body.request_framing(req) }
+    end
+
+    # `content_length` answers the conformant single-digit-run header off the value's bytes and
+    # defers every other spelling to the strict path (the original implementation). The split is
+    # only safe while the two agree, and a disagreement here IS a CL desync — so the corpus
+    # below walks the boundary: what the fast path answers, and what it must hand over.
+    it "frames or refuses every Content-Length spelling the same way the strict parse does" do
+      framed = {
+        "0"                   => 0_i64,
+        "5"                   => 5_i64,
+        "007"                 => 7_i64,                   # leading zeros are still 1*DIGIT
+        "999999999999999999"  => 999999999999999999_i64,  # 18 digits: the fast path's own ceiling
+        "1000000000000000000" => 1000000000000000000_i64, # 19 digits, in range — strict parses it
+        "5, 5"                => 5_i64,                   # a comma list of identical values collapses
+      }
+      framed.each do |value, expected|
+        req = Http1.parse_request_head("POST / HTTP/1.1\r\nContent-Length: #{value}\r\n\r\n".to_slice)
+        Body.request_framing(req).should eq({BodyFraming::Length, expected})
+      end
+
+      # Not a length at all: no token survives, so the message is body-less exactly as before.
+      empty = Http1.parse_request_head("POST / HTTP/1.1\r\nContent-Length:\r\n\r\n".to_slice)
+      Body.request_framing(empty).should eq({BodyFraming::None, 0_i64})
+
+      ["5, 6",                   # conflicting values in one field line
+       "9999999999999999999999", # 22 digits: past Int64, and the fast path must not wrap it
+       "5x", "0x10", " 5 5",     # non-digits anywhere in the token
+       "1_000"].each do |value|
+        req = Http1.parse_request_head("POST / HTTP/1.1\r\nContent-Length: #{value}\r\n\r\n".to_slice)
+        expect_raises(Gori::Error) { Body.request_framing(req) }
+      end
     end
 
     it "rejects Transfer-Encoding + Content-Length coexistence (CL.TE/TE.CL smuggling)" do
@@ -333,6 +446,40 @@ describe Gori::Proxy::Codec::Body do
       folded = Http1.parse_response_head(
         "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Foo: bar\r\n continued\r\n\r\n".to_slice)
       Body.response_framing(folded, "GET").should eq({BodyFraming::Length, 5_i64})
+    end
+
+    # A head that ENDS on a bare-LF blank line is framed off its LF reading (RFC 9112 §2.2): a
+    # CRLF-only recipient never ends it, so the parties that can disagree are LF-lenient ones.
+    it "frames a clean bare-LF-terminated response by the headers its LF reading finds" do
+      lf = Http1.parse_response_head("HTTP/1.1 200 OK\nContent-Length: 5\nContent-Type: text/plain\n\n".to_slice)
+      Http1.framing_ambiguous?(lf.raw_head, lf.headers).should be_false
+      Body.response_framing(lf, "GET").should eq({BodyFraming::Length, 5_i64})
+      chunked = Http1.parse_response_head("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\n".to_slice)
+      Body.response_framing(chunked, "GET").should eq({BodyFraming::Chunked, 0_i64})
+      bare = Http1.parse_response_head("HTTP/1.1 200 OK\nContent-Type: text/plain\n\n".to_slice)
+      Body.response_framing(bare, "GET").should eq({BodyFraming::CloseDelimited, 0_i64})
+    end
+
+    it "still refuses a bare-LF-terminated response whose framing two lenient readers split on" do
+      # A lone CR hiding Transfer-Encoding, whitespace before the colon, and an obs-folded
+      # Content-Length: the LF reading and a CR/fold/whitespace-lenient one disagree on CL/TE.
+      ["HTTP/1.1 200 OK\nContent-Length: 0\nX-Foo: bar\rTransfer-Encoding: chunked\n\n",
+       "HTTP/1.1 200 OK\nContent-Length: 0\nTransfer-Encoding : chunked\n\n",
+       "HTTP/1.1 200 OK\nContent-Length:\n 5\n\n"].each do |head|
+        resp = Http1.parse_response_head(head.to_slice)
+        Http1.framing_ambiguous?(resp.raw_head, resp.headers).should be_true
+        expect_raises(Gori::Error) { Body.response_framing(resp, "GET") }
+      end
+    end
+
+    it "rejects a CRLFCRLF head a lenient recipient ends early, once it declares a body" do
+      # Both views read Content-Length: 5, but a lenient client ends the head at `\n\r\n` and
+      # frames five different bytes as the body.
+      resp = Http1.parse_response_head("HTTP/1.1 200 OK\r\nContent-Length: 5\n\r\nX: y\r\n\r\n".to_slice)
+      Http1.framing_ambiguous?(resp.raw_head, resp.headers).should be_true
+      expect_raises(Gori::Error) { Body.response_framing(resp, "GET") }
+      zero = Http1.parse_response_head("HTTP/1.1 200 OK\r\nContent-Length: 0\n\r\nX: y\r\n\r\n".to_slice)
+      Http1.framing_ambiguous?(zero.raw_head, zero.headers).should be_false
     end
 
     it "leaves an ordinary clean response untouched by the ambiguity check" do
@@ -508,6 +655,54 @@ describe "Body.stream reused buffers (perf: per-connection copy buffer + chunked
     dst.to_s.should eq(expected) # wire form forwarded byte-exact (framing + trailer intact)
     tee.to_s.should eq(expected)
     src.gets_to_end.should eq("NEXT") # next keep-alive message not consumed
+  end
+end
+
+# `parse_chunk_size` answers a bare hex size + CRLF/LF from the bytes and hands every other
+# line to the strict reader. It must never disagree with that reader: a line the strict one
+# refuses stays refused, and nothing it would parse one way is parsed another (P7).
+describe "Body.parse_chunk_size byte fast path" do
+  it "agrees with the strict reader on a hostile corpus" do
+    corpus = [
+      "0\r\n", "5\r\n", "5\n", "5", "5\r", "a\r\n", "A\r\n", "1f40\r\n", "1F40\n", "00005\r\n",
+      "fffffffffffffff\r\n", "FFFFFFFFFFFFFFF\n", "0000000000000005\r\n", "7fffffffffffffff\r\n",
+      "8000000000000000\r\n", "ffffffffffffffff\r\n", "000000000000000000000001\r\n",
+      "5;ext\r\n", "5;name=value\r\n", "5 ;ext\r\n", "5; ext\r\n", ";ext\r\n", "5;\r\n",
+      " 5\r\n", "5 \r\n", "\t5\r\n", "5\t\r\n", "5 5\r\n", "+5\r\n", "-5\r\n", "-0\r\n",
+      "0x5\r\n", "0X5\r\n", "5_0\r\n", "g\r\n", "5g\r\n", "", "\r\n", "\n", "\r", "\r\r\n",
+      "5\r\r\n", "5\n\n", "5\n\r", "\r5\r\n", "5\u00a0\r\n", "\u00a05\r\n", "5\u000b\r\n",
+      "5\u000c\r\n", "5\u0000\r\n", "\u00005\r\n",
+    ].map(&.to_slice)
+    corpus << Bytes[0x35, 0xff, 0x0d, 0x0a] << Bytes[0xef, 0xbb, 0xbf, 0x35, 0x0a]
+    corpus.each do |line|
+      Body.parse_chunk_size(line).should eq(Body.parse_chunk_size_strict(line)),
+        "diverged on #{String.new(line).inspect}"
+    end
+  end
+
+  it "reads the plain sizes the fast path answers" do
+    Body.parse_chunk_size("1f40\r\n".to_slice).should eq(0x1f40)
+    Body.parse_chunk_size("1F40\n".to_slice).should eq(0x1f40)
+    Body.parse_chunk_size("0\r\n".to_slice).should eq(0)
+    Body.parse_chunk_size("fffffffffffffff\r\n".to_slice).should eq(0xfffffffffffffff_i64)
+    Body.parse_chunk_size("+5\r\n".to_slice).should be_nil
+    Body.parse_chunk_size("\r\n".to_slice).should be_nil
+  end
+
+  it "agrees with the strict reader over random short lines" do
+    alphabet = "0123456789abcdefABCDEFgxX+-_; =\t\r\n".bytes + [0x00_u8, 0x0b_u8, 0xa0_u8, 0xff_u8]
+    rng = Random.new(0xc4c5)
+    hex = "0123456789abcdefABCDEF".bytes
+    ends = ["", "\n", "\r\n", "\r", "\r\r\n", "\n\n", " \r\n", ";x\r\n"]
+    5000.times do
+      line = Bytes.new(rng.rand(0..20)) { alphabet.sample(rng) }
+      Body.parse_chunk_size(line).should eq(Body.parse_chunk_size_strict(line)),
+        "diverged on #{String.new(line).inspect}"
+      # ...and lines shaped like the fast path's own, 0-17 hex digits around its 15 limit.
+      shaped = String.new(Bytes.new(rng.rand(0..17)) { hex.sample(rng) }) + ends.sample(rng)
+      Body.parse_chunk_size(shaped.to_slice).should eq(Body.parse_chunk_size_strict(shaped.to_slice)),
+        "diverged on #{shaped.inspect}"
+    end
   end
 end
 

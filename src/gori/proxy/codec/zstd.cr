@@ -9,11 +9,6 @@ module Gori::Proxy::Codec
     # HTTP streams decode instead of erroring.
     WINDOW_LOG_MAX = 100
 
-    # Decode a zstd stream, tolerant of truncation. `max_out` caps output (bomb guard).
-    def self.decode(input : Bytes, max_out : Int32) : Bytes
-      decode_full(input, max_out)[0]
-    end
-
     # :ditto: — plus whether the stream ENDED cleanly: every frame in it completed and every
     # input byte was consumed.
     #
@@ -84,7 +79,8 @@ module Gori::Proxy::Codec
 end
 
 {% unless flag?(:without_native_codecs) %}
-  @[Link(pkg_config: "libzstd")]
+  # The lib name is what MSVC links (`zstd.lib`); it ignores pkg-config.
+  @[Link("zstd", pkg_config: "libzstd")]
   lib LibZstd
     struct InBuffer
       src : Void*

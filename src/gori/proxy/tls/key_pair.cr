@@ -1,3 +1,4 @@
+require "base64"
 require "./ffi"
 
 module Gori::Proxy::Tls
@@ -49,7 +50,7 @@ module Gori::Proxy::Tls
       # and cannot protect is not a key to hand out.
       File.open(path, "w", perm: perm) { }
       File.chmod(path, perm)
-      bio = LibCrypto.bio_new_file(path, "w")
+      bio = LibCrypto.bio_new_file(path, "wb") # binary: a text-mode Windows fopen writes CRLF
       raise Gori::Error.new("BIO_new_file(#{path}) failed") if bio.null?
       begin
         ok = LibCrypto.pem_write_bio_privatekey(bio, @handle, Pointer(Void).null,
@@ -86,7 +87,8 @@ module Gori::Proxy::Tls
     end
 
     def write_pem(path : String) : Nil
-      bio = LibCrypto.bio_new_file(path, "w")
+      # Binary, so the file is byte-identical to `to_pem`: a text-mode Windows fopen writes CRLF.
+      bio = LibCrypto.bio_new_file(path, "wb")
       raise Gori::Error.new("BIO_new_file(#{path}) failed") if bio.null?
       begin
         raise Gori::Error.new("PEM_write_bio_X509 failed") if LibCrypto.pem_write_bio_x509(bio, @handle) != 1
@@ -120,6 +122,17 @@ module Gori::Proxy::Tls
       ptr = der.to_unsafe
       LibCrypto.i2d_x509(@handle, pointerof(ptr))
       der
+    end
+
+    # PEM encoding, byte-identical to what write_pem puts in a file (RFC 7468: base64 in
+    # 64-column lines between the CERTIFICATE labels), built from to_der so it needs no
+    # memory BIO.
+    def to_pem : String
+      String.build do |io|
+        io << "-----BEGIN CERTIFICATE-----\n"
+        Base64.strict_encode(to_der).each_char.each_slice(64) { |line| io << line.join << '\n' }
+        io << "-----END CERTIFICATE-----\n"
+      end
     end
 
     def finalize

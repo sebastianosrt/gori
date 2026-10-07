@@ -13,18 +13,20 @@ module Gori
       # Session management + the lens/format toggles are COMMON (reachable from every pane).
       r.register Verb::Definition.new(
         "cookie.new", "New session", "Open a fresh blank Cookie session sub-tab",
-        Verb::Scope::Cookie, available: in_cookie, mnemonic: 'n') { |ctx| ctx.cookie_new; nil }
+        Verb::Scope::Cookie, [Verb::Chord.new("n", ctrl: true)],
+        available: in_cookie, intent: :new, section: :subtab) { |ctx| ctx.cookie_new; nil }
       r.register Verb::Definition.new(
         "cookie.close", "Close session", "Close the active Cookie session (keeps at least one)",
-        Verb::Scope::Cookie, available: in_cookie, mnemonic: 'w') { |ctx| ctx.cookie_close; nil }
+        Verb::Scope::Cookie, [Verb::Chord.new("w", ctrl: true)],
+        available: in_cookie, intent: :close, section: :subtab) { |ctx| ctx.cookie_close; nil }
       r.register Verb::Definition.new(
         "cookie.toggle-mode", "Toggle decode/forge", "Flip between the DECODE and FORGE lenses",
         Verb::Scope::Cookie, [Verb::Chord.new("t", ctrl: true)],
-        available: in_cookie, mnemonic: 'e') { |ctx| ctx.cookie_toggle_mode; nil }
+        available: in_cookie, menu: :palette) { |ctx| ctx.cookie_toggle_mode; nil }
       r.register Verb::Definition.new(
         "cookie.cycle-format", "Cycle format", "Cycle the cookie format: auto / flask / rack / django",
         Verb::Scope::Cookie, [Verb::Chord.new("a", ctrl: true)],
-        available: in_cookie, mnemonic: 'a') { |ctx| ctx.cookie_cycle_format; nil }
+        available: in_cookie, menu: :palette) { |ctx| ctx.cookie_cycle_format; nil }
       r.register Verb::Definition.new(
         "cookie.cycle-algorithm", "Cycle Django algorithm", "Cycle the Django HMAC algorithm: sha256 / sha1",
         Verb::Scope::Cookie, available: in_cookie, mnemonic: 'g') { |ctx| ctx.cookie_cycle_algorithm; nil }
@@ -33,11 +35,11 @@ module Gori
         Verb::Scope::Cookie, available: in_cookie, mnemonic: 's') { |ctx| ctx.cookie_cycle_salt; nil }
       r.register Verb::Definition.new(
         "cookie.load-decoded", "Load decoded payload", "Seed the FORGE payload editor from the INPUT cookie's parts",
-        Verb::Scope::Cookie, available: in_cookie, mnemonic: 'l') { |ctx| ctx.cookie_load_decoded; nil }
+        Verb::Scope::Cookie, available: in_cookie, mnemonic: 'L') { |ctx| ctx.cookie_load_decoded; nil }
       r.register Verb::Definition.new(
         "cookie.clear", "Clear session", "Clear the cookie, payload, secret, and salt of the active session",
         Verb::Scope::Cookie, [Verb::Chord.new("l", ctrl: true)],
-        available: in_cookie, mnemonic: 'k') { |ctx| ctx.cookie_clear; nil }
+        available: in_cookie, intent: :clear_input, group: :danger) { |ctx| ctx.cookie_clear; nil }
 
       # Crack: reachable as `c` from a READ pane (INPUT-read / DECODED), where a bare letter
       # falls through to the keymap; in the editable panes `c` is a literal character. Also in
@@ -55,20 +57,21 @@ module Gori
       r.register Verb::Definition.new(
         "cookie.copy", "Copy", "Copy the selection, or the whole focused pane if nothing is selected",
         Verb::Scope::Cookie, [Verb::Chord.new("y"), Verb::Chord.new("y", ctrl: true)],
-        available: in_cookie_copy, mnemonic: 'y') { |ctx| ctx.cookie_copy; nil }
+        available: in_cookie_copy, intent: :copy) { |ctx| ctx.cookie_copy; nil }
 
-      # Copy the forged OUTPUT cookie — tagged :output (the FORGE result pane).
+      # Copy the forged OUTPUT cookie — tagged :output (the FORGE result pane). `C`, as on the
+      # JWT tab: `t` is a sub-tab strip letter.
       r.register Verb::Definition.new(
         "cookie.copy-cookie", "Copy forged cookie", "Copy the OUTPUT cookie to the clipboard",
-        Verb::Scope::Cookie, available: in_cookie, mnemonic: 't', section: :output) { |ctx| ctx.cookie_copy_output; nil }
+        Verb::Scope::Cookie, available: in_cookie, mnemonic: 'C', section: :output) { |ctx| ctx.cookie_copy_output; nil }
 
       # Sub-tab chip rename + content clone — tagged :subtab (mirrors JWT/Decoder).
       r.register Verb::Definition.new(
         "cookie.rename-subtab", "Rename subtab", "Rename the active session's sub-tab chip",
-        Verb::Scope::Cookie, available: in_cookie, mnemonic: 'r', section: :subtab) { |ctx| ctx.cookie_rename_subtab; nil }
+        Verb::Scope::Cookie, available: in_cookie, intent: :rename, section: :subtab) { |ctx| ctx.cookie_rename_subtab; nil }
       r.register Verb::Definition.new(
         "cookie.duplicate-subtab", "Duplicate subtab", "Open a new session with the same cookie + payload",
-        Verb::Scope::Cookie, available: in_cookie, mnemonic: 'd', section: :subtab) { |ctx| ctx.cookie_duplicate_subtab; nil }
+        Verb::Scope::Cookie, available: in_cookie, intent: :duplicate, section: :subtab) { |ctx| ctx.cookie_duplicate_subtab; nil }
 
       # Search + filter across sessions — tagged :tab (like jwt.find-subtab), so jumping never
       # needs Ctrl+digit. The two thresholds differ and must not share a lambda (see the JWT note).
@@ -76,10 +79,10 @@ module Gori
       has_many = ->(ctx : Verb::ExecContext) { ctx.current_tab == :cookie && ctx.subtab_search_count >= 2 }
       r.register Verb::Definition.new(
         "cookie.find-subtab", "Search sub-tabs", "Filter the open Cookie sessions and jump to one",
-        Verb::Scope::Cookie, available: has_any, mnemonic: 'f', section: :tab) { |ctx| ctx.subtab_search_open; nil }
+        Verb::Scope::Cookie, available: has_any, intent: :find_subtab, section: :tab) { |ctx| ctx.subtab_search_open; nil }
       r.register Verb::Definition.new(
         "cookie.filter-subtabs", "Filter sub-tabs", "Filter the Cookie sub-tab strip by name / cookie",
-        Verb::Scope::Cookie, available: has_many, mnemonic: '/', section: :tab) { |ctx| ctx.subtab_filter_open; nil }
+        Verb::Scope::Cookie, available: has_many, intent: :filter, section: :tab) { |ctx| ctx.subtab_filter_open; nil }
 
       # Sub-tab multi-select (#683). `t` marks a chip and `⇧T` marks the strip; ^W then
       # closes every marked one, `space ▸ r` sends them, and so on — the existing verbs
@@ -87,25 +90,32 @@ module Gori
       # `@focus == :subtabs` returns before the keymap, so a chord could never fire on the
       # strip, and it WOULD fire in the body, marking sub-tabs while the operator types.
       r.register Verb::Definition.new(
+        "cookie.subtab-mark", "Mark sub-tab", "Mark or unmark the active sub-tab (the strip's `t`) — the actions above then act on every marked one",
+        Verb::Scope::Cookie, available: subtab_mark_ready(:cookie), intent: :mark, section: :subtab) { |ctx| ctx.subtab_mark_toggle; nil }
+      r.register Verb::Definition.new(
         "cookie.subtab-mark-all", "Mark all sub-tabs", "Mark every session the sub-tab filter shows — the actions above then act on all of them",
-        Verb::Scope::Cookie, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :cookie && ctx.subtab_search_count >= 2 }, mnemonic: 'T', section: :subtab) { |ctx| ctx.subtab_mark_all; nil }
+        Verb::Scope::Cookie, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :cookie && ctx.subtab_search_count >= 2 }, intent: :mark_all, section: :subtab) { |ctx| ctx.subtab_mark_all; nil }
       r.register Verb::Definition.new(
         "cookie.subtab-mark-clear", "Clear marks", "Drop every sub-tab mark (esc on the strip does the same)",
-        Verb::Scope::Cookie, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :cookie && ctx.subtab_marked_count > 0 }, mnemonic: 'N', section: :subtab) { |ctx| ctx.subtab_mark_clear; nil }
+        Verb::Scope::Cookie, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :cookie && ctx.subtab_marked_count > 0 }, intent: :mark_clear, section: :subtab) { |ctx| ctx.subtab_mark_clear; nil }
 
       # Read-pane selection verbs (INPUT-read, DECODED, OUTPUT). Tagged :input for select-line
       # (the cookie pane is the one with a fine selection); send-to stays COMMON.
       r.register Verb::Definition.new(
         "cookie.select-line", "Select line", "Select the entire current line",
         Verb::Scope::Cookie, [Verb::Chord.new("x")],
-        available: in_cookie_read, mnemonic: 'x', section: :input) { |ctx| ctx.read_select_line; nil }
+        available: in_cookie_read, intent: :select_line, section: :input) { |ctx| ctx.read_select_line; nil }
       in_sel = ->(ctx : Verb::ExecContext) { ctx.current_tab == :cookie && ctx.read_selection_active? }
       r.register Verb::Definition.new(
         "cookie.clear-selection", "Clear selection", "Clear the text selection",
-        Verb::Scope::Cookie, available: in_sel, mnemonic: 'v', section: :input) { |ctx| ctx.read_clear_selection; nil }
+        Verb::Scope::Cookie, available: in_sel, intent: :clear_selection, section: :input) { |ctx| ctx.read_clear_selection; nil }
+      # Listed with no selection too, acting on the line under the cursor — see the `sendable`
+      # note in verbs/read_edit.cr for why every `S` reads this way now.
       r.register Verb::Definition.new(
         "cookie.send-to", "Send selection to…", "Send the selected text to another tool (Decoder, JWT, …)",
-        Verb::Scope::Cookie, available: in_sel, mnemonic: 'S') { |ctx| ctx.send_to_open; nil }
+        Verb::Scope::Cookie,
+        available: ->(ctx : Verb::ExecContext) { in_sel.call(ctx) || in_cookie_read.call(ctx) },
+        intent: :send_selection) { |ctx| ctx.send_to_open; nil }
     end
   end
 end

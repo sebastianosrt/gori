@@ -10,6 +10,33 @@ private alias SW = Gori::Tui::SetupWizard
 # the tallest step; these examples pin that derivation from BOTH sides, so a step that grows a
 # row can't quietly push the real floor past the advertised one again.
 describe Gori::Tui::SetupWizard do
+  # #1379: `-l`/`-p` bind this run only; the fields edit the saved default, so the step says so.
+  it "notes the address a -l/-p flag binds this run to, and nothing without one" do
+    SW.run_bind_note(nil, nil).should be_nil
+    SW.run_bind_note(nil, 18911).should eq("this run: :18911 (-p) · these set the default")
+    SW.run_bind_note("0.0.0.0", 18911).should eq("this run: 0.0.0.0:18911 (-l -p) · these set the default")
+    SW.run_bind_note("0.0.0.0", nil).should eq("this run: 0.0.0.0 (-l) · these set the default")
+  end
+
+  # Ctrl+digit carries no control character, so tmux and many terminals never deliver it:
+  # the recap must not promise a ^1-9 jump that may not land.
+  it "promises no Ctrl+digit jump in the Shortcuts recap" do
+    SW.modifier_recap("ctrl").should_not contain("1-9")
+    SW.modifier_recap("alt").should contain("⌥1-9")
+  end
+
+  it "names what each Ctrl chord does in the Shortcuts recap" do
+    SW.modifier_recap("ctrl").should eq("^P palette · ^N new · ^W close  (←/→ adds ⌥)")
+  end
+
+  it "keeps local and other-device guidance readable at the minimum width" do
+    inner = SW.card_w(SW::MIN_W, 64) - 6
+    hints = SW.bind_guidance(inner)
+    hints[0].should contain("127.0.0.1")
+    hints[1].should contain("0.0.0.0")
+    hints.each { |hint| Gori::Tui::Screen.draw_width(hint).should be <= inner }
+  end
+
   it "gives every fixed-layout step a card that fits at MIN_H" do
     {SW::BIND_ROWS, SW::COMPANION_ROWS, SW::REVIEW_ROWS}.each do |rows|
       # `rows + 3` = top border + pad row + content + bottom border, which is exactly the
@@ -47,6 +74,21 @@ describe Gori::Tui::SetupWizard do
     }.each do |(last_row, rows)|
       last_row.should be >= 2
       last_row.should be <= rows + 1
+    end
+  end
+
+  it "holds the floor at 15 rows" do
+    SW::MIN_H.should eq(15)
+  end
+
+  # The wizard no longer asks for a keyset; REVIEW names the saved one and where to change it.
+  # On an 80-column card that row must fit the value column (`recap`'s width) unclipped.
+  it "fits the Editor keys recap on an 80-column card" do
+    route = Gori::Verbs.registry["settings.keys"].title
+    route.should eq("Settings: Keys")
+    value_w = SW.card_w(80, 84) - 3 - 3 - ("Proxy default".size + 2) # right margin, ix, label column
+    Gori::Hotkeys::KEYSETS.each do |name|
+      Gori::Tui::Screen.draw_width(SW.keys_recap(name, route)).should be <= value_w
     end
   end
 
@@ -98,9 +140,9 @@ describe Gori::Tui::SetupWizard do
     it "seats her on a card that can hold the step's opening line beside her" do
       # 69 columns is the first width whose card leaves COMPANION_TEXT_MIN for the text, and 68 the
       # last that doesn't — the pair is what stops the constant from being quietly padded.
-      # COMPANION_TEXT_MIN is the width of that opening line ("A mascot in the corner, off unless
-      # you want her.", 48 columns) and is coupled to it BY HAND, so a reword of the sentence
-      # is a reason to revisit the constant and therefore these two numbers.
+      # COMPANION_TEXT_MIN is the width of that opening line ("A mascot in the corner, yours
+      # unless you say no.", 48 columns) and is coupled to it BY HAND, so a reword of the
+      # sentence is a reason to revisit the constant and therefore these two numbers.
       SW.companion_preview_x(private_box.call(69)).should_not be_nil
       SW.companion_preview_x(private_box.call(68)).should be_nil
       SW.companion_preview_x(private_box.call(80)).should_not be_nil

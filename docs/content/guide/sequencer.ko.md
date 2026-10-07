@@ -1,10 +1,11 @@
 +++
-title = "Sequencer"
+title = "토큰 무작위성 테스트"
 description = "세션 token, CSRF token, 리셋 코드의 무작위성을 예측 가능성 관점에서 등급 매기기."
 weight = 60
 
 [extra]
 group = "워크벤치"
+shot = "sequencer"
 +++
 
 session cookie, CSRF token, 비밀번호 리셋 코드, API key가 예측 가능하다면 공격자는 그것을 위조하거나 추측할 수 있습니다. **Sequencer**는 token 샘플을 수집해 실제로 얼마나 무작위한지 등급을 매깁니다. Burp Sequencer나 Caido Sequencer에 대응하는 gori의 도구입니다.
@@ -14,13 +15,13 @@ session cookie, CSRF token, 비밀번호 리셋 코드, API key가 예측 가능
   <figcaption>캡처한 플로우를 <strong>Sequencer</strong>로 보내면 session cookie를 자동으로 감지하고, 수집을 시작하기 전에 샘플 크기와 concurrency를 설정할 수 있습니다.</figcaption>
 </figure>
 
-**Sequencer** 탭은 기본적으로 숨겨져 있습니다. 탭 바의 `⋯` 메뉴나 커맨드 팔레트(`Ctrl-P` → **Go to Sequencer**)에서 드러내세요.
+**Sequencer** 탭은 기본적으로 바 밖에 있습니다. **`0`**을 누르고 "seq"를 입력하거나 커맨드 팔레트(`Ctrl-P` → **Go to Sequencer**)를 쓰세요. Preferences → **Network & Tabs** → **Tabs**에서 아홉 슬롯 중 하나를 내줄 수도 있습니다.
 
 ## 토큰을 넣는 두 가지 방법 {#two-ways-to-feed-it}
 
-**라이브.** 새 token을 발급하는 요청을 지정하면, gori가 그 요청을 여러 번 재전송하면서 각 응답에서 token을 뽑아냅니다. **History**에서 token을 설정하는 플로우를 선택하고 `Space` → **Send to Sequencer**를 고르면, gori가 유력한 session cookie를 자동으로 감지합니다. `c`(재설정)로 token 위치와 샘플 크기를 조정한 뒤, `Ctrl-R`로 수집을 시작하고 `Ctrl-X`로 멈춥니다.
+**라이브.** 새 token을 발급하는 요청을 지정하면, gori가 그 요청을 여러 번 재전송하면서 각 응답에서 token을 뽑아냅니다. **History**에서 token을 설정하는 플로우를 선택하고 `Space` `>` `s`(**Send flow to…** → **Send to Sequencer**)를 누르면, 유력한 session cookie를 자동 감지한 **SEND TO SEQUENCER** 카드가 현재 탭 위에 열립니다. 거기서 token 위치, 샘플 목표, 동시성을 정하고 **Start**를 누르면 탭을 떠나지 않은 채 백그라운드에서 수집합니다. Sequencer 탭에서는 `c`로 세션을 재설정하고, `Ctrl-R`로 다시 수집하고, `Ctrl-X`로 멈춥니다.
 
-**수동.** 이미 token 목록이 있나요? 한 줄에 하나씩 붙여넣으면 네트워크 트래픽 없이 순수하게 통계 분석만 수행합니다.
+**수동.** 이미 token 목록이 있나요? 텍스트 패널에서 선택하고(한 줄에 하나씩) `Space` `S`(**Send selection to…**) → `s` **Sequencer**를 누르면 네트워크 트래픽 없이 순수하게 통계 분석만 수행합니다. 다른 탭에서 보낼 때마다 새 수동 세션이 열리고, Sequencer 탭 안에서 대기 중인 수동 세션을 보고 있을 때 보내면 그 세션에 덧붙여 다시 분석합니다. 헤드리스에서는 `gori run sequence --tokens FILE`이 같은 일을 합니다.
 
 다음 위치 중 어디에서든 token을 추출할 수 있습니다:
 
@@ -36,7 +37,7 @@ session cookie, CSRF token, 비밀번호 리셋 코드, API key가 예측 가능
 
 ## 등급 읽기 {#reading-the-grade}
 
-핵심 지표는 bit 단위의 **effective entropy**입니다. 각 token이 실제로 지닌 예측 불가능성의 양을 샘플 전체에 걸쳐 측정한 보수적인 추정치입니다. 등급은 여기서 도출됩니다:
+핵심 지표는 bit 단위의 **effective entropy**입니다. 각 token이 실제로 지닌 예측 불가능성의 양을 샘플 전체에 걸쳐 측정한 보수적인 추정치입니다. 이것이 기본 등급을 정하고, 아래 통계 테스트 중 실패한 것 하나마다 한 단계씩 내려갑니다:
 
 | Rating | Effective entropy |
 |--------|-------------------|
@@ -51,13 +52,13 @@ session cookie, CSRF token, 비밀번호 리셋 코드, API key가 예측 가능
 
 ### 구조는 비밀이 아닙니다 {#structure-is-not-secret}
 
-실제 token에는 대개 뼈대가 있습니다. `sess_v1_` 같은 접두사, 버전 byte, base64 padding 같은 것들입니다. **Structure** 행은 샘플 전체에서 한 번도 변하지 않는 위치가 몇 개인지 보여주고, 모든 byte 단위 테스트는 그 다음부터 *변하는* 영역만 측정합니다.
+실제 token에는 대개 뼈대가 있습니다. `sess_v1_` 같은 접두사, 버전 byte, base64 padding 같은 것들입니다. **Structure** 행은 샘플 전체에서 한 번도 변하지 않는 위치가 몇 개인지 보여주고, 모든 byte 단위 테스트는 그 다음부터 *변하는* 영역만 측정합니다. UUIDv4의 variant nibble(`8`/`9`/`a`/`b`)처럼 알파벳의 일부 값만 오가는 위치는 부분 고정으로 보아 테스트에서 함께 제외하고, 추정치에는 그 위치에서 실제로 측정한 entropy만 더합니다.
 
 이 구분이 등급을 좌우합니다. `sess_v1_` 뒤에 무작위 hex 24자가 붙은 token은 접두사까지 세면 알파벳 크기가 19가 되는데, 이는 2의 거듭제곱이 아니므로 비트 테스트 전체가 "해당 없음"으로 꺼집니다. 그러면 chi-square와 압축 검사는 순전히 접두사 때문에 치우친 분포를 보고 실패합니다. 변하는 영역만 측정하면 같은 샘플이 원래 모습대로 나옵니다. lower-hex 알파벳에 전체 비트 테스트가 활성화되고 모든 행이 통과합니다.
 
 무작위 부분이 가변 길이 머리 뒤의 *접미사*인 token(`123-<random>`)이라면, gori는 per-position 창을 entropy가 더 많은 쪽 끝에 맞추므로 머리 부분이 추정치를 끌어내리지 않습니다.
 
-패널은 **CONFIG**(소스와 token 위치), **SAMPLES**(수집된 token), **ANALYSIS**(등급과 테스트별 분석)로 구성되며, 개별 샘플에 대한 상세 보기가 함께 제공됩니다.
+패널은 제목 없는 설정 카드(소스와 token 위치, 테두리에 `^R` RUN / `^X` STOP 배지), **SAMPLES**(수집된 token), **ANALYSIS**(등급과 테스트별 분석)로 구성되며, 개별 샘플을 보는 **TOKEN** 상세 보기가 함께 제공됩니다.
 
 ## 판정 결과 내보내기 {#getting-the-verdict-out}
 
@@ -66,8 +67,8 @@ session cookie, CSRF token, 비밀번호 리셋 코드, API key가 예측 가능
 | 동작 | 키 | 기록 대상 |
 |------|-----|-----------|
 | Export report | `⇧E` | 직접 지정한 경로의 Markdown 리포트 |
-| Export report (JSON) | 팔레트 | 동일한 리포트의 JSON |
-| File as issue | `Space` → `i` | Issues 탭의 Issue |
+| Export report (JSON) | 팔레트 (`Ctrl-P`) | 동일한 리포트의 JSON |
+| File as issue | `Space` → `a` | Issues 탭의 Issue |
 
 **File as issue**는 등급을 Issues 리포트에 기록하며 Critical은 `critical`, Weak은 `high`, Moderate는 `medium`, Secure는 `info`로 매핑합니다. Issue 본문에는 대상, token 디스크립터, entropy 수치, 전체 테스트 표가 담기고 근거로 시드가 된 플로우가 연결됩니다. 내보낸 파일과 Issue 어느 쪽에도 token 값은 들어가지 않습니다. 리포트는 빈도표와 판정만으로 만들어지므로 애초에 유출될 샘플이 들어 있지 않습니다.
 

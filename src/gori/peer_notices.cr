@@ -1,4 +1,6 @@
 require "./probe/mode"
+require "./env"
+require "./plural"
 require "./rule_set_change"
 require "./store"
 
@@ -86,23 +88,18 @@ module Gori
     # have to be remembered twice. Each surface is left with only its emitter.
     def absorb(rules : RuleSetChange?, extract : RuleSetChange?, now : Time::Instant, store : Store) : Nil
       return unless rules || extract
-      by_agent = PeerNotices.agent_wrote?(store, RULE_TOOLS)
-      record_rules(rules, now, by_agent) if rules
-      record_extract(extract, now, by_agent) if extract
+      record(now, PeerNotices.agent_wrote?(store, RULE_TOOLS), rules: rules, extract: extract)
     end
 
-    # A peer changed the Match&Replace rules this session rewrites live traffic with.
-    def record_rules(change : RuleSetChange, now : Time::Instant, by_agent : Bool = false) : Nil
-      @rules = (held = @rules) ? held.merge(change) : change
+    # A peer changed the Match&Replace rules this session rewrites live traffic with (`rules`),
+    # and/or the extract rules that decide what a binding token (`$BIND.NAME`, or bare `$NAME`)
+    # expands to at every send seam (`extract`).
+    def record(now : Time::Instant, by_agent : Bool = false, *,
+               rules : RuleSetChange? = nil, extract : RuleSetChange? = nil) : Nil
+      @rules = (held = @rules) ? held.merge(rules) : rules if rules
+      @extract = (held = @extract) ? held.merge(extract) : extract if extract
       # An agent anywhere in the burst names the burst. The alternative — the LAST writer wins —
       # would let one unattributed peer write erase the one fact worth carrying.
-      @by_agent ||= by_agent
-      @since ||= now
-    end
-
-    # A peer changed the extract rules that decide what `$KEY` expands to at every send seam.
-    def record_extract(change : RuleSetChange, now : Time::Instant, by_agent : Bool = false) : Nil
-      @extract = (held = @extract) ? held.merge(change) : change
       @by_agent ||= by_agent
       @since ||= now
     end
@@ -134,7 +131,12 @@ module Gori
       if (change = rules) && change.executes > 0
         return executes_notice(change, extract, by_agent)
       end
-      # ONE level for the whole line. A change that leaves nothing enabled cannot move a byte on
+      # A peer's map-local rule (#1237) is the next-loudest: it does not run anything, but it
+      # answers this operator's browser with files read off this machine's disk.
+      if (change = rules) && change.serves_files > 0
+        return serves_files_notice(change, extract, by_agent)
+      end
+      # ONE level for the whole line. A change that leaves no active rule cannot move a byte on
       # the wire, whatever just happened to the list — and the operator must not get a bell or no
       # bell depending only on whether the peer happened to touch one list or two.
       quiet = ((rules.try(&.enabled) || 0) + (extract.try(&.enabled) || 0)).zero?
@@ -148,7 +150,7 @@ module Gori
           "#{consequence(change, "rewriting live traffic here", "a different rule now wins on the same header")}"
         elsif change = extract
           "#{subject(change, "extract rule")} changed by #{author(by_agent)} — " \
-          "#{consequence(change, "$KEY may expand to a different value here", "they are read in a different order")}"
+          "#{consequence(change, "#{binding_token} may expand to a different value here", "they are read in a different order")}"
         else
           return nil
         end
@@ -161,20 +163,32 @@ module Gori
       one = change.executes == 1
       # `flush` has already taken and cleared BOTH held changes, so an extract change that
       # arrived in the same burst cannot be re-announced later — returning here without it
-      # would drop the "$KEY may expand to a different value" warning outright. It rides on
+      # would drop the "may expand to a different value" warning outright. It rides on
       # the end of this line instead: the pipe fact leads because it is the bigger one.
-      also = extract ? " (the extract rules moved too — $KEY may expand to a different value here)" : ""
+      also = extract ? " (the extract rules moved too — #{binding_token} may expand to a different value here)" : ""
       Notice.new(:warn,
-        "#{counted(change.executes, "Match&Replace pipe rule")} added or changed by " \
+        "#{Gori.plural(change.executes, "Match&Replace pipe rule")} added or changed by " \
         "#{author(by_agent)} — #{one ? "it runs" : "they run"} a local command " \
         "here, with your privileges, on every message #{one ? "it matches" : "they match"}#{also}",
+        :rewriter, by_agent)
+    end
+
+    # The map-local line — `executes_notice`'s shape, for a rule that reads local files.
+    private def serves_files_notice(change : RuleSetChange, extract : RuleSetChange?,
+                                    by_agent : Bool) : Notice
+      one = change.serves_files == 1
+      also = extract ? " (the extract rules moved too — #{binding_token} may expand to a different value here)" : ""
+      Notice.new(:warn,
+        "#{Gori.plural(change.serves_files, "Match&Replace map-local rule")} added or changed by " \
+        "#{author(by_agent)} — #{one ? "it answers" : "they answer"} matching requests with " \
+        "files from a directory on this machine#{also}",
         :rewriter, by_agent)
     end
 
     # What moved. A change that added, removed and edited NOTHING can only have moved in ORDER, and
     # a line reading "0 rules changed" would be both wrong and useless.
     private def subject(change : RuleSetChange, noun : String) : String
-      change.changed.zero? ? "#{noun} order" : counted(change.changed, noun)
+      change.changed.zero? ? "#{noun} order" : Gori.plural(change.changed, noun)
     end
 
     # What it means for the wire.
@@ -183,7 +197,7 @@ module Gori
     # burst that edited one rule AND moved another: the count then carries the edit and nothing
     # would carry the precedence move, which is the only thing that field was added for.
     private def consequence(change : RuleSetChange, live : String, reorder : String) : String
-      return "none are enabled, nothing on the wire" if change.enabled.zero?
+      return "none are active, nothing on the wire" if change.enabled.zero?
       return reorder if change.changed.zero?
       change.reordered ? "#{live}, and in a new order" : live
     end
@@ -194,8 +208,11 @@ module Gori
       by_agent ? "an agent" : "another session"
     end
 
-    private def counted(n : Int32, noun : String) : String
-      "#{n} #{noun}#{"s" if n != 1}"
+    # How a binding token is SPELLED on this install — `$BIND.NAME` under the namespaced syntax,
+    # `$NAME` under the legacy bare one. A notice that named the wrong grammar would point the
+    # operator at bytes their editor is not painting.
+    private def binding_token : String
+      Env.spell("NAME", Env::Namespace::Bind)
     end
 
     # A peer moved the project's probe mode and this session ADOPTED it — `@mode` is the

@@ -1,5 +1,6 @@
 require "./store"
 require "./token_extract"
+require "./redact/headers"
 
 module Gori
   # User-defined History columns (#819) — the model shared by the TUI list, the column editor,
@@ -60,10 +61,14 @@ module Gori
       [] of Store::DisplayColumn
     end
 
-    # Does this set need the message BODY? Answers whether a caller has to pay for the BLOBs at
-    # all — a head-only set is served by `Store#get_flow(body_max: 0)`-shaped reads.
-    def self.body_scoped?(columns : Array(Store::DisplayColumn)) : Bool
-      columns.any?(&.body_scoped?)
+    # Does this column extract a SENSITIVE header value (#1002)? A `cookie:` column is, whatever
+    # its selector: a named cookie's value is by construction a substring of the `Cookie` header
+    # every surface redacts. The three content-scoped kinds (`regex:`, `jsonpath:`, `position:`)
+    # are not: they can lift a credential out of any byte of the message and the descriptor
+    # cannot say whether they do. Its home is here, beside the descriptors, because the CLI
+    # (`gori run history`) and MCP (`list_history{columns}`) both mask on it.
+    def self.sensitive?(c : Store::DisplayColumn) : Bool
+      c.kind.cookie? || (c.kind.header? && Redact.sensitive_header?(c.selector))
     end
 
     # A column set with its regexes already compiled — the shape every row loop should hold.

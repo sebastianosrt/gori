@@ -2,10 +2,11 @@ require "../tab_controller"
 require "../history_view"
 require "./history_search"
 require "../clipboard"
-require "../url"
+require "../../url"
 require "../../hotkeys"
 require "../../protobuf/reflection"
 require "../../protobuf/schemas"
+require "../../plural"
 
 module Gori::Tui
   # The History tab: the live flow list + the in-frame detail drill-in. The detail
@@ -21,6 +22,8 @@ module Gori::Tui
       super(host)
       @history = history
       @history.set_scope(@host.session.scope)
+      @history.set_registry(@host.session.registry)
+      @history.set_hide_static(StaticAsset.hidden?(@host.session.store))
       @history.set_colormarker(@host.session.colormarker)
       reload_columns
       @query_reload_at = nil.as(Time::Instant?)
@@ -89,19 +92,32 @@ module Gori::Tui
       @history.querying? ? :editor : :body
     end
 
+    # Display… rows (#1274). Pretty, whitespace and the static lens are the shell's
+    # (`Runner#menu_state`); Columns… opens an editor and has no state.
+    def menu_state(verb_id : String) : String?
+      case verb_id
+      when "history.toggle-follow" then SpaceMenu.on_off(@history.follow?)
+      when "detail.toggle-hex"     then SpaceMenu.on_off(@history.hex_view?)
+      when "detail.toggle-unicode" then SpaceMenu.on_off(@history.unicode_decoded?)
+      end
+    end
+
     def render_body(screen : Screen, rect : Rect, focus : Symbol) : Nil
       body_focused = focus == :body
       @history.reveal = @host.reveal? # propagate the global whitespace-reveal pref
       @history.pretty = @host.pretty? # propagate the global pretty-print pref
       # List (optionally + bottom Req/Res preview) or full detail drill-in.
       proxy = @host.session.proxy
-      if @host.overlay == :detail
+      # `detail_shown?`, not `overlay == :detail`: a card over the flow (^P, a form) keeps it
+      # drawn behind, not the list it would close onto.
+      if @host.detail_shown?
         # Two-level detail focus: the STRIP (chip row) vs the BODY. When the strip holds
         # focus the frame greys and the caret/selection stand down (gated on `focused`),
         # while the active chip lights a gold pill (strip_focused).
         strip_here = body_focused && @history.detail_strip_focus?
         body_here = body_focused && !@history.detail_strip_focus?
-        BodyChrome.framed(screen, rect, body_here) { |inner| @history.render_detail(screen, inner, focused: body_here, strip_focused: strip_here) }
+        @history.step_keys = step_key_labels
+        BodyChrome.framed(screen, rect, body_here) { |inner| @history.render_drill(screen, inner, body_here, strip_here) }
       else
         # The list's user-defined columns (#819) read flow bytes for the rows they are about to
         # draw, and the list holds no store of its own — same seam, and same reason, as the
@@ -113,6 +129,15 @@ module Gori::Tui
             listen: {proxy.host, proxy.port}, capturing: @host.session.capturing?)
         end
       end
+    end
+
+    # The effective chords for the item step, read from the keymap so the rail's gutter and
+    # the crumb's chip move when they are rebound. Each half comes from its OWN verb: a
+    # derived label (⇧ + whatever `next` is bound to) lies the moment only one is rebound.
+    private def step_key_labels : {String, String}
+      reg = @host.session.registry
+      {Hotkeys.binding_label(reg, "detail.next-item", DrillIn::NEXT_KEY),
+       Hotkeys.binding_label(reg, "detail.prev-item", DrillIn::PREV_KEY)}
     end
 
     # Called after settings:layout save so the preview cache matches the new pref.
@@ -155,14 +180,34 @@ module Gori::Tui
     # read cursor pins it to the first text row, which is what an upward drag means.
     private def detail_text_rect(rect : Rect) : Rect?
       # The view owns the derivation: it is the side that also draws the footer strip under
-      # the text, and the strip's height is what this rect must stop above.
-      @history.detail_text_rect(rect.inset(1, 1))
+      # the text, and the strip's height is what this rect must stop above. `detail_body_rect`
+      # is the other half — the text sits under the LIST RAIL when one fits, so an `inset`
+      # alone would hit-test three rows above where the body was drawn.
+      @history.detail_text_rect(@history.detail_body_rect(rect.inset(1, 1)))
     end
 
     # A click inside the detail drill-in: the pane chips, then the mode chips (both on the
     # strip rows), then the text. Lifted out of `handle_click`, which carries the LIST arm as
     # well and was over ameba's complexity ceiling with a third condition on this ladder.
     private def click_detail(rect : Rect, inner : Rect, mx : Int32, my : Int32) : Nil
+      rail = @history.rail_rect(inner)
+      inner = @history.detail_body_rect(inner)
+      # The crumb's `‹` — a real button now. First arm, because it rides a row nothing else
+      # in the drill-in claims (the frame's top edge, or the rail's divider), and because
+      # "leave" must win over any pane hit-test a stray column might also match.
+      if (c = @history.detail_crumb) && Frame.crumb_hit_rect(inner, c).try(&.contains?(mx, my))
+        @host.focus_body
+        close_detail
+        return
+      end
+      # A rail row: open THAT flow, staying in the drill-in. The rail shows the list, so a
+      # click on it means what a click on the list means — with the one difference that you
+      # are already inside an item, so it opens rather than merely selecting.
+      if i = DrillIn.rail_row_at(rail, mx, my)
+        @host.focus_body
+        detail_step_item(i - @history.rail_cursor)
+        return
+      end
       if pane = @history.detail_pane_at(inner, mx, my)
         @history.set_detail_pane_public(pane)
         @history.set_detail_focus(:strip) # a chip click parks focus on the strip
@@ -171,11 +216,7 @@ module Gori::Tui
       if mode = @history.detail_mode_at(inner, mx, my)
         @host.focus_body
         @history.set_detail_focus(:strip) # the mode chips live on the strip row too
-        case mode
-        when :hex    then @history.toggle_detail_hex
-        when :ws     then @host.toggle_reveal
-        when :pretty then @host.toggle_pretty
-        end
+        toggle_detail_mode(mode)
         return
       end
       # `detail_text_rect`, not a second Rect built here: that helper's own comment says it
@@ -198,8 +239,18 @@ module Gori::Tui
       @history.detail_click_to_cursor(body, mx, my, focused: true)
     end
 
+    private def toggle_detail_mode(mode : Symbol) : Nil
+      case mode
+      when :hex     then @history.toggle_detail_hex
+      when :ws      then @host.toggle_reveal
+      when :pretty  then @host.toggle_pretty
+      when :unicode then @history.toggle_unicode_decoding
+      end
+    end
+
     # The filter bar row. Its right cluster's chips do exactly what their own chords do —
-    # ⇧S flips the scope lens, `f` follow, `v` opens the view picker — and the field left of
+    # `s` flips the scope lens, the `⌁follow` chip toggles follow (menu-only since F3 took
+    # bare `f` back), `v` opens the view picker — and the field left of
     # them opens for editing like `/`. A chip that is a READOUT rather than a control (the row
     # count, the mark count) still consumes the click: it is chrome, not a list row, and
     # falling through would move the selection out from under the pointer.
@@ -213,6 +264,7 @@ module Gori::Tui
         when :scope  then @host.toggle_scope_lens
         when :follow then toggle_follow
         when :view   then @host.open_history_view_picker
+        when :static then @host.toggle_static_assets
         end
         return true
       end
@@ -295,7 +347,7 @@ module Gori::Tui
       if pane = @history.preview_pane_at(rect.inset(1, 1), mx, my)
         @history.wheel_preview(pane, step)
       else
-        @history.move(step)
+        @history.move_list(step)
       end
       true
     end
@@ -304,6 +356,12 @@ module Gori::Tui
     # layout is active. Runs BEFORE the Body keymap, so the esc branch shadows
     # body.to-menu ONLY while marks are set — with none set, esc still pops to the tab bar.
     # (The QL bar claims every key ahead of this while it's up, so filter-esc is unaffected.)
+    # The `/` query bar. The shell routes its keys itself (handle_query_key, above the digit
+    # arm), but the gate has to agree with it or a typed `3` would jump tabs on its way there.
+    def body_takes_text? : Bool
+      @history.querying?
+    end
+
     def handle_body_key(ev : Termisu::Event::Key) : Bool
       return false if @host.overlay == :detail
       return false if ev.ctrl? || ev.alt?
@@ -355,21 +413,35 @@ module Gori::Tui
       @history.detail_strip_focus? ? handle_detail_strip_key(ev) : handle_detail_body_key(ev)
     end
 
-    # STRIP level: the chip row acts as a focusable sub-tab strip. ←/→ switch panes
-    # (clamped at both ends — no auto-close), ↓/↵/j descend into the body, ↑/k pop out
-    # (close detail → the tab bar). esc/Tab/toggles fall through (return false).
+    # STRIP level: the chip row acts as a focusable sub-tab strip. → switches panes, ←
+    # walks back and LEAVES at the first one, ↓/↵/j descend into the body, ↑/k pop out to
+    # the list. esc/Tab/toggles fall through (return false).
+    #
+    # ↑ used to close the detail AND jump to the TAB BAR, skipping the list the drill-in
+    # came from — two levels on one press, from a strip whose own ←/→ are tab-switch keys
+    # one level up. It copied `handle_subtabs_key`, which is right for a strip that IS a
+    # sibling of the tab bar and wrong for one nested under a list.
     private def handle_detail_strip_key(ev : Termisu::Event::Key) : Bool
       return false if ev.ctrl? || ev.alt?
       key = ev.key
       case
-      when key.left?, key.lower_h?             then @history.detail_pane_advance(-1)
+      when key.left?, key.lower_h?             then detail_pane_back
       when key.right?, key.lower_l?            then @history.detail_pane_advance(1)
       when key.down?, key.lower_j?, key.enter? then @history.set_detail_focus(:body)
-      when key.up?, key.lower_k?               then close_detail; @host.request_focus(:menu)
+      when key.up?, key.lower_k?               then close_detail
       else
         return false
       end
       true
+    end
+
+    # ← on the chip strip: walk back a pane, and at the FIRST pane leave for the list.
+    # It used to clamp and do nothing there — a dead key under a border that said `‹ list`,
+    # while Issues and Probe both closed on ←. One arrow, three tabs, three meanings; the
+    # register comment above the pane verbs ("neither ever closes the detail") documented
+    # the divergence rather than resolving it.
+    private def detail_pane_back : Nil
+      move_detail_pane(-1)
     end
 
     # BODY level: caret move + shift-selection (all four directions, incl. horizontal
@@ -430,15 +502,15 @@ module Gori::Tui
       true
     end
 
-    def detail_selection_active? : Bool
+    def selection_active? : Bool
       @history.detail_selection?
     end
 
-    def detail_select_line : Nil
+    def select_line : Nil
       @history.detail_select_line
     end
 
-    def detail_clear_selection : Nil
+    def clear_selection : Nil
       @history.detail_clear_selection
     end
 
@@ -446,16 +518,34 @@ module Gori::Tui
       reg = @host.session.registry
       repeater = Hotkeys.binding_label(reg, "history.repeater", "^R")
       issue = Hotkeys.binding_label(reg, "issue.create", "⇧F")
-      follow = Hotkeys.binding_label(reg, "history.toggle-follow", "f")
       filter = Hotkeys.binding_label(reg, "history.query", "/")
       intercept = Hotkeys.binding_label(reg, "intercept.toggle", "i")
       if @host.overlay == :detail
+        # Each level names the key that leaves FROM HERE, and only that key. ← really does
+        # go back from the strip (it walks panes and then leaves at the first one) and really
+        # does not from the body, where the caret owns it — so the body's line says `esc`
+        # alone. Naming a key that does nothing from where you are is the defect the old
+        # ` ‹ list ` border chip had.
+        # Dropped whole, not greyed, when there is nowhere to step — see DrillIn::Host's
+        # `step_available?`. A hint that names every key a scope COULD have is how the old
+        # ` ‹ list ` chip came to point at a key that did nothing.
+        nx, pv = step_key_labels
+        step = @history.step_available? ? "#{nx}/#{pv} flow · " : ""
+        # `^R repeater` in BOTH detail lines. It fires from either level — the strip ladder
+        # declines every ctrl chord and the body ladder does too, so the keymap gets it — and
+        # it was named in neither, at 132 columns or at 240. The measured cost was two keys:
+        # the operator walked ↑/← back to the LIST to reach the one key that already worked
+        # where they were standing.
         if @history.detail_strip_focus?
-          return "←/→ panes · ↓/↵ enter · ↑ tabs · ↹ pane · space cmds · esc back"
+          return "←/→ panes · ↓/↵ enter · #{step}↑/← list · #{repeater} repeater · ↹ pane · space cmds · esc back"
         end
         nav = @history.detail_navigable? ? "↑/↓ move · ←/→ caret" : "↑/↓ scroll"
         dy = Hotkeys.binding_label(reg, "detail.copy", "y")
-        return "#{nav} · ⇧arrows select · #{dy} copy · ↑ strip · ↹ pane · space cmds · esc back"
+        # `x select` beside the copy token. It is the key that makes the selection the space
+        # menu's `S Send selection to…` acts on, and it lived only in the menu: the route from
+        # a response to the Decoder began with a key nothing on screen named.
+        dx = Hotkeys.binding_label(reg, "detail.select-line", "x")
+        return "#{nav} · ⇧arrows select · #{dx} select · #{dy} copy · #{repeater} repeater · #{step}↑ strip · ↹ pane · space cmds · esc back"
       end
       return "type query · ↹ complete · ↵ apply · esc clear" if @history.querying?
       # #898 gave this list `d` and `⇧X` and named neither here. `⇧X` is the one that goes in:
@@ -472,7 +562,7 @@ module Gori::Tui
         return "↑/↓ scroll preview · ↹ list · ↵ open full · #{clear} clear · space cmds · esc tabs" if @history.preview_focus != :list
         return "↑/↓ move · ↵ open · ↹ preview · #{repeater} repeater · #{filter} filter · #{clear} clear · space cmds · esc tabs"
       end
-      "↑/↓ move · ↵ open · #{repeater} repeater · #{issue} issue · #{follow} follow · #{clear} clear · #{filter} filter · #{intercept} hold-mode · space cmds · esc tabs"
+      "↑/↓ move · ↵ open · #{repeater} repeater · #{issue} issue · #{clear} clear · #{filter} filter · #{intercept} intercept · space cmds · esc tabs"
     end
 
     # Live IME composition only flows to the QL filter bar (the one text field).
@@ -491,12 +581,17 @@ module Gori::Tui
 
     def on_enter : Nil
       reload_columns
+      @history.forget_all_row_memos
+      # The same reason as the view below: a peer clear while the operator sat on another tab
+      # reaches `on_external_change` only on the tab that was active.
+      @history.prune_reused_marks(@host.session.store, full: true)
       # Re-resolve BEFORE the reload, and not only in `on_external_change`: the runner
       # dispatches that to `@tabs[@active_tab]` alone, so a peer deleting the active view while
       # the operator sat on another tab left History filtering by a view that no longer exists —
       # no status line, and no `●` on any picker row to explain it.
       had = @history.active_view
       lost = resolve_active_view
+      sync_hide_static
       @history.reload(@host.session.store) # catch peer captures while we were elsewhere
       if had && @history.active_view.nil?
         @lost_view_key = nil
@@ -510,8 +605,16 @@ module Gori::Tui
       end
     end
 
+    # The hide-static lens as the project stores it. Re-read on entry and on a peer's change for
+    # the reason the view is: another gori on this project may have flipped it (#1239).
+    private def sync_hide_static : Nil
+      @history.set_hide_static(StaticAsset.hidden?(@host.session.store))
+    end
+
     def on_external_change : Nil
       reload_columns
+      @history.forget_all_row_memos
+      @history.prune_reused_marks(@host.session.store)
       # A peer can create, edit or DELETE a view between frames — through the CLI, through MCP,
       # or from another gori against the same project. Re-resolving here (rather than only at
       # construction) is what keeps the chip and the list agreeing with the stores.
@@ -526,6 +629,7 @@ module Gori::Tui
       if had && @history.active_view.nil?
         @host.status("the #{had.name} view is gone — showing All")
       end
+      sync_hide_static
       refresh_search
       @history.refresh_detail(@host.session.store) if @host.overlay == :detail # peer filled the open flow
     end
@@ -533,58 +637,7 @@ module Gori::Tui
     # --- QL filter bar (a text sub-mode; the shell claims it before the focus ring) ---
     # Returns true (swallows) — mirrors the old `return handle_query_key(ev)`.
     def handle_query_key(ev : Termisu::Event::Key) : Bool
-      key = ev.key
-      c = ev.char || key.to_char
-      store = @host.session.store
-      return true if query_nav(ev)
-      case
-      when key.enter?  then query_enter
-      when key.escape? then query_escape(store)
-      when key.tab?    then (@history.query_complete; schedule_query_reload)
-      when key.backspace? then @history.query_backspace; schedule_query_reload
-      # Above the printable arm below, which would otherwise type the `?` (see ql_help_key?).
-      when TabController.ql_help_key?(ev, @history.query) then @host.open_help_query(:history)
-      else
-        if c && !ev.ctrl? && !ev.alt?
-          @history.query_insert(c)
-          schedule_query_reload
-          @history.set_preedit("") # clear preedit on committed char
-        end
-      end
-      true
-    end
-
-    # ↵ with the dropdown open takes the highlighted candidate and SHUTS it — the same thing ↹
-    # does, except for the shutting, which is what lets the next ↵ reach `stop_query`. Closed, it
-    # is unchanged: apply the filter and leave edit mode.
-    # ↓/↑ drive the dropdown, ←/→ the caret. Handled ahead of the `case` below rather than as
-    # four more arms in it: the dropdown's two keys pushed `handle_query_key` past the complexity
-    # gate CI runs, and "move something" is a different question from "what does this key do".
-    # `↓`/`↑` were dead in this bar before the dropdown — a one-line field has no second row to
-    # move a caret to — which is why they could be claimed without displacing anything.
-    private def query_nav(ev : Termisu::Event::Key) : Bool
-      key = ev.key
-      case
-      when act = LineEdit.action(ev) # ⌃/⌥←→, Home/End, Delete, ⌥⌫ — before the bare arrows
-        @history.query_edit(act)
-        schedule_query_reload if LineEdit.mutating?(act)
-      when key.down?  then @history.popup_down
-      when key.up?    then @history.popup_up
-      when key.left?  then @history.query_move(-1)
-      when key.right? then @history.query_move(1)
-      else                 return false
-      end
-      true
-    end
-
-    private def query_enter : Nil
-      if @history.popup_open?
-        @history.query_complete(close: true)
-        schedule_query_reload
-      else
-        flush_query_reload
-        @history.stop_query
-      end
+      handle_ql_bar_key(ev, @history, :history) { query_escape(@host.session.store) }
     end
 
     # esc closes the DROPDOWN first and clears the filter only on a second press. Otherwise
@@ -611,7 +664,7 @@ module Gori::Tui
     end
 
     # Defer the filter reload until typing pauses (coalesces a burst into one search).
-    private def schedule_query_reload : Nil
+    protected def on_query_edit : Nil
       invalidate_search
       @query_reload_at = Time.instant + QUERY_DEBOUNCE
     end
@@ -665,6 +718,39 @@ module Gori::Tui
     def close_detail : Nil
       @host.request_overlay(:none)
       @history.close_detail
+    end
+
+    # `⇧N`/`⇧P` inside the drill-in: open the next/previous flow of the list behind WITHOUT
+    # going back to it.
+    #
+    # The drill-in had no way to step, so reading twenty rows meant `esc ↓ ↵` twenty times.
+    # That is most of what "going back is inconvenient" was measuring: not the cost of one
+    # exit, but paying a full exit and re-entry for every row. The crumb's `12/123` is this
+    # verb's affordance — a position readout is what makes "there is a next one" visible.
+    #
+    # Carries the pane you were reading (`open_detail` resets it), and does nothing at the
+    # ends of the list: `move` clamps, so a step that changed no row must not re-open the
+    # same flow and throw away its scroll position.
+    def detail_step_item(delta : Int32) : Nil
+      return unless @host.overlay == :detail
+      # Anchored on the flow the detail HAS OPEN, not on the list cursor: live capture
+      # advances the cursor under follow while the drill-in stays put, so stepping from
+      # `selected_index` walks away from whatever the tail happens to be showing.
+      here = @history.detail_row_index || return
+      target = here + delta
+      # Clamp and bail BEFORE touching the list: `select_row` re-seeds the ⇧-range mark
+      # anchor and drops the preview even when the index does not move, so a ⇧N at the end
+      # of the list would silently destroy a mark range the operator had built.
+      return if target < 0 || target >= @history.row_count
+      pane = @history.detail_pane
+      strip = @history.detail_strip_focus?
+      @history.select_row(target)
+      open_detail
+      @history.set_detail_pane_public(pane)
+      # …and the LEVEL, not just the pane. `open_detail_id` lands every open on the chip
+      # strip, so a step out of a response body used to put ↑/↓ back on pane-switching — and
+      # the very next ↑ leaves the drill-in entirely.
+      @history.set_detail_focus(strip ? :strip : :body)
     end
 
     def toggle_follow : Nil
@@ -745,20 +831,11 @@ module Gori::Tui
     # this runs once per frame, and `receive?` would park the UI fiber on an empty channel.
     def drain_reflection : Bool
       dirty = false
-      while done = nonblocking_reflection
+      while done = poll(@reflect_results)
         dirty = true
         apply_reflection(done)
       end
       dirty
-    end
-
-    private def nonblocking_reflection : ReflectDone?
-      select
-      when d = @reflect_results.receive
-        d
-      else
-        nil
-      end
     end
 
     private def apply_reflection(done : ReflectDone) : Nil
@@ -808,6 +885,56 @@ module Gori::Tui
       @history.primary_target_id
     end
 
+    # --- the MCP selection snapshot (#1091) -----------------------------------
+
+    def selection_kind : String?
+      "flow"
+    end
+
+    def list_selection_ident : SelectionIdent
+      # `Scope#active?` takes the scope mutex. Uncontended, and `HistoryView#chips` already
+      # calls it once per FRAME, so reading it on the 50 ms identity tick costs strictly less
+      # than one render per second — noted here so the next P6 audit need not re-derive it.
+      SelectionIdent.new(
+        marks: @history.mark_count,
+        cursor: @history.selected,
+        cursor_id: @history.selected_id || 0_i64,
+        rows: @history.row_count,
+        # `id`, never `key`: `SavedViews::View#key` INTERPOLATES (`"#{scope[0]}_#{id}"`), and
+        # this runs on the tick — the interpolated string this tuple exists to stop building.
+        # An id that collides across scopes is covered by `rows`, which a different view's
+        # row set moves.
+        view: @history.active_view.try(&.id) || "",
+        scoped: @host.session.scope.active?,
+        pinned: @host.detail_pinned_flow_id || 0_i64)
+    end
+
+    def write_selection_fields(j : JSON::Builder) : Nil
+      # An OPEN detail pins one flow and every detail verb acts on it rather than on the
+      # marks (Runner#history_target_flow_ids). Publishing the marks there would hand an
+      # agent a target set the keys on screen would not use.
+      if pinned = @host.detail_pinned_flow_id
+        TabController.write_id_targets(j, [pinned], marked: @history.mark_count,
+          hidden: @history.marked_hidden_count, source: "detail")
+        j.field "primary_id", pinned
+      else
+        TabController.write_id_targets(j, @history.target_ids, marked: @history.mark_count,
+          hidden: @history.marked_hidden_count)
+        @history.primary_target_id.try { |id| j.field "primary_id", id }
+      end
+      # The narrowing the operator is LOOKING at, so a selection too large to name is still
+      # reproducible from what is on their screen (list_history takes all three by these names).
+      j.field "visible_rows", @history.row_count
+      j.field "query", @history.query unless @history.query.blank?
+      @history.active_view.try { |v| j.field "view", v.name }
+      j.field "scope_lens", @host.session.scope.active?
+      j.field "hide_static", @history.hide_static? # list_history's own argument name
+    end
+
+    def mcp_mark_count : Int32
+      @history.mark_count
+    end
+
     def history_mark_toggle : Nil
       return @host.status("no flow to mark") unless @history.selected_id
       @history.toggle_mark
@@ -837,7 +964,7 @@ module Gori::Tui
       n = @history.mark_count
       return "no marks — verbs act on the cursor row" if n == 0
       hidden = @history.marked_hidden_count
-      msg = "#{n} flow#{n == 1 ? "" : "s"} marked"
+      msg = "#{Gori.plural(n, "flow")} marked"
       msg += " (#{hidden} not visible)" if hidden > 0
       msg
     end
@@ -954,38 +1081,28 @@ module Gori::Tui
       @history.scroll_detail(delta)
     end
 
-    # The open detail is scrolled/caret'd to its very top — the boundary where a further
-    # ↑ escapes up to the tab bar (Runner#scroll_detail reads this).
-    def detail_at_top? : Bool
-      @history.detail_at_top?
-    end
-
     # `y` in the detail: the selection when one is held, else the WHOLE pane. The fallback used
     # to be the caret's own LINE, which on a request/response dump is the one thing nobody
     # reaches for `y` to get — and it made this pane the last holdout against the rule every
     # other read pane follows (`Runner#read_copy`: selection if active, else the whole pane).
-    # `detail_selection_text` keeps the line fallback: "Send selection to" is gated on a live
+    # `selection_text` keeps the line fallback: "Send selection to" is gated on a live
     # selection, so its payload is never the fallback anyway.
     def detail_copy : Nil
       sel = @history.detail_selection?
       text = sel ? @history.detail_copy_text : @history.detail_copy_all
-      if text.empty?
-        @host.status("nothing to copy")
-        return
-      end
-      written = Clipboard.copy(text)
-      note = Clipboard.note(written, text)
-      @host.status(sel ? "copied #{written}b to clipboard#{note}" : "copied all (#{written}b)#{note}")
+      copy_text(text, sel ? nil : "all")
     end
 
     # The detail pane's selection (or current line) text without copying — "Send selection to".
-    def detail_selection_text : String
+    def selection_text : String
       @history.detail_copy_text
     end
 
     # The focus-aware "copy as X" menu for the open detail pane ({title, options}).
     def detail_copy_as_menu : {String, Array(CopyMenu::Option)}
-      @history.detail_copy_as_menu
+      # The store, for the same reason `list_copy_as_menu` hands one over: the redaction policy
+      # is half settings.json and half this project's own row, and the view holds neither.
+      @history.detail_copy_as_menu(Redact::Policy.ambient(@host.session.store))
     end
 
     # "Copy as…" over the list's effective target set (#442) — the Runner passes the ids so
@@ -1003,12 +1120,21 @@ module Gori::Tui
     # the STRIP level above does for the same keys: `handle_detail_strip_key` claims ←/h first,
     # so this verb only fires under a rebinding, and a rebound ← must not close the detail
     # when the stock one does not. esc/q are the way out.
+    # ←/→ between the detail's panes, and at the FIRST pane ← leaves for the list. Both the
+    # keymap verb (`detail.prev-pane`) and the chip strip's literal ← arm come through here,
+    # so a rebound prev-pane behaves like the arrow instead of clamping dead — the very key
+    # this contract exists to remove.
     def move_detail_pane(dir : Int32) : Nil
-      @history.detail_pane_advance(dir)
+      return if @history.detail_pane_advance(dir)
+      close_detail if dir < 0
     end
 
     def toggle_detail_hex : Nil
       @history.toggle_detail_hex
+    end
+
+    def toggle_unicode_decoding : Nil
+      @history.toggle_unicode_decoding
     end
   end
 end

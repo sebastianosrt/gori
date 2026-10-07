@@ -1,6 +1,20 @@
 require "./spec_helper"
 
 describe Gori::Proto do
+  describe ".websocket?" do
+    it "recognises both lightweight row shapes that emit WebSocket message updates" do
+      Gori::Proto.websocket?(101, nil).should be_true
+      Gori::Proto.websocket?(200, "websocket").should be_true
+      Gori::Proto.websocket?(204, "WebSocket").should be_true
+    end
+
+    it "rejects a refused or non-WebSocket extended CONNECT" do
+      Gori::Proto.websocket?(403, "websocket").should be_false
+      Gori::Proto.websocket?(200, "connect-udp").should be_false
+      Gori::Proto.websocket?(200, nil).should be_false
+    end
+  end
+
   describe ".classify" do
     it "classifies a 101 upgrade as WebSocket (status wins over any type)" do
       Gori::Proto.classify(101, nil, nil, nil).should eq(Gori::Proto::Kind::Ws)
@@ -17,6 +31,8 @@ describe Gori::Proto do
     it "classifies SSE by Content-Type, tolerating charset params" do
       Gori::Proto.classify(200, "text/event-stream", nil, nil).should eq(Gori::Proto::Kind::Sse)
       Gori::Proto.classify(200, "text/event-stream; charset=utf-8", nil, nil).should eq(Gori::Proto::Kind::Sse)
+      Gori::Proto.classify(200, "text/event-streaming", nil, nil).should eq(Gori::Proto::Kind::Http)
+      Gori::Proto.classify(200, "text/event-streamx", nil, nil).should eq(Gori::Proto::Kind::Http)
     end
 
     it "treats everything else — including a pending/typeless flow — as HTTP" do

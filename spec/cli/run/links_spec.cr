@@ -1,5 +1,32 @@
 require "../../spec_helper"
 
+private def cli_run_method_source(path : String, method : String) : String
+  source = File.read(File.join(__DIR__, "../../../src/gori/cli/run", path))
+  tail = source[source.index!("private def self.#{method}")..]
+  next_method = tail.index("\n      private def self.", 1) || tail.size
+  tail[0, next_method]
+end
+
+describe "gori run evidence-link help" do
+  it "keeps the shared example copy-pasteable" do
+    Gori::CLI::Run::EVIDENCE_LINK_HELP.should eq(
+      "See also — attach flow/repeater/fuzz/miner evidence to an issue:\n" \
+      "  gori run links add --owner=issue --id=ISSUE_ID --ref=repeater --ref-id=REPEATER_ID")
+  end
+
+  {
+    {"issues.cr", "cmd_issues_list"},
+    {"issues.cr", "cmd_issues_create"},
+    {"issues.cr", "cmd_issues_update"},
+    {"repeater.cr", "cmd_repeater_create"},
+    {"repeater.cr", "cmd_repeater_single"},
+  }.each do |path, method|
+    it "points #{method} at the shared links example" do
+      cli_run_method_source(path, method).should contain("EVIDENCE_LINK_HELP")
+    end
+  end
+end
+
 # `gori run links` — the evidence pointers an Issue or Note carries. Both ENDS are
 # validated before a link is filed: without that, `links add` would write an orphan row
 # pointing at nothing and still report success, and `links list` on a typo'd id would
@@ -14,23 +41,37 @@ private def seed_flow(store : Gori::Store) : Int64
 end
 
 # Private CLI glue — reopen the module for bare-call wrappers. (The `abort` branches of
-# resolve_link_ends / parse_link_id call `exit`, so only their success paths run here.)
+# resolve_link_ref / parse_id call `exit`, so only their success paths run here.)
 module Gori::CLI::Run
   def self.link_owner_exists_for_spec(store : Gori::Store, kind : Gori::Store::LinkOwnerKind, id : Int64) : Bool
     link_owner_exists?(store, kind, id)
   end
 
-  def self.link_ref_exists_for_spec(store : Gori::Store, kind : Gori::Store::LinkRefKind, id : Int64) : Bool
-    link_ref_exists?(store, kind, id)
+  def self.resolve_link_ref_for_spec(verb : String, ref_s : String?,
+                                     ref_id : Int64?) : {Gori::Store::LinkRefKind, Int64}
+    resolve_link_ref(verb, ref_s, ref_id)
   end
 
-  def self.resolve_link_ends_for_spec(verb : String, owner_id : Int64?, ref_s : String?,
-                                      ref_id : Int64?) : {Int64, Gori::Store::LinkRefKind, Int64}
-    resolve_link_ends(verb, owner_id, ref_s, ref_id)
+  def self.parse_id_for_spec(v : String, flag : String) : Int64
+    parse_id(v, "gori run links", flag)
   end
 
-  def self.parse_link_id_for_spec(v : String, flag : String) : Int64
-    parse_link_id(v, flag)
+  def self.parse_link_note_position_for_spec(v : String) : Int32
+    parse_link_note_position(v)
+  end
+
+  def self.resolve_link_owner_id_for_spec(store : Gori::Store, kind : Gori::Store::LinkOwnerKind,
+                                          owner_id : Int64?, note_position : Int32?) : Int64
+    resolve_link_owner_id(store, kind, owner_id, note_position, "links")
+  end
+
+  def self.link_add_for_spec(store : Gori::Store, owner_kind : Gori::Store::LinkOwnerKind, oid : Int64,
+                             ref_kind : Gori::Store::LinkRefKind, rid : Int64, format : Symbol) : String
+    link_add(store, owner_kind, oid, ref_kind, rid, format)
+  end
+
+  def self.link_row_json_for_spec(r : Links::Resolved) : String
+    JSON.build { |j| j.object { link_row_fields(j, r) } }
   end
 end
 
@@ -47,14 +88,18 @@ describe "gori run links — flag parsing" do
     Gori::Store::LinkRefKind.parse("issue").should be_nil # an issue is an OWNER, never a ref
   end
 
-  it "returns the {owner id, ref kind, ref id} triple when all three are given" do
-    Gori::CLI::Run.resolve_link_ends_for_spec("add", 4_i64, "repeater", 9_i64)
-      .should eq({4_i64, Gori::Store::LinkRefKind::Repeater, 9_i64})
+  it "returns the ref kind and ref id when both are given" do
+    Gori::CLI::Run.resolve_link_ref_for_spec("add", "repeater", 9_i64)
+      .should eq({Gori::Store::LinkRefKind::Repeater, 9_i64})
   end
 
   it "parses a plain integer id, including a large one" do
-    Gori::CLI::Run.parse_link_id_for_spec("42", "--id").should eq(42_i64)
-    Gori::CLI::Run.parse_link_id_for_spec("9007199254740993", "--ref-id").should eq(9_007_199_254_740_993_i64)
+    Gori::CLI::Run.parse_id_for_spec("42", "--id").should eq(42_i64)
+    Gori::CLI::Run.parse_id_for_spec("9007199254740993", "--ref-id").should eq(9_007_199_254_740_993_i64)
+  end
+
+  it "parses a positive 1-based note position" do
+    Gori::CLI::Run.parse_link_note_position_for_spec("2").should eq(2)
   end
 end
 
@@ -80,17 +125,55 @@ describe "gori run links — end validation" do
     end
   end
 
-  it "checks each ref kind against its own table" do
+  it "resolves a displayed note position to its stable id and still accepts the id" do
+    with_store do |store|
+      store.set_setting("notes.docs",
+        Gori::Notes.serialize(0, [Gori::Notes::NoteEntry.new(2_i64, "B")], 3_i64))
+      kind = Gori::Store::LinkOwnerKind::Note
+      Gori::CLI::Run.resolve_link_owner_id_for_spec(store, kind, nil, 1).should eq(2_i64)
+      Gori::CLI::Run.resolve_link_owner_id_for_spec(store, kind, 2_i64, nil).should eq(2_i64)
+    end
+  end
+end
+
+# `links add --format json` (#1117): the link's `links list --format json` row plus `created`.
+# A pair that was already linked is the desired end state, not a failure — it answers
+# `created: false` with THAT link's id, the row the next listing shows.
+describe "gori run links add --format json" do
+  it "prints the new link's listing row with created: true, then false for the same pair" do
     with_store do |store|
       fid = seed_flow(store)
-      rid = store.insert_repeater("https://api.test", "GET / HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
+      iid = store.insert_issue("finding", Gori::Store::Severity::Low, "api.test", nil)
+      owner, ref = Gori::Store::LinkOwnerKind::Issue, Gori::Store::LinkRefKind::Flow
 
-      Gori::CLI::Run.link_ref_exists_for_spec(store, Gori::Store::LinkRefKind::Flow, fid).should be_true
-      Gori::CLI::Run.link_ref_exists_for_spec(store, Gori::Store::LinkRefKind::Repeater, rid).should be_true
-      # A flow id is NOT a repeater id: the kinds must not fall through to a shared lookup.
-      Gori::CLI::Run.link_ref_exists_for_spec(store, Gori::Store::LinkRefKind::Fuzz, fid).should be_false
-      Gori::CLI::Run.link_ref_exists_for_spec(store, Gori::Store::LinkRefKind::Miner, rid).should be_false
-      Gori::CLI::Run.link_ref_exists_for_spec(store, Gori::Store::LinkRefKind::Flow, 99_999_i64).should be_false
+      first = JSON.parse(Gori::CLI::Run.link_add_for_spec(store, owner, iid, ref, fid, :json))
+      first["created"].as_bool.should be_true
+      first["ref_kind"].as_s.should eq("flow")
+      first["ref_id"].as_i64.should eq(fid)
+      link_id = first["id"].as_i64
+      link_id.should eq(store.link_id(owner, iid, ref, fid))
+
+      listed = JSON.parse(Gori::CLI::Run.link_row_json_for_spec(
+        Gori::Links.resolve_all(store, store.list_links(owner, iid)).find! { |r| r.link.id == link_id }))
+      first.as_h.keys.should eq(listed.as_h.keys + ["created"])
+      first.as_h.reject("created").should eq(listed.as_h)
+
+      again = JSON.parse(Gori::CLI::Run.link_add_for_spec(store, owner, iid, ref, fid, :json))
+      again["created"].as_bool.should be_false
+      again["id"].as_i64.should eq(link_id)
+      store.list_links(owner, iid).size.should eq(1)
+    end
+  end
+
+  it "keeps both text sentences unchanged" do
+    with_store do |store|
+      fid = seed_flow(store)
+      iid = store.insert_issue("finding", Gori::Store::Severity::Low, "api.test", nil)
+      owner, ref = Gori::Store::LinkOwnerKind::Issue, Gori::Store::LinkRefKind::Flow
+      Gori::CLI::Run.link_add_for_spec(store, owner, iid, ref, fid, :text)
+        .should eq("Linked issue ##{iid} → flow ##{fid}.")
+      Gori::CLI::Run.link_add_for_spec(store, owner, iid, ref, fid, :text)
+        .should eq("Issue ##{iid} was already linked to flow ##{fid}.")
     end
   end
 end
@@ -100,3 +183,46 @@ end
 # duplicated here. What is CLI-specific is the validation above: `links list` refuses an
 # unknown owner instead of printing "no links on issue #99999", which would read as "this
 # issue has no evidence" rather than "there is no such issue".
+
+# `Store#add_link` answers nil both for "already linked" and for a write that did not commit,
+# and the text used to call the second one "already linked" — a link that did not exist. The
+# command now reads the row back and refuses when there is none.
+private def with_contended_links_store(&)
+  path = File.tempname("gori-links-contended", ".db")
+  store = Gori::Store.open(path, busy_timeout_ms: 1)
+  peer = DB.open("sqlite3:#{path}?journal_mode=wal&busy_timeout=1")
+  begin
+    yield store, peer
+  ensure
+    peer.close rescue nil
+    store.close
+    {path, "#{path}-wal", "#{path}-shm", "#{path}.open.lock"}.each { |f| File.delete?(f) }
+  end
+end
+
+describe "gori run links add — a write that did not commit" do
+  it "has no row to report, so there is no sentence to print" do
+    with_contended_links_store do |store, peer|
+      iid = store.insert_issue("t", Gori::Store::Severity::Low, nil, nil)
+      lock = peer.checkout
+      created = begin
+        lock.exec("BEGIN IMMEDIATE")
+        store.add_link(Gori::Store::LinkOwnerKind::Issue, iid, Gori::Store::LinkRefKind::Flow, 5_i64)
+      ensure
+        lock.exec("ROLLBACK") rescue nil
+        lock.release rescue nil
+      end
+      created.should be_nil
+      linked = store.list_links(Gori::Store::LinkOwnerKind::Issue, iid).any? { |l| l.ref_id == 5_i64 }
+      linked.should be_false
+      Gori::CLI::Run.link_add_sentence(created, linked, Gori::Store::LinkOwnerKind::Issue, iid,
+        Gori::Store::LinkRefKind::Flow, 5_i64).should be_nil
+    end
+  end
+
+  it "still tells a new link from an existing one" do
+    owner, ref = Gori::Store::LinkOwnerKind::Issue, Gori::Store::LinkRefKind::Flow
+    Gori::CLI::Run.link_add_sentence(9_i64, true, owner, 1_i64, ref, 2_i64).not_nil!.should start_with("Linked")
+    Gori::CLI::Run.link_add_sentence(nil, true, owner, 1_i64, ref, 2_i64).not_nil!.should contain("already linked")
+  end
+end

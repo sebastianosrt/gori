@@ -247,7 +247,7 @@ describe Gori::Settings do
       Gori::Settings.upstream_proxy_ca_error("").should be_nil
       Gori::Settings.upstream_proxy_ca_error("/nonexistent/gori-spec/ca.pem").to_s
         .should contain("does not exist")
-      Gori::Settings.upstream_proxy_ca_error("/tmp").to_s.should contain("not a regular file")
+      Gori::Settings.upstream_proxy_ca_error(Dir.tempdir).to_s.should contain("not a regular file")
     end
 
     it "warns about the legacy spelling and about unverified proxy TLS, and refuses neither" do
@@ -267,6 +267,79 @@ describe Gori::Settings do
         Gori::Settings.upstream_proxy_warnings.should be_empty
       ensure
         Gori::Settings.upstream_proxy, Gori::Settings.upstream_proxy_insecure = prev
+      end
+    end
+
+    # The environment used to be the one route no surface named: `settings:network` rendered
+    # "None", the banner said nothing, and a malformed value refused every dial with the same
+    # silence (#1114). Named at startup, never with its credentials.
+    it "names an environment proxy that is in effect, and one that fails every dial closed" do
+      proxy_keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                    "http_proxy", "https_proxy", "all_proxy", "no_proxy"]
+      previous_env = proxy_keys.map { |key| {key, ENV[key]?} }
+      previous_proxy = Gori::Settings.upstream_proxy
+      previous_project_proxy = Gori::Settings.project_upstream_proxy
+      previous_rules = Gori::Settings.upstream_rules
+      begin
+        proxy_keys.each { |key| ENV.delete(key) }
+        Gori::Settings.upstream_proxy = ""
+        Gori::Settings.project_upstream_proxy = nil
+        Gori::Settings.upstream_rules = [] of Gori::Settings::UpstreamRule
+
+        ENV["HTTPS_PROXY"] = "http://alice:super-secret@corp.example:3128"
+        joined = Gori::Settings.upstream_proxy_warnings.join("\n")
+        joined.should contain("$HTTPS_PROXY")
+        joined.should contain("http proxy corp.example:3128")
+        joined.should contain("https origins")
+        joined.should_not contain("super-secret")
+        joined.should_not contain("alice")
+
+        ENV["HTTP_PROXY"] = "http://not a proxy:::"
+        joined = Gori::Settings.upstream_proxy_warnings.join("\n")
+        joined.should contain("$HTTP_PROXY")
+        joined.should contain("fails closed")
+        joined.should contain("http origin") # HTTPS_PROXY still covers https
+
+        # An explicit gori upstream shadows the variables, so there is nothing to announce.
+        Gori::Settings.upstream_proxy = "http://gori-proxy.test:8080"
+        Gori::Settings.upstream_proxy_warnings.join("\n").should_not contain("_PROXY")
+      ensure
+        previous_env.each do |key, value|
+          value ? (ENV[key] = value) : ENV.delete(key)
+        end
+        Gori::Settings.upstream_proxy = previous_proxy
+        Gori::Settings.project_upstream_proxy = previous_project_proxy
+        Gori::Settings.upstream_rules = previous_rules
+      end
+    end
+
+    it "warns when an environment-selected TLS proxy is not verified" do
+      proxy_keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                    "http_proxy", "https_proxy", "all_proxy", "no_proxy"]
+      previous_env = proxy_keys.map { |key| {key, ENV[key]?} }
+      previous_proxy = Gori::Settings.upstream_proxy
+      previous_insecure = Gori::Settings.upstream_proxy_insecure?
+      previous_project_proxy = Gori::Settings.project_upstream_proxy
+      previous_rules = Gori::Settings.upstream_rules
+      begin
+        proxy_keys.each { |key| ENV.delete(key) }
+        ENV["HTTPS_PROXY"] = "https://env-proxy.test:8443"
+        Gori::Settings.upstream_proxy = ""
+        Gori::Settings.project_upstream_proxy = nil
+        # `tls_proxy_configured?` answers from the rule table before it reaches the environment
+        # arm this example exercises — a leftover `http+tls` rule satisfied it vacuously.
+        Gori::Settings.upstream_rules = [] of Gori::Settings::UpstreamRule
+        Gori::Settings.upstream_proxy_insecure = true
+
+        Gori::Settings.upstream_proxy_warnings.join("\n").should contain("upstream_proxy_insecure is on")
+      ensure
+        previous_env.each do |key, value|
+          value ? (ENV[key] = value) : ENV.delete(key)
+        end
+        Gori::Settings.upstream_proxy = previous_proxy
+        Gori::Settings.upstream_proxy_insecure = previous_insecure
+        Gori::Settings.project_upstream_proxy = previous_project_proxy
+        Gori::Settings.upstream_rules = previous_rules
       end
     end
 
@@ -341,6 +414,34 @@ describe Gori::Settings do
       prev_home ? (ENV["GORI_HOME"] = prev_home) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(dir)
       Gori::Settings.upstream_proxy = ""
+    end
+  end
+
+  # Memory holds a blank for a non-string declaration, and a save that wrote that blank turned
+  # the refusal into DIRECT at the next start — after any unrelated network edit.
+  it "writes a non-string upstream_proxy back verbatim until it is reassigned" do
+    dir = File.tempname("gori-settings-upstream-keep")
+    Dir.mkdir_p(dir)
+    prev_home = ENV["GORI_HOME"]?
+    prev_port = Gori::Settings.bind_port
+    begin
+      ENV["GORI_HOME"] = dir
+      File.write(Gori::Settings.path, %({"network":{"upstream_proxy":8080}}))
+      Gori::Settings.load
+      Gori::Settings.bind_port = 9191
+      Gori::Settings.save.should be_true
+      JSON.parse(File.read(Gori::Settings.path))["network"]["upstream_proxy"].should eq(JSON::Any.new(8080_i64))
+
+      Gori::Settings.load
+      Gori::Settings.upstream_route("origin.test").invalid?.should be_true
+      Gori::Settings.upstream_proxy = "http://proxy.test:8080"
+      Gori::Settings.save.should be_true
+      JSON.parse(File.read(Gori::Settings.path))["network"]["upstream_proxy"].should eq("http://proxy.test:8080")
+    ensure
+      prev_home ? (ENV["GORI_HOME"] = prev_home) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(dir)
+      Gori::Settings.upstream_proxy = ""
+      Gori::Settings.bind_port = prev_port
     end
   end
 
@@ -457,6 +558,11 @@ describe Gori::Settings do
       Gori::Settings.load
       Gori::Settings.env_prefix.should eq("%")
       Gori::Settings.env_vars.should eq([{"HOST", "h.test"}, {"TOKEN", "t"}])
+      # The prefix is the SIGIL in both grammars and is orthogonal to `env.syntax`: this file
+      # names no syntax, so the grammar is bare (the absence rule) and the round trip is
+      # unchanged by the namespaces existing.
+      Gori::Settings.env_syntax.should eq(Gori::Env::Syntax::Bare)
+      Gori::Env.spell("HOST", Gori::Env::Namespace::Env).should eq("%HOST")
     ensure
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(dir)
@@ -717,15 +823,24 @@ describe Gori::Settings do
     end
   end
 
-  it "persists and reloads companion prefs; omits the section at factory defaults (false survives)" do
+  # Miss Ring SHIPS ON, so "off" is the answer that has to reach disk — under the old default
+  # it was written by OMITTING the section, which is exactly why flipping the default reaches
+  # an install that had already declined her (a deliberate one-off; see CHANGELOG). Both
+  # directions are pinned here: an explicit off survives a reload, and a file that says
+  # nothing about her does not take her away.
+  it "persists and reloads companion prefs; ships her on, so \"off\" is what reaches the file" do
+    Gori::Settings::DEFAULT_COMPANION.should be_true
+
     dir = File.tempname("gori-settings-companion")
     Dir.mkdir_p(dir)
     prev = ENV["GORI_HOME"]?
     prev_companion = {Gori::Settings.companion?, Gori::Settings.companion_placement,
-                      Gori::Settings.companion_motion, Gori::Settings.companion_notices?}
+                      Gori::Settings.companion_motion, Gori::Settings.companion_notices?,
+                      Gori::Settings.companion_replies}
     begin
       ENV["GORI_HOME"] = dir
       Gori::Settings.companion = true
+      Gori::Settings.companion_replies = "timed"
       Gori::Settings.companion_placement = "bar"
       Gori::Settings.companion_motion = "calm"
       Gori::Settings.companion_notices = false
@@ -736,8 +851,10 @@ describe Gori::Settings do
       Gori::Settings.companion_placement = "body"
       Gori::Settings.companion_motion = "lively"
       Gori::Settings.companion_notices = true
+      Gori::Settings.companion_replies = "hold"
       Gori::Settings.load
       Gori::Settings.companion?.should be_true
+      Gori::Settings.companion_replies.should eq("timed")
       Gori::Settings.companion_placement.should eq("bar")
       Gori::Settings.companion_motion.should eq("calm")
       Gori::Settings.companion_notices?.should be_false # a stored false survives the reload
@@ -752,11 +869,37 @@ describe Gori::Settings do
       Gori::Settings.load
       Gori::Settings.companion_placement.should eq(Gori::Settings::DEFAULT_COMPANION_PLACEMENT)
 
+      # ...and so does a hand-edited replies mode.
+      File.write(Gori::Settings.path, %({"companion":{"enabled":true,"replies":"forever"}}))
+      Gori::Settings.load
+      Gori::Settings.companion_replies.should eq(Gori::Settings::DEFAULT_COMPANION_REPLIES)
+
+      # An explicit OFF differs from the factory default now, so it is written out and read
+      # back — the answer someone gives once has to survive every later upgrade.
+      Gori::Settings.companion = false
+      Gori::Settings.companion_placement = Gori::Settings::DEFAULT_COMPANION_PLACEMENT
+      Gori::Settings.companion_motion = Gori::Settings::DEFAULT_COMPANION_MOTION
+      Gori::Settings.companion_notices = Gori::Settings::DEFAULT_COMPANION_NOTICES
+      Gori::Settings.save.should be_true
+      File.read(Gori::Settings.path).should contain(%("companion"))
+      Gori::Settings.companion = true # what the next process would start at
+      Gori::Settings.load
+      Gori::Settings.companion?.should be_false
+
+      # ...and a file that says NOTHING about her leaves her where a fresh process starts,
+      # which is on. `load` is tolerant of an absent section rather than resetting it, so the
+      # assignment below is the fresh-process value, not a shortcut around the assertion.
+      File.write(Gori::Settings.path, %({})) # a whole file that names no section at all
+      Gori::Settings.companion = Gori::Settings::DEFAULT_COMPANION
+      Gori::Settings.load
+      Gori::Settings.companion?.should be_true
+
       # Back to defaults → section omitted, so a default install's file stays quiet
       Gori::Settings.companion = Gori::Settings::DEFAULT_COMPANION
       Gori::Settings.companion_placement = Gori::Settings::DEFAULT_COMPANION_PLACEMENT
       Gori::Settings.companion_motion = Gori::Settings::DEFAULT_COMPANION_MOTION
       Gori::Settings.companion_notices = Gori::Settings::DEFAULT_COMPANION_NOTICES
+      Gori::Settings.companion_replies = Gori::Settings::DEFAULT_COMPANION_REPLIES
       Gori::Settings.save
       File.read(Gori::Settings.path).should_not contain(%("companion"))
     ensure
@@ -764,44 +907,36 @@ describe Gori::Settings do
       FileUtils.rm_rf(dir)
       Gori::Settings.companion, Gori::Settings.companion_placement = prev_companion[0], prev_companion[1]
       Gori::Settings.companion_motion, Gori::Settings.companion_notices = prev_companion[2], prev_companion[3]
+      Gori::Settings.companion_replies = prev_companion[4]
     end
   end
 
-  it "migrates the retired \"pet\" section to \"companion\" and drops it from the file" do
-    dir = File.tempname("gori-settings-companion-legacy")
+  # Pre-v0.3 upgrade shims are gone: the `pet` section, `decoder.sessions` and `rewriter.presets`
+  # are no longer read or migrated, but a file still carrying them must load, keep every other
+  # section, and save without crashing.
+  it "tolerates retired pet / decoder.sessions / rewriter.presets keys" do
+    dir = File.tempname("gori-settings-retired-keys")
     Dir.mkdir_p(dir)
     prev = ENV["GORI_HOME"]?
-    prev_companion = {Gori::Settings.companion?, Gori::Settings.companion_placement,
-                      Gori::Settings.companion_motion, Gori::Settings.companion_notices?}
     begin
       ENV["GORI_HOME"] = dir
-      # What a v0.1.x install left on disk.
-      File.write(Gori::Settings.path,
-        %({"pet":{"enabled":true,"placement":"bar","motion":"calm","notices":false}}))
+      Gori::Settings.decoder_chains = [] of {String, String}
+      Gori::Settings.rewriter_rules = [] of Gori::Settings::RewriterRule
+      File.write(Gori::Settings.path, %({"theme":"goridark","pet":{"enabled":true},) +
+                                      %("decoder":{"sessions":[{"input":"tok","chain":"base64"}],"chains":[{"name":"h","spec":"md5"}]},) +
+                                      %("rewriter":{"presets":[{"name":"strip csp","pattern":"x"}]}}))
       Gori::Settings.load
-      Gori::Settings.companion?.should be_true
-      Gori::Settings.companion_placement.should eq("bar")
-      Gori::Settings.companion_motion.should eq("calm")
-      Gori::Settings.companion_notices?.should be_false
-
-      # The next save writes the new name and clears the old one — without the explicit drop
-      # the 3-way merge reads "pet" as a section this process never touched and keeps disk's.
+      Gori::Settings.theme.should eq("goridark")
+      Gori::Settings.decoder_chains.should eq([{"h", "md5"}])
+      Gori::Settings.rewriter_rules.should be_empty
       Gori::Settings.save.should be_true
       saved = File.read(Gori::Settings.path)
-      saved.should contain(%("companion"))
-      saved.should_not contain(%("pet"))
-
-      # Both names present = the file has already been migrated once; the current one wins.
-      File.write(Gori::Settings.path,
-        %({"pet":{"enabled":false},"companion":{"enabled":true,"motion":"calm"}}))
-      Gori::Settings.load
-      Gori::Settings.companion?.should be_true
-      Gori::Settings.companion_motion.should eq("calm")
+      saved.should contain("goridark")
+      saved.should contain("md5")
     ensure
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(dir)
-      Gori::Settings.companion, Gori::Settings.companion_placement = prev_companion[0], prev_companion[1]
-      Gori::Settings.companion_motion, Gori::Settings.companion_notices = prev_companion[2], prev_companion[3]
+      Gori::Settings.decoder_chains = [] of {String, String}
     end
   end
 
@@ -904,6 +1039,41 @@ describe Gori::Settings do
     end
   end
 
+  # No file at load time left the merge with no base, so the first save wrote this process's
+  # state WHOLE over a file a peer had created since — a `gori mcp` started on a fresh home erased
+  # the wizard's theme and bind the moment it saved anything.
+  it "merges with a file a peer created after a load that found none" do
+    dir = File.tempname("gori-settings-nofile")
+    Dir.mkdir_p(dir)
+    prev = ENV["GORI_HOME"]?
+    prev_theme = Gori::Settings.theme
+    prev_mouse = Gori::Settings.mouse
+    begin
+      ENV["GORI_HOME"] = dir
+      Gori::Settings.theme = "goriday"
+      Gori::Settings.bind_port = 8070
+      Gori::Settings.load
+      File.exists?(Gori::Settings.path).should be_false
+      Gori::Settings.load_degraded?.should be_false
+
+      File.write(Gori::Settings.path, %({"theme":"dracula","network":{"bind_port":9999}}))
+
+      Gori::Settings.mouse = !prev_mouse
+      Gori::Settings.save.should be_true
+
+      Gori::Settings.load
+      Gori::Settings.theme.should eq("dracula")
+      Gori::Settings.bind_port.should eq(9999)
+      Gori::Settings.mouse.should eq(!prev_mouse) # and this process's own change landed
+    ensure
+      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(dir)
+      Gori::Settings.theme = prev_theme
+      Gori::Settings.mouse = prev_mouse
+      Gori::Settings.bind_port = 8070
+    end
+  end
+
   it "does not clobber a concurrent writer's change on a SECOND save with no intervening load" do
     dir = File.tempname("gori-settings-merge2")
     Dir.mkdir_p(dir)
@@ -1002,6 +1172,28 @@ describe Gori::Settings do
     end
   end
 
+  # The same promise when the file breaks AFTER a clean load: a hand edit left a trailing comma
+  # while a TUI was running, and that TUI's next save replaces the file.
+  it "keeps a .corrupt copy of a file that broke after load before saving over it" do
+    dir = File.tempname("gori-settings-corrupt-late")
+    Dir.mkdir_p(dir)
+    prev = ENV["GORI_HOME"]?
+    prev_theme = Gori::Settings.theme
+    begin
+      ENV["GORI_HOME"] = dir
+      File.write(Gori::Settings.path, %({"theme":"goriday"}))
+      Gori::Settings.load
+      broken = %({"theme":"dracula",})
+      File.write(Gori::Settings.path, broken)
+      Gori::Settings.save.should be_true
+      File.read("#{Gori::Settings.path}.corrupt").should eq(broken)
+    ensure
+      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(dir)
+      Gori::Settings.theme = prev_theme
+    end
+  end
+
   it "preserves a recoverable .corrupt copy when the settings file is unparseable" do
     dir = File.tempname("gori-settings-corrupt")
     Dir.mkdir_p(dir)
@@ -1073,6 +1265,53 @@ describe Gori::Settings do
       Gori::Settings.save.should be_true
     ensure
       Gori::Settings.warning_io = nil # spec_helper's default: never on the suite's STDERR
+      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(dir)
+      Gori::Settings.theme = prev_theme
+      Gori::Settings.bind_port = 8070
+    end
+  end
+
+  # The same refusal for a file that is there and could not be READ at all — EACCES on a
+  # settings.json a `sudo gori` left root-owned. Nothing of it reached memory, the merge has no
+  # base, and the directory is still the operator's, so `DurableFile`'s rename landed a factory
+  # document on top of a file gori never opened — on the very first save of the session, which
+  # the project picker's update check makes on every launch. `reset_to_factory` already refused
+  # here; the ordinary save did not. A 0000 file stages the read failure under one uid.
+  it "refuses to write over a settings file it could not read" do
+    dir = File.tempname("gori-settings-unreadable")
+    Dir.mkdir_p(dir)
+    prev = ENV["GORI_HOME"]?
+    prev_theme = Gori::Settings.theme
+    sink = IO::Memory.new
+    begin
+      ENV["GORI_HOME"] = dir
+      Gori::Settings.warning_io = sink
+      Gori::Settings.reset_load_warning_guard
+      original = %({"theme":"dracula","network":{"bind_port":9999}})
+      File.write(Gori::Settings.path, original)
+      File.chmod(Gori::Settings.path, 0o000)
+      # Root reads through a 0000 mode, so there is no read failure to stage.
+      next if File::Info.readable?(Gori::Settings.path)
+
+      Gori::Settings.load
+      Gori::Settings.load_degraded?.should be_true
+      Gori::Settings.load_warning.not_nil!.should contain(Gori::Settings.path)
+      sink.to_s.should contain("will not overwrite")
+
+      Gori::Settings.theme = "goriday"
+      Gori::Settings.save.should be_false
+      File.chmod(Gori::Settings.path, 0o600)
+      File.read(Gori::Settings.path).should eq(original) # still the operator's file
+
+      # A load that can read it again clears the refusal.
+      Gori::Settings.load
+      Gori::Settings.load_degraded?.should be_false
+      Gori::Settings.load_warning.should be_nil
+      Gori::Settings.save.should be_true
+    ensure
+      File.chmod(Gori::Settings.path, 0o600) rescue nil
+      Gori::Settings.warning_io = nil
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(dir)
       Gori::Settings.theme = prev_theme
@@ -1189,7 +1428,7 @@ describe Gori::Settings do
         ENV.delete("VISUAL"); ENV["EDITOR"] = "nano"
         Gori::Settings.editor_command.should eq(["nano"])
         ENV.delete("EDITOR")
-        Gori::Settings.editor_command.should eq(["vi"])
+        Gori::Settings.editor_command.should eq([{{ flag?(:win32) ? "notepad" : "vi" }}])
       ensure
         v ? (ENV["VISUAL"] = v) : ENV.delete("VISUAL")
         e ? (ENV["EDITOR"] = e) : ENV.delete("EDITOR")
@@ -1321,7 +1560,6 @@ describe Gori::Settings do
     prev = ENV["GORI_HOME"]?
     begin
       ENV["GORI_HOME"] = dir
-      Gori::Settings.decoder_sessions = [] of {String, String, String}
       Gori::Settings.decoder_chains = [{"hash", "base64 > sha256"}, {"enc", "url-encode"}]
       Gori::Settings.save.should be_true
       Gori::Settings.decoder_chains = [] of {String, String}
@@ -1359,54 +1597,6 @@ describe Gori::Settings do
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(dir)
       Gori::Settings.decoder_chains = [] of {String, String}
-      Gori::Settings.decoder_sessions = [] of {String, String, String}
-    end
-  end
-
-  # Open sub-tabs moved to the per-project store; settings.json only still READS a
-  # pre-upgrade block so DecoderController can adopt it once. Saving must never write one
-  # back — that block is exactly what carried one project's decoded material into the next.
-  it "reads a legacy Decoder sessions block but never writes one back" do
-    dir = File.tempname("gori-settings-decoder-sessions")
-    Dir.mkdir_p(dir)
-    prev = ENV["GORI_HOME"]?
-    begin
-      ENV["GORI_HOME"] = dir
-      Gori::Settings.decoder_chains = [] of {String, String}
-      File.write(Gori::Settings.path,
-        %({"decoder":{"sessions":[{"input":"in1","chain":"base64","name":"first"},{"input":"in2","chain":"hex > upper"}]}}))
-      Gori::Settings.load
-      Gori::Settings.decoder_sessions.should eq([{"in1", "base64", "first"}, {"in2", "hex > upper", ""}])
-
-      # save no longer SERIALIZES sessions, but it cannot erase what disk already has: an
-      # unserialized section reads as "unchanged" to the 3-way merge and yields to the copy on
-      # disk. That gap is exactly why the migration needs its own eraser.
-      File.write(Gori::Settings.path,
-        %({"theme":"goridark","decoder":{"sessions":[{"input":"tok","chain":"base64"}],"chains":[{"name":"h","spec":"md5"}]}}))
-      Gori::Settings.load
-      Gori::Settings.save.should be_true
-      File.read(Gori::Settings.path).includes?(%("sessions")).should be_true
-
-      Gori::Settings.drop_legacy_decoder_sessions.should be_true
-      after = File.read(Gori::Settings.path)
-      after.includes?(%("sessions")).should be_false
-      after.includes?(%("md5")).should be_true   # the named chains survive
-      after.includes?("goridark").should be_true # and so does every unrelated section
-      # a fresh process (empty property) finds nothing left to adopt from the erased file —
-      # the tolerant parser keeps the CURRENT value for an absent node, so clear it first
-      Gori::Settings.decoder_sessions = [] of {String, String, String}
-      Gori::Settings.load
-      Gori::Settings.decoder_sessions.should be_empty
-      Gori::Settings.decoder_chains.should eq([{"h", "md5"}])
-
-      # idempotent: a second pass (or a file that never had the block) is a no-op success
-      Gori::Settings.drop_legacy_decoder_sessions.should be_true
-      File.read(Gori::Settings.path).should eq(after)
-    ensure
-      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
-      FileUtils.rm_rf(dir)
-      Gori::Settings.decoder_chains = [] of {String, String}
-      Gori::Settings.decoder_sessions = [] of {String, String, String}
     end
   end
 
@@ -1417,19 +1607,11 @@ describe Gori::Settings do
     begin
       ENV["GORI_HOME"] = dir
       Gori::Settings.decoder_chains = [] of {String, String}
-      Gori::Settings.decoder_sessions = [] of {String, String, String}
-      Gori::Settings.save.should be_true
-      File.read(Gori::Settings.path).includes?("decoder").should be_false
-
-      # sessions no longer feed the block at all — even a non-blank legacy set (still in
-      # memory before the migration clears it) must not resurrect a "decoder" section
-      Gori::Settings.decoder_sessions = [{"secret-token", "base64-decode", "loot"}]
       Gori::Settings.save.should be_true
       File.read(Gori::Settings.path).includes?("decoder").should be_false
     ensure
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(dir)
-      Gori::Settings.decoder_sessions = [] of {String, String, String}
     end
   end
 
@@ -1486,7 +1668,7 @@ describe Gori::Settings do
       Gori::Settings.rewriter_rules.size.should eq(2)
 
       # Malformed rules tolerated: an entry with no pattern is dropped, an unknown enum label
-      # is CLAMPED rather than raised (`from_label` would raise, and load's blanket rescue
+      # is preserved rather than raised (`from_label` would raise, and load's blanket rescue
       # would turn one typo into a factory reset of every section), a missing `enabled` reads
       # as OFF, and a duplicated id is renumbered so every by-id mutation stays unambiguous.
       File.write(Gori::Settings.path, %({"rewriter":{"rules":[\
@@ -1497,11 +1679,12 @@ describe Gori::Settings do
       Gori::Settings.rewriter_rules.size.should eq(2)
       kept = Gori::Settings.rewriter_rules.first
       kept.name.should eq("ok")
-      kept.op.should eq("replace")
-      kept.part.should eq("head")
-      kept.target.should eq("request")
-      kept.match_kind.should eq("literal")
-      kept.to_rule.op.replace?.should be_true # the clamped labels really rebuild a rule
+      kept.op.should eq("nonsense")
+      kept.part.should eq("nope")
+      kept.target.should eq("sideways")
+      kept.match_kind.should eq("fuzzy")
+      kept.to_rule.op.replace?.should be_true # legacy projection is preserved
+      kept.to_rule.inert?.should be_true      # raw unknown labels keep it out of live traffic
       dup = Gori::Settings.rewriter_rules[1]
       dup.id.should_not eq(7_i64)
       dup.enabled.should be_false # no "enabled" key => OFF, never armed by a hand edit
@@ -1522,6 +1705,49 @@ describe Gori::Settings do
   # they ask `save`, so a refused save left the new/edited/deleted rule live in memory while
   # every caller was told the write did not commit: the TUI lists a rule its own toast says
   # was not added, and the proxy rewrites traffic with it.
+  # Same shape for the global OAST provider library, whose mutators dropped `save`'s answer
+  # entirely: a refused write stayed live under an "added provider" toast and was gone at the
+  # next start.
+  # The form saves a blank token as "none"; a hand-edited `""` must read the same, or a
+  # resumed session polls with an empty token instead of its own.
+  it "reads a blank global OAST provider token as no token" do
+    dir = File.tempname("gori-settings-oast-token")
+    Dir.mkdir_p(dir)
+    prev_home = ENV["GORI_HOME"]?
+    prev = Gori::Settings.oast_providers
+    begin
+      ENV["GORI_HOME"] = dir
+      File.write(Gori::Settings.path,
+        %({"oast_providers":[{"id":"p1","name":"n","kind":"interactsh","host":"o.test","token":""}]}))
+      Gori::Settings.load
+      Gori::Settings.oast_providers.first.token.should be_nil
+    ensure
+      prev_home ? (ENV["GORI_HOME"] = prev_home) : ENV.delete("GORI_HOME")
+      Gori::Settings.oast_providers = prev
+      FileUtils.rm_rf(dir)
+    end
+  end
+
+  describe "global OAST provider CRUD on a refused save" do
+    it "answers, and leaves the library as it was" do
+      prev = Gori::Settings.oast_providers
+      begin
+        with_refused_save do
+          seed = Gori::Settings::OastProvider.new("p1", "seed", "interactsh", "oast.test", nil, true)
+          Gori::Settings.oast_providers = [seed]
+
+          Gori::Settings.add_oast_provider("new", "interactsh", "x.test", nil).should eq("")
+          Gori::Settings.update_oast_provider("p1", "renamed", "interactsh", "y.test", nil).should be_false
+          Gori::Settings.set_oast_provider_enabled("p1", false).should be_false
+          Gori::Settings.delete_oast_provider("p1").should be_false
+          Gori::Settings.oast_providers.should eq([seed])
+        end
+      ensure
+        Gori::Settings.oast_providers = prev
+      end
+    end
+  end
+
   describe "global rewriter CRUD on a refused save" do
     it "does not leave the rule in the list when add reports 0" do
       with_refused_save do
@@ -1862,48 +2088,6 @@ describe Gori::Settings do
     end
   end
 
-  # The pre-upgrade preset library. A preset was INERT — it did nothing until loaded into a
-  # project — so it must not come back as a live rule in every project.
-  it "adopts legacy rewriter presets as DISABLED global rules" do
-    dir = File.tempname("gori-settings-rwlegacy")
-    Dir.mkdir_p(dir)
-    prev = ENV["GORI_HOME"]?
-    begin
-      ENV["GORI_HOME"] = dir
-      Gori::Settings.rewriter_rules = [] of Gori::Settings::RewriterRule
-      Gori::Settings.rewriter_next_rule_id = 1_i64
-      File.write(Gori::Settings.path, %({"rewriter":{"presets":[\
-{"id":"a1","name":"strip csp","pattern":"Content-Security-Policy","op":"remove_header","target":"response"},\
-{"id":"b2","name":"","pattern":"x"}]}}))
-      Gori::Settings.load
-      # The unnamed entry is dropped (a preset was addressed by name); the named one arrives OFF.
-      Gori::Settings.rewriter_rules.size.should eq(1)
-      adopted = Gori::Settings.rewriter_rules.first
-      adopted.name.should eq("strip csp")
-      adopted.enabled.should be_false
-      adopted.op.should eq("remove_header")
-
-      # In-memory and idempotent: a second load of the same file adopts the same one rule
-      # rather than appending a copy per launch.
-      Gori::Settings.load
-      Gori::Settings.rewriter_rules.size.should eq(1)
-
-      # The first save that touches the section replaces `presets` with `rules` outright —
-      # the 3-way merge sees the section change, so this process wins it.
-      Gori::Settings.set_rewriter_rule_enabled(adopted.id, true).should be_true
-      raw = File.read(Gori::Settings.path)
-      raw.includes?("presets").should be_false
-      raw.includes?("\"rules\"").should be_true
-      Gori::Settings.load
-      Gori::Settings.rewriter_rules.first.enabled.should be_true
-    ensure
-      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
-      FileUtils.rm_rf(dir)
-      Gori::Settings.rewriter_rules = [] of Gori::Settings::RewriterRule
-      Gori::Settings.rewriter_next_rule_id = 1_i64
-    end
-  end
-
   it "omits the rewriter key entirely when there are no global rules" do
     dir = File.tempname("gori-settings-norewriter")
     Dir.mkdir_p(dir)
@@ -1940,13 +2124,17 @@ describe Gori::Settings do
 
       # tolerant: non-array entry dropped, unparseable chord dropped, [] preserved
       File.write(Gori::Settings.path,
-        %({"hotkeys":{"os":"WINDOWS","bindings":{"a":"x","b":["ctrl-g","nope"],"c":[]}}}))
+        %({"hotkeys":{"os":"WINDOWS","bindings":{"a":"x","b":["ctrl-g","nope"],"c":[],"d":["ctl-y"]}}}))
       Gori::Settings.keymap_overrides = {} of String => Array(String)
       Gori::Settings.load
       Gori::Settings.keymap_os.should eq("windows")                 # normalized lowercase
       Gori::Settings.keymap_overrides.has_key?("a").should be_false # non-array dropped
       Gori::Settings.keymap_overrides["b"].should eq(["ctrl-g"])    # garbage label dropped
       Gori::Settings.keymap_overrides["c"].should eq([] of String)  # explicit unbind kept
+      # Every label garbage is NOT an unbind: kept raw, so the default stands (chord_overrides
+      # falls back) and the next save does not erase what the operator wrote.
+      Gori::Settings.keymap_overrides["d"].should eq(["ctl-y"])
+      Gori::Hotkeys.chord_overrides.has_key?("d").should be_false
 
       # a file with no "hotkeys" block keeps the in-memory defaults
       File.write(Gori::Settings.path, %({"theme":"goridark"}))
@@ -1960,6 +2148,39 @@ describe Gori::Settings do
       FileUtils.rm_rf(dir)
       Gori::Settings.keymap_os = "auto"
       Gori::Settings.keymap_overrides = {} of String => Array(String)
+    end
+  end
+
+  it "round-trips the editor keyset in the same block as the bindings" do
+    dir = File.tempname("gori-settings-keyset")
+    Dir.mkdir_p(dir)
+    prev = ENV["GORI_HOME"]?
+    begin
+      ENV["GORI_HOME"] = dir
+      Gori::Settings.editor_keyset = "vim"
+      Gori::Settings.save.should be_true
+      File.read(Gori::Settings.path).should contain(%("keyset": "vim"))
+
+      Gori::Settings.editor_keyset = "helix"
+      Gori::Settings.load
+      Gori::Settings.editor_keyset.should eq("vim")
+
+      # Unknown name → the shipped keyset, not an editor with no keys.
+      File.write(Gori::Settings.path, %({"hotkeys":{"os":"auto","keyset":"emacs"}}))
+      Gori::Settings.load
+      Gori::Settings.editor_keyset.should eq("helix")
+
+      # A hotkeys block written before keysets existed keeps the in-memory value, the way
+      # `command_modifier` does — it is read only WHEN PRESENT.
+      Gori::Settings.editor_keyset = "vim"
+      File.write(Gori::Settings.path, %({"hotkeys":{"os":"linux"}}))
+      Gori::Settings.load
+      Gori::Settings.editor_keyset.should eq("vim")
+    ensure
+      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(dir)
+      Gori::Settings.keymap_os = "auto"
+      Gori::Settings.editor_keyset = Gori::Settings::DEFAULT_EDITOR_KEYSET
     end
   end
 
@@ -2170,6 +2391,46 @@ describe Gori::Settings do
   # #538 — the ONE loader every surface that opens a project store calls. Session.open passes
   # bind: true (it listens), CLI::Run.open_store and the MCP bind path pass bind: false.
   describe ".load_project_network" do
+    # Nothing validates a row on the way OUT of the store — an older gori or a hand edit wrote
+    # it — so the read applies the floors the global section's load does: a 0 timeout was a
+    # zero-second dial on every request, and a port past 65535 failed every rebind.
+    it "reads out-of-range rows under the same floors as the global section" do
+      with_net_store do |store|
+        reset_net
+        store.set_setting(Gori::Settings::PROJECT_BIND_PORT_KEY, "99999")
+        store.set_setting(Gori::Settings::PROJECT_CONNECT_TIMEOUT_KEY, "0")
+        store.set_setting(Gori::Settings::PROJECT_IO_TIMEOUT_KEY, "-5")
+        store.set_setting(Gori::Settings::PROJECT_CAPTURE_MAX_KEY, "999999")
+
+        Gori::Settings.load_project_network(store, bind: true)
+
+        Gori::Settings.project_bind_port.should be_nil
+        Gori::Settings.effective_bind_port.should eq(8070)
+        Gori::Settings.effective_connect_timeout_secs.should eq(1)
+        Gori::Settings.effective_io_timeout_secs.should eq(1)
+        Gori::Settings.effective_capture_max_mib.should eq(Gori::Settings::MAX_CAPTURE_MAX_MIB)
+      ensure
+        reset_net
+      end
+    end
+
+    it "keeps the global bind port when the file holds one past 65535" do
+      dir = File.tempname("gori-settings-port")
+      Dir.mkdir_p(dir)
+      prev = ENV["GORI_HOME"]?
+      begin
+        reset_net
+        ENV["GORI_HOME"] = dir
+        File.write(Gori::Settings.path, %({"network":{"bind_port":99999}}))
+        Gori::Settings.load
+        Gori::Settings.bind_port.should eq(8070)
+      ensure
+        prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+        FileUtils.rm_rf(dir)
+        reset_net
+      end
+    end
+
     it "installs every key with bind: true, including the destination and proxy credentials" do
       with_net_store do |store|
         reset_net
@@ -2416,6 +2677,41 @@ describe Gori::Settings do
       end
     end
 
+    # The pane re-submits every field it displayed, so a save of the connect timeout also hands
+    # back the upstream it showed. A `gori run project network set upstream_proxy=` pin (dial
+    # DIRECT) beside a blank global equals the global, and folding it to "inherit" sent the
+    # project through `upstream_rules` instead — a routing change nobody asked for.
+    it "keeps a pin the pane re-submits unchanged, even when it equals the global" do
+      with_net_store do |store|
+        reset_net
+        previous_rules = Gori::Settings.upstream_rules
+        Gori::Settings.upstream_rules = [Gori::Settings::UpstreamRule.new("*", "http", "corp.test:3128")]
+        store.set_setting(Gori::Settings::PROJECT_UPSTREAM_KEY, "").should be_true
+        store.set_setting(Gori::Settings::PROJECT_IO_TIMEOUT_KEY, Gori::Settings.io_timeout_secs.to_s).should be_true
+        Gori::Settings.load_project_network(store, bind: true)
+        Gori::Settings.upstream_route("target.test").direct?.should be_true
+
+        config = Gori::Settings::ProjectNetworkConfig.new(
+          "127.0.0.1", 8070, "", nil, 7, Gori::Settings.io_timeout_secs, Gori::Settings.capture_max_mib
+        )
+        Gori::Settings.save_project_network(store, config).should be_true
+        store.setting(Gori::Settings::PROJECT_UPSTREAM_KEY).should eq("")
+        store.setting(Gori::Settings::PROJECT_IO_TIMEOUT_KEY).should eq(Gori::Settings.io_timeout_secs.to_s)
+        store.setting(Gori::Settings::PROJECT_CONNECT_TIMEOUT_KEY).should eq("7")
+        Gori::Settings.upstream_route("target.test").direct?.should be_true
+        # The live layer reads the same rows the store got.
+        Gori::Settings.project_upstream_proxy.should eq("")
+        Gori::Settings.project_io_timeout_secs.should eq(Gori::Settings.io_timeout_secs)
+        # A value equal to the global on a row that held something else still folds to inherit.
+        Gori::Settings.save_project_network(store, config.copy_with(connect_secs: Gori::Settings.connect_timeout_secs)).should be_true
+        store.setting(Gori::Settings::PROJECT_CONNECT_TIMEOUT_KEY).should be_nil
+        Gori::Settings.project_connect_timeout_secs.should be_nil
+      ensure
+        Gori::Settings.upstream_rules = previous_rules if previous_rules
+        reset_net
+      end
+    end
+
     # The pin, the credential and the destination gate are one decision about where this
     # project's traffic goes. Written as three tasks, a busy row could commit the credential
     # beside the address the project used to have — and the next open would send the secret
@@ -2513,5 +2809,86 @@ describe "per-project network overrides" do
     Gori::Settings.capture_max.should eq(Gori::Settings::MAX_CAPTURE_MAX_MIB * 1024 * 1024)
   ensure
     Gori::Settings.project_capture_max_mib = nil
+  end
+end
+
+# A list in the global wordlist catalog is remembered by NAME (#1353), whichever spelling it was
+# picked or stored under, and anything else is remembered exactly as given.
+describe "Settings wordlist history and the catalog" do
+  around_each do |example|
+    Gori::Settings.fuzz_recent_wordlists = [] of String
+    Gori::Settings.fuzz_favorite_wordlists = [] of String
+    with_wordlist_home { |_| example.run }
+    Gori::Settings.fuzz_recent_wordlists = [] of String
+    Gori::Settings.fuzz_favorite_wordlists = [] of String
+  end
+
+  it "canonicalizes an absolute path into the catalog to its name and leaves everything else alone" do
+    dir = Gori::Paths.wordlists_dir
+    Gori::Settings.canonical_wordlist(File.join(dir, "common.txt")).should eq("common.txt")
+    Gori::Settings.canonical_wordlist("  #{File.join(dir, "common.txt")}  ").should eq("common.txt")
+    Gori::Settings.canonical_wordlist("common.txt").should eq("common.txt")
+    Gori::Settings.canonical_wordlist("/tmp/common.txt").should eq("/tmp/common.txt")
+    Gori::Settings.canonical_wordlist("./common.txt").should eq("./common.txt")
+    # a subdirectory of the catalog, a hidden file and a name the catalog cannot address are paths
+    Gori::Settings.canonical_wordlist(File.join(dir, "sub", "x.txt")).should eq(File.join(dir, "sub", "x.txt"))
+    Gori::Settings.canonical_wordlist(File.join(dir, ".hidden")).should eq(File.join(dir, ".hidden"))
+    Gori::Settings.canonical_wordlist(File.join(dir, "trailing.")).should eq(File.join(dir, "trailing."))
+    # a sibling directory that merely shares the prefix is not the catalog
+    Gori::Settings.canonical_wordlist("#{dir}-other/x.txt").should eq("#{dir}-other/x.txt")
+  end
+
+  it "records a catalog pick by name, and an absolute spelling of it is the same entry" do
+    dir = Gori::Paths.wordlists_dir
+    Gori::Settings.record_recent_wordlist(File.join(dir, "common.txt"))
+    Gori::Settings.fuzz_recent_wordlists.should eq(["common.txt"])
+    Gori::Settings.record_recent_wordlist("/tmp/other.txt")
+    Gori::Settings.record_recent_wordlist("common.txt")
+    Gori::Settings.fuzz_recent_wordlists.should eq(["common.txt", "/tmp/other.txt"])
+  end
+
+  it "replaces an entry an older gori stored as the absolute path instead of listing it twice" do
+    dir = Gori::Paths.wordlists_dir
+    Gori::Settings.fuzz_recent_wordlists = ["/tmp/other.txt", File.join(dir, "common.txt")]
+    Gori::Settings.record_recent_wordlist("common.txt")
+    Gori::Settings.fuzz_recent_wordlists.should eq(["common.txt", "/tmp/other.txt"])
+  end
+
+  it "treats a path and the name of the same catalog list as one favorite" do
+    dir = Gori::Paths.wordlists_dir
+    Gori::Settings.fuzz_favorite_wordlists = [File.join(dir, "common.txt")] # stored by an older gori
+    Gori::Settings.favorite_wordlist?("common.txt").should be_true
+    Gori::Settings.favorite_wordlist?(File.join(dir, "common.txt")).should be_true
+    Gori::Settings.favorite_wordlist?("other.txt").should be_false
+    # toggling by the name removes the old spelling, rather than adding a second entry
+    Gori::Settings.toggle_favorite_wordlist("common.txt").should be_false
+    Gori::Settings.fuzz_favorite_wordlists.should be_empty
+    Gori::Settings.toggle_favorite_wordlist(File.join(dir, "common.txt")).should be_true
+    Gori::Settings.fuzz_favorite_wordlists.should eq(["common.txt"])
+  end
+
+  # A bare name reads the working directory first. Where a file of that name sits beside the
+  # catalog's list, the PATH is what keeps meaning "the catalog list", so it is what is stored —
+  # while the key stays the name, so it is still one entry however it was written.
+  it "remembers the path, not the name, of a catalog list a working-directory file shadows" do
+    path = File.join(Gori::Paths.wordlists_dir, "common.txt")
+    Gori::WordlistCatalog.save_values("common.txt", ["a"])
+    Gori::Settings.remembered_wordlist(path).should eq("common.txt") # nothing shadows it: the name is enough
+    File.write("common.txt", "cwd copy\n")
+    Gori::Settings.remembered_wordlist(path).should eq(path)
+    Gori::Settings.remembered_wordlist("common.txt").should eq("common.txt") # a bare name stays as typed
+    Gori::Settings.remembered_wordlist("/tmp/x.txt").should eq("/tmp/x.txt")
+    Gori::Settings.record_recent_wordlist(path)
+    Gori::Settings.fuzz_recent_wordlists.should eq([path])
+    Gori::Settings.record_recent_wordlist(path) # the same pick again changes nothing
+    Gori::Settings.fuzz_recent_wordlists.should eq([path])
+    Gori::Settings.record_recent_wordlist("common.txt") # same key: replaces, never lists it twice
+    Gori::Settings.fuzz_recent_wordlists.should eq(["common.txt"])
+  end
+
+  it "keeps a path outside the catalog exactly as given" do
+    Gori::Settings.toggle_favorite_wordlist("/home/me/lists/api.txt").should be_true
+    Gori::Settings.fuzz_favorite_wordlists.should eq(["/home/me/lists/api.txt"])
+    Gori::Settings.favorite_wordlist?("api.txt").should be_false # a bare name is not that path
   end
 end

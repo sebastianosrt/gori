@@ -1,5 +1,6 @@
 require "../../spec_helper"
 require "file_utils"
+require "json"
 
 # `gori run project create / delete` — project resolution and the delete preview. These
 # operate on the on-disk registry, so they are the CLI surface where a wrong answer
@@ -12,8 +13,13 @@ module Gori::CLI::Run
     project_object_counts(project)
   end
 
-  def self.ambiguous_project_name_for_spec(registry : Gori::ProjectRegistry, name : String) : Bool
-    ambiguous_name?(registry, name)
+  def self.delete_preview_verdict_for_spec(project : Gori::Project, locked : Bool,
+                                           open_elsewhere : Bool) : String
+    delete_preview_verdict(project, locked, open_elsewhere)
+  end
+
+  def self.scope_rule_json_for_spec(rule : Gori::Scope::Rule) : JSON::Any
+    JSON.parse(JSON.build { |j| scope_rule_json(j, rule) })
   end
 end
 
@@ -70,6 +76,14 @@ describe "gori run project create" do
     end
   end
 
+  it "refuses a project name containing invalid UTF-8 as a clean registry error" do
+    with_project_root do |registry|
+      invalid = String.new(Bytes[0xff, 0xfe])
+      error = expect_raises(Gori::Error) { registry.create(invalid) }
+      error.message.not_nil!.should contain("valid UTF-8")
+    end
+  end
+
   it "leaves an existing DB untouched when create reopens the project" do
     with_project_root do |registry|
       project = registry.create("spec proj")
@@ -113,27 +127,64 @@ describe "gori run project delete (preview)" do
       FileUtils.rm_rf(root)
     end
   end
+
+  # `ProjectRegistry#delete` refuses on EITHER lock, so a preview that ends in "re-run with
+  # --yes" while one of them is held is promising a delete its own next step declines.
+  it "predicts the refusal instead of inviting --yes when the project is held" do
+    with_project_root do |registry|
+      project = registry.create("held proj")
+      free = Gori::CLI::Run.delete_preview_verdict_for_spec(project, false, false)
+      free.should contain("re-run with --yes")
+
+      # The case the preview used to miss entirely: nobody is capturing, a peer merely has
+      # the database open (an MCP server takes no capture lock and writes issues and notes
+      # all the same).
+      open_only = Gori::CLI::Run.delete_preview_verdict_for_spec(project, false, true)
+      open_only.should contain("held by another gori instance")
+      open_only.should_not contain("--yes to remove")
+
+      capturing = Gori::CLI::Run.delete_preview_verdict_for_spec(project, true, false)
+      capturing.should contain("held by a live capture")
+    end
+  end
+
+  # The probe behind the second half of that verdict, against a REAL open handle — the
+  # counts above run through a read-only Store of their own, so the preview has to ask
+  # after closing it or it finds its own lock and calls every project held.
+  it "reads a live peer's handle as 'open in another instance', and its own as not" do
+    with_project_root do |registry|
+      project = registry.create("lock proj")
+      Gori::OpenLock.in_use?(project.db_path).should be_false
+      with_project_store(project) do |_store|
+        Gori::OpenLock.in_use?(project.db_path).should be_true
+      end
+      Gori::CLI::Run.project_object_counts_for_spec(project) # opens and closes its own handle
+      Gori::OpenLock.in_use?(project.db_path).should be_false
+    end
+  end
 end
 
 describe "gori run project delete (resolution)" do
+  # The delete resolves through `ProjectRegistry#find`, which refuses a name that addresses
+  # two projects on every surface (#1163) — the rule this command used to keep privately.
   it "refuses a display name shared by two projects, and accepts either slug" do
     root = File.tempname("gori-projroot")
     begin
       registry = Gori::ProjectRegistry.new(root)
       # What create_for_workspace produces for two checkouts with the same basename:
       # distinct slugs (my-api, my-api-2), one shared display name.
-      registry.create("My API")
+      first = registry.create("My API")
       twin = File.join(root, "my-api-2")
       Dir.mkdir_p(twin)
       File.write(File.join(twin, Gori::ProjectRegistry::NAME_FILE), "My API")
       Gori::Store.open(File.join(twin, Gori::Project::DB_FILE)).close
 
       registry.list.count { |p| p.name == "My API" }.should eq(2)
-      Gori::CLI::Run.ambiguous_project_name_for_spec(registry, "My API").should be_true
-      Gori::CLI::Run.ambiguous_project_name_for_spec(registry, "my api").should be_true # find is case-insensitive
-      # Slugs are unique, and #find resolves them before the display-name pass.
-      Gori::CLI::Run.ambiguous_project_name_for_spec(registry, "my-api").should be_false
-      Gori::CLI::Run.ambiguous_project_name_for_spec(registry, "my-api-2").should be_false
+      expect_raises(Gori::ProjectRegistry::Ambiguous) { registry.find("My API") }
+      expect_raises(Gori::ProjectRegistry::Ambiguous) { registry.find("my api") } # case-insensitive
+      # Slugs are unique, so an exact one is never called ambiguous.
+      registry.find("my-api").try(&.dir).should eq(first.dir)
+      registry.find("my-api-2").try(&.dir).should eq(twin)
     ensure
       FileUtils.rm_rf(root)
     end
@@ -141,18 +192,60 @@ describe "gori run project delete (resolution)" do
 
   it "does not call a uniquely-named project ambiguous" do
     with_project_root do |registry|
-      registry.create("alpha")
+      alpha = registry.create("alpha")
       registry.create("beta")
-      Gori::CLI::Run.ambiguous_project_name_for_spec(registry, "alpha").should be_false
+      registry.find("alpha").try(&.dir).should eq(alpha.dir)
     end
   end
 
   it "does not call an unknown name ambiguous (that is a separate, clearer error)" do
-    # `ambiguous_name?` gates the "refuse to guess" abort; answering true for a name that
-    # matches nothing would report a collision where the real problem is a typo.
+    # Raising for a name that matches nothing would report a collision where the real
+    # problem is a typo.
     with_project_root do |registry|
       registry.create("alpha")
-      Gori::CLI::Run.ambiguous_project_name_for_spec(registry, "no-such-project").should be_false
+      registry.find("no-such-project").should be_nil
     end
+  end
+end
+
+# `scope add --format json` (#1117): the success line used to carry no id at all, so a script
+# that added a rule it meant to remove later had nothing to remove it by. The object is the one
+# `scope --format json` lists, because both call `scope_rule_json`.
+describe "gori run project scope add --format json" do
+  it "is the listed rule, id included" do
+    with_store do |store|
+      scope = Gori::Scope.load(store)
+      scope.add("include", "host", " api.example.test ").should be_true
+      rule = scope.rules.find { |r| r.pattern == "api.example.test" }.not_nil!
+      j = Gori::CLI::Run.scope_rule_json_for_spec(rule)
+      j.as_h.keys.should eq(["id", "kind", "type", "pattern"])
+      {j["id"].as_i64, j["kind"].as_s, j["type"].as_s, j["pattern"].as_s}
+        .should eq({rule.id, "include", "host", "api.example.test"})
+    end
+  end
+end
+
+# #1388: `scope list` said "Scope filtering: DISABLED" while `gori run send` refused an
+# out-of-scope target — the gate is armed by the rules existing, enabled or not.
+describe "gori run project scope — the active-send gate line" do
+  it "says ON whenever a rule exists, whatever the enabled flag" do
+    with_store do |store|
+      scope = Gori::Scope.load(store)
+      Gori::CLI::Run.scope_gate_line(scope).should contain("no rules")
+      scope.add("include", "host", "example.com")
+      scope.enabled?.should be_false
+      Gori::CLI::Run.scope_gate_line(scope).should start_with("Active-send gate: ON (1 rule)")
+    end
+  end
+end
+
+# #1389: an import that clashes with an existing name said "choose another name" and never
+# which flag does that.
+describe "gori run project import — the name clash hint" do
+  it "names --name when it was not passed, and only for the clash" do
+    msg = %(project "demo" already exists — choose another name)
+    Gori::CLI::Run.import_error_message(msg, nil).should end_with("(pass --name NEW to import it under another)")
+    Gori::CLI::Run.import_error_message(msg, "demo").should eq(msg)
+    Gori::CLI::Run.import_error_message("archive is corrupt", nil).should eq("archive is corrupt")
   end
 end

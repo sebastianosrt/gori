@@ -14,8 +14,8 @@ module Gori
     # Deliberately parsed with a string scanner rather than `require "xml"`. libxml2 is not
     # currently linked into gori, and pulling it in would mean adding `libxml2-dev` +
     # `libxml2-static` (and its transitive static deps) to every packaging path that builds
-    # `--static` — docker/Dockerfile, the release workflow, flake.nix, Homebrew, AUR, snap —
-    # for one import format. Burp's export is machine-generated with a fixed, flat shape, so
+    # `--static` — packaging/docker/Dockerfile, the release workflow, flake.nix, Homebrew,
+    # AUR, snap — for one import format. Burp's export is machine-generated with a fixed, flat shape, so
     # a scanner is sufficient and, as a side effect, has no XXE or entity-expansion surface
     # at all. The bound: this is NOT a general XML parser. Namespaced, re-ordered or
     # hand-edited variants (and Logger++/other third-party exports) are out of scope.
@@ -28,9 +28,10 @@ module Gori
         # file is a scrub of the wire bytes — and this importer's whole reason to exist is
         # that those bytes survive. It used to `raw = raw.scrub unless raw.valid_encoding?`
         # on the theory that scrubbing "keeps the scanner's ASCII needles working"; the
-        # scanner never needed it. `String#index` and `String#[]` agree on char boundaries
-        # even over invalid UTF-8, and `String#[](a, n)` COPIES the bytes of those chars
-        # rather than re-encoding them, so every needle below still lands where it did.
+        # scanner never needed it. It works in BYTE offsets (`byte_index`, `byte_slice`), and
+        # every needle is ASCII — a byte that can never sit inside a multibyte character — so
+        # invalid UTF-8 around a tag cannot move one, and `byte_slice` copies the bytes between
+        # tags exactly as they are.
         #
         # What the scrub actually did, measured through `gori run import --burp` into a real
         # store on a source body `a=1&bin=<ff fe 01 02>&b=2`:
@@ -102,10 +103,10 @@ module Gori
         time =
           begin
             Time.parse_rfc3339(s)
-          rescue Time::Format::Error
+          rescue Time::Format::Error | ArgumentError
             java_date(s)
           end
-        time ? time.to_unix * 1_000_000 : now
+        time && Builder.representable?(time) ? time.to_unix * 1_000_000 : now
       end
 
       private def self.java_date(s : String) : Time?
@@ -114,31 +115,37 @@ module Gori
         zone = m[2].upcase
         loc = zone.in?("UTC", "GMT", "Z") ? Time::Location::UTC : Time::Location.local
         Time.parse("#{m[1]} #{m[3]}", "%b %d %H:%M:%S %Y", loc)
-      rescue Time::Format::Error
+      rescue Time::Format::Error | ArgumentError
         nil
       end
 
       # --- the scanner ---------------------------------------------------------
+
+      # Every offset in the scanner is a BYTE offset, and one only ever goes back into these
+      # helpers. It walked characters (`String#index(needle, pos)`, `src[a...b]`), and on a
+      # string that is not pure ASCII each of those counts from byte 0 to find `pos` — once per
+      # item, so a 16 MB export took 17 s (56 s with a single non-ASCII byte in it) where the
+      # byte walk takes ~20 ms. The needles are ASCII, so a byte search finds exactly the tags
+      # the char search did, and `byte_slice` copies what lies between them verbatim (P7).
 
       # The inner text of `<name …>…</name>` starting at `from`, plus the offset just past
       # the closing tag. nil when there is no further occurrence.
       private def self.next_element(src : String, name : String, from : Int32) : {String, Int32}?
         needle = "<#{name}"
         pos = from
-        while open_at = src.index(needle, pos)
-          after = open_at + needle.size
-          ch = src[after]?
+        while open_at = src.byte_index(needle, pos)
+          after = open_at + needle.bytesize
           # `<response` must not match `<responselength`: the next char has to end the name.
-          unless ch && (ch.whitespace? || ch == '>' || ch == '/')
+          unless name_ends_at?(src, after)
             pos = after
             next
           end
-          gt = src.index('>', after)
+          gt = src.byte_index('>', after)
           return nil unless gt
-          return {"", gt + 1} if src[gt - 1] == '/' # <response/>
-          close = src.index("</#{name}>", gt + 1)
+          return {"", gt + 1} if src.to_unsafe[gt - 1] == '/'.ord # <response/>
+          close = src.byte_index("</#{name}>", gt + 1)
           return nil unless close
-          return {src[(gt + 1)...close], close + name.size + 3}
+          return {src.byte_slice(gt + 1, close - gt - 1), close + name.bytesize + 3}
         end
         nil
       end
@@ -147,22 +154,29 @@ module Gori
       private def self.element(src : String, name : String) : {String, String}?
         needle = "<#{name}"
         pos = 0
-        while open_at = src.index(needle, pos)
-          after = open_at + needle.size
-          ch = src[after]?
-          unless ch && (ch.whitespace? || ch == '>' || ch == '/')
+        while open_at = src.byte_index(needle, pos)
+          after = open_at + needle.bytesize
+          unless name_ends_at?(src, after)
             pos = after
             next
           end
-          gt = src.index('>', after)
+          gt = src.byte_index('>', after)
           return nil unless gt
-          attrs = src[after...gt]
+          attrs = src.byte_slice(after, gt - after)
           return {attrs, ""} if attrs.ends_with?('/')
-          close = src.index("</#{name}>", gt + 1)
+          close = src.byte_index("</#{name}>", gt + 1)
           return nil unless close
-          return {attrs, src[(gt + 1)...close]}
+          return {attrs, src.byte_slice(gt + 1, close - gt - 1)}
         end
         nil
+      end
+
+      # Whether the character at byte `at` ends a tag name: whitespace, `>` or `/`. Decoded as
+      # a whole character, as the char-offset scanner did, so a non-ASCII space still counts.
+      private def self.name_ends_at?(src : String, at : Int32) : Bool
+        return false if at >= src.bytesize
+        ch = Char::Reader.new(src, pos: at).current_char
+        ch.whitespace? || ch == '>' || ch == '/'
       end
 
       # The TEXT elements — `<url>`, `<host>`, `<protocol>`, `<port>`, `<time>`. These become
@@ -187,7 +201,10 @@ module Gori
         attrs, inner = el
         return nil if inner.empty?
         if attrs.includes?(%(base64="true")) || attrs.includes?("base64='true'")
-          Base64.decode(inner.strip)
+          # Burp wraps the base64 payload in CDATA too (`<request base64="true"><![CDATA[R0VU…
+          # ]]></request>`). `Base64.decode` raises on the `<` of the wrapper, and the item
+          # was then counted as skipped — so a real export imported next to nothing.
+          Base64.decode((XmlText.cdata?(inner) ? XmlText.uncdata(inner) : inner).strip)
         else
           (XmlText.cdata?(inner) ? XmlText.uncdata(inner) : XmlText.unescape(inner)).to_slice
         end

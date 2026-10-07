@@ -37,11 +37,52 @@ describe Gori::Tui::LineEdit do
     LineEdit.apply(:delete_word, "abc", 0).should eq({"abc", 0})
   end
 
-  it "only reports the two edits as mutating" do
+  it "only reports the three edits as mutating" do
     LineEdit.mutating?(:delete).should be_true
     LineEdit.mutating?(:delete_word).should be_true
+    LineEdit.mutating?(:delete_to_start).should be_true
     LineEdit.mutating?(:word_left).should be_false
     LineEdit.mutating?(:home).should be_false
+  end
+end
+
+# #1379: the shell's line keys. A bar that is editing takes every key ahead of the keymap, so
+# these shadow no tab chord while it has the caret.
+describe "LineEdit shell keys" do
+  ctrl = Termisu::Input::Modifier::Ctrl
+
+  it "reads ^A ^E ^U ^W as line start, line end, delete to start and delete word" do
+    LineEdit.action(key(Termisu::Input::Key::LowerA, ctrl)).should eq(:home)
+    LineEdit.action(key(Termisu::Input::Key::LowerE, ctrl)).should eq(:end)
+    LineEdit.action(key(Termisu::Input::Key::LowerU, ctrl)).should eq(:delete_to_start)
+    LineEdit.action(key(Termisu::Input::Key::LowerW, ctrl)).should eq(:delete_word)
+    LineEdit.action(key(Termisu::Input::Key::LowerU, Termisu::Input::Modifier::Alt)).should be_nil
+    LineEdit.action(key(Termisu::Input::Key::LowerU, Termisu::Input::Modifier::None, 'u')).should be_nil
+  end
+
+  it "deletes from the caret back to the start of the line" do
+    LineEdit.apply(:delete_to_start, "status:200 host:a", 11).should eq({"host:a", 0})
+    LineEdit.apply(:delete_to_start, "abc", 0).should eq({"abc", 0})
+  end
+
+  it "edits the History bar, and keeps ^W off the sub-tab close while it does" do
+    TuiContract.with_session("line-edit-shell") do |session|
+      TuiContract.each_controller(session) do |controller, _host|
+        next unless controller.is_a?(HistoryController)
+        view = controller.view
+        view.start_query
+        "status:200 host:a".each_char { |c| view.query_insert(c) }
+        controller.handle_query_key(key(Termisu::Input::Key::LowerW, ctrl)).should be_true
+        view.query.should eq("status:200 host:")
+        controller.handle_query_key(key(Termisu::Input::Key::LowerA, ctrl))
+        controller.handle_query_key(key(Termisu::Input::Key::Delete))
+        view.query.should eq("tatus:200 host:")
+        controller.handle_query_key(key(Termisu::Input::Key::LowerE, ctrl))
+        controller.handle_query_key(key(Termisu::Input::Key::LowerU, ctrl))
+        view.query.should eq("")
+        view.querying?.should be_true
+      end
+    end
   end
 end
 
@@ -87,5 +128,44 @@ describe "the `/` bars take LineEdit" do
         end
       end
     end
+  end
+end
+
+# `QueryBarEdit` owns the plumbing of all six bars; what an edit SETTLES stays each bar's own,
+# through the hooks. These pin the settle differences no other spec reaches.
+describe "QueryBarEdit's per-bar hooks" do
+  it "leaves Sitemap's and Intercept's open dropdown alone on a LineEdit action, unlike a caret move" do
+    [SitemapView.new, InterceptView.new].each do |v|
+      v.start_query
+      "zzz met".each_char { |c| v.query_insert(c) }
+      v.popup_down
+      v.popup_open?.should be_true # offering `method:`
+      v.query_edit(:home)          # caret now on `zzz`, which completes to nothing
+      v.popup_open?.should be_true
+      v.query_move(0) # a bare caret step re-syncs, and an empty candidate set shuts it
+      v.popup_open?.should be_false
+    end
+  end
+
+  it "completes Sitemap's bar over the space-delimited word, not the QL cursor" do
+    v = SitemapView.new
+    v.start_query
+    %(host:"a me).each_char { |c| v.query_insert(c) }
+    v.query_complete.should be_true
+    v.query.should eq(%(host:"a method:))
+  end
+
+  it "drops Evidence's IME composition on Enter" do
+    v = EvidenceView.new
+    v.start_query
+    v.set_preedit("zq")
+    shown = MemoryBackend.new(60, 6)
+    v.render(Screen.new(shown), Rect.new(0, 0, 60, 6), true)
+    shown.contains?("zq").should be_true
+    v.stop_query
+    v.start_query
+    back = MemoryBackend.new(60, 6)
+    v.render(Screen.new(back), Rect.new(0, 0, 60, 6), true)
+    back.contains?("zq").should be_false
   end
 end

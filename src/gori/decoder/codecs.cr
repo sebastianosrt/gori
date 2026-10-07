@@ -4,7 +4,10 @@ require "compress/gzip"
 require "compress/zlib"
 require "compress/deflate"
 require "big"
+require "uri/punycode"
 require "../cookie"
+require "../jwt/jwe"
+require "../raw_json"
 require "../proxy/codec/brotli"
 require "../proxy/codec/zstd"
 
@@ -134,10 +137,20 @@ module Gori::Decoder
       n = 0
       acc = 0_u32
       bits = 0
+      symbols = 0
+      padding = 0
+      padding_started = false
       bytes.each do |b|
-        next if b == 0x3d_u8 || ascii_ws?(b) # '=' padding / whitespace
+        next if ascii_ws?(b)
+        if b == 0x3d_u8
+          padding_started = true
+          padding += 1
+          next
+        end
+        raise DecoderError.new("base32 data after padding") if padding_started
         v = B32_DEC[b]
         raise DecoderError.new("invalid base32 char: #{b.chr}") if v == 0xff_u8
+        symbols += 1
         acc = (acc << 5) | v.to_u32
         bits += 5
         if bits >= 8
@@ -146,6 +159,7 @@ module Gori::Decoder
           n += 1
         end
       end
+      validate_base32_tail(symbols, padding)
       buf[0, n]
     end
 
@@ -156,11 +170,21 @@ module Gori::Decoder
       n = 0
       acc = 0_u32
       bits = 0
+      symbols = 0
+      padding = 0
+      padding_started = false
       s.each_char do |c|
-        next if c == '=' || c.whitespace?
+        next if c.whitespace?
+        if c == '='
+          padding_started = true
+          padding += 1
+          next
+        end
+        raise DecoderError.new("base32 data after padding") if padding_started
         o = c.ord
         v = o < 256 ? B32_DEC[o.to_u8] : 0xff_u8
         raise DecoderError.new("invalid base32 char: #{c}") if v == 0xff_u8
+        symbols += 1
         acc = (acc << 5) | v.to_u32
         bits += 5
         if bits >= 8
@@ -169,7 +193,27 @@ module Gori::Decoder
           n += 1
         end
       end
+      validate_base32_tail(symbols, padding)
       buf[0, n]
+    end
+
+    # RFC 4648 base32 tails can carry 0, 1, 2, 3, or 4 bytes. Their symbol counts
+    # modulo eight are 0, 2, 4, 5, or 7; every other count leaves an impossible group.
+    # Unpadded valid tails remain accepted, but explicit padding must match its quantum.
+    # Unused low bits are ignored, like the stdlib's Base64 decoder.
+    private def validate_base32_tail(symbols : Int32, padding : Int32) : Nil
+      tail = symbols % 8
+      expected_padding = case tail
+                         when 0 then 0
+                         when 2 then 6
+                         when 4 then 4
+                         when 5 then 3
+                         when 7 then 1
+                         else        raise DecoderError.new("invalid base32 length")
+                         end
+      if padding > 0 && padding != expected_padding
+        raise DecoderError.new("invalid base32 padding")
+      end
     end
 
     # ---- ascii85 (Adobe; 'z' shortcut for an all-zero quad; no <~ ~> wrap) ----
@@ -350,18 +394,6 @@ module Gori::Decoder
       end
     end
 
-    # Single hex digit's value (0..15), or -1 for a non-hex byte. Only 0-9a-fA-F
-    # count: a sign/space/underscore returns -1 so `\u+ABC`/`\u 1FF`/`\u-1FF` stay
-    # literal (the old `hex?` guard that kept `to_i?(16)` from accepting them).
-    private def hex_digit(b : UInt8) : Int32
-      case b
-      when 0x30_u8..0x39_u8 then (b - 0x30_u8).to_i      # '0'..'9'
-      when 0x61_u8..0x66_u8 then (b - 0x61_u8 + 10).to_i # 'a'..'f'
-      when 0x41_u8..0x46_u8 then (b - 0x41_u8 + 10).to_i # 'A'..'F'
-      else                       -1
-      end
-    end
-
     # Parse EXACTLY 4 hex digits at byte offset `at`, or nil. A short run near
     # end-of-string (e.g. `\uAB`) must NOT decode — it stays literal, matching the
     # mid-string case where `\uABX` is left alone because `X` is not a hex digit.
@@ -374,8 +406,9 @@ module Gori::Decoder
       return nil if at + width > bytes.size
       v = 0
       width.times do |k|
-        d = hex_digit(bytes[at + k])
-        return nil if d < 0
+        # Per CHAR, never `String#to_i?(16)` over the run: that would take `\u+ABC`'s sign.
+        d = bytes[at + k].unsafe_chr.to_i?(16)
+        return nil unless d
         v = (v << 4) | d
       end
       v
@@ -463,7 +496,14 @@ module Gori::Decoder
 
     # ---- JWT (header.payload[.signature]) — decode only, no signature verify ----
     def jwt_decode(data : Bytes) : String
-      parts = String.new(data).strip.split('.')
+      text = String.new(data).strip
+      # A five-part JWE is a JWT too, just an encrypted one — its protected header decodes
+      # and is the first thing an operator needs. Checked before the JWS path because the
+      # segment positions differ: parts[1] there is a wrapped KEY, not the claims.
+      if jwe = Gori::Jwt::Jwe.parse(text)
+        return Gori::Jwt::Jwe.render(jwe)
+      end
+      parts = text.split('.')
       raise DecoderError.new("not a JWT (need 2-3 dot-separated parts)") unless parts.size >= 2
       sig = parts[2]?
       String.build do |io|
@@ -479,13 +519,14 @@ module Gori::Decoder
         if (alg = jwt_alg(parts[0])) && alg.downcase == "none"
           io << "\n\n// WARNING: alg=none — this token is UNSIGNED and can be forged by anyone; never trust it as authentication."
         end
-        # >3 segments isn't a plain JWT (JWS) — most commonly a 5-part JWE (header,
-        # encrypted key, IV, ciphertext, tag), but could just as well be smuggled/obfuscated
-        # data riding after a valid-looking JWS prefix. Either way, silently decoding only
-        # parts[0..2] would hide it. Surface the extra segments rather than dropping them.
+        # >3 segments isn't a plain JWT (JWS). A real 5-part JWE never reaches here (it is
+        # rendered above), so what is left is smuggled/obfuscated data riding after a
+        # valid-looking JWS prefix — or a JWE-shaped blob whose header carries no `enc`, which
+        # is not a JWE either. Silently decoding only parts[0..2] would hide it; surface the
+        # extra segments rather than dropping them.
         if parts.size > 3
           extra = parts[3..]
-          shape = parts.size == 5 ? "JWE-shaped (5 parts: header.key.iv.ciphertext.tag) — not JOSE/JWS-decodable" : "not a standard JWT"
+          shape = parts.size == 5 ? "JWE-shaped (5 parts) but not a decodable JWE — no `enc` in the header, or a segment is not base64url" : "not a standard JWT"
           io << "\n\n// WARNING: #{parts.size} dot-separated parts (#{shape}); #{extra.size} extra segment(s) beyond header.payload.signature, shown raw:\n"
           extra.each_with_index(3) { |seg, i| io << "//   [#{i}] #{seg}\n" }
         end
@@ -494,14 +535,16 @@ module Gori::Decoder
 
     # The `alg` from a JWT header segment (base64url JSON), or nil if unreadable.
     private def jwt_alg(header_seg : String) : String?
-      JSON.parse(String.new(Base64.decode(header_seg)))["alg"]?.try(&.as_s?)
+      Gori::RawJson.member(String.new(Base64.decode(header_seg)), "alg").try(&.as_s?)
     rescue
       nil
     end
 
+    # Numbers are shown as the digits the token carries (`RawJson`): one claim past
+    # Int64/Float64 (an unsigned 64-bit id) used to make the WHOLE segment undecodable.
     private def pretty_json_segment(seg : String) : String
       bytes = Base64.decode(seg) # urlsafe + missing-pad tolerant
-      JSON.parse(String.new(bytes)).to_pretty_json
+      Gori::RawJson.reformat(String.new(bytes), "  ")
     rescue
       "(undecodable segment)"
     end
@@ -609,6 +652,38 @@ module Gori::Decoder
 
     def cbor_to_json(data : Bytes) : Bytes
       document(Gori::Cbor.render(data), "cbor", "CBOR")
+    end
+
+    # ---- native serialization: Java / .NET ViewState / PHP / Python pickle ----
+    #
+    # All four take BYTES rather than text, `Php` included: a PHP `s:` payload is a byte count
+    # and the bytes behind it are whatever the application put there, so a `text` converter's
+    # UTF-8 gate would refuse a perfectly ordinary serialized blob carrying binary.
+
+    def java_to_json(data : Bytes) : Bytes
+      serialized(Gori::Decoder::Serialized::Java.render(data), "java-deserialize", "Java serialized stream")
+    end
+
+    def viewstate_to_json(data : Bytes) : Bytes
+      serialized(Gori::Decoder::Serialized::DotnetViewState.render(data), "dotnet-viewstate", "ViewState")
+    end
+
+    def php_to_json(data : Bytes) : Bytes
+      serialized(Gori::Decoder::Serialized::Php.render(data), "php-unserialize", "PHP serialize() value")
+    end
+
+    def pickle_to_json(data : Bytes) : Bytes
+      serialized(Gori::Decoder::Serialized::Pickle.render(data), "pickle-disasm", "pickle stream")
+    end
+
+    # As permissive as `document` and refused on a different test. Three of the four readers
+    # write an ENVELOPE (`{"$format": …}`) before they read the first value, so "the whole
+    # rendering is one `$partial` marker" — the test `document` makes — can never be true for
+    # them. `decoded` is the same question asked where it still has an answer: did the reader
+    # make anything at all of these bytes, or only of the header it wrote itself?
+    private def serialized(r : Gori::BinaryDocument::Rendering, label : String, name : String) : Bytes
+      raise DecoderError.new("#{label} decode failed: not a #{name}") unless r.decoded
+      r.json.to_slice
     end
 
     private def document(r : Gori::BinaryDocument::Rendering, label : String, name : String) : Bytes
@@ -823,15 +898,395 @@ module Gori::Decoder
       sink.to_slice
     end
 
-    # ---- punycode / IDN (RFC 3492 bootstring) ----
-    PUNY_BASE         =   36
-    PUNY_TMIN         =    1
-    PUNY_TMAX         =   26
-    PUNY_SKEW         =   38
-    PUNY_DAMP         =  700
-    PUNY_INITIAL_BIAS =   72
-    PUNY_INITIAL_N    =  128
-    PUNY_MAX_IN       = 4096
+    # ---- RFC 2047 encoded words (UTF-8 output; Q and B) ----
+
+    # An encoded-word has 75 octets total; `=?UTF-8?X?` plus `?=` takes 12. Q leaves
+    # room for 63 encoded-text characters, while Base64 uses at most 60 characters
+    # (45 source octets). Chunks stay on UTF-8 character boundaries so each word is
+    # independently decodable.
+    RFC2047_Q_MAX = 63
+    RFC2047_B_MAX = 45
+
+    def rfc2047_q_encode(s : String) : String
+      return "" if s.empty?
+      chunks = [] of String
+      chunk = IO::Memory.new
+      width = 0
+      s.each_char do |char|
+        token = rfc2047_q_token(char.to_s.to_slice)
+        if width + token.bytesize > RFC2047_Q_MAX && width > 0
+          chunks << chunk.to_s
+          chunk = IO::Memory.new
+          width = 0
+        end
+        chunk.write(token.to_slice)
+        width += token.bytesize
+      end
+      chunks << chunk.to_s if width > 0
+      rfc2047_words(chunks, 'Q')
+    end
+
+    def rfc2047_b_encode(s : String) : String
+      return "" if s.empty?
+      chunks = [] of String
+      chunk = IO::Memory.new
+      width = 0
+      s.each_char do |char|
+        bytes = char.to_s.to_slice
+        if width + bytes.size > RFC2047_B_MAX && width > 0
+          chunks << Base64.strict_encode(chunk.to_slice)
+          chunk = IO::Memory.new
+          width = 0
+        end
+        chunk.write(bytes)
+        width += bytes.size
+      end
+      chunks << Base64.strict_encode(chunk.to_slice) if width > 0
+      rfc2047_words(chunks, 'B')
+    end
+
+    private def rfc2047_words(chunks : Array(String), encoding : Char) : String
+      String.build do |io|
+        chunks.each_with_index do |chunk, index|
+          io << "\r\n " unless index == 0
+          io << "=?UTF-8?" << encoding << '?' << chunk << "?="
+        end
+      end
+    end
+
+    private def rfc2047_q_token(bytes : Bytes) : String
+      String.build(bytes.size * 3) do |io|
+        bytes.each do |b|
+          if b == 0x20_u8
+            io << '_'
+          elsif 33_u8 <= b <= 126_u8 && b != 0x3d_u8 && b != 0x3f_u8 && b != 0x5f_u8
+            io.write_byte(b)
+          else
+            io << "=%02X" % b
+          end
+        end
+      end
+    end
+
+    # Decode every well-formed encoded-word in a header-like value. Malformed marker
+    # text stays literal (a word with a space, bad Q/B data, or bytes its charset
+    # cannot decode), but a recognized word with an unsupported charset or the wrong
+    # forced encoding fails clearly. Linear whitespace between adjacent words is
+    # ignored as RFC 2047 requires, and adjacent same-charset words are joined BEFORE
+    # charset decoding (§5: a multibyte character may be split across words);
+    # whitespace beside ordinary text is preserved.
+    def rfc2047_decode(s : String, required_encoding : UInt8? = nil) : String
+      bytes = s.to_slice
+      sink = IO::Memory.new(bytes.size)
+      i = 0
+      while i < bytes.size
+        if word = rfc2047_word_at(bytes, i, required_encoding)
+          words = [{i, word}]
+          data = IO::Memory.new
+          data.write(word.data)
+          i = word.next_pos
+          resume = nil.as(Int32?)
+          while (gap_end = rfc2047_fws_end(bytes, i)) > i && (following = rfc2047_word_at(bytes, gap_end, required_encoding))
+            if rfc2047_charset_key(following.charset) != rfc2047_charset_key(word.charset)
+              resume = gap_end # a charset change ends the run; the gap between words is still dropped
+              break
+            end
+            words << {gap_end, following}
+            data.write(following.data)
+            i = following.next_pos
+          end
+          if text = (rfc2047_charset_decode(word.charset, data.to_slice) rescue nil)
+            sink << text
+            i = resume if resume
+          elsif rfc2047_write_words(sink, bytes, words)
+            i = resume if resume # the run ended on a decoded word, so its gap to the next is dropped
+          end
+          next
+        end
+
+        width = utf8_char_width(bytes[i])
+        width.times { |offset| sink.write_byte(bytes[i + offset]) }
+        i += width
+      end
+      String.new(sink.to_slice)
+    end
+
+    # A run whose joined bytes did not decode, word by word: one bad word used to leave every
+    # valid neighbour literal too. A word that decodes alone is written decoded; one that does not
+    # stays literal, and so does the whitespace beside it (it is ordinary text now).
+    #
+    # Answers whether the LAST word decoded, so the caller knows whether the gap after the run
+    # sits between two encoded-words (dropped) or beside literal text (kept).
+    private def rfc2047_write_words(sink : IO, bytes : Bytes, words : Array({Int32, Rfc2047RawWord})) : Bool
+      prev_end = nil.as(Int32?)
+      prev_literal = false
+      words.each do |(start, w)|
+        text = (rfc2047_charset_decode(w.charset, w.data) rescue nil)
+        if pe = prev_end
+          sink.write(bytes[pe, start - pe]) if prev_literal || text.nil?
+        end
+        text ? (sink << text) : sink.write(bytes[start, w.next_pos - start])
+        prev_literal = text.nil?
+        prev_end = w.next_pos
+      end
+      !prev_literal
+    end
+
+    # The charset names `rfc2047_charset_decode` treats as one, so `utf-8` beside `UTF8` still
+    # joins into one run (a character may be split across them).
+    private def rfc2047_charset_key(charset : String) : String
+      case cs = charset.downcase
+      when "utf8"                           then "utf-8"
+      when "ascii"                          then "us-ascii"
+      when "iso8859-1", "latin1", "latin-1" then "iso-8859-1"
+      when "cp1252"                         then "windows-1252"
+      else                                       cs
+      end
+    end
+
+    # A single encoded-word, payload-decoded but not yet charset-decoded: adjacent words are
+    # joined on these raw bytes first, so a multibyte character split across two words decodes.
+    private record Rfc2047RawWord, charset : String, data : Bytes, next_pos : Int32
+
+    # nil = not a well-formed encoded-word (the caller keeps the text literal). A recognized
+    # word still raises for an unsupported charset or a forced encoding it does not carry.
+    private def rfc2047_word_at(bytes : Bytes, start : Int32, required_encoding : UInt8? = nil) : Rfc2047RawWord?
+      return nil unless bytes[start]? == 0x3d_u8 && bytes[start + 1]? == 0x3f_u8 # =?
+      charset_start = start + 2
+      charset_end = rfc2047_charset_end(bytes, charset_start)
+      return nil unless charset_end && charset_end > charset_start && charset_end < bytes.size
+
+      encoding = rfc2047_word_encoding(bytes, charset_end + 1)
+      return nil unless encoding
+
+      text_start = charset_end + 3
+      text_end = rfc2047_encoded_text_end(bytes, text_start)
+      return nil unless text_end
+
+      # RFC 2231 §5: `charset*language` — the language tag does not affect decoding.
+      charset = String.new(bytes[charset_start, charset_end - charset_start]).partition('*')[0]
+      rfc2047_check_word(charset, encoding, required_encoding)
+      decoded = rfc2047_decode_payload(String.new(bytes[text_start, text_end - text_start]), encoding) rescue nil
+      return nil unless decoded
+      Rfc2047RawWord.new(charset, decoded, text_end + 2)
+    end
+
+    private def rfc2047_check_word(charset : String, encoding : UInt8, required_encoding : UInt8?) : Nil
+      raise DecoderError.new("unsupported RFC 2047 charset: #{charset}") unless rfc2047_supported_charset?(charset)
+      if required_encoding && encoding != required_encoding
+        raise DecoderError.new("expected RFC 2047 #{required_encoding.chr} encoded-word")
+      end
+    end
+
+    private def rfc2047_charset_end(bytes : Bytes, start : Int32) : Int32?
+      i = start
+      while i < bytes.size && bytes[i] != 0x3f_u8
+        return nil unless 33_u8 <= bytes[i] <= 126_u8
+        i += 1
+      end
+      i
+    end
+
+    private def rfc2047_word_encoding(bytes : Bytes, start : Int32) : UInt8?
+      return nil if start + 1 >= bytes.size || bytes[start + 1] != 0x3f_u8
+      encoding = bytes[start]
+      encoding -= 0x20_u8 if 0x61_u8 <= encoding <= 0x7a_u8
+      return nil unless encoding == 'Q'.ord.to_u8 || encoding == 'B'.ord.to_u8
+      encoding
+    end
+
+    private def rfc2047_encoded_text_end(bytes : Bytes, start : Int32) : Int32?
+      i = start
+      while i + 1 < bytes.size
+        # RFC 2047 §5: encoded-text is printable ASCII with no space.
+        return nil if bytes[i] <= 0x20_u8 || bytes[i] > 126_u8
+        if bytes[i] == 0x3f_u8
+          return nil unless bytes[i + 1] == 0x3d_u8 # a '?' inside encoded-text is invalid
+          return i == start ? nil : i               # empty encoded-text is not an encoded-word
+        end
+        i += 1
+      end
+      nil
+    end
+
+    private def rfc2047_decode_payload(encoded_text : String, encoding : UInt8) : Bytes
+      if encoding == 'Q'.ord.to_u8
+        rfc2047_q_decode(encoded_text)
+      else
+        rfc2047_b_decode(encoded_text)
+      end
+    end
+
+    private def rfc2047_q_decode(s : String) : Bytes
+      bytes = s.to_slice
+      sink = IO::Memory.new(bytes.size)
+      i = 0
+      while i < bytes.size
+        b = bytes[i]
+        if b == 0x5f_u8 # '_' represents SPACE in encoded-word Q, unlike body QP
+          sink.write_byte(0x20_u8)
+          i += 1
+        elsif b == 0x3d_u8
+          value = hex_n(bytes, i + 1, 2) || raise DecoderError.new("invalid RFC 2047 Q escape")
+          sink.write_byte(value.to_u8)
+          i += 3
+        elsif 33_u8 <= b <= 126_u8 && b != 0x3f_u8
+          sink.write_byte(b)
+          i += 1
+        else
+          raise DecoderError.new("invalid RFC 2047 Q character")
+        end
+      end
+      sink.to_slice
+    end
+
+    private def rfc2047_b_decode(s : String) : Bytes
+      bytes = s.to_slice
+      unless rfc2047_base64_valid?(bytes)
+        raise DecoderError.new("invalid RFC 2047 Base64 data")
+      end
+      Base64.decode(s)
+    rescue ex : Base64::Error
+      raise DecoderError.new("invalid RFC 2047 Base64 data: #{ex.message}")
+    end
+
+    private def rfc2047_base64_valid?(bytes : Bytes) : Bool
+      return false if bytes.empty? || bytes.size % 4 != 0
+      padding = 0
+      i = bytes.size - 1
+      while i >= 0 && bytes[i] == 0x3d_u8
+        padding += 1
+        i -= 1
+      end
+      return false if padding > 2 || i < 0
+      (0..i).each do |index|
+        b = bytes[index]
+        return false unless (65_u8..90_u8).includes?(b) || (97_u8..122_u8).includes?(b) ||
+                            (48_u8..57_u8).includes?(b) || b == 0x2b_u8 || b == 0x2f_u8
+      end
+      true
+    end
+
+    private def rfc2047_supported_charset?(charset : String) : Bool
+      case charset.downcase
+      when "utf-8", "utf8", "us-ascii", "ascii", "iso-8859-1", "iso8859-1", "latin1", "latin-1", "windows-1252", "cp1252"
+        true
+      else
+        false
+      end
+    end
+
+    private def rfc2047_charset_decode(charset : String, data : Bytes) : String
+      # Through `rfc2047_charset_key`, so the aliases a run joins on and the ones decoded here
+      # are one list.
+      case rfc2047_charset_key(charset)
+      when "utf-8"
+        text = String.new(data)
+        raise DecoderError.new("invalid UTF-8 in RFC 2047 encoded-word") unless text.valid_encoding?
+        text
+      when "us-ascii"
+        raise DecoderError.new("non-ASCII byte in RFC 2047 US-ASCII word") if data.any? { |b| b >= 0x80 }
+        String.new(data)
+      when "iso-8859-1"
+        String.build { |io| data.each { |b| io << b.to_i.chr } }
+      when "windows-1252"
+        String.build { |io| data.each { |b| io << windows_1252_scalar(b).chr } }
+      else
+        raise DecoderError.new("unsupported RFC 2047 charset: #{charset}")
+      end
+    end
+
+    WINDOWS_1252_SPECIAL_SCALARS = {
+      0x80_u8 => 0x20ac, 0x82_u8 => 0x201a, 0x83_u8 => 0x0192, 0x84_u8 => 0x201e,
+      0x85_u8 => 0x2026, 0x86_u8 => 0x2020, 0x87_u8 => 0x2021, 0x88_u8 => 0x02c6,
+      0x89_u8 => 0x2030, 0x8a_u8 => 0x0160, 0x8b_u8 => 0x2039, 0x8c_u8 => 0x0152,
+      0x8e_u8 => 0x017d, 0x91_u8 => 0x2018, 0x92_u8 => 0x2019, 0x93_u8 => 0x201c,
+      0x94_u8 => 0x201d, 0x95_u8 => 0x2022, 0x96_u8 => 0x2013, 0x97_u8 => 0x2014,
+      0x98_u8 => 0x02dc, 0x99_u8 => 0x2122, 0x9a_u8 => 0x0161, 0x9b_u8 => 0x203a,
+      0x9c_u8 => 0x0153, 0x9e_u8 => 0x017e, 0x9f_u8 => 0x0178,
+    }
+
+    private def windows_1252_scalar(byte : UInt8) : Int32
+      WINDOWS_1252_SPECIAL_SCALARS[byte]? || byte.to_i
+    end
+
+    private def rfc2047_fws_end(bytes : Bytes, start : Int32) : Int32
+      i = start
+      loop do
+        if bytes[i]? == 0x20_u8 || bytes[i]? == 0x09_u8
+          i += 1
+        elsif bytes[i]? == 0x0d_u8 && bytes[i + 1]? == 0x0a_u8 &&
+              (bytes[i + 2]? == 0x20_u8 || bytes[i + 2]? == 0x09_u8)
+          i += 2
+        else
+          break
+        end
+      end
+      i
+    end
+
+    private def utf8_char_width(lead : UInt8) : Int32
+      case lead
+      when 0x00_u8..0x7f_u8 then 1
+      when 0xc2_u8..0xdf_u8 then 2
+      when 0xe0_u8..0xef_u8 then 3
+      else                       4
+      end
+    end
+
+    # ---- codepoint overflow (Unicode scalar -> low byte) ----
+
+    # This models the common mod-256 mistake explicitly: U+0140 becomes 0x40 ('@').
+    # It returns bytes, so a following `hex-encode` step makes non-printable results
+    # inspectable without pretending they are UTF-8 text.
+    def codepoint_overflow(data : Bytes) : Bytes
+      s = String.new(data)
+      raise DecoderError.new("codepoint-overflow: input is not valid UTF-8 text") unless s.valid_encoding?
+      sink = IO::Memory.new(s.size)
+      s.each_char { |char| sink.write_byte((char.ord & 0xff).to_u8) }
+      sink.to_slice
+    end
+
+    # ---- Windows ANSI Best-Fit target-side preview ----
+
+    WINDOWS_BESTFIT_CODE_PAGES = BestFitData::TABLES.keys.sort!
+
+    @@windows_bestfit_cache : Hash(Int32, Hash(Int32, Int32)) = {} of Int32 => Hash(Int32, Int32)
+
+    # Apply Microsoft's Unicode-to-ANSI best-fit mapping and decode its output through
+    # the selected code page. Characters with no WCTABLE entry become that page's
+    # default '?', matching WideCharToMultiByte's default-character behavior. That API
+    # walks UTF-16 code units, so a character above U+FFFF (a surrogate pair) becomes
+    # two defaults: "😀" -> "??".
+    def windows_bestfit_preview(s : String, code_page : Int32) : String
+      table = windows_bestfit_table(code_page)
+      String.build(s.bytesize) do |io|
+        s.each_char do |char|
+          if mapped = table[char.ord]?
+            io << mapped.unsafe_chr
+          else
+            (char.ord > 0xffff ? 2 : 1).times { io << '?' }
+          end
+        end
+      end
+    end
+
+    private def windows_bestfit_table(code_page : Int32) : Hash(Int32, Int32)
+      @@windows_bestfit_cache[code_page]? || begin
+        raw = BestFitData::TABLES[code_page]?
+        raise DecoderError.new("unsupported Windows Best-Fit code page: #{code_page}") unless raw
+
+        table = {} of Int32 => Int32
+        raw.each_line do |line|
+          source, target = line.split('\t')
+          table[source.to_i(16)] = target.to_i(16)
+        end
+        @@windows_bestfit_cache[code_page] = table
+      end
+    end
+
+    # ---- punycode / IDN (RFC 3492 bootstring, via URI::Punycode) ----
+    PUNY_MAX_IN = 4096
 
     # Domain-aware, because that is the only form an operator ever holds: each dot-separated
     # label carrying non-ASCII becomes "xn--" + its bootstring encoding, and a pure-ASCII
@@ -864,128 +1319,37 @@ module Gori::Decoder
       label.size > 4 && label[0, 4].downcase == "xn--" ? puny_decode_label(label[4..]) : label
     end
 
+    # `URI::Punycode.encode` raises a bare `Exception` on overflow, the only way it fails.
     private def puny_encode_label(label : String) : String
-      input = label.chars.map(&.ord)
-      n = PUNY_INITIAL_N
-      delta = 0_i64
-      bias = PUNY_INITIAL_BIAS
-      basic = input.select { |c| c < 0x80 }
-      h = b = basic.size
-      String.build do |io|
-        basic.each { |c| io << c.unsafe_chr }
-        io << '-' if b > 0
-        while h < input.size
-          m = input.select { |c| c >= n }.min
-          delta += (m - n).to_i64 * (h + 1)
-          raise DecoderError.new("punycode overflow") if delta > Int32::MAX
-          n = m
-          input.each do |c|
-            delta += 1 if c < n
-            next unless c == n
-            q = delta
-            k = PUNY_BASE
-            loop do
-              t = puny_threshold(k, bias)
-              break if q < t
-              io << puny_digit((t + ((q - t) % (PUNY_BASE - t))).to_i32)
-              q = (q - t) // (PUNY_BASE - t)
-              k += PUNY_BASE
-            end
-            io << puny_digit(q.to_i32)
-            bias = puny_adapt(delta, h + 1, h == b)
-            delta = 0_i64
-            h += 1
-          end
-          delta += 1
-          n += 1
-        end
-      end
+      # Non-ASCII that downcase+NFC folds to ASCII (U+212A KELVIN SIGN -> "k"): RFC 3492 still
+      # writes the basic run plus its delimiter, which `URI::Punycode.encode` skips.
+      return "#{label}-" if label.ascii_only? && !label.empty?
+      URI::Punycode.encode(label)
+    rescue Exception
+      raise DecoderError.new("punycode overflow")
     end
 
+    # Two refusals `URI::Punycode.decode` does not make, which it would otherwise answer with
+    # garbage. RFC 3492 §6.2: the basic-code-point run ends at the LAST delimiter, and a
+    # delimiter at index 0 means there is no basic run at all — that '-' then has to parse as
+    # a digit, which it cannot. And the basic run is ASCII by definition.
     private def puny_decode_label(s : String) : String
-      n = PUNY_INITIAL_N
-      i = 0_i64
-      bias = PUNY_INITIAL_BIAS
-      acc = [] of Char
-      chars = s.chars
-      # RFC 3492 §6.2: the basic-code-point run ends at the LAST delimiter. A delimiter at
-      # index 0 means there is no basic run at all (and that '-' then has to parse as a
-      # digit, which it cannot) — so only a strictly-positive index splits.
       delim = s.rindex('-')
-      pos = 0
-      if delim && delim > 0
-        chars[0, delim].each do |c|
-          raise DecoderError.new("invalid punycode: non-ASCII '#{c}' in the basic part") unless c.ord < 0x80
-          acc << c
-        end
-        pos = delim + 1
+      raise DecoderError.new("invalid punycode digit: -") if delim == 0
+      if delim && (c = s[0, delim].each_char.find { |ch| !ch.ascii? })
+        raise DecoderError.new("invalid punycode: non-ASCII '#{c}' in the basic part")
       end
-      while pos < chars.size
-        oldi = i
-        w = 1_i64
-        k = PUNY_BASE
-        loop do
-          raise DecoderError.new("invalid punycode: truncated variable-length integer") if pos >= chars.size
-          digit = puny_digit_value(chars[pos])
-          pos += 1
-          i += digit.to_i64 * w
-          raise DecoderError.new("punycode overflow") if i > Int32::MAX
-          t = puny_threshold(k, bias)
-          break if digit < t
-          w *= (PUNY_BASE - t)
-          raise DecoderError.new("punycode overflow") if w > Int32::MAX
-          k += PUNY_BASE
-        end
-        bias = puny_adapt(i - oldi, acc.size + 1, oldi == 0)
-        # Accumulate in Int64 and range-check BEFORE narrowing. The loop guard above only
-        # bounds `i` at Int32::MAX, so with `acc.size + 1 == 1` the addition itself could
-        # carry `n` past Int32 and raise a raw `OverflowError` — the one exit from this
-        # module that was not the `DecoderError` its callers are written around. (The chain's
-        # blanket rescue caught it, so the step merely read "Arithmetic overflow" instead of
-        # naming punycode.) Matches the explicit overflow guards at the two `raise`s above.
-        n_wide = n.to_i64 + (i // (acc.size + 1))
-        raise DecoderError.new("punycode overflow") if n_wide > Int32::MAX
-        n = n_wide.to_i32
-        raise DecoderError.new("invalid punycode: U+#{n.to_s(16).upcase} is not a Unicode scalar value") unless puny_scalar?(n)
-        i = i % (acc.size + 1)
-        acc.insert(i.to_i32, n.unsafe_chr)
-        i += 1
-      end
-      acc.join
+      URI::Punycode.decode(s)
+    rescue OverflowError
+      raise DecoderError.new("punycode overflow")
+    rescue ex : ArgumentError # a bad digit, a truncated integer, or not a Unicode scalar value
+      raise DecoderError.new("invalid punycode: #{ex.message}")
     end
 
-    private def puny_scalar?(n : Int32) : Bool
+    # A code point a `Char` may hold: in range and not a surrogate. Used by the numeric
+    # character-reference decoders.
+    private def unicode_scalar?(n : Int32) : Bool
       0 <= n <= 0x10FFFF && !(0xD800 <= n <= 0xDFFF)
-    end
-
-    private def puny_threshold(k : Int32, bias : Int32) : Int32
-      return PUNY_TMIN if k <= bias
-      return PUNY_TMAX if k >= bias + PUNY_TMAX
-      k - bias
-    end
-
-    private def puny_adapt(delta : Int64, numpoints : Int32, firsttime : Bool) : Int32
-      d = firsttime ? delta // PUNY_DAMP : delta // 2
-      d += d // numpoints
-      k = 0
-      while d > ((PUNY_BASE - PUNY_TMIN) * PUNY_TMAX) // 2
-        d //= (PUNY_BASE - PUNY_TMIN)
-        k += PUNY_BASE
-      end
-      k + (((PUNY_BASE - PUNY_TMIN + 1) * d) // (d + PUNY_SKEW)).to_i32
-    end
-
-    private def puny_digit(v : Int32) : Char
-      v < 26 ? ('a'.ord + v).unsafe_chr : ('0'.ord + v - 26).unsafe_chr
-    end
-
-    private def puny_digit_value(c : Char) : Int32
-      case c
-      when 'a'..'z' then c.ord - 'a'.ord
-      when 'A'..'Z' then c.ord - 'A'.ord
-      when '0'..'9' then c.ord - '0'.ord + 26
-      else               raise DecoderError.new("invalid punycode digit: #{c}")
-      end
     end
 
     # ---- XML (the five predefined entities) ----
@@ -1054,7 +1418,7 @@ module Gori::Decoder
         digits = body[(hex ? 2 : 1)..]
         return nil unless xml_digit_run?(digits, hex)
         cp = digits.to_i?(hex ? 16 : 10)
-        return nil unless cp && puny_scalar?(cp)
+        return nil unless cp && unicode_scalar?(cp)
         cp.unsafe_chr.to_s
       end
     end
@@ -1094,7 +1458,7 @@ module Gori::Decoder
             io << esc
           elsif 0x20_u8 <= b <= 0x7e_u8
             io << b.unsafe_chr
-          elsif (nx = data[i + 1]?) && hex_digit(nx) >= 0
+          elsif (nx = data[i + 1]?) && nx.unsafe_chr.hex?
             # \xNN is GREEDY in C — it swallows every hex digit that follows, so "\x01" then
             # 'A' would compile as the single byte 0x1A. When the next byte would extend it,
             # emit the fixed-width 3-digit octal form instead, which cannot run on.
@@ -1148,7 +1512,7 @@ module Gori::Decoder
     private def c_hex_run(bytes : Bytes, at : Int32) : {Bytes, Int32}?
       j = at
       v = 0
-      while j < bytes.size && (d = hex_digit(bytes[j])) >= 0
+      while j < bytes.size && (d = bytes[j].unsafe_chr.to_i?(16))
         v = ((v << 4) | d) & 0xff
         j += 1
       end
@@ -1175,7 +1539,7 @@ module Gori::Decoder
     private def c_universal(bytes : Bytes, at : Int32, marker : UInt8) : {Bytes, Int32}?
       width = marker == 0x75_u8 ? 4 : 8
       cp = hex_n(bytes, at + 2, width)
-      return nil unless cp && puny_scalar?(cp)
+      return nil unless cp && unicode_scalar?(cp)
       {cp.unsafe_chr.to_s.to_slice, at + 2 + width}
     end
 

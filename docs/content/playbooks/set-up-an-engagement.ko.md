@@ -7,7 +7,7 @@ weight = 10
 group = "기초"
 +++
 
-요청 하나를 캡처하기 전에 테스트의 경계부터 정합니다. 어느 프로젝트가 트래픽을 담을지, 어떤 호스트가 스코프에 들어가는지, 그리고 gori가 그 밖의 무언가를 건드려도 되는지까지요. 이 플레이북은 그 셋을 모두 다룹니다. 약 5분이 걸리며, 이후의 모든 단계를 안전하게 만드는 지점입니다. Repeater, Fuzzer, 스캐너 모두 스코프를 잡지 않은 대상에는 발동을 거부합니다.
+요청 하나를 캡처하기 전에 테스트의 경계부터 정합니다. 어느 프로젝트가 트래픽을 담을지, 어떤 호스트가 스코프에 들어가는지, 그리고 gori가 그 밖의 무언가를 건드려도 되는지까지요. 이 플레이북은 그 셋을 모두 다룹니다. 약 5분이 걸리며, 이후의 모든 단계를 안전하게 만드는 지점입니다. 헤드리스와 에이전트의 전송은 스코프를 잡지 않은 대상을 거부하고, 샌드박스는 TUI를 포함한 모든 표면을 막습니다.
 
 > **시작하기 전에.** 먼저 [Quick Start](/ko/getting-started/quick-start/)를 끝내 gori가 실행 중이고 탭 사이를 이동할 수 있게 하세요. 테스트 권한이 있는 호스트를 하나 떠올려 두세요. 예시는 `api.example.com`을 대역으로 씁니다.
 
@@ -27,7 +27,7 @@ gori run project create "Acme API" --description="staging engagement"
 
 ## 2. 스코프 그리기 {#2-draw-your-scope}
 
-**Project** 탭을 열고 **SCOPE** 카드로 이동한 뒤 `↓` 또는 `Enter`로 안으로 들어갑니다. 스코프는 **include**와 **exclude** 규칙의 목록이며, 각 규칙은 **host**, **string**, 또는 **regex**로 매칭합니다. 대상에 대한 include를 하나 추가하고, 관심 없는 노이즈를 exclude로 걸러 냅니다:
+**Project** 탭을 열고 **Scope** 서브탭으로 이동한 뒤 `↓` 또는 `Enter`로 안으로 들어갑니다. 스코프는 **include**와 **exclude** 규칙의 목록이며, 각 규칙은 **host**, **string**, 또는 **regex**로 매칭합니다. 대상에 대한 include를 하나 추가하고, 관심 없는 노이즈를 exclude로 걸러 냅니다:
 
 ```bash
 gori run project scope add --kind=include --type=host  --pattern=api.example.com
@@ -36,11 +36,11 @@ gori run project scope add --kind=exclude --type=regex --pattern='\.(css|js|png|
 
 스코프는 **허용 목록(allowlist)**으로 평가됩니다. include 규칙 중 하나 이상이 매칭하고 exclude 규칙이 하나도 매칭하지 않을 때 플로우가 스코프 안에 듭니다. 이 정의가 다음 두 단계를 좌우합니다.
 
-**체크포인트.** `gori run project scope`(또는 SCOPE 카드)에 두 규칙이 모두 나열됩니다. 아직 걸러지거나 차단되는 것은 없습니다. 경계를 서술했을 뿐입니다.
+**체크포인트.** `gori run project scope`(또는 Scope 서브탭)에 두 규칙이 모두 나열됩니다. TUI에서는 아직 걸러지는 것이 없습니다. 경계를 서술했을 뿐입니다. 다만 하나는 달라집니다. 이제 `gori run`은 이 스코프 밖 호스트로의 액티브 전송을 거부합니다.
 
 ## 3. 스코프 렌즈로 시야 좁히기 {#3-focus-your-view-with-the-scope-lens}
 
-어디서든 `s`를 눌러 **스코프 렌즈**를 토글합니다. History, Sitemap, 그 밖의 뷰를 스코프 안 트래픽으로 좁혀, 분주한 캡처가 대상만 남도록 접힙니다. 이것은 *렌즈*이지 게이트가 아닙니다. 스코프 밖 플로우도 여전히 캡처되며, 다시 끄는 순간 되돌아옵니다.
+어디서든 `s`를 눌러 **스코프 렌즈**를 토글합니다. History, Sitemap, 그 밖의 뷰를 스코프 안 트래픽으로 좁혀 분주한 캡처가 대상만 남도록 접히고, Intercept가 붙잡는 요청도 스코프 안으로 좁힙니다. 이것은 *렌즈*이지 게이트가 아닙니다. 스코프 밖 플로우도 여전히 캡처되며, 다시 끄는 순간 되돌아옵니다.
 
 **체크포인트.** 렌즈를 켜면 History에 `api.example.com` 행만 보입니다. `s`를 다시 누르면 나머지 트래픽이 돌아옵니다.
 
@@ -56,21 +56,23 @@ gori run project sandbox on
 
 스코프가 허용 목록이므로 **include 규칙이 없는 샌드박스는 모든 것을 차단합니다**. 스코프를 먼저 그린 이유가 바로 이것입니다. 켜져 있는 내내 상단 바에 빨간 `sandbox` 칩이 켜져 있습니다.
 
-**체크포인트.** `sandbox` 칩이 켜져 있습니다. 스코프 밖 사이트로의 요청은 실패하고, `api.example.com`으로의 요청은 통과합니다. 다시 자유롭게 다니려면 샌드박스를 끄세요.
+**체크포인트.** `sandbox` 칩이 켜져 있습니다. 스코프 밖 사이트로의 요청은 실패하고, `api.example.com`으로의 요청은 통과합니다. 터미널에서 둘 다 시험하려면 `gori run shell`을 쓰세요. curl, git, Python, Go, Node 트래픽이 실행 중인 gori를 거치고 그 CA를 신뢰하는 터미널을 엽니다. 다시 자유롭게 다니려면 샌드박스를 끄세요.
 
 ## 5. DNS를 건드리지 않고 호스트 리다이렉트 (선택) {#5-redirect-a-host-without-touching-dns-optional}
 
-대상의 이름이 공개 DNS가 아닌 다른 곳(스테이징 서버, 로컬 인스턴스)으로 해석되어야 한다면, **Project → HOST OVERRIDES** 카드에 **host override**를 추가하세요. TCP 다이얼 대상만 바꿀 뿐, SNI·인증서 이름·`Host` 헤더는 원래 이름 그대로라 서버는 평범한 요청으로 봅니다:
+대상의 이름이 공개 DNS가 아닌 다른 곳(스테이징 서버, 로컬 인스턴스)으로 해석되어야 한다면, **Project → Host overrides** 서브탭에 **host override**를 추가하세요. TCP 다이얼 대상만 바꿀 뿐, SNI·인증서 이름·`Host` 헤더는 원래 이름 그대로라 서버는 평범한 요청으로 봅니다:
 
 ```bash
 gori run project host-override add --host=api.example.com --ip=10.0.0.1
 ```
 
+고객사 프록시나 SOCKS 점프 호스트를 거쳐 나가야 하는 엔게이지먼트라면, **Project settings** 패널의 NETWORK 필드에서 이 프로젝트만의 upstream을 지정하거나, 헤드리스로 `gori run project network set upstream_proxy=socks5h://127.0.0.1:1080`을 실행하세요. `gori run project network`는 키마다 프로젝트가 직접 지정했는지, 전역 값을 물려받는지 보여 줍니다.
+
 **체크포인트.** `gori run project host-override`에 항목이 나열되고, `api.example.com`으로의 요청이 이제 `10.0.0.1`로 연결됩니다.
 
 ## 스코프가 먼저인 이유 {#why-scope-comes-first}
 
-스코프는 필터만이 아닙니다. 액티브 도구들은 스코프를 스스로 강제합니다. **Repeater**, **Fuzzer**, **Miner**, 그리고 MCP `send_request` 도구는 샌드박스가 켜져 있든 아니든, 스코프 밖 대상을 `SCOPE_BLOCKED` 오류로 거부합니다. 이것이 빗나간 재전송이나 퍼징 실행이 의도치 않은 호스트에 닿는 것을 막는 가드레일입니다. 스코프를 여기서 한 번 잡아 두면, 이후의 모든 플레이북이 그것을 물려받습니다.
+스코프는 필터만이 아닙니다. 헤드리스와 에이전트 표면은 샌드박스가 켜져 있든 아니든 스코프를 스스로 강제합니다. `gori run`은 설정된 스코프 밖 호스트로의 액티브 전송을 거부하고, MCP의 모든 액션 도구는 스코프에 들지 않는 대상을 `SCOPE_BLOCKED` 오류로 거부하며, 스코프가 아직 없어도 마찬가지입니다. TUI에서는 대상을 직접 입력했으므로 Repeater와 스윕이 이 검사를 건너뛰고, 샌드박스가 이들을 가둡니다. 이 둘이 합쳐져 빗나간 재전송이나 퍼징 실행이 의도치 않은 호스트에 닿는 것을 막는 가드레일이 됩니다. 스코프를 여기서 한 번 잡아 두면, 이후의 모든 플레이북이 그것을 물려받습니다.
 
 ## 다음 단계 {#next-steps}
 

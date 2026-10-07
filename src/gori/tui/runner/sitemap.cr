@@ -5,42 +5,74 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     sitemap_controller.sitemap_move(delta)
   end
 
-  def sitemap_toggle : Nil
-    sitemap_controller.sitemap_toggle
+  forward sitemap_toggle : Nil,
+    sitemap_expand : Nil,
+    sitemap_collapse : Nil,
+    sitemap_query : Nil,
+    sitemap_tag : Nil,
+    to: sitemap_controller
+
+  # `⇧E` — the marked paths, else the cursor's host or subtree, as an OpenAPI 3.0.3 document
+  # (#1241). The flow set is the tree's own (the `/` query, the scope and hide-static lenses),
+  # so the file describes what the tree shows. The path comes from the export popup.
+  def sitemap_export : Nil
+    view = sitemap_controller.view
+    unless picked = view.export_targets
+      @toast = "select a host or path to export"
+      return
+    end
+    unless filter = view.params_filter
+      @toast = "the Sitemap query has no usable terms — fix it (/) before exporting"
+      return
+    end
+    targets, label = picked
+    base = if targets.size == 1
+             "openapi-#{export_file_label(targets.keys.first)}.json"
+           else
+             "openapi.json"
+           end
+    open_export(:openapi, File.join(Dir.current, base)) do |path|
+      sitemap_controller.export_openapi(path, filter, targets, label)
+      true
+    end
   end
 
-  def sitemap_expand : Nil
-    sitemap_controller.sitemap_expand
+  # A root's origin as a file-name stem: its authority, so a non-default port is in the name —
+  # `openapi-acme.test.json`, `openapi-127.0.0.1_19021.json` — and two ports of one host do not
+  # propose the same file.
+  private def export_file_label(o : Sitemap::Origin) : String
+    Gori::Url.authority(o.scheme, o.host, o.port).scrub.gsub(/[^A-Za-z0-9._-]/, "_")
   end
 
-  def sitemap_collapse : Nil
-    sitemap_controller.sitemap_collapse
+  # The captured flow behind a Sitemap endpoint, looked up on the row's OWN origin (#1371): a
+  # root is one scheme and port, so `/x` under `http://h:19022` must not open the `:19021` flow
+  # for the same path. Every Sitemap send/open resolves through here.
+  private def sitemap_flow_id(ep : SitemapView::Endpoint) : Int64?
+    o = ep[:origin]
+    @session.store.representative_flow_id(ep[:host], ep[:method], ep[:target], o.try(&.scheme), o.try(&.port))
   end
 
-  def sitemap_query : Nil
-    sitemap_controller.sitemap_query
-  end
+  forward sitemap_toggle_grouping : Nil,
+    sitemap_toggle_query_fold : Nil,
+    sitemap_toggle_js_refs : Nil,
+    to: sitemap_controller
 
-  def sitemap_tag : Nil
-    sitemap_controller.sitemap_tag
-  end
-
-  def sitemap_toggle_grouping : Nil
-    sitemap_controller.sitemap_toggle_grouping
-  end
-
-  def sitemap_toggle_query_fold : Nil
-    sitemap_controller.sitemap_toggle_query_fold
+  # `sitemap.js-scan` (#1243) — read the captured JS responses and HTML pages behind the tree's
+  # own flow set that no scan has read, and store the endpoints they reference. Sends nothing;
+  # the result lands as a toast and a rebuilt tree (`SitemapController#drain_js_scan`).
+  def sitemap_js_scan : Nil
+    unless filter = sitemap_controller.view.params_filter
+      @toast = "the Sitemap query has no usable terms — fix it (/) before scanning"
+      return
+    end
+    sitemap_controller.js_scan(filter)
   end
 
   # --- multi-select marks ---
-  def sitemap_mark_toggle : Nil
-    sitemap_controller.sitemap_mark_toggle
-  end
-
-  def sitemap_mark_clear : Nil
-    sitemap_controller.sitemap_mark_clear
-  end
+  forward sitemap_mark_toggle : Nil,
+    sitemap_mark_all : Nil,
+    sitemap_mark_clear : Nil,
+    to: sitemap_controller
 
   def sitemap_mark_extend(delta : Int32) : Nil
     sitemap_controller.sitemap_mark_extend(delta)
@@ -55,12 +87,15 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   # (a fold can't be marked) and which target_endpoints therefore doesn't do.
   def sitemap_repeater : Nil
     return sitemap_repeater_marked if sitemap_controller.marked_node_count > 0
+    if ref = sitemap_controller.view.selected_js_ref
+      return sitemap_repeater_js(ref[:host], ref[:path], ref[:origin])
+    end
     ep = sitemap_controller.view.selected_endpoint
     unless ep
       @toast = "select an endpoint to send"
       return
     end
-    if id = @session.store.representative_flow_id(ep[:host], ep[:method], ep[:target])
+    if id = sitemap_flow_id(ep)
       repeater_flow(id)
     else
       @toast = "no captured request for this path — capture it, or use Discover"
@@ -89,19 +124,22 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
 
   # Open the bytes behind the cursor row. CROSS-TAB mediator: resolves the tree node through
   # the store, then drives the History controller + detail overlay — exactly the hop
-  # issue_open_flow (runner/issues.cr) makes from an issue to its evidence.
+  # `navigate_link_ref` (runner/links.cr) makes from an Issue's RELATED row to its source.
   #
   # Deliberately NOT marked-set aware, unlike sitemap_repeater: a detail overlay shows one
   # flow, so the cursor row is the only thing it could mean. It uses the same
   # `selected_endpoint` resolve, so `o` and `r` never disagree about which path is under
   # the cursor — including a `{uuid}` fold, which both resolve to a real descendant.
   def sitemap_open_flow : Nil
+    if ref = sitemap_controller.view.selected_js_ref
+      return sitemap_open_js_source(ref[:host], ref[:path], ref[:origin])
+    end
     ep = sitemap_controller.view.selected_endpoint
     unless ep
       @toast = "select an endpoint to open"
       return
     end
-    unless id = @session.store.representative_flow_id(ep[:host], ep[:method], ep[:target])
+    unless id = sitemap_flow_id(ep)
       @toast = "no captured request for this path — capture it, or use Discover"
       return
     end
@@ -117,6 +155,59 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     end
   end
 
+  # The sighting a JavaScript-only row stands for: the newest one read in CODE, else the newest
+  # at all (a route only ever seen commented out is still where it was seen). On the row's own
+  # origin (#1371): the sightings are read by host, and `http://h:9090/api` is not the reference
+  # under `http://h:8080`.
+  private def sitemap_js_sighting(host : String, path : String, origin : Sitemap::Origin?) : Store::JsRefSighting?
+    seen = @session.store.js_ref_sightings(host: host, path: path, scheme: origin.try(&.scheme),
+      port: origin.try(&.port), limit: 50)
+    seen.find { |s| s.flags & JsRefs::FLAG_COMMENT == 0 } || seen.first?
+  end
+
+  # `o` on a path only JavaScript names: there is no request to open, so open where the
+  # reference was READ — the script's (or page's) flow in History — and say where in it.
+  private def sitemap_open_js_source(host : String, path : String, origin : Sitemap::Origin?) : Nil
+    unless s = sitemap_js_sighting(host, path, origin)
+      @toast = "that reference is gone since the tree was built (its flow was deleted)"
+      return
+    end
+    unless history_controller.view.open_detail_id(s.flow_id, @session.store)
+      @toast = "that script was pruned since the tree was built"
+      return
+    end
+    # The reference sits in the RESPONSE body. The pane is not scrolled to it: a body line is
+    # not a display line once the head, pretty-printing and wrap are drawn above and around it,
+    # so the toast names the line and byte instead of landing somewhere near them.
+    history_controller.view.set_detail_pane_public(:response)
+    @active_tab = :history
+    @focus = :body
+    @overlay = OverlayKind::Detail
+    comment = s.flags & JsRefs::FLAG_COMMENT != 0 ? " (in a comment)" : ""
+    @toast = "referenced at line #{s.line}, byte #{s.offset}#{comment}: #{DisplayColumns.display_safe(s.literal)}"
+  end
+
+  # `r` on a path only JavaScript names: a BARE GET for it in a new Repeater tab — nothing is
+  # sent until ^R. Bare on purpose: copying the page's Cookie/Authorization would carry
+  # credentials to a URL nobody visited, and that is the operator's call to make in the editor.
+  private def sitemap_repeater_js(host : String, path : String, origin : Sitemap::Origin?) : Nil
+    unless s = sitemap_js_sighting(host, path, origin)
+      @toast = "that reference is gone since the tree was built (its flow was deleted)"
+      return
+    end
+    url = Store::FlowRow.url_of(s.scheme, s.host, s.port, s.target)
+    built = Repeater::UrlRequest.structured(Repeater::UrlRequest.target(url), "GET",
+      [] of {String, String}, nil, expand: false)
+    repeater_controller.repeater_from_request(url, String.new(built.bytes), false, nil, name: "js")
+    @toast = if s.flags & JsRefs::FLAG_TEMPLATED != 0
+               "a GET for a JavaScript reference — replace {expr} before ^R sends it"
+             else
+               "a bare GET for a path only JavaScript names — nothing sent; ^R sends it"
+             end
+  rescue ex : Gori::Error
+    @toast = "can't build a request for that reference: #{ex.message}"
+  end
+
   # Batch over the marks: one Repeater sub-tab per marked endpoint, capped (BATCH_SUBTAB_CAP)
   # like History's ^R. Nothing is SENT here — a Repeater session only fires on ^R — so this
   # just confirms the sub-tab count.
@@ -128,10 +219,10 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     view = sitemap_controller.view
     wanted = view.target_keys.size
     ids = view.target_endpoints.compact_map do |ep|
-      @session.store.representative_flow_id(ep[:host], ep[:method], ep[:target])
+      sitemap_flow_id(ep)
     end.uniq!
     if ids.empty?
-      @toast = "no captured requests for the #{plural(wanted, "marked path")} — capture them, or use Discover"
+      @toast = "no captured requests for the #{Gori.plural(wanted, "marked path")} — capture them, or use Discover"
       return
     end
     # One flow behind the whole set — a single mark, or N marks that share a representative
@@ -148,7 +239,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
       end
       # `wanted`, not targets.size, is the denominator: a marked path with no captured request
       # never became an id, and a batch that silently drops it reads as "sent everything".
-      @toast = "opened #{opened} of #{plural(wanted, "marked path")}"
+      @toast = "opened #{opened} of #{Gori.plural(wanted, "marked path")}"
     end
   end
 end

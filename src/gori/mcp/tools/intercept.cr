@@ -10,64 +10,58 @@ module Gori
     class Tools
       # --- #123 live intercept (read side) ------------------------------------
 
-      # Parse the bridge blob the capturing TUI publishes (nil when no capturing instance is
-      # live / has ever published). See Runner#publish_intercept_bridge.
-      private def intercept_bridge_state : Hash(String, JSON::Any)?
-        raw = store.intercept_bridge
-        return nil unless raw
-        JSON.parse(raw).as_h?
-      rescue
-        nil
-      end
-
       @[Tool("intercept_list")]
       private def intercept_list(h) : Result
         include_sensitive = bool_arg(h, "include_sensitive", false)
-        bridge = intercept_bridge_state
+        # The bridge blob the capturing TUI publishes (Runner#publish_intercept_bridge); nil
+        # when no capturing instance has ever published one.
+        bridge = store.intercept_bridge_state
         unless bridge
-          return Result.new(JSON.build do |j|
-            j.object do
-              j.field "available", false
-              j.field "reason", "no capturing gori instance is publishing intercept state (open the project's TUI to intercept)"
-            end
-          end)
+          return Result.new({
+            available: false,
+            reason:    "no capturing gori instance is publishing intercept state (open the project's TUI to intercept)",
+          }.to_json)
         end
-        token = bridge["session_token"]?.try(&.as_s?) || ""
-        hb = bridge["heartbeat_ms"]?.try(&.as_i64?) || 0_i64
         now_ms = Time.utc.to_unix_ms
-        items = token.empty? ? [] of Store::HeldRow : store.intercept_held(token)
+        items = store.intercept_held_items(bridge)
         # Stamp viewed_ms so the capturing instance's auto-forward reaper sees the agent is
-        # watching (only meaningful when we can actually act; skip in read-only mode).
-        store.touch_intercept_held(token, items.map(&.item_id), now_ms) if @allow_actions && !items.empty?
+        # watching (only meaningful when we can actually act — see `touches_held?`).
+        store.touch_intercept_held(bridge.token, items.map(&.item_id), now_ms) if touches_held? && !items.empty?
         Result.new(JSON.build do |j|
           j.object do
             j.field "available", true
             # Derive `capturing` from LIVENESS, not the blob's static true: a crashed/closed
-            # instance leaves a stale blob behind (nothing writes capturing:false, and cleanup
-            # only runs at the NEXT session's startup), so echoing it would report a dead session
-            # as live. intercept_live? (heartbeat < 10s) is the authoritative freshness signal.
-            j.field "capturing", intercept_live?(bridge)
-            j.field "enabled", bridge["enabled"]?.try(&.as_bool?) || false
-            j.field "direction", bridge["direction"]?.try(&.as_s?) || "both"
-            j.field "filter", bridge["filter"]?.try(&.as_s?) || ""
-            j.field "heartbeat_age_seconds", (hb > 0 ? ((now_ms - hb) // 1000) : nil)
+            # instance leaves a stale blob behind, so echoing it would report a dead session
+            # as live (see `InterceptBridgeState#live?`).
+            j.field "capturing", bridge.live?
+            j.field "enabled", bridge.enabled?
+            j.field "direction", bridge.direction
+            j.field "filter", bridge.filter
+            j.field "heartbeat_age_seconds", bridge.heartbeat_age_seconds(now_ms)
             j.field "pending_count", items.size
             j.field("items") { j.array { items.each { |r| Serialize.intercept_item_row(j, r, include_sensitive, now_ms) } } }
           end
         end)
       end
 
+      # Whether reading a held item may stamp `viewed_ms`. The capturing instance's reaper
+      # reads that stamp as "an agent is handling this hold" and stops auto-forwarding it, so
+      # only an agent that CAN forward or drop may claim it: under --read-only, or with
+      # "Intercept control" switched off, a polling agent would otherwise park the operator's
+      # traffic until they came to the Intercept tab themselves.
+      private def touches_held? : Bool
+        @allow_actions && denied_permission("intercept_forward").nil?
+      end
+
       @[Tool("intercept_get")]
       private def intercept_get(h) : Result
-        item_id = int(h, "item_id")
-        return err(id_error(h, "item_id"), "INVALID_ARGUMENT", field: "item_id") unless item_id
+        item_id = required_id(h, "item_id")
         include_sensitive = bool_arg(h, "include_sensitive", false)
-        bridge = intercept_bridge_state
+        bridge = store.intercept_bridge_state
         return not_found("no capturing gori instance is publishing intercept state") unless bridge
-        token = bridge["session_token"]?.try(&.as_s?) || ""
-        row = token.empty? ? nil : store.intercept_held(token).find { |r| r.item_id == item_id }
+        row = store.intercept_held_item(bridge, item_id)
         return not_found("held item #{item_id} is not currently held (already forwarded/dropped, or never held)") unless row
-        store.touch_intercept_held(token, [row.item_id], Time.utc.to_unix_ms) if @allow_actions
+        store.touch_intercept_held(bridge.token, [row.item_id], Time.utc.to_unix_ms) if touches_held?
         Result.new(JSON.build { |j| Serialize.intercept_item_detail(j, row, include_sensitive, Time.utc.to_unix_ms) })
       end
 
@@ -79,53 +73,33 @@ module Gori
       # HTTP-shaped rule, which is harmless — the enqueue below will resolve `no_such_item` on
       # its own if the row really is gone.
       private def held_row_for_edit(item_id : Int64) : Store::HeldRow?
-        bridge = intercept_bridge_state
-        return nil unless bridge
-        token = bridge["session_token"]?.try(&.as_s?) || ""
-        return nil if token.empty?
-        store.intercept_held(token).find { |r| r.item_id == item_id }
+        store.intercept_bridge_state.try { |bridge| store.intercept_held_item(bridge, item_id) }
       end
 
       # --- #123 live intercept (write side; gated behind allow_actions) -------
 
-      # A capturing instance is "live" only if its bridge says capturing AND the heartbeat is
-      # recent — otherwise a queued command would never be applied (leaving a hung hold), so a
-      # mutating verb refuses up front instead of enqueuing into the void.
-      INTERCEPT_LIVE_MS   = 10_000_i64
-      INTERCEPT_ACK_POLLS =         30
-      INTERCEPT_ACK_SLEEP = 100.milliseconds
-
-      private def intercept_live?(bridge : Hash(String, JSON::Any)) : Bool
-        return false unless bridge["capturing"]?.try(&.as_bool?)
-        hb = bridge["heartbeat_ms"]?.try(&.as_i64?) || 0_i64
-        hb > 0 && (Time.utc.to_unix_ms - hb) < INTERCEPT_LIVE_MS
-      end
-
-      @[Tool("intercept_forward", gated: true, agent_action: true)]
+      @[Tool("intercept_forward", gated: true, agent_action: true, permission: "intercept")]
       private def intercept_forward(h) : Result
-        id = int(h, "item_id")
-        return err(id_error(h, "item_id"), "INVALID_ARGUMENT", field: "item_id") unless id
+        id = required_id(h, "item_id")
         enqueue_intercept("forward", item_id: id)
       end
 
-      @[Tool("intercept_drop", gated: true, agent_action: true)]
+      @[Tool("intercept_drop", gated: true, agent_action: true, permission: "intercept")]
       private def intercept_drop(h) : Result
-        id = int(h, "item_id")
-        return err(id_error(h, "item_id"), "INVALID_ARGUMENT", field: "item_id") unless id
+        id = required_id(h, "item_id")
         enqueue_intercept("drop", item_id: id)
       end
 
-      @[Tool("intercept_forward_edit", gated: true, agent_action: true)]
+      @[Tool("intercept_forward_edit", gated: true, agent_action: true, permission: "intercept")]
       private def intercept_forward_edit(h) : Result
-        id = int(h, "item_id")
-        return err(id_error(h, "item_id"), "INVALID_ARGUMENT", field: "item_id") unless id
+        id = required_id(h, "item_id")
         row = held_row_for_edit(id)
         edited = intercept_edit_bytes(h, row)
         return edited if edited.is_a?(Result)
         # Bytes are LITERAL — no Env.expand_wire, so a remote agent's $SECRET references are
         # never expanded into forwarded traffic; and no smuggling guard, because byte-exact
         # forwarding of arbitrary edits is the whole point of an intercept editor in a security
-        # tool (matches the human forward_bytes contract).
+        # tool (matches the human pending_edit contract).
         #
         # Content-Length sync is now a DECLARED argument, default on. It used to be
         # unconditional, one line under that very comment — which made a CL desync (CL shorter
@@ -156,7 +130,7 @@ module Gori
       # `raw` behaves differently depending on WHAT is held, because the two shapes are not the
       # same message:
       #   - An HTTP head+body: lone LFs in the HEADER block become CRLF (a hand-typed message
-      #     still frames) while the BODY is left untouched — `RequestBuilder.normalize_raw`,
+      #     still frames) while the BODY is left untouched — `Repeater::UrlRequest.normalize_raw`,
       #     the same rule `send_request`'s `raw` uses.
       #   - A WebSocket message (`row.ws?`): there IS no header block — no start line, no
       #     headers, no head/body split — so running the HTTP rule on it is not "safe
@@ -207,20 +181,19 @@ module Gori
           end
           return raw.to_slice
         end
-        RequestBuilder.normalize_raw(raw)
+        Repeater::UrlRequest.normalize_raw(raw)
       end
 
-      @[Tool("intercept_toggle", gated: true, agent_action: true)]
+      @[Tool("intercept_toggle", gated: true, agent_action: true, permission: "intercept")]
       private def intercept_toggle(h) : Result
         want = optional_bool_arg(h, "enable")
         return err("missing required 'enable' (true or false)", "INVALID_ARGUMENT", field: "enable") if want.nil?
         enqueue_intercept("toggle", arg: want ? "true" : "false")
       end
 
-      @[Tool("intercept_set_filter", gated: true, agent_action: true)]
+      @[Tool("intercept_set_filter", gated: true, agent_action: true, permission: "intercept")]
       private def intercept_set_filter(h) : Result
-        q = str(h, "query")
-        return err("missing required 'query' (empty string to clear)", "INVALID_ARGUMENT", field: "query") if q.nil?
+        q = required_str(h, "query", "(empty string to clear)", blank: true)
         # A field the hold gate refuses (`InterceptFilter::UNSUPPORTED_FIELDS`) compiles to a
         # never-match, so `scope:in` here holds NOTHING and `-scope:in` holds EVERY in-flight
         # message until each is forwarded by hand — and an agent has no note row to read. Refused
@@ -230,25 +203,36 @@ module Gori
         if bad = Gori::InterceptFilter.unsupported_field_reason(q)
           return err(bad, "INVALID_ARGUMENT", field: "query")
         end
-        enqueue_intercept("set_filter", arg: q)
+        bridge = store.intercept_bridge_state
+        dir = bridge.try { |b| Interceptor::Direction.from_arg?(b.direction) }
+        enqueue_intercept("set_filter", arg: q, extra: direction_note_extra(q, dir))
       end
 
-      @[Tool("intercept_set_direction", gated: true, agent_action: true)]
+      # A `status:` condition under a requests-only catch holds nothing until the direction
+      # changes. Said as a `note` beside the ack, never a refusal: either half may change next.
+      private def direction_note_extra(query : String, dir : Interceptor::Direction?) : Hash(String, JSON::Any)?
+        return nil unless dir
+        note = Interceptor.direction_note(query, dir, "intercept_set_direction response or both holds them")
+        note ? {"note" => JSON::Any.new(note)} : nil
+      end
+
+      @[Tool("intercept_set_direction", gated: true, agent_action: true, permission: "intercept")]
       private def intercept_set_direction(h) : Result
         raw = str(h, "direction").try(&.strip).presence
         unless raw
           return err("missing required 'direction' (#{INTERCEPT_DIRECTIONS.join(" | ")})", "INVALID_ARGUMENT", field: "direction")
         end
-        dir = raw.downcase
-        unless INTERCEPT_DIRECTIONS.includes?(dir)
+        unless dir = Interceptor::Direction.from_arg?(raw)
           return err("invalid 'direction' #{raw.inspect} (expected #{INTERCEPT_DIRECTIONS.join(" | ")})", "INVALID_ARGUMENT", field: "direction")
         end
-        enqueue_intercept("set_direction", arg: dir)
+        filter = store.intercept_bridge_state.try(&.filter) || ""
+        enqueue_intercept("set_direction", arg: dir.arg, extra: direction_note_extra(filter, dir))
       end
 
-      # Enqueue one command for the live capturing instance, then bounded-poll its ack so the
-      # agent gets a real outcome (forwarded/dropped/no_such_item/…) rather than assuming success
-      # on a write that may have been dropped or never drained.
+      # Send one command to the live capturing instance and wait for its ack
+      # (`Store#send_intercept_command`), so the agent gets a real outcome
+      # (forwarded/dropped/no_such_item/…) rather than assuming success on a write that may have
+      # been dropped or never drained.
       # `extra` rides onto the SUCCESS envelope so a verb can report what it did to the
       # caller's bytes — see `intercept_forward_edit`'s Content-Length switch. Reporting a
       # transformation is not optional: a surface that shows a value which did not go out is
@@ -256,25 +240,17 @@ module Gori
       private def enqueue_intercept(verb : String, *, item_id : Int64? = nil, bytes : Bytes? = nil,
                                     arg : String? = nil,
                                     extra : Hash(String, JSON::Any)? = nil) : Result
-        bridge = intercept_bridge_state
-        unless bridge && intercept_live?(bridge)
-          return busy("no live capturing gori instance is draining intercept commands (open the project's TUI with intercept on)")
+        outcome = store.send_intercept_command(verb, item_id: item_id, bytes: bytes, arg: arg)
+        return intercept_ack_result(outcome.status, outcome.detail, extra) if outcome.is_a?(Store::InterceptAck)
+        case outcome
+        in .not_live?
+          busy("no live capturing gori instance is draining intercept commands (open the project's TUI with intercept on)")
+        in .not_enqueued?
+          busy("could not enqueue intercept command (store write dropped); retry")
+        in .not_confirmed?
+          err("intercept command not confirmed within #{Store.intercept_ack_budget_ms}ms — the capturing instance may be busy; retry",
+            "NOT_CONFIRMED", retryable: true)
         end
-        token = bridge["session_token"]?.try(&.as_s?)
-        id = store.enqueue_intercept_command(token, verb, item_id: item_id, bytes: bytes, arg: arg)
-        return busy("could not enqueue intercept command (store write dropped); retry") if id == 0
-        await_intercept_ack(id, extra)
-      end
-
-      private def await_intercept_ack(id : Int64, extra : Hash(String, JSON::Any)? = nil) : Result
-        INTERCEPT_ACK_POLLS.times do
-          if st = store.command_status(id)
-            return intercept_ack_result(st[0], st[1], extra) unless st[0] == "pending"
-          end
-          sleep INTERCEPT_ACK_SLEEP
-        end
-        err("intercept command not confirmed within #{(INTERCEPT_ACK_POLLS * INTERCEPT_ACK_SLEEP.total_milliseconds).to_i}ms — the capturing instance may be busy; retry",
-          "NOT_CONFIRMED", retryable: true)
       end
 
       private def intercept_ack_result(status : String, detail : String?,
@@ -283,11 +259,11 @@ module Gori
         when "forwarded"
           Result.new(JSON.build { |j| j.object { j.field "status", "forwarded"; j.field "detail", detail; emit_extra(j, extra) } })
         when "dropped"
-          Result.new(JSON.build { |j| j.object { j.field "status", "dropped"; j.field "detail", detail } })
+          Result.new({status: "dropped", detail: detail}.to_json)
         when "edited"
           Result.new(JSON.build { |j| j.object { j.field "status", "forwarded"; j.field "edited", true; j.field "detail", detail; emit_extra(j, extra) } })
         when "toggled", "filter_set", "direction_set"
-          Result.new(JSON.build { |j| j.object { j.field "status", status; j.field "detail", detail } })
+          Result.new(JSON.build { |j| j.object { j.field "status", status; j.field "detail", detail; emit_extra(j, extra) } })
         when "no_such_item"
           not_found(detail || "the held item is no longer held (already forwarded/dropped)")
         when "stale"
@@ -378,9 +354,9 @@ module Gori
         end
 
         tool j, "intercept_toggle",
-          "Enable or disable the live intercept catch (desired state — idempotent). NOTE: " \
-          "enabling only affects NEW connections; an already-established HTTP/2 connection " \
-          "stays un-held. Applied by the capturing instance. Returns toggled | busy." do |s|
+          "Enable or disable the live intercept catch (desired state — idempotent). Applies " \
+          "to live connections too, HTTP/2 streams included. Applied by the capturing " \
+          "instance. Returns toggled | busy." do |s|
           s.field "enable", boolprop("true = start holding matching traffic; false = stop (auto-forwards anything currently held)"), required: true
         end
 
@@ -392,9 +368,10 @@ module Gori
         end
 
         tool j, "intercept_set_direction",
-          "Set which leg(s) intercept holds: both | request | response. Applied by the " \
+          "Set which leg(s) intercept holds: both | request | response (default request; the requestonly / " \
+          "responseonly spellings intercept_list reports are accepted too). Applied by the " \
           "capturing instance." do |s|
-          s.field "direction", enumprop("which side of a flow the proxy holds", INTERCEPT_DIRECTIONS), required: true
+          s.field "direction", enumprop("which side of a flow the proxy holds", INTERCEPT_DIRECTION_ARGS), required: true
         end
       end
     end

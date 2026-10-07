@@ -1,6 +1,7 @@
 require "json"
 require "../../store"
 require "../../rules"
+require "../serialize"
 
 module Gori
   module MCP
@@ -23,48 +24,18 @@ module Gori
             j.field "count", rules.size
             j.field "rules" do
               j.array do
-                rules.each do |r|
-                  j.object do
-                    j.field "id", r.id
-                    j.field "scope", r.scope.label
-                    # The EFFECTIVE state here. For a global rule the library's own default may
-                    # differ — this project overrode it — and both are reported so an agent can
-                    # tell "off everywhere" from "off in this engagement".
-                    j.field "enabled", r.enabled?
-                    if r.global?
-                      j.field "overridden", r.overridden?
-                      j.field "default_enabled", Settings.rewriter_rules.find { |g| g.id == r.id }.try(&.enabled)
-                    end
-                    j.field "name", r.name
-                    j.field "target", r.target.label
-                    j.field "part", r.part.label
-                    j.field "op", r.op.label
-                    j.field "match", r.match_kind.label
-                    j.field "host", r.host
-                    j.field "pattern", r.pattern
-                    j.field "replacement", r.replacement
-                    j.field "body_file", r.body_file
-                  end
-                end
+                rules.each { |r| Serialize.match_rule(j, r) }
               end
             end
           end
         end)
       end
 
-      # The `scope` argument, defaulting to this project — the safe direction: a caller that
-      # omits it edits the engagement in front of it, never every future one. An unrecognised
-      # value is REFUSED rather than clamped, because clamping "globl" to project would report
-      # success for an edit the caller meant to make everywhere.
+      # The `scope` argument of the Rewriter and Colormarker tools, defaulting to this project —
+      # the safe direction: a caller that omits it edits the engagement in front of it, never
+      # every future one. Not stripped, as it never was.
       private def rule_scope(h) : Store::RuleScope | Result
-        s = str(h, "scope")
-        return Store::RuleScope::Project if s.nil? || s.empty?
-        # One list — `RuleScope.values` — behind the match, the refusal sentence and the
-        # schema's `enum`, so they cannot come to disagree. Matched on `label` rather than
-        # through `parse?`, which folds separators and so accepts spellings the enum never
-        # advertises; case is folded, as it is in every sibling reader here.
-        Store::RuleScope.values.find { |v| v.label == s.downcase } ||
-          err("invalid 'scope' (expected #{RULE_SCOPES.join("|")})", "INVALID_ARGUMENT", field: "scope")
+        label_arg(h, "scope", Store::RuleScope, Store::RuleScope::Project, strip: false)
       end
 
       # Whether a rule's pattern is acceptable: only a Replace+Regex rule must compile; a
@@ -84,28 +55,163 @@ module Gori
       # creation rather than discovered from live traffic — the same stance the CLI takes.
       # `body_file` on any other op is rejected too: silently storing an ignored path would
       # leave the caller believing a body source is configured.
-      private def short_circuit_error(op : Store::RuleOp, replacement : String, body_file : String) : Result?
+      #
+      # The shape itself is judged by `RuleStub.respond_error`, the validator the CLI and the TUI
+      # editor call too (#1237).
+      private def short_circuit_error(op : Store::RuleOp, replacement : String, body_file : String,
+                                      respond : Store::RespondKind = Store::RespondKind.implied(body_file),
+                                      respond_args : String = "") : Result?
         unless op.short_circuit?
           return err("'body_file' is only valid with op=short_circuit", "INVALID_ARGUMENT", field: "body_file") unless body_file.empty?
           return nil
         end
-        return nil if Gori::RuleStub.valid?(replacement)
-        err("'replacement' is not a parseable HTTP response (expected a status line such as " \
-            "'200 OK', then headers, then a blank line and the body)", "INVALID_ARGUMENT", field: "replacement")
+        if msg = Gori::RuleStub.respond_error(respond, replacement, body_file, respond_args)
+          # Name the argument the caller has to change: a stub that does not parse is the
+          # `replacement`, everything else is the shape `respond` and its options describe.
+          stub = (respond.inline? || respond.file?) && !Gori::RuleStub.valid?(replacement)
+          return err("invalid short_circuit rule: #{msg}", "INVALID_ARGUMENT", field: stub ? "replacement" : "respond")
+        end
+        nil
       end
 
-      @[Tool("create_rule", gated: true, agent_action: true)]
+      # Whether a mocking argument was actually GIVEN. A client that fills every schema property
+      # sends `""`, `false` and `0` for the ones it means to leave alone — `describes?` already
+      # reads the empty string and null that way, and a `false`/`0` here is each argument's own
+      # default — so none of them may make a plain replace rule "use a short_circuit argument".
+      private def mock_given?(h, key : String) : Bool
+        return false unless describes?(h, key)
+        raw = h[key].raw
+        !(raw == false || raw == 0 || raw == 0_i64)
+      end
+
+      # The #1237 arguments: WHERE a short-circuit rule's answer comes from. `existing` is the rule
+      # an update starts from — each argument that is present overrides its field, and everything
+      # else is kept, so `update_rule{delay_ms: 0}` does not also forget a fault kind. Returns
+      # {respond, respond_args, body_file}.
+      MOCK_ARGS = %w[respond dir strip_prefix fallthrough fault delay_ms hang_ms from_flow_id]
+
+      private def mock_rule_args(h, op : Store::RuleOp, body_file : String,
+                                 existing : Store::MatchRule? = nil) : {Store::RespondKind, String, String} | Result
+        unless op.short_circuit?
+          if bad = MOCK_ARGS.find { |k| mock_given?(h, k) }
+            return err("'#{bad}' is only valid with op=short_circuit", "INVALID_ARGUMENT", field: bad)
+          end
+          return {Store::RespondKind::Inline, "", body_file}
+        end
+        body_file = mock_body_file(h, body_file)
+        return body_file if body_file.is_a?(Result)
+        base = existing.try(&.args) || Store::RespondArgs.new
+        fault = mock_fault(h, base)
+        return fault if fault.is_a?(Result)
+        respond = mock_respond_kind(h, fault, body_file, existing)
+        return respond if respond.is_a?(Result)
+        # Switching an existing rule to another answer drops what the new one does not read —
+        # the kept args and the kept body file — exactly as the TUI's `source:` row does. What the
+        # caller passed explicitly is still judged by `respond_error`.
+        base = base.for(respond, fault)
+        body_file = "" if (respond.inline? || respond.fault?) && !mock_given?(h, "body_file")
+        {respond, mock_args_stored(h, base, respond.fault? ? fault : nil), body_file}
+      rescue OverflowError
+        err("'delay_ms'/'hang_ms' out of range (0-#{Store::RespondArgs::MAX_WAIT_MS})", "INVALID_ARGUMENT", field: "delay_ms")
+      end
+
+      # `dir` names the directory in the same column a single-file stub keeps its body file in, so
+      # the two are one argument spelled twice — and passing both is refused, not merged.
+      private def mock_body_file(h, body_file : String) : String | Result
+        return body_file unless mock_given?(h, "dir")
+        if mock_given?(h, "body_file")
+          return err("pass either 'dir' (a directory to serve) or 'body_file' (one body), not both", "INVALID_ARGUMENT", field: "dir")
+        end
+        if mock_given?(h, "fault")
+          return err("'dir' and 'fault' are two different answers — pick one", "INVALID_ARGUMENT", field: "fault")
+        end
+        str(h, "dir") || ""
+      end
+
+      # The `fault` argument over the rule's own (an update), refusing a kind this gori lacks.
+      private def mock_fault(h, base : Store::RespondArgs) : Store::FaultKind? | Result
+        return base.fault unless mock_given?(h, "fault")
+        label = str(h, "fault") || ""
+        Store::FaultKind.from_label?(label.downcase) ||
+          err("invalid 'fault' (expected #{FAULT_KINDS.join("|")})", "INVALID_ARGUMENT", field: "fault")
+      end
+
+      # The stored `respond_args`: each argument present overrides the rule's own value. An
+      # out-of-range number is stored as given and refused by `RuleStub.respond_error`, which is
+      # the sentence every surface prints.
+      private def mock_args_stored(h, base : Store::RespondArgs, fault : Store::FaultKind?) : String
+        Store::RespondArgs.new(
+          describes?(h, "strip_prefix") ? (str(h, "strip_prefix") || "") : base.strip_prefix,
+          describes?(h, "fallthrough") ? bool_arg(h, "fallthrough", false) : base.fallthrough?,
+          fault,
+          describes?(h, "delay_ms") ? (int(h, "delay_ms") || -1).to_i32 : base.delay_ms,
+          describes?(h, "hang_ms") ? (int(h, "hang_ms") || -1).to_i32 : base.hang_ms).to_stored
+      end
+
+      # `respond` as named, or — when it is not — what the other arguments imply: a directory is
+      # a dir rule, a fault kind a fault rule, a body file a file stub. An update that names none
+      # of them keeps the rule's own.
+      private def mock_respond_kind(h, fault : Store::FaultKind?, body_file : String,
+                                    existing : Store::MatchRule?) : Store::RespondKind | Result
+        return mock_named_respond(h) if mock_given?(h, "respond")
+        return Store::RespondKind::Dir if mock_given?(h, "dir")
+        return Store::RespondKind::Fault if mock_given?(h, "fault") && fault
+        # An update keeps the rule's own answer — and on a dir rule a `body_file` is the one
+        # column the directory lives in, so it moves the directory rather than making a file stub.
+        return existing.respond if existing && (!mock_given?(h, "body_file") || existing.respond.dir?)
+        Store::RespondKind.implied(body_file)
+      end
+
+      # An explicit `respond`. A `dir` or `fault` argument that contradicts it is refused, never
+      # dropped: the caller asked for both and would read the rule back as the one they meant.
+      private def mock_named_respond(h) : Store::RespondKind | Result
+        label = str(h, "respond") || ""
+        named = Store::RespondKind.from_label?(label.downcase) ||
+                return err("invalid 'respond' (expected #{RESPOND_KINDS.join("|")})", "INVALID_ARGUMENT", field: "respond")
+        return err("'dir' needs respond=dir", "INVALID_ARGUMENT", field: "dir") if mock_given?(h, "dir") && !named.dir?
+        return err("'fault' needs respond=fault", "INVALID_ARGUMENT", field: "fault") if mock_given?(h, "fault") && !named.fault?
+        named
+      end
+
+      # `from_flow_id` (#1237): the captured response, snapshotted by the same engine the TUI and
+      # `gori run rewriter add --from-flow` use, so the refusals match. Returns the draft or the
+      # refusal as a Result; nil when the argument is absent.
+      private def mock_flow_draft(h) : (MockFromFlow::Draft | Result)?
+        return nil unless mock_given?(h, "from_flow_id")
+        flow_id = int(h, "from_flow_id")
+        return err(id_error(h, "from_flow_id"), "INVALID_ARGUMENT", field: "from_flow_id") unless flow_id
+        detail = store.get_flow(flow_id)
+        return not_found("no flow with id #{flow_id}") unless detail
+        drafted = Gori::MockFromFlow.draft(detail)
+        if refusal = drafted.as?(Gori::MockFromFlow::Refusal)
+          # Deterministic: the same flow refuses the same way next time — not retryable.
+          return err("flow ##{flow_id} — #{refusal.message}", refusal.code, field: "from_flow_id")
+        end
+        drafted.as(Gori::MockFromFlow::Draft)
+      end
+
+      @[Tool("create_rule", gated: true, agent_action: true, permission: "write")]
       private def create_rule(h) : Result
-        pattern = str(h, "pattern")
+        draft = mock_flow_draft(h)
+        return draft if draft.is_a?(Result)
+        pattern = str(h, "pattern").presence || draft.try(&.pattern)
         return err("missing required 'pattern'", "INVALID_ARGUMENT", field: "pattern") if pattern.nil? || pattern.empty?
         scope = rule_scope(h)
         return scope if scope.is_a?(Result)
         tp = rule_target_part(h, Store::RuleTarget::Request, Store::RulePart::Head)
         return tp if tp.is_a?(Result)
         target, part = tp
-        ok = rule_op_kind(h, Store::RuleOp::Replace, Store::MatchKind::Literal)
+        # A drafted pattern is a regex anchored on the request line (`MockFromFlow`).
+        default_match = draft && !describes?(h, "pattern") ? Store::MatchKind::Regex : Store::MatchKind::Literal
+        ok = rule_op_kind(h, Store::RuleOp::Replace, default_match)
         return ok if ok.is_a?(Result)
         op, match_kind = ok
+        if draft && !op.short_circuit?
+          return err("'from_flow_id' is only valid with op=short_circuit", "INVALID_ARGUMENT", field: "from_flow_id")
+        end
+        if draft && !describes?(h, "pattern") && match_kind.literal?
+          return err("the pattern drafted from 'from_flow_id' is a regex — omit 'match', or pass your own 'pattern'", "INVALID_ARGUMENT", field: "match")
+        end
         if bad = ws_shape_error(op, part)
           return bad
         end
@@ -115,11 +221,13 @@ module Gori
         unless valid_rule_regex?(op, match_kind, pattern)
           return err("invalid regex pattern (failed to compile)", "INVALID_ARGUMENT", field: "pattern")
         end
-        replacement = str(h, "replacement") || ""
+        replacement = str(h, "replacement").presence || draft.try(&.replacement) || ""
         name = str(h, "name") || ""
-        host = str(h, "host") || ""
-        body_file = str(h, "body_file") || ""
-        if bad = short_circuit_error(op, replacement, body_file)
+        host = str(h, "host").presence || draft.try(&.host) || ""
+        mock = mock_rule_args(h, op, str(h, "body_file") || "")
+        return mock if mock.is_a?(Result)
+        respond, respond_args, body_file = mock
+        if bad = short_circuit_error(op, replacement, body_file, respond, respond_args)
           return bad
         end
         if bad = pipe_shape_error(op, replacement)
@@ -138,7 +246,7 @@ module Gori
         # argument cannot carry the VALUE. `create` is `add` answering the new id, which this
         # tool echoes.
         id = rules_model.create(target, part, pattern, replacement, op, match_kind, name, host,
-          body_file, scope: scope, enabled: enabled)
+          body_file, scope: scope, enabled: enabled, respond: respond, respond_args: respond_args)
         if id == 0
           return busy(scope.global? ? "failed to persist global rule (settings not writable)" : "failed to persist rule (store busy or unwritable)")
         end
@@ -150,6 +258,7 @@ module Gori
             j.field "part", part.label
             j.field "op", op.label
             j.field "match", match_kind.label
+            j.field "respond", respond.label if op.short_circuit?
             j.field "enabled", enabled
           end
         end)
@@ -161,7 +270,7 @@ module Gori
       # list tools rather than behind the action gate. `create_rule_from_preset` installs one.
       @[Tool("list_rule_presets")]
       private def list_rule_presets : Result
-        Result.new(JSON.build do |j|
+        items_result(JSON.build do |j|
           j.array do
             Gori::RulePresets.all.each do |ps|
               j.object do
@@ -171,15 +280,15 @@ module Gori
                 j.field "rules" do
                   j.array do
                     ps.rules.each do |spec|
-                      j.object do
-                        j.field "target", spec.target.label
-                        j.field "part", spec.part.label
-                        j.field "op", spec.op.label
-                        j.field "match", spec.match_kind.label
-                        j.field "pattern", spec.pattern
-                        j.field "replacement", spec.replacement
-                        j.field "name", spec.name
-                      end
+                      {
+                        target:      spec.target.label,
+                        part:        spec.part.label,
+                        op:          spec.op.label,
+                        match:       spec.match_kind.label,
+                        pattern:     spec.pattern,
+                        replacement: spec.replacement,
+                        name:        spec.name,
+                      }.to_json(j)
                     end
                   end
                 end
@@ -194,7 +303,7 @@ module Gori
       # indistinguishable from a hand-authored one and is editable/disable-able/deletable (P4).
       # Returns the ids created; a partial write (some rows committed, one refused) reports
       # what landed rather than pretending it was all-or-nothing.
-      @[Tool("create_rule_from_preset", gated: true, agent_action: true)]
+      @[Tool("create_rule_from_preset", gated: true, agent_action: true, permission: "write")]
       private def create_rule_from_preset(h) : Result
         key = str(h, "preset")
         return err("missing required 'preset' (see list_rule_presets)", "INVALID_ARGUMENT", field: "preset") if key.nil? || key.empty?
@@ -229,7 +338,7 @@ module Gori
         err(ex.message || "invalid preset arguments", "INVALID_ARGUMENT")
       end
 
-      @[Tool("update_rule", gated: true, agent_action: true)]
+      @[Tool("update_rule", gated: true, agent_action: true, permission: "write")]
       private def update_rule(h) : Result
         id = int(h, "id")
         return err(id_error(h, "id"), "INVALID_ARGUMENT", field: "id") unless id
@@ -237,6 +346,9 @@ module Gori
         return scope if scope.is_a?(Result)
         existing = Gori::Rules.merged(store).find { |r| r.id == id && r.scope == scope }
         return not_found("no #{scope.label} rule with id #{id}") unless existing
+        if existing.inert?
+          return err("#{existing.inert_reason} — cannot edit this rule with this gori; use a newer version or delete it", "INVALID_ARGUMENT", field: "id")
+        end
         tp = rule_target_part(h, existing.target, existing.part)
         return tp if tp.is_a?(Result)
         target, part = tp
@@ -252,39 +364,55 @@ module Gori
         unless valid_rule_regex?(op, match_kind, pattern)
           return err("invalid regex pattern (failed to compile)", "INVALID_ARGUMENT", field: "pattern")
         end
-        replacement = present?(h, "replacement") ? (str(h, "replacement") || "") : existing.replacement
+        draft = mock_flow_draft(h)
+        return draft if draft.is_a?(Result)
+        replacement = present?(h, "replacement") ? (str(h, "replacement") || "") : (draft.try(&.replacement) || existing.replacement)
         name = present?(h, "name") ? (str(h, "name") || "") : existing.name
         host = present?(h, "host") ? (str(h, "host") || "") : existing.host
-        body_file = present?(h, "body_file") ? (str(h, "body_file") || "") : existing.body_file
-        if bad = short_circuit_error(op, replacement, body_file)
+        # A stub's file/dir does not survive a switch to an op that never reads it, as the TUI
+        # form's `body_file` row empties for one — keeping it refused every such switch over a
+        # `body_file` the caller never passed.
+        body_file = if present?(h, "body_file")
+                      str(h, "body_file") || ""
+                    else
+                      op.short_circuit? ? existing.body_file : ""
+                    end
+        mock = mock_rule_args(h, op, body_file, existing.op.short_circuit? ? existing : nil)
+        return mock if mock.is_a?(Result)
+        respond, respond_args, body_file = mock
+        # A fault answers nothing: switching a stub to one drops the old response rather than
+        # refusing the switch over bytes the new answer never sends (the TUI does the same).
+        replacement = "" if respond.fault? && !describes?(h, "replacement")
+        if bad = short_circuit_error(op, replacement, body_file, respond, respond_args)
           return bad
         end
         if bad = pipe_shape_error(op, replacement)
           return bad
         end
+        # Read BEFORE the write, as `update_extract_rule` does: read after it, a refused
+        # `enabled` reported failure over an edit already live on the proxy.
+        en = enabled_arg(h, existing.enabled?)
+        return en if en.is_a?(Result)
         model = rules_model
         # Through the model — see `create_rule` for why the whole family had to move.
         updated = model.update(id, target, part, pattern, replacement, op, match_kind, name,
-          host, body_file, scope: scope)
+          host, body_file, scope: scope, respond: respond, respond_args: respond_args)
         return busy("rule not updated (store busy or unwritable); the rule is unchanged") unless updated
-        if present?(h, "enabled")
-          en = bool_arg(h, "enabled", existing.enabled?)
+        unless en.nil?
           # For a global rule this is THIS project's answer, exactly as `set_rule_enabled`
           # means it — changing the library's default is `set_rule_enabled` + everywhere.
           unless model.set_enabled(id, en, scope)
             return busy("rule fields were updated but the enable/disable did not persist (store busy or unwritable); retry")
           end
         end
-        Result.new(JSON.build do |j|
-          j.object do
-            j.field "id", id
-            j.field "scope", scope.label
-            j.field "updated", true
-            j.field "target", target.label
-            j.field "part", part.label
-            j.field "op", op.label
-          end
-        end)
+        Result.new({
+          id:      id,
+          scope:   scope.label,
+          updated: true,
+          target:  target.label,
+          part:    part.label,
+          op:      op.label,
+        }.to_json)
       rescue ex : Gori::Error
         err(ex.message || "invalid rule arguments", "INVALID_ARGUMENT")
       end
@@ -293,7 +421,7 @@ module Gori
       # transform the live proxy uses (regex / header ops / host-scope all reflected)
       # over recent flows. Nothing is written. Approximate: response bodies are scanned
       # as STORED (possibly compressed) wire bytes.
-      @[Tool("preview_rule", gated: true)]
+      @[Tool("preview_rule", gated: true, read_only: true)]
       private def preview_rule(h) : Result
         pattern = str(h, "pattern")
         return err("missing required 'pattern'", "INVALID_ARGUMENT", field: "pattern") if pattern.nil? || pattern.empty?
@@ -322,6 +450,7 @@ module Gori
         candidate = Store::MatchRule.new(0_i64, true, target, part, pattern, replacement, op, match_kind, "", host)
         # Reuse the engine's preview over a throwaway Rules bound only to the store.
         pv = Gori::Rules.new(store, [] of Store::MatchRule).preview(candidate)
+        part_defaulted = preview_part_defaulted?(h, part, op)
         Result.new(JSON.build do |j|
           j.object do
             j.field "target", target.label
@@ -334,24 +463,31 @@ module Gori
             j.field "total_flows", pv.total
             j.field "scan_capped", pv.total > pv.scanned
             j.field "note", "Replays the rule transform over recent flows (bounded to #{Gori::Rules::RULE_PREVIEW_SCAN}); response bodies are matched as stored wire bytes."
+            if part_defaulted
+              j.field "part_defaulted", true
+              j.field "part_note", "'part' was not given, so it defaulted to head: only the start line and headers " \
+                                   "were matched, never a body. Pass part:\"body\" to preview a body match."
+            end
           end
         end)
+      end
+
+      # The default `part` is `head`, the same default `create_rule` stores — so it stays, or the
+      # preview would describe a different rule than the one it previews. But a caller who left
+      # `part` out and is looking for a BODY string reads `would_match: 0` as "not in the
+      # traffic" when the body was never scanned; `preview_rule` says so, only when it was the
+      # default. Header ops and short_circuit are head-only whatever `part` says: no note.
+      private def preview_part_defaulted?(h, part : Store::RulePart, op : Store::RuleOp) : Bool
+        str(h, "part").try(&.strip).presence.nil? && part.head? && (op.replace? || op.pipe?)
       end
 
       # Parse target/part from args, defaulting to the given fallbacks. Returns the
       # pair or an error Result. Shared by create/update/preview_rule.
       private def rule_target_part(h, dft_target : Store::RuleTarget, dft_part : Store::RulePart) : {Store::RuleTarget, Store::RulePart} | Result
-        tgt_s = str(h, "target").try(&.strip)
-        # Matched against the LABEL rather than through `parse?`, so ONE list — the enum's own
-        # members — backs the match, the refusal sentence and the schema's `enum` alike; add a
-        # member and all three follow. (`parse?` is also looser than the advertised set: it
-        # folds separators, so it answers for `shortcircuit` where `RuleOp` offers only
-        # `short_circuit`.) Case is still folded, as every sibling reader here folds it.
-        target = tgt_s.nil? || tgt_s.empty? ? dft_target : Store::RuleTarget.values.find { |v| v.label == tgt_s.downcase }
-        return err("invalid 'target' (expected #{RULE_TARGETS.join("|")})", "INVALID_ARGUMENT", field: "target") unless target
-        part_s = str(h, "part").try(&.strip)
-        part = part_s.nil? || part_s.empty? ? dft_part : Store::RulePart.values.find { |v| v.label == part_s.downcase }
-        return err("invalid 'part' (expected #{RULE_PARTS.join("|")})", "INVALID_ARGUMENT", field: "part") unless part
+        target = label_arg(h, "target", Store::RuleTarget, dft_target)
+        return target if target.is_a?(Result)
+        part = label_arg(h, "part", Store::RulePart, dft_part)
+        return part if part.is_a?(Result)
         {target, part}
       end
 
@@ -382,34 +518,23 @@ module Gori
       # Parse op/match from args, defaulting to the given fallbacks. Returns the pair or
       # an error Result. Shared by create/update/preview_rule.
       private def rule_op_kind(h, dft_op : Store::RuleOp, dft_kind : Store::MatchKind) : {Store::RuleOp, Store::MatchKind} | Result
-        op_s = str(h, "op").try(&.strip)
-        op = if op_s.nil? || op_s.empty?
-               dft_op
-             else
-               Store::RuleOp.values.find { |v| v.label == op_s.downcase }
-             end
-        return err("invalid 'op' (expected #{RULE_OPS.join("|")})", "INVALID_ARGUMENT", field: "op") unless op
+        op = label_arg(h, "op", Store::RuleOp, dft_op)
+        return op if op.is_a?(Result)
         # Validate `match` explicitly instead of leaning on MatchKind.from_label
         # (which coerces any unknown label to Literal). A silent literal fallback
         # would mislead a caller into thinking a `regex` rule was applied while the
         # proxy actually did a literal match — so an unrecognized label is rejected.
-        kind_s = str(h, "match").try(&.strip)
-        kind = if kind_s.nil? || kind_s.empty?
-                 dft_kind
-               else
-                 Store::MatchKind.values.find { |v| v.label == kind_s.downcase }
-               end
-        return err("invalid 'match' (expected #{RULE_MATCHES.join("|")})", "INVALID_ARGUMENT", field: "match") unless kind
+        kind = label_arg(h, "match", Store::MatchKind, dft_kind)
+        return kind if kind.is_a?(Result)
         {op, kind}
       end
 
       # For a global rule this writes THIS PROJECT's override by default — the same meaning `x`
       # has in the Rewriter tab. `everywhere: true` changes the library's own default instead,
       # which reaches every project that has not overridden it.
-      @[Tool("set_rule_enabled", gated: true, agent_action: true)]
+      @[Tool("set_rule_enabled", gated: true, agent_action: true, permission: "write")]
       private def set_rule_enabled(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
+        id = required_id(h, "id")
         scope = rule_scope(h)
         return scope if scope.is_a?(Result)
         enabled = optional_bool_arg(h, "enabled")
@@ -417,6 +542,9 @@ module Gori
         everywhere = bool_arg(h, "everywhere", false)
         return err("'everywhere' needs scope=global — a project rule has no default", "INVALID_ARGUMENT", field: "everywhere") if everywhere && !scope.global?
         return not_found("no #{scope.label} rule with id #{id}") unless rule_exists?(id, scope)
+        if error = inert_enable_error(id, scope, enabled)
+          return error
+        end
         # Through the model — see `create_rule`. `set_default` is the library's own default;
         # `set_enabled` is this project's answer, and for a GLOBAL rule that is an override,
         # dropped rather than pinned when it agrees with the default.
@@ -433,10 +561,16 @@ module Gori
         end)
       end
 
-      @[Tool("delete_rule", gated: true, agent_action: true)]
+      private def inert_enable_error(id : Int64, scope : Store::RuleScope, enabled : Bool) : Result?
+        return nil unless enabled
+        rule = Gori::Rules.merged(store).find { |r| r.id == id && r.scope == scope }
+        return nil unless rule && rule.inert?
+        err("#{rule.inert_reason} — cannot enable this rule with this gori; use a newer version or delete it", "INVALID_ARGUMENT", field: "enabled")
+      end
+
+      @[Tool("delete_rule", gated: true, agent_action: true, permission: "write")]
       private def delete_rule(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
+        id = required_id(h, "id")
         scope = rule_scope(h)
         return scope if scope.is_a?(Result)
         return not_found("no #{scope.label} rule with id #{id}") unless rule_exists?(id, scope)
@@ -452,7 +586,7 @@ module Gori
         unless rules_model.remove(id, scope)
           return busy("rule NOT deleted (store busy or unwritable); it is unchanged and may still be rewriting live traffic")
         end
-        Result.new(JSON.build { |j| j.object { j.field "id", id; j.field "scope", scope.label; j.field "deleted", true } })
+        Result.new({id: id, scope: scope.label, deleted: true}.to_json)
       end
 
       # The Match & Replace MODEL over this project's store, built per call — the same shape
@@ -483,32 +617,20 @@ module Gori
       # `replacement: "$SESSION"`. Same CRUD shape as the rules above so an agent that learned
       # one has learned the other.
 
-      private def extract_rule_json(j : JSON::Builder, r : Store::ExtractRule) : Nil
-        j.object do
-          j.field "id", r.id
-          j.field "enabled", r.enabled?
-          j.field "name", r.name
-          j.field "when", r.match_filter
-          j.field "host", r.host
-          j.field "kind", r.kind.label
-          j.field "selector", r.selector
-          j.field "pos_start", r.pos_start
-          j.field "pos_end", r.pos_end
-        end
-      end
-
       @[Tool("list_extract_rules")]
       private def list_extract_rules : Result
         rules = store.extract_rules
         Result.new(JSON.build do |j|
           j.object do
             j.field "count", rules.size
-            j.field "rules" { j.array { rules.each { |r| extract_rule_json(j, r) } } }
+            j.field "rules" { j.array { rules.each { |r| Serialize.extract_rule(j, r) } } }
             # The whole point of the feature, stated where an agent reading this list will
             # see it — otherwise "no value field" reads as an omission rather than a design.
+            # Spelled through `Env.spell`, not hardcoded: this note tells the caller what to
+            # WRITE, and the binding spelling is per-install (`$BIND.NAME` / bare `$NAME`).
             j.field "note", "Values are bound in the memory of the gori that observed them and are " \
                             "never persisted, so they are not readable here. Inject one from a Match & " \
-                            "Replace rule with replacement \"$NAME\"."
+                            "Replace rule with replacement #{Env.spell("NAME", Env::Namespace::Bind).inspect}."
           end
         end)
       end
@@ -521,18 +643,13 @@ module Gori
         Gori::Bindings.new(store, store.extract_rules)
       end
 
-      private def extract_kind_arg(h, dft : Gori::ExtractKind) : Gori::ExtractKind | Result
-        raw = str(h, "kind").try(&.strip)
-        return dft if raw.nil? || raw.empty?
-        Gori::ExtractKind.values.find { |v| v.label == raw.downcase } ||
-          err("invalid 'kind' (expected #{EXTRACT_KINDS.join("|")})", "INVALID_ARGUMENT", field: "kind")
-      end
-
-      # The `$` is stripped so an agent may pass the token the way an operator reads it.
+      # The spelling is stripped so an agent may pass the token the way an operator reads it —
+      # `$BIND.SESSION`, `BIND.SESSION`, `$SESSION` or `SESSION` all name the same extract rule,
+      # whose stored `name` column is the bare one.
       private def extract_name_arg(raw : String?) : String?
         n = raw.try(&.strip)
         return nil if n.nil? || n.empty?
-        n.starts_with?('$') ? n[1..] : n
+        Gori::Env.strip_spelling(n, Gori::Env::Namespace::Bind).presence
       end
 
       # An omitted field keeps the row's current value — the "omitted fields are left
@@ -579,27 +696,42 @@ module Gori
       # condition. Merged into ONE helper rather than a second `if` at each caller: both callers
       # are already at the cyclomatic limit, and these are one question — "are the arguments
       # usable" — asked of two of them.
-      private def extract_shape_error(kind : Gori::ExtractKind, pos_start : Int32, pos_end : Int32,
-                                      match_filter : String) : Result?
+      # The selector's two refusals (missing, or a regex that does not compile) are the same
+      # case: through `Bindings#validate` they came back as `field: "name"` too.
+      private def extract_shape_error(kind : Gori::ExtractKind, selector : String, pos_start : Int32,
+                                      pos_end : Int32, match_filter : String) : Result?
         if bad = Gori::InterceptFilter.unsupported_field_reason(match_filter)
           return err(bad, "INVALID_ARGUMENT", field: "when")
+        end
+        if bad = extract_selector_error(kind, selector)
+          return err(bad, "INVALID_ARGUMENT", field: "selector")
         end
         return nil unless kind.position? && pos_end <= pos_start
         err("'pos_end' must be greater than 'pos_start' for kind=position", "INVALID_ARGUMENT", field: "pos_end")
       end
 
-      @[Tool("create_extract_rule", gated: true, agent_action: true)]
+      private def extract_selector_error(kind : Gori::ExtractKind, selector : String) : String?
+        return nil if kind.position?
+        return "a #{kind.label} descriptor needs a selector" if selector.empty?
+        return nil unless kind.regex?
+        Regex.new(selector)
+        nil
+      rescue ex : ArgumentError | Regex::Error
+        "regex #{selector.inspect} does not compile: #{ex.message}"
+      end
+
+      @[Tool("create_extract_rule", gated: true, agent_action: true, permission: "write")]
       private def create_extract_rule(h) : Result
         name = extract_name_arg(str(h, "name"))
         return err("missing required 'name'", "INVALID_ARGUMENT", field: "name") unless name
-        kind = extract_kind_arg(h, Gori::ExtractKind::Cookie)
+        kind = label_arg(h, "kind", Gori::ExtractKind, Gori::ExtractKind::Cookie)
         return kind if kind.is_a?(Result)
         selector = str(h, "selector") || ""
         # Bounded in Int64 before the narrowing, for the reason spelled out at `keep_int`.
         pos_start = bounded_int_arg(h, "pos_start", 0_i64, min: Int32::MIN.to_i64, max: Int32::MAX.to_i64).to_i
         pos_end = bounded_int_arg(h, "pos_end", 0_i64, min: Int32::MIN.to_i64, max: Int32::MAX.to_i64).to_i
         when_s = str(h, "when") || ""
-        if bad = extract_shape_error(kind, pos_start, pos_end, when_s)
+        if bad = extract_shape_error(kind, selector, pos_start, pos_end, when_s)
           return bad
         end
         # Read BEFORE the insert, exactly as `create_rule` does: `bool_arg` RAISES on a
@@ -619,14 +751,7 @@ module Gori
         if bad = apply_created_extract_state(row.id, enabled)
           return bad
         end
-        Result.new(JSON.build do |j|
-          j.object do
-            j.field "id", row.id
-            j.field "name", name
-            j.field "kind", kind.label
-            j.field "enabled", enabled
-          end
-        end)
+        Result.new({id: row.id, name: name, kind: kind.label, enabled: enabled}.to_json)
       end
 
       # Atomic disabled creation, matching create_rule: flip before returning so there is no
@@ -637,21 +762,20 @@ module Gori
         busy("extract rule created but the disable did not persist (store busy or unwritable); retry")
       end
 
-      @[Tool("update_extract_rule", gated: true, agent_action: true)]
+      @[Tool("update_extract_rule", gated: true, agent_action: true, permission: "write")]
       private def update_extract_rule(h) : Result
-        id = int(h, "id")
-        return err(id_error(h, "id"), "INVALID_ARGUMENT", field: "id") unless id
+        id = required_id(h, "id")
         existing = store.extract_rules.find { |r| r.id == id }
         return not_found("no extract rule with id #{id}") unless existing
         name = extract_name_arg(present?(h, "name") ? str(h, "name") : existing.name)
         return err("name must not be empty", "INVALID_ARGUMENT", field: "name") unless name
-        kind = extract_kind_arg(h, existing.kind)
+        kind = label_arg(h, "kind", Gori::ExtractKind, existing.kind)
         return kind if kind.is_a?(Result)
         selector = keep(h, "selector", existing.selector)
         pos_start = keep_int(h, "pos_start", existing.pos_start)
         pos_end = keep_int(h, "pos_end", existing.pos_end)
         filter = keep(h, "when", existing.match_filter)
-        if bad = extract_shape_error(kind, pos_start, pos_end, filter)
+        if bad = extract_shape_error(kind, selector, pos_start, pos_end, filter)
           return bad
         end
         host = keep(h, "host", existing.host)
@@ -665,40 +789,44 @@ module Gori
         unless en.nil?
           return busy("extract rule fields were updated but the enable/disable did not persist (store busy or unwritable); retry") unless store.set_extract_rule_enabled(id, en)
         end
-        Result.new(JSON.build do |j|
-          j.object do
-            j.field "id", id
-            j.field "updated", true
-            j.field "name", name
-            j.field "kind", kind.label
-          end
-        end)
+        Result.new({id: id, updated: true, name: name, kind: kind.label}.to_json)
       end
 
-      @[Tool("set_extract_rule_enabled", gated: true, agent_action: true)]
+      @[Tool("set_extract_rule_enabled", gated: true, agent_action: true, permission: "write")]
       private def set_extract_rule_enabled(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
+        id = required_id(h, "id")
         enabled = optional_bool_arg(h, "enabled")
         return Result.new("missing required 'enabled' (true|false)", is_error: true) if enabled.nil?
         return not_found("no extract rule with id #{id}") unless store.extract_rules.any?(&.id.==(id))
         return busy("enable/disable NOT applied (store busy or unwritable); the extract rule is unchanged") unless store.set_extract_rule_enabled(id, enabled)
-        Result.new(JSON.build { |j| j.object { j.field "id", id; j.field "enabled", enabled } })
+        Result.new({id: id, enabled: enabled}.to_json)
       end
 
-      @[Tool("delete_extract_rule", gated: true, agent_action: true)]
+      @[Tool("delete_extract_rule", gated: true, agent_action: true, permission: "write")]
       private def delete_extract_rule(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
+        id = required_id(h, "id")
         return not_found("no extract rule with id #{id}") unless store.extract_rules.any?(&.id.==(id))
         return busy("extract rule NOT deleted (store busy or unwritable); it is unchanged") unless store.delete_extract_rule(id)
-        Result.new(JSON.build { |j| j.object { j.field "id", id; j.field "deleted", true } })
+        Result.new({id: id, deleted: true}.to_json)
       end
 
       # The tools/list schemas for the Match & Replace / extract rule tools, kept beside the handlers that
       # implement them. `Tools#list` composes every one of these; the action gate is applied
       # here rather than around one long block, so a new write tool cannot be added on the
       # wrong side of it by landing in the wrong place in a 1,300-line method.
+      # The #1237 mocking arguments, shared by create_rule and update_rule. Terse on purpose: every
+      # byte here counts against each profile's catalogue budget (`catalogue_size_spec.cr`).
+      private def mock_rule_props(s) : Nil
+        s.field "respond", enumprop("short_circuit: where the answer comes from (default: inferred from the dir, fault or body_file argument, else inline)", RESPOND_KINDS)
+        s.field "dir", strprop("respond=dir: directory to serve; the request path picks the file (dot segments and dotfiles refused)")
+        s.field "strip_prefix", strprop("respond=dir: URL prefix removed before the path is joined under dir, e.g. /static/")
+        s.field "fallthrough", boolprop("respond=dir: a request whose file is MISSING goes to the origin instead of a 502")
+        s.field "fault", enumprop("respond=fault: close (FIN), reset (RST) or hang (hold, bounded by hang_ms)", FAULT_KINDS)
+        s.field "delay_ms", intprop("short_circuit: wait this long before answering (max #{Store::RespondArgs::MAX_WAIT_MS})")
+        s.field "hang_ms", intprop("fault=hang: how long to hold (default #{Store::RespondArgs::DEFAULT_HANG_MS})")
+        s.field "from_flow_id", intprop("short_circuit: copy this flow's captured response into the rule; pattern/host/replacement default from it")
+      end
+
       private def list_rules_tools(j : JSON::Builder) : Nil
         tool j, "list_rules",
           "List the Match & Replace rules applied to this project (the Rewriter tab — literal/regex " \
@@ -719,9 +847,10 @@ module Gori
 
         tool j, "list_extract_rules",
           "List the project's EXTRACT rules — the read half of a session binding. Each one " \
-          "observes a response and binds one named value ($SESSION) in memory, which a Match & " \
-          "Replace rule injects with replacement \"$SESSION\". Values are never persisted and are " \
-          "not readable here. Unordered: an extract rule produces no bytes, so two cannot compose." { }
+          "observes a response and binds one named value ($BIND.SESSION, or $SESSION under the " \
+          "legacy bare syntax — see list_env's 'syntax') in memory, which a Match & Replace rule " \
+          "injects as its replacement. Values are never persisted and are not readable here. " \
+          "Unordered: an extract rule produces no bytes, so two cannot compose." { }
 
         return unless @allow_actions
 
@@ -738,9 +867,10 @@ module Gori
           s.field "part", enumprop("head = request/status line + headers, body = entity body, ws = a WebSocket MESSAGE on an upgraded (101) flow with target picking the direction (request = client→server, response = server→client). Default head; ignored by header ops and short_circuit, which are head-only, and rejected for those ops when set to ws (replace and pipe are the two ops that can target ws)", RULE_PARTS)
           s.field "op", enumprop("what the rule does (default replace). short_circuit ANSWERS the request from the rule and never dials the origin — nothing is sent upstream; use it to stub a response that does not exist. pipe RUNS A LOCAL COMMAND: 'replacement' is an argv, exec'd with no shell and with the operator's own privileges, fed the matched bytes on stdin, its stdout spliced back in — on timeout, non-zero exit or a failed spawn the bytes pass through unchanged and a notice is written (P6)", RULE_OPS)
           s.field "body_file", strprop("short_circuit only: serve this file's bytes as the response BODY instead of the inline one (re-read when the file changes). Empty = inline")
+          mock_rule_props(s)
           s.field "match", enumprop("for replace: how `pattern` is read (default literal). Regex supports $1/\\1 capture groups", RULE_MATCHES)
           s.field "name", strprop("optional label for the rule")
-          s.field "host", strprop("optional host glob scoping the rule (e.g. 'example.com' substring, '*.example.com' wildcard; empty = all hosts)")
+          s.field "host", strprop("optional host glob scoping the rule (e.g. 'example.com' substring, '*.example.com' wildcard; empty = all hosts). With from_flow_id an empty host keeps the flow's own host — pass '*' for all hosts")
           s.field "enabled", boolprop("create the rule already enabled (default true); pass false for an atomic disabled creation (no live window before you can preview/adjust it)")
         end
 
@@ -766,6 +896,7 @@ module Gori
           s.field "part", enumprop("which part of the message (ws = a WebSocket message; replace only)", RULE_PARTS)
           s.field "op", enumprop("what the rule does", RULE_OPS)
           s.field "body_file", strprop("short_circuit only: file served as the response body ('' = inline)")
+          mock_rule_props(s)
           s.field "match", enumprop("how `pattern` is read", RULE_MATCHES)
           s.field "name", strprop("rule label")
           s.field "host", strprop("host glob ('' = all hosts)")
@@ -803,12 +934,13 @@ module Gori
         end
 
         tool j, "create_extract_rule",
-          "Add an EXTRACT rule: observe a response and bind one named value ($NAME) in memory " \
-          "for a Match & Replace rule to inject with replacement \"$NAME\". Only a DELIBERATE " \
+          "Add an EXTRACT rule: observe a response and bind one named value in memory for a " \
+          "Match & Replace rule to inject as its replacement — written $BIND.NAME, or $NAME " \
+          "under the legacy bare syntax (see list_env's 'syntax'). Only a DELIBERATE " \
           "single send (Repeater / send_request) feeds extraction — sweeps deliberately do not, " \
           "because a response echoing an attacker-shaped payload back could otherwise rebind the " \
           "operator's session to it. One name, one writer: a duplicate name is refused." do |s|
-          s.field "name", strprop("the binding name, without the $ (letters, digits and _, not starting with a digit)"), required: true
+          s.field "name", strprop("the binding name alone, no sigil or namespace (letters, digits and _, not starting with a digit)"), required: true
           s.field "kind", enumprop("where the token is read from (default cookie). cookie and header read the parsed head; the rest read the DECODED body", EXTRACT_KINDS)
           s.field "selector", strprop("cookie name, header name, regex source, or JSON path ($.a.b[0]) — required for every kind except position")
           s.field "when", strprop("which messages to read, in intercept-filter syntax (host:/path:/method:/scheme:/status:, AND/OR/NOT, '' = any). status: matches responses only")
@@ -822,7 +954,7 @@ module Gori
           "Update an existing extract rule by id. Omitted fields are left unchanged. Renaming " \
           "drops the old name's bound value rather than re-labelling it." do |s|
           s.field "id", intprop("extract rule id from list_extract_rules"), required: true
-          s.field "name", strprop("new binding name (without the $)")
+          s.field "name", strprop("new binding name (the name alone, no sigil or namespace)")
           s.field "kind", enumprop("where the token is read from", EXTRACT_KINDS)
           s.field "selector", strprop("cookie/header name, regex source, or JSON path")
           s.field "when", strprop("intercept-filter condition ('' = any message)")

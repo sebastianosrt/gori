@@ -43,8 +43,7 @@ module Gori
         if bad = exec_step_refusal(spec)
           return bad
         end
-        raw = str(h, "input")
-        return Result.new("missing required 'input'", is_error: true) if raw.nil?
+        raw = required_str(h, "input", blank: true)
 
         input =
           if bool_arg(h, "input_base64", false)
@@ -105,10 +104,7 @@ module Gori
             j.field "steps" do
               j.array do
                 result.steps.each do |s|
-                  j.object do
-                    j.field "converter", s.name
-                    j.field "state", s.state.to_s.downcase
-                  end
+                  {converter: s.name, state: s.state.to_s.downcase}.to_json(j)
                 end
               end
             end
@@ -116,24 +112,80 @@ module Gori
         end)
       end
 
-      # The warning for a spec whose bare tokens ENCODED. nil when there is nothing to say:
-      # the caller spelled a direction (`base64-encode`), or the step decodes, or it is a
-      # hash/compress step where "encode" is the only direction there is.
+      # The three spellings the catalog gives ONE direction, each mapped to the spelling that
+      # undoes it. The note used to know only the first, and the comment that stood here
+      # excused the rest as "a hash/compress step where encode is the only direction there
+      # is" — which is not true of either of the other two: `gunzip` sits beside `gzip` in
+      # the catalog and `html-unescape` beside `html-escape`. So `decode{spec:"gzip"}`
+      # COMPRESSED, `decode{spec:"deflate"}` COMPRESSED, and `decode{spec:"html"}` ESCAPED,
+      # each with `isError:false` and nothing said — the very shape this note exists for,
+      # three families wide.
+      INVERSE_SUFFIX = {"-encode" => "-decode", "-compress" => "-decompress", "-escape" => "-unescape"}
+
+      # The two encoders in the catalog named for what they DO rather than for which half of
+      # a pair they are, so no suffix rule can reach them. Named here rather than given a
+      # field on `Converter` that the other seventeen pairs would leave nil — and swept by a
+      # spec (`spec/mcp/decode_tool_spec.cr`) that walks every Encode converter in the
+      # registry, so an encoder added later with an inverse and no rule for it fails there
+      # instead of going quiet in the note.
+      INVERSE_NAME = {"raw-deflate" => "raw-inflate", "url-encode-all" => "url-decode"}
+
+      # A token that spells one of these named a DIRECTION, whatever else it says, so what it
+      # did is not a surprise. Substring and not a suffix: `url-encode-all` and `gzip-compress`
+      # both say which way they go without ending in the word.
+      DIRECTION_WORDS = %w[encode decode compress decompress escape unescape]
+
+      # The warning for a spec whose direction-less tokens ENCODED. nil when there is nothing
+      # to say: the caller spelled a direction (`base64-encode`, `gzip-compress`), the step
+      # decodes or hashes, or the converter is genuinely ONE-WAY (`shell-escape`, `homoglyph`)
+      # and there is no other way to point them at.
       private def encode_surprise(result : Decoder::ChainResult) : String?
-        bare = [] of String
+        reg = Decoder.shared_registry
+        bare = [] of {String, String, String}
         result.steps.each do |step|
           next unless conv = step.converter
+          next unless conv.direction.encode?
           # The token AS TYPED — an alias that already names its direction is not a surprise,
           # and neither is a canonical name the caller spelled in full.
           token = step.token.split(':', 2).first.strip.downcase
-          next if token.ends_with?("-encode") || token.ends_with?("-decode")
-          next unless conv.direction.encode? && conv.name.ends_with?("-encode")
-          bare << "#{token} -> #{conv.name}"
+          next if DIRECTION_WORDS.any? { |w| token.includes?(w) }
+          next unless inverse = Tools.inverse_of(reg, conv.name)
+          bare << {token, conv.name, inverse}
         end
         return nil if bare.empty?
-        "this tool is named `decode`, but #{bare.join(", ")} ENCODED — a bare converter name " \
-        "is the encode direction. Pass the -decode name (e.g. base64-decode, hex-decode, " \
-        "url-decode) to go the other way."
+        went = bare.map { |(tok, name, _)| "#{tok} -> #{name}" }.join(", ")
+        # REVERSED: a chain undoes back to front, so `gzip > base64` is undone by
+        # `base64-decode > gzip-decompress`. Listing the inverses in step order handed an
+        # agent a spec that fails at step 1 — a new trap in the one message whose whole job
+        # is to keep an agent out of one.
+        instead = bare.map(&.[2]).reverse!.uniq!.join(" > ")
+        "this tool is named `decode`, but #{went} ENCODED — a bare converter name is the " \
+        "encode direction. Pass #{instead} to go the other way."
+      end
+
+      # The converter that undoes `name`, or nil when this build has none. Asked of the
+      # REGISTRY rather than derived from the name alone: the note tells the caller to spell a
+      # converter, so that converter has to exist and has to decode. A one-way transform has
+      # no counterpart and therefore gets no note — telling someone to pass `shell-unescape`
+      # would send them after a name that was never in the catalog.
+      #
+      # A CLASS method, using no instance state: it is what the registry sweep in
+      # `spec/mcp/decode_tool_spec.cr` walks the whole catalog through, and building a `Tools`
+      # (and so a store) to ask a question about two strings would only make that spec harder
+      # to keep.
+      def self.inverse_of(reg : Decoder::Registry, name : String) : String?
+        candidates = [] of String
+        if named = INVERSE_NAME[name]?
+          candidates << named
+        end
+        INVERSE_SUFFIX.each do |enc, dec|
+          candidates << "#{name[0...-enc.size]}#{dec}" if name.ends_with?(enc)
+        end
+        candidates.each do |c|
+          other = reg[c]?
+          return other.name if other && other.direction.decode?
+        end
+        nil
       end
 
       # --- jwt workbench tools (pure compute; always exposed, not action-gated) ---
@@ -166,9 +218,19 @@ module Gori
         # header. The old code defaulted to "" and then blamed "invalid header JSON" for a
         # header the caller never touched.
         header = raw_header || (token ? Jwt.header_json(token.strip) : "{}")
-        payload = raw_payload || (token ? Jwt.payload_json(token.strip) : "{}")
         alg = str(h, "alg") || "HS256"
+        # `secret` and `key` fill the SAME engine slot; the alg decides how it is read. Both
+        # present would silently pick one, so refuse rather than sign with the wrong material.
         secret = str(h, "secret") || ""
+        pem = str(h, "key").try(&.presence)
+        if pem && !secret.empty?
+          return Result.new("'secret' and 'key' are two names for the same key — pass one", is_error: true)
+        end
+        begin
+          secret = Jwt.key_material(secret, pem)
+        rescue ex : Jwt::ForgeError
+          return Result.new("key: #{ex.message}", is_error: true)
+        end
         # `set` patches individual claims (`role=admin`), the same knob as `gori run jwt --set`.
         # `payload` replaces the claims wholesale, so the two are mutually exclusive — a `set` on
         # top of a wholesale `payload` would depend on order.
@@ -177,21 +239,58 @@ module Gori
           return Result.new("'payload' and 'set' are mutually exclusive", is_error: true)
         end
         begin
+          # A token's claims come through `signing_payload`, which refuses a payload segment it
+          # cannot read rather than answer "" — `set` would otherwise re-sign `{}` plus the
+          # patch and drop every other claim (#1169).
+          payload = raw_payload || (token ? Jwt.signing_payload(token) : "{}")
           payload = Jwt.patch_payload(payload, sets) unless sets.empty?
           signed = Jwt.encode(header, payload, alg, secret)
         rescue ex : Jwt::ForgeError
           return Result.new(ex.message || "invalid input", is_error: true)
         end
-        Result.new(JSON.build { |j| j.object { j.field "token", signed; j.field "alg", alg } })
+        Result.new({token: signed, alg: alg}.to_json)
       end
 
       @[Tool("jwt_attacks", unbound: true)]
       private def jwt_attacks_tool(h) : Result
         token = str(h, "token")
         return Result.new("missing required 'token'", is_error: true) if token.nil? || token.strip.empty?
-        attacks = Jwt.attacks(token.strip)
-        return Result.new("not a decodable JWT — no payloads generated", is_error: true) if attacks.empty?
-        Result.new(Jwt.attacks_json(attacks))
+        attacks = begin
+          Jwt.attacks(token.strip, str(h, "public_key").try(&.presence))
+        rescue ex : Jwt::ForgeError
+          return Result.new("public_key: #{ex.message}", is_error: true)
+        end
+        if attacks.empty?
+          return Result.new("not a decodable JWT — no payloads generated (an encrypted JWE has no " \
+                            "claims to tamper with and no signature to strip)", is_error: true)
+        end
+        items_result(Jwt.attacks_json(attacks))
+      end
+
+      # Verify is its own tool rather than a flag on jwt_decode: decoding is pure and needs
+      # nothing, verifying needs key material, and folding them would make every decode call
+      # look like it might be checking a signature when it never was.
+      @[Tool("jwt_verify", unbound: true)]
+      private def jwt_verify_tool(h) : Result
+        token = str(h, "token")
+        return Result.new("missing required 'token'", is_error: true) if token.nil? || token.strip.empty?
+        secret = str(h, "secret")
+        pem = str(h, "key").try(&.presence)
+        # An explicit `secret: ""` names the empty secret, so beside a `key` it conflicts too.
+        if pem && secret
+          return Result.new("'secret' and 'key' are two names for the same key — pass one", is_error: true)
+        end
+        # Naming no key used to check the EMPTY secret and answer a bare `verified: false`, which
+        # an agent reads as "wrong key". An explicit `secret: ""` still means the empty secret.
+        if secret.nil? && pem.nil?
+          return Result.new("jwt_verify needs 'secret' (HMAC) or 'key' (PEM) — pass secret:\"\" to check " \
+                            "the empty secret", is_error: true)
+        end
+        begin
+          Result.new(Jwt.verify_json(Jwt.verify(token.strip, Jwt.key_material(secret || "", pem))))
+        rescue ex : Jwt::ForgeError
+          Result.new(ex.message || "invalid key", is_error: true)
+        end
       end
 
       # The tools/list schemas for the decoder / JWT tools, kept beside the handlers that
@@ -205,11 +304,14 @@ module Gori
           "`spec` is converter tokens separated by '>', '|' or ',' applied left-to-right, e.g. " \
           "'base64-decode > gunzip', 'url-encode', 'sha256'. DIRECTION IS PART OF THE NAME, and " \
           "a bare one is the ENCODE half: `base64` is base64-ENCODE, `hex` is hex-encode, `url` " \
-          "is url-encode — despite this tool being called decode. To DECODE, spell it: " \
-          "base64-decode, hex-decode, url-decode. Common converters: base64-encode, " \
+          "is url-encode, `gzip`/`deflate` COMPRESS and `html`/`xml` ESCAPE — despite this tool " \
+          "being called decode. To DECODE, spell it: base64-decode, hex-decode, url-decode, " \
+          "gunzip, inflate, html-unescape. Common converters: base64-encode, " \
           "base64-decode, url-encode, url-encode-all, url-decode, hex-encode, hex-decode, gzip, gunzip, " \
           "deflate, inflate, raw-deflate, raw-inflate, brotli, zstd (both decompress-only), " \
           "msgpack-decode, cbor-decode (binary document -> JSON), " \
+          "java-deserialize, dotnet-viewstate, php-unserialize, pickle-disasm " \
+          "(native serialization -> JSON; pickle is disassembled, never executed), " \
           "jwt-decode, html-encode, md5, sha256, crc32, " \
           "decimal, binary, rot47, quoted-printable, punycode-encode, punycode-decode, base36, " \
           "base62, xml-escape, shell-escape, powershell-escape, c-string-escape, homoglyph, typo. " \
@@ -221,29 +323,61 @@ module Gori
 
         tool j, "jwt_decode",
           "Decode a JWT into its header + payload JSON and signature — the same engine as the " \
-          "TUI JWT tab. Pure transform: no network, no state, no signature verification. Returns " \
-          "{alg, header, payload, signature, signed}." do |s|
-          s.field "token", strprop("the JWT (header.payload[.signature])"), required: true
+          "TUI JWT tab. Pure transform: no network, no state, no signature verification (use " \
+          "jwt_verify for that). A SIGNED token returns {type:\"JWS\", alg, header, payload, " \
+          "signature, signed}. An ENCRYPTED five-part token (JWE) returns {type:\"JWE\", alg, enc, " \
+          "kid, header, payload:null, encrypted:true, encrypted_key, iv, ciphertext, tag} — gori " \
+          "reads the JWE protected header and does NOT decrypt, so the claims are not available " \
+          "at any surface and `payload` is null rather than absent. Branch on `type`. A " \
+          "malformed token stays type JWS but also carries a `note`: one segment (not a " \
+          "decodable token) or, past three, `extra_segments` too — the raw trailing segments " \
+          "of data smuggled after a JWS prefix, which `jwt_verify` refuses." do |s|
+          s.field "token", strprop("the JWT: a JWS (header.payload[.signature]) or a JWE (header.encrypted_key.iv.ciphertext.tag)"), required: true
+        end
+
+        tool j, "jwt_verify",
+          "Check whether a JWT's OWN signature verifies under a key you supply — the question " \
+          "\"would a server holding this key accept this token\". Verification always uses the alg " \
+          "the TOKEN declares, never one you pick, because that is what a vulnerable server does " \
+          "too. Pure compute: no network. Returns {alg, verified, code, reason}. A false " \
+          "`verified` is an ANSWER, not an error, and always carries a `code` to branch on plus " \
+          "a prose `reason`. Another key may succeed only after signature_mismatch (a " \
+          "well-formed signature this key did not make) or key_mismatch (a key of the wrong type " \
+          "or size for the token's alg, which a server holding it rejects). No key helps after " \
+          "signature_malformed (not base64, or a width no key produces), unsigned (alg=none or " \
+          "no signature), alg_unsupported, no_alg, jwe (encrypted, nothing to verify), " \
+          "extra_segments or malformed. Both are null when `verified` is true. Pass 'secret' or " \
+          "'key' — a call with neither is refused rather than checked against an empty secret." do |s|
+          s.field "token", strprop("the JWT to check"), required: true
+          s.field "secret", strprop("HMAC secret, for an HS256/384/512 token. \"\" checks the empty secret")
+          s.field "key", strprop("PEM key for an RS/PS/ES/EdDSA token — inline PEM text, or a path to a .pem file. A PUBLIC KEY, a CERTIFICATE, or the private key all work. Mutually exclusive with 'secret'")
         end
 
         tool j, "jwt_encode",
-          "Re-sign a JWT with a chosen algorithm + secret — the classic testing move (swap alg to " \
+          "Re-sign a JWT with a chosen algorithm + key — the classic testing move (swap alg to " \
           "none, or re-sign with a guessed HS secret). Takes the header + payload from `token` " \
           "(or the explicit `header`/`payload` JSON overrides), FORCES `alg` into the header, and " \
-          "HMAC-signs with `secret` (HS256/384/512) or leaves it unsigned (none). Returns {token, alg}." do |s|
+          "signs: HMAC with `secret` for HS256/384/512, the PEM private key in `key` for " \
+          "RS/PS/ES/EdDSA, or nothing at all for `none`. gori generates no keys — an asymmetric " \
+          "alg requires the private key you already hold. Returns {token, alg}." do |s|
           s.field "token", strprop("a JWT to take the header + payload from (optional if header+payload are given)")
           s.field "header", strprop("header JSON object (overrides the token's header)")
           s.field "payload", strprop("payload JSON (overrides the token's payload wholesale; mutually exclusive with 'set')")
           s.field "set", strarrprop("patch individual claims before signing, each \"key=value\" (e.g. \"role=admin\"); value is JSON if it parses (true/3), else a string. Mutually exclusive with 'payload'")
           s.field "alg", enumprop("signing algorithm (default HS256; none emits an unsigned token)", Gori::Jwt::ALGS)
           s.field "secret", strprop("HMAC secret for an HS algorithm")
+          s.field "key", strprop("PEM PRIVATE key for an RS/PS/ES/EdDSA algorithm — inline PEM text, or a path to a .pem file. Mutually exclusive with 'secret'")
         end
 
         tool j, "jwt_attacks",
           "Generate testing payloads from a JWT: alg:none variants + signature strip, weak-secret " \
           "HS256 re-signs, and header-parameter injection (kid path-traversal/SQLi, jku/x5u/jwk). " \
-          "Pure transform: no network. Returns an array of {name, category, note, token}." do |s|
+          "With `public_key`, also the algorithm-confusion family for an RS/PS/ES token — HS256 " \
+          "re-signs keyed with the public key's own bytes, in each spelling a server might hold. " \
+          "Pure transform: no network. Returns {items:[{name, category, note, token, verified}]}. " \
+          "An encrypted JWE yields nothing: it has no claims segment to tamper with." do |s|
           s.field "token", strprop("the JWT to derive testing payloads from"), required: true
+          s.field "public_key", strprop("the server's PUBLIC verification key for the algorithm-confusion family — inline PEM text (a PUBLIC KEY or a CERTIFICATE), or a path to a .pem file. Only meaningful for a token whose alg is RS*/PS*/ES*")
         end
       end
     end

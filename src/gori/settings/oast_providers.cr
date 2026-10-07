@@ -30,7 +30,7 @@ module Gori::Settings
       kind = o["kind"]?.try(&.as_s?)
       host = o["host"]?.try(&.as_s?)
       next if id.nil? || id.empty? || name.nil? || name.empty? || kind.nil? || kind.empty? || host.nil? || host.empty?
-      token = o["token"]?.try(&.as_s?)
+      token = o["token"]?.try(&.as_s?).presence # blank is "no token", as the form saves it
       enabled = o["enabled"]?.try(&.as_bool?)
       out << OastProvider.new(id, name, kind, host, token, enabled.nil? ? true : enabled)
     end
@@ -40,28 +40,42 @@ module Gori::Settings
   # --- global provider library CRUD (settings:oast providers → global scope) ---------------
   # Each mutation rewrites the array and persists via save (atomic + 3-way merge). add returns
   # the new provider's generated id so the caller can select it.
-  def self.add_oast_provider(name : String, kind : String, host : String, token : String?, enabled : Bool = true) : String
-    id = Random::Secure.hex(4)
-    self.oast_providers = oast_providers + [OastProvider.new(id, name, kind, host, token, enabled)]
-    save
-    id
-  end
-
-  def self.update_oast_provider(id : String, name : String, kind : String, host : String, token : String?) : Nil
-    self.oast_providers = oast_providers.map do |p|
-      p.id == id ? OastProvider.new(id, name, kind, host, token, p.enabled) : p
+  #
+  # And each one ANSWERS, restoring the list when the write did not land — the shape
+  # `add_scan_rule` and the rewriter CRUD already have. Dropping `save`'s result left a refused
+  # write (a half-read or unreadable settings.json, a full disk) live for the rest of the session
+  # under an "added provider" toast and gone at the next start; and a provider MOVED from a
+  # project into the global library had its project row deleted first, so it vanished outright.
+  #
+  # Each also re-reads the section first (see `reload_scan_rules_from_disk`), and an id that is
+  # not there answers false: a provider a peer deleted must not come back as an edit.
+  def self.reload_oast_providers_from_disk : Nil
+    reload_section("oast_providers", absent: JSON::Any.new([] of JSON::Any), object: false) do |node|
+      self.oast_providers = parse_oast_providers(node)
     end
-    save
   end
 
-  def self.set_oast_provider_enabled(id : String, enabled : Bool) : Nil
-    self.oast_providers = oast_providers.map { |p| p.id == id ? p.copy_with(enabled: enabled) : p }
-    save
+  def self.add_oast_provider(name : String, kind : String, host : String, token : String?, enabled : Bool = true) : String
+    reload_oast_providers_from_disk
+    id = Random::Secure.hex(4)
+    commit(oast_providers, oast_providers + [OastProvider.new(id, name, kind, host, token, enabled)]) ? id : ""
   end
 
-  def self.delete_oast_provider(id : String) : Nil
-    self.oast_providers = oast_providers.reject { |p| p.id == id }
-    save
+  def self.update_oast_provider(id : String, name : String, kind : String, host : String, token : String?) : Bool
+    reload_oast_providers_from_disk
+    commit(oast_providers, replace_by_id(oast_providers, id) do |p|
+      OastProvider.new(id, name, kind, host, token, p.enabled)
+    end)
+  end
+
+  def self.set_oast_provider_enabled(id : String, enabled : Bool) : Bool
+    reload_oast_providers_from_disk
+    commit(oast_providers, replace_by_id(oast_providers, id, &.copy_with(enabled: enabled)))
+  end
+
+  def self.delete_oast_provider(id : String) : Bool
+    reload_oast_providers_from_disk
+    commit(oast_providers, remove_by_id(oast_providers, id))
   end
 
   # Factory reset for this section (dispatched by Settings.reset_to_factory). Provider TOKENS

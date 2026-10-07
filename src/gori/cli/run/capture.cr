@@ -19,26 +19,29 @@ module Gori
         format = :text
         every : Time::Span? = nil
         max : Int32? = nil
+        ca_dir = Paths.default_ca_dir
 
-        parser = OptionParser.new do |p|
+        parse_no_positionals(args, "gori run capture",
+          "pass the project as --project NAME and the bind address as --listen/--port") do |p|
           p.banner = "Usage: gori run capture [options]\n\nRun the proxy and stream captured flows to STDOUT until Ctrl-C (or --for / --max)."
-          p.on("-lHOST", "--listen=HOST", "Listen address (default #{listen})") { |v| listen = listen_flag = v }
+          p.on("-lHOST", "--listen=HOST", "Listen address (default #{listen})") do |v|
+            # An empty `-l "$UNSET"` was taken as given: it bound whatever the resolver picks
+            # for the default (often ::1 only) while the banner said "all interfaces".
+            abort "gori run capture: --listen needs an address (e.g. 127.0.0.1)" if v.strip.empty?
+            if err = Settings.bind_host_error(v)
+              abort "gori run capture: --listen: #{err.lchop("settings: ")}"
+            end
+            listen = listen_flag = v.strip
+          end
           p.on("-pPORT", "--port=PORT", "Listen port (default #{port})") { |v| port = port_flag = parse_port(v) }
-          p.on("--project=NAME", "Capture into project NAME (created if missing; default 'default')") { |v| project_name = v }
+          p.on("--project=NAME", "Capture into project NAME (created if missing). Default: $#{DEFAULT_PROJECT_ENV}, else the project pinned by `gori run project switch`, else 'default'") { |v| project_name = v }
           p.on("--db=PATH", "Capture into an explicit SQLite db file") { |v| db_path = v }
           p.on("-k", "--insecure-upstream", "Do not verify upstream TLS certificates") { insecure = true }
-          p.on("--format=FMT", "Output: text (default) | json | jsonl (both emit JSON-Lines)") do |v|
-            format = parse_format(v, [:text, :json, :jsonl])
-            format = :json if format == :jsonl # streamed output is JSON-Lines; accept the standard name too
-          end
+          p.on("--ca-dir=DIR", "Directory for the root CA (default #{Paths.default_ca_dir}), as `gori --ca-dir` and `gori ca` take it") { |v| ca_dir = v }
+          format_flag(p, [:text, :json, :jsonl], "Output: text (default) | jsonl (one object per flow, streamed) | json (one array, closed when the capture stops)") { |f| format = f }
           p.on("--for=DURATION", "Stop after DURATION (e.g. 30s, 5m, 1h)") { |v| every = parse_duration(v) }
           p.on("--max=N", "Stop after N completed flows") { |v| max = parse_count(v, "--max") }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.invalid_option { |f| abort "gori run capture: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run capture: missing value for #{f}" }
         end
-        parse_no_positionals(parser, args, "gori run capture",
-          "pass the project as --project NAME and the bind address as --listen/--port")
 
         Paths.ensure_dirs
         # The process-only override layer, not the persisted global: Session.open reads
@@ -47,7 +50,7 @@ module Gori
         Settings.cli_bind_host = listen_flag
         Settings.cli_bind_port = port_flag
         project = resolve_capture_project(project_name, db_path)
-        config = Config.new(listen, port, project.db_path, Paths.default_ca_dir,
+        config = Config.new(listen, port, project.db_path, ca_dir,
           insecure_upstream: insecure)
         signaled = App.new(config).run_capture(project, format: format, max: max, every: every)
         exit 130 if signaled

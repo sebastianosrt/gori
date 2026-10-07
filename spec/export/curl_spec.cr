@@ -320,6 +320,32 @@ describe Gori::Export::Curl do
     end
   end
 
+  # Both measured against a raw listener, curl 8.7.1, and both found by holding the export to
+  # the import round trip (`spec/curl_round_trip_spec.cr`).
+  describe "what curl would change on its own" do
+    it "adds --path-as-is for a . or .. path segment, which curl collapses otherwise" do
+      cmd = curl_of("GET /a/../etc/passwd HTTP/1.1\r\nHost: h\r\n\r\n", "http://h")
+      cmd.should contain("--path-as-is")
+      curl_of("GET /a/./b HTTP/1.1\r\nHost: h\r\n\r\n", "http://h").should contain("--path-as-is")
+    end
+
+    it "leaves the flag off a dotted name that is not a segment, and off a query" do
+      curl_of("GET /a..b/.hidden HTTP/1.1\r\nHost: h\r\n\r\n", "http://h").should_not contain("--path-as-is")
+      curl_of("GET /p?x=../y HTTP/1.1\r\nHost: h\r\n\r\n", "http://h").should_not contain("--path-as-is")
+    end
+
+    it "writes -H 'Content-Type:' for a body the capture sent without one" do
+      cmd = curl_of("POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc", "http://h")
+      cmd.should contain("-H 'Content-Type:' \\\n  --data-raw 'abc'")
+    end
+
+    it "writes no suppression when the capture stated a Content-Type, or had no body" do
+      curl_of("POST /a HTTP/1.1\r\nHost: h\r\ncontent-type: text/plain\r\n\r\nabc", "http://h")
+        .should_not contain("'Content-Type:'")
+      curl_of("POST /a HTTP/1.1\r\nHost: h\r\n\r\n", "http://h").should_not contain("Content-Type")
+    end
+  end
+
   describe "a body no shell argument can carry" do
     it "refuses a NUL-bearing body in a comment rather than sending a SHORTER one" do
       cmd = curl_of("POST /a HTTP/1.1\r\nHost: h\r\n\r\nab\u{0}cd", "http://h")
@@ -327,5 +353,23 @@ describe Gori::Export::Curl do
       cmd.should contain("# body omitted")
       cmd.should contain("--data-binary @FILE")
     end
+  end
+end
+
+# #1389: a proxy capture carries the browser's `Proxy-Connection`, addressed to gori. A copied
+# command sends it straight to the origin, so the exports leave it out — the replay does not.
+describe "exports drop the headers a browser addressed to its proxy" do
+  wire = "GET /p HTTP/1.1\r\nHost: a.test\r\nProxy-Connection: keep-alive\r\nX-Keep: 1\r\n\r\n"
+
+  it "leaves Proxy-Connection out of the curl line" do
+    line = Gori::Export::Curl.text(wire, "http://a.test").not_nil!
+    line.downcase.should_not contain("proxy-connection")
+    line.should contain("X-Keep: 1")
+  end
+
+  it "leaves it out of the generated clients too" do
+    code = Gori::Export::PythonRequests.text(wire, "http://a.test").not_nil!
+    code.downcase.should_not contain("proxy-connection")
+    code.should contain("X-Keep")
   end
 end

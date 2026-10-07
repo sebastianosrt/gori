@@ -56,6 +56,22 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   # The press just consumed was Miss Ring's. Reset at the top of every dispatch_click, so
   # it is true only for the press immediately after one she took.
   @companion_pressed = false
+  # Whether the press just dispatched reached the ACTIVE TAB'S BODY — i.e. whether
+  # `click_body` ran and the controller got a `handle_click` at all.
+  #
+  # `drag_press_target?` re-derives `dispatch_click`'s precedence approximately, and the two
+  # had drifted: the SUB-TAB STRIP tier consumes any press on the chip row (`click_subtab_strip`
+  # returns true "even between chips") and only moves focus when a press lands ON a chip — so a
+  # press on the empty half of that row leaves `@focus == :body`, never reaches the tab, and was
+  # then offered to `supports_drag?` anyway. Every controller answers that from state its own
+  # `handle_click` maintains, so the answer was the PREVIOUS press's: a click in a note, then one
+  # on the strip's empty half, then a twitch, extended the editor's band — and under
+  # `settings:mouse` drag-copy put it on the clipboard. The companion and top-bar tiers have the
+  # same shape.
+  #
+  # Recorded rather than re-derived, so a tier added to `dispatch_click` tomorrow is covered
+  # without a second copy of its precedence here.
+  @click_reached_body = false
 
   # Button up. Under `settings:mouse` Drag release = "select + copy" this also puts the band
   # the drag just built on the clipboard — the primary-selection gesture a terminal gives you
@@ -153,6 +169,10 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     end
     return false if modal_overlay? # palette / more menu: capture without dragging
     return false unless @focus == :body
+    # The press has to have REACHED the tab. A controller answers `supports_drag?` from what
+    # its own `handle_click` recorded, so asking after a press an earlier tier consumed gets
+    # the last press's answer — see `@click_reached_body`.
+    return false unless @click_reached_body
     layout.body.contains?(mx, my) && (@tabs[@active_tab]?.try(&.supports_drag?) || false)
   end
 
@@ -230,6 +250,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   # like the keyboard). Centered modals capture every click (outside → dismiss).
   private def dispatch_click(layout : Layout, mx : Int32, my : Int32) : Nil
     @companion_pressed = false
+    @click_reached_body = false
     return if @space_menu_open && click_space_menu(layout, mx, my)
     return if copy_as_shown? && click_copy_as(layout.body, mx, my) # modal while up — floats over @overlay
     return if send_to_shown? && click_send_to(layout.body, mx, my) # ditto
@@ -255,7 +276,9 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     return click_menu(layout.menu, mx, my) if layout.menu.contains?(mx, my)
     return if subtabs_shown? && !subtab_strip_self_drawn? && click_subtab_strip(layout.body, mx, my)
     return if click_companion(layout, mx, my)
-    click_body(layout.body, mx, my) if layout.body.contains?(mx, my)
+    return unless layout.body.contains?(mx, my)
+    @click_reached_body = true
+    click_body(layout.body, mx, my)
   end
 
   # Miss Ring is a click target in both placements. She is the notification ring's FACE —
@@ -276,6 +299,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     return false unless frame = @companion.frame # not drawn yet, or dropped while disabled
     if Settings.companion_in_bar?
       return false unless Chrome.status_bar_chip_at(layout.status, mx, my, focus: focus_label,
+                            hints: Hotkeys.retag(status_line || key_hints),
                             activity: activity_chip, resource: @resource.label,
                             time: clock_label, companion: frame) == :companion
     else
@@ -298,7 +322,6 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   # a single packed line would conflict on every merge.
   MODAL_OVERLAYS = {
     OverlayKind::Palette,
-    OverlayKind::TabsMore,
   }
 
   private def modal_overlay? : Bool
@@ -309,15 +332,20 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   # Click the top tab bar: switch to the clicked tab and land focus on the bar
   # (TABS level) — clicking a tab selects the tab, it does not drill into the body.
   private def click_menu(rect : Rect, mx : Int32, my : Int32) : Nil
-    # The far-right ⋯ "more" affordance opens the hidden-tabs dropdown.
-    if (mb = Chrome.more_button_rect(rect, hidden_tab_count)) && mb.contains?(mx, my)
+    tabs, _, slots = effective_bar
+    # ONE geometry for the whole row: the pill and the segments come from the same pass the
+    # render used, so a click can never land on a tab the bar drew somewhere else.
+    geo = Chrome.menu_geometry(rect, @active_tab, tabs: tabs,
+      intercept_count: @session.interceptor.pending_count,
+      numbered: Settings.tab_numbers?, slots: slots)
+    # The `0:Tabs` pill opens the Go-to picker — the same card the `0` key and the bar's own
+    # far-right stop open.
+    if (mb = geo.more) && mb.contains?(mx, my)
       focus_pane(:menu) # land on the bar (clears any stale overlay / saves edits)
-      open_more_menu
+      open_tab_goto
       return
     end
-    seg = Chrome.menu_segments(rect, @active_tab, tabs: effective_tabs,
-      intercept_count: @session.interceptor.pending_count, hidden_count: hidden_tab_count,
-      numbered: Settings.tab_numbers?).find { |(_, r)| r.contains?(mx, my) }
+    seg = geo.segments.find { |(_, r)| r.contains?(mx, my) }
     if seg
       seg[0] == @active_tab ? focus_pane(:menu) : focus_tab(seg[0], focus: :menu)
     else
@@ -331,6 +359,13 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   private def click_subtab_strip(body : Rect, mx : Int32, my : Int32) : Bool
     sub_rect = BodyChrome.strip_rect(body, strip: subtabs_shown?, strip_divider: subtab_strip_divider?)
     return false unless sub_rect && sub_rect.contains?(mx, my)
+    # The strip owns its CHIP row; the hairline under it is the body's top boundary, and
+    # `BodyChrome.tab_row`'s own comment already says hit-tests ignore the divider. Swallowing
+    # that row (this method consumes anything inside sub_rect) made every control a tab draws
+    # there dead — a drill-in's `‹` back button rides exactly that hairline whenever no list
+    # rail is up, so on Probe it silently worked or did not depending on how many findings
+    # the filter left.
+    return false unless my == BodyChrome.tab_row(sub_rect).y
     icon, chips = subtab_strip_split(sub_rect)
     if icon.try(&.contains?(mx, my))
       open_subtab_find_from_click
@@ -343,7 +378,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     true # consume any click on the strip row, even between chips
   end
 
-  # Clicking the ⌕ pill opens the picker, like the tab bar's ⋯ affordance opens the
+  # Clicking the ⌕ pill opens the picker, like the tab bar's `0:Tabs` stop opens the
   # hidden-tabs menu. ORDER IS LOAD-BEARING: focus_pane clears @overlay, so opening first
   # would have the focus hop close the picker it just opened.
   private def open_subtab_find_from_click : Nil
@@ -415,7 +450,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   private def click_space_menu(layout : Layout, mx : Int32, my : Int32) : Bool
     if idx = @space_menu.row_at(layout.body, mx, my)
       @space_menu.set_selected(idx)
-      run_space_verb(@space_menu.selected_verb)
+      activate_space_entry(@space_menu.selected_entry)
     elsif !@space_menu.box(layout.body).contains?(mx, my)
       close_space_menu
     end
@@ -431,8 +466,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
       return
     end
     case @overlay
-    when .palette?   then click_palette(area, mx, my)
-    when .tabs_more? then click_more_menu(layout, mx, my)
+    when .palette? then click_palette(area, mx, my)
     end
   end
 
@@ -454,9 +488,16 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
       unread: @notifications.unread, capturing: @session.capturing?,
       write_failures: @session.store.write_failures, bypass: Settings.passthrough_count,
       listeners: listener_chip_count, listener_errors: @session.listener_errors.size,
-      authorize: authorize_chip_label, session: session_slot_chip, agents: agent_chip)
+      authorize: authorize_chip_label, session: session_slot_chip, agents: agent_chip,
+      asks: answerable_questions.size)
     return false unless tag
+    run_top_bar_chip(tag)
+    true
+  end
 
+  # What a top-bar chip does when pressed, by its tag — split from the hit test above so each
+  # stays one decision.
+  private def run_top_bar_chip(tag : Symbol) : Nil
     case tag
     when :notify    then open_notifications
     when :scope     then scope_toggle_lens
@@ -465,11 +506,11 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     when :listeners then open_listeners
     when :session   then open_session_slots
     when :agents    then open_agents
+    when :ask       then answer_agent_question
     when :listen    then toggle_capture
     when :palette   then open_palette
     when :settings  then open_preferences
     end
-    true
   end
 
   private def click_palette(area : Rect, mx : Int32, my : Int32) : Nil
@@ -478,8 +519,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     return unless idx = @palette.row_at(box, mx, my)
     @palette.set_selected(idx)
     if verb = @palette.selected_verb
-      close_overlay
-      @toast = verb.call(self) || @toast
+      run_palette_verb(verb)
     end
   end
 
@@ -526,8 +566,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
       return
     end
     case @overlay
-    when .palette?   then @palette.move(step)
-    when .tabs_more? then @more_menu.try(&.move(step))
+    when .palette? then @palette.move(step)
     end
   end
 end

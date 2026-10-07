@@ -3,6 +3,7 @@ require "./types"
 require "./inject"
 require "./fingerprint"
 require "../fuzz/engine"
+require "wait_group"
 
 module Gori::Miner
   # The strongest non-reflective signal a response carries vs the baseline.
@@ -364,7 +365,7 @@ module Gori::Miner
     # each with its own canary value. nil when the send failed.
     private def control(loc : Location, width : Int32, name_len : Int32) : Probe?
       bogus = bogus_bucket(width, name_len)
-      raw = send_with_retries(Inject.apply(@base, loc, bogus, @config.add_content_length_when_missing?))
+      raw = send_with_retries(Inject.apply(@base, loc, bogus))
       return nil unless raw.error.nil?
       probe = Fingerprint.probe(raw)
       # An endpoint that echoes its input does it at every width, so recording this as each
@@ -455,7 +456,7 @@ module Gori::Miner
       end
 
       jobs = Channel(Int32).new
-      done = Channel(Nil).new(workers)
+      done = WaitGroup.new(workers)
       failure = nil.as(Exception?)
       workers.times do
         spawn(name: "miner-baseline") do
@@ -467,12 +468,12 @@ module Gori::Miner
             end
           end
         ensure
-          done.send(nil)
+          done.done
         end
       end
       count.times { |i| jobs.send(i) }
       jobs.close
-      workers.times { done.receive }
+      done.wait
       if ex = failure
         raise ex
       end

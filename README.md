@@ -76,7 +76,17 @@ surface limits explicitly.
 curl -fsSL https://gori.hahwul.com/install.sh | bash
 ```
 
-Then update later with `gori update` (self-update for binary installs; package-manager guidance for Homebrew / Snap / AUR).
+Then update later with `gori update` (self-update for binary installs; package-manager guidance for Chocolatey / Homebrew / Snap / AUR).
+
+On Windows, use [Chocolatey](#chocolatey), or download `gori-windows-x86_64.exe` from [Releases](https://github.com/hahwul/gori/releases/latest), rename it to `gori.exe` and put it on your `PATH`.
+
+### Chocolatey
+
+The [Chocolatey package](https://community.chocolatey.org/packages/gori) installs the Windows x86_64 binary:
+
+```powershell
+choco install gori
+```
 
 ### Homebrew
 
@@ -145,7 +155,11 @@ gori mcp --install-codex         # OpenAI Codex
 gori mcp --install-agy           # Antigravity CLI
 gori mcp --install-grok          # Grok
 gori mcp --install-hermes        # Hermes        (~/.hermes/config.yaml)
+gori mcp --install-pi            # Pi            (~/.pi/agent/mcp.json)
 ```
+
+Pi needs an MCP adapter, such as [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter)
+(`pi install npm:pi-mcp-adapter`). The installer honors `PI_CODING_AGENT_DIR` when set.
 
 Add `--read-only` to hand a project to an untrusted agent (read tools only, no live requests). The
 [AI Setup guide](https://gori.hahwul.com/getting-started/ai-setup/) walks through connecting an agent and

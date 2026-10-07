@@ -3,8 +3,8 @@ require "../../spec_helper"
 # Every parser under `src/gori/cli/` that takes a `=VALUE` flag, as a CLASS.
 #
 # `OptionParser`'s default `missing_option` handler RAISES `OptionParser::MissingOption`. That
-# is neither `Gori::Error` (the only type `CLI.run` rescues, src/gori/cli.cr) nor `IO::Error`
-# (the only type `Run.dispatch` rescues, src/gori/cli/run.cr), so a value flag left bare at the
+# is neither `Gori::Error` nor a broken-pipe `IO::Error` (the only two `CLI.run` rescues,
+# src/gori/cli.cr), so a value flag left bare at the
 # end of argv — `gori run rewriter rm 1 --project`, or an unset `--project "$P"` in a wrapper
 # script — reaches `main` and prints a Crystal backtrace instead of a one-line abort:
 #
@@ -24,7 +24,7 @@ describe "gori run — missing_option on every value-taking parser" do
   it "is bound wherever a =VALUE flag is declared" do
     dir = File.join(__DIR__, "..", "..", "..", "src", "gori", "cli")
     offenders = [] of String
-    Dir.glob(File.join(dir, "**", "*.cr")).sort.each do |path|
+    glob_files(dir, "**", "*.cr").sort.each do |path|
       lines = File.read_lines(path)
       i = 0
       while i < lines.size
@@ -49,8 +49,10 @@ describe "gori run — missing_option on every value-taking parser" do
         # alternative alone still passed — which is exactly the kind of accident that lets an
         # unpaired `-nN` slip through later. Flag names in this tree are lowercase kebab-case,
         # so `[a-z][A-Z]` cannot fire on a bare switch. `-h`/`--help` do not match either.
+        # `project_options` registers `--project=NAME` and `--db=PATH` out of sight of that regex.
         takes_value = body.any? do |l|
-          l.includes?("p.on(") && l.matches?(/"-{1,2}[^"]*(?:[= ][A-Z]|[a-z][A-Z])/)
+          l.includes?("project_options(") ||
+            (l.includes?("p.on(") && l.matches?(/"-{1,2}[^"]*(?:[= ][A-Z]|[a-z][A-Z])/))
         end
         offenders << "#{File.basename(path)}:#{i + 1}" if takes_value && !body.any?(&.includes?("p.missing_option"))
         i = j

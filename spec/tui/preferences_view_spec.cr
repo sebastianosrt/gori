@@ -1,5 +1,6 @@
 require "../spec_helper"
 require "../support/memory_backend"
+require "file_utils"
 
 include Gori::Tui
 
@@ -102,6 +103,36 @@ describe Gori::Tui::PreferencesView do
     v.handle_key(pkey(Termisu::Input::Key::Enter)).kind.should eq(:none)
   end
 
+  it "still has the host apply a section whose write failed after its setters ran" do
+    # The change is live in this session either way; without the apply the proxy keeps its
+    # old upstream TLS policy under a footer that says "applied".
+    dir = File.tempname("gori-prefs-refused")
+    Dir.mkdir_p(dir)
+    prev_home = ENV["GORI_HOME"]?
+    prev_theme = Gori::Settings.theme
+    begin
+      ENV["GORI_HOME"] = dir
+      Gori::Settings.warning_io = nil
+      Gori::Settings.reset_load_warning_guard
+      File.write(Gori::Settings.path, %([{"theme":"dracula"}])) # not an object: save refuses
+      Gori::Settings.load
+      v = PreferencesView.new
+      v.open(:network)
+      v.handle_key(pkey(DOWN)) # into Bind Port, unchanged
+      outcome = v.handle_key(pkey(Termisu::Input::Key::Enter))
+      outcome.kind.should eq(:saved)
+      outcome.message.to_s.should contain("could not save")
+    ensure
+      # Clear the refusal latch with a readable file, as `with_refused_save` does.
+      File.write(Gori::Settings.path, %({"theme":"#{prev_theme}"}))
+      Gori::Settings.load
+      prev_home ? (ENV["GORI_HOME"] = prev_home) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(dir)
+      Gori::Settings.theme = prev_theme
+      Gori::Settings.bind_port = 8070
+    end
+  end
+
   it "keeps the modal's focus and the section's focus together across ^R" do
     # `reset_to_defaults` snaps the FORM's own cursor back to field 0 while the modal keeps
     # its separate flat index, so without a re-sync the row drawn as focused and the row
@@ -181,6 +212,23 @@ describe Gori::Tui::PreferencesView do
       v.dirty?.should be_false
     ensure
       Gori::Settings.bind_port = prev
+    end
+  end
+
+  # The group strip sits inside the card, so its inactive labels take the card's colour: the
+  # strip's canvas default drew a black band hugging each one, flush to the text.
+  it "draws the group strip on the card's own surface" do
+    Theme.panel.should_not eq(Theme.bg) # else this example proves nothing
+    v = PreferencesView.new
+    v.open(:network) # focus in the body: the active pill is the receded gold, not the strip's
+    area = Rect.new(0, 0, 100, 40)
+    backend = MemoryBackend.new(area.w, area.h)
+    v.render(Screen.new(backend), area)
+    box = v.overlay_box(area)
+    y = box.y + 2
+    backend.row(y).includes?("Appearance").should be_true
+    ((box.x + 1)...(box.right - 1)).each do |x|
+      backend.bg_at(x, y).should_not eq(Theme.bg)
     end
   end
 

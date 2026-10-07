@@ -107,6 +107,15 @@ private class DeadOrigin < F::Backend
   end
 end
 
+# Every send refused by the scope's sweep gate, as Fuzz::Sender answers an excluded target.
+private class RefusedOrigin < F::Backend
+  getter origin : F::Origin = F::Origin.new("http", "h", 80)
+
+  def send(bytes : Bytes) : Gori::Repeater::Result
+    Gori::Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, Gori::Outbound::EXCLUDE_SWEEP_ERROR)
+  end
+end
+
 # Answers 200 only when the raw request bytes still carry the FF FE pair — a byte-wise
 # scan, never `String#includes?`, so the check itself can't launder the invalid bytes.
 private class ByteSensitiveOrigin < F::Backend
@@ -303,6 +312,22 @@ describe Gori::Repeater::Minimize do
     report.removed.map(&.label).should contain("drop")
   end
 
+  it "still enumerates JSON keys when another member holds a number past Int64 (#1200)" do
+    body = %({"keep":1,"id":18446744073709551615,"drop":2})
+    text = [
+      "POST /j HTTP/1.1",
+      "Host: h",
+      "Content-Type: application/json",
+      "Content-Length: #{body.bytesize}",
+      "",
+      body,
+    ].join("\n")
+
+    report = minimize(JsonOrigin.new, text, auto_cl: true)
+    report.removed.map(&.label).should contain("drop")
+    report.minimized_text.should contain(%("keep":1))
+  end
+
   # The gate was `ct.includes?("application/json")`, and that substring is absent from every
   # `+json` structured-syntax type — `application/graphql+json`, `application/vnd.api+json`.
   # The content-type being non-empty, the `looks_json?` fallback did not run either, so the
@@ -403,6 +428,17 @@ describe Gori::Repeater::Minimize do
     report = minimize(FlappyOrigin.new, text)
     report.aborted.should be_true
     report.removed.should be_empty
+    report.minimized_text.should eq(text)
+  end
+
+  # Every surface's minimize sends through Fuzz::Sender, whose sweep gate refuses an excluded
+  # target: that is a refusal with nothing sent, not an origin that did not answer.
+  it "reports a scope refusal as refused, with no sends" do
+    text = ["GET / HTTP/1.1", "Host: h", "User-Agent: x"].join("\n")
+    report = minimize(RefusedOrigin.new, text)
+    report.aborted.should be_true
+    report.sends.should eq(0)
+    report.note.should start_with("refused: #{Gori::Outbound::EXCLUDE_SWEEP_ERROR}")
     report.minimized_text.should eq(text)
   end
 

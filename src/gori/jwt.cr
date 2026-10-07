@@ -3,6 +3,7 @@ require "json"
 require "uri"
 require "./decoder/codecs"
 require "./jwt/forge"
+require "./jwt/jwe"
 require "./jwt/attacks"
 require "./jwt/present"
 
@@ -17,10 +18,15 @@ module Gori
   module Jwt
     extend self
 
-    # Structural test: three (or two) base64url segments. The body scan additionally
-    # anchors on `eyJ` (base64url of `{"`, which every JWT header starts with).
-    JWT_RE  = /\A[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)?\z/
-    SCAN_RE = /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)?/
+    # Structural test: three (or two) base64url segments — the JWS shape. A five-part JWE
+    # is a different predicate and lives in `Jwe::JWE_RE`; `jose?` is the union.
+    JWT_RE = /\A[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*)?\z/
+
+    # The body/header scan, anchored on `eyJ` (base64url of `{"`, which opens every JOSE
+    # header). Up to FIVE segments so an encrypted token is matched whole rather than
+    # truncated after its IV — `narrow` steps a greedy over-match back down (a JWS that
+    # ends a sentence, "…a.b.c.Next", would otherwise be swallowed and then rejected).
+    SCAN_RE = /eyJ[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]*){1,4}/
 
     MAX_TOKENS = 16              # distinct tokens surfaced per flow
     MAX_SCAN   = 2 * 1024 * 1024 # don't regex-scan a body larger than this
@@ -38,8 +44,8 @@ module Gori
                   resp_head : Bytes?, resp_body : Bytes?) : Array(Found)
       found = [] of Found
       seen = Set(String).new
-      add = ->(loc : String, tok : String) do
-        if found.size < MAX_TOKENS && !seen.includes?(tok) && jwt?(tok)
+      add = ->(loc : String, raw : String) do
+        if found.size < MAX_TOKENS && (tok = narrow(raw)) && !seen.includes?(tok)
           seen << tok
           found << Found.new(loc, tok, brief(tok), decode(tok))
         end
@@ -61,14 +67,43 @@ module Gori
       found
     end
 
-    # A structurally-valid JWT: matches the shape AND its header base64url-decodes to
+    # A structurally-valid JWT (JWS): matches the shape AND its header base64url-decodes to
     # a JSON object (the strong signal that rules out a dotted-word false positive).
     def jwt?(s : String) : Bool
       return false unless s =~ JWT_RE
       header = Base64.decode(s.split('.', 2).first)
-      JSON.parse(String.new(header)).as_h? != nil
+      # `RawJson`: an oversized number in the header must not hide the token (#1169).
+      !RawJson.members(String.new(header)).nil?
     rescue
       false
+    end
+
+    # Either JOSE shape: a signed JWS or an encrypted JWE. Everything that LOCATES tokens
+    # asks this; `jwt?` stays JWS-only because the projections downstream of it (claims,
+    # attack payloads, re-signing) are meaningless on a JWE and must keep refusing one.
+    def jose?(s : String) : Bool
+      jwt?(s) || Jwe.jwe?(s)
+    end
+
+    # The JOSE token inside a scan match, or nil when there is none. SCAN_RE is greedy up to
+    # five segments so a JWE matches whole; that same greed can swallow the word after a
+    # three-part token ("…a.b.c.Next" — no separator in between), so a match that is not
+    # itself a token is retried at the JWS segment counts before it is dropped.
+    def narrow(candidate : String) : String?
+      return candidate if jose?(candidate)
+      parts = candidate.split('.')
+      {3, 2}.each do |n|
+        next unless parts.size > n
+        shorter = parts[0, n].join('.')
+        return shorter if jwt?(shorter)
+      end
+      nil
+    end
+
+    # The `exp` claim of a JWS payload SEGMENT (the token's second part), or nil. Public for
+    # `SessionRefresh`'s `jwt-exp` policy (#1233), which reads the expiry of a bound value.
+    def claim_exp(payload_segment : String) : Int64?
+      claim_i(payload_segment, "exp")
     end
 
     # --- internals ----------------------------------------------------------
@@ -81,7 +116,13 @@ module Gori
 
     # A short claims line: alg (from the header) and exp (from the payload, rendered
     # as a UTC timestamp). Deterministic — no "now" comparison. nil when nothing parses.
+    #
+    # A JWE gets its own line (alg/enc/kid, "encrypted"): its second segment is a wrapped
+    # key, not claims, so reading `exp` out of it would print a number that means nothing.
     private def brief(tok : String) : String?
+      if jwe = Jwe.parse(tok)
+        return Jwe.brief(jwe)
+      end
       parts = tok.split('.')
       return nil if parts.size < 2
       bits = [] of String
@@ -104,7 +145,7 @@ module Gori
     end
 
     private def claim_s(seg : String, key : String) : String?
-      JSON.parse(String.new(Base64.decode(seg)))[key]?.try(&.as_s?)
+      RawJson.member(String.new(Base64.decode(seg)), key).try(&.as_s?)
     rescue
       nil
     end
@@ -112,7 +153,7 @@ module Gori
     private def claim_i(seg : String, key : String) : Int64?
       # RFC 7519 NumericDate permits a non-integer value (sub-second precision), so `exp`
       # can arrive as a JSON float — take its integer part rather than dropping the claim.
-      v = JSON.parse(String.new(Base64.decode(seg)))[key]?
+      v = RawJson.member(String.new(Base64.decode(seg)), key)
       v.try(&.as_i64?) || v.try(&.as_f?).try(&.to_i64)
     rescue
       nil

@@ -27,13 +27,14 @@ end
 # controllers compare `@host.overlay` against these symbols, and every symbol handed to
 # from_sym now RAISES if it is not a member (it used to be a silent no-op).
 private EXPECTED_OVERLAY_SYMS = {
-  :none, :detail, :palette, :issue_new, :confirm, :browser, :choice, :tabs_more,
+  :none, :detail, :palette, :issue_new, :confirm, :browser, :choice, :tab_goto,
   :comparer_pick, :repeater_subtab, :links, :link_pick, :preferences,
-  :settings, :tabs, :hosts, :env, :hotkeys, :help, :notifications, :passthrough, :listeners, :agents, :probe_active,
+  :settings, :tabs, :hosts, :env, :user_agents, :hotkeys, :help, :notifications, :note_detail, :passthrough, :listeners, :agents, :probe_active,
   :discover_config, :discover_headers, :fuzz_set, :fuzz_advanced, :oast_provider,
   :oast_provider_pick, :oast_session,
-  :probe_rule, :rewriter_rule, :colormarker_rule, :colormarker_color, :extract_rule, :rewriter_stub, :authorize_identities, :authorize_identity, :ca_import, :import, :export, :scope_rule, :sequence_config,
+  :probe_rule, :rewriter_rule, :colormarker_rule, :colormarker_color, :extract_rule, :rewriter_stub, :rewriter_respond, :authorize_identities, :authorize_identity, :ca_import, :import, :curl_paste, :export, :scope_rule, :sequence_config,
   :mine_config, :name_prompt, :columns, :column, :library_pick, :cvss_calculator, :copy_as, :send_to,
+  :evidence, :retest, :retest_assert, :timing_report, :agent_question, :keyset_playground,
 }
 
 # The migration ledger — THE one line a Phase 1 batch edits in this file. Each batch
@@ -58,10 +59,18 @@ private MIGRATED_KINDS = [
   OverlayKind::ColormarkerColor,
   # #511 — the short-circuit stub sub-editor, born on the seam
   OverlayKind::RewriterStub,
+  # #1237 — the short-circuit answer-options sub-editor, born on the seam
+  OverlayKind::RewriterRespond,
   OverlayKind::CaImport,
   OverlayKind::Import,
+  # CurlPaste (#1244) — the curl paste box, born on the seam (Repeater → Paste cURL,
+  # Import: cURL), so never in MODAL_OVERLAYS.
+  OverlayKind::CurlPaste,
   # C1 — scan/fuzz config forms
   OverlayKind::Notifications,
+  # NoteDetail (#1090) — one notification's long form, born on the seam (↵ on a ring row that
+  # carries a detail), so likewise never in MODAL_OVERLAYS.
+  OverlayKind::NoteDetail,
   OverlayKind::ProbeActive,
   OverlayKind::DiscoverConfig,
   OverlayKind::DiscoverHeaders,
@@ -83,6 +92,7 @@ private MIGRATED_KINDS = [
   OverlayKind::Tabs,
   OverlayKind::Hosts,
   OverlayKind::Env,
+  OverlayKind::UserAgents,
   OverlayKind::Hotkeys,
   # Export — born on the seam (Notes → Export note, Issues → Export issues), so it was
   # never in MODAL_OVERLAYS to be deleted from.
@@ -120,6 +130,24 @@ private MIGRATED_KINDS = [
   # born on the seam, so likewise never in MODAL_OVERLAYS.
   OverlayKind::Columns,
   OverlayKind::Column,
+  # Evidence (#1038) — the frozen-evidence viewer, born on the seam (↵ on a FROZEN row of
+  # the Issues detail), so likewise never in MODAL_OVERLAYS.
+  OverlayKind::Evidence,
+  # Retest (#1036) — the per-Issue RETEST card, born on the seam (space → Retest… / ⇧R on
+  # the Issues detail), so likewise never in MODAL_OVERLAYS.
+  OverlayKind::Retest,
+  # …and the one-field card its assertion is typed into, born on the seam too.
+  OverlayKind::RetestAssert,
+  # TabGoto — the `0` key's Go-to picker. It took the place of the tab bar's ⋯ dropdown
+  # (`TabsMore`), which was the LAST unmigrated member of MODAL_OVERLAYS beside the palette;
+  # the picker is an Overlay, so it rides the object seam like everything else here.
+  OverlayKind::TabGoto,
+  # TimingReport — the differential-timing verdict card (#1246), an Overlay from birth.
+  OverlayKind::TimingReport,
+  # AgentQuestion (#1324) — the ask_operator answer card, an Overlay from birth.
+  OverlayKind::AgentQuestion,
+  # KeysetPlayground — Preferences → Keys' practice pad, born on the seam.
+  OverlayKind::KeysetPlayground,
 ]
 
 # Never in MODAL_OVERLAYS by design, migrated or not. `None` is "no modal at all" and
@@ -392,7 +420,7 @@ describe "Overlay seam — SequenceConfigOverlay (hard case: 2 open-sites, no fl
     # Drive each to Start (row 6) and commit through the generic shell dispatch.
     [new_h, reconf_h].each do |h|
       5.times { h.press(Termisu::Input::Key::Down) } # selector → … → Start
-      h.overlay.as(SequenceConfigOverlay).on_start_row?.should be_true
+      h.overlay.as(SequenceConfigOverlay).on_save_row?.should be_true
       h.press(Termisu::Input::Key::Enter).should eq(:closed)
     end
 
@@ -454,8 +482,9 @@ describe "Overlay seam — MineConfigOverlay (laggard: keys were shell-owned; cl
   it "commits from the Start row through the generic dispatch" do
     ov = MineConfigOverlay.new(mseed)
     h = OverlayHarness.new(ov)
-    # rows: [Query, Json, max requests, concurrency, notify, keep-alive, Start] → 6 downs.
-    6.times { h.press(Termisu::Input::Key::Down) }
+    # rows: [Query, Json, max requests, concurrency, notify, keep-alive, macro step, macro
+    # cadence, macro on failure, Start] → 9 downs.
+    9.times { h.press(Termisu::Input::Key::Down) }
     ov.on_start_row?.should be_true
     h.press(Termisu::Input::Key::Enter).should eq(:closed)
     h.commits.should eq(1)
@@ -464,7 +493,7 @@ describe "Overlay seam — MineConfigOverlay (laggard: keys were shell-owned; cl
   it "keeps the form open when the commit closure rejects (no location selected)" do
     ov = MineConfigOverlay.new(mseed)
     h = OverlayHarness.new(ov, commit: false) # e.g. any_checked? was false
-    ov.set_selected(6)                        # Start row
+    ov.set_selected(9)                        # Start row
     h.press(Termisu::Input::Key::Enter).should eq(:open)
   end
 
@@ -479,8 +508,8 @@ describe "Overlay seam — MineConfigOverlay (laggard: keys were shell-owned; cl
 
   it "click on Start commits; a click outside dismisses" do
     h = OverlayHarness.new(MineConfigOverlay.new(mseed))
-    # Start is row index 6; its screen row is box.y + 3 + 6.
-    h.click_in_box(3, 9).should eq(:closed)
+    # Start is row index 9; its screen row is box.y + 3 + 9.
+    h.click_in_box(3, 12).should eq(:closed)
     h.commits.should eq(1)
 
     away = OverlayHarness.new(MineConfigOverlay.new(mseed))

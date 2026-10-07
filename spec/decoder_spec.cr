@@ -1,4 +1,5 @@
 require "./spec_helper"
+require "./support/serialized_vectors"
 
 private REG = Gori::Decoder.default_registry
 
@@ -110,9 +111,23 @@ describe Gori::Decoder do
       conv("base64-decode", "aGVs bG8g\td29y\r\nbG Q=").should eq "hello world"
     end
 
+    it "accepts non-zero unused base64 bits and valid unpadded tails" do
+      conv("base64-decode", "Zg").should eq "f"
+      conv("base64-decode", "Zg==").should eq "f"
+      conv("base64-decode", "Zm8").should eq "fo"
+      conv("base64-decode", "Zh").should eq "f"
+      conv("base64-decode", "Zh==").should eq "f"
+      conv("base64-decode", "Zm9").should eq "fo"
+    end
+
     it "url encode/decode (form style)" do
       conv("url-encode", "a b+c").should eq "a+b%2Bc"
       conv("url-decode", "a+b%2Bc").should eq "a b+c"
+    end
+
+    it "url-encode takes the binary url-decode yields, so the pair round-trips" do
+      String.new(conv_bytes("url-encode", Bytes[0xff, 0xfe, 0x20])).should eq "%FF%FE+"
+      conv_bytes("url-decode", conv_bytes("url-encode", Bytes[0xff, 0x00])).should eq Bytes[0xff, 0x00]
     end
 
     it "url-encode-all percent-encodes every byte (uppercase)" do
@@ -153,6 +168,38 @@ describe Gori::Decoder do
       conv("base32-decode", "MzXw6YtBoI").should eq "foobar"       # mixed case, no padding
       # 0/1/8/9 are not in the RFC 4648 alphabet
       expect_raises(Gori::Decoder::DecoderError) { conv("base32-decode", "MZXW0918") }
+    end
+
+    it "accepts every valid unpadded final group length" do
+      [{"f", "MY"}, {"fo", "MZXQ"}, {"foo", "MZXW6"},
+       {"foob", "MZXW6YQ"}, {"fooba", "MZXW6YTB"}].each do |(expected, encoded)|
+        conv("base32-decode", encoded).should eq expected
+      end
+      conv("base32-decode", "MY======").should eq "f"
+    end
+
+    it "rejects symbol counts that cannot form a base32 byte tail" do
+      ["M", "MZX", "MZXW6Y"].each do |encoded|
+        expect_raises(Gori::Decoder::DecoderError) { conv("base32-decode", encoded) }
+      end
+    end
+
+    it "accepts non-zero unused bits in padded and unpadded base32 tails" do
+      conv("base32-decode", "MZ").should eq "f"
+      conv("base32-decode", "MZ======").should eq "f"
+      conv("base32-decode", "MZXR").should eq "fo"
+      conv("base32-decode", "MZXW7").should eq "foo"
+      conv("base32-decode", "MZXW6YR").should eq "foob"
+    end
+
+    it "rejects malformed and misplaced base32 padding" do
+      expect_raises(Gori::Decoder::DecoderError) { conv("base32-decode", "M=Y======") }
+      expect_raises(Gori::Decoder::DecoderError) { conv("base32-decode", "MY=====") }
+      expect_raises(Gori::Decoder::DecoderError) { conv("base32-decode", "MZXW6YTBOI=======") }
+    end
+
+    it "validates tails after Unicode whitespace filtering too" do
+      expect_raises(Gori::Decoder::DecoderError) { conv("base32-decode", "MZX#{0x2003.chr}") }
     end
 
     it "base32-encode emits exact RFC 4648 length + padding across input sizes" do
@@ -252,6 +299,8 @@ describe Gori::Decoder do
       conv("punycode-encode", "münchen.de").should eq "xn--mnchen-3ya.de"
       conv("punycode-encode", "bücher").should eq "xn--bcher-kva"
       conv("punycode-encode", "日本語.jp").should eq "xn--wgv71a119e.jp"
+      # KELVIN SIGN folds to "k": the label keeps its RFC 3492 delimiter (`xn--k-`, not `xn--k`).
+      conv("punycode-encode", "\u212A").should eq "xn--k-"
       conv("punycode-decode", "xn--maana-pta.com").should eq "mañana.com"
       conv("punycode-decode", "xn--r8jz45g.xn--zckzah").should eq "例え.テスト"
       # Astral plane (a surrogate pair in UTF-16 terms) must survive the bootstring.
@@ -300,6 +349,103 @@ describe Gori::Decoder do
     end
   end
 
+  describe "Unicode and security encoding transforms" do
+    it "registers the four Unicode normalization forms as one-way encoders" do
+      REG["nfc"].direction.should eq Gori::Decoder::Direction::Encode
+      REG["normalize-nfkc"].should eq REG["nfkc"]
+      conv("nfc", "e\u0301").should eq "é"
+      conv("nfd", "é").should eq "e\u0301"
+      conv("nfkc", "ﬁ ⁵ ／").should eq "fi 5 /"
+      conv("nfkc", "⁄").should eq "⁄" # FRACTION SLASH is a confusable, not an NFKC compatibility character
+      conv("nfkd", "ﬁ").should eq "fi"
+    end
+
+    it "RFC 2047 Q and B encode UTF-8 and decode their own output" do
+      conv("rfc2047-q-encode", "André test?").should eq "=?UTF-8?Q?Andr=C3=A9_test=3F?="
+      conv("rfc2047-b-encode", "André").should eq "=?UTF-8?B?QW5kcsOp?="
+      ["André", "plain ASCII", "質問です", "x" * 160].each do |sample|
+        conv("rfc2047-q-decode", conv("rfc2047-q-encode", sample)).should eq sample
+        conv("rfc2047-b-decode", conv("rfc2047-b-encode", sample)).should eq sample
+      end
+    end
+
+    it "keeps RFC 2047 words within 75 octets and folds only between words" do
+      ["rfc2047-q-encode", "rfc2047-b-encode"].each do |encoder|
+        encoded = conv(encoder, "é" * 80)
+        words = encoded.split("\r\n ")
+        words.size.should be > 1
+        words.each(&.bytesize.should(be <= 75))
+        conv(encoder.ends_with?("q-encode") ? "rfc2047-q-decode" : "rfc2047-b-decode", encoded).should eq "é" * 80
+      end
+    end
+
+    it "decodes RFC 2047 words in mixed text and suppresses whitespace between adjacent words" do
+      conv("rfc2047-decode", "Subject: =?UTF-8?Q?hello_world?= =?UTF-8?B?IQ==?=").should eq "Subject: hello world!"
+      conv("rfc2047-decode", "=?ISO-8859-1?Q?Keld_J=F8rn?=").should eq "Keld Jørn"
+      # Joins adjacent encoded-words before charset decoding so multibyte chars split across words decode
+      conv("rfc2047-decode", "=?UTF-8?Q?=E2=82?= =?UTF-8?Q?=AC?=").should eq "€"
+      # Accepts RFC 2231 language suffix
+      conv("rfc2047-decode", "=?UTF-8*en?Q?a?=").should eq "a"
+      # Words containing spaces stay literal
+      conv("rfc2047-decode", "=?UTF-8?Q?a b?=").should eq "=?UTF-8?Q?a b?="
+      # One malformed word stays literal without failing the rest of the value
+      conv("rfc2047-decode", "=?UTF-8?Q?bad=ZZ?= =?UTF-8?Q?ok?=").should eq "=?UTF-8?Q?bad=ZZ?= ok"
+      conv("rfc2047-decode", "=?UTF-8?Q?=FF?= =?ISO-8859-1?Q?=E9?=").should eq "=?UTF-8?Q?=FF?= é"
+      # One undecodable word in a same-charset run used to leave every valid neighbour literal.
+      conv("rfc2047-decode", "=?utf-8?q?=FF?= =?utf-8?q?ok?=").should eq "=?utf-8?q?=FF?= ok"
+      conv("rfc2047-decode", "=?UTF-8?Q?a?= =?UTF-8?Q?b?= =?UTF-8?Q?=FF?=").should eq "ab =?UTF-8?Q?=FF?="
+      # Charset aliases join into one run, so a character split across them decodes.
+      conv("rfc2047-decode", "=?utf-8?q?=E2=82?= =?UTF8?Q?=AC?=").should eq "€"
+      conv("rfc2047-decode", "=?UTF-8?Q?=FF?= =?UTF-8?Q?a?= =?ISO-8859-1?Q?b?=").should eq "=?UTF-8?Q?=FF?= ab"
+      # Marker-shaped text that is not a whole word never reaches the charset check
+      conv("rfc2047-decode", "=?shift_jis?Q?a b?=").should eq "=?shift_jis?Q?a b?="
+      conv("rfc2047-decode", "=?Windows-1252?Q?=80?=").should eq "€"
+      conv("rfc2047-decode", "=?UTF-8?Q?a?= text =?UTF-8?Q?b?=").should eq "a text b"
+      conv("rfc2047-decode", "ordinary text").should eq "ordinary text"
+    end
+
+    it "leaves malformed encoded words literal and reports unsupported charsets or wrong forced encodings" do
+      conv("rfc2047-q-decode", "=?UTF-8?Q?bad=ZZ?=").should eq "=?UTF-8?Q?bad=ZZ?="
+      conv("rfc2047-b-decode", "=?UTF-8?B?@@==?=").should eq "=?UTF-8?B?@@==?="
+      conv("rfc2047-decode", "=?UTF-8?B?====?=").should eq "=?UTF-8?B?====?="
+      conv("rfc2047-decode", "=?UTF-8?Q??=").should eq "=?UTF-8?Q??="
+      expect_raises(Gori::Decoder::DecoderError, /unsupported RFC 2047 charset/) do
+        conv("rfc2047-decode", "=?shift_jis?B?QQ==?=")
+      end
+      expect_raises(Gori::Decoder::DecoderError, /expected RFC 2047 Q/) do
+        conv("rfc2047-q-decode", "=?UTF-8?B?QQ==?=")
+      end
+    end
+
+    it "maps codepoints to their low byte and exposes binary results to later chain steps" do
+      conv_bytes("codepoint-overflow", "plain".to_slice).should eq "plain".to_slice
+      conv_bytes("codepoint-overflow", "\u0140".to_slice).should eq Bytes[0x40]
+      conv("mod-256", "\u0140").should eq "@"
+      result = Gori::Decoder.run(REG, "\\u0140".to_slice, "unicode-unescape > codepoint-overflow > hex-encode")
+      String.new(result.output.not_nil!).should eq "40"
+      Gori::Decoder.run(REG, Bytes[0xff], "codepoint-overflow").ok?.should be_false
+    end
+
+    it "shows Windows Best-Fit table results by code page" do
+      REG["bestfit-932"].should eq REG["windows-bestfit-932"]
+      REG["worstfit-949"].should eq REG["windows-bestfit-949"]
+      conv("windows-bestfit-932", "yen=¥ soft=\u00ad overline=‾").should eq "yen=\\ soft=- overline=?"
+      conv("windows-bestfit-936", "\u00ad").should eq "-"
+      conv("windows-bestfit-950", "\u00ad").should eq "-"
+      conv("windows-bestfit-949", "₩").should eq "\\"
+      conv("windows-bestfit-1252", "＼／．＂＇＜＞⁵∞").should eq "\\/.\"'<>58"
+      # Windows Best-Fit independently maps FRACTION SLASH to ASCII slash on these pages.
+      conv("windows-bestfit-1252", "⁄").should eq "/"
+      conv("windows-bestfit-1250", "⁄").should eq "/"
+      conv("windows-bestfit-1254", "⁄").should eq "/"
+      # CP932 can represent fullwidth reverse solidus exactly, so it is not folded to ASCII.
+      conv("windows-bestfit-932", "＼").should eq "＼"
+      # Characters outside BMP (U+FFFF) yield two default characters ('??') per UTF-16 surrogate code unit
+      conv("windows-bestfit-1252", "café 😀").should eq "café ??"
+      Gori::Decoder::Codecs::WINDOWS_BESTFIT_CODE_PAGES.size.should eq 14
+    end
+  end
+
   describe "serialization" do
     it "renders a MessagePack document as JSON, naming what JSON cannot hold" do
       # {"a": 1, "b": <2 raw bytes>}
@@ -342,6 +488,53 @@ describe Gori::Decoder do
       # base64 in, JSON out — the shape of a body pasted out of a header or a JSON string.
       chain = Gori::Decoder.run(REG, "kQE=".to_slice, "base64-decode > msgpack-decode")
       String.new(chain.output.not_nil!).should eq("[1]")
+    end
+
+    # The four native-serialization readers (#1011). Their own grammars are covered under
+    # `spec/decoder/serialized/`; what is here is that each one is REACHABLE by the name and
+    # the aliases the catalog claims, chains off a base64 step the way an operator pastes a
+    # cookie, and refuses a body it made nothing of.
+    it "reads the four native-serialization formats under the names the catalog registers" do
+      String.new(conv_bytes("java-deserialize", SerializedVectors::JAVA_HASHMAP))
+        .should contain(%("$object":"java.util.HashMap"))
+      String.new(conv_bytes("dotnet-viewstate", SerializedVectors::VIEWSTATE_CLASSIC))
+        .should contain(%("$format":"aspnet-viewstate"))
+      String.new(conv_bytes("php-unserialize", SerializedVectors::PHP_OBJECT))
+        .should contain(%("$class":"MyClass"))
+      String.new(conv_bytes("pickle-disasm", SerializedVectors::PICKLE_REDUCE))
+        .should contain(%("globals":["posix.system"]))
+      # …and by their aliases, which is how an operator actually types them.
+      {"java", "viewstate", "php", "pickle"}.each { |a| REG[a]?.should_not be_nil }
+    end
+
+    it "chains a serialization reader off a base64 step, the way a blob arrives" do
+      b64 = Base64.strict_encode(SerializedVectors::PICKLE_REDUCE).to_slice
+      chain = Gori::Decoder.run(REG, b64, "base64-decode > pickle-disasm")
+      String.new(chain.output.not_nil!).should contain(%("op":"REDUCE"))
+    end
+
+    it "refuses a body a serialization reader made NOTHING of" do
+      # Three of the four write an envelope before they read a value, so `document`'s
+      # "the whole rendering is one $partial" test can never fire for them — `decoded` is the
+      # same question asked where it still has an answer.
+      png = Bytes[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x11]
+      expect_raises(Gori::Decoder::DecoderError, /not a Java serialized stream/) do
+        conv_bytes("java-deserialize", png)
+      end
+      expect_raises(Gori::Decoder::DecoderError, /not a ViewState/) do
+        conv_bytes("dotnet-viewstate", png)
+      end
+      expect_raises(Gori::Decoder::DecoderError, /not a PHP serialize\(\) value/) do
+        conv_bytes("php-unserialize", "hello".to_slice)
+      end
+    end
+
+    it "reads a pickle the SNIFF would decline, because the operator named the format" do
+      # Protocol 0 has no header, so `Serialized.sniff` cannot claim it — but a converter the
+      # operator typed is a decision already made. Same split as `document`'s permissiveness.
+      p0 = "cposix\nsystem\np0\n(V id\np1\ntp2\nRp3\n.".to_slice
+      Gori::Decoder::Serialized.sniff(p0).should be_nil
+      String.new(conv_bytes("pickle-disasm", p0)).should contain(%("globals":["posix.system"]))
     end
   end
 
@@ -427,7 +620,7 @@ describe Gori::Decoder do
         reason.try(&.starts_with?("#{name}: ")).should eq(available ? nil : true)
       end
       # Nothing else in the catalog claims to be unusable.
-      REG.each { |c| c.unusable.should be_nil } if available
+      REG.each(&.unusable.should(be_nil)) if available
     end
 
     it "raw deflate round-trips (RFC 1951, no zlib/gzip wrapper)" do
@@ -467,7 +660,7 @@ describe Gori::Decoder do
     end
 
     it "round-trips every byte value 0..255 in each base" do
-      bytes = Bytes.new(256) { |i| i.to_u8 }
+      bytes = Bytes.new(256, &.to_u8)
       {"decimal", "binary", "octal"}.each do |base|
         rt = conv_bytes("#{base}-decode", conv_bytes("#{base}-encode", bytes).dup)
         rt.should eq bytes
@@ -651,6 +844,14 @@ describe Gori::Decoder do
       out.should contain "not verified"
     end
 
+    it "decodes a payload holding a number past Int64 instead of calling it undecodable (#1169)" do
+      h = Base64.urlsafe_encode(%({"alg":"HS256"}), padding: false)
+      p = Base64.urlsafe_encode(%({"sub":"admin","uid":18446744073709551615}), padding: false)
+      out = conv("jwt-decode", "#{h}.#{p}.sig")
+      out.should contain %("uid": 18446744073709551615)
+      out.should_not contain "undecodable"
+    end
+
     it "raises a clean error on junk" do
       expect_raises(Gori::Decoder::DecoderError) { conv("jwt-decode", "not-a-jwt") }
     end
@@ -798,6 +999,29 @@ describe Gori::Decoder do
         res = Gori::Decoder.run(reg, "x".to_slice, "a")
         res.steps[0].state.should eq Gori::Decoder::StepState::Failed
         res.steps[0].error.not_nil!.should contain "recursive"
+      end
+    end
+
+    it "names only the cycle, whichever chain reached it first" do
+      # Flattened in settings order: listed first, `caller` reaches the cycle from outside, and
+      # the reason for `selfref` must read the same as when it is listed second.
+      [[{"caller", "selfref"}, {"selfref", "selfref"}], [{"selfref", "selfref"}, {"caller", "selfref"}]].each do |entries|
+        with_library(entries) do |reg|
+          err = Gori::Decoder.run(reg, "x".to_slice, "selfref").steps[0].error.not_nil!
+          err.should contain "recursive definition (selfref > selfref)"
+          err.should_not contain "caller"
+        end
+      end
+    end
+
+    it "names a mutual cycle the same way whatever order the chains are saved in" do
+      [[{"a", "b"}, {"b", "a"}], [{"b", "a"}, {"a", "b"}], [{"c", "b"}, {"a", "b"}, {"b", "a"}]].each do |entries|
+        with_library(entries) do |reg|
+          %w[a b].each do |name|
+            Gori::Decoder.run(reg, "x".to_slice, name).steps[0].error.not_nil!
+              .should contain "recursive definition (a > b > a)"
+          end
+        end
       end
     end
 

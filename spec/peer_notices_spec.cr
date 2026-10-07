@@ -85,7 +85,7 @@ describe Gori::PeerNotices do
       # and one belled line per tick is the noise this feature exists to avoid.
       t0 = Time.instant
       p = notices
-      p.record_rules(Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1), t0)
+      p.record(t0, rules: Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1))
       p.flush(t0).should be_nil
       p.flush(t0 + 1.second).should be_nil
       p.flush(t0 + Gori::PeerNotices::QUIET_WINDOW).should_not be_nil
@@ -96,8 +96,8 @@ describe Gori::PeerNotices do
     it "counts the whole burst, not the last write in it" do
       t0 = Time.instant
       p = notices
-      p.record_rules(Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1), t0)
-      p.record_rules(Gori::RuleSetChange.new(changed: 2, reordered: false, enabled: 3), t0 + 1.second)
+      p.record(t0, rules: Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1))
+      p.record(t0 + 1.second, rules: Gori::RuleSetChange.new(changed: 2, reordered: false, enabled: 3))
       note = p.flush(t0 + 5.seconds).not_nil!
       note.message.should contain("3 Match&Replace rules")
       note.level.should eq(:warn)
@@ -109,8 +109,8 @@ describe Gori::PeerNotices do
       # is a line the operator never hears — and "the rules changed" is one fact to them anyway.
       t0 = Time.instant
       p = notices
-      p.record_rules(Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1), t0)
-      p.record_extract(Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1), t0)
+      p.record(t0, rules: Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1))
+      p.record(t0, extract: Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1))
       p.flush(t0 + 5.seconds).not_nil!.message.should contain("Match&Replace and extract rules")
     end
 
@@ -119,7 +119,7 @@ describe Gori::PeerNotices do
       # fork a program off local disk. See `RuleSetChange#executes`.
       t0 = Time.instant
       p = notices
-      p.record_rules(Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1, executes: 1), t0)
+      p.record(t0, rules: Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1, executes: 1))
       note = p.flush(t0 + 5.seconds).not_nil!
       note.level.should eq(:warn)
       note.tab.should eq(:rewriter)
@@ -131,47 +131,67 @@ describe Gori::PeerNotices do
     it "does not escalate when the peer's change touched no pipe rule" do
       t0 = Time.instant
       p = notices
-      p.record_rules(Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 4), t0)
+      p.record(t0, rules: Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 4))
       p.flush(t0 + 5.seconds).not_nil!.message.should_not contain("local command")
     end
 
     it "carries an escalation through a coalesced burst" do
       t0 = Time.instant
       p = notices
-      p.record_rules(Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1, executes: 1), t0)
-      p.record_rules(Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 2), t0 + 1.second)
+      p.record(t0, rules: Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1, executes: 1))
+      p.record(t0 + 1.second, rules: Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 2))
       p.flush(t0 + 5.seconds).not_nil!.message.should contain("local command")
+    end
+
+    # #1237: a peer's map-local rule answers this operator's browser with files off local disk.
+    it "escalates a peer's MAP-LOCAL rule, below a pipe rule" do
+      t0 = Time.instant
+      p = notices
+      p.record(t0, rules: Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1, serves_files: 1))
+      note = p.flush(t0 + 5.seconds).not_nil!
+      note.level.should eq(:warn)
+      note.message.should contain("map-local rule")
+      note.message.should contain("files from a directory on this machine")
+
+      p.record(t0, rules: Gori::RuleSetChange.new(changed: 2, reordered: false, enabled: 2, executes: 1, serves_files: 1))
+      p.flush(t0 + 5.seconds).not_nil!.message.should contain("runs a local command")
     end
 
     it "says nothing at all when nothing was recorded" do
       notices.flush(Time.instant).should be_nil
     end
 
-    it "drops the bell for a change that leaves nothing enabled" do
-      # Nothing enabled means nothing on the wire moved, whatever just happened to the list.
+    it "drops the bell for a change that leaves no active rule" do
+      # No active rule means nothing on the wire moved, whatever just happened to the list.
       t0 = Time.instant
       p = notices
-      p.record_rules(Gori::RuleSetChange.new(changed: 2, reordered: false, enabled: 0), t0)
+      p.record(t0, rules: Gori::RuleSetChange.new(changed: 2, reordered: false, enabled: 0))
       note = p.flush(t0 + 5.seconds).not_nil!
       note.level.should eq(:info)
-      note.message.should contain("none are enabled")
+      note.message.should contain("none are active")
     end
 
     it "names a pure REORDER as what it is, never as zero rules changed" do
       t0 = Time.instant
       p = notices
-      p.record_rules(Gori::RuleSetChange.new(changed: 0, reordered: true, enabled: 2), t0)
+      p.record(t0, rules: Gori::RuleSetChange.new(changed: 0, reordered: true, enabled: 2))
       note = p.flush(t0 + 5.seconds).not_nil!
       note.message.should contain("order changed")
       note.message.should_not contain("0 ")
       note.level.should eq(:warn)
     end
 
-    it "names the consequence for extract rules, which is where $KEY comes from" do
+    it "names the consequence for extract rules, which is where a binding token comes from" do
       t0 = Time.instant
       p = notices
-      p.record_extract(Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1), t0)
-      p.flush(t0 + 5.seconds).not_nil!.message.should contain("$KEY")
+      p.record(t0, extract: Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1))
+      # Spelled through the formatter, so the notice follows the install's grammar: `$NAME`
+      # under the bare pin the suite runs in, `$BIND.NAME` when namespaced.
+      p.flush(t0 + 5.seconds).not_nil!.message.should contain("$NAME")
+      with_env_syntax(Gori::Env::Syntax::Namespaced) do
+        p.record(t0, extract: Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1))
+        p.flush(t0 + 5.seconds).not_nil!.message.should contain("$BIND.NAME")
+      end
     end
   end
 end
@@ -213,6 +233,34 @@ describe Gori::RuleSetChange do
     key = ->(r : Gori::Store::MatchRule) { {r.scope, r.id} }
     change = Gori::RuleSetChange.between([project], [global, project], key).not_nil!
     change.changed.should eq(1) # the global arrived; the project rule is untouched
+  end
+
+  it "counts a caller's live rules instead of raw enabled rows when asked" do
+    inert_pipe = Gori::Store::MatchRule.new(1_i64, true, Gori::Store::RuleTarget::Request,
+      Gori::Store::RulePart::Head, "a", "command", Gori::Store::RuleOp::Pipe,
+      unknown_target: "future_side")
+    active_replace = Gori::Store::MatchRule.new(2_i64, true, Gori::Store::RuleTarget::Request,
+      Gori::Store::RulePart::Head, "a", "b")
+    change = Gori::RuleSetChange.between([] of Gori::Store::MatchRule, [inert_pipe, active_replace],
+      ->(r : Gori::Store::MatchRule) { r.id },
+      ->(r : Gori::Store::MatchRule) { r.active? && r.op.executes? },
+      ->(r : Gori::Store::MatchRule) { r.active? }).not_nil!
+
+    change.enabled.should eq(1)
+    change.executes.should eq(0)
+  end
+
+  it "counts the changed map-local rules, and a merge sums them" do
+    dir = Gori::Store::MatchRule.new(1_i64, true, Gori::Store::RuleTarget::Request,
+      Gori::Store::RulePart::Head, "GET /s/", "", Gori::Store::RuleOp::ShortCircuit,
+      body_file: "/srv", respond: Gori::Store::RespondKind::Dir)
+    stub = Gori::Store::MatchRule.new(2_i64, true, Gori::Store::RuleTarget::Request,
+      Gori::Store::RulePart::Head, "/x", "200 OK", Gori::Store::RuleOp::ShortCircuit)
+    change = Gori::RuleSetChange.between([] of Gori::Store::MatchRule, [dir, stub],
+      ->(r : Gori::Store::MatchRule) { r.id }, nil, ->(r : Gori::Store::MatchRule) { r.active? },
+      ->(r : Gori::Store::MatchRule) { r.active? && r.respond.dir? }).not_nil!
+    change.serves_files.should eq(1)
+    change.merge(change).serves_files.should eq(2)
   end
 end
 
@@ -266,7 +314,7 @@ describe "peer-change attribution" do
   it "swaps only the author into the line, and marks the note as AI-made" do
     t0 = Time.instant
     p = notices
-    p.record_rules(Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1), t0, by_agent: true)
+    p.record(t0, by_agent: true, rules: Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1))
     note = p.flush(t0 + 5.seconds).not_nil!
     note.message.should contain("by an agent")
     note.message.should_not contain("another session")
@@ -278,8 +326,8 @@ describe "peer-change attribution" do
     # Otherwise one unattributed write late in the burst erases the one fact worth carrying.
     t0 = Time.instant
     p = notices
-    p.record_rules(Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1), t0, by_agent: true)
-    p.record_rules(Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 2), t0 + 1.second)
+    p.record(t0, by_agent: true, rules: Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 1))
+    p.record(t0 + 1.second, rules: Gori::RuleSetChange.new(changed: 1, reordered: false, enabled: 2))
     p.flush(t0 + 5.seconds).not_nil!.source.should eq("agent")
   end
 

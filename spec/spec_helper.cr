@@ -12,6 +12,15 @@ GORI_TEST_HOME = File.tempname("gori-spec-home")
 Dir.mkdir_p(GORI_TEST_HOME)
 ENV["GORI_HOME"] = GORI_TEST_HOME
 
+# Keep the suite deterministic now that an empty gori upstream intentionally adopts the
+# conventional process proxy variables. Individual examples that exercise that fallback set
+# them explicitly and restore the caller's environment around the example.
+["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+ "http_proxy", "https_proxy", "all_proxy", "no_proxy"].each { |key| ENV.delete(key) }
+# …and the markers a `gori run shell` exports (#1238), so a suite started inside one reads the
+# same environment as anywhere else.
+ENV.keys.each { |key| ENV.delete(key) if key == "GORI_SHELL" || key == "GORI_PROXY" || key.starts_with?("GORI_SHELL_ORIG_") }
+
 require "../src/gori"
 
 # Several examples feed Settings a deliberately unparseable file. The warning that earns
@@ -20,7 +29,143 @@ require "../src/gori"
 # assert the line swap in an IO::Memory of their own.
 Gori::Settings.warning_io = nil
 
+# THE BARE-MODE PIN, and it is now what the ABSENCE of `env.syntax` means for this process.
+#
+# Every spec home is a brand-new one — `GORI_TEST_HOME` above, plus the per-example temp homes — and
+# in production an absent key means "this file predates namespaces", which is a MIGRATION: without
+# the pin every `Settings.load` in the suite would adopt the namespaced grammar, read the ~1,000
+# bare `$TOKEN` fixtures under it, re-spell every store a spec opens (backup file and all) and write
+# a settings.json into every temp home on the way. Pinned bare, the marker in a fresh database
+# (absent = bare) AGREES with the install, so `EnvMigration.reconcile` is a no-op and nothing is
+# written. The existing suite IS the bare-mode contract; namespaced behaviour gets its own files and
+# opts in with `with_env_syntax`, and the open-time migration with `spec/env_migration_spec.cr`'s
+# own homes.
+Gori::Settings.env_syntax_when_absent = Gori::Env::Syntax::Bare
+# …and the value in memory BEFORE any load, for the many examples that never call one. The class
+# property defaults to the production grammar, so this is the same pin one line earlier.
+Gori::Settings.env_syntax = Gori::Env::Syntax::Bare
+
+# Run a block under one token grammar and restore whatever was in effect.
+#
+# The setter bumps the highlight revision (a `TextArea`'s styled buffer, the `Highlight` caches and
+# `Rules#subst_snapshot` are keyed on it), and so does the restore — otherwise an example that
+# painted under one grammar would leave a neighbour reading its cache.
+# This is a PIN, not a load, so the mid-process re-read (`EnvMigration.follow_disk`) is switched off
+# for the duration: the temp home's settings.json says something else — or nothing — and a seam that
+# adopted the file's answer here would be fighting the pin rather than following a peer. The examples
+# that exercise that seam write a real settings.json and drive it directly.
+def with_env_syntax(syntax : Gori::Env::Syntax, &)
+  was = Gori::Settings.env_syntax
+  followed = Gori::Settings.env_syntax_follow_disk?
+  Gori::Settings.env_syntax = syntax
+  Gori::Settings.env_syntax_follow_disk = false
+  begin
+    yield
+  ensure
+    Gori::Settings.env_syntax_follow_disk = followed
+    Gori::Settings.env_syntax = was
+  end
+end
+
 Spec.after_suite { FileUtils.rm_rf(GORI_TEST_HOME) }
+
+# Does anything accept a TCP connection on `host:port`? `TCPSocket.new` alone cannot say on
+# macOS 27: a REFUSED connect comes back as a socket (Crystal's event loop reads the second
+# `connect()`'s EISCONN as success), so a spec asserting "this port is closed" by expecting it to
+# raise passes a listener that is still up and fails one that is down. Asking for the peer
+# address is what tells the two apart. Raw on purpose: `Upstream.dial` would answer through the
+# process's host overrides and upstream routes, which is not the question.
+def tcp_port_accepts?(host : String, port : Int32) : Bool
+  sock = TCPSocket.new(host, port, connect_timeout: 2.seconds)
+  begin
+    sock.remote_address
+    true
+  ensure
+    sock.close
+  end
+rescue
+  false
+end
+
+# Two connected stream sockets, for an example that needs real fds talking to each other.
+# Loopback TCP rather than `UNIXSocket.pair`, which has no Windows implementation.
+def stream_pair : {TCPSocket, TCPSocket}
+  server = TCPServer.new("127.0.0.1", 0)
+  begin
+    pair = {TCPSocket.new("127.0.0.1", server.local_address.port), server.accept}
+  ensure
+    server.close
+  end
+  pair.each(&.tcp_nodelay = true)
+  pair
+end
+
+# A hung example is not a failure, it is a suite that never ends: a bare `channel.receive`
+# waiting on a server that was never reached parks the one fiber the runner has, the process
+# sits at 0% CPU, and the dots are buffered so the log says nothing. Such processes outlived
+# their `crystal spec` parent by days on a developer machine. The watchdog turns that into a
+# loud exit naming the example. What it covers is an EXAMPLE that parks: a hang in a
+# `before_all`/`after_suite` hook is outside it, and an example spinning without yielding
+# starves this fiber too. `GORI_SPEC_EXAMPLE_TIMEOUT` (seconds, 0 = off) is generous by
+# default: no example should take minutes, and a false trip costs a rerun where a missed hang
+# costs the machine.
+#
+# Counted in watchdog ticks rather than read off a clock: Darwin's monotonic clock keeps running
+# while the machine sleeps, so closing a laptop lid mid-suite would otherwise read as a hang.
+# The one-second timer does not fire during sleep, so ticks only count time the suite had.
+SPEC_EXAMPLE_TIMEOUT = ENV["GORI_SPEC_EXAMPLE_TIMEOUT"]?.try(&.to_i?) || 300
+
+# A native crash on Windows ends the process without flushing a buffered STDOUT, which would
+# take the name of the example that crashed with it.
+{% if flag?(:win32) %}
+  STDOUT.sync = true
+{% end %}
+
+# Marks the running example pending on Windows, where *reason* (a POSIX-only mechanism the
+# example depends on) does not exist. Everywhere else it is a no-op.
+def posix_only!(reason : String, file = __FILE__, line = __LINE__) : Nil
+  {% if flag?(:win32) %}
+    pending!("POSIX only: #{reason}", file, line)
+  {% end %}
+end
+
+module SpecWatchdog
+  class_property ticks = 0_i64
+  class_property running : {Spec::Example, Int64}? = nil
+end
+
+if SPEC_EXAMPLE_TIMEOUT > 0
+  Spec.around_each do |example|
+    SpecWatchdog.running = {example.example, SpecWatchdog.ticks}
+    begin
+      example.run
+    ensure
+      SpecWatchdog.running = nil
+    end
+  end
+
+  Spec.before_suite do
+    spawn(name: "spec-watchdog") do
+      loop do
+        sleep 1.second
+        SpecWatchdog.ticks += 1
+        next unless running = SpecWatchdog.running
+        example, started = running
+        next if SpecWatchdog.ticks - started < SPEC_EXAMPLE_TIMEOUT
+        STDOUT.flush
+        STDERR.puts "\nspec watchdog: example still running after #{SPEC_EXAMPLE_TIMEOUT}s " \
+                    "(GORI_SPEC_EXAMPLE_TIMEOUT), aborting the suite:\n" \
+                    "crystal spec #{example.file}:#{example.line} # #{example.description}"
+        STDERR.flush
+        # `_exit`, not `exit`: the runner itself lives in an at_exit handler, and this fiber
+        # may be the only thing still able to run. That skips `after_suite`, so the suite's
+        # own temp home is removed here; per-file hooks' temp dirs are left behind.
+        FileUtils.rm_rf(GORI_TEST_HOME) rescue nil
+        LibC._exit(124)
+      end
+    end
+  end
+end
 
 # The chord a keypress ACTUALLY produces, built the way the TUI builds it: a Termisu key
 # event run through `Keybind.from_event`, never a hand-spelled `Verb::Chord.new`.
@@ -84,6 +229,22 @@ def shift_chord(letter : Char) : Gori::Verb::Chord
   typed_chord(letter.downcase.to_s, shift: true)
 end
 
+# A typed key for the hex editor (`hex_key` → `HexEdit#handle_key`).
+def hex_ev(c : Char) : Termisu::Event::Key
+  Termisu::Event::Key.new(Termisu::Input::Key.from_char(c), Termisu::Input::Modifier::None, c)
+end
+
+def hex_ev(k : Termisu::Input::Key) : Termisu::Event::Key
+  Termisu::Event::Key.new(k, Termisu::Input::Modifier::None, nil)
+end
+
+# Every line the response pane is showing, materialised — through `resp_line_source`, the one
+# definition of what that pane holds.
+def resp_lines(view : Gori::Tui::RepeaterView) : Array(String)
+  size, line_at = view.resp_line_source
+  (0...size).map { |i| line_at.call(i) }
+end
+
 # The scope decision for a spec that is exercising something OTHER than the scope gate
 # (payload generation, host overrides, engine plumbing). `Gori::Outbound` is a required
 # constructor argument on every active sender — that is the whole point of the seam — so
@@ -94,6 +255,32 @@ def ungated_outbound : Gori::Outbound
   Gori::Outbound.waived(nil, Gori::Outbound::Reason::NoProject)
 end
 
+# A Repeater tab AT an explicit id, created now. Since V40 `repeaters.id` is never handed out
+# twice, so a spec that pins a guard against a REUSED id plants the successor itself: the shape a
+# project that reused ids before its upgrade can still hold.
+def plant_repeater_at(store : Gori::Store, id : Int64, target : String, request : String,
+                      position : Int32 = 0) : Int64
+  now = (Time.utc - Time::UNIX_EPOCH).total_microseconds.to_i64
+  store.@db.exec("INSERT INTO repeaters (id, created_at, updated_at, target, request, position) " \
+                 "VALUES (?, ?, ?, ?, ?, ?)", id, now, now, target, request.to_slice, position)
+  id
+end
+
+# Rewrite `table`'s stored CREATE text into one gori never wrote but SQLite accepts: the rowid
+# clause lowercased, and a table CHECK that spells the uppercase phrase inside a string literal —
+# true for every row as written. An AUTOINCREMENT edit that went by the phrase alone would land in
+# the CHECK and fail every row. The shape a crafted `.gori` archive can carry past an import's
+# `quick_check`.
+def plant_crafted_create(c : DB::Connection, table : String) : Nil
+  c.as(SQLite3::Connection).gori_swap_defensive(false)
+  cookie = c.scalar("PRAGMA schema_version").as(Int64)
+  c.exec("PRAGMA writable_schema = ON")
+  c.exec("UPDATE sqlite_master SET sql = substr(replace(sql, 'INTEGER PRIMARY KEY', 'integer primary key'), 1, " \
+         "length(sql) - 1) || ', CHECK (length(''INTEGER PRIMARY KEY'') = 19))' WHERE type = 'table' AND name = ?", table)
+  c.exec("PRAGMA schema_version = #{cookie + 1}")
+  c.exec("PRAGMA writable_schema = OFF")
+end
+
 # A throwaway on-disk Store for one example: opened on a fresh temp path, closed and
 # deleted (with its WAL/SHM sidecars) on the way out, whether or not the block raised. This
 # is the harness behind most store-backed examples in the tree; it used to be pasted into
@@ -101,17 +288,72 @@ end
 # the store, an event channel, a retention knob, an Env layer restored on exit) keeps a
 # file-private `with_store` of its own — a top-level `private def` shadows this one inside
 # that file only, so the two never collide.
+#
+# The teardown runs after the `rescue`, never in an `ensure`: on Windows a fiber switch while an
+# exception unwinds (`Store#close` waits on the writer fiber) ends the process without a word, so
+# an example that failed, or went pending, inside the store took the rest of its file with it.
 def with_store(&)
   path = File.tempname("gori-spec", ".db")
   store = Gori::Store.open(path)
-  begin
-    yield store
-  ensure
-    store.close
-    File.delete?(path)
-    File.delete?("#{path}-wal")
-    File.delete?("#{path}-shm")
+  raised = run_capturing { yield store }
+  store.close
+  delete_db_files(path)
+  raise raised if raised
+end
+
+# One page of a saved fuzz run with every column (request/response BLOBs included), in the
+# store's `idx, id` order — collected from the production `Store#each_fuzz_result_page`.
+def fuzz_result_page(store : Gori::Store, run_id : Int64, limit : Int32 = 200,
+                     offset : Int32 = 0) : Array(Gori::Store::FuzzResultRecord)
+  rows = [] of Gori::Store::FuzzResultRecord
+  store.each_fuzz_result_page(run_id, limit, offset.to_i64) { |row| rows << row }
+  rows
+end
+
+# Runs the block and hands back what it raised, so a teardown that switches fibers can run once
+# the exception has finished unwinding (see `with_store`), and re-raise it after.
+def run_capturing(&) : Exception?
+  yield
+  nil
+rescue ex
+  ex
+end
+
+# Deletes a throwaway database and its WAL/SHM sidecars. Windows will not delete a file that
+# is still open, and a read after `Store#close` reopens the pool (a known store bug; an example
+# that closes its store to make writes fail reads after it), so there the files are left in
+# the temp dir rather than failing an example on its teardown.
+def delete_db_files(path : String) : Nil
+  {path, "#{path}-wal", "#{path}-shm"}.each do |file|
+    {% if flag?(:win32) %}
+      File.delete?(file) rescue nil
+    {% else %}
+      File.delete?(file)
+    {% end %}
   end
+end
+
+# Hand `table`'s next insert the id `max(id)+1` again, the way every capture was allocated
+# before V39. `flows` and `h2_connections` are AUTOINCREMENT now, so an id is never issued twice
+# — but the guards #1342 put in each consumer of a flow id stay, as defence in depth, and a spec
+# that proves one needs a reused id to prove it against. With no `sqlite_sequence` row SQLite
+# falls back to the largest rowid, so call this after the delete and before the insert that
+# should take the id back.
+def reissue_rowids(store : Gori::Store, table : String = "flows") : Nil
+  store.@db.exec("DELETE FROM sqlite_sequence WHERE name = ?", table)
+end
+
+# Refuse every write of the project's active-view pointer (`SavedViews::ACTIVE_KEY`), the shape
+# of a busy store for that one setting, until `unblock_active_view_writes`.
+def block_active_view_writes(store : Gori::Store) : Nil
+  {"insert", "update"}.each do |op|
+    store.@db.exec("CREATE TRIGGER block_active_view_#{op} BEFORE #{op.upcase} ON settings " \
+                   "WHEN NEW.key = '#{Gori::SavedViews::ACTIVE_KEY}' BEGIN SELECT RAISE(ABORT, 'blocked'); END")
+  end
+end
+
+def unblock_active_view_writes(store : Gori::Store) : Nil
+  {"insert", "update"}.each { |op| store.@db.exec("DROP TRIGGER block_active_view_#{op}") }
 end
 
 # `with_store` for an example that writes the project env or bindings layer: the
@@ -123,17 +365,13 @@ def with_store_env(&)
   store = Gori::Store.open(path)
   prev_env = Gori::Settings.project_env_vars
   prev_layer = Gori::Env.layer
-  begin
-    yield store
-  ensure
-    Gori::Env.layer = prev_layer
-    Gori::Settings.project_env_vars = prev_env
-    Gori::Env.bump_highlight_rev
-    store.close
-    File.delete?(path)
-    File.delete?("#{path}-wal")
-    File.delete?("#{path}-shm")
-  end
+  raised = run_capturing { yield store } # not an `ensure`: see `with_store`
+  Gori::Env.layer = prev_layer
+  Gori::Settings.project_env_vars = prev_env
+  Gori::Env.bump_highlight_rev
+  store.close
+  delete_db_files(path)
+  raise raised if raised
 end
 
 # The MCP tool facade over a store, built the way `gori mcp` builds it for a bound project:
@@ -204,5 +442,69 @@ def receive_within(chan : Channel(T), seconds : Int32 = 20, what : String = "a v
     got
   when timeout(seconds.seconds)
     raise "nothing arrived on the channel within #{seconds}s (expected #{what})"
+  end
+end
+
+# A throwaway `$GORI_HOME` for one example, so a spec that saves, lists or resolves wordlists
+# (`Gori::WordlistCatalog`, #1353) sees an empty global catalog of its own and never the suite's
+# shared one. Yields the catalog directory (`Paths.wordlists_dir`), which does NOT exist yet — a
+# fresh home has none, and `save` creates it — and restores the previous `GORI_HOME`.
+#
+# The working directory is a fresh empty one too (`Dir.cd`, restored), because a bare wordlist
+# name resolves against it before the catalog: an example run from the repo root would find a
+# `shard.yml`-adjacent file of the same name and pass or fail for the wrong reason.
+def with_wordlist_home(&)
+  prev = ENV["GORI_HOME"]?
+  home = File.tempname("gori-wl-home")
+  cwd = File.tempname("gori-wl-cwd")
+  Dir.mkdir_p(home)
+  Dir.mkdir_p(cwd)
+  ENV["GORI_HOME"] = home
+  begin
+    Dir.cd(cwd) { yield Gori::Paths.wordlists_dir }
+  ensure
+    prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+    FileUtils.rm_rf(home)
+    FileUtils.rm_rf(cwd)
+  end
+end
+
+{% unless flag?(:win32) %}
+  # `dup(2)` is not in Crystal's LibC bindings; one line binds it for the helper below.
+  lib LibC
+    fun dup(fd : Int) : Int
+  end
+{% end %}
+
+# Run the block with STDOUT pointed at /dev/null — for driving a `gori run` entry point whose
+# normal output is the help page, when the example is about a side effect and not the page.
+# Windows runs it unsilenced: its STDOUT is a handle, not an fd to `dup`, and the noise is
+# only cosmetic.
+def stdout_silenced(&)
+  {% if flag?(:win32) %}
+    yield
+  {% else %}
+    STDOUT.flush
+    saved = LibC.dup(STDOUT.fd)
+    File.open(File::NULL, "w") { |null| STDOUT.reopen(null) }
+    begin
+      yield
+    ensure
+      STDOUT.flush
+      STDOUT.reopen(IO::FileDescriptor.new(saved))
+    end
+  {% end %}
+end
+
+# `Dir.glob` over path parts joined like `File.join`. A glob pattern takes `/` on every
+# platform (`\` escapes), so on Windows the joined parts are turned POSIX first.
+def glob_files(*parts : String) : Array(String)
+  Dir.glob(Path.new(*parts).to_posix.to_s)
+end
+
+# Reads a request head off a test origin's connection before it answers. Windows answers a
+# close over unread bytes with an RST, which throws the reply away before the client reads it.
+def drain_request_head(io : IO) : Nil
+  while (line = io.gets) && !line.empty?
   end
 end

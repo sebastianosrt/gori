@@ -28,6 +28,13 @@ private class RuleUpdateFailingStore < Gori::Store
     return false if @fail_delete
     super
   end
+
+  property? fail_status_update = false
+
+  def update_probe_issue_status(id : Int64, status : Gori::Store::Status)
+    return false if fail_status_update?
+    super
+  end
 end
 
 # Opened the long way round (the `Store.open` recipe minus the subclass), like
@@ -189,6 +196,17 @@ describe "MCP probe triage tools" do
     end
   end
 
+  it "returns a busy error when toggling dismiss fails to land in the store" do
+    with_rule_update_failing_store do |store|
+      issue = seed_probe_issue(store)
+      tools = tools_for(store)
+      store.fail_status_update = true
+      res = tools.call("probe_dismiss", JSON.parse(%({"id":#{issue.id}})))
+      res.is_error.should be_true
+      res.text.should contain("finding #{issue.id} is unchanged")
+    end
+  end
+
   it "bulk-dismisses by code and by host" do
     with_store do |store|
       seed_probe_issue(store, code: "secret_in_url", host: "a.test")
@@ -282,9 +300,10 @@ describe "MCP probe rules + mode tools" do
       tools = tools_for(store)
       res = call_json(tools, "list_probe_rules", "{}")
       res["mode"].as_s.should eq("passive") # the fresh-project default
-      # One built-in ships OFF by default (the opt-in request-smuggling detector), so a fresh
-      # project already reports it disabled — see Probe::DEFAULT_DISABLED_RULES.
-      res["disabled_count"].as_i.should eq(1)
+      # Two built-ins ship OFF by default (the opt-in request-smuggling detector and time-based
+      # blind SQLi), so a fresh project already reports them disabled — see
+      # Probe::DEFAULT_DISABLED_RULES.
+      res["disabled_count"].as_i.should eq(2)
       rules = res["rules"].as_a
       rules.size.should be > 0
       kinds = rules.map { |r| r["kind"].as_s }.uniq
@@ -315,8 +334,8 @@ describe "MCP probe rules + mode tools" do
       before.should contain("secret_in_url")
 
       call_json(tools, "set_probe_rule_enabled", %({"id":"secret_in_url","enabled":false}))["enabled"].as_bool.should be_false
-      # 2 = secret_in_url (just disabled) + request_smuggling (off by default).
-      call_json(tools, "list_probe_rules", "{}")["disabled_count"].as_i.should eq(2)
+      # 3 = secret_in_url (just disabled) + request_smuggling + sqli_time_based (off by default).
+      call_json(tools, "list_probe_rules", "{}")["disabled_count"].as_i.should eq(3)
 
       after = call_json(tools, "probe_scan", "{}")["issues"].as_a.map { |g| g["code"].as_s }
       after.should_not contain("secret_in_url")
@@ -495,6 +514,56 @@ describe "MCP probe_delete guards" do
       res = call_json(tools, "probe_issues", %({"category":"custom"}))
       res["total"].as_i.should eq(1)
       res["issues"].as_a.first["code"].as_s.should eq("custom_p_1")
+    end
+  end
+end
+
+# --- probe_scan must say when the out-of-band rules were inert ---------------------------
+#
+# An OOB rule closes its loop through a third-party interaction server, not on the sending
+# socket, so it needs an `oast_sessions` row to mint against (`OutOfBand::StoreMinter`). With
+# none it plans nothing, sends nothing, and finds nothing — and an agent reading an empty
+# `issues` array records "no blind SSRF" for a check that never ran. `gori run probe` prints
+# this as a notice and the TUI's Rules sub-tab badges it "needs OAST"; MCP was the one surface
+# that stayed silent, and it is the surface where a clean-looking result is believed without a
+# human reading the run.
+describe "MCP probe_scan — out-of-band reachability" do
+  # The QUERY matches nothing on purpose: the notice is a property of the project's OAST
+  # state, not of what was scanned, so this needs no flow — and an active scan over a real one
+  # would put this example on the wire.
+  it "names the enabled OOB rules and says an empty result is not an answer about them" do
+    with_store do |store|
+      seed_secret_flow(store)
+      store.add_scope_rule("include", "host", "acme.test")
+      tools = tools_for(store)
+      res = call_json(tools, "probe_scan", %({"active":true,"query":"host:nothing.invalid"}))
+      oob = res["out_of_band"]
+      oob["session"].as_bool.should be_false
+      rules = oob["inert_rules"].as_a.map(&.as_s)
+      Gori::Probe::OOB_RULE_IDS.each { |id| rules.should contain(id) }
+      oob["note"].as_s.should contain("NOT evidence")
+      oob["note"].as_s.should contain("persist:true")
+    end
+  end
+
+  it "says nothing once a session exists to mint against" do
+    with_store do |store|
+      seed_secret_flow(store)
+      store.add_scope_rule("include", "host", "acme.test")
+      store.insert_oast_session(nil, "custom-http", "https://oob.example/hits", "corr", "", nil, nil)
+      store.flush
+      res = call_json(tools_for(store), "probe_scan", %({"active":true,"query":"host:nothing.invalid"}))
+      res.as_h.has_key?("out_of_band").should be_false
+    end
+  end
+
+  # A PASSIVE scan plants nothing by design, so reporting a missing listener there would be
+  # noise on the one mode that never sends.
+  it "stays silent on a passive scan" do
+    with_store do |store|
+      seed_secret_flow(store)
+      res = call_json(tools_for(store), "probe_scan", "{}")
+      res.as_h.has_key?("out_of_band").should be_false
     end
   end
 end

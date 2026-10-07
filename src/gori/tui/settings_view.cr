@@ -82,7 +82,10 @@ module Gori::Tui
       Field.new("Strip HTTP/3 Alt-Svc", "remove Alt-Svc alternatives advertising h3 from the response the client gets, so a browser cannot switch to QUIC/UDP where gori sees nothing — Alt-Svc: clear and non-h3 alternatives are left alone; ←/→/space toggles", bool: true),
       Field.new("TLS passthrough", "comma-separated hosts to relay WITHOUT decrypting (for certificate-pinned apps) — acme.test covers subdomains, *.acme.test globs; nothing is captured for them"),
       Field.new("Upstream rules",
-        "per-host routing / proxy auth — edit with `gori settings --edit` (network.upstream_rules)",
+        "per-host routing / proxy auth — edit with `gori settings --edit` (upstream_rules)",
+        readonly: true),
+      Field.new("Environment proxy",
+        "HTTPS_PROXY / HTTP_PROXY / ALL_PROXY as this process sees them — the route while Proxy protocol is None and no project pin or rule claims the host (a `*` rule shadows them entirely); localhost stays direct, NO_PROXY exceptions apply; set a proxy above or unset the variable to change it",
         readonly: true),
       Field.new("Outbound TLS",
         "per-host client certificates, protocol range and TLS fingerprint (groups/sigalgs/ALPN, or a chrome/firefox/safari/curl preset) — edit with `gori settings --edit` (outbound_tls); check what actually goes on the wire with `gori settings tls-fingerprint`",
@@ -119,7 +122,14 @@ module Gori::Tui
     KEYS_FIELDS = [
       Field.new("Command modifier", "which modifier fronts gori's built-in shortcuts (^P ^N ^W ^G ^F ^B ^E ^, ^1-9) — Option ADDS ⌥ as an alias, Ctrl keeps working; for terminals/multiplexers that swallow the Ctrl form (tmux's ^B, Ctrl+digit). macOS Terminal/iTerm must be set to send Option as Meta. ←/→ cycles",
         choices: COMMAND_MODIFIER_CHOICES, choice_labels: COMMAND_MODIFIER_LABELS),
+      Field.new("Editor keyset",
+        "how the READ-mode keys of a text pane are spelled: helix-ish selects the line with x, then d deletes or y copies it · vim-ish uses dd / yy, ⇧V line select, u undo, / find, a / ⇧A / ⇧I insert, w / b words, g / ⇧G top-bottom. A mapping, not an emulation — counts, motions after an operator and :commands are not offered. Your own rebindings win over the keyset. ←/→ cycles",
+        choices: Gori::Hotkeys::KEYSETS, choice_labels: Gori::Hotkeys::KEYSET_LABELS),
+      Field.new("Keyset playground", "↵ to try both keysets on a practice pad, with every READ-mode key of each listed — pick yours on the row above",
+        opener: :keyset_playground),
     ]
+    # The playground row's value column: an opener shows a summary, and this one has no state.
+    KEYSET_PLAYGROUND_SUMMARY = "try helix-ish / vim-ish ›"
     # The THEME section is special: a single field whose value is the selected theme
     # name, but rendered as a vertical, scrollable list (built-ins + user themes) rather
     # than the inline ←/→ cycle the other `choices` fields use. `choices` is kept only so
@@ -149,7 +159,10 @@ module Gori::Tui
         "how deep the tree opens after reload — ←/→ cycles (all = fully expanded)",
         choices: LAYOUT_DEPTH_CHOICES, choice_labels: LAYOUT_DEPTH_LABELS),
       Field.new("Tab numbers",
-        "paint 1:…9: on the tab bar, the keys the 1-9 jump answers to — ←/→/space toggles",
+        "paint 1:…9: on the tab bar, the keys the 1-9 jump answers to — ←/→/space toggles (on by default)",
+        bool: true),
+      Field.new("Tab bar slots",
+        "cap the bar at nine numbered slots (off: unbounded, scrolls with ‹ ›) — 0 reaches every tab either way",
         bool: true),
     ]
     # Statusline: an opt-in bottom row that runs a command and shows its output.
@@ -158,7 +171,7 @@ module Gori::Tui
         "run a command and show its output at the very bottom — ←/→/space toggles",
         bool: true),
       Field.new("Command",
-        "shell command (/bin/sh -c) — receives a JSON context (project, capture, flows, proxy) on stdin"),
+        "shell command (/bin/sh -c) — a JSON context (project, proxy, scope, intercept, jobs…) arrives on stdin"),
       Field.new("Interval (s)",
         "how often to re-run the command — seconds (min 1)"),
       Field.new("Timeout (s)",
@@ -196,6 +209,7 @@ module Gori::Tui
     # Companion: Miss Ring, the mascot in the body's bottom-right corner.
     COMPANION_MOTION_CHOICES    = ["lively", "calm", "still"]
     COMPANION_PLACEMENT_CHOICES = ["body", "bar"]
+    COMPANION_REPLIES_CHOICES   = ["hold", "timed"]
     COMPANION_FIELDS            = [
       Field.new("Companion (Miss Ring)",
         "show the mascot in the body's bottom-right corner — she covers three rows and repaints about once a second while you're at the keyboard — ←/→/space toggles",
@@ -209,6 +223,9 @@ module Gori::Tui
       Field.new("Notices",
         "announce new background results in a speech bubble, and react to them — independent of the bottom-bar toast — ←/→/space toggles",
         bool: true),
+      Field.new("Agent replies",
+        "hold = an agent's reply stays in her bubble (the status row, in bar) until your next key or click, and later notices do not replace it; timed = it leaves after a few seconds like any other notice — ←/→ cycles",
+        choices: COMPANION_REPLIES_CHOICES),
     ]
     # Notifications: bell/toast toggles + ring-buffer retention.
     NOTIFICATIONS_FIELDS = [
@@ -238,18 +255,34 @@ module Gori::Tui
         "write every Repeater send into History as a flow (SRC column: RPTR) so it can be filtered, compared and exported — TUI only; gori run and MCP take their own per-call argument; ←/→/space toggles",
         bool: true),
     ]
+    # MCP: how `gori mcp` talks back to an attached agent ("Tell the agent…").
+    MCP_FIELDS = [
+      Field.new("Channel delivery",
+        "push \"Tell the agent…\" messages as a claude/channel event when no confirmed route answers — research preview, needs Claude Code launched with --dangerously-load-development-channels server:gori; the inbox socket, codex queue, operator_messages poll and tool-result carry run either way, and a confirmed route is always tried first; applies to agents started after the change — ←/→/space toggles",
+        bool: true),
+    ]
+    # MCP permissions: one row per `Settings::MCP_PERMISSIONS` group, in its order, so a group
+    # added there is a row here without a second list to keep in step.
+    MCP_PERMISSION_FIELDS = Settings::MCP_PERMISSIONS.map do |perm|
+      Field.new(perm.title,
+        "let an attached agent use #{perm.summary} — off leaves those tools out of gori mcp's tools/list " \
+        "and refuses them; reading the capture is always allowed; applies to agents started after the change — ←/→/space toggles",
+        bool: true)
+    end
     SECTIONS = {
-      :network       => NETWORK_FIELDS,
-      :editor        => EDITOR_FIELDS,
-      :mouse         => MOUSE_FIELDS,
-      :keys          => KEYS_FIELDS,
-      :theme         => THEME_FIELDS,
-      :layout        => LAYOUT_FIELDS,
-      :statusline    => STATUSLINE_FIELDS,
-      :display       => DISPLAY_FIELDS,
-      :companion     => COMPANION_FIELDS,
-      :notifications => NOTIFICATIONS_FIELDS,
-      :general       => GENERAL_FIELDS,
+      :network         => NETWORK_FIELDS,
+      :editor          => EDITOR_FIELDS,
+      :mouse           => MOUSE_FIELDS,
+      :keys            => KEYS_FIELDS,
+      :theme           => THEME_FIELDS,
+      :layout          => LAYOUT_FIELDS,
+      :statusline      => STATUSLINE_FIELDS,
+      :display         => DISPLAY_FIELDS,
+      :companion       => COMPANION_FIELDS,
+      :notifications   => NOTIFICATIONS_FIELDS,
+      :general         => GENERAL_FIELDS,
+      :mcp             => MCP_FIELDS,
+      :mcp_permissions => MCP_PERMISSION_FIELDS,
     }
 
     # Max theme rows shown at once before the list scrolls (the box also shrinks to the
@@ -281,17 +314,19 @@ module Gori::Tui
       @section = section
       Theme.load_custom if section == :theme # pick up theme files dropped since startup
       @values = case section
-                when :editor        then editor_values
-                when :mouse         then mouse_values
-                when :keys          then keys_values
-                when :theme         then [Theme.canonical(Settings.theme)]
-                when :layout        then layout_values
-                when :statusline    then statusline_values
-                when :display       then display_values
-                when :companion     then companion_values
-                when :notifications then [Settings.notify_bell? ? "on" : "off", Settings.notify_toast? ? "on" : "off", Settings.notify_retention.to_s]
-                when :general       then general_values
-                else                     network_values
+                when :editor          then editor_values
+                when :mouse           then mouse_values
+                when :keys            then keys_values
+                when :theme           then [Theme.canonical(Settings.theme)]
+                when :layout          then layout_values
+                when :statusline      then statusline_values
+                when :display         then display_values
+                when :companion       then companion_values
+                when :notifications   then [Settings.notify_bell? ? "on" : "off", Settings.notify_toast? ? "on" : "off", Settings.notify_retention.to_s]
+                when :general         then general_values
+                when :mcp             then mcp_values
+                when :mcp_permissions then mcp_permission_values
+                else                       network_values
                 end
       @focused = 0
       @cursor = @values[0].size
@@ -324,7 +359,7 @@ module Gori::Tui
                   Settings::DEFAULT_MOUSE ? "on" : "off",
                   Settings::DEFAULT_MOUSE_DRAG,
                 ]
-                when :keys  then [Settings::DEFAULT_COMMAND_MODIFIER]
+                when :keys  then [Settings::DEFAULT_COMMAND_MODIFIER, Settings::DEFAULT_EDITOR_KEYSET, KEYSET_PLAYGROUND_SUMMARY]
                 when :theme then [Theme.canonical(Settings::DEFAULT_THEME)]
                 when :layout then [
                   Settings::DEFAULT_HISTORY_PREVIEW ? "on" : "off",
@@ -333,6 +368,7 @@ module Gori::Tui
                   Settings::DEFAULT_HISTORY_LIST_ORDER,
                   Settings::DEFAULT_SITEMAP_EXPAND_DEPTH.to_s,
                   Settings::DEFAULT_TAB_NUMBERS ? "on" : "off",
+                  Settings::DEFAULT_TAB_SLOTS ? "on" : "off",
                 ]
                 when :statusline then [
                   Settings::DEFAULT_STATUSLINE_ENABLED ? "on" : "off",
@@ -354,6 +390,7 @@ module Gori::Tui
                   Settings::DEFAULT_COMPANION_PLACEMENT,
                   Settings::DEFAULT_COMPANION_MOTION,
                   Settings::DEFAULT_COMPANION_NOTICES ? "on" : "off",
+                  Settings::DEFAULT_COMPANION_REPLIES,
                 ]
                 when :notifications then [
                   Settings::DEFAULT_NOTIFY_BELL ? "on" : "off",
@@ -367,7 +404,11 @@ module Gori::Tui
                   Settings::DEFAULT_RETENTION_FLOWS.to_s,
                   Settings::DEFAULT_REPEATER_RECORD_HISTORY ? "on" : "off",
                 ]
-                else [Settings::DEFAULT_BIND_HOST, Settings::DEFAULT_BIND_PORT.to_s,
+                when :mcp then [
+                  Settings::DEFAULT_MCP_CHANNELS ? "on" : "off",
+                ]
+                when :mcp_permissions then Settings::MCP_PERMISSIONS.map { "on" } # every group allowed
+                else                       [Settings::DEFAULT_BIND_HOST, Settings::DEFAULT_BIND_PORT.to_s,
                       "none", "", "",
                       Settings::DEFAULT_UPSTREAM_PROXY_CA,
                       Settings::DEFAULT_UPSTREAM_PROXY_INSECURE ? "off" : "on",
@@ -380,6 +421,7 @@ module Gori::Tui
                       Settings::DEFAULT_STRIP_ALT_SVC ? "on" : "off",
                       passthrough_label(Settings::DEFAULT_TLS_PASSTHROUGH),
                       rule_count_label(Settings.upstream_rules.size, "rule"),
+                      environment_proxy_summary,
                       outbound_tls_summary,
                       hostnames_summary]
                 end
@@ -416,12 +458,16 @@ module Gori::Tui
         Settings.strip_alt_svc? ? "on" : "off",
         passthrough_label(Settings.tls_passthrough),
         rule_count_label(Settings.upstream_rules.size, "rule"),
+        environment_proxy_summary,
         outbound_tls_summary,
         hostnames_summary,
       ]
     end
 
     private def upstream_proxy_field_values(raw : String) : {String, String, String}
+      if bad = Settings.upstream_proxy_unparsed
+        return {"Invalid · #{bad.to_json}", "", ""}
+      end
       if fields = Settings.upstream_proxy_fields(raw)
         {PROXY_PROTOCOL_CHOICES.includes?(fields[0]) ? fields[0] : "none", fields[1], fields[2]}
       else
@@ -450,9 +496,11 @@ module Gori::Tui
       ]
     end
 
-    # The KEYS row values (one row today — the command modifier).
+    # The KEYS row values. Both are clamped on the way OUT as well as in (the `mouse_values`
+    # defence): a hand-edited settings.json holding an unknown keyset would otherwise show a
+    # row whose ←/→ cycle cannot find its own current value in `choices`.
     private def keys_values : Array(String)
-      [Settings.command_modifier]
+      [Settings.command_modifier, Settings.normalize_editor_keyset(Settings.editor_keyset), KEYSET_PLAYGROUND_SUMMARY]
     end
 
     # The GENERAL row values, read from the live Settings — one helper for the load and the
@@ -487,6 +535,21 @@ module Gori::Tui
       presets.empty? ? base : "#{base} · #{presets.join(", ")}"
     end
 
+    # The environment-proxy row's value. The Proxy protocol row above it reads "None" for a
+    # blank scalar, which is also what an install routing everything through `$HTTPS_PROXY`
+    # shows — so this row is where that fact lives (#1114). "none" when nothing is exported;
+    # `Settings.environment_upstream_status` (the variables, the proxies, and how far they
+    # reach once rules narrow them) when the environment is a route in effect; and named as
+    # SHADOWED when the variables are exported but nothing can reach them — a project pin, a
+    # scalar, or a catch-all rule. Never the credentials (`Settings::EnvironmentUpstream#label`).
+    private def environment_proxy_summary : String
+      summary = Settings.environment_upstream_summary
+      return "none" if summary.empty?
+      # Status FIRST, and short: the modal is narrow and the tail is what gets truncated. The
+      # help line under the row says what "shadowed" means.
+      Settings.environment_upstream_in_effect? ? Settings.environment_upstream_status : "shadowed · #{summary}"
+    end
+
     private def passthrough_label(patterns : Array(String)) : String
       patterns.join(", ")
     end
@@ -503,6 +566,7 @@ module Gori::Tui
         Settings.history_list_order,
         Settings.sitemap_expand_depth.to_s,
         Settings.tab_numbers? ? "on" : "off",
+        Settings.tab_slots? ? "on" : "off",
       ]
     end
 
@@ -535,7 +599,21 @@ module Gori::Tui
         Settings.companion_placement,
         Settings.companion_motion,
         Settings.companion_notices? ? "on" : "off",
+        Settings.companion_replies,
       ]
+    end
+
+    # Positional, like every other *_values reader: a literal at each call site would drift
+    # from MCP_FIELDS the moment a row is inserted.
+    private def mcp_values : Array(String)
+      [
+        Settings.mcp_channels? ? "on" : "off",
+      ]
+    end
+
+    # Positional over `Settings::MCP_PERMISSIONS`, the list MCP_PERMISSION_FIELDS is built from.
+    private def mcp_permission_values : Array(String)
+      Settings::MCP_PERMISSIONS.map { |perm| Settings.mcp_permitted?(perm.key) ? "on" : "off" }
     end
 
     # ↑/↓: move between fields — except in the THEME section, whose single field IS a
@@ -575,9 +653,12 @@ module Gori::Tui
     end
 
     def backspace : Nil
-      return if bool_field? || choice_field? || opener_field? || readonly_field? || disabled_field? || @cursor == 0
+      return if bool_field? || choice_field? || opener_field? || readonly_field? || disabled_field?
       v = @values[@focused]
+      # Clamp before the zero test: a save can shorten the value under the caret
+      # (`editor` is stripped), and `v[0, -1]` raises.
       c = @cursor.clamp(0, v.size)
+      return if c == 0
       @values[@focused] = "#{v[0, c - 1]}#{v[c..]}"
       @cursor = c - 1
       @status = nil
@@ -704,6 +785,9 @@ module Gori::Tui
     # Validate, apply, and persist. Returns a status message for the caller to
     # toast (nil decoded values are not possible here — port is the only check).
     def save : String
+      # Per attempt: a refused edit after a good save must not read as saved (or applied).
+      @saved = false
+      @applied = false
       if @section == :theme
         Settings.theme = @values[0] # always one of THEME_FIELDS' choices (set only via cycle)
         return persist
@@ -723,6 +807,7 @@ module Gori::Tui
       end
       if @section == :keys
         Settings.command_modifier = Settings.normalize_command_modifier(@values[0])
+        Settings.editor_keyset = Settings.normalize_editor_keyset(@values[1])
         @values = keys_values
         return persist
       end
@@ -733,6 +818,7 @@ module Gori::Tui
         Settings.history_list_order = Settings.normalize_history_list_order(@values[3])
         Settings.sitemap_expand_depth = Settings.normalize_sitemap_depth(@values[4].to_i? || Settings::DEFAULT_SITEMAP_EXPAND_DEPTH)
         Settings.tab_numbers = @values[5] == "on"
+        Settings.tab_slots = @values[6] == "on"
         @values = layout_values
         return persist
       end
@@ -776,6 +862,7 @@ module Gori::Tui
         Settings.companion_placement = Settings.normalize_companion_placement(@values[1])
         Settings.companion_motion = Settings.normalize_companion_motion(@values[2])
         Settings.companion_notices = @values[3] == "on"
+        Settings.companion_replies = Settings.normalize_companion_replies(@values[4])
         @values = companion_values
         return persist
       end
@@ -804,6 +891,20 @@ module Gori::Tui
         @values = general_values
         return persist
       end
+      if @section == :mcp
+        Settings.mcp_channels = @values[0] == "on"
+        @values = mcp_values
+        return persist
+      end
+      if @section == :mcp_permissions
+        # Per group, never a rebuilt set: a key this gori does not draw (a newer gori's group)
+        # stays denied rather than being dropped by a save from here.
+        Settings::MCP_PERMISSIONS.each_with_index do |perm, i|
+          Settings.set_mcp_permitted(perm.key, @values[i] == "on")
+        end
+        @values = mcp_permission_values
+        return persist
+      end
       if err = Settings.bind_host_error(@values[NETWORK_BIND_HOST])
         @status = "invalid bind IP"
         return err
@@ -815,6 +916,12 @@ module Gori::Tui
       end
       proxy_fields_unchanged = @values[NETWORK_PROXY_PROTOCOL, 3] == @baseline[NETWORK_PROXY_PROTOCOL, 3]
       if proxy_fields_unchanged
+        # A non-string declaration reads as a blank `upstream_proxy`; saving that blank would
+        # retire the refusal, so it is refused until repaired, like an invalid string.
+        if Settings.upstream_proxy_unparsed
+          @status = "invalid upstream proxy"
+          return "settings: network.upstream_proxy must be a string"
+        end
         up = @network_upstream_raw
       else
         up, proxy_error = Settings.build_upstream_proxy(
@@ -883,7 +990,12 @@ module Gori::Tui
       persist
     end
 
+    # Whether the last `save` ran its setters — the change is live in this session whether or
+    # not it then reached disk, so the host still has to apply it.
+    getter? applied = false
+
     private def persist : String
+      @applied = true
       ok = Settings.save
       @saved = ok
       @baseline = @values.dup if ok # the working copy IS the persisted state now → no longer dirty
@@ -907,9 +1019,7 @@ module Gori::Tui
       # then falls through to !contains? and closes instead of focusing a field on an
       # undrawn card.
       return Rect.new(area.x, area.y, 0, 0) if w < 30 || area.h < h
-      x = area.x + (area.w - w) // 2
-      y = area.y + (area.h - h) // 2
-      Rect.new(x, y, w, h)
+      area.center(w, h)
     end
 
     # Interior content rows for `area`: one per field, or — in the THEME section — the
@@ -1051,7 +1161,7 @@ module Gori::Tui
       vp.times do |row|
         i = @theme_scroll + row
         break if i >= names.size
-        draw_theme_row(screen, box, names[i], i == sel, list_top + row)
+        Frame.theme_row(screen, box.x + 1, list_top + row, box.w - 2, names[i], i == sel)
       end
       # The shared gauge on the card's own hairline, replacing the ▲/▼/↕ glyphs this list used
       # to paint into its last interior column — an affordance that existed nowhere else in
@@ -1059,32 +1169,6 @@ module Gori::Tui
       # now gets back.
       Frame.scroll_gauge(screen, Rect.new(box.x + 1, list_top, box.w - 2, vp),
         names.size, @theme_scroll, true, Theme.panel)
-    end
-
-    private def draw_theme_row(screen : Screen, box : Rect, name : String, selected : Bool, ry : Int32) : Nil
-      bg = selected ? Theme.accent_bg : Theme.panel
-      screen.fill(Rect.new(box.x + 1, ry, box.w - 2, 1), bg)
-      screen.cell(box.x + 1, ry, selected ? '▎' : ' ', Theme.accent, bg)
-      screen.cell(box.x + 3, ry, selected ? '◉' : '◯', selected ? Theme.accent : Theme.muted, bg)
-      # The swatch now runs to the last interior column (box.right-2) — the scroll marker that
-      # used to sit there moved onto the card's hairline as a gauge.
-      swatch_w = 7
-      sx = box.right - 1 - swatch_w
-      name_w = {sx - (box.x + 5) - 1, 1}.max
-      screen.text(box.x + 5, ry, name, selected ? Theme.text_bright : Theme.text, bg, width: name_w)
-      draw_swatch(screen, sx, ry, name)
-    end
-
-    # A tiny preview strip in the theme's OWN palette (not the active one): its canvas
-    # colour framing a few accent ticks, so each row previews the theme without making
-    # it active. Width must match `swatch_w` in draw_theme_row (1 + 5 ticks + 1).
-    private def draw_swatch(screen : Screen, x : Int32, ry : Int32, name : String) : Nil
-      pal = Theme.palette(name)
-      return unless pal
-      ticks = {pal.accent, pal.green, pal.yellow, pal.red, pal.syn_header}
-      screen.cell(x, ry, ' ', pal.bg, pal.bg)
-      ticks.each_with_index { |c, i| screen.cell(x + 1 + i, ry, '█', c, pal.bg) }
-      screen.cell(x + 6, ry, ' ', pal.bg, pal.bg)
     end
 
     # The two-row footer block: the note (save status / focused field's hint) on its OWN
@@ -1229,7 +1313,7 @@ module Gori::Tui
         @view.backspace
       elsif key.delete?
         @view.delete
-      elsif c && !ev.ctrl? && !ev.alt?
+      elsif c && !c.control? && !ev.ctrl? && !ev.alt? # termisu reads Tab as '\t'
         @view.insert(c)
         @view.set_preedit("")
         preview # space cycles the theme in the :theme section — preview it too

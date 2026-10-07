@@ -128,11 +128,6 @@ module Gori::Protobuf
       def field?(number : UInt32) : FieldDef?
         @fields[number]?
       end
-
-      # Last segment — what a tree header shows.
-      def short_name : String
-        @full_name.rpartition('.')[2].presence || @full_name
-      end
     end
 
     # An enum declaration: value number → name. Numbers are int32 and MAY be negative
@@ -349,10 +344,12 @@ module Gori::Protobuf
       v
     end
 
-    # An int32 descriptor field. Negative values arrive sign-extended to 64 bits, so the
-    # reinterpretation — not a truncation — is what recovers them.
+    # An int32 descriptor field. Negative values arrive sign-extended to 64 bits, and the
+    # low 32 bits are the value — the rule every protobuf parser applies to an int32. Kept to
+    # the int32 range so a hostile varint cannot hand a caller a value past it (reflection's
+    # `ErrorResponse.error_code` of 2^40 raised `OverflowError` and threw the whole fetch away).
     def self.int32(m : Protobuf::Message, number : Int32) : Int64?
-      varint(m, number).try(&.to_i64!)
+      varint(m, number).try(&.to_u32!.to_i32!.to_i64)
     end
 
     # Every sub-message at `number`. Falls back to decoding the payload directly when the

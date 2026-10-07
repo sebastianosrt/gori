@@ -5,6 +5,12 @@ require "openssl"
 # Validated end-to-end against OpenSSL 3.x (see SPIKE 1). Type aliases use names
 # not already defined by stdlib to avoid collisions; `X509`, `X509_NAME`, `Bio`,
 # `EVP_MD`, `EC_KEY`, `X509_EXTENSION` etc. are reused from stdlib.
+#
+# This file is also the SHARED home for the generic EVP/BIO funs more than one
+# subsystem needs: `lib LibCrypto` is reopened in `../../oast/rsa.cr` (RSA keygen +
+# OAEP) and `../../jwt/asym.cr` (JWS sign/verify), and a `fun` declared twice across
+# those files collides. Anything generic enough for a second caller belongs here;
+# only the algorithm-specific remainder stays in the reopening file.
 lib LibCrypto
   type EVP_PKEY = Void*
   type ASN1_TIME = Void*
@@ -41,6 +47,15 @@ lib LibCrypto
   # CA that is expired or not-yet-valid.
   fun x509_cmp_time = X509_cmp_time(s : ASN1_TIME, t : Void*) : Int
 
+  # Key identifiers (#1168). X509_pubkey_digest hashes the subjectPublicKey BIT STRING
+  # contents, i.e. RFC 5280 §4.2.1.2 method (1) when given SHA-1 — the same value
+  # OpenSSL's `subjectKeyIdentifier = hash` produces. X509_get0_subject_key_id reads an
+  # existing SKI (NULL when the cert has none); X509_get_ext_by_NID finds an extension's
+  # index (-1 when absent). All three exist in OpenSSL 1.1.1 and 3.x.
+  fun x509_pubkey_digest = X509_pubkey_digest(x : X509, type : EVP_MD, md : UInt8*, len : UInt32*) : Int
+  fun x509_get0_subject_key_id = X509_get0_subject_key_id(x : X509) : ASN1_STRING
+  fun x509_get_ext_by_nid = X509_get_ext_by_NID(x : X509, nid : Int, lastpos : Int) : Int
+
   # SubjectPublicKeyInfo (for the browser's --ignore-certificate-errors-spki-list
   # pin): grab the SPKI structure, then DER-encode it (pp == NULL returns the
   # length so we can size the buffer first).
@@ -51,6 +66,27 @@ lib LibCrypto
   # form). Like i2d_X509_PUBKEY, a null `pp` returns the length so we can size the
   # buffer before encoding.
   fun i2d_x509 = i2d_X509(x : X509, pp : UInt8**) : Int
+
+  # Memory BIOs — the in-process read/write path for PEM. Shared: OAST reads its own
+  # private-key PEM back and writes an SPKI PEM out, the JWT workbench reads the
+  # operator's signing/verification key in. `BIO_new` / `BIO_free` come from stdlib.
+  fun bio_s_mem = BIO_s_mem : BioMethod*
+  fun bio_read = BIO_read(b : Bio*, data : UInt8*, dlen : Int) : Int
+  fun bio_new_mem_buf = BIO_new_mem_buf(buf : UInt8*, len : Int) : Bio*
+
+  # EVP_PKEY operation contexts. `EVP_PKEY_CTX_ctrl` is the version-independent way to
+  # reach what OpenSSL 1.1.1 spells as macros and 3.x as functions (RSA padding, PSS
+  # salt length, OAEP digests) — see the ctrl call sites for the numeric cmd constants.
+  type EVP_PKEY_CTX = Void*
+  fun evp_pkey_ctx_new = EVP_PKEY_CTX_new(pkey : EVP_PKEY, e : Void*) : EVP_PKEY_CTX
+  fun evp_pkey_ctx_free = EVP_PKEY_CTX_free(ctx : EVP_PKEY_CTX)
+  fun evp_pkey_ctx_ctrl = EVP_PKEY_CTX_ctrl(ctx : EVP_PKEY_CTX, keytype : Int, optype : Int,
+                                            cmd : Int, p1 : Int, p2 : Void*) : Int
+
+  # SPKI public-key PEM out. Shared: OAST publishes its own public key, and the JWT
+  # workbench re-serializes an operator's key (or a certificate's) into the canonical PEM
+  # a server would hold, for the algorithm-confusion family.
+  fun pem_write_bio_pubkey = PEM_write_bio_PUBKEY(bio : Bio*, pkey : EVP_PKEY) : Int
 
   # PEM persistence via file BIOs (root CA only; leaves stay in memory)
   fun bio_new_file = BIO_new_file(filename : Char*, mode : Char*) : Bio*
@@ -75,9 +111,15 @@ module Gori::Proxy::Tls
   EVP_PKEY_EC      = 408 # NID_X9_62_id_ecPublicKey
   NID_BASIC_CONSTR =  87 # NID_basic_constraints
   NID_SUBJECT_ALT  =  85 # NID_subject_alt_name
+  NID_SUBJECT_KEY  =  82 # NID_subject_key_identifier
+  NID_KEY_USAGE    =  83 # NID_key_usage
+  NID_AUTH_KEY     =  90 # NID_authority_key_identifier
+  NID_EXT_KEY_USE  = 126 # NID_ext_key_usage
 
   SSL_CTRL_EXTRA_CHAIN_CERT = 14 # SSL_CTX_ctrl cmd for SSL_CTX_add_extra_chain_cert
 
   CA_VALIDITY_SECS   = 60_i64 * 60 * 24 * 3650 # ~10 years
   LEAF_VALIDITY_SECS = 60_i64 * 60 * 24 * 397  # ~13 months (browser leaf cap)
+  # How far a minted cert's notBefore sits in the past. See CertBuilder.build.
+  CLOCK_SKEW_SECS = 60_i64 * 60 * 24 # 1 day
 end

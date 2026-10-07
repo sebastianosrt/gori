@@ -21,7 +21,7 @@ group = "마무리"
 
 ```bash
 gori run probe                       # 패시브 발견만
-gori run probe --severity high       # high 심각도 행만
+gori run probe --severity high       # high와 critical (하한선)
 gori run probe --category cors       # 단일 카테고리
 ```
 
@@ -29,7 +29,7 @@ gori run probe --category cors       # 단일 카테고리
 
 ## 2. 이슈 파일링 {#2-file-an-issue}
 
-**Issues**는 결국 리포트에 넘길 트리아지 목록입니다. **History** 플로우나 Repeater 전송에서 `Shift-F`를 눌러 하나를 파일링하고, **Probe** 발견은 Probe 탭에서 이슈로 승격합니다. 심각도(`info`부터 `critical`까지)와 상태(`open`, `confirmed`, `false-positive`, `resolved`)를 부여하세요. 파일링한 플로우가 증거로 링크되므로 이슈가 스스로 증거를 담습니다. 이슈에서 `Enter`를 누르면 그 교환으로 바로 돌아갑니다.
+**Issues**는 결국 리포트에 넘길 트리아지 목록입니다. **History** 플로우에서 `Shift-F`를 눌러 하나를 파일링하고(Repeater 탭에서는 `Space` → **Link…** → `+ New issue…`), **Probe** 발견은 Probe 탭에서 이슈로 승격합니다. 심각도(`info`부터 `critical`까지)와 상태(`open`, `confirmed`, `false-positive`, `resolved`)를 부여하세요. 파일링한 플로우가 증거로 링크되므로 이슈가 스스로 증거를 담습니다. 이슈에서 `Enter`를 누르면 이슈가 열리고, 그 플로우는 **RELATED** 행에 있습니다. 그 행에서 `↵`는 교환을 제자리에서 보여 주고 `s`는 History에서 엽니다.
 
 <figure class="tui-shot">
   <img src="/images/tui/issues.svg" alt="gori Issues tab listing triaged findings with severity, status, host and title columns, one row selected and its linked evidence flow shown">
@@ -44,13 +44,13 @@ gori run issues update 7 --status confirmed --notes "Verified on staging"
 gori run probe promote 12            # Probe 발견을 Issues로 확정
 ```
 
-**체크포인트.** **Issues** 탭에 심각도와 함께 이슈가 보이고, 그것을 열면 증거 플로우로 점프합니다.
+**체크포인트.** **Issues** 탭에 심각도와 함께 이슈가 보이고, 그것을 열면 **RELATED** 아래에 증거 플로우가 보입니다.
 
 ## 3. Comparer로 증명하기 {#3-prove-it-with-the-comparer}
 
 발견은 이전과 이후를 나란히 놓으면 더 강하게 꽂힙니다. 인증 없는 `403` 옆에 인증된 `200`, 또는 패치된 응답 옆에 취약한 응답처럼요. **Comparer**는 두 메시지 A와 B를 담아 diff합니다.
 
-요청과 응답이 있는 곳이면 어디서든 슬롯을 채웁니다. **History**에서 첫 플로우를 선택하고 `Space` → **Send to Comparer**를 누르면 슬롯 A에 들어갑니다. 두 번째도 같은 방식으로 보내 슬롯 B를 채웁니다. Repeater 전송이나 Fuzzer 결과 행도 같은 방식으로 들어가며, 둘 다 캡처된 플로우를 남기지 않으므로, 이것이 그들이 diff로 들어가는 유일한 경로입니다. Comparer 탭에서는 `a` / `b`로 캡처된 플로우를 각 슬롯에 바로 골라 넣습니다. 이 경로는 활성 Scope 렌즈를 거치므로, 스코프 밖 대조군이 필요하면 렌즈를 꺼야 합니다.
+요청과 응답이 있는 곳이면 어디서든 슬롯을 채웁니다. **History**에서 첫 플로우를 선택하고 `Space` `>` `c`(**Send flow to…** → **Send to Comparer**)를 누르면 슬롯 A에 들어갑니다. 두 번째도 같은 방식으로 보내 슬롯 B를 채웁니다. Repeater 전송이나 Fuzzer 결과 행도 같은 방식으로 들어가며, 둘 다 캡처된 플로우를 남기지 않으므로, 이것이 그들이 diff로 들어가는 유일한 경로입니다. Comparer 탭에서는 `a` / `b`로 캡처된 플로우를 각 슬롯에 바로 골라 넣습니다. 이 경로는 활성 Scope 렌즈를 거치므로, 스코프 밖 대조군이 필요하면 렌즈를 꺼야 합니다.
 
 두 컬럼 사이의 구분선은 한 줄을 읽기도 전에 A→B 델타를 알려 줍니다. `403 → 200`이면 대개 그게 답 전부입니다. `←`/`→`로 요청 diff와 응답 diff를 오가고, 변경된 행에서는 실제로 다른 바이트만 빨강·초록으로 켜지므로, 뒤바뀐 값 하나가 줄을 읽지 않아도 눈에 띕니다.
 
@@ -72,13 +72,24 @@ gori run diff --from q1-audit --to q3-retest --format md
 
 판정은 문자 그대로 읽으세요. `gone`은 새 캡처가 *요청했고* `404`를 받았다는 뜻이고, `not seen`은 아예 요청하지 않았다는 뜻입니다. 이번 리테스트의 커버리지 공백이지 수정된 게 아닙니다. 리포트 끝에는 아직 열려 있는 이슈들과 그 이슈가 걸려 있던 엔드포인트의 현재 상태가 붙습니다. 요청은 보내지 않습니다.
 
+표면 전체가 아니라 발견 하나를 다시 확인하려면 그 이슈에 **리테스트**를 붙이세요. 그것을 재현하는 Repeater 세션들을 순서대로 두고, 각각 기대 결과를 하나까지 답니다(`status:403`, `json:data.role=admin`, `json-absent:data.token`, `body:same`). `json:` 경로는 `--jsonpath`와 같은 방식으로 읽히며(`data.user.id`, `$.items[0].id`), 읽을 수 없는 경로는 스텝을 적는 시점에 거부되어 나중에 통과로 처리될 일이 없습니다. 이슈 상세에서는 `⇧R`(**Retest…**)이고, 헤드리스로는 이렇습니다:
+
+```bash
+gori run retest add --issue 7 --repeater 12 --assert 'json-absent:data.token'
+gori run retest run --issue 7
+```
+
+`retest run`은 스코프와 샌드박스 게이트를 거쳐 보내고, 전송마다 History에 기록하며, 판정이 `pass`일 때만 `0`으로 끝납니다.
+
 **체크포인트.** `--format md`는 리테스트 산출물에 그대로 붙여 넣을 수 있는 섹션을 만들어 주고, 개수 위에 양쪽의 커버리지가 함께 적힙니다.
 
 ## 4. 노트와 링크 남기기 {#4-keep-notes-and-links}
 
 모든 것이 이슈는 아닙니다. **Notes**는 자유 형식의 프로젝트별 Markdown 문서입니다(프로젝트당 여러 개). 시도한 것, 통한 페이로드, 나중에 다시 볼 단서를 적는 기록장이죠. **Notes** 탭에서 만들고 편집합니다.
 
-흩어진 증거를 하나로 묶으려면 History, Repeater, Fuzzer, Miner에서 `Space` → **Link…**를 누르세요. 하나의 카드에 모든 이슈 *와* 모든 노트가 나열되고, 위에 `+ New issue…` / `+ New note…`가 고정됩니다. 지금 보고 있는 것을 기존 이슈에 붙이는 것과, 이미 링크된 새 이슈를 파일링하는 것이 같은 키 입력입니다. 입력한 글자는 제목·호스트·상태로 필터링하고, 생성 행에 닿으면 새 이슈의 제목이 됩니다.
+흩어진 증거를 하나로 묶으려면 History, Repeater, Fuzzer, Miner에서 `Space` → **Link…**를 누르세요. 하나의 카드에 모든 이슈 *와* 모든 노트가 나열되고, 위에 `+ New issue…` / `+ New note…`가 고정됩니다. 지금 보고 있는 것을 기존 이슈에 붙이는 것과, 이미 링크된 새 이슈를 파일링하는 것이 같은 키 입력입니다. 입력한 글자는 제목·호스트·상태로 필터링하고, 생성 행에 닿으면 새 이슈의 제목이 됩니다. 링크하려는 대상에 아직 아무것도 파일링된 적이 없으면 커서는 `+ New issue…`에서 열리고(가장 흔한 첫 파일링), 링크가 이미 있으면 첫 기존 이슈에서 열립니다. **이슈**를 고르면 *바이트*까지 함께 남습니다. 다음 Repeater 전송이나 보존 정리가 가져가 버릴, 취약점을 확인해 준 그 응답이 같은 단계에서 변경 불가 복사본으로 동결됩니다. 이슈의 RELATED 카드에 **FROZEN** 행으로 표시되고 모든 내보내기에 SHA-256과 함께 실립니다. 노트는 포인터만 받고, 아직 교환이 없는 대상(대기 중 플로우, 보낸 적 없는 탭)도 링크는 됩니다. 카드의 `↵` 토큰이 누르기 전에 이유를 말하고(`↵ link — nothing to freeze: …`), 누른 뒤에는 토스트가 같은 말을 반복합니다.
+
+손으로 새 이슈를 파일링하면 그 이슈가 **바로 열립니다**. 폼이 커밋되면 Issues 상세가 새 이슈 위에 뜨고, 토스트 끝에 돌아가는 길이 적힙니다 — `issue #21 created and linked · frozen as evidence #5 · esc returns to History`. 그 `esc`는 드릴인과 커서까지 그대로, 있던 자리로 되돌립니다. (Diff에서 줄줄이 파일링하는 재검증 스윕은 의도적으로 그 자리에 머뭅니다.)
 
 ```bash
 gori run notes create --text "SSRF candidate on /fetch, needs OAST to confirm"
@@ -87,7 +98,7 @@ gori run notes --all
 
 **체크포인트.** Notes 탭에 노트가 담기고, 링크한 이슈 아래에 증거 플로우나 세션이 나열됩니다.
 
-## 5. 리포트 내보내기 {#export-the-report}
+## 5. 리포트 내보내기 {#5-export-the-report}
 
 이슈 트리아지가 끝나면, gori 없이도 동료가 읽을 수 있는 단일 Markdown 문서로 내보냅니다:
 
@@ -95,7 +106,7 @@ gori run notes --all
 gori run issues --format markdown --export report.md
 ```
 
-TUI에서는 Issues 탭의 `⇧E`가 같은 리포트입니다. 형식을 고르고, 저장 경로를 고르면 됩니다.
+TUI에서는 Issues 탭의 `⇧E`가 같은 리포트입니다 — 목록의 힌트 줄에 이 키가 적혀 있습니다. 형식을 고르고(`↵ export`), 저장 경로를 고르면 됩니다(`↵ write`, 파일이 이미 있으면 `↵ overwrite`).
 
 리포트를 사람이 아니라 기계가 읽는다면 SARIF로 내보내세요. GitHub code scanning, DefectDojo, Azure DevOps가 그대로 읽는 형식입니다:
 
@@ -106,7 +117,7 @@ gh api -X POST /repos/OWNER/REPO/code-scanning/sarifs \
   -f sarif="$(gzip -c issues.sarif | base64 | tr -d '\n')"
 ```
 
-이슈 하나가 result 하나로, URL과 심각도를 싣고 도착합니다. 플로우를 링크해 두었다면 실제 요청·응답이 `webRequest`/`webResponse`로 함께 갑니다. `false-positive`나 `resolved`로 트리아지한 이슈는 SARIF *suppression*으로 나가므로, gori에서 정리한 발견은 대시보드에서도 정리된 상태로 남고 다시 열리지 않습니다.
+이슈 하나가 result 하나로, URL과 심각도를 싣고 도착합니다. 플로우를 링크해 두었다면 실제 요청·응답이 `webRequest`/`webResponse`로 함께 갑니다(`--include-sensitive`를 주지 않으면 Authorization, Cookie, Set-Cookie, API 키 헤더 값은 `[REDACTED]`로 나갑니다). `false-positive`나 `resolved`로 트리아지한 이슈는 SARIF *suppression*으로 나가므로, gori에서 정리한 발견은 대시보드에서도 정리된 상태로 남고 다시 열리지 않습니다.
 
 발견 뒤의 원본 트래픽까지(요약본만이 아니라) 넘기려면, History 쿼리를 하나의 HAR 로그로 내보내세요. STDOUT으로 쓰이고, Burp·Charles·브라우저 네트워크 패널로 불러들일 수 있으며, gori로 그대로 다시 임포트됩니다:
 

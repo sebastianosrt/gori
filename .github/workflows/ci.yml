@@ -8,11 +8,14 @@ on:
       - shard.yml
       - shard.lock
       - "**/*.cr"
-      # Three shell scripts the jobs below actually execute, none of which matches
-      # `**/*.cr`: without these lines a change to the spec partition or to the bench
-      # type-check would merge without the job that runs it ever waking up.
+      # Shell scripts the jobs below actually execute, none of which matches `**/*.cr`:
+      # without these lines a change to the spec selector, partition or type-check would
+      # merge without the job that runs it ever waking up.
+      - scripts/ci_test_scope.sh
+      - scripts/spec_for_changes.sh
       - scripts/spec_shard.sh
       - scripts/bench_check.sh
+      - scripts/script_check.sh
       - scripts/ameba_gate.sh
       # …and the lint gate's config: a relaxed or added rule must wake `lint-gate`.
       - .ameba.yml
@@ -21,8 +24,13 @@ on:
       # landing without the regeneration); this line covers the other direction —
       # an edit to the generated file alone, which would otherwise merge with the
       # job that reads it never waking up.
-      - nix/shards.nix
-      # `docker/Dockerfile` is deliberately absent: nothing in this workflow
+      - packaging/nix/shards.nix
+      # Read by a spec, not just rendered: `spec/mcp/catalogue_size_spec.cr` checks the
+      # MCP guide's catalogue table against the build (#1137). A docs-only edit to a row
+      # would otherwise merge unchecked, and fail the next unrelated `.cr` PR instead.
+      - docs/content/guide/mcp.md
+      - docs/content/guide/mcp.ko.md
+      # `packaging/docker/Dockerfile` is deliberately absent: nothing in this workflow
       # builds the image any more (see the note under `tests`), so listing it
       # would only wake the Crystal build and the spec matrix to test nothing
       # that changed.
@@ -54,12 +62,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Refresh apt index
+        # install-crystal apt-installs its build deps without an update, so a stale
+        # runner-image index 404s once the mirror drops a superseded .deb.
+        run: sudo apt-get update
       - uses: crystal-lang/install-crystal@v1
         with:
           crystal: 1.21.0
-      - name: Check nix/shards.nix against shard.lock
-        # The Nix flake builds from `nix/shards.nix`, which crystal2nix generates from
-        # shard.lock (`just nix-shards`). Nothing forced the regeneration, and skipping
+      - name: Check packaging/nix/shards.nix against shard.lock
+        # The Nix flake builds from `packaging/nix/shards.nix`, which crystal2nix generates
+        # from shard.lock (`just nix-shards`). Nothing forced the regeneration, and skipping
         # it fails silently in the worst way: the flake goes on linking the OLD
         # revisions and `nix build` stays green, so the packaged binary stops matching
         # the tree that produced it.
@@ -103,6 +115,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Refresh apt index
+        # install-crystal apt-installs its build deps without an update, so a stale
+        # runner-image index 404s once the mirror drops a superseded .deb.
+        run: sudo apt-get update
       - uses: crystal-lang/install-crystal@v1
         with:
           # Deliberately NOT the build matrix. `crystal tool format` is the formatter
@@ -118,7 +134,8 @@ jobs:
       - name: Check formatting
         run: crystal tool format --check src spec bench scripts
   benchmarks:
-    # Type-checks every harness in `bench/`. Nothing ran them before: `format` above only
+    # Type-checks every harness in `bench/`, and (second step) every program in `scripts/`.
+    # Nothing ran them before: `format` above only
     # FORMATS bench/, and the other jobs build `src` and run `spec` — so a harness could rot
     # for months and the first sign would be someone reaching for it mid-investigation.
     # Seventeen of them had. AGENTS.md points at these for "measure, don't guess", and a
@@ -132,6 +149,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Refresh apt index
+        # install-crystal apt-installs its build deps without an update, so a stale
+        # runner-image index 404s once the mirror drops a superseded .deb.
+        run: sudo apt-get update
       - uses: crystal-lang/install-crystal@v1
         with:
           # One version, for the same reason `format` pins one: the harnesses
@@ -150,6 +171,14 @@ jobs:
         # The same script `just benchmark-check` runs, so local and CI cannot drift apart
         # (and this job needs no `just` on the runner).
         run: scripts/bench_check.sh
+      - name: Type-check scripts/
+        # Same failure mode, one directory over, and it had already happened: nothing in CI
+        # compiled `scripts/*.cr`, so `seed_demo.cr` — the demo database every manual TUI
+        # pass starts from — sat broken on main against an argument #1047 added, with
+        # nothing red to say so. Rides this job rather than its own because the harnesses
+        # and the scripts want the identical runner (native link deps + `shards install`)
+        # and neither costs more than half a minute.
+        run: scripts/script_check.sh
   lint-gate:
     # ameba, as a DIFF gate: `scripts/ameba_gate.sh` counts findings per changed file at
     # the merge base and at HEAD, and fails only when a file GAINED some. The plain run is
@@ -175,6 +204,10 @@ jobs:
           # The whole history: the script diffs against the merge base with the target
           # branch, and a shallow clone has no such commit.
           fetch-depth: 0
+      - name: Refresh apt index
+        # install-crystal apt-installs its build deps without an update, so a stale
+        # runner-image index 404s once the mirror drops a superseded .deb.
+        run: sudo apt-get update
       - uses: crystal-lang/install-crystal@v1
         with:
           crystal: 1.21.0
@@ -182,26 +215,86 @@ jobs:
         run: shards install
       - name: No changed file may gain ameba findings
         run: scripts/ameba_gate.sh "origin/${{ github.base_ref }}"
+  test-scope:
+    # Pull requests use the existing source-to-spec mirror for a fast feedback path.
+    # Changes to the selector, shard machinery, dependency set or a shared source file
+    # promote themselves to the full suite. Pushes, merge groups and manual runs always
+    # select the full suite below.
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.scope.outputs.mode }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # The selector compares against the merge base, so a shallow checkout is not
+          # enough for pull_request runs.
+          fetch-depth: 0
+      - id: scope
+        name: Select test scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+            echo "CI test scope: full ($EVENT_NAME)"
+            exit 0
+          fi
+          mode=$(scripts/ci_test_scope.sh "origin/$BASE_REF")
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "CI test scope: $mode"
+
+  changed-tests:
+    needs: test-scope
+    if: ${{ needs.test-scope.outputs.mode == 'changed' }}
+    name: tests (changed)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Refresh apt index
+        # install-crystal apt-installs its build deps without an update, so a stale
+        # runner-image index 404s once the mirror drops a superseded .deb.
+        run: sudo apt-get update
+      - uses: crystal-lang/install-crystal@v1
+        with:
+          crystal: 1.21.0
+      - name: Install native link dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libbrotli-dev libzstd-dev libsqlite3-dev
+      - name: Install dependencies
+        # `--production`: see the note on the same step in `build-crystal`.
+        run: shards install --production
+      - name: Run selected tests
+        # Keep the same linker workaround as the full-suite path. The changed-spec binary
+        # is smaller today, but its size grows with the code selected by the mapper.
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+        run: |
+          mapfile -t files < <(scripts/spec_for_changes.sh "$BASE_REF")
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "changed test mode selected no specs" >&2
+            exit 1
+          fi
+          for file in "${files[@]}"; do
+            printf '  %s\n' "$file"
+          done
+          crystal spec --link-flags "-Wl,--no-export-dynamic" "${files[@]}"
+
   tests:
-    # Sharded, because `crystal spec` compiles the whole suite into ONE binary and runs
-    # its ~10,900 examples in ONE single-threaded fiber scheduler — so this job was the
-    # only thing anybody waited for: 8.5 of the workflow's 8.5 minutes, while `format`
-    # finished in 18 seconds and the other two in under three minutes.
+    needs: test-scope
+    if: ${{ needs.test-scope.outputs.mode == 'full' }}
+    # Sharded because `crystal spec` compiles the whole suite into one binary and runs
+    # its ~17,700 examples in one single-threaded fiber scheduler. Recent shards execute
+    # for roughly two to two and a half minutes, so four runners keep the wall clock near
+    # four minutes while preserving the process isolation that loopback specs need.
     #
-    # Measured on this tree, the run splits roughly 1:5 between compiling (~35 s) and
-    # executing (~370 s), and the executing half is barely CPU-bound at all — the suite
-    # spends most of it parked on real sockets and deliberate sleeps that hold a
-    # connection open so a stall stays distinguishable from a hangup. That is time four
-    # runners can wait through at once, and the four-way split takes the job to well
-    # under four minutes. It is NOT free: each shard pays the compile again, so the
-    # workflow burns more runner-minutes than it did. Four is where that trade stops
-    # paying — at six the compile plus job setup is already most of a shard's wall
-    # clock, and the longest shard barely moves (43 s of examples against 49 s at four)
-    # because the heaviest spec FILE cannot be split any finer than itself.
-    #
-    # Sharding by PROCESS rather than by threads inside one is deliberate: several
-    # specs bind a fixed loopback port, and two of them in one process — or two
-    # processes on one runner — would collide. One shard per runner keeps them apart.
+    # Sharding by PROCESS rather than by threads inside one is deliberate: several specs
+    # bind a fixed loopback port, and two of them in one process — or two processes on one
+    # runner — would collide. One shard per runner keeps them apart.
     strategy:
       # A failing shard must not cancel the other three. The whole point of the split is
       # that one run tells you everything that is broken; fail-fast would turn it back
@@ -213,6 +306,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Refresh apt index
+        # install-crystal apt-installs its build deps without an update, so a stale
+        # runner-image index 404s once the mirror drops a superseded .deb.
+        run: sudo apt-get update
       - uses: crystal-lang/install-crystal@v1
         with:
           crystal: 1.21.0
@@ -259,8 +356,10 @@ jobs:
         # locally with one command. It partitions by walking the tree, never by a list
         # checked in here: a hardcoded split stops covering whatever spec file is added
         # next and nothing goes red to say so.
-        run: crystal spec --link-flags "-Wl,--no-export-dynamic" $(scripts/spec_shard.sh ${{ matrix.shard }} 4)
-# No `build-docker` job here. It used to build docker/Dockerfile for amd64 and
+        run: |
+          mapfile -t files < <(scripts/spec_shard.sh "${{ matrix.shard }}" 4)
+          crystal spec --link-flags "-Wl,--no-export-dynamic" "${files[@]}"
+# No `build-docker` job here. It used to build packaging/docker/Dockerfile for amd64 and
 # arm64 on every PR, and those two builds — each compiling a static Crystal
 # binary from source, the arm64 one on a native runner because QEMU is far too
 # slow for it — dominated PR wall-clock while catching almost nothing: the

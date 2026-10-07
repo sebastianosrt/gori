@@ -18,7 +18,8 @@ module Gori::Tui
   # global Settings + live Theme, mirroring ProjectPicker's run-loop/render shape.
   #
   # Steps: NETWORK (bind ip/port) → THEME (list + live preview) → COMPANION (Miss Ring) →
-  # REVIEW (recap + finish).
+  # REVIEW (recap + finish). The editor keyset is left to Preferences → Keys: REVIEW names the
+  # saved one and where to change it, and the wizard never writes it.
   #
   # Edits are STAGED in wizard-local fields and committed to Settings only on
   # finish, so "skip" (Esc) is coherent: it reverts the live theme preview to the
@@ -30,7 +31,7 @@ module Gori::Tui
     COMPANION_PREVIEW_W   = Mascot::W + 2
     COMPANION_PREVIEW_GAP = 2 # min columns between the text column and her plate
     # Narrowest text column the COMPANION step will lay out AROUND her sprite: the width of its
-    # opening line ("A mascot in the corner, off unless you want her."), the one sentence
+    # opening line ("A mascot in the corner, yours unless you say no."), the one sentence
     # that says what the step is asking. Below it she is dropped and the copy takes the
     # card — see `self.companion_preview_x`. Coupled BY HAND to that sentence, exactly the way
     # BIND_ROWS/COMPANION_ROWS/REVIEW_ROWS are coupled to their renderers and just as unchecked:
@@ -55,7 +56,7 @@ module Gori::Tui
     # demanding one; see `content_rows`.)
     BIND_ROWS      = 8 # heading, gap, ip, port, gap, 2 info lines, status
     COMPANION_ROWS = 7 # heading, gap, 2 offer rows, gap, motion row, info line
-    REVIEW_ROWS    = 9 # title, gap, 4 recap rows, gap, 2 offer rows
+    REVIEW_ROWS    = 9 # title, 6 recap rows (HTTPS fills the gap), 2 offer rows
 
     # Interior row offsets (from the card's top border) of the rows a click can land on. ONE
     # home each, read by the renderer AND the mouse hit-test, so a row cannot move on screen
@@ -66,8 +67,8 @@ module Gori::Tui
     BIND_FIELD_ROW       = 4 # Bind IP; Bind Port is the row under it
     COMPANION_OFFER_ROW  = 4 # "Show Miss Ring"; "No mascot" is the row under it
     COMPANION_MOTION_ROW = COMPANION_OFFER_ROW + 3
-    REVIEW_RECAP_ROW     = 4 # four recap rows; Shortcuts (the editable one) is the last
-    REVIEW_SHORTCUTS_ROW = REVIEW_RECAP_ROW + 3
+    REVIEW_RECAP_ROW     = 3 # five recap rows; Shortcuts (the editable one) is the last
+    REVIEW_SHORTCUTS_ROW = REVIEW_RECAP_ROW + 4
     REVIEW_OFFER_ROW     = REVIEW_SHORTCUTS_ROW + 2 # "Take the guided tour"; "Skip" under it
 
     # The footer while esc is armed — widest first, like `footer_hints`. The long form is
@@ -95,10 +96,12 @@ module Gori::Tui
     SAVE_FAILED_SHORT = "save failed · ↵ retry · esc discard"
 
     # The card height `step_card` settles on for a terminal of height `h` and a step wanting
-    # `rows` of content. Pulled out as a pure class method so the MIN_H invariant above is
-    # checkable without standing up a terminal.
+    # `rows` of content: top border, a pad row, the content, a pad row, bottom border — so the
+    # content sits centred. It was `rows + 6`, a leftover of a hint row the card no longer
+    # draws, which left three blank rows under every step and only one above. Pulled out as a
+    # pure class method so the MIN_H invariant above is checkable without standing up a terminal.
     def self.card_h(h : Int32, rows : Int32) : Int32
-      {rows + 6, {h - 3, 3}.max}.min
+      {rows + 4, {h - 3, 3}.max}.min
     end
 
     # The card WIDTH `step_card` settles on for a terminal `w` columns wide and a step
@@ -135,7 +138,7 @@ module Gori::Tui
       Review # recap + finish
     end
 
-    def initialize(@term : Termisu)
+    def initialize(@term : Termisu, @tour_handoff : Tutorial::Handoff = Tutorial::Handoff::Shell)
       # Held as the base Backend: TermisuBackend is generic over the terminal type.
       @backend = TermisuBackend.new(@term).as(Backend)
       @step = Step::Bind
@@ -174,6 +177,7 @@ module Gori::Tui
       # turning on.
       @companion_enabled = Settings.companion?
       @companion_motion = Settings.companion_motion
+      @keys_route = nil.as(String?) # REVIEW's "change in …": `Verbs.registry` is not free
       # Review step — offer a guided TUI tour after setup. `@launch_tutorial` is set
       # on finish and read by `run` (below) to launch the tour in this same terminal.
       @offer = :tour # :tour | :skip
@@ -231,7 +235,7 @@ module Gori::Tui
       borrowed = !Settings.mouse
       @term.enable_mouse if borrowed
       begin
-        Tutorial.new(@term).run
+        Tutorial.new(@term, @tour_handoff).run
       ensure
         @term.disable_mouse if borrowed
       end
@@ -350,8 +354,9 @@ module Gori::Tui
         # Motion is hers; with "No mascot" selected there is nothing to set a motion FOR,
         # and the row is hidden in that state. Accepting the key anyway let a user who
         # declined her still stage a non-default motion, which #finish would then persist —
-        # materializing a "companion" section in settings.json for someone who said no. Settings
-        # only omits that section while EVERY field is factory-default.
+        # writing a motion into settings.json for someone who said no, on top of the one
+        # field their answer is. Settings only omits that section while EVERY field is
+        # factory-default.
         cycle_companion_motion(key.left? ? -1 : 1)
       end
     end
@@ -403,7 +408,7 @@ module Gori::Tui
         # in the field we land on clears the status (bind_insert), which is the fix the message
         # is asking for.
         switch_bind_field(:ip)
-        @status = "invalid bind IP (e.g. 127.0.0.1)"
+        @status = "invalid IP · try 127.0.0.1"
         return
       end
       unless valid_port?(@port)
@@ -418,7 +423,7 @@ module Gori::Tui
       key = "#{effective_ip}:#{@port.strip}"
       if @port_warned != key && SetupWizard.port_in_use?(effective_ip, @port.strip.to_i)
         @port_warned = key
-        @status = "port #{@port.strip} is in use on #{effective_ip} · ↵ again to keep it"
+        @status = "port #{@port.strip} busy · ↵ keep"
         return
       end
       @status = nil
@@ -434,7 +439,7 @@ module Gori::Tui
       TCPServer.new(host, port).close
       false
     rescue ex : Socket::BindError
-      ex.os_error == Errno::EADDRINUSE
+      ex.os_error.in?(Errno::EADDRINUSE, WinError::WSAEADDRINUSE) # Windows reports a Winsock code
     rescue Socket::Error | IO::Error
       false
     end
@@ -519,9 +524,9 @@ module Gori::Tui
       Settings.command_modifier = Settings.normalize_command_modifier(@modifier)
       # Miss Ring — the ONE place the wizard writes her, so Esc can never persist a preview.
       # Motion is written only when she is ON: a user who declined her must not leave a
-      # non-default motion behind, which is what keeps a default install's settings.json
-      # free of a "companion" section entirely (Settings omits it only while every field is
-      # factory-default).
+      # non-default motion behind, so "No mascot" writes exactly one answer — `enabled: false`
+      # over three factory-default fields — and accepting her writes nothing at all (Settings
+      # omits the section while every field is factory-default, and she is one of them now).
       Settings.companion = @companion_enabled
       Settings.companion_motion = Settings.normalize_companion_motion(@companion_motion) if @companion_enabled
       if Settings.save
@@ -573,6 +578,7 @@ module Gori::Tui
     private def handle_mouse(ev : Termisu::Event::Mouse) : Nil
       return unless ev.press? || ev.wheel?
       return unless fits?(*@backend.size) # same reason handle_key bails: nothing is on screen to hit
+      @esc_armed = false                  # a click or a scroll is intent to stay (see handle_escape)
       mx, my = ev.x - 1, ev.y - 1         # termisu mouse coords are 1-based
       if ev.wheel?
         if @step.appearance? && (ev.button.wheel_up? || ev.button.wheel_down?)
@@ -580,7 +586,6 @@ module Gori::Tui
         end
         return
       end
-      @esc_armed = false # a click is intent to stay (see handle_escape)
       w, h = @backend.size
       box = step_card(w, h)
       case @step
@@ -640,7 +645,7 @@ module Gori::Tui
       return unless box.x < mx <= box.x + theme_list_w(box)
       names = Theme.available
       return if names.empty?
-      vp = {box.h - 6, 1}.max
+      vp = theme_vp(box)
       row = my - (box.y + 2)
       return unless 0 <= row < vp
       i = @theme_scroll + row
@@ -654,9 +659,9 @@ module Gori::Tui
 
     # The centred step card for `w`×`h`. Only BIND uses the narrow settings-sized card —
     # Appearance needs room for the preview panel beside the list, and Review's Shortcuts
-    # row spells out a chord family plus how to change it. Height is content + 6 rows of
-    # chrome, clamped to the space between the header and the hint. The ONE source of this
-    # geometry — render and the mouse hit-tests share it.
+    # row spells out a chord family plus how to change it. Height is content + 4 rows of
+    # chrome (`card_h`), clamped to the space between the header and the hint. The ONE source
+    # of this geometry — render and the mouse hit-tests share it.
     private def step_card(w : Int32, h : Int32) : Rect
       # Only BIND uses the narrow card. Appearance needs room for the preview panel beside
       # the list, Review's Shortcuts row spells out a chord family, and Companion holds her
@@ -679,6 +684,12 @@ module Gori::Tui
       full >= LIST_MIN + PREVIEW_GAP + PREVIEW_W ? full - PREVIEW_GAP - PREVIEW_W : full
     end
 
+    # Rows of the theme list (and its preview panel beside it): the card's interior less the
+    # pad row above and below. Render and the click hit-test share it.
+    private def theme_vp(box : Rect) : Int32
+      {box.h - 4, 1}.max
+    end
+
     # Interior content rows a step draws (below the card's top border + 1 pad row).
     # Must be ACCURATE for the fixed-layout steps: MIN_H is derived from the largest of
     # them, and render_* draw at fixed offsets up to `box.y + 2 + this`.
@@ -687,15 +698,10 @@ module Gori::Tui
       when Step::Bind      then BIND_ROWS
       when Step::Companion then COMPANION_ROWS
       when Step::Review    then REVIEW_ROWS
-        # ≥7 so the preview panel (header + 3 status rows) is unclipped whenever the card can
-        # actually have the rows it ASKS for, capped so a long theme list scrolls (the list
-        # viewport derives from the card height) instead of demanding the whole screen. The
-        # floor is a request, not a guarantee: `card_h` clamps to `h - 3`, so at MIN_H the card
-        # is 12 rows however many this returns, the list viewport is 6, and the preview's third
-        # status row falls to render_theme_preview's own `break`. One mock row, on the shortest
-        # terminal the wizard runs on at all — cheaper than the alternative, which is REVIEW
-        # (the tallest step, and the only one that can commit) losing terminal sizes to a
-        # higher MIN_H.
+        # ≥7 so the preview panel (header + 3 status rows) is unclipped, capped so a long theme
+        # list scrolls (the list viewport derives from the card height, `theme_vp`) instead of
+        # demanding the whole screen. At MIN_H `card_h` clamps the card to 12 rows, which still
+        # leaves the list and the preview 8.
       else { {Theme.available.size, 7}.max, THEME_VP_MAX }.min # appearance
       end
     end
@@ -774,7 +780,7 @@ module Gori::Tui
 
     private def card_title : String
       case @step
-      when Step::Bind       then "NETWORK · global default"
+      when Step::Bind       then "NETWORK · proxy address"
       when Step::Appearance then "THEME · appearance"
       when Step::Companion  then "COMPANION · Miss Ring"
       else                       "REVIEW"
@@ -820,7 +826,11 @@ module Gori::Tui
     private def footer_hints : Array(String)
       case @step
       when Step::Bind
-        ["↵ next · ↑/↓ field · esc skip", "↵ next · esc skip"]
+        if @bind_field == :ip
+          ["↵ next field · ↑/↓ field · esc skip", "↵ port · esc skip"]
+        else
+          ["↵ next · ↑/↓ field · esc skip", "↵ next · esc skip"]
+        end
       when Step::Appearance
         ["↑/↓ pick theme · ↵ next · ⇧⇥ back · esc skip", "↑/↓ theme · ↵ next · esc skip"]
       when Step::Companion
@@ -839,24 +849,43 @@ module Gori::Tui
     private def render_bind(screen : Screen, box : Rect) : Nil
       ix = box.x + 3
       iw = {box.w - 6, 1}.max
-      screen.text(ix, box.y + 2, "Global default bind (projects inherit this)", Theme.text, Theme.panel, width: iw)
+      screen.text(ix, box.y + 2, "Where should gori listen?", Theme.text, Theme.panel, width: iw)
       fy = box.y + BIND_FIELD_ROW
-      render_field(screen, box, fy, "Bind IP", @ip, @bind_field == :ip)
-      render_field(screen, box, fy + 1, "Bind Port", @port, @bind_field == :port)
-      # Two muted lines: this is the *global* layer only. Projects may pin their own
-      # bind; -l/-p override settings for one process and are not written to disk.
-      # Keep each line ≤ ~56 chars so a 64-col card (iw ≈ 58) never clips mid-word.
-      screen.text(ix, fy + 3, "Projects inherit this unless they pin their own bind.", Theme.muted, Theme.panel, width: iw)
-      screen.text(ix, fy + 4, "Settings later · Project tab to pin · -l/-p one run.", Theme.muted, Theme.panel, width: iw)
+      render_field(screen, box, fy, "Listen IP", @ip, @bind_field == :ip)
+      render_field(screen, box, fy + 1, "Port", @port, @bind_field == :port)
+      guidance = SetupWizard.bind_guidance(iw)
+      screen.text(ix, fy + 3, guidance[0], Theme.muted, Theme.panel, width: iw)
+      screen.text(ix, fy + 4, guidance[1], Theme.muted, Theme.panel, width: iw)
       if st = @status
         screen.text(ix, fy + 5, "• #{st}", Theme.yellow, Theme.panel, width: iw)
+      elsif note = SetupWizard.run_bind_note(Settings.cli_bind_host, Settings.cli_bind_port)
+        screen.text(ix, fy + 5, note, Theme.muted, Theme.panel, width: iw)
+      end
+    end
+
+    # A `-l`/`-p` flag binds THIS run and never reaches the fields above, which edit the saved
+    # default (see App#run_tui) — so `gori tui -p 18911` offered 8070 with nothing to say the
+    # session is on :18911 (#1379). One line, on the status row, which a validation message
+    # displaces. Nil with no flag.
+    def self.run_bind_note(host : String?, port : Int32?) : String?
+      return nil unless host || port
+      flags = [host ? "-l" : nil, port ? "-p" : nil].compact.join(" ")
+      "this run: #{host}#{port ? ":#{port}" : ""} (#{flags}) · these set the default"
+    end
+
+    # The two network hints have fixed rows. At 40 columns, show the meaning of each
+    # address rather than clipping a detailed settings explanation halfway through.
+    def self.bind_guidance(width : Int32) : {String, String}
+      if width >= 52
+        {"127.0.0.1: this computer only (recommended)",
+         "0.0.0.0: allow other devices · change in Settings"}
+      else
+        {"127.0.0.1: this computer", "0.0.0.0: allow other devices"}
       end
     end
 
     private def render_field(screen : Screen, box : Rect, ry : Int32, label : String, value : String, focused : Bool) : Nil
-      bg = focused ? Theme.accent_bg : Theme.panel
-      screen.fill(Rect.new(box.x + 1, ry, box.w - 2, 1), bg)
-      screen.cell(box.x + 1, ry, focused ? '▎' : ' ', Theme.accent, bg)
+      bg = Frame.row_band(screen, box, ry, focused)
       screen.text(box.x + 3, ry, label, focused ? Theme.text_bright : Theme.text, bg)
       vx = box.x + 3 + LABEL_W + 2
       vw = {box.right - vx - 1, 1}.max
@@ -874,7 +903,7 @@ module Gori::Tui
       names = Theme.available
       return if names.empty?
       sel = names.index(@theme_name) || 0
-      vp = {box.h - 6, 1}.max
+      vp = theme_vp(box)
       list_w = theme_list_w(box)
       two_col = list_w < box.w - 2 # theme_list_w gives the list everything when it can't fit both
 
@@ -888,7 +917,7 @@ module Gori::Tui
       vp.times do |row|
         i = @theme_scroll + row
         break if i >= names.size
-        draw_theme_row(screen, box, list_w, names[i], i == sel, list_top + row)
+        Frame.theme_row(screen, box.x + 1, list_top + row, list_w, names[i], i == sel, gauge_col: true)
       end
       # The shared gauge on the list area's last column — where the per-row ▲/▼/↕ markers used
       # to sit. Same replacement as the Settings theme list, which is a copy of this one.
@@ -899,32 +928,6 @@ module Gori::Tui
         px = box.x + 1 + list_w + PREVIEW_GAP
         render_theme_preview(screen, Rect.new(px, list_top, PREVIEW_W, vp), names[sel])
       end
-    end
-
-    private def draw_theme_row(screen : Screen, box : Rect, list_w : Int32, name : String,
-                               selected : Bool, ry : Int32) : Nil
-      bg = selected ? Theme.accent_bg : Theme.panel
-      screen.fill(Rect.new(box.x + 1, ry, list_w, 1), bg)
-      screen.cell(box.x + 1, ry, selected ? '▎' : ' ', Theme.accent, bg)
-      screen.cell(box.x + 3, ry, selected ? '◉' : '◯', selected ? Theme.accent : Theme.muted, bg)
-      # The list area's last column now carries the scroll gauge, so the swatch ends one cell
-      # short of it rather than leaving a gap for a per-row marker.
-      mark_x = box.x + list_w
-      swatch_w = 7
-      sx = mark_x - swatch_w
-      name_w = {sx - (box.x + 5) - 1, 1}.max
-      screen.text(box.x + 5, ry, name, selected ? Theme.text_bright : Theme.text, bg, width: name_w)
-      draw_swatch(screen, sx, ry, name)
-    end
-
-    # A 7-cell strip in the theme's OWN palette (Theme.palette, not the active one).
-    private def draw_swatch(screen : Screen, x : Int32, ry : Int32, name : String) : Nil
-      pal = Theme.palette(name)
-      return unless pal
-      ticks = {pal.accent, pal.green, pal.yellow, pal.red, pal.syn_header}
-      screen.cell(x, ry, ' ', pal.bg, pal.bg)
-      ticks.each_with_index { |c, i| screen.cell(x + 1 + i, ry, '█', c, pal.bg) }
-      screen.cell(x + 6, ry, ' ', pal.bg, pal.bg)
     end
 
     # A small mock of the History view rendered entirely in `name`'s OWN palette, so
@@ -974,7 +977,7 @@ module Gori::Tui
       px = @companion_enabled ? SetupWizard.companion_preview_x(box) : nil
       band = px.try { |x| x - COMPANION_PREVIEW_GAP }
       iw = {(band || (box.right - 1)) - ix, 1}.max
-      screen.text(ix, box.y + 2, "A mascot in the corner, off unless you want her.",
+      screen.text(ix, box.y + 2, "A mascot in the corner, yours unless you say no.",
         Theme.text, Theme.panel, width: iw)
       ry = box.y + COMPANION_OFFER_ROW
       render_offer_row(screen, box, ry, "Show Miss Ring", @companion_enabled, band)
@@ -984,7 +987,8 @@ module Gori::Tui
       # does nothing in that state.
       screen.text(ix, box.y + COMPANION_MOTION_ROW, "Motion   #{companion_motion_recap}", Theme.muted, Theme.panel, width: iw) if @companion_enabled
       # Say the cost out loud: she is the one piece of chrome that repaints while you are
-      # at the keyboard, which is why she is opt-in at all.
+      # at the keyboard, which is why the step asks at all rather than leaving her to
+      # Preferences.
       screen.text(ix, ry + 4, "She reacts to results, then dozes off after 90s idle.",
         Theme.muted, Theme.panel, width: iw)
       px.try { |x| draw_companion_preview(screen, x, ry) }
@@ -1023,15 +1027,22 @@ module Gori::Tui
       rerun = "re-run anytime: gori wizard"
       screen.text(tx + 3, y, rerun, Theme.muted, Theme.panel) if tx + 3 + rerun.size <= box.right - 1
       y = box.y + REVIEW_RECAP_ROW
-      recap_labels = ["Proxy (global)", "Theme", "Miss Ring", "Shortcuts"]
+      recap_labels = ["Proxy default", "Theme", "Editor keys", "Miss Ring", "Shortcuts", "HTTPS"]
       vx = ix + recap_labels.max_of { |l| Screen.draw_width(l) } + 2 # +2 = min visible gap before the value column
-      recap(screen, box, ix, vx, y, "Proxy (global)", "#{effective_ip}:#{@port.strip}"); y += 1
+      recap(screen, box, ix, vx, y, "Proxy default", "#{effective_ip}:#{@port.strip}"); y += 1
       recap(screen, box, ix, vx, y, "Theme", @theme_name); y += 1
+      # The palette entry's name alone, no chord: the Shortcuts row below can change which
+      # modifier opens the palette before finish, and a chord read here would go stale.
+      route = @keys_route ||= (Verbs.registry["settings.keys"]?.try(&.title) || "Settings: Keys")
+      recap(screen, box, ix, vx, y, "Editor keys", SetupWizard.keys_recap(Hotkeys.editor_keyset, route)); y += 1
       recap(screen, box, ix, vx, y, "Miss Ring", @companion_enabled ? "on · #{@companion_motion}" : "off"); y += 1
       # The only EDITABLE recap row (←/→, or a click). Spell out both the chords it moves
       # and the macOS caveat — a user who picks ⌥ without Option-as-Meta would see nothing
       # happen.
-      recap(screen, box, ix, vx, box.y + REVIEW_SHORTCUTS_ROW, "Shortcuts", modifier_recap)
+      recap(screen, box, ix, vx, box.y + REVIEW_SHORTCUTS_ROW, "Shortcuts", SetupWizard.modifier_recap(@modifier))
+      # Fills the gap row above the offers (REVIEW_ROWS and MIN_H stay put): HTTPS sites fail until
+      # the CA is trusted, and the proxy answers this URL itself (SelfPage::MAGIC_URL).
+      recap(screen, box, ix, vx, box.y + REVIEW_SHORTCUTS_ROW + 1, "HTTPS", "trust the CA: #{Proxy::SelfPage::MAGIC_URL} · gori ca")
       y = box.y + REVIEW_OFFER_ROW
       # No prompt line above the offer: the two rows below say "Take the guided tour" /
       # "Skip — finish setup" in full, so "New to gori? Take a quick tour of the TUI:" was
@@ -1039,23 +1050,35 @@ module Gori::Tui
       # fourth recap row otherwise pushed content_rows from 9 to 10, which moved this step's
       # minimum height from 15 rows to 16 and, since REVIEW is the tallest step, MIN_H along
       # with it. That is the worst row to lose: `finish` lives here, so every row added
-      # locks another terminal size out of completing setup. Net rows are unchanged.
+      # locks another terminal size out of completing setup. Net rows are unchanged. The fifth
+      # (Editor keys) took the gap under the headline for the same reason (REVIEW_RECAP_ROW).
       render_offer_row(screen, box, y, "Take the guided tour", @offer == :tour); y += 1
       render_offer_row(screen, box, y, "Skip — finish setup", @offer == :skip)
     end
 
+    # The Editor keys recap value: the SAVED keyset (the wizard never sets it) and where to
+    # change it, short enough for the 80-column card's value column (the floor spec checks).
+    def self.keys_recap(keyset : String, route : String) : String
+      "#{Hotkeys::KEYSET_LABELS[keyset]? || keyset} · change in #{route}"
+    end
+
     # The Shortcuts recap value: what's staged, plus how to change it / what it costs.
-    private def modifier_recap : String
-      if @modifier == "alt"
+    # No `^1-9` on the Ctrl line: Ctrl+digit carries no control character, so many terminals
+    # (tmux among them) never deliver the jump — `⇧1-9` is the primary, and `⌥1-9` is what
+    # the ⌥ alias adds (see the Repeater's arrival hint).
+    def self.modifier_recap(modifier : String) : String
+      if modifier == "alt"
         "⌥P ⌥N ⌥W ⌥1-9  (←/→ for Ctrl · needs Option-as-Meta)"
       else
-        "^P ^N ^W ^1-9  (←/→ to add ⌥ aliases)"
+        "^P palette · ^N new · ^W close  (←/→ adds ⌥)"
       end
     end
 
     private def recap(screen : Screen, box : Rect, ix : Int32, vx : Int32, y : Int32, key : String, value : String) : Nil
       screen.text(ix, y, key, Theme.muted, Theme.panel)
-      screen.text(vx, y, value, Theme.text_bright, Theme.panel, width: {box.right - vx - 1, 1}.max)
+      # The headline's right margin (`iw`), not the border: a clipped value's `…` sat flush
+      # against `│`.
+      screen.text(vx, y, value, Theme.text_bright, Theme.panel, width: {box.right - 3 - vx, 1}.max)
     end
 
     # A selectable offer row (radio-style), mirroring the theme list's accent band.

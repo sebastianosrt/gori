@@ -7,11 +7,23 @@ class Gori::Tui::RepeaterView
   # What gets PERSISTED (and what reconcile compares against). Wire form, so a saved tab
   # restores to the bytes it was sending: persisting the LF projection would have re-lost
   # every body CR on the next restore, undoing the fix one session later.
+  #
+  # The hex buffer only once it has been EDITED (`hex_buffer_text`).
   def request_text : String
-    (h = @req_hex_edit) ? String.new(h.to_bytes) : @editor.wire_text
+    hex_buffer_text || @editor.wire_text
   end
 
-  # The same request handed to a tab that reads `§…§` as TEMPLATE SYNTAX — `space ▸ f`
+  # The `^X` buffer as text, or nil while it is a pure peek. An unedited hex buffer is the
+  # editor's request in the form text mode sends (`hex_seed`), so for a typed draft it differs
+  # from `wire_text` by the head's CRs alone. Reading it there made a peek look like an edit
+  # to everything that compares this text to a saved copy: the drift digest called the next
+  # response stale against a row nobody changed, and a minimize finishing under the peek
+  # refused to install its result (#1427).
+  private def hex_buffer_text : String?
+    (h = @req_hex_edit) && h.mutated? ? String.new(h.to_bytes) : nil
+  end
+
+  # The same request handed to a tab that reads `§…§` as TEMPLATE SYNTAX — `space ▸ F`
   # (Send to Fuzzer). Where this tab's markers are inert (a capture whose body legitimately
   # carries `§`; see `markers_live?`), the literal `§` are escaped to `§§` — the escape
   # `Fuzz::Template.parse` already defines — so the receiving template renders them back to
@@ -29,13 +41,13 @@ class Gori::Tui::RepeaterView
   # spent three round-trips removing for the `%%%` separator. Only the PROVENANCE question
   # (`markers_live?`) is ours; the byte rule belongs to the template.
   #
-  # Each road escapes exactly once: `space ▸ f` goes runner/fuzzer.cr → here →
+  # Each road escapes exactly once: `space ▸ F` goes runner/fuzzer.cr → here →
   # `FuzzerView#load_request`, which sets the text unescaped, so a captured `§` is never
   # doubled.
   # The `marker_bytes_in?` guard is LOAD-BEARING, not a redundant pre-check.
   # `escape_literal_markers` returns `raw` itself when there is no `§`, but `String.new(Bytes)`
   # always copies — so collapsing this to one line would copy the whole request buffer on
-  # every marker-free `space ▸ f`, which is the overwhelmingly common seed and exactly the
+  # every marker-free `space ▸ F`, which is the overwhelmingly common seed and exactly the
   # allocation the helper's own comment says it avoids.
   def fuzz_seed_text : String
     text = request_text
@@ -56,7 +68,7 @@ class Gori::Tui::RepeaterView
   # being a payload. `set_text` (in `replace_edit_buffer`) is the exact inverse, so a file
   # the editor left alone round-trips byte for byte.
   def edit_buffer_text : String
-    (h = @req_hex_edit) ? String.new(h.to_bytes) : req_editor.wire_text
+    hex_buffer_text || req_editor.wire_text
   end
 
   def replace_edit_buffer(text : String) : Nil
@@ -127,10 +139,6 @@ class Gori::Tui::RepeaterView
     @flow.try(&.row.id)
   end
 
-  def mark_dirty : Nil
-    @dirty = true
-  end
-
   def clear_dirty : Nil
     @dirty = false
     @decoded_dirty = false
@@ -138,35 +146,46 @@ class Gori::Tui::RepeaterView
 
   # The starting scaffold for a hand-authored request (Repeater `^N`): a minimal
   # but immediately sendable HTTP/1.1 message the user edits in place.
-  BLANK_TARGET  = "https://example.com"
-  BLANK_REQUEST = "GET / HTTP/1.1\nHost: example.com\nUser-Agent: gori\nAccept: */*\n\n"
+  BLANK_TARGET    = "https://example.com"
+  BLANK_HOST_LINE = "Host: example.com"
+  BLANK_REQUEST   = "GET / HTTP/1.1\n#{BLANK_HOST_LINE}\nUser-Agent: gori\nAccept: */*\n\n"
+
+  # The response/scroll/hex reset every fresh load or restore ends with: no result yet,
+  # the pane caches dropped (`reset_result_caches` also resets the wrap memo), a clean tab.
+  private def fresh_panes(focus : Symbol, diffable : Bool) : Nil
+    @result = nil
+    @prev_result = nil
+    reset_result_caches
+    @focus = focus
+    @resp_mode = :response
+    @scroll = 0
+    @diffable = diffable
+    @loaded = true
+    @dirty = false
+    @req_hex_edit = nil # a fresh load/restore replaces the request → drop any hex buffer
+    @scroll_req = 0
+  end
+
+  # The target field seeded from a captured flow: its origin, no SNI override, caret at the end.
+  private def seed_target(detail : Store::FlowDetail) : Nil
+    @target = build_target(detail.row.scheme, detail.row.host, detail.row.port)
+    @tcx = @target.size
+    @sni = ""
+    @scx = 0
+    @target_field = :url
+  end
 
   def load(detail : Store::FlowDetail) : Nil
     @flow = detail
     @evidence = true          # a CAPTURED request — see `evidence?`
     @markers_declared = false # a fresh capture: any § in it is the origin's (see markers_live?)
     @http2 = detail.http_version == "HTTP/2"
-    @target = build_target(detail.row.scheme, detail.row.host, detail.row.port)
-    @tcx = @target.size
-    @sni = ""
-    @scx = 0
-    @target_field = :url
+    seed_target(detail)
     @editor.set_text(origin_form_text(detail))
     seed_draft_baselines
     @original_lines = message_lines(detail.response_head, display_body(detail.response_head, detail.response_body))
 
-    @result = nil
-    @prev_result = nil
-    reset_result_caches
-    @focus = :request
-    @resp_mode = :response
-    @scroll = 0
-    resp_wrap_reset
-    @diffable = true
-    @loaded = true
-    @dirty = false
-    @req_hex_edit = nil # a fresh load/restore replaces the request → drop any hex buffer
-    @scroll_req = 0
+    fresh_panes(:request, diffable: true)
     reflect_content_length_in_editor if @auto_content_length
   end
 
@@ -205,6 +224,7 @@ class Gori::Tui::RepeaterView
       tls_preset)
 
     @original_lines = [] of String
+    fresh_panes(:target, diffable: false)
     # Rebuild the persisted result: a head (success) or an error (failed send)
     # marks a real stored response; both nil → never sent → empty pane.
     @result =
@@ -212,15 +232,6 @@ class Gori::Tui::RepeaterView
         Repeater::Result.new(response_head || Bytes.empty, response_body, nil,
           response_duration_us || 0_i64, response_error)
       end
-    @prev_result = nil
-    reset_result_caches
-    @focus = :target
-    @resp_mode = :response
-    @scroll = 0
-    resp_wrap_reset
-    @diffable = false
-    @req_hex_edit = nil # a fresh load/restore replaces the request → drop any hex buffer
-    @scroll_req = 0
     reflect_content_length_in_editor if @auto_content_length
   end
 
@@ -362,18 +373,7 @@ class Gori::Tui::RepeaterView
     @editor.set_text(BLANK_REQUEST)
     @evidence_pipeline_seps = 0 # a draft: every `%%%` in it is the operator's
     @original_lines = [] of String
-    @result = nil
-    @prev_result = nil
-    reset_result_caches
-    @focus = :target
-    @resp_mode = :response
-    @scroll = 0
-    resp_wrap_reset
-    @diffable = false
-    @loaded = true
-    @dirty = false
-    @req_hex_edit = nil # a fresh load/restore replaces the request → drop any hex buffer
-    @scroll_req = 0
+    fresh_panes(:target, diffable: false)
   end
 
   # Content-only clone for the sub-tab strip "Duplicate" action. Copies the editable
@@ -384,7 +384,10 @@ class Gori::Tui::RepeaterView
     @evidence = src.evidence?                             # the same bytes carry the same provenance
     @markers_declared = src.@markers_declared             # …and the same reading of their §
     @evidence_pipeline_seps = src.@evidence_pipeline_seps # …and of their `%%%`
-    @evidence_env_names = src.@evidence_env_names.dup     # …and of their `$NAME`
+    # …and of their `$NAME`, carried as the SEED BYTES so the clone re-derives its baseline on a
+    # grammar flip exactly as its source does — and so the clone's own EDITOR learns the literal
+    # set, which a copy of the derived name set never gave it.
+    adopt_evidence_env_seed(src.@evidence_env_seed)
     @http2 = src.@http2
     @target = src.@target
     @tcx = @target.size

@@ -3,6 +3,7 @@
 abstract class Gori::Verb::ExecContext
   # Probe → Rules sub-tab: toggle the selected rule, and add/edit/delete a custom rule.
   abstract def probe_rule_toggle : Nil            # enable/disable the selected Probe rule
+  abstract def probe_rule_filter : Nil            # open the RULES `/` bar (a lens over the rule list)
   abstract def probe_rule_add : Nil               # open the custom-rule popup to add a rule
   abstract def probe_rule_edit : Nil              # edit the selected custom rule
   abstract def probe_rule_delete : Nil            # delete the selected custom rule (with confirm)
@@ -10,8 +11,10 @@ abstract class Gori::Verb::ExecContext
 
   # probe (passive/active scan issues — grouped by code+host)
   abstract def probe_move(delta : Int32) : Nil
-  abstract def probe_open : Nil          # open the selected issue's detail
-  abstract def probe_close : Nil         # back to the list
+  abstract def probe_open : Nil  # open the selected issue's detail
+  abstract def probe_close : Nil # back to the list
+  # `⇧N`/`⇧P` inside the drill-in — open the next/previous finding without returning to the list.
+  abstract def probe_step_item(delta : Int32) : Nil
   abstract def probe_query : Nil         # focus the `/` filter bar
   abstract def probe_set_mode : Nil      # open the OFF/Passive/Active picker
   abstract def probe_clear : Nil         # delete all issues (after a confirm)
@@ -31,8 +34,14 @@ abstract class Gori::Verb::ExecContext
   abstract def probe_active_selected : Nil      # active-scan History's selected (or open) flow
   abstract def probe_active_rescan : Nil        # re-active-scan the selected Probe issue's sample flow
   abstract def probe_active_from_repeater : Nil # active-scan the current Repeater session's last send
-  # A Probe issue's detail is open — the gate for the AFFECTED URLS list's read verbs.
+  # A Probe issue's detail is open — the gate for its read panes' verbs. TRUE for either
+  # pane: `x`/`v`/`S`/`y` act on whichever holds focus.
   abstract def probe_detail_readable? : Bool
+
+  # …and narrower: an AFFECTED URL sits under the caret. The detail's other pane holds
+  # remediation prose with no URL in it, so `probe.open-affected` has nothing to open
+  # while DESCRIPTION has focus and must not offer itself in the space menu there.
+  abstract def probe_affected_selected? : Bool
 
   # The issue LIST is in front (no detail open) and an issue is under the cursor.
   abstract def probe_issue_selected? : Bool

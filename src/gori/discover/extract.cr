@@ -1,3 +1,5 @@
+require "../utf8"
+
 module Gori::Discover
   # Link extraction from a response body — the spider's discovery source. Net-new (the
   # repo's links.cr is unrelated; it resolves DB entity_links). A single bounded pass of
@@ -15,7 +17,7 @@ module Gori::Discover
     # globally; this bounds what a single response can spend, before it is ever queued.
     MAX_LINKS = 4096
 
-    # href / src / action attributes (quoted or bare), plus <meta refresh url=…>.
+    # href / src / action attributes (quoted or bare). `<meta refresh>` is `META_TAG` below.
     #
     # The alternation is deliberately UNANCHORED (no `\b`), which is why `data-src`,
     # `data-href` and `formaction` are already covered by `src`/`href`/`action` — only the
@@ -24,8 +26,26 @@ module Gori::Discover
     # list, not one URL, so capturing it whole would hand `Url.resolve` a string it would
     # percent-encode into a URL nobody serves.
     ATTR = /(?:href|src|action|poster|data-(?:url|uri|endpoint|api))\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/i
-    META = /<meta[^>]+http-equiv\s*=\s*["']?refresh["']?[^>]*content\s*=\s*["'][^"']*url\s*=\s*([^"'>\s]+)/i
-    LOC  = /<loc>\s*([^<\s]+)\s*<\/loc>/i
+
+    # A `<meta>` start tag's attribute run, read by `meta_refresh`. Attributes are an unordered
+    # set, so this only finds the TAG — one regex naming `http-equiv` before `content` missed
+    # `<meta content="0;url=/next" http-equiv="refresh">`, and its URL class stopped at either
+    # quote, which dropped the quoted relative `content="0; url='next'"` a browser follows (#1182).
+    # Linear: the run is consumed by its own match, so an unclosed tag cannot be rescanned.
+    META_TAG = /<meta\b([^>]*)/i
+
+    # One `name=value` attribute inside a tag's run, the value in any of its three spellings.
+    # A quoted value is consumed whole, so a `content=` written inside another attribute's value
+    # is never read as an attribute of its own. `{1,64}` bounds the name: an unclosed quote makes
+    # every start position in the name before it scan to the end of the run, so an unbounded
+    # name turned one long hostile tag into a quadratic scan.
+    TAG_ATTR = /([^\s"'>\/=]{1,64})\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/
+
+    # Cheap proof a meta tag cannot be a refresh: it has to NAME `http-equiv`. The name, not the
+    # `refresh` value, because a value may be spelled with character references and a name may not.
+    HTTP_EQUIV = /http-equiv/i
+
+    LOC = /<loc>\s*([^<\s]+)\s*<\/loc>/i
 
     # An endpoint literal in NON-markup text: an absolute http(s) URL, or a root-relative path
     # opening a quoted string. Two branches in one pass because the two shapes interleave
@@ -276,33 +296,73 @@ module Gori::Discover
       {cut, masked}
     end
 
+    # The URL a `<meta http-equiv="refresh" content="…">` names, from its tag's attribute run, or
+    # nil when the tag is not a refresh or its content names no URL. Attribute order is not
+    # significant, and the FIRST of a repeated attribute is the one HTML keeps. The content is
+    # the `Refresh` header's value grammar, so the header's parser reads it (`refresh_url`) —
+    # after its character references are resolved, which is the attribute's own escaping.
+    private def self.meta_refresh(attrs : String) : String?
+      return nil unless attrs.matches?(HTTP_EQUIV)
+      equiv = nil.as(String?)
+      content = nil.as(String?)
+      attrs.scan(TAG_ATTR) do |m|
+        value = m[2]? || m[3]? || m[4]? || ""
+        name = m[1]
+        if equiv.nil? && name.compare("http-equiv", case_insensitive: true) == 0
+          equiv = value
+        elsif content.nil? && name.compare("content", case_insensitive: true) == 0
+          content = value
+        end
+      end
+      return nil unless equiv && content
+      return nil unless decode_refs(equiv).strip.compare("refresh", case_insensitive: true) == 0
+      refresh_url(decode_refs(content))
+    end
+
     # A captured attribute value ready to become a candidate: references resolved, empty
-    # rejected, and not already `seen`. Shared by the two declared-value passes so `from_html`
-    # states each of them once.
+    # rejected, and not already `seen`.
     private def self.declared(v : String?, seen : Set(String)) : String?
       return nil unless v && !v.empty?
       d = decode_refs(v)
       d.empty? || !seen.add?(d) ? nil : d
     end
 
+    # The two things `Engine#extract_links` needs from EVERY html-like body: its links, and
+    # the `<base href>` those links resolve against — from ONE pass over the body's text.
+    #
+    # Asked separately they built that text twice, and `scan_text` is not cheap: a
+    # `String.new` copy of up to MAX_SCAN bytes plus a `valid_encoding?` walk of the result.
+    # Measured on a 1 MB page, the duplicate `base_href(body)` cost 1.26ms of which 443µs was
+    # rebuilding a String the caller had just discarded — against 6.7ms for the extraction it
+    # accompanies, so a sixth of the crawl's per-page CPU was spent on a copy.
+    def self.from_html_with_base(body : Bytes) : {Array(Found), String?}
+      text = scan_text(body)
+      {from_html(text), base_href(text)}
+    end
+
     def self.from_html(body : Bytes) : Array(Found)
+      from_html(scan_text(body))
+    end
+
+    # The String half, for a caller that already holds the scanned text (`from_html_with_base`,
+    # and a spec) — the same split `base_href` carries beside it, for the same reason.
+    def self.from_html(text : String) : Array(Found)
       # `acc`, not `out`: `out` is a Crystal keyword in ARGUMENT position, so a local named
       # that cannot be passed to `endpoints` below (it parses as an out-parameter).
       acc = [] of Found
       seen = Set(String).new
-      text = scan_text(body)
       text.scan(ATTR) do |m|
         break if acc.size >= MAX_LINKS
         if v = declared(m[1]? || m[2]? || m[3]?, seen)
           acc << Found.new(v, true)
         end
       end
-      text.scan(META) do |m|
+      text.scan(META_TAG) do |m|
         # The cap is per BODY, not per pass — this loop appends to the same `acc` the one above
         # filled, so without the guard a page could leave here over MAX_LINKS and hand the
         # orchestrator the excess anyway.
         break if acc.size >= MAX_LINKS
-        if v = declared(m[1]?, seen)
+        if (v = meta_refresh(m[1])) && seen.add?(v)
           acc << Found.new(v, true)
         end
       end
@@ -345,12 +405,28 @@ module Gori::Discover
     # script.
     private def self.endpoints(text : String, acc : Array(Found), seen : Set(String)) : Nil
       return if acc.size >= MAX_LINKS
-      text.scan(ENDPOINT) do |m|
+      each_endpoint(text) do |v, _, _|
         break if acc.size >= MAX_LINKS
+        acc << Found.new(v, false) if seen.add?(v)
+      end
+    end
+
+    # Every ENDPOINT match in `text`, in order, with WHERE it sits: the value, the byte offset
+    # of the match's first byte (the opening quote of a path, the `h` of a URL) and the byte
+    # offset just past it. Neither deduplicated nor capped — both are the caller's policy, and
+    # the two callers want different ones (the crawl keeps the first spelling of a string;
+    # `JsRefs` keeps the occurrence in CODE over one in a comment).
+    #
+    # The one home of the regex's reading, so the passive JS reference scan (#1243) cannot come
+    # to disagree with the crawl about what an endpoint literal is. Byte offsets rather than
+    # `MatchData#begin`'s char index: on a non-ASCII body a char index costs a walk from the
+    # start of the string to convert, which over 4096 matches in a 2 MiB bundle is quadratic.
+    def self.each_endpoint(text : String, & : String, Int32, Int32 ->) : Nil
+      text.scan(ENDPOINT) do |m|
         # Group 1 is the path branch's capture; on the URL branch it is nil and the whole
         # match IS the URL.
         v = m[1]? || m[0]
-        acc << Found.new(v, false) if !v.empty? && seen.add?(v)
+        yield v, m.byte_begin(0), m.byte_end(0) unless v.empty?
       end
     end
 
@@ -384,6 +460,62 @@ module Gori::Discover
         out << v unless v.empty?
       end
       out
+    end
+
+    # ── links a response declares in its HEAD, not its body ─────────────────────────────
+    #
+    # Every extractor above reads BYTES the origin sent as content. These read the fields it
+    # sent ABOUT that content, and they are a discovery source the body cannot substitute
+    # for: an API that paginates with `Link: <…>; rel="next"` names its next page nowhere
+    # else, a `Content-Location` names the canonical spelling of a resource reached under
+    # another, and a `Set-Cookie` scoped to `Path=/admin` is the application stating where it
+    # is mounted — on a 404, on a redirect, on any response at all.
+    #
+    # Kept here as pure String → String functions rather than taking a header collection, so
+    # this file stays free of a `Proxy::Codec` require; `Engine#header_links` walks the
+    # HeaderList and calls these.
+
+    # An RFC 8288 `Link` field carries one or more `<uri-reference>; param=…` members. Only
+    # the angle-bracketed target is a URL — the parameters are metadata, and `rel`'s value is
+    # a relation type, not a link — so this returns the bracketed runs and nothing else. `>`
+    # cannot appear inside a URI, so the non-greedy class cannot run past its own member.
+    LINK_TARGET = /<([^<>]*)>/
+
+    # The three header readers below hand a wire value to PCRE, which RAISES on invalid UTF-8
+    # (a Latin-1 cookie) — and the raise cost the whole page, body links included. Scrubbed
+    # the way the body already is (`Utf8.text`).
+    def self.from_link_header(value : String) : Array(String)
+      out = [] of String
+      Gori::Utf8.subject(value).scan(LINK_TARGET) do |m|
+        v = m[1]?.try(&.strip)
+        out << v if v && !v.empty?
+      end
+      out
+    end
+
+    # The header spelling of `<meta http-equiv="refresh">`: `Refresh: 5; url=/somewhere`.
+    # Same value grammar, so the same tolerance — optional quotes, delay first, `url=`
+    # case-insensitive.
+    REFRESH_URL = /url\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s;]+))/i
+
+    def self.refresh_url(value : String) : String?
+      return nil unless m = Gori::Utf8.subject(value).match(REFRESH_URL)
+      (m[1]? || m[2]? || m[3]?).presence
+    end
+
+    # The `Path` attribute of one `Set-Cookie` field, when it names something narrower than
+    # the origin. `Path=/` is the default and says nothing, so it answers nil — the point of
+    # asking is a cookie the application scoped to the subtree it actually lives under.
+    #
+    # RFC 6265 §5.2.4 takes the LAST `Path` attribute and treats a value not starting with
+    # `/` as the default path, which is the same nil answer here.
+    COOKIE_PATH = /;\s*path\s*=\s*([^;]*)/i
+
+    def self.cookie_path(value : String) : String?
+      last = nil.as(String?)
+      Gori::Utf8.subject(value).scan(COOKIE_PATH) { |m| last = m[1]?.try(&.strip) }
+      return nil unless last && last.starts_with?('/') && last != "/"
+      last
     end
 
     SNIFF_MAX    = 8192 # a sitemap's root element sits at the top; no need to read further
@@ -455,17 +587,12 @@ module Gori::Discover
       text(slice)
     end
 
-    # A response body as a String the PCRE2 scans above can be run over. The scrub is
-    # required — `String.new` validates nothing, and a Regex on invalid UTF-8 raises — but it
-    # is only required for a body that is ACTUALLY invalid, and `String#scrub` charges for the
-    # check either way: it walks the whole string through a `Char::Reader` and returns `self`
-    # at the end, which measured 130µs on a valid 40 KB page against 9µs for
-    # `valid_encoding?`. Every crawled page and every brute-force probe response pays this, so
-    # ask the cheap question first and scrub only the bodies that need it (`scrub` re-walks
-    # them, which is the right trade at ~1 body in a run).
+    # A response body as a String the PCRE2 scans above can be run over. This measured 130µs
+    # on a valid 40 KB page against 9µs for the cheap check, and the fuzz matcher and the
+    # intercept filter were paying the same toll with the slow spelling — so the reasoning and
+    # the code moved to `Gori::Utf8`, which is where the numbers now live.
     private def self.text(slice : Bytes) : String
-      s = String.new(slice)
-      s.valid_encoding? ? s : s.scrub
+      Gori::Utf8.text(slice)
     end
   end
 end

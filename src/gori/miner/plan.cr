@@ -3,12 +3,15 @@ require "../fuzz/content_length"
 require "../fuzz/engine"
 require "../host_overrides"
 require "../outbound"
+require "../payload_from"
 require "../process_hook"
 require "../repeater/flow_request"
+require "../request_macro"
 require "../settings"
 require "./detect"
 require "./engine"
 require "./hook_backend"
+require "./macro_backend"
 require "./types"
 require "./wordlist"
 
@@ -27,8 +30,11 @@ module Gori::Miner
       # A target was given but no host could be parsed out of it (`detail` = the
       # Env-expanded string that failed, for surfaces that quote it back).
       BadTarget
-      # Nothing to mine: the surface asked for an empty location set, or auto-detection
-      # found none that apply to this request.
+      # Nothing to mine: the surface asked for an empty location set, auto-detection found
+      # none that apply to this request, or EVERY location the surface named is one this
+      # request cannot carry (`detail` = why, per location, from `Detect.inapplicable_reason`;
+      # nil for the other two). Refused before any send: a run with nothing to inject still
+      # sent its baseline and then reported every name as tested and clean (#1203).
       NoLocations
       # The user wordlist could not be read (`detail` = the underlying message).
       Wordlist
@@ -100,6 +106,17 @@ module Gori::Miner
     # The project's hostname overrides, or nil when the surface has no project to load
     # them from. Only a surface can reach a Store, so this is passed in rather than loaded.
     property overrides : Gori::HostOverrides?
+    # Candidate names read from the project's own captured data (#1352): each `param-names`
+    # source names a QL-selected flow set whose parameter names are tested BEFORE the built-in
+    # list and the user wordlist (after any explicit `config.seed_names`). Only that projection
+    # is a list of NAMES; another is refused by name. Resolved by `Plan.build`, against `project`.
+    property project_names : Array(PayloadFrom::Spec)
+    # The project `project_names` are read from — passed in like `overrides`, since only a surface
+    # can reach a store. A name source with no project to read is refused.
+    property project : Gori::Store?
+    # Drain the off-commit search index before a `body:`/free-text source query, and refuse when it
+    # cannot: the default for one-shot CLI and MCP. The live TUI passes false.
+    property? project_drain_fts : Bool
 
     def initialize(@request : String = "",
                    *,
@@ -112,7 +129,10 @@ module Gori::Miner
                    @config : Config = Config.new,
                    @verify : Bool = true,
                    @sni : String? = nil,
-                   @overrides : Gori::HostOverrides? = nil)
+                   @overrides : Gori::HostOverrides? = nil,
+                   @project_names : Array(PayloadFrom::Spec) = [] of PayloadFrom::Spec,
+                   @project : Gori::Store? = nil,
+                   @project_drain_fts : Bool = true)
     end
   end
 
@@ -153,18 +173,39 @@ module Gori::Miner
     getter request : Bytes
     # The request-target of the request's first line, for the Layer-1 scope check.
     getter request_target : String
-    # The candidate parameter names (built-in list + the user wordlist).
+    # The candidate parameter names, in the order they are tested: the explicit `seed_names`,
+    # then the names read from the project (`PlanOptions#project_names`), then the built-in list,
+    # then the user wordlist — de-duplicated, the first sighting keeping its place.
     getter names : Array(String)
 
-    # Resolved locations that `Detect` says do NOT apply to this request — a surface can
-    # only reach these by naming them explicitly, and `gori run mine` warns per location
-    # rather than dropping them silently.
+    # What each project name source read (#1352), in the order given: flows, names, what a
+    # cap cut short. Never carries a value beyond the names themselves, which are `names`.
+    getter project_reports : Array(PayloadFrom::Report)
+
+    # Named locations that `Detect` says do NOT apply to this request, dropped from the run —
+    # a surface can only reach these by naming them explicitly, so each one says so
+    # (`gori run mine` per location on stderr, MCP as `not-applicable` skipped rows).
     getter inapplicable : Array(Location)
+
+    # The run's request-time macro (#1350), or nil when it has none. The lane the engine's
+    # `MacroBackend` gates every request through; a surface reads `request_macro_info` for the
+    # plan-time line and `Progress#request_macro` for what happened.
+    getter request_macro : RequestMacro::Lane?
 
     def initialize(@engine : Engine, @sender : Fuzz::Sender, @config : Config,
                    @origin : Fuzz::Origin, @http2 : Bool, @request : Bytes,
                    @request_target : String, @names : Array(String),
-                   @inapplicable : Array(Location))
+                   @inapplicable : Array(Location),
+                   @project_reports : Array(PayloadFrom::Report) = [] of PayloadFrom::Report,
+                   @request_macro : RequestMacro::Lane? = nil)
+    end
+
+    # What the macro does to this run, said before it starts: the steps, the cadence, whether a
+    # value is shared between requests, and the parallelism that leaves the run. nil without a
+    # macro. The engine's OWN clamped concurrency, so the line cannot describe a number the run
+    # will not use.
+    def request_macro_info : RequestMacro::Info?
+      @request_macro.try(&.info(@engine.concurrency))
     end
 
     # The run's keep-alive pool, or nil when it runs connection-per-send (h2, or
@@ -198,13 +239,14 @@ module Gori::Miner
       # is a literal string on the wire (see `Env::Escape`). It refused a Mongo `$ne` and a
       # GraphQL `$id` in a query string — the operator's test case, not a typo.
       #
-      # `resync_expanded_body` re-frames the head when expansion moved the BODY's byte length
-      # — see its own comment. It and the dropped refusal are orthogonal edits to this one
-      # statement, landed independently; the union is what both intended.
+      # `ContentLength.resync_expanded` re-frames the head when expansion moved the BODY's
+      # byte length — see its comment. Without it a mine reported `baseline: stable · 0 found ·
+      # 0 errors` over a conversation the target had 400'd. It and the dropped refusal are
+      # orthogonal edits to this one statement; the union is what both intended.
       request = if options.evidence?
                   options.request.to_slice
                 else
-                  resync_expanded_body(options.request.to_slice, Env.expand_wire(options.request))
+                  Fuzz::ContentLength.resync_expanded(options.request.to_slice, Env.expand_wire(options.request))
                 end
       request = frame_unframed_body(request)
       request_target = Gori::Outbound.request_target(request)
@@ -214,14 +256,25 @@ module Gori::Miner
       detected = Detect.detect(request)
       # Written back into the caller's live Config: the engine reads its `locations`, and
       # `gori run mine` prints them, so the resolved set has to be the one everyone sees.
-      config.locations = options.locations || detected.default
-      raise PlanError.new(PlanError::Reason::NoLocations, "no applicable locations for this request") if config.locations.empty?
-      inapplicable = config.locations - detected.applicable
+      #
+      # A named location this request cannot carry is DROPPED from the run, not kept in it: the
+      # engine could inject nothing there, yet counted its names as tested and clean (#1203).
+      # The plan and the engine both keep the list, so every surface can say what was skipped.
+      # Refused BEFORE the write-back, so a refusal leaves the TUI's live selection as it was.
+      requested = options.locations || detected.default
+      inapplicable = requested - detected.applicable
+      runnable = requested - inapplicable
+      if runnable.empty?
+        why = inapplicable.empty? ? nil : inapplicable.map { |loc| "#{loc.label}: #{Detect.inapplicable_reason(loc, request)}" }.join("; ")
+        raise PlanError.new(PlanError::Reason::NoLocations, "no applicable locations for this request", why)
+      end
+      config.locations = runnable
       if b = options.bucket
         config.locations.each { |loc| config.bucket_size[loc] = b }
       end
 
-      names = load_names(config.user_wordlist)
+      project_reports = [] of PayloadFrom::Report
+      names = load_names(config.user_wordlist, config.seed_names, resolve_project_names(options, project_reports))
       # `evidence:` carries the branch above to the SEND seam, where session bindings resolve
       # (`Fuzz::Sender#evidence?`). Round 6 marked the miner's INJECTED candidates verbatim
       # and cleared the carrier as safe because gori's canaries cannot contain a `$` — true
@@ -235,6 +288,10 @@ module Gori::Miner
       # session-slot overlay: a hook must sign the FINAL bytes, so when one is present the overlay
       # becomes the hook wrapper's job and the sender must not also apply it (see below).
       hook_argv = resolve_hook_argv(config)
+      # The request-time macro (#1350), validated HERE for the reason the hook is: a build-time
+      # refusal before a request is sent, not a per-worker surprise. Its steps are the first
+      # traffic the run produces.
+      request_macro = build_request_macro(options, outbound, request)
       # `idle_conns: concurrency` — one parked socket per worker fiber is the most that can
       # ever be checked out at once, so a larger pool would only hold dead sockets open.
       #
@@ -255,56 +312,49 @@ module Gori::Miner
       # the plan holds for `pool`/`blocked` reporting; `HookBackend` delegates those down to it.
       backend = hook_argv ? HookBackend.new(sender, hook_argv,
         Gori::Settings.hook_timeout_secs.seconds, hook_env(origin)) : sender
-      new(engine: Engine.new(request, options.http2?, names, backend, config), sender: sender,
+      # The macro OUTSIDE the hook, so the value it leaves is bound before the hook expands the
+      # request and signs it (see `MacroBackend`).
+      backend = MacroBackend.new(backend, request_macro) if request_macro
+      new(engine: Engine.new(request, options.http2?, names, backend, config, inapplicable, request_macro),
+        sender: sender,
         config: config, origin: origin, http2: options.http2?, request: request,
-        request_target: request_target, names: names, inapplicable: inapplicable)
+        request_target: request_target, names: names, inapplicable: inapplicable,
+        project_reports: project_reports, request_macro: request_macro)
     end
 
-    # Re-frame the head when `Env.expand_wire` changed the BODY's byte length.
-    #
-    # The expansion runs over the whole message, head and body, so a `$KEY` in a body
-    # resolves to a value that is almost never the token's own width — and the head still
-    # declares the PRE-expansion `Content-Length`. Every mine sent from this plan then wrote
-    # more (or fewer) body bytes than it announced: the origin read the declared prefix and
-    # the remainder sat in the connection as the front of the next request line, which is a
-    # request-smuggling primitive gori generated by itself out of a request nobody authored.
-    # It is invisible from the outside, because an origin reads exactly `Content-Length`
-    # bytes and never notices the rest — the run still reported `baseline: stable · 0 found ·
-    # 0 errors` over a conversation the target had 400'd.
-    #
-    # Every sibling builder already does this and the miner was the one that did not:
-    # `Repeater::Plan` runs `FlowRequest.resync_content_length_if_body_changed`,
-    # `Fuzz::Generator#emit` runs `ContentLength.sync` on every dispatched request, and
-    # `Env.expand_bindings` carries `shift_content_length` for the send-time half of the same
-    # collision. This is that missing pass, at the one seam all three mine surfaces
-    # (`gori run mine`, MCP `mine_start`, the TUI Miner tab) expand through.
-    #
-    # Gated on the body LENGTH changing, never run unconditionally:
-    #
-    #   * a request with no `$KEY` in its body — the overwhelmingly common one — comes back
-    #     byte-identical, so a deliberately-wrong `Content-Length: 99` over a 2-byte body
-    #     (a CL desync probe, the reason an operator mines that endpoint at all) survives.
-    #     `Fuzz::ContentLength.sync` is otherwise a RESYNC and would silently correct it.
-    #   * an expansion that only touched the HEAD leaves the body alone and is a no-op here.
-    #
-    # `Fuzz::ContentLength.sync` and not `FlowRequest.resync_content_length`: it is the
-    # byte-level one (no `String` round trip, so a binary body survives) and it is already
-    # what `Miner::Inject` re-frames every injected body with, so the baseline and the probes
-    # agree on the framing policy inside one run. `add_when_missing: false` — a request that
-    # declared no length never grows one, and `sync` leaves a `Transfer-Encoding` message
-    # alone for the same reason `Env.content_length_digits` refuses it.
-    #
-    # `Env.head_body_boundary` on BOTH sides on purpose: it is the shared answer to where a
-    # body starts and it accepts `\n\n` as well as `\r\n\r\n`, so a bare-LF head — what the
-    # TUI editors hold, and what `expand_wire` promotes to CRLF on the way out — is measured
-    # correctly rather than silently skipped.
-    private def self.resync_expanded_body(before : Bytes, after : Bytes) : Bytes
-      return after if body_size(before) == body_size(after)
-      Fuzz::ContentLength.sync(after, add_when_missing: false)
+    # The run's macro lane, or nil when it has none (or has it `off`). Refused with the words the
+    # operator can act on: no project to read the steps from; a step that cannot run
+    # (`Runner.build` names it); a request that can never carry what the steps produce.
+    private def self.build_request_macro(options : PlanOptions, outbound : Gori::Outbound,
+                                         request : Bytes) : RequestMacro::Lane?
+      spec = options.config.request_macro
+      return nil unless spec && spec.active?
+      store = options.project || raise RequestMacro::Error.new(
+        "a macro reads its steps from the project's Repeater sessions, and this run has no project attached — " \
+        "open one (--project / --db), or seed the run from a captured flow or a Repeater session")
+      runner = RequestMacro::Runner.build(spec, store, outbound,
+        overrides: options.overrides, verify: options.verify?)
+      runner.check_reachable!([String.new(request)], options.evidence?)
+      RequestMacro::Lane.new(spec, runner, "miner", "request")
     end
 
-    private def self.body_size(bytes : Bytes) : Int32
-      bytes.size - Env.head_body_boundary(bytes)
+    # The names the project's own traffic offers (#1352), read HERE — the one place a store is
+    # read for a mine, so every surface gets the same caps, secret policy and refusals. Header
+    # and cookie NAMES are not withheld (a name is not a value); an unknown location is refused
+    # by the source's own policy, and the run's location checks still decide which candidate is
+    # tested where (`Miner::Engine#skipped_names`).
+    private def self.resolve_project_names(options : PlanOptions, reports : Array(PayloadFrom::Report)) : Array(String)
+      options.project_names.flat_map do |spec|
+        unless spec.projection.param_names?
+          raise PayloadFrom::Error.new("a Miner name source reads parameter NAMES: use the param-names projection " \
+                                       "(got #{spec.projection.label} in #{spec.label.inspect})")
+        end
+        store = options.project || raise PayloadFrom::Error.new(
+          "payload source #{spec.label.inspect} reads the project's captured data, and this run has no project to read")
+        resolved = PayloadFrom.resolve(store, spec, drain_fts: options.project_drain_fts?)
+        reports << resolved.report
+        resolved.values
+      end
     end
 
     # ADD a `Content-Length` when the seed carries a body and declares none — once, here, so
@@ -318,7 +368,7 @@ module Gori::Miner
     # a `debug` parameter the origin reflects, the mine reported `baseline: stable · 0 found ·
     # 0 errors` and exit 0, while the same seed carrying `Content-Length: 5` found it.
     #
-    # This is `Fuzz::Config#add_content_length_when_missing`'s default-TRUE decision (#905) at
+    # This is `Fuzz::Config#update_content_length`'s add-when-missing decision (#905) at
     # the sibling builder that was missed. It is done to the SEED rather than left to
     # `Inject.apply`'s own `add_cl_when_missing` flag — which no surface can set, and which
     # `Baseline`'s plain stability rounds never reach — because the baseline sends `@base`
@@ -366,43 +416,29 @@ module Gori::Miner
     private def self.resolve_origin(options : PlanOptions) : Fuzz::Origin
       raw = options.target.presence || options.default_target.presence
       raise PlanError.new(PlanError::Reason::NoTarget, "no target origin") unless raw
-      # `deferred: nil` — a DIAL TUPLE cannot defer. Every other unresolved-name site skips a
-      # DECLARED binding because a send seam re-scans the same value with `Env.expand_bindings`
-      # later; this value is read ONCE, frozen into the plan, and never
-      # looked at again — `Fuzz::Sender`/`Discover::Sender` build their ConnPool on it and the
-      # Layer-1 `Outbound#check` verdict was already taken against it, so re-resolving per send
-      # would move the dial target out from under a scope decision. Deferring bought nothing
-      # anyway: a binding value is a token observed from a response, never a hostname, a port
-      # or an SNI. Left deferred it shipped as the literal `$SESSION` — every send failing DNS,
-      # and `Outbound.scope_url` asked about `https://$SESSION/a`, a URL no rule can match, so
-      # the run was refused as out-of-scope, naming the wrong gate.
-      refuse_unresolved(Env.unresolved(raw, deferred: nil))
-      url = Env.expand(raw)
-      scheme, host, port = Repeater::FlowRequest.parse_target(url)
-      raise PlanError.new(PlanError::Reason::BadTarget, "could not parse a host from #{url.inspect}", url) if host.empty?
-      Fuzz::Origin.new(scheme, host, port)
+      Fuzz::Origin.new(*Repeater::FlowRequest.dial_target(raw))
+    rescue e : Repeater::FlowRequest::DialTargetError
+      raise PlanError.new(e.unresolved? ? PlanError::Reason::UnresolvedEnv : PlanError::Reason::BadTarget, e.message.to_s, e.detail)
     end
 
-    # Refuse a run whose request or target still carries a token that resolves to
-    # nothing. `Env.expand` leaves an unregistered `$KEY` literal on purpose — right for
-    # a display path, wrong here, because the seven characters `$SESSION` then go out as
-    # a header value, the origin answers 401, and the results read as findings about the
-    # target rather than as a variable the operator never set (#519). This builder is the
-    # surface-independent chokepoint every mine surface expands through, so the check
-    # lives here once instead of in each of the three.
-    private def self.refuse_unresolved(names : Array(String)) : Nil
-      return if names.empty?
-      detail = Env.token_list(names)
-      raise PlanError.new(PlanError::Reason::UnresolvedEnv,
-        "unresolved env #{detail}", detail)
-    end
-
-    # Built-in names plus the optional user file, read HERE so a bad path surfaces as a
-    # PlanError at build time rather than from inside a worker fiber.
-    private def self.load_names(user_wordlist : String?) : Array(String)
+    # The candidate list, in the order it is TESTED (which is what a `max_requests`-capped run
+    # spends its budget on, so it is the likeliest-first order):
+    #
+    #   1. the explicit `seed_names` (`--name`, MCP `names`) — the operator's own guesses;
+    #   2. the names read from the project (`--payload-from '<QL> param-names'`) — vocabulary the
+    #      target has already used, ahead of any generic list;
+    #   3. the built-in list;
+    #   4. the user wordlist (`--wordlist`).
+    #
+    # De-duplicated with the first sighting keeping its place, so a name the project offers is
+    # tested at ITS position and not again where the built-in list has it. The user file is read
+    # HERE so a bad path surfaces as a PlanError at build time rather than from inside a worker
+    # fiber.
+    private def self.load_names(user_wordlist : String?, seeds : Array(String),
+                                project : Array(String) = [] of String) : Array(String)
       names = Wordlist.load(user_wordlist)
-      # `Wordlist.load` always prepends the compiled-in list, so an empty result means the
-      # candidate set is gone entirely — a run that would send nothing but a baseline.
+      front = (seeds + project).reject(&.strip.empty?)
+      names = (front + names).uniq unless front.empty?
       raise PlanError.new(PlanError::Reason::NoNames, "the candidate name list is empty") if names.empty?
       names
       # `IO::Error`, not `File::Error`: a missing path raises the latter, but a path that

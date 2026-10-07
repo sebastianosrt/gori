@@ -1,6 +1,6 @@
 +++
-title = "Installation"
-description = "Install gori via curl, Homebrew, the AUR, Nix, Docker, a pre-built binary, or from source."
+title = "Install gori"
+description = "Install gori via curl, Chocolatey, Homebrew, the AUR, Snap, Nix, Docker, a pre-built binary (Linux, macOS, Windows), or from source."
 weight = 10
 +++
 
@@ -14,11 +14,11 @@ macOS and Linux one-liner. Detects OS/arch, downloads the matching [GitHub Relea
 curl -fsSL https://gori.hahwul.com/install.sh | bash
 ```
 
-Installs under `/usr/local` when writable, otherwise `~/.local`. Override with `GORI_INSTALL_PREFIX`. After install, `gori update` self-updates the binary (or guides you through Homebrew / Snap / AUR when those channels own the install).
+Installs under `/usr/local` when writable, otherwise `~/.local`. Override with `GORI_INSTALL_PREFIX`. After install, `gori update` self-updates the binary (or guides you through Chocolatey / Homebrew / Snap / AUR when those channels own the install).
 
 ### If you hit a GitHub rate limit
 
-The installer asks the GitHub API which release is latest, and that API allows only **60 unauthenticated requests per hour per IP**, so behind shared CI or NAT egress it can answer `403`. Both the installer and `gori update` fall back to the rate-limit-free release redirect automatically, so they keep working; you should see a line like `resolved v0.4.0 via ... (no API call)`.
+The installer asks the GitHub API which release is latest, and that API allows only **60 unauthenticated requests per hour per IP**, so behind shared CI or NAT egress it can answer `403`. Both the installer and `gori update` fall back to the rate-limit-free release redirect automatically, so they keep working; you should see a line like `resolved v0.8.0 via ... (no API call)`.
 
 To use the authenticated 5000/hour limit instead, export a token first. Note that it has to be exported rather than prefixed onto `curl`, because the script runs in the piped `bash`, which would not inherit a `curl`-scoped variable:
 
@@ -39,9 +39,12 @@ curl -fsSL -o gori https://github.com/hahwul/gori/releases/latest/download/gori-
 
 # macOS arm64 / x86_64: a tarball holding gori plus its lib/
 curl -fsSL -o gori.tar.gz https://github.com/hahwul/gori/releases/latest/download/gori-osx-arm64.tar.gz
+
+# Windows x86_64: a self-contained .exe
+curl -fsSL -o gori.exe https://github.com/hahwul/gori/releases/latest/download/gori-windows-x86_64.exe
 ```
 
-The versioned names (`gori-v0.4.0-linux-x86_64`) stay published alongside them; use those when you want to pin a build.
+The versioned names (`gori-v0.8.0-linux-x86_64`) stay published alongside them; use those when you want to pin a build.
 
 Each release also publishes a `SHA256SUMS` listing every asset under both naming schemes. The installer and `gori update` check against it automatically; to verify a direct download yourself:
 
@@ -68,6 +71,16 @@ brew install gori
 
 The macOS bottle is a self-contained tarball with every linked dylib bundled next to the binary, and the Linux bottle is a static build. Neither pulls extra Homebrew dependencies.
 
+## Chocolatey (Windows)
+
+Install gori from the [Chocolatey community repository](https://community.chocolatey.org/packages/gori):
+
+```powershell
+choco install gori
+```
+
+The package ships the Windows x86_64 binary, available from v0.8.0. `gori update` recognizes a Chocolatey install and prints `choco upgrade gori -y`. Run that from an elevated shell with gori closed, since Windows will not replace a running `gori.exe`.
+
 ## Arch Linux (AUR)
 
 A binary package is published to the [AUR](https://aur.archlinux.org/packages/gori) for **x86_64**. Install it with your favorite AUR helper:
@@ -77,6 +90,16 @@ yay -S gori
 # or
 paru -S gori
 ```
+
+## Snap
+
+A strictly confined snap is published to the Snap Store with every release, for **Linux x86_64**:
+
+```bash
+sudo snap install gori
+```
+
+Strict confinement keeps the snap out of hidden directories in your home, so its `GORI_HOME` (settings, root CA, project databases) is `~/snap/gori/common` rather than `~/.gori`. `gori update` recognises a snap install and prints `snap refresh gori` (`gori update --exec` runs it when a `snap` command is on `PATH`).
 
 ## Nix
 
@@ -143,9 +166,29 @@ docker run --rm -it -v gori:/data -p 8070:8070 -e TZ=Asia/Seoul \
   ghcr.io/hahwul/gori --listen 0.0.0.0
 ```
 
+### Apple container
+
+Apple's [`container`](https://github.com/apple/container) (macOS 26+, Apple Silicon) runs the same image with the same flags. `-v gori:/data` creates the named volume for you, `-it` gives the TUI its terminal, and `-i` is all `gori mcp` needs:
+
+```bash
+container run --rm -it \
+  -v gori:/data \
+  -p 8070:8070 \
+  ghcr.io/hahwul/gori --listen 0.0.0.0
+```
+
+Every container also gets its own IP on the host's `vmnet` network, so publishing a port is optional: `container ls` prints the address, and pointing your client's proxy straight at `<ip>:8070` works just as well.
+
+`container build -f packaging/docker/Dockerfile -t gori:dev .` builds the image from source, and reads `packaging/docker/Dockerfile.dockerignore` — a Dockerfile-adjacent ignore list is the only one it looks for, so unlike BuildKit it never falls back to a `.dockerignore` at the context root. The builder runs in its own VM, which does not inherit the host's `HTTP_PROXY` and defaults to 2 CPUs and 2 GB (`container builder status`). A `--release` build of gori runs well over an hour at that size, so give it more first:
+
+```bash
+container builder stop
+container builder start --cpus 8 --memory 8g
+```
+
 ## Pre-built Binary
 
-Standalone binaries for macOS and Linux are attached to every [GitHub Release](https://github.com/hahwul/gori/releases/latest).
+Standalone binaries for macOS and Linux are attached to every [GitHub Release](https://github.com/hahwul/gori/releases/latest), and for Windows (x86_64) from v0.8.0. [Platform Support](/reference/platform-support/) lists what each platform's tier promises and the known gaps on Windows.
 
 | Platform | Asset |
 |----------|-------|
@@ -153,6 +196,7 @@ Standalone binaries for macOS and Linux are attached to every [GitHub Release](h
 | Linux arm64 | `gori-v*-linux-arm64` |
 | macOS Apple Silicon | `gori-v*-osx-arm64.tar.gz` |
 | macOS Intel | `gori-v*-osx-x86_64.tar.gz` |
+| Windows x86_64 | `gori-v*-windows-x86_64.exe` |
 
 ### Linux
 
@@ -175,6 +219,18 @@ sudo ln -sf /usr/local/opt/gori/gori /usr/local/bin/gori
 ```
 
 > The binaries are ad-hoc signed. If Gatekeeper blocks the download, clear the quarantine flag: `xattr -dr com.apple.quarantine /usr/local/opt/gori`. Installing via [Homebrew](#homebrew) avoids this.
+
+### Windows
+
+The Windows binary is statically linked: nothing else to install, and no DLL beside it. Rename it to `gori.exe` and put it in a folder on your `PATH`:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\Programs\gori" | Out-Null
+Move-Item gori-v*-windows-x86_64.exe "$env:LOCALAPPDATA\Programs\gori\gori.exe"
+# then add that folder to your user PATH (Settings → Environment Variables)
+```
+
+Run the TUI in Windows Terminal (or any console that speaks VT sequences, which every Windows 10 1809+ console does). `gori update` replaces the `.exe` in place. `GORI_HOME` defaults to `%USERPROFILE%\.gori`.
 
 ## Build from Source
 
@@ -217,13 +273,24 @@ shards build --release -Dwithout_native_codecs
 
 > If linking fails with undefined `BrotliDecoder*` symbols, `libbrotlidec` is missing or `pkg-config` cannot find it. Install `brotli` (see above) or use `-Dwithout_native_codecs`.
 
+### Building on Windows
+
+Crystal's Windows installer ships every library gori links except SQLite (with FTS5), Brotli and Zstd. Take those from [vcpkg](https://vcpkg.io/) as static libraries, and build with `--static` so the static C runtime matches them:
+
+```bash
+vcpkg install --triplet x64-windows-static "sqlite3[fts5]" brotli zstd
+export CRYSTAL_LIBRARY_PATH="$(crystal env CRYSTAL_LIBRARY_PATH);C:\vcpkg\installed\x64-windows-static\lib"
+shards install
+crystal build src/main.cr -o bin/gori.exe --release --static
+```
+
 ## Verify the Installation
 
 ```bash
 gori --version
 ```
 
-You should see `gori 0.4.0`.
+You should see `gori 0.8.0`.
 
 ## Run Without Installing
 

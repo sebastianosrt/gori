@@ -10,7 +10,14 @@ module Gori
       # strict:true additionally rejects any query with dropped/invalid terms
       # (default lenient — matching the historical bare-array behavior). A blank
       # query yields EMPTY (match all).
-      private def ql_filter_or_error(h, query : String?) : QL::Filter | Result
+      #
+      # Lenient is not SILENT: the terms it dropped are appended to `dropped`, and the caller
+      # writes them into its reply with `emit_ignored_terms`. `status:abc method:POST` ran as
+      # `method:POST` and came back as every POST with nothing on it, while `gori run history`
+      # printed "ignored … result is BROADER" for the same query — and this transport's caller
+      # is the one with no stderr to read. A required argument, not an optional one, so a new
+      # read tool cannot call this and forget to pass the warning on.
+      private def ql_filter_or_error(h, query : String?, dropped : Array(String)) : QL::Filter | Result
         return QL::EMPTY if query.nil? || query.strip.empty?
         # The project's scope, so a `scope:in`/`scope:out` term compiles instead of being
         # dropped. Read per call rather than cached: an agent (or a peer process) can add a
@@ -28,11 +35,24 @@ module Gori
         return ql_error(query) if QL.reject_empty?(query, filter)
         bad = QL.invalid_regex_terms(query)
         return ql_invalid_regex_error(query, bad) unless bad.empty?
-        if bool_arg(h, "strict", false)
-          analysis = QL.analyze(query, scope: lens)
-          return ql_strict_error(analysis) unless analysis.clean?
-        end
+        # The same lens the query compiled with, or the diagnosis disagrees with it about a
+        # `scope:` term (see `QL.analyze`).
+        analysis = QL.analyze(query, scope: lens)
+        return ql_strict_error(analysis) if bool_arg(h, "strict", false) && !analysis.clean?
+        dropped.concat(analysis.ignored)
         filter
+      end
+
+      # The terms `ql_filter_or_error` dropped, as two fields on a read tool's reply — the list,
+      # and the sentence that says what it means. Written only when there is something to say,
+      # so a clean query's reply is byte-for-byte what it was.
+      private def emit_ignored_terms(j : JSON::Builder, dropped : Array(String)) : Nil
+        return if dropped.empty?
+        j.field("ignored_terms") { j.array { dropped.each { |t| j.string t } } }
+        j.field "ignored_terms_note",
+          "these query terms were unrecognized or invalid and were DROPPED, so the result is " \
+          "BROADER than the query asks for — fix them (ql_explain shows why), or pass strict:true " \
+          "to refuse such a query instead"
       end
 
       # Refuse a query naming a `field:`/`field~` QL does not implement, instead of running the
@@ -63,6 +83,9 @@ module Gori
         msg =
           if near
             "unknown query field `#{use.name}#{op}` — did you mean `#{near}#{op}`? (#{tail})"
+          elsif FilterAst::ID_FIELDS.includes?(use.name.downcase)
+            "unknown query field `#{use.name}#{op}` — QL has no `#{use.name}:` field; " \
+            "use the 'ids' argument to select flows by id (#{tail})"
           else
             "unknown query field `#{use.name}#{op}` — QL has no such field. " \
             "Fields: #{QL::FIELDS.join(' ')} (call ql_reference; #{tail})"
@@ -137,10 +160,7 @@ module Gori
             j.field("unknown_fields") do
               j.array do
                 unknown.each do |n|
-                  j.object do
-                    j.field "name", n
-                    j.field "did_you_mean", QL.suggest_field(n)
-                  end
+                  {name: n, did_you_mean: QL.suggest_field(n)}.to_json(j)
                 end
               end
             end
@@ -166,11 +186,22 @@ module Gori
                            "empty query to get the most recent rows"
                 end
                 unless unknown.empty?
-                  named = unknown.map { |n| (near = QL.suggest_field(n)) ? "`#{n}:` (did you mean `#{near}:`?)" : "`#{n}:`" }
+                  named = unknown.map do |n|
+                    if near = QL.suggest_field(n)
+                      "`#{n}:` (did you mean `#{near}:`?)"
+                    elsif FilterAst::ID_FIELDS.includes?(n.downcase)
+                      "`#{n}:` (use the 'ids' argument to select flows by id)"
+                    else
+                      "`#{n}:`"
+                    end
+                  end
                   j.string "QL has no such field: #{named.join(", ")} — the whole token is " \
                            "searched as literal TEXT, which is why it matches nothing; " \
                            "list_history / list_sitemap / probe_scan REFUSE it (QUERY_SYNTAX) " \
                            "unless you pass lenient:true"
+                end
+                if hint = QL.missing_colon_hint(query)
+                  j.string hint
                 end
                 j.string "dropped (broadens results): #{a.ignored.join(", ")}" unless a.ignored.empty?
                 unless a.invalid_regex.empty?
@@ -181,7 +212,7 @@ module Gori
                 if scope_unconfigured
                   j.string "no scope rules are configured, so nothing is in scope: `scope:in` and " \
                            "`scope:out` both match NOTHING here (and a negated `-scope:in` matches " \
-                           "every flow) — add scope rules with add_scope_rule, or drop the term"
+                           "every flow) — #{add_scope_rule_hint}, or drop the term"
                 end
                 if scope_unbound
                   j.string "no project is selected, so the `scope:` term was compiled without one: " \
@@ -196,14 +227,18 @@ module Gori
 
       @[Tool("ql_reference", unbound: true)]
       private def ql_reference : Result
-        Result.new(JSON.build { |j| j.object { j.field "reference", QL::REFERENCE } })
+        Result.new({reference: QL::REFERENCE}.to_json)
       end
 
       private def ql_error(query : String) : Result
-        err(
-          "invalid query #{query.inspect}: did not match any field " \
-          "(call ql_reference; e.g. host:example.com status:>=500 method:POST)",
-          "QUERY_SYNTAX", field: "query")
+        msg =
+          if reason = QL.reject_empty_reason(query)
+            "invalid query #{query.inspect}: #{reason} (call ql_reference)"
+          else
+            "invalid query #{query.inspect}: did not match any field " \
+            "(call ql_reference; e.g. host:example.com status:>=500 method:POST)"
+          end
+        err(msg, "QUERY_SYNTAX", field: "query")
       end
 
       # The tools/list schemas for the QL reference tools, kept beside the handlers that
@@ -217,7 +252,7 @@ module Gori
 
         tool j, "ql_explain",
           "Diagnose a gori QL query WITHOUT running it: which terms were applied, which " \
-          "were silently dropped (broadening results), which regex terms are invalid " \
+          "would be dropped (broadening results), which regex terms are invalid " \
           "(match nothing), the compiled SQL, and warnings. Use to debug a query that " \
           "returns too many or zero rows. `matches_everything` means every term was dropped " \
           "and the query narrows nothing; `unknown_fields` names a `field:` QL does not " \

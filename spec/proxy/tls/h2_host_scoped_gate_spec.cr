@@ -136,7 +136,7 @@ end
 
 private def gate_pipe(rewriter : Gori::Proxy::HeadRewriter?,
                       extractor : Gori::Proxy::ResponseExtract? = nil) : {Gori::Proxy::H2::HeadRewrite, Gori::Proxy::H2::Assembler}
-  assembler = Gori::Proxy::H2::Assembler.new(GateSink.new, "api.example.com", 443, 1_i64)
+  assembler = Gori::Proxy::H2::Assembler.new(GateSink.new, "api.example.com", 443)
   {Gori::Proxy::H2::HeadRewrite.new("out", rewriter, assembler, "api.example.com", extractor), assembler}
 end
 
@@ -183,7 +183,6 @@ describe "h2 downgrade gate, host-scoped (#526)" do
     it "scopes the short-circuit question exactly as `short_circuit` itself is scoped" do
       with_gate_rules do |rules|
         rules.add(SCOPED_REQ, SCOPED_HEAD, "/admin", "403 Forbidden", op: SCOPED_SC, host: "alpha.test")
-        rules.short_circuits?.should be_true
         rules.short_circuits_for_host?("alpha.test").should be_true
         rules.short_circuits_for_host?("127.0.0.1").should be_false
         # ...and that is precisely the reachability `short_circuit` has for those two hosts,

@@ -3,6 +3,7 @@ require "../../store"
 require "../../session_slots"
 require "../../discover/headers"
 require "../../session_from_flow"
+require "../../session_refresh"
 
 module Gori
   module MCP
@@ -62,17 +63,16 @@ module Gori
                                    "overlay, global bindings). Pick one with set_active_session_slot." if active.nil?
             j.field("slots") do
               j.array do
-                registry.slots.each { |s| emit_session_slot(j, s, include_sensitive, active) }
+                registry.slots.each { |s| emit_session_slot(j, s, include_sensitive, active, refresh_status: true) }
               end
             end
           end
         end)
       end
 
-      @[Tool("create_session_slot", gated: true, agent_action: true)]
+      @[Tool("create_session_slot", gated: true, agent_action: true, permission: "write")]
       private def create_session_slot(h) : Result
-        name = str(h, "name").try(&.strip)
-        return err("missing required 'name'", "INVALID_ARGUMENT", field: "name") if name.nil? || name.empty?
+        name = required_str(h, "name")
         registry = fresh_slots
         # Deterministic and un-retryable, so INVALID_ARGUMENT rather than PROJECT_BUSY — the
         # #414 shape: an agent that trusts `retryable` loops forever on a duplicate.
@@ -87,9 +87,12 @@ module Gori
         end
         built = slot_set_headers_or_flow(h)
         return built if built.is_a?(Result)
-        set_headers, sources = built
+        set_headers, sources, literal_headers = built
+        refresh = slot_refresh_args(h, [] of Int64, Gori::SessionSlot::RefreshBefore.off)
+        return refresh if refresh.is_a?(Result)
         slot = Gori::SessionSlot.new(name, set_headers, str_list(h, "remove_headers").map(&.strip).reject(&.empty?),
-          bool_arg(h, "baseline", false), str_list(h, "rules").map(&.strip).reject(&.empty?))
+          bool_arg(h, "baseline", false), str_list(h, "rules").map(&.strip).reject(&.empty?),
+          literal_headers, refresh[0], refresh[1])
         unless registry.add(slot)
           return busy("session slot NOT created (store busy or unwritable); no slot was added")
         end
@@ -100,20 +103,72 @@ module Gori
       end
 
       # The overlay a `create_session_slot` call asked for, plus one line per SOURCE when it
-      # was read off a flow. Two spellings and they are exclusive: `set_headers` is the caller
-      # dictating the overlay, `flow_id` is gori BUILDING it from a captured login exchange
-      # (`Gori::SessionFromFlow` — the same reader `gori run session from-flow` uses, so the
-      # two surfaces cannot build different identities from one flow).
+      # was read off a flow. There are three spellings and they are exclusive: `set_headers` is
+      # the caller dictating the overlay, `flow_id` builds it from a captured login response,
+      # and `from_request_flow_id` + `copy_headers` copies selected headers from a captured
+      # request. Both flow forms use `Gori::SessionFromFlow`, so the surfaces cannot build
+      # different identities from one flow.
       #
       # Passing both is refused rather than merged: an agent that sent both has one of the two
       # in mind, and silently picking either is how it ends up sending a credential it did not
       # choose.
-      private def slot_set_headers_or_flow(h) : {Array({String, String}), Array(String)} | Result
-        flow_id = optional_int_arg(h, "flow_id")
+      private def slot_set_headers_or_flow(h) : {Array({String, String}), Array(String), Array(String)} | Result
+        has_response_flow = present?(h, "flow_id")
+        has_request_flow = present?(h, "from_request_flow_id")
+        has_copy_headers = present?(h, "copy_headers")
+        has_set_headers = present?(h, "set_headers")
+        if conflict = slot_source_conflict(has_response_flow, has_request_flow, has_copy_headers, has_set_headers)
+          return conflict
+        end
+        return slot_request_flow(h) if has_request_flow
+        slot_response_or_manual(h)
+      end
+
+      private def slot_source_conflict(response_flow : Bool, request_flow : Bool,
+                                       copy_headers : Bool, set_headers : Bool) : Result?
+        return err("pass either 'from_request_flow_id' or 'flow_id', not both — the former " \
+                   "copies request headers and the latter builds an overlay from the response",
+          "INVALID_ARGUMENT", field: "from_request_flow_id") if request_flow && response_flow
+        return err("pass either 'copy_headers' with 'from_request_flow_id' or 'flow_id', not both",
+          "INVALID_ARGUMENT", field: "copy_headers") if copy_headers && response_flow
+        return err("pass either 'from_request_flow_id' with 'copy_headers' or 'set_headers', not both",
+          "INVALID_ARGUMENT", field: "set_headers") if request_flow && set_headers
+        return err("pass either 'copy_headers' with 'from_request_flow_id' or 'set_headers', not both",
+          "INVALID_ARGUMENT", field: "copy_headers") if copy_headers && set_headers
+        return err("'from_request_flow_id' and 'copy_headers' must be supplied together",
+          "INVALID_ARGUMENT", field: request_flow ? "copy_headers" : "from_request_flow_id") if request_flow != copy_headers
+        nil
+      end
+
+      private def slot_request_flow(h) : {Array({String, String}), Array(String), Array(String)} | Result
+        flow_id = slot_int_arg(h, "from_request_flow_id")
+        return flow_id if flow_id.is_a?(Result)
+        return err("'from_request_flow_id' must be an integer", "INVALID_ARGUMENT",
+          field: "from_request_flow_id") unless flow_id
+        # Preserve blank entries so the shared request-header grammar can refuse the whole
+        # selection atomically. Dropping one here would make ["Authorization", ""] succeed
+        # with only the first credential, which is a different request than the caller named.
+        copy_headers = str_list(h, "copy_headers").map(&.strip)
+        detail = store.get_flow(flow_id)
+        return not_found("no flow ##{flow_id} in this project (see list_history)") unless detail
+        drafted = Gori::SessionFromFlow.draft_request(detail, copy_headers)
+        if refusal = drafted.as?(Gori::SessionFromFlow::Refusal)
+          # Deterministic: the SAME flow and requested header list refuse the same way next
+          # time, so this must not be retryable — the #414 shape again.
+          return err("flow ##{flow_id} — #{refusal.message}", refusal.code,
+            field: "copy_headers")
+        end
+        draft = drafted.as(Gori::SessionFromFlow::Draft)
+        {draft.set_headers, draft.sources, draft.literal_headers}
+      end
+
+      private def slot_response_or_manual(h) : {Array({String, String}), Array(String), Array(String)} | Result
+        flow_id = slot_int_arg(h, "flow_id")
+        return flow_id if flow_id.is_a?(Result)
         unless flow_id
           headers = session_set_headers(h)
           return headers if headers.is_a?(Result)
-          return {headers, [] of String}
+          return {headers, [] of String, [] of String}
         end
         if present?(h, "set_headers")
           return err("pass either 'flow_id' or 'set_headers', not both — 'flow_id' BUILDS the " \
@@ -129,30 +184,38 @@ module Gori
           return err("flow ##{flow_id} — #{refusal.message}", refusal.code, field: "flow_id")
         end
         draft = drafted.as(Gori::SessionFromFlow::Draft)
-        {draft.set_headers, draft.sources}
+        {draft.set_headers, draft.sources, draft.literal_headers}
+      end
+
+      private def slot_int_arg(h, key : String) : Int64? | Result
+        optional_int_arg(h, key)
+      rescue ex : Gori::Error
+        err(ex.message || "invalid '#{key}' (expected an integer)",
+          "INVALID_ARGUMENT", field: key)
       end
 
       # A partial update: an argument left out keeps what the slot already has. That is the
       # shape an agent needs to rotate ONE cookie without having to re-send the rule list it
       # never read (and would blank).
-      @[Tool("update_session_slot", gated: true, agent_action: true)]
+      @[Tool("update_session_slot", gated: true, agent_action: true, permission: "write")]
       private def update_session_slot(h) : Result
-        name = str(h, "name").try(&.strip)
-        return err("missing required 'name'", "INVALID_ARGUMENT", field: "name") if name.nil? || name.empty?
+        name = required_str(h, "name")
         registry = fresh_slots
         current = registry.find(name)
         return not_found("no session slot named '#{name}' (see list_session_slots)") unless current
-        renamed = (str(h, "new_name").try(&.strip)).presence
-        if renamed && renamed != name && (taken = registry.name_clash(renamed, except: name))
-          return err("another session slot is already called '#{taken}' (names are compared " \
-                     "case-insensitively)", "INVALID_ARGUMENT", field: "new_name")
-        end
-        set_headers = h.has_key?("set_headers") ? session_set_headers(h) : current.set_headers
-        return set_headers if set_headers.is_a?(Result)
-        updated = Gori::SessionSlot.new(renamed || name, set_headers,
-          slot_names_arg(h, "remove_headers", current.remove_headers),
-          bool_arg(h, "baseline", current.baseline?),
-          slot_names_arg(h, "rules", current.rules))
+        target = update_slot_target(registry, name, h)
+        return target if target.is_a?(Result)
+        target_name = target[0]
+        headers = update_slot_headers(h, current)
+        return headers if headers.is_a?(Result)
+        set_headers, literal_headers = headers
+        refresh = slot_refresh_args(h, current.refresh, current.refresh_before)
+        return refresh if refresh.is_a?(Result)
+        updated = current.copy_with(name: target_name, set_headers: set_headers,
+          remove_headers: slot_names_arg(h, "remove_headers", current.remove_headers),
+          baseline: bool_arg(h, "baseline", current.baseline?),
+          rules: slot_names_arg(h, "rules", current.rules), literal_headers: literal_headers,
+          refresh: refresh[0], refresh_before: refresh[1])
         unless registry.update(name, updated)
           return busy("session slot NOT updated (store busy or unwritable); it is unchanged")
         end
@@ -160,10 +223,25 @@ module Gori
         Result.new(JSON.build { |j| emit_session_slot(j, registry.find(updated.name) || updated, false, registry.active_name) })
       end
 
-      @[Tool("delete_session_slot", gated: true, agent_action: true)]
+      private def update_slot_target(registry : Gori::SessionSlots, name : String, h) : {String} | Result
+        renamed = (str(h, "new_name").try(&.strip)).presence
+        if renamed && renamed != name && (taken = registry.name_clash(renamed, except: name))
+          return err("another session slot is already called '#{taken}' (names are compared " \
+                     "case-insensitively)", "INVALID_ARGUMENT", field: "new_name")
+        end
+        {renamed || name}
+      end
+
+      private def update_slot_headers(h, current : Gori::SessionSlot) : {Array({String, String}), Array(String)} | Result
+        return {current.set_headers, current.literal_headers} unless slot_list_given?(h, "set_headers")
+        set_headers = session_set_headers(h)
+        return set_headers if set_headers.is_a?(Result)
+        {set_headers, [] of String}
+      end
+
+      @[Tool("delete_session_slot", gated: true, agent_action: true, permission: "write")]
       private def delete_session_slot(h) : Result
-        name = str(h, "name").try(&.strip)
-        return err("missing required 'name'", "INVALID_ARGUMENT", field: "name") if name.nil? || name.empty?
+        name = required_str(h, "name")
         registry = fresh_slots
         return not_found("no session slot named '#{name}' (see list_session_slots)") unless registry.find(name)
         unless registry.remove(name)
@@ -172,18 +250,12 @@ module Gori
         # Deleting the ACTIVE slot deactivates it (`SessionSlots#save`), which is a behaviour
         # change the caller has to see: the next send goes out as captured, not as the slot it
         # last selected.
-        Result.new(JSON.build do |j|
-          j.object do
-            j.field "name", name
-            j.field "deleted", true
-            j.field "active", registry.active_name
-          end
-        end)
+        Result.new({name: name, deleted: true, active: registry.active_name}.to_json)
       end
 
       # The send context for THIS server process. `name: null` (or omitted) deactivates, which
       # is `as-captured`: no header overlay, `$NAME` out of the global binding table.
-      @[Tool("set_active_session_slot", gated: true, agent_action: true)]
+      @[Tool("set_active_session_slot", gated: true, agent_action: true, permission: "write")]
       private def set_active_session_slot(h) : Result
         registry = fresh_slots
         raw = str(h, "name").try(&.strip)
@@ -208,11 +280,79 @@ module Gori
         end)
       end
 
+      # `refresh` (Repeater session ids, in order) and `refresh_before` (`off` | `jwt-exp` |
+      # `ttl=10m`), each ABSENT-keeps like the name lists above. Every id must name a Repeater
+      # session that exists now: a typo refused here is cheaper than a step that fails at the
+      # first automatic refresh in the middle of a sweep. Deterministic, so INVALID_ARGUMENT.
+      private def slot_refresh_args(h, ids : Array(Int64),
+                                    policy : Gori::SessionSlot::RefreshBefore) : {Array(Int64), Gori::SessionSlot::RefreshBefore} | Result
+        if slot_list_given?(h, "refresh")
+          ids = begin
+            id_list_arg(h, "refresh")
+          rescue ex : Gori::Error
+            return err(ex.message || "invalid 'refresh'", "INVALID_ARGUMENT", field: "refresh")
+          end
+          if bad = ids.find { |id| id <= 0 || store.get_repeater(id).nil? }
+            return err("no Repeater session ##{bad} in this project (see get_repeater_context / " \
+                       "create_repeater) — 'refresh' lists the Repeater sessions that re-authenticate " \
+                       "the slot, in order", "INVALID_ARGUMENT", field: "refresh")
+          end
+        end
+        if (raw = str(h, "refresh_before")) && !raw.strip.empty?
+          policy = Gori::SessionSlot::RefreshBefore.parse?(raw) ||
+                   return err("'refresh_before' #{raw.inspect} is not a policy — use \"off\", " \
+                              "\"jwt-exp\" or \"ttl=<n>[s|m|h]\" (e.g. \"ttl=10m\")",
+                     "INVALID_ARGUMENT", field: "refresh_before")
+        end
+        {ids, policy}
+      end
+
+      # Run a slot's refresh steps now (#1233). The values it rebinds live in THIS server
+      # process — the same per-process table every other tool here resolves against — and the
+      # reply carries binding NAMES, never a value. Every step is recorded in History (source
+      # `refresh`) and the outcome in the event log.
+      #
+      # `allow_unscoped` gates the STEPS, strictly by default (`Outbound.agent`), exactly as it
+      # gates `send_request`. A deterministic refusal (no such slot, no steps) is
+      # INVALID_ARGUMENT; a refresh that RAN and failed is a normal reply with `ok: false`, since
+      # the step's answer is the result the caller asked for.
+      @[Tool("refresh_session_slot", gated: true, agent_action: true, env_refresh: true, permission: "send")]
+      private def refresh_session_slot(h) : Result
+        name = required_str(h, "name")
+        registry = fresh_slots
+        slot = registry.find(name)
+        return not_found("no session slot named '#{name}' (see list_session_slots)") unless slot
+        if slot.refresh.empty?
+          return err("session slot '#{name}' has no refresh steps — set them with update_session_slot " \
+                     "{refresh: [repeater ids, in order]}", "INVALID_ARGUMENT", field: "name")
+        end
+        runner = @refresher || return err("no project is bound", "INVALID_ARGUMENT")
+        outcome = runner.refresh(name, agent_outbound(Scope.load(store), bool_arg(h, "allow_unscoped", false)))
+        Result.new(JSON.build { |j| emit_refresh_outcome(j, outcome) })
+      end
+
+      private def emit_refresh_outcome(j : JSON::Builder, o : Gori::SessionRefresh::Outcome) : Nil
+        j.object do
+          o.json_fields(j)
+          j.field "note", "values live in THIS server process only; a TUI or another gori keeps its own"
+        end
+      end
+
+      # Whether a list argument was GIVEN. A JSON null or an empty string is not: a client that
+      # fills every declared property sends `rules: null` beside the one field it means, and
+      # reading that as "clear" turned an identity into as-captured — an authorize run or an
+      # active send then went out unauthenticated and reported nothing wrong. `null` is absent
+      # everywhere else on this surface (`present?`), and the CLI needs an explicit
+      # `--clear-*`; here the explicit clear is `[]`.
+      private def slot_list_given?(h, key : String) : Bool
+        present?(h, key) && h[key].as_s? != ""
+      end
+
       # A name-list argument that is ABSENT rather than empty keeps what the slot already has —
       # the difference an agent rotating one cookie depends on, since it never read the rule
       # list it would otherwise blank. An explicit `[]` is a clear.
       private def slot_names_arg(h, key : String, current : Array(String)) : Array(String)
-        return current unless h.has_key?(key)
+        return current unless slot_list_given?(h, key)
         str_list(h, key).map(&.strip).reject(&.empty?)
       end
 
@@ -230,7 +370,20 @@ module Gori
         if arr = raw.as_a?
           arr.each do |entry|
             if o = entry.as_h?
-              n = o["name"]?.try(&.as_s?).try(&.strip) || ""
+              # An object entry with no `name` is the OTHER object an agent reaches for — the
+              # `{"Cookie": "session=…"}` map, which this surface does not take here. Refused
+              # by its own shape rather than folded into `": "`: that empty pair is then what
+              # the rejection quotes back, and the caller cannot find in its own call an entry
+              # it never wrote.
+              # `presence` closes the same hole the guard opens on: an empty or whitespace-only
+              # name folds to the very `": value"` this refusal exists to stop quoting back.
+              n = o["name"]?.try(&.as_s?).try(&.strip).presence
+              unless n
+                return err("'set_headers' entry #{entry.to_json} names no header — an object " \
+                           "entry is {\"name\": \"Cookie\", \"value\": \"session=…\"}, or pass " \
+                           "the line \"Cookie: session=…\" as a string",
+                  "INVALID_ARGUMENT", field: "set_headers")
+              end
               v = o["value"]?.try(&.as_s?) || ""
               lines << "#{n}: #{v}"
             else
@@ -252,7 +405,8 @@ module Gori
 
       private def emit_session_slot(j : JSON::Builder, slot : Gori::SessionSlot,
                                     include_sensitive : Bool, active : String?,
-                                    sources : Array(String) = [] of String) : Nil
+                                    sources : Array(String) = [] of String,
+                                    refresh_status : Bool = false) : Nil
         j.object do
           j.field "name", slot.name
           # Where each header came from, when the overlay was READ off a flow rather than
@@ -276,6 +430,24 @@ module Gori
           end
           j.field("remove_headers") { j.array { slot.remove_headers.each { |n| j.string n } } }
           j.field("rules") { j.array { slot.rules.each { |n| j.string n } } }
+          # The refresh half (#1233). A NEGATIVE id is a step whose Repeater session was
+          # deleted — it refuses to run until it is removed.
+          j.field("refresh") { j.array { slot.refresh.each { |id| j.number id } } }
+          j.field("refresh_steps") { j.array { Gori::SessionRefresh.step_labels(store, slot).each { |l| j.string l } } }
+          j.field "refresh_before", slot.refresh_before.to_s
+          emit_refresh_status(j, slot) if refresh_status
+        end
+      end
+
+      # THIS process's refresh state for the slot: refreshing now, the last outcome (names,
+      # never values), and whether automatic refresh has switched itself off.
+      private def emit_refresh_status(j : JSON::Builder, slot : Gori::SessionSlot) : Nil
+        return unless (runner = @refresher) && slot.refreshable?
+        st = runner.status(slot.name)
+        j.field "refreshing", st.refreshing
+        j.field "auto_refresh_off", st.auto_off if st.auto_off
+        if last = st.last
+          j.field("last_refresh") { emit_refresh_outcome(j, last) }
         end
       end
 
@@ -298,19 +470,28 @@ module Gori
         tool j, "create_session_slot",
           "Create a session slot (a named identity). A slot that sets and strips nothing is " \
           "'as captured' — the no-overlay baseline. Values may reference a binding: " \
-          "\"Bearer $SESSION\" resolves against THIS slot's own table when it claims the rule. " \
+          "\"Bearer $BIND.SESSION\" (\"Bearer $SESSION\" under the legacy bare syntax) resolves " \
+          "against THIS slot's own table when it claims the rule. " \
           "Pass 'flow_id' instead of 'set_headers' to BUILD the overlay from a captured login " \
           "exchange: gori copies the response's Set-Cookie pairs into one Cookie header and its " \
           "Authorization (or a top-level access_token/token/id_token string in a JSON body, as a " \
-          "Bearer token). That overlay is LITERAL — the bytes that login handed back — and does " \
-          "NOT re-authenticate; a token that ROTATES belongs on the extract-rule path " \
-          "(create_extract_rule) instead." do |s|
+          "Bearer token). That overlay is a LITERAL snapshot of the response bytes: it does " \
+          "NOT re-authenticate by itself — give the slot 'refresh' steps (Repeater sessions that " \
+          "log in) for that. The slot is project-wide and its active overlay " \
+          "can affect every outbound request from this server, so consider the blast radius. " \
+          "For a token that ROTATES, use the extract-rule path (create_extract_rule) instead. " \
+          "Pass 'from_request_flow_id' together with 'copy_headers' to copy selected headers " \
+          "from the captured request; that is also a literal snapshot and never auto-reauthenticates." do |s|
           s.field "name", strprop("slot name (unique in the project; how every surface refers to it)"), required: true
-          s.field "flow_id", intprop("build the overlay from THIS captured flow's login response (see list_history); mutually exclusive with set_headers")
+          s.field "flow_id", intprop("build a literal overlay from THIS captured flow's login response (see list_history); mutually exclusive with set_headers and the request-source mode")
           s.field "set_headers", session_headers_prop
+          s.field "from_request_flow_id", intprop("copy selected request headers from THIS captured flow (see list_history); must be supplied with copy_headers and is mutually exclusive with flow_id and set_headers")
+          s.field "copy_headers", strarrprop("request header names to copy verbatim from from_request_flow_id; must be supplied with from_request_flow_id (values stay redacted in replies). Content-Length, Transfer-Encoding and Host are refused — a slot is applied to a message with a different body and target")
           s.field "remove_headers", strarrprop("header names to STRIP before sending (e.g. [\"Cookie\",\"Authorization\"] for an anonymous identity)")
           s.field "rules", strarrprop("extract-rule binding NAMES whose observed values belong to this slot instead of the global table (see list_extract_rules)")
           s.field "baseline", boolprop("make this the authorize BASELINE every other slot is judged against (exactly one slot holds it)")
+          s.field "refresh", refresh_ids_prop
+          s.field "refresh_before", refresh_before_prop
         end
 
         tool j, "update_session_slot",
@@ -322,6 +503,22 @@ module Gori
           s.field "remove_headers", strarrprop("replace the header names this slot strips")
           s.field "rules", strarrprop("replace the extract-rule binding names this slot claims")
           s.field "baseline", boolprop("make this the authorize baseline")
+          s.field "refresh", refresh_ids_prop
+          s.field "refresh_before", refresh_before_prop
+        end
+
+        tool j, "refresh_session_slot",
+          "Run a session slot's REFRESH steps now: its Repeater sessions, in order (e.g. csrf-fetch " \
+          "then login), each response going through the slot's own extract rules so the slot's " \
+          "bindings are rebound. Steps resolve THIS slot's $BIND values and carry no slot header " \
+          "overlay. Each step is recorded in History (source refresh) and the outcome in the event " \
+          "log. Returns ok/failed_step/status and the binding NAMES rebound — never a value. The " \
+          "values live in this server process only. A slot with refresh_before set also refreshes " \
+          "on its own before a send that goes out as it; a failed automatic refresh cools down " \
+          "#{Gori::SessionRefresh::COOLDOWN.total_seconds.to_i}s and stops after " \
+          "#{Gori::SessionRefresh::FAILURE_LIMIT} failures until a manual refresh succeeds." do |s|
+          s.field "name", strprop("the slot to refresh (see list_session_slots)"), required: true
+          s.field "allow_unscoped", boolprop("send the steps even when their host is outside the project scope (default false)")
         end
 
         tool j, "delete_session_slot",
@@ -333,7 +530,8 @@ module Gori
         tool j, "set_active_session_slot",
           "Choose the SEND CONTEXT for this server: the slot whose header overlay is applied to " \
           "every outbound request (send_request, send_websocket, repeater, fuzz/mine/sequence/" \
-          "discover) and whose binding table $NAME resolves against. Pass name:null for " \
+          "discover) and whose binding table a $BIND.NAME token (bare syntax: $NAME) resolves " \
+          "against. Pass name:null for " \
           "as-captured (no overlay). Held in memory by THIS process only — it is never persisted, " \
           "so a new connection starts as-captured." do |s|
           s.field "name", strprop("slot name, or null/omitted for as-captured (no overlay)")
@@ -343,6 +541,18 @@ module Gori
       # `set_headers` accepts both shapes a client reaches for: the {name, value} objects the
       # rest of this surface uses, and the "Name: value" lines an operator copies out of a
       # request. Declaring both beats refusing one an LLM will send anyway.
+      private def refresh_ids_prop : JSON::Any
+        id_list_prop("Repeater session ids that RE-AUTHENTICATE this slot, in the order they run " \
+                     "(e.g. [csrf-fetch id, login id]). Omit to keep the current list; [] clears it")
+      end
+
+      private def refresh_before_prop : JSON::Any
+        strprop("when the slot refreshes on its own before a send: \"off\" (default), \"jwt-exp\" " \
+                "(a JWT bound in the slot is within #{Gori::SessionSlot::RefreshBefore::SKEW.total_seconds.to_i}s " \
+                "of its exp) or \"ttl=10m\" (that long since the last successful refresh, or since its oldest binding). Acts before a " \
+                "send, never on a response: a 401 is never retried")
+      end
+
       private def session_headers_prop : JSON::Any
         desc = "headers this slot UPSERTS (replace if present, append if absent). Either " \
                "[{\"name\":\"Cookie\",\"value\":\"session=…\"}] or [\"Cookie: session=…\"]. " \

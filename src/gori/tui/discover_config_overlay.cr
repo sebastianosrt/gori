@@ -41,9 +41,10 @@ module Gori::Tui
     ROW_CONC    =  6
     ROW_EXT     =  7
     ROW_KEEP    =  8
-    ROW_HEADERS =  9
-    ROW_START   = 10
-    ROWS        = 11
+    ROW_ASSETS  =  9
+    ROW_HEADERS = 10
+    ROW_START   = 11
+    ROWS        = 12
 
     getter seed : DiscoverSeed
     # Custom request headers ({name, value}) prefilled from a History flow and/or
@@ -65,6 +66,7 @@ module Gori::Tui
       @maxreq_idx = 0
       @ext = false
       @keep_alive = true
+      @assets = false
       @selected = 0
       restore_saved_prefs
     end
@@ -82,14 +84,10 @@ module Gori::Tui
       @seed.choices[@target_idx][1]
     end
 
-    def selected_path : String
-      @seed.choices[@target_idx][0]
-    end
-
     # Remember the last confirmed overlay for the next Sitemap/History discovery.
     def save_prefs : Bool
       Settings.save_discover_prefs(CONTAINMENTS[@contain_idx].label, DEPTHS[@depth_idx],
-        CONCS[@conc_idx], @spider, @bruteforce, @ext, @keep_alive)
+        CONCS[@conc_idx], @spider, @bruteforce, @ext, @keep_alive, @assets)
     end
 
     private def restore_saved_prefs : Nil
@@ -98,6 +96,7 @@ module Gori::Tui
       @bruteforce = Settings.discover_bruteforce?
       @ext = Settings.discover_extensions?
       @keep_alive = Settings.discover_keep_alive?
+      @assets = Settings.discover_assets?
       DEPTHS.index(Settings.discover_max_depth).try { |i| @depth_idx = i }
       CONCS.index(Settings.discover_concurrency).try { |i| @conc_idx = i }
       if c = Discover::Containment.parse?(Settings.discover_containment)
@@ -122,8 +121,10 @@ module Gori::Tui
       "↑/↓ field · ←/→ adjust · ␣ toggle · ↵ start/edit · esc cancel"
     end
 
-    # Formerly Runner#handle_discover_config_key: ↑/↓ move, ←/→ adjust the cyclers, ␣/↵
-    # commits on Start, opens the headers sub-editor on the headers row, else toggles.
+    # Formerly Runner#handle_discover_config_key: ↑/↓ move, ←/→ adjust the cyclers. ↵ starts
+    # from any row — the hint's promise; it used to flip whatever row had focus (#1373) — except
+    # the headers row, where it opens the sub-editor. ␣ toggles the focused row (and on Start
+    # starts, on the headers row edits).
     def handle_key(ev : Termisu::Event::Key) : Symbol
       k = ev.key
       return :cancel if k.escape?
@@ -135,14 +136,17 @@ module Gori::Tui
         adjust(-1)
       elsif k.right?
         adjust(1)
-      elsif k.enter? || k.space?
+      elsif k.enter?
+        return :commit unless on_headers_row?
+        activate_row
+      elsif k.space?
         return :commit if on_start_row?
         activate_row
       end
       :stay
     end
 
-    # Click a row to select it, then act on it exactly as ↵ would; outside the card cancels.
+    # Click a row to select it, then act on it exactly as ␣ would; outside the card cancels.
     # Mirrors the prior Runner#click_discover_config.
     def handle_click(area : Rect, mx : Int32, my : Int32) : Symbol
       box = overlay_box(area)
@@ -183,6 +187,7 @@ module Gori::Tui
       when ROW_BRUTE                                                then @bruteforce = !@bruteforce
       when ROW_EXT                                                  then @ext = !@ext
       when ROW_KEEP                                                 then @keep_alive = !@keep_alive
+      when ROW_ASSETS                                               then @assets = !@assets
       when ROW_TARGET, ROW_DEPTH, ROW_CONTAIN, ROW_CONC, ROW_MAXREQ then adjust(1)
       end
     end
@@ -199,14 +204,12 @@ module Gori::Tui
         containment: CONTAINMENTS[@contain_idx],
         extensions: @ext ? COMMON_EXT.dup : [] of String,
         keep_alive: @keep_alive,
+        crawl_assets: @assets,
         headers: @headers)
     end
 
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 56}.min
-      h = {area.h - 2, ROWS + 5}.min
-      return nil if w < 30 || h < 6
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      area.card?(56, ROWS + 5, 30, 6)
     end
 
     def render(screen : Screen, area : Rect) : Nil
@@ -227,22 +230,22 @@ module Gori::Tui
 
     private def draw_row(screen : Screen, box : Rect, i : Int32, py : Int32) : Nil
       sel = i == @selected
-      bg = sel ? Theme.accent_bg : Theme.panel
-      screen.fill(Rect.new(box.x + 1, py, box.w - 2, 1), bg)
-      screen.cell(box.x + 1, py, sel ? '▎' : ' ', Theme.accent, bg)
+      bg = Frame.row_band(screen, box, py, sel)
       x = box.x + 3
       case i
       when ROW_TARGET
         # The one row whose options come from the seed rather than a constant — and the one
         # that may not be cyclable at all (a single candidate). `focused: false` then drops
-        # the ‹/› cue, which is honest: the keys do nothing here.
+        # the ‹/› cue, which is honest: the keys do nothing here. The options are the display
+        # PATHS: a choice is a `{path, url}` pair, and stringifying the pair drew the tuple
+        # while comparing it to a path never matched, so the row stuck on the first (#1373).
         Frame.option_cycle(screen, x, py, box.right - 2, bg, "start at:",
-          @seed.choices.map(&.to_s), @seed.choices.index(selected_path) || 0,
-          sel && @seed.choices.size > 1)
+          @seed.choices.map(&.[0]), @target_idx, sel && @seed.choices.size > 1)
       when ROW_SPIDER  then check(screen, x, py, bg, sel, @spider, "spider (follow links)")
       when ROW_BRUTE   then check(screen, x, py, bg, sel, @bruteforce, "bruteforce (probe paths)")
       when ROW_EXT     then check(screen, x, py, bg, sel, @ext, "probe common extensions")
       when ROW_KEEP    then check(screen, x, py, bg, sel, @keep_alive, "reuse connections (keep-alive)")
+      when ROW_ASSETS  then check(screen, x, py, bg, sel, @assets, "fetch images/fonts/media")
       when ROW_DEPTH   then Frame.option_cycle(screen, x, py, box.right - 2, bg, "max depth:", DEPTHS.map(&.to_s), @depth_idx, sel)
       when ROW_CONTAIN then Frame.option_cycle(screen, x, py, box.right - 2, bg, "scope:", CONTAINMENTS.map(&.label), @contain_idx, sel)
       when ROW_CONC    then Frame.option_cycle(screen, x, py, box.right - 2, bg, "concurrency:", CONCS.map(&.to_s), @conc_idx, sel)

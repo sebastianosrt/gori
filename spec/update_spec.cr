@@ -1,5 +1,6 @@
 require "./spec_helper"
 require "file_utils"
+require "compress/gzip"
 require "./support/mock_release_server"
 
 # Sets env vars for the block and restores them exactly afterwards — a nil value
@@ -47,6 +48,46 @@ private def dead_port : Int32
   port
 end
 
+# A listener that reads the request and answers it with a non-HTTP banner. It reads
+# first so the client's write never meets a closed socket (EPIPE is an IO::Error,
+# which is not the path under test).
+private def with_non_http_server(&)
+  server = TCPServer.new("127.0.0.1", 0)
+  spawn do
+    while client = server.accept?
+      while line = client.gets
+        break if line.strip.empty?
+      end
+      client.print "SSH-2.0-OpenSSH_9.9\r\n"
+      client.close
+    end
+  end
+  begin
+    yield server.local_address.port
+  ensure
+    server.close
+  end
+end
+
+# Serves `body` with `Content-Encoding: gzip` and the length of those encoded bytes,
+# the way a static server labels a .tar.gz (or a CDN that compressed the file).
+private def with_gzip_labelled_server(body : Bytes, &)
+  server = HTTP::Server.new do |context|
+    context.response.content_type = "application/octet-stream"
+    context.response.headers["Content-Encoding"] = "gzip"
+    context.response.content_length = body.size
+    context.response.write(body)
+  end
+  port = server.bind_unused_port("127.0.0.1").port
+  spawn { server.listen }
+  sleep 10.milliseconds
+  begin
+    yield "http://127.0.0.1:#{port}/download/gori-v99.0.0-osx-arm64.tar.gz"
+  ensure
+    server.close
+  end
+end
+
 private def mode_enforced?(dir : String) : Bool
   probe = File.join(dir, ".gori-perm-probe")
   File.write(probe, "x")
@@ -84,6 +125,19 @@ describe Gori::Update do
     it "detects Snap paths" do
       Gori::Update.detect_channel("/snap/gori/current/bin/gori").should eq(Gori::Update::Channel::Snap)
       Gori::Update.detect_channel("/snap/bin/gori").should eq(Gori::Update::Channel::Snap)
+    end
+
+    it "detects Chocolatey package binaries and shims" do
+      Gori::Update.detect_channel("C:\\ProgramData\\chocolatey\\lib\\gori\\tools\\gori.exe")
+        .should eq(Gori::Update::Channel::Chocolatey)
+      Gori::Update.detect_channel("c:/programdata/chocolatey/bin/gori.exe")
+        .should eq(Gori::Update::Channel::Chocolatey)
+      Gori::Update.detect_channel("D:\\choco\\lib\\gori\\tools\\gori.exe", chocolatey_root: "D:\\choco")
+        .should eq(Gori::Update::Channel::Chocolatey)
+      Gori::Update.detect_channel("D:/choco/bin/gori.exe", chocolatey_root: "D:/choco")
+        .should eq(Gori::Update::Channel::Chocolatey)
+      Gori::Update.detect_channel("C:\\ProgramData\\chocolatey\\lib\\other\\tools\\gori.exe")
+        .should eq(Gori::Update::Channel::Binary)
     end
 
     it "detects Nix store paths" do
@@ -202,9 +256,15 @@ describe Gori::Update do
       Gori::Update.asset_name("v1.2.3", "macos", "aarch64").should eq("gori-v1.2.3-osx-arm64.tar.gz")
     end
 
+    it "builds Windows .exe asset names" do
+      Gori::Update.asset_name("0.17.0", "windows", "x86_64").should eq("gori-v0.17.0-windows-x86_64.exe")
+      Gori::Update.asset_name("0.17.0", "win32", "amd64").should eq("gori-v0.17.0-windows-x86_64.exe")
+      Gori::Update.alias_asset_name("windows", "x86_64").should eq("gori-windows-x86_64.exe")
+    end
+
     it "rejects unsupported OS" do
       expect_raises(Gori::Error, /unsupported OS/) do
-        Gori::Update.asset_name("0.1.0", "windows", "x86_64")
+        Gori::Update.asset_name("0.1.0", "plan9", "x86_64")
       end
     end
   end
@@ -216,6 +276,27 @@ describe Gori::Update do
       Gori::Update.version_cmp("0.1.0", "0.2.0").should eq(-1)
       Gori::Update.version_cmp("0.10.0", "0.9.0").should eq(1)
       Gori::Update.version_cmp("1.0.0", "0.9.9").should eq(1)
+    end
+  end
+
+  describe ".check_cache_fresh?" do
+    it "is fresh only inside the window, never for a stamp from the future" do
+      Gori::Update.check_cache_fresh?(1_000_i64, 1_000_i64, 86_400).should be_true
+      Gori::Update.check_cache_fresh?(1_000_i64, 87_399_i64, 86_400).should be_true
+      Gori::Update.check_cache_fresh?(1_000_i64, 87_400_i64, 86_400).should be_false
+      # A clock that ran ahead stamped this; trusting it would pin the cache.
+      Gori::Update.check_cache_fresh?(10_000_000_i64, 1_000_i64, 86_400).should be_false
+    end
+  end
+
+  describe ".https_downgrade?" do
+    it "flags only an https download redirected to something that is not https" do
+      Gori::Update.https_downgrade?("https://github.com/a", "http://cdn.example/b").should be_true
+      Gori::Update.https_downgrade?("HTTPS://github.com/a", "HTTP://cdn.example/b").should be_true
+      Gori::Update.https_downgrade?("https://github.com/a", "https://cdn.example/b").should be_false
+      Gori::Update.https_downgrade?("https://github.com/a", "HTTPS://cdn.example/b").should be_false
+      # A plain-http mirror (GORI_UPDATE_API_URL, the mock server) was never https.
+      Gori::Update.https_downgrade?("http://127.0.0.1/a", "http://127.0.0.1/b").should be_false
     end
   end
 
@@ -245,6 +326,8 @@ describe Gori::Update do
   end
 
   describe "lib destination safety" do
+    before_each { posix_only!("the macOS archive layout's /usr and /opt roots") }
+
     it "forbids shared system library roots" do
       Gori::Update.forbidden_lib_destination?("/usr/local/lib").should be_true
       Gori::Update.forbidden_lib_destination?("/usr/lib").should be_true
@@ -370,26 +453,26 @@ describe Gori::Update do
     end
 
     it "selects the platform asset URL from fixture JSON" do
-      asset = Gori::Update.resolve_asset_from_json(full_release, "linux", "x86_64")
+      asset = Gori::Update.resolve_asset(Gori::Update.parse_release(full_release), "linux", "x86_64")
       asset.name.should eq("gori-v0.17.0-linux-x86_64")
       asset.browser_download_url.should eq(
         "https://github.com/hahwul/gori/releases/download/v0.17.0/gori-v0.17.0-linux-x86_64"
       )
 
-      mac = Gori::Update.resolve_asset_from_json(full_release, "osx", "arm64")
+      mac = Gori::Update.resolve_asset(Gori::Update.parse_release(full_release), "osx", "arm64")
       mac.name.should eq("gori-v0.17.0-osx-arm64.tar.gz")
       mac.browser_download_url.should contain("gori-v0.17.0-osx-arm64.tar.gz")
     end
 
     it "fails clearly when the release has no assets" do
       expect_raises(Gori::Error, /no downloadable assets/) do
-        Gori::Update.resolve_asset_from_json(empty_assets, "linux", "x86_64")
+        Gori::Update.resolve_asset(Gori::Update.parse_release(empty_assets), "linux", "x86_64")
       end
     end
 
     it "fails clearly when the platform asset is missing" do
       expect_raises(Gori::Error, /no matching asset.*gori-v0.2.0-linux-x86_64/) do
-        Gori::Update.resolve_asset_from_json(no_matching, "linux", "x86_64")
+        Gori::Update.resolve_asset(Gori::Update.parse_release(no_matching), "linux", "x86_64")
       end
     end
 
@@ -411,6 +494,14 @@ describe Gori::Update do
       action = Gori::Update.package_action(Gori::Update::Channel::Snap)
       action[:command].should eq("snap refresh gori")
       action[:message].should match(/Snap/i)
+    end
+
+    it "returns Chocolatey upgrade guidance" do
+      action = Gori::Update.package_action(Gori::Update::Channel::Chocolatey)
+      # Print-only: a running gori.exe cannot replace itself through choco.
+      action[:command].should be_nil
+      action[:message].should contain("choco upgrade gori -y")
+      action[:message].should contain("elevated")
     end
 
     it "returns pacman/AUR helper guidance without a single auto-run command" do
@@ -465,6 +556,24 @@ describe Gori::Update do
       out = io.to_s
       out.should contain("install channel: snap")
       out.should contain("snap refresh gori")
+    end
+
+    it "prints Chocolatey upgrade guidance for a package-managed Windows binary" do
+      io = IO::Memory.new
+      Gori::Update.run(io, io,
+        exe_path: "C:\\ProgramData\\chocolatey\\lib\\gori\\tools\\gori.exe")
+      out = io.to_s
+      out.should contain("install channel: chocolatey")
+      out.should contain("choco upgrade gori -y")
+      out.should_not contain("--exec")
+    end
+
+    it "uses ChocolateyInstall when the package manager is installed outside its default path" do
+      with_env({"ChocolateyInstall" => "D:\\choco"}) do
+        io = IO::Memory.new
+        Gori::Update.run(io, io, exe_path: "D:/choco/bin/gori.exe")
+        io.to_s.should contain("install channel: chocolatey")
+      end
     end
 
     it "prints pacman guidance when ownership is pacman" do
@@ -655,6 +764,7 @@ describe Gori::Update do
     end
 
     it "update_binary installs from the mock and prints staged download lines" do
+      posix_only!("self-update has no Windows asset, and the archive path needs tar")
       payload = "#!/bin/sh\necho mock-new\n"
       root = File.tempname("gori-upd-")
       Dir.mkdir_p(root)
@@ -698,6 +808,26 @@ describe Gori::Update do
       end
     end
 
+    # Implicit decompression inflated a gzip-labelled response and dropped its
+    # Content-Length, so the completeness check never ran and a .tar.gz came down
+    # as the inner tar — failing its published sha256, or with none to check,
+    # installed as is.
+    it "keeps a gzip-labelled asset byte for byte instead of inflating it" do
+      gz = IO::Memory.new
+      Compress::Gzip::Writer.open(gz, &.print("tar bytes " * 4096))
+      published = gz.to_slice.dup
+      with_gzip_labelled_server(published) do |url|
+        dest = File.tempname("gori-dl-")
+        begin
+          got = Gori::Update.download_to(url, dest)
+          got.should eq(published.size)
+          File.open(dest, &.getb_to_end).should eq(published)
+        ensure
+          File.delete?(dest)
+        end
+      end
+    end
+
     it "fetches release JSON from the mock API URL" do
       with_mock_release_server(tag: "v99.0.0", body: "hi") do |server|
         json = Gori::Update.fetch_latest_release_json(server.api_url)
@@ -728,6 +858,7 @@ describe Gori::Update do
     end
 
     it "update_binary refuses to install a truncated download and leaves the target untouched (Bug A)" do
+      posix_only!("self-update has no Windows asset, and the archive path needs tar")
       payload = "y" * 40_000
       root = File.tempname("gori-trunc-")
       Dir.mkdir_p(root)
@@ -755,6 +886,7 @@ describe Gori::Update do
     end
 
     it "verifies and installs when the release advertises a correct sha256 digest (R2-10)" do
+      posix_only!("self-update has no Windows asset, and the archive path needs tar")
       payload = "#!/bin/sh\necho mock-verified\n"
       root = File.tempname("gori-sha-ok-")
       Dir.mkdir_p(root)
@@ -793,6 +925,7 @@ describe Gori::Update do
     end
 
     it "refuses to install on a sha256 checksum mismatch and leaves the target untouched (R2-10)" do
+      posix_only!("self-update has no Windows asset, and the archive path needs tar")
       # A well-formed download whose advertised digest does NOT match the body — the
       # CDN/transit-tampering (or wrong-asset) case the digest check exists to catch.
       payload = "z" * 4096
@@ -880,6 +1013,7 @@ describe Gori::Update do
 
   describe ".update_binary permission pre-check" do
     it "refuses an unwritable install dir before downloading anything" do
+      posix_only!("self-update has no Windows asset, and the archive path needs tar")
       root = File.tempname("gori-ro-")
       Dir.mkdir_p(root)
       begin
@@ -909,6 +1043,7 @@ describe Gori::Update do
 
   describe ".install_from_download (plain binary)" do
     it "replaces the target path with the downloaded file via the shipped installer" do
+      posix_only!("an executable bit on a #!/bin/sh binary")
       dir = File.tempname("gori-inst-")
       Dir.mkdir_p(dir)
       begin
@@ -959,8 +1094,31 @@ describe Gori::Update do
     end
   end
 
+  {% if flag?(:win32) %}
+    describe ".atomic_install on Windows" do
+      it "moves the old binary aside to swap in the new one, then drops it" do
+        dir = File.tempname("gori-winexe-")
+        Dir.mkdir_p(dir)
+        begin
+          target = File.join(dir, "gori.exe")
+          source = File.join(dir, "new.exe")
+          File.write(target, "old-build")
+          File.write(source, "new-build")
+          Gori::Update.atomic_install(source, target)
+          File.read(target).should eq("new-build")
+          # Nothing runs the old one here, so it is gone at once; a running one would stay
+          # under the temp prefix for the next sweep.
+          Dir.children(dir).select(&.starts_with?(".gori-update.")).should be_empty
+        ensure
+          FileUtils.rm_rf(dir)
+        end
+      end
+    end
+  {% end %}
+
   describe ".install_from_download (macOS-style tarball + lib/)" do
     it "extracts gori and refreshes sibling lib/ next to the target in a dedicated dir" do
+      posix_only!("self-update has no Windows asset, and the archive path needs tar")
       root = File.tempname("gori-tar-")
       Dir.mkdir_p(root)
       begin
@@ -994,6 +1152,7 @@ describe Gori::Update do
     # beside the old binary with the backup already deleted — unrecoverable when a
     # bundled dylib's basename changed between releases.
     it "rolls lib/ back when the binary install fails" do
+      posix_only!("self-update has no Windows asset, and the archive path needs tar")
       root = File.tempname("gori-rollback-")
       Dir.mkdir_p(root)
       begin
@@ -1020,13 +1179,14 @@ describe Gori::Update do
 
         File.read(File.join(target_dir, "lib", "libexample.dylib")).should eq("old-dylib")
         # And no staging debris survives the failure.
-        Dir.glob(File.join(target_dir, "lib.gori-*")).should be_empty
+        glob_files(target_dir, "lib.gori-*").should be_empty
       ensure
         FileUtils.rm_rf(root) if File.exists?(root)
       end
     end
 
     it "removes a freshly installed lib/ when the target had none to restore" do
+      posix_only!("self-update has no Windows asset, and the archive path needs tar")
       # The other rollback branch: the archive carries lib/ but the install dir did
       # not, so reverting means taking the new tree back out rather than moving one
       # back in. Untested, this is a silent rm_rf.
@@ -1190,6 +1350,7 @@ describe Gori::Update do
     end
 
     it "refuses archive install when lib/ would land on a shared system path" do
+      posix_only!("self-update has no Windows asset, and the archive path needs tar")
       root = File.tempname("gori-unsafe-")
       Dir.mkdir_p(root)
       begin
@@ -1277,10 +1438,9 @@ describe Gori::Update do
     end
   end
 
-  describe ".synthesize_release_json" do
-    it "builds a release the normal parser and asset picker consume" do
-      json = Gori::Update.synthesize_release_json("v9.9.9", "linux", "x86_64")
-      release = Gori::Update.parse_release(json)
+  describe ".synthesize_release" do
+    it "builds a release the asset picker consumes" do
+      release = Gori::Update.synthesize_release("v9.9.9", "linux", "x86_64")
       release.tag_name.should eq("v9.9.9")
       asset = Gori::Update.select_asset(release, "linux", "x86_64").not_nil!
       asset.name.should eq("gori-v9.9.9-linux-x86_64")
@@ -1289,16 +1449,14 @@ describe Gori::Update do
     end
 
     it "advertises no digest when SHA256SUMS gave none, rather than faking one" do
-      release = Gori::Update.parse_release(
-        Gori::Update.synthesize_release_json("v9.9.9", "osx", "arm64"))
+      release = Gori::Update.synthesize_release("v9.9.9", "osx", "arm64")
       release.assets.first.digest.should be_nil
       Gori::Update.parse_sha256_digest(release.assets.first.digest).should be_nil
     end
 
     it "carries a SHA256SUMS digest through so verify_sha256! actually runs" do
       hex = "e" * 64
-      release = Gori::Update.parse_release(
-        Gori::Update.synthesize_release_json("v9.9.9", "linux", "x86_64", digest: hex))
+      release = Gori::Update.synthesize_release("v9.9.9", "linux", "x86_64", digest: hex)
       Gori::Update.parse_sha256_digest(release.assets.first.digest).should eq(hex)
     end
 
@@ -1307,8 +1465,7 @@ describe Gori::Update do
     # no version to get wrong — is the only name left worth trying, so it has to
     # already be in the list download_asset's retry looks through.
     it "lists the version-less alias beside the guessed versioned asset" do
-      release = Gori::Update.parse_release(
-        Gori::Update.synthesize_release_json("v9.9.9", "linux", "x86_64"))
+      release = Gori::Update.synthesize_release("v9.9.9", "linux", "x86_64")
       release.assets.map(&.name).should eq(["gori-v9.9.9-linux-x86_64", "gori-linux-x86_64"])
       release.assets[1].browser_download_url.should eq(
         "https://github.com/hahwul/gori/releases/download/v9.9.9/gori-linux-x86_64")
@@ -1326,16 +1483,14 @@ describe Gori::Update do
       # the retry to no checksum after we said we would verify.
       versioned_hex = "a" * 64
       alias_hex = "b" * 64
-      release = Gori::Update.parse_release(
-        Gori::Update.synthesize_release_json("v9.9.9", "linux", "x86_64",
-          digest: versioned_hex, alias_digest: alias_hex))
+      release = Gori::Update.synthesize_release("v9.9.9", "linux", "x86_64",
+        digest: versioned_hex, alias_digest: alias_hex)
       Gori::Update.parse_sha256_digest(release.assets[0].digest).should eq(versioned_hex)
       Gori::Update.parse_sha256_digest(release.assets[1].digest).should eq(alias_hex)
     end
 
     it "omits the alias entirely when the platform has no naming for it" do
-      release = Gori::Update.parse_release(
-        Gori::Update.synthesize_release_json("v9.9.9", "linux", "x86_64"))
+      release = Gori::Update.synthesize_release("v9.9.9", "linux", "x86_64")
       release.assets.size.should eq(2)
       # asset_name would raise for plan9 before we ever get here; the point is that
       # the alias guard degrades rather than taking the whole synthesis down.
@@ -1406,6 +1561,7 @@ describe Gori::Update do
 
   describe "update_binary alias retry" do
     it "falls back to the version-less alias when the versioned name 404s" do
+      posix_only!("self-update has no Windows asset, and the archive path needs tar")
       payload = "#!/bin/sh\necho from-alias\n"
       root = File.tempname("gori-alias-")
       Dir.mkdir_p(root)
@@ -1460,6 +1616,7 @@ describe Gori::Update do
     end
 
     it "does not retry the alias for a non-404 failure" do
+      posix_only!("self-update has no Windows asset, and the archive path needs tar")
       # A truncated transfer (or a checksum mismatch) means the asset IS there and
       # came back wrong. Retrying it under a second name would paper over exactly
       # the signal the integrity checks exist to raise.
@@ -1518,7 +1675,7 @@ describe Gori::Update do
     end
   end
 
-  describe ".fetch_latest_release_json_with_fallback" do
+  describe ".fetch_latest_release_with_fallback" do
     it "reports HTTP 403 as a rate limit and names the token workaround" do
       with_mock_release_server(api_status: 403) do |server|
         ex = expect_raises(Gori::Error, /rate limit/i) do
@@ -1528,11 +1685,11 @@ describe Gori::Update do
       end
     end
 
-    it "passes an API success straight through, with no fallback flag" do
+    it "passes an API success straight through, with no fallback reason" do
       with_mock_release_server do |server|
-        json, via_redirect = Gori::Update.fetch_latest_release_json_with_fallback(server.api_url)
-        via_redirect.should be_false
-        Gori::Update.parse_release(json).tag_name.should eq("v99.0.0")
+        release, fallback_reason = Gori::Update.fetch_latest_release_with_fallback(server.api_url)
+        fallback_reason.should be_nil
+        release.tag_name.should eq("v99.0.0")
       end
     end
 
@@ -1541,7 +1698,7 @@ describe Gori::Update do
       # injected endpoint has to surface, not silently retarget the real repo.
       with_mock_release_server(api_status: 403) do |server|
         expect_raises(Gori::Error, /rate limit/i) do
-          Gori::Update.fetch_latest_release_json_with_fallback(server.api_url)
+          Gori::Update.fetch_latest_release_with_fallback(server.api_url)
         end
       end
     end
@@ -1570,13 +1727,13 @@ describe Gori::Update do
       end
     end
 
-    # fetch_latest_release_json_with_fallback re-raises whatever the API fetch
+    # fetch_latest_release_with_fallback re-raises whatever the API fetch
     # threw once the redirect fallback has nothing to offer (or is not eligible).
     # That re-raise is only as clean as the original exception.
     it "keeps the re-raise from the fallback path a Gori::Error too" do
       url = "http://127.0.0.1:#{dead_port}/repos/hahwul/gori/releases/latest"
       expect_raises(Gori::Error, /could not reach/) do
-        Gori::Update.fetch_latest_release_json_with_fallback(url)
+        Gori::Update.fetch_latest_release_with_fallback(url)
       end
     end
 
@@ -1589,6 +1746,32 @@ describe Gori::Update do
         end
       ensure
         File.delete?(dest)
+      end
+    end
+
+    # stdlib's response parser raises a BARE Exception for a status line it cannot
+    # read — what a captive portal, a middlebox or a non-HTTP port answers with.
+    it "wraps a peer that does not speak HTTP, on the API fetch and on a download" do
+      with_non_http_server do |port|
+        expect_raises(Gori::Error, /could not reach 127\.0\.0\.1: Invalid HTTP response/) do
+          Gori::Update.fetch_latest_release_json("http://127.0.0.1:#{port}/repos/hahwul/gori/releases/latest")
+        end
+        dest = File.tempname("gori-dl-")
+        begin
+          expect_raises(Gori::Error, /could not download .*Invalid HTTP response/) do
+            Gori::Update.download_to("http://127.0.0.1:#{port}/download/gori", dest)
+          end
+        ensure
+          File.delete?(dest)
+        end
+      end
+    end
+
+    it "wraps a release-API body that claims gzip and is not" do
+      with_gzip_labelled_server("{\"tag_name\":\"v99.0.0\"}".to_slice) do |url|
+        expect_raises(Gori::Error, /could not reach 127\.0\.0\.1/) do
+          Gori::Update.fetch_latest_release_json(url)
+        end
       end
     end
 
@@ -1625,6 +1808,7 @@ describe Gori::Update do
     # than returning a failed status, so `tar list failed` never got a chance to
     # run on a minimal image — the macOS archive install backtraced instead.
     it "wraps a missing tar" do
+      posix_only!("Windows finds tar.exe in System32 without PATH")
       expect_raises(Gori::Error, /could not run tar/) do
         with_env({"PATH" => File.tempname("gori-empty-path-", "")}) do
           Gori::Update.list_tar_entries("/nonexistent.tar.gz")
@@ -1733,6 +1917,7 @@ describe Gori::Update do
     # Matched by prefix over Dir.children rather than by Dir.glob, for the reason
     # sweep_lib_leftovers gives: the install path belongs to the operator.
     it "treats glob metacharacters in the install path as literal" do
+      posix_only!("'*' and '?' in a directory name")
       root = File.tempname("gori-sweep-glob-")
       dir = File.join(root, "gori[1]*?")
       Dir.mkdir_p(dir)

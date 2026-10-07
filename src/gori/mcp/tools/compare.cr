@@ -14,10 +14,8 @@ module Gori
       # cap, so the comparison matches what a human sees in the Comparer tab.
       @[Tool("compare_flows")]
       private def compare_flows(h) : Result
-        id_a = int(h, "flow_id_a")
-        return err(id_error(h, "flow_id_a"), "INVALID_ARGUMENT", field: "flow_id_a") unless id_a
-        id_b = int(h, "flow_id_b")
-        return err(id_error(h, "flow_id_b"), "INVALID_ARGUMENT", field: "flow_id_b") unless id_b
+        id_a = required_id(h, "flow_id_a")
+        id_b = required_id(h, "flow_id_b")
         detail_a = store.get_flow(id_a)
         return not_found("no flow with id #{id_a}") unless detail_a
         detail_b = store.get_flow(id_b)
@@ -38,8 +36,8 @@ module Gori
           return err("'changes_only' and 'context' are mutually exclusive", "INVALID_ARGUMENT", field: "context")
         end
 
-        lines_a = compare_lines(detail_a, pane, include_sensitive)
-        lines_b = compare_lines(detail_b, pane, include_sensitive)
+        lines_a = compare_lines(detail_a, pane, true)
+        lines_b = compare_lines(detail_b, pane, true)
         # The same argument `identical` already makes about a diff cut at MAX_LINES, applied to
         # the cut that happened BEFORE this tool saw the bytes: the proxy stops storing a body
         # at the capture ceiling, so two flows cut at 2 KiB with matching prefixes diff to zero
@@ -47,11 +45,12 @@ module Gori
         # Named per side, because "which one was cut" is what decides whether the comparison is
         # salvageable by re-sending one of them.
         cut_sides = [] of String
-        cut_sides << "a" if body_cut?(detail_a, pane)
-        cut_sides << "b" if body_cut?(detail_b, pane)
+        cut_sides << "a" if detail_a.body_truncated?(pane)
+        cut_sides << "b" if detail_b.body_truncated?(pane)
         truncated = Repeater::Diff.truncated?(lines_a, lines_b) || !cut_sides.empty?
-        full_diff = Repeater::Diff.lines(lines_a, lines_b)
-        change_count = Repeater::Diff.change_count(full_diff)
+        raw_diff = Repeater::Diff.lines(lines_a, lines_b)
+        change_count = Repeater::Diff.change_count(raw_diff)
+        full_diff, redaction, shown_redacted = redact_diff(raw_diff, detail_a, detail_b, pane, include_sensitive)
         # `context` folds the unchanged runs to counted markers; `changes_only` drops them
         # outright. Folding is the one an agent wants for a long response: it keeps the
         # changes readable in place without claiming the message had nothing else in it.
@@ -86,6 +85,14 @@ module Gori
             # two responses match when only their first MAX_LINES lines were compared.
             j.field "identical", change_count == 0 && !truncated
             j.field "truncated", truncated
+            Serialize.emit_redaction_note(j, redaction)
+            if shown_redacted
+              j.field "diff_of_redacted_copies", true
+              j.field "diff_of_redacted_copies_note",
+                "the redaction profile rewrote a body, so `diff` compares the two redacted copies and a change " \
+                "inside a redacted value may not show as a row; `changed_lines` and `identical` are over the " \
+                "captured bytes. Pass include_sensitive:true for the diff of the captured messages"
+            end
             unless cut_sides.empty?
               j.field "source_truncated" { j.array { cut_sides.each { |side| j.string side } } }
               j.field "source_truncated_note",
@@ -98,13 +105,7 @@ module Gori
                 meta_a = Repeater::ExchangeMeta.of(detail_a.row)
                 meta_b = Repeater::ExchangeMeta.of(detail_b.row)
                 {"a" => meta_a, "b" => meta_b}.each do |name, m|
-                  j.field name do
-                    j.object do
-                      j.field "status", m.status
-                      j.field "size", m.size
-                      j.field "duration_us", m.duration_us
-                    end
-                  end
+                  j.field name, {status: m.status, size: m.size, duration_us: m.duration_us}
                 end
                 j.field "delta", Repeater::ExchangeMeta.delta(meta_a, meta_b)
               end
@@ -168,12 +169,6 @@ module Gori
         {kept, trimmed}
       end
 
-      # Whether the capture cap cut the side of this flow the diff is about. `compare_lines`
-      # builds head+body text from the stored blob and has no way to know the blob is a prefix.
-      private def body_cut?(detail : Store::FlowDetail, pane : Symbol) : Bool
-        pane == :request ? detail.request_body_truncated? : detail.response_body_truncated?
-      end
-
       private def compare_lines(d : Store::FlowDetail, pane : Symbol, include_sensitive : Bool) : Array(String)
         if pane == :request
           Repeater::MessageLines.of(redacted_head(d.request_head, include_sensitive), d.request_body, decode: false)
@@ -182,10 +177,78 @@ module Gori
         end
       end
 
+      # The diff is taken over the CAPTURED lines and only its `text` is redacted. Redacting
+      # first and diffing second decided the verdict on the redacted copy, so the same request
+      # sent as Alice and as Bob — the comparison authorization testing is — came back
+      # `identical:true` because both tokens read `[REDACTED]`. Redaction decides what a line
+      # SHOWS, never whether it changed: a changed credential is a del/add pair whose text is
+      # `Authorization: [REDACTED]` on both sides.
+      #
+      # The shown text is redacted the way `get_flow` redacts the same flows: header values, and
+      # the body through the project's ambient redaction profile (#1035), which this tool skipped.
+      #
+      # Header redaction keeps every line where it was, so when it is all that applied the rows
+      # are paired with their redacted twins by walking `Diff.lines`' output with two cursors
+      # (Same advances both, Del `a`, Add `b`). A profile that rewrote a body also reframes its
+      # head (`Redact::Wire` moves Content-Length, drops a coding), so its lines no longer sit
+      # where the captured ones did: then the rows shown are a diff of the two redacted copies,
+      # and the third element says so — `changed_lines`/`identical` still describe the bytes.
+      private def redact_diff(diff : Array(Repeater::DiffLine), detail_a : Store::FlowDetail,
+                              detail_b : Store::FlowDetail, pane : Symbol,
+                              include_sensitive : Bool) : {Array(Repeater::DiffLine), Serialize::RedactionNote?, Bool}
+        return {diff, nil, false} if include_sensitive
+        matcher = Redact::Policy.ambient(store)
+        shown_a, hits_a, decoded_a = shown_lines(detail_a, pane, matcher)
+        shown_b, hits_b, decoded_b = shown_lines(detail_b, pane, matcher)
+        note = matcher.try { |m| Serialize::RedactionNote.new(m.profile.name, hits_a + hits_b, 0, decoded_a || decoded_b) }
+        if hits_a + hits_b > 0 || shown_a.size != diff.count { |dl| !dl.kind.add? } ||
+           shown_b.size != diff.count { |dl| !dl.kind.del? }
+          return {Repeater::Diff.lines(shown_a, shown_b), note, true}
+        end
+        i = 0
+        k = 0
+        shown = diff.map do |dl|
+          text = case dl.kind
+                 when .add?
+                   shown_b[k].tap { k += 1 }
+                 when .del?
+                   shown_a[i].tap { i += 1 }
+                 else
+                   shown_a[i].tap { i += 1; k += 1 }
+                 end
+          Repeater::DiffLine.new(dl.kind, text)
+        end
+        {shown, note, false}
+      end
+
+      # One side's lines as shown: header values redacted, and the pane's body through the
+      # profile when it has one — only the pane being diffed is decoded and sanitized. Returns
+      # the lines (cut where `Diff.lines` cuts), the profile's hit count and whether it decoded.
+      private def shown_lines(d : Store::FlowDetail, pane : Symbol,
+                              matcher : Redact::Matcher?) : {Array(String), Int32, Bool}
+        head, body = pane == :request ? {d.request_head, d.request_body} : {d.response_head, d.response_body}
+        hits = 0
+        decoded = false
+        if matcher && body && !body.empty?
+          clean = Redact::Wire.message(head, body, matcher)
+          if clean.count > 0
+            hits = clean.count
+            decoded = clean.decoded?
+            head = clean.head unless head.nil?
+            body = clean.body
+          end
+        end
+        lines = if pane == :request
+                  Repeater::MessageLines.of(redacted_head(head, false), body, decode: false)
+                else
+                  Repeater::MessageLines.of(redacted_head(head, false), body, decode: true, error: d.error)
+                end
+        {lines.first(Repeater::Diff::MAX_LINES), hits, decoded}
+      end
+
       # Authorization/Cookie/Set-Cookie/API-key header VALUES are [REDACTED] unless
       # include_sensitive:true — same default as get_flow/intercept_get/
-      # get_repeater_context. Applied before diffing so a redacted value can't leak
-      # through the `text` field of a diff line.
+      # get_repeater_context. `redact_diff` applies it to the diff's text only.
       private def redacted_head(head : Bytes?, include_sensitive : Bool) : Bytes?
         return head unless head
         Serialize.redact_head(String.new(head).scrub, include_sensitive).to_slice
@@ -210,7 +273,8 @@ module Gori
           "(`source_truncated` names which side), sets `truncated` and leaves `identical` " \
           "false, because matching prefixes are not matching bodies. " \
           "Authorization/Cookie/Set-Cookie/API-key header values are [REDACTED] in the diff " \
-          "text unless include_sensitive=true. Pure read: no network, nothing written." do |s|
+          "text unless include_sensitive=true; the diff itself is taken over the captured values, so a " \
+          "changed credential is still a del/add pair. Pure read: no network, nothing written." do |s|
           s.field "flow_id_a", intprop("first flow id (the 'original' side)"), required: true
           s.field "flow_id_b", intprop("second flow id (the 'new' side)"), required: true
           s.field "pane", enumprop("which half of the two flows to diff (default response)", MESSAGE_SIDES)

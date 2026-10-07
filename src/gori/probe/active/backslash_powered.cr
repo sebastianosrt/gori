@@ -65,12 +65,12 @@ module Gori
         end
 
         def dedup_key(detail : Store::FlowDetail, opts : Options = Options::DEFAULT) : String?
-          s, slots = injectables(detail, opts) || return nil
+          s, slots = injectables(detail, opts, MAX_PROBE_PARAMS, MAX_PROBE_PARAMS_AGGRESSIVE) || return nil
           InsertionPoints.dedup_key("backslash_powered", detail, s.method, s.path, slots)
         end
 
         def plan(detail : Store::FlowDetail, opts : Options = Options::DEFAULT) : Plan?
-          s, slots = injectables(detail, opts) || return nil
+          s, slots = injectables(detail, opts, MAX_PROBE_PARAMS, MAX_PROBE_PARAMS_AGGRESSIVE) || return nil
           baseline = InsertionPoints.build(detail, InsertionPoints::NO_CHANGES)
           # A SECOND, identical baseline, sent first among the follow-ups. The whole rule is a
           # difference test against the baseline fingerprint, which silently assumed the endpoint
@@ -104,13 +104,12 @@ module Gori
             single = results[2 + 2 * i]?
             double = results[3 + 2 * i]?
             next unless single && double
-            next unless single.ok? && double.ok? # a failed leg ⇒ incomplete comparison, skip
+            next unless Evidence.complete?(single) && Evidence.complete?(double)
             # A TRUNCATED leg (origin closed early, or the capture ceiling) is `ok?` but carries
             # a short body, so its length/error-class fingerprint is not the whole response. A
             # flake landing on the `\` leg and not its `\\` twin reproduces this rule's exact
             # asymmetry with no escaping involved — the false positive NextjsActionNoAuth guards
-            # against with the same `incomplete?` check. Skip the param rather than report it.
-            next if single.incomplete? || double.incomplete?
+            # against with the same completeness check. Skip the param rather than report it.
             sa = attrs(single, with_size)
             da = attrs(double, with_size)
             # The asymmetry that marks an escape being interpreted. A reflecting/echoing endpoint
@@ -132,22 +131,6 @@ module Gori
           detections_all(plan, [result], detail)
         end
 
-        # Shared gate for plan + dedup_key so the two can't drift (equivalence-spec invariant).
-        # Returns {surface, the first ≤cap injectable slots} for an eligible flow, else nil. The cap
-        # spans ALL enumerated locations at once, so a wide param set can't blow up the request count.
-        private def injectables(detail : Store::FlowDetail, opts : Options) : {InsertionPoints::Surface, Array(InsertionPoints::Slot)}?
-          s = InsertionPoints.enumerate(detail, opts, InsertionPoints::DEFAULT_LOCATIONS) || return nil
-          # Body-differential gate: the comparison reads response BODIES (HEAD has none), so HEAD is
-          # always out. By default GET only — the automatic scan never auto-re-sends a state-changing
-          # method — but opts.allow_unsafe (manual per-flow scan / AGGRESSIVE mode) widens to
-          # POST/PUT/PATCH/DELETE, whose params can still be interpreted server-side.
-          return nil unless diff_method_allowed?(s.method, opts)
-          cap = opts.aggressive ? MAX_PROBE_PARAMS_AGGRESSIVE : MAX_PROBE_PARAMS
-          slots = s.slots.first(cap)
-          return nil if slots.empty?
-          {s, slots}
-        end
-
         # {baseline fingerprint, whether body LENGTH is part of it} — but only when the endpoint
         # reproduced that fingerprint on a SECOND identical request (results[0] and results[1]).
         # nil when either baseline is missing or failed to send, or when the two disagree even
@@ -164,11 +147,10 @@ module Gori
         private def stable_baseline(results : Array(Repeater::Result)) : { {Int32, String?, Int32}, Bool }?
           first = results[0]?
           second = results[1]?
-          return nil unless first && first.ok? && second && second.ok?
+          return nil unless first && second && Evidence.complete?(first) && Evidence.complete?(second)
           # A truncated baseline (ok? but short-bodied) cannot anchor a length comparison: its
           # fingerprint is a fraction of the real response, so every probe would diff against a
           # phantom. Decline rather than measure the endpoint against a body it never finished.
-          return nil if first.incomplete? || second.incomplete?
           sized = attrs(first, true)
           return {sized, true} if sized == attrs(second, true)
           blind = attrs(first, false)
@@ -181,17 +163,8 @@ module Gori
         # really changed shape, so ordinary same-length content jitter doesn't read as a difference.
         # `with_size: false` substitutes a constant, so a jittery endpoint compares on the other two.
         private def attrs(result : Repeater::Result, with_size : Bool) : {Int32, String?, Int32}
-          body = decoded_body(result)
-          {response_status(result), error_signature_of(body), with_size ? body.bytesize : -1}
-        end
-
-        private def response_status(result : Repeater::Result) : Int32
-          if r = result.response
-            return r.status
-          end
-          Proxy::Codec::Http1.parse_response_head(result.head).status
-        rescue
-          0
+          body = decoded_text(result)
+          {probe_status(result), error_signature_of(body), with_size ? body.bytesize : -1}
         end
 
         # Known server-side interpreter/parser error fingerprints. Presence is a strong signal, but
@@ -212,15 +185,6 @@ module Gori
             return label if needles.any? { |n| hay.includes?(n) }
           end
           nil
-        end
-
-        private def decoded_body(result : Repeater::Result) : String
-          decoded, _ = Proxy::Codec::ContentDecode.decode(result.head, result.body, BODY_CAP)
-          bytes = decoded || result.body
-          return "" unless bytes && !bytes.empty?
-          String.new(bytes[0, {bytes.size, BODY_CAP}.min]).scrub
-        rescue
-          ""
         end
 
         # A short human tag for the evidence line: prefer the interpreter-error class, else the

@@ -48,7 +48,7 @@ module Gori
 
         def dedup_key(detail : Store::FlowDetail, opts : Options = Options::DEFAULT) : String?
           g = gate(detail, opts) || return nil
-          key_string(detail, g[0], g[1])
+          endpoint_key(detail, g[0], g[1])
         end
 
         def plan(detail : Store::FlowDetail, opts : Options = Options::DEFAULT) : Plan?
@@ -57,19 +57,18 @@ module Gori
           probe = rebuild_root(detail.request_head, detail.request_body, orig_full)
           control = rebuild_root(detail.request_head, detail.request_body, nil)
           control2 = rebuild_root(detail.request_head, detail.request_body, nil)
-          Plan.new(probe, [] of Param, key_string(detail, method_up, path), [control, control2])
+          Plan.new(probe, [] of Param, endpoint_key(detail, method_up, path), [control, control2])
         end
 
         # results = [probe, control, control2].
         def detections_all(plan : Plan, results : Array(Repeater::Result), detail : Store::FlowDetail) : Array(Detection)
           probe = results[0]?
-          return [] of Detection unless probe && probe.ok?
+          return [] of Detection unless probe && Evidence.complete?(probe)
           # A TRUNCATED probe (origin closed early, or the capture ceiling) is `ok?` but its body
           # is short of what the origin framed, so `body_size` below is not the real size. The
           # whole finding is "the probe body differs from the root", and a truncation makes it
           # differ for a reason that is not a bypass — decline rather than report on a body the
           # origin never finished. (Mirrors NextjsActionNoAuth's incomplete guard.)
-          return [] of Detection if probe.incomplete?
           ps = probe_status(probe)
           return [] of Detection unless (200..299).includes?(ps)
           cs, csize = stable_root(results) || return [] of Detection
@@ -102,10 +101,6 @@ module Gori
           {method_up, path, orig_full}
         end
 
-        private def key_string(detail : Store::FlowDetail, method_upcase : String, path : String) : String
-          "url_rewrite_bypass|#{detail.row.host}:#{detail.row.port}|#{method_upcase}|#{path}"
-        end
-
         # The plain-root {status, body-size} fingerprint — but only when the root reproduced it on a
         # SECOND identical request (results[1] and results[2]). nil when either control is missing or
         # failed to send, or when the two disagree: this whole finding is "the probe differs from the
@@ -114,10 +109,9 @@ module Gori
         private def stable_root(results : Array(Repeater::Result)) : {Int32, Int32}?
           a = results[1]?
           b = results[2]?
-          return nil unless a && a.ok? && b && b.ok?
+          return nil unless a && b && Evidence.complete?(a) && Evidence.complete?(b)
           # A truncated control (ok? but short-bodied) has an unreliable size; comparing the probe
           # against it would judge a bypass on a body the origin never finished. Decline.
-          return nil if a.incomplete? || b.incomplete?
           fp = {probe_status(a), body_size(a)}
           fp == {probe_status(b), body_size(b)} ? fp : nil
         end
@@ -158,24 +152,8 @@ module Gori
           (c = line.index(':')) ? line[0...c].strip.downcase == name : false
         end
 
-        private def path_only(origin_target : String) : String
-          qi = origin_target.index('?')
-          qi ? origin_target[0...qi] : origin_target
-        end
-
-        private def probe_status(result : Repeater::Result) : Int32
-          if r = result.response
-            return r.status
-          end
-          Proxy::Codec::Http1.parse_response_head(result.head).status
-        rescue
-          0
-        end
-
         private def body_size(result : Repeater::Result) : Int32
-          decoded, _ = Proxy::Codec::ContentDecode.decode(result.head, result.body, BODY_CAP)
-          b = decoded || result.body
-          b ? {b.size, BODY_CAP}.min : 0
+          decoded_body(result.head, result.body).try(&.size) || 0
         end
       end
     end

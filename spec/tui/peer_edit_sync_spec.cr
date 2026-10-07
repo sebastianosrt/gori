@@ -701,7 +701,7 @@ describe "intercept in a VIEW-ONLY window" do
       ctrl = Gori::Tui::InterceptController.new(host)
 
       ctrl.intercept_cycle_direction
-      viewer.interceptor.direction.both?.should be_true # unchanged
+      viewer.interceptor.direction.request_only?.should be_true # unchanged
       host.last_status.should contain("view-only")
 
       ctrl.intercept_query
@@ -721,7 +721,7 @@ describe "intercept in a VIEW-ONLY window" do
 
       # And the other two, so the guard is not simply "the lock holder can do nothing either".
       ctrl.intercept_cycle_direction
-      session.interceptor.direction.request_only?.should be_true
+      session.interceptor.direction.response_only?.should be_true
       ctrl.intercept_query
       ctrl.view.querying?.should be_true
     end
@@ -779,7 +779,7 @@ describe "the auto-forward reaper and an in-progress edit" do
     # under spec/ (it owns a terminal), and the reaper only runs on the tick.
     src = File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui", "runner", "intercept_bridge.cr"))
     body = src.lines.reject(&.lstrip.starts_with?('#')).join('\n')
-    reap = body[/^ *private def reap_stale_holds.*?\n *end\n/m]
+    reap = body[/^  private def reap_stale_holds.*?\n  end\n/m] # to the method's own `end`, at def indent
     reap.should_not be_nil
     reap.not_nil!.should contain("held_edit_id")
     # The skip is INSIDE the per-item loop and BEFORE the forward: reading the edit id and

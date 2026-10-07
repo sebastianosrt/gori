@@ -2,6 +2,7 @@ require "json"
 require "base64"
 require "../store"
 require "./types"
+require "./clusters"
 
 module Gori
   module Fuzz
@@ -18,7 +19,10 @@ module Gori
       tls_preset : String? = nil,
       websocket : Bool = false,
       surface : String? = nil,
-      source_ref : String? = nil
+      source_ref : String? = nil,
+      # The result-capture policy this run is archived under (issue #1240) — `Fuzz::Keep#label`.
+      # Recorded on the run row so a filtered archive is legible as one, not a lost run.
+      keep : String = "all"
 
     # Bounded asynchronous writer shared by permanent saves and the temporary result spool.
     # Live Result appends only serialize and offer a batch to this four-slot queue; they never
@@ -41,23 +45,30 @@ module Gori
       ROW_METADATA_BYTES = 128_i64
 
       private record Batch, rows : Array(Store::FuzzResultWrite), bytes : Int64
-      private record Barrier, reply : Channel(Bool)
       private record Terminal,
         sent : Int64,
         matched : Int64,
         errors : Int64,
         status : String,
         finished_at : Int64,
+        stop_idx : Int64?,
         reply : Channel(Bool)
-      private alias Command = Batch | Barrier | Terminal
+      private alias Command = Batch | Terminal
 
       getter run_id : Int64
       getter error : String?
       getter written : Int64
+      # The result-capture policy this archive is written under (issue #1240). The live
+      # `append(result : Result)` path drops a row the policy does not keep — so a
+      # `keep: interesting` run stores matched/errored/re-sent/stop rows and skips the rest,
+      # while the whole-run counters `finish` records stay complete. The record/write-row
+      # overloads (the spool→permanent copy) are NOT re-filtered: the spool already applied it.
+      getter keep : Keep
 
       def initialize(@store : Store, meta : SavedRunMeta, initial_status : String = "running",
                      @batch_size : Int32 = BATCH_SIZE,
                      @batch_bytes : Int64 = BATCH_BYTES)
+        @keep = Keep.parse?(meta.keep) || Keep::All
         raise ArgumentError.new("batch_size must be positive") if @batch_size <= 0
         raise ArgumentError.new("batch_bytes must be positive") if @batch_bytes <= 0
 
@@ -77,7 +88,7 @@ module Gori
           @run_id = @store.insert_fuzz_run(meta.session_id, meta.target, meta.mode, meta.total,
             created_at: meta.created_at, status: initial_status, http2: meta.http2,
             sni: meta.sni, tls_preset: meta.tls_preset, websocket: meta.websocket,
-            surface: meta.surface, source_ref: meta.source_ref)
+            surface: meta.surface, source_ref: meta.source_ref, keep: meta.keep)
           if @run_id > 0
             @worker_started = true
             @worker_stopped = false
@@ -121,6 +132,11 @@ module Gori
       # Live-engine path. It never waits for the Store writer or for this Persistence queue.
       def append(result : Result) : Bool
         return false unless accepting?
+        # `keep: interesting` drops a row the archive does not keep — reported as ACCEPTED
+        # (true), not a failure: the caller's saturation/`spool_lost` signal is about the queue,
+        # and a policy-skipped row never touched it. `written` stays the count of ROWS STORED,
+        # which is what "N of M kept" reads off.
+        return true unless @keep.keeps?(result)
         try_append(self.class.write_row(result))
       rescue ex
         fail_save(ex.message || "could not serialize a fuzz result")
@@ -153,25 +169,17 @@ module Gori
         append(self.class.write_row(record))
       end
 
-      # Explicitly drain every accepted row. Unlike live append, flush is a caller-requested
-      # barrier and may wait; a buffered reply keeps a cancelled waiter from stalling the worker.
-      def flush : Bool
-        return terminal_success if terminal?
-        return false unless @worker_started
-        queued = enqueue_pending_wait
-        drained = queued && barrier
-        drained && !failed?
-      rescue ex
-        fail_save(ex.message || "could not flush fuzz results")
-        false
-      end
-
       # FIFO terminal barrier: pending rows are queued behind all accepted batches, then the
       # checked run update executes on the same worker. Repeated finishes return the first
       # outcome and never issue a second terminal update.
+      #
+      # `stop_idx` is `DoneEvent#stop_index`, the row the run's `stop_on` tripped on (issue
+      # #1270). Queued behind every batch, so the row it names is already committed when the
+      # Store checks for it; the Store keeps it only on a `condition_met` finish.
       def finish(sent : Int64, matched : Int64, errors : Int64, status : String,
-                 finished_at : Int64 = Time.utc.to_unix_ms * 1000_i64) : Bool
-        finish_once(sent, matched, errors, status, finished_at)
+                 finished_at : Int64 = Time.utc.to_unix_ms * 1000_i64, *,
+                 stop_idx : Int64? = nil) : Bool
+        finish_once(sent, matched, errors, status, finished_at, stop_idx)
         terminal_success
       end
 
@@ -183,7 +191,7 @@ module Gori
                 reason : String = "fuzz result persistence aborted") : Bool
         return @terminal_committed || false if terminal?
         fail_save(reason)
-        finish_once(sent, matched, errors, "save_failed", finished_at)
+        finish_once(sent, matched, errors, "save_failed", finished_at, nil)
         @terminal_committed || false
       end
 
@@ -210,7 +218,7 @@ module Gori
           result.incomplete?, result.extracted, result.request, result.head, result.body,
           result.retried?, result.chain_error, result.grpc_status, result.grpc_message,
           result.timed_out?, result.resent_count, result.wire, result.ws_close_code,
-          result.ws_frames_in)
+          result.ws_frames_in, result.shape)
       end
 
       # Record -> write is deliberately field-for-field. This is the spool copy seam: parsing
@@ -222,7 +230,7 @@ module Gori
           record.incomplete?, record.extracted, record.request, record.response_head,
           record.response_body, record.retried?, record.chain_error, record.grpc_status,
           record.grpc_message, record.timed_out?, record.resent_count, record.wire,
-          record.ws_close_code, record.ws_frames_in)
+          record.ws_close_code, record.ws_frames_in, record.shape)
       end
 
       # Deterministic transaction budget: every variable-width field plus a fixed allowance for
@@ -262,7 +270,44 @@ module Gori
           record.incomplete?, record.extracted, record.response_head, record.response_body,
           record.request, record.retried?, record.chain_error, record.grpc_status,
           record.grpc_message, record.timed_out?, record.resent_count, record.wire,
-          ws_close_code: record.ws_close_code, ws_frames_in: record.ws_frames_in)
+          ws_close_code: record.ws_close_code, ws_frames_in: record.ws_frames_in,
+          shape: record.shape)
+      end
+
+      # A saved run's response-shape clusters (#1351), from the keyset-paged scalar stream so
+      # no retained byte crosses SQLite and one entry per shape is all that is held. The block
+      # runs once per row — a surface's cancellation check and fiber yield. The one saved-run
+      # aggregation MCP, the CLI and the TUI restore share.
+      def self.clusters(store : Store, run_id : Int64, &each : -> Nil) : Clusters
+        clusters = Clusters.new
+        store.each_fuzz_result_summary(run_id) do |record|
+          each.call
+          clusters.add(result(record))
+        end
+        clusters
+      end
+
+      def self.clusters(store : Store, run_id : Int64) : Clusters
+        clusters(store, run_id) { }
+      end
+
+      # One page of one cluster's member rows, in index order, with the run's clusters (for the
+      # cluster's own summary) and how many members the filter selects in all. The same pass
+      # aggregates and pages, so nothing past one page of rows is held.
+      def self.cluster_members(store : Store, run_id : Int64, id : Int64, matched_only : Bool,
+                               offset : Int32, limit : Int32) : {Clusters, Array(Store::FuzzResultRecord), Int32}
+        clusters = Clusters.new
+        page = [] of Store::FuzzResultRecord
+        seen = 0
+        store.each_fuzz_result_summary(run_id) do |record|
+          row = result(record)
+          clusters.add(row)
+          next unless Clusters.key(row)[0] == id
+          next if matched_only && !row.matched?
+          page << record if seen >= offset && page.size < limit
+          seen += 1
+        end
+        {clusters, page, seen}
       end
 
       private def accepting? : Bool
@@ -368,17 +413,8 @@ module Gori
         false
       end
 
-      private def barrier : Bool
-        reply = Channel(Bool).new(1)
-        return false unless send_command(Barrier.new(reply))
-        reply.receive
-      rescue Channel::ClosedError
-        fail_save("the fuzz persistence worker stopped before the flush barrier")
-        false
-      end
-
       private def finish_once(sent : Int64, matched : Int64, errors : Int64, status : String,
-                              finished_at : Int64) : Nil
+                              finished_at : Int64, stop_idx : Int64?) : Nil
         return if terminal?
         @terminal_requested = true
         unless @worker_started && enqueue_pending_wait
@@ -386,7 +422,7 @@ module Gori
           return
         end
         reply = Channel(Bool).new(1)
-        unless send_command(Terminal.new(sent, matched, errors, status, finished_at, reply))
+        unless send_command(Terminal.new(sent, matched, errors, status, finished_at, stop_idx, reply))
           @terminal_committed = false
           return
         end
@@ -412,7 +448,7 @@ module Gori
         end
       ensure
         @commands.close rescue nil
-        # A worker failure must answer every buffered barrier/finish. Batch commands have no
+        # A worker failure must answer every buffered finish. Batch commands have no
         # waiter; dropping them is already represented by @error/save_failed.
         while command = (@commands.receive? rescue nil)
           answer_failed(command)
@@ -430,13 +466,10 @@ module Gori
             fail_save("a fuzz result batch did not commit (project busy, full, or read-only)")
           end
           false
-        when Barrier
-          command.reply.send(!failed?)
-          false
         when Terminal
           terminal = failed? ? "save_failed" : command.status
           committed = @store.finish_fuzz_run(@run_id, command.sent, command.matched,
-            command.errors, terminal, command.finished_at)
+            command.errors, terminal, command.finished_at, stop_idx: command.stop_idx)
           fail_save("the fuzz run summary did not commit") unless committed
           command.reply.send(committed)
           true
@@ -447,7 +480,6 @@ module Gori
 
       private def answer_failed(command : Command?) : Nil
         case command
-        when Barrier  then command.reply.send(false) rescue nil
         when Terminal then command.reply.send(false) rescue nil
         end
       end

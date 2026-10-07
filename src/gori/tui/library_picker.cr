@@ -45,6 +45,9 @@ module Gori::Tui
     #
     # nil = a library with no editor (the ^E hint then stays off).
     property on_edit : Proc(Int32, Nil)?
+    # ^R on the entry under the cursor, for an open-site whose rows can be refreshed in place
+    # (the session-slot picker, #1233). Nil = no such action; the hint says so by omission.
+    property on_refresh : Proc(Int32, Nil)?
 
     def initialize(@title : String, @rows : Array(Row), @noun : String, @action : String = "load")
       # Precompute each row's filter haystack ONCE (not per keystroke).
@@ -85,7 +88,8 @@ module Gori::Tui
     private def idle_hint : String
       edit = @on_edit ? " · ^E edit" : ""
       del = @on_delete ? " · ^X delete" : ""
-      "type to filter · ↑/↓ select · ↵ #{@action}#{edit}#{del} · esc cancel"
+      refresh = @on_refresh ? " · ^R refresh" : ""
+      "type to filter · ↑/↓ select · ↵ #{@action}#{edit}#{refresh}#{del} · esc cancel"
     end
 
     # ^X removes the highlighted entry from the library, in place — the card stays up so a
@@ -113,6 +117,11 @@ module Gori::Tui
         edit.call(i)
         return :cancel
       end
+      # ^R stays: the card is where the operator watches the row it refreshed.
+      if ev.ctrl? && ev.key.lower_r? && (refresh = @on_refresh) && (i = selected_index)
+        refresh.call(i)
+        return :stay
+      end
       super
     end
 
@@ -125,40 +134,17 @@ module Gori::Tui
     protected def refilter : Nil
       terms = query.downcase.split
       @filtered = terms.empty? ? @rows : @indexed.select { |(_, hay)| terms.all? { |t| hay.includes?(t) } }.map(&.first)
-      @selected = 0
+      # Land on the first LIBRARY entry, not on an action row that happens to match. A negative
+      # `Row#index` is an open-site's sentinel (the view picker's hide-static toggle and
+      # `+ Save current filter…`), and "type a name, press ↵" is how an entry is picked — so
+      # `err` + ↵ must reach the Errors view, not flip a lens whose detail says "errors stay".
+      # An action row is still reachable with ↑, and still first when nothing else matches.
+      @selected = @filtered.index { |row| row.index >= 0 } || 0
       @scroll = 0
     end
 
-    # A centred card filling most of the body area (stable height). nil when there isn't
-    # room to draw.
-    def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 96}.min
-      h = area.h - 2
-      return nil if w < 30 || h < 8
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
-    end
-
-    # Row index under (mx, my), mirroring render's list loop; nil outside the list.
-    def row_at(box : Rect, mx : Int32, my : Int32) : Int32?
-      list_h = list_height(box)
-      i = my - (box.y + LIST_OFFSET)
-      return nil if i < 0 || i >= list_h
-      return nil if mx < box.x + 1 || mx >= box.right - 1
-      ri = @scroll + i
-      ri < @filtered.size ? ri : nil
-    end
-
     def render(screen : Screen, area : Rect) : Nil
-      box = overlay_box(area)
-      unless box
-        Overlay.too_small(screen, area, "picker needs a larger window")
-        return
-      end
-      Frame.card(screen, box, @title, border: Theme.border_focus)
-
-      list_top = render_filter(screen, box, idle_hint)
-      list_h = list_height(box)
-      ensure_visible(list_h)
+      box, list_top, list_h = render_card(screen, area, @title, idle_hint) || return
 
       if @filtered.empty?
         # An empty LIBRARY and an empty FILTER are different dead ends, and the way out of
@@ -168,10 +154,8 @@ module Gori::Tui
         return
       end
 
-      (0...list_h).each do |i|
-        ri = @scroll + i
-        break if ri >= @filtered.size
-        draw_row(screen, box, list_top + i, @filtered[ri], ri == @selected)
+      each_visible_row(list_top, list_h, @filtered.size) do |ry, ri|
+        draw_row(screen, box, ry, @filtered[ri], ri == @selected)
       end
     end
 

@@ -1,4 +1,6 @@
 require "./proxy/codec/message"
+require "./proxy/codec/http1"
+require "./proxy/h2/head_codec"
 require "./store/models"
 
 module Gori
@@ -17,7 +19,8 @@ module Gori
                      advisory : String? = nil,
                      source : FlowSource::Kind,
                      source_surface : FlowSource::Surface? = nil,
-                     source_ref : String? = nil) : Store::CapturedRequest
+                     source_ref : String? = nil,
+                     intercept_original : Bytes? = nil) : Store::CapturedRequest
       # A malformed request-line (unencoded space ⇒ >3 tokens, or the h2 preface) makes
       # split(' ') mis-slice target/version — target becomes a truncated fragment and
       # version a garbage token. RawRequest keeps those for the live forwarding/keep-alive
@@ -47,7 +50,20 @@ module Gori
         source: source,
         source_surface: source_surface,
         source_ref: source_ref,
+        intercept_original: intercept_original,
       )
+    end
+
+    # The {method, target, version} a gori-originated recorder (Repeater, `gori run send`, the
+    # Fuzzer, MCP `send_request`, a frozen Repeater snapshot) files for a TEXT head it sent.
+    # Over h1 that is `Http1.authored_projection`, which keeps `request` above's rule for a line
+    # `split(' ')` cannot frame. Over h2 there is no request line on the wire: `H2Engine` sent
+    # the `:path` `HeadCodec.request_pseudo` cut, which keeps `/a b` whole, so that is the
+    # target — the h1 rule would file an h1 line no h2 stream ever carried (#1423).
+    def self.authored_request(head : Bytes, *, http2 : Bool) : {String, String, String}
+      return Proxy::Codec::Http1.authored_projection(head) unless http2
+      method, path = Proxy::H2::HeadCodec.request_pseudo(String.new(head).split('\n', 2).first.rstrip('\r'))
+      {method, path, "HTTP/2"}
     end
 
     def self.response(resp : Proxy::Codec::RawResponse, *, flow_id : Int64,
@@ -56,7 +72,8 @@ module Gori
                       state : Store::FlowState = Store::FlowState::Complete,
                       error : String? = nil,
                       body_truncated : Bool = false, body_size : Int64? = nil,
-                      advisory : String? = nil) : Store::CapturedResponse
+                      advisory : String? = nil,
+                      interims : Store::Interims? = nil) : Store::CapturedResponse
       Store::CapturedResponse.new(
         flow_id: flow_id,
         status: resp.status,
@@ -72,13 +89,15 @@ module Gori
         body_truncated: body_truncated,
         body_size: body_size,
         advisory: advisory,
+        interims: interims,
       )
     end
 
     # A flow the human deliberately dropped via Intercept (P4). Recorded as
     # Aborted so it's visible in History distinct from upstream errors.
     def self.aborted_response(flow_id : Int64, message : String, *,
-                              ttfb_us : Int64? = nil, duration_us : Int64? = nil) : Store::CapturedResponse
+                              ttfb_us : Int64? = nil, duration_us : Int64? = nil,
+                              interims : Store::Interims? = nil) : Store::CapturedResponse
       Store::CapturedResponse.new(
         flow_id: flow_id,
         status: 0,
@@ -88,6 +107,7 @@ module Gori
         duration_us: duration_us,
         state: Store::FlowState::Aborted,
         error: message,
+        interims: interims,
       )
     end
 
@@ -108,7 +128,8 @@ module Gori
     # difference between a NULL head (Pending) and an EMPTY one (Error/Aborted) — the R4-F3
     # case in `spec/export/har_spec.cr`.
     def self.error_response(flow_id : Int64, message : String, duration_us : Int64? = nil,
-                            head : Bytes = Bytes.new(0)) : Store::CapturedResponse
+                            head : Bytes = Bytes.new(0),
+                            interims : Store::Interims? = nil) : Store::CapturedResponse
       Store::CapturedResponse.new(
         flow_id: flow_id,
         status: 0,
@@ -117,6 +138,7 @@ module Gori
         duration_us: duration_us,
         state: Store::FlowState::Error,
         error: message,
+        interims: interims,
       )
     end
   end

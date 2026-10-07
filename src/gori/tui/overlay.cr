@@ -3,6 +3,7 @@ require "./screen"
 require "./geometry"
 require "./text_field"
 require "./theme"
+require "./frame"
 
 module Gori::Tui
   # Every modal state the shell's `@overlay` can hold. This was a bare `Symbol` with 33
@@ -27,7 +28,9 @@ module Gori::Tui
     Confirm
     Browser
     Choice
-    TabsMore
+    # The `0` key's Go-to picker (TabGotoPicker) — the type-to-filter list over the whole tab
+    # catalog that replaced the ⋯ dropdown's `TabsMore`.
+    TabGoto
     ComparerPick
     RepeaterSubtab
     Links
@@ -37,11 +40,14 @@ module Gori::Tui
     Tabs
     Hosts
     Env
+    UserAgents
     Hotkeys
     # Help's cheat-sheet / QL reference as a popup over the current pane (HelpPopupOverlay).
     # ONE member for both pages: they never coexist, and an overlay's `title` is per instance.
     Help
     Notifications
+    # One notification's long form (#1090), opened with ↵ on a ring row that carries a detail.
+    NoteDetail
     Passthrough
     Listeners
     # The MCP clients bound to this project (#815), opened from the `mcp:` top-bar chip or the
@@ -62,6 +68,9 @@ module Gori::Tui
     ColormarkerColor
     ExtractRule
     RewriterStub
+    # The answer options of a short-circuit rule (#1237) — a sub-editor of the rule form, like
+    # RewriterStub.
+    RewriterRespond
     # The Authorize tab's identities: a LIST card (pick / reorder the baseline / delete) and
     # the per-identity FORM it hands off to. Two members, because the list stays the thing the
     # form returns to — see Runner#open_authorize_identities.
@@ -69,6 +78,9 @@ module Gori::Tui
     AuthorizeIdentity
     CaImport
     Import
+    # The curl paste box (#1244) — one member for both of its destinations (a Repeater sub-tab,
+    # History), for the reason `Help` gives: they never coexist, and the title is per instance.
+    CurlPaste
     Export
     ScopeRule
     SequenceConfig
@@ -93,6 +105,30 @@ module Gori::Tui
     # must answer it honestly rather than borrow `None`.
     CopyAs
     SendTo
+    # The read-only viewer for one frozen issue-evidence row (#1038): the request and
+    # response as they were copied, over the Issues detail they were opened from. A modal
+    # rather than the History drill-in, because the drill-in's verbs act on a LIVE flow id
+    # (delete, link, probe) and a snapshot has none — and because closing a modal lands the
+    # operator back on the RELATED row they came from, tab and cursor intact.
+    Evidence
+    # An Issue's retest (#1036): the ordered Repeater steps and the last run's result table,
+    # in one card over the Issues detail. A modal for the reason `RetestOverlay` gives — the
+    # detail's row budget is already clamped, and a retest is a thing you open, not a pane
+    # every issue pays for.
+    Retest
+    # The one expected result a retest step carries. Its own card rather than
+    # `NamePromptOverlay` because the accepted forms have to be readable WHILE it is typed —
+    # see `RetestAssertOverlay`.
+    RetestAssert
+    # The differential-timing verdict card (#1246), opened when the repeater.timing-analysis
+    # fiber finishes: a read-only report over marked Repeater sub-tabs.
+    TimingReport
+    # An agent's `ask_operator` question (#1324): its choices on digit keys, opened by the
+    # operator from the ring, the `ask:` chip or app.answer-agent — never by the question.
+    AgentQuestion
+    # Preferences → Keys → Keyset playground: the practice pad plus each keyset's key
+    # list, born on the seam.
+    KeysetPlayground
 
     def to_sym : Symbol
       {% begin %}
@@ -166,10 +202,7 @@ module Gori::Tui
     # returned nil at every terminal size and the form could not be opened at all.
     def self.rule_form_box(area : Rect, rows : Int32, preview : Bool = false) : Rect?
       natural = rows + (preview ? 5 : 4)
-      w = {area.w - 4, RULE_FORM_W}.min
-      h = {area.h - 2, natural}.min
-      return nil if w < RULE_FORM_MIN_W || h < {RULE_FORM_MIN_H, natural}.min
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      area.card?(RULE_FORM_W, natural, RULE_FORM_MIN_W, {RULE_FORM_MIN_H, natural}.min)
     end
 
     # One `label: value` row of such a form: the label in muted, the field's text (or its
@@ -217,6 +250,21 @@ module Gori::Tui
       !ev.key.enter?
     end
 
+    # Whether a bracketed paste over this modal is collected and handed over whole
+    # (`paste_text`) instead of arriving key by key — the tab tier's `accepts_bulk_paste?`,
+    # one tier up. False by default: only a card whose body IS a multi-line editor opts in,
+    # because only there do the two paths build the same buffer, and only there does the
+    # per-keystroke cost (quadratic in the paste, `runner/paste.cr`) matter.
+    def accepts_bulk_paste? : Bool
+      false
+    end
+
+    # The whole paste, line breaks as `\n`. False hands it back to the Runner, which replays
+    # it keystroke by keystroke.
+    def paste_text(text : String) : Bool
+      false
+    end
+
     # Runs on a :commit outcome; returns true when the overlay should close (false keeps
     # it open — e.g. a validation error keeps the form up). Supplied at the open-site.
     property on_commit : Proc(Bool)?
@@ -243,6 +291,12 @@ module Gori::Tui
     # `Runner#leave_overlay`, which skips this, so the pop-back can't re-open on top of
     # where the user asked to go.
     property on_close : Proc(Nil)?
+
+    # Whether this modal was opened over the History drill-in, written by
+    # `Runner#open_overlay`. The drill-in is an `@overlay` state too, so the modal replaces
+    # it there; this is what keeps the flow drawn behind the card and puts the drill-in back
+    # when the card closes, instead of both falling to the bare list (`Runner.detail_beneath?`).
+    property? over_detail : Bool = false
 
     # The `@overlay` state this modal sets, written by `Runner#open_overlay`.
     #
@@ -368,10 +422,6 @@ module Gori::Tui
       0
     end
 
-    # Put the cursor on row `idx` (clamped). Default no-op; list cards override it.
-    def set_selected(idx : Int32) : Nil
-    end
-
     # PgUp/PgDn/Home/End over the list, one page being the rows the last frame drew. True
     # when `ev` was one of the four, so a key ladder can take it as one arm.
     def page_key(ev : Termisu::Event::Key) : Bool
@@ -422,6 +472,380 @@ module Gori::Tui
     # overlay (default true when no closure was supplied).
     def commit : Bool
       (c = on_commit) ? c.call : true
+    end
+  end
+
+  # The row form: a card of `label: value` rows, one selected, each drawn as a band with a `▎`
+  # marker, the LAST row the button that commits (Save / Run / Start). Ten forms — Rewriter,
+  # Colormarker, Probe custom, extract, column, Scope, OAST provider, custom colour, Sequencer,
+  # active scan — had each hand-rolled the selection, the click, the render loop and the row
+  # prelude. A subclass answers `row_count`, `card_title`, `too_small_what` and
+  # `draw_row_body`, and keeps its own key cases.
+  abstract class FormOverlay < Overlay
+    @sel = 0
+
+    abstract def row_count : Int32
+
+    # The card's border title (`title` is the shell's focus badge).
+    abstract def card_title : String
+
+    # The "<what>" of the line drawn when the card does not fit (`Overlay.too_small`).
+    abstract def too_small_what : String
+
+    # One row's content, drawn over the band and the `▎` marker; `x` is the label column.
+    abstract def draw_row_body(screen : Screen, box : Rect, i : Int32, py : Int32,
+                               x : Int32, bg : Color, fg : Color, sel : Bool) : Nil
+
+    # Whether `row` is one ↑/↓ walks past: a row the form's current kind or op ignores.
+    def skip_row?(row : Int32) : Bool
+      false
+    end
+
+    # Whether the card draws a preview band under the rows (`Overlay.rule_form_box`).
+    def preview? : Bool
+      false
+    end
+
+    def on_save_row? : Bool
+      @sel == row_count - 1
+    end
+
+    # One row per step whatever `d`'s size, walking PAST rows `skip_row?` names instead of
+    # landing on them, and stopping at the ends rather than wrapping. A form whose wheel notch
+    # moves the full `d` overrides with a clamp.
+    def move(d : Int32) : Nil
+      step = d < 0 ? -1 : 1
+      nxt = @sel
+      loop do
+        probe = nxt + step
+        break if probe < 0 || probe > row_count - 1
+        nxt = probe
+        break unless skip_row?(nxt)
+      end
+      @sel = nxt unless skip_row?(nxt)
+    end
+
+    def set_selected(idx : Int32) : Nil
+      idx = idx.clamp(0, row_count - 1)
+      @sel = idx unless skip_row?(idx)
+    end
+
+    # The text field on `row`, or nil when the row is not one (a cycler, the commit row).
+    private def text_field_for(row : Int32) : TextField?
+      nil
+    end
+
+    # Live IME composition goes to the selected row's text field, when it has one.
+    def set_preedit(text : String) : Nil
+      text_field_for(@sel).try(&.set_preedit(text))
+    end
+
+    # A cycler row's keys: ←/→ step its value (the form's `adjust`), ↵/space moves on.
+    private def cycler_key(key : Termisu::Input::Key) : Symbol
+      case
+      when key.left?              then adjust(-1)
+      when key.right?             then adjust(1)
+      when key.enter?, key.space? then move(1)
+      end
+      :stay
+    end
+
+    # A text row's keys: ↵ commits when `commit` (the form's last text row) and moves on
+    # otherwise; anything else edits the row's field.
+    private def text_row_key(ev : Termisu::Event::Key, commit : Bool) : Symbol
+      field = text_field_for(@sel)
+      if ev.key.enter?
+        return :commit if commit
+        move(1)
+      elsif field
+        field.handle_edit_key(ev)
+      end
+      :stay
+    end
+
+    # ↑/⇤ and ↓/↹ step between rows. True when `ev` was one of the four, so a key ladder can
+    # take it as one arm.
+    private def field_nav?(ev : Termisu::Event::Key) : Bool
+      key = ev.key
+      if key.up? || key.back_tab?
+        move(-1)
+      elsif key.down? || key.tab?
+        move(1)
+      else
+        return false
+      end
+      true
+    end
+
+    # Click a row to select it; a click on the commit row commits; a click outside the card
+    # cancels. Mirrors the ↑/↓ + ↵ keyboard model.
+    def handle_click(area : Rect, mx : Int32, my : Int32) : Symbol
+      box = overlay_box(area)
+      return :cancel if box.nil? || !box.contains?(mx, my)
+      if idx = row_at(box, mx, my)
+        set_selected(idx)
+        return :commit if on_save_row?
+        row_clicked(idx)
+      end
+      # …then the caret, if the press landed inside a drawn field. The row pick above is
+      # what focuses; this is what puts the caret where the operator pointed instead of
+      # leaving it wherever the last keystroke did (Overlay#click_text_field).
+      click_text_field(mx, my)
+      :stay
+    end
+
+    # A press on a row that is not the commit row, after it was selected.
+    private def row_clicked(idx : Int32) : Nil
+    end
+
+    def overlay_box(area : Rect) : Rect?
+      Overlay.rule_form_box(area, row_count, preview: preview?)
+    end
+
+    private def first_row_y(box : Rect) : Int32
+      box.y + 2
+    end
+
+    # The first y a row may not be drawn on: the bottom border, or the preview band above it.
+    private def rows_bottom(box : Rect) : Int32
+      box.bottom - (preview? ? 2 : 1)
+    end
+
+    def render(screen : Screen, area : Rect) : Nil
+      box = overlay_box(area)
+      unless box
+        Overlay.too_small(screen, area, too_small_what)
+        return
+      end
+      Frame.card(screen, box, card_title, border: Theme.border_focus)
+      draw_head(screen, box)
+      first = first_row_y(box)
+      row_count.times do |i|
+        py = first + i
+        break if py >= rows_bottom(box)
+        draw_row(screen, box, i, py)
+      end
+      draw_tail(screen, box, first)
+      # No key hint on the bottom border: the shell already draws `hint` in the status strip
+      # for whichever modal is open (Runner#key_hints), so a second copy here was the same
+      # advice twice — and the copies had drifted apart. Per-row affordances stay where the
+      # key applies (the `‹/›` a cycler draws when it has focus).
+    end
+
+    # What a card draws between its title and its rows.
+    private def draw_head(screen : Screen, box : Rect) : Nil
+    end
+
+    # What a card draws under its rows (the preview band); `first` is the first row's y.
+    private def draw_tail(screen : Screen, box : Rect, first : Int32) : Nil
+    end
+
+    private def draw_row(screen : Screen, box : Rect, i : Int32, py : Int32) : Nil
+      sel = i == @sel
+      bg = Frame.row_band(screen, box, py, sel)
+      draw_row_body(screen, box, i, py, box.x + 3, bg, sel ? Theme.text_bright : Theme.text, sel)
+    end
+
+    def row_at(box : Rect, mx : Int32, my : Int32) : Int32?
+      return nil unless box.contains?(mx, my)
+      return nil if my >= rows_bottom(box) # render stops there: the preview band, not a row
+      i = my - first_row_y(box)
+      (0 <= i < row_count) ? i : nil
+    end
+  end
+
+  # A read-only inventory card reached from a top-bar chip: the additional listeners, the TLS
+  # passthrough hosts, the attached MCP clients. Nothing on it is edited — ↑/↓ scroll, `r`
+  # re-snapshots, a click selects, esc closes — and the last row inside the card is a footer
+  # saying what the list itself cannot. A subclass holds its rows (a COPY, so they cannot shift
+  # under a click hit-tested against the previous frame) and draws them.
+  abstract class ListCard < Overlay
+    # ^P leaves for the command palette, like every other list overlay. Injected because
+    # raising another modal is the shell's job.
+    property on_palette : Proc(Nil)?
+
+    @selected = 0
+
+    # Re-snapshot the rows, keeping the selection in range.
+    abstract def reload : Nil
+
+    private abstract def card_w : Int32
+    private abstract def meta : String
+    private abstract def empty_text : String
+    private abstract def too_small_what : String
+    private abstract def draw_row(screen : Screen, box : Rect, i : Int32, py : Int32) : Nil
+    private abstract def draw_footer(screen : Screen, box : Rect) : Nil
+
+    # A card's own key, ahead of the list keys. True when it took `ev`.
+    private def card_key(ev : Termisu::Event::Key) : Bool
+      false
+    end
+
+    # What bare `r` does.
+    private def refresh : Nil
+      reload
+    end
+
+    # Read-only: no ↵ commit, nothing to apply.
+    def handle_key(ev : Termisu::Event::Key) : Symbol
+      k = ev.key
+      if ev.ctrl? && k.lower_p?
+        on_palette.try(&.call)
+      elsif k.escape?
+        return :cancel
+      elsif !card_key(ev)
+        handle_nav(ev)
+      end
+      :stay
+    end
+
+    # ↑/↓ and their bare-letter twins, plus the bare `r`. Split out of `handle_key` for the same
+    # reason `HotkeysOverlay#bare_char` is a method — to keep the dispatcher under the ameba
+    # complexity bar — and the guard in the middle is the whole point of the split.
+    #
+    # BOTH halves of every letter arm need it, which is why guarding the `ev.char` arm alone was
+    # not enough. `Event::Key#char` is `@char || key.to_char`, so ^R folds back to 'r'; and the
+    # termisu parser emits ^K as `Key::LowerK + Ctrl` (parser.cr maps 0x01..0x1A through
+    # `Key.from_char`), so `k.lower_k?` is TRUE on a chord too — no `ev.char` involved. The
+    # shell pre-filters only ^C/^D/^G/^F/^B (`Runner#handle_key`), so every other chord lands
+    # here. ARROWS stay outside the guard deliberately: ⌃↑/⌃↓ are a scroll gesture elsewhere in
+    # gori and nothing folds them into a letter, so there is no bug to fix on that arm.
+    private def handle_nav(ev : Termisu::Event::Key) : Nil
+      k = ev.key
+      if k.up?
+        move(-1)
+      elsif k.down?
+        move(1)
+      elsif page_key(ev)
+        # PgUp/PgDn/Home/End — the list contract, `Overlay#page_key`
+      elsif ev.ctrl? || ev.alt?
+        # A chord is not a mnemonic. Claimed and dropped rather than fallen through: this
+        # overlay returns :stay for everything, so the chord was consumed either way — the
+        # only question was whether it also DID something, and it should not.
+      elsif k.lower_k?
+        move(-1)
+      elsif k.lower_j?
+        move(1)
+      elsif (ev.char || k.to_char) == 'r'
+        refresh
+      end
+    end
+
+    # A click inside the card selects a row (there is nothing to open); outside dismisses.
+    # Never :commit — a read-only list that closed itself on a row click would look like it
+    # had done something.
+    def handle_click(area : Rect, mx : Int32, my : Int32) : Symbol
+      box = overlay_box(area)
+      return :cancel if box.nil? || !box.contains?(mx, my)
+      # The gauge on the card's right hairline, before `row_at` — which has no `mx` bound and
+      # would otherwise read a click there as a plain pick of whatever row shares its `my`.
+      if row = gauge_row_at(box, mx, my)
+        set_selected(row)
+      elsif idx = row_at(box, mx, my)
+        set_selected(idx)
+      end
+      :stay
+    end
+
+    def move(d : Int32) : Nil
+      @selected = (@selected + d).clamp(0, {entry_count - 1, 0}.max)
+    end
+
+    def set_selected(idx : Int32) : Nil
+      @selected = idx.clamp(0, {entry_count - 1, 0}.max)
+    end
+
+    # Centered box, sized to the content (min 6 rows), `card_w` wide at most.
+    def overlay_box(area : Rect) : Rect?
+      w = {area.w - 4, card_w}.min
+      rows = {entry_count, 6}.max
+      h = {area.h - 2, rows + 4}.min # title gap + list + footer + bottom border
+      return nil if w < 32 || h < 7
+      area.center(w, h)
+    end
+
+    def render(screen : Screen, area : Rect) : Nil
+      box = overlay_box(area)
+      unless box
+        Overlay.too_small(screen, area, too_small_what)
+        return
+      end
+      Frame.card(screen, box, title, border: Theme.border_focus)
+      Frame.border_meta(screen, box, title, meta, bg: Theme.panel)
+
+      cap = list_capacity(box)
+      @list_last_h = cap
+      return if cap <= 0
+      start = list_window(cap)
+      if entry_count == 0
+        screen.text(box.x + 3, box.y + 2, empty_text, Theme.muted, Theme.panel)
+      else
+        cap.times do |row|
+          i = start + row
+          break if i >= entry_count
+          draw_row(screen, box, i, box.y + 2 + row)
+        end
+      end
+      # A windowed list with no gauge gave an operator scrolling past row `cap` nothing that
+      # said there was more. `true` for focused: an open modal IS the focus.
+      Frame.scroll_gauge(screen, Rect.new(box.x + 1, box.y + 2, box.w - 2, cap),
+        entry_count, start, true, Theme.panel)
+      draw_footer(screen, box)
+    end
+
+    # The row a click on the list's scroll gauge asks for. The gauge rides the card's right
+    # hairline; the window is derived from the selection, so this answers with a selection.
+    def gauge_row_at(box : Rect, mx : Int32, my : Int32) : Int32?
+      Frame.scroll_gauge_row(Rect.new(box.x + 1, box.y + 2, box.w - 2, list_capacity(box)),
+        entry_count, mx, my)
+    end
+
+    # Row index under (mx,my) — inverts render's windowed layout so a click maps to the same
+    # row that was drawn.
+    def row_at(box : Rect, mx : Int32, my : Int32) : Int32?
+      return nil unless box.contains?(mx, my)
+      cap = list_capacity(box)
+      row = my - (box.y + 2)
+      return nil if row < 0 || row >= cap
+      i = list_window(cap) + row
+      i < entry_count ? i : nil
+    end
+
+    # One row above the border is reserved for the footer (see draw_footer).
+    private def list_capacity(box : Rect) : Int32
+      {box.bottom - 2 - (box.y + 2), 0}.max
+    end
+
+    private def list_window(cap : Int32) : Int32
+      return 0 if cap <= 0 || entry_count <= cap
+      { {@selected - cap + 1, 0}.max, entry_count - cap }.min
+    end
+  end
+
+  # A card whose body is ONE `TextArea` (`@editor`, laid out by the card's `editor_rect(box)`):
+  # a drag and a double-click select in it, a pasted line break is a newline, and IME preedit
+  # lands in it. Included by the class, so these replace `Overlay`'s defaults.
+  module EditorCard
+    def supports_drag? : Bool
+      true
+    end
+
+    def handle_drag(area : Rect, mx : Int32, my : Int32) : Nil
+      return unless box = overlay_box(area)
+      @editor.click_to_cursor(editor_rect(box), mx, my, selecting: true)
+    end
+
+    def handle_double_click(area : Rect, mx : Int32, my : Int32) : Symbol
+      return :pass unless box = overlay_box(area)
+      @editor.select_word_at(editor_rect(box), mx, my) ? :stay : :pass
+    end
+
+    def takes_pasted?(ev : Termisu::Event::Key) : Bool
+      true
+    end
+
+    def set_preedit(text : String) : Nil
+      @editor.set_preedit(text)
     end
   end
 end

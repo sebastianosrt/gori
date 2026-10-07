@@ -5,10 +5,11 @@ require "../spec_helper"
 # filters on `menu_key`, and the palette only queries `Scope::Global`. A shipped export with
 # a handler, an `ExecContext` method and no way to invoke it.
 #
-# The three surfaces, and the whole rule:
+# The four surfaces, and the whole rule:
 #   • a chord      → the keymap fires it
 #   • a menu_key   → the space menu lists it (explicit `mnemonic:`, else a plain 1-char chord)
 #   • Scope::Global → the palette lists it regardless
+#   • `menu: :palette` → the palette's typed search lists it from its own view (#1282)
 describe "verb reachability" do
   it "leaves no verb without a keyboard path" do
     unreachable = [] of String
@@ -16,10 +17,27 @@ describe "verb reachability" do
       next if v.hidden?                            # a gesture, not a listed command
       next if v.scope == Gori::Verb::Scope::Global # the palette lists these by scope alone
       next unless v.chords.empty?
-      next if v.menu_key
+      next if v.menu_listed?  # a level-1 letter, or a row inside its family (#1274 WP9)
+      next if v.palette_only? # the palette's search — pinned by the example below
       unreachable << v.id
     end
     unreachable.should be_empty
+  end
+
+  it "lists every palette-only verb in its own tab's view, which the palette's search reads" do
+    # `menu: :palette` drops the space-menu row, so the palette is the one listing left: the
+    # verb must be a tab verb the view registers (`Registry#for_view` is what `^P` searches,
+    # #1282), never hidden, and never a Global or Editor verb, which no view lists.
+    reg = Gori::Verbs.registry
+    placed = reg.select(&.palette_only?)
+    placed.size.should be >= 36
+    placed.each do |v|
+      v.hidden?.should be_false, v.id
+      v.scope.global?.should be_false, v.id
+      v.scope.editor?.should be_false, v.id
+      subtabs = reg.has_section?(v.scope, :subtab)
+      reg.registered_in_view(v.scope, v.section, subtabs).should contain(v), v.id
+    end
   end
 
   it "keeps a hidden verb's chord, since hidden means unlisted rather than unbound" do
@@ -55,14 +73,17 @@ describe "rule-list keys" do
     r["colormarker.edit"].chords.should contain(plain.call("e"))
     r["colormarker.edit"].chords.should contain(plain.call("enter"))
     r["colormarker.delete"].chords.should contain(plain.call("d"))
-    r["colormarker.toggle"].chords.should contain(plain.call("x"))
-    r["colormarker.scope"].chords.should contain(plain.call("s"))
+    r["colormarker.toggle"].chords.should contain(plain.call("t")) # F4: `t` flips a row flag
+    # F7: menu-only, so the Global `s` (scope lens) is not shadowed on this tab.
+    r["colormarker.scope"].chords.should be_empty
+    r["colormarker.scope"].menu_key.should eq('s')
     r["colormarker.toggle-default"].chords.should be_empty # menu-only: ⇧X is the wipe chord elsewhere
     r["colormarker.move-down"].chords.should contain(shift.call("j"))
     r["colormarker.move-up"].chords.should contain(shift.call("k"))
-    # …and the menu letter now names the key. It was 'g', which matched neither the verb
-    # ("Enable/disable everywhere") nor its ⇧X binding.
-    r["colormarker.toggle-default"].menu_key.should eq('X')
+    # It was 'g', then 'X' — and ⇧X is the wipe letter app-wide, which this is not. 'T' is
+    # the broad form of the list's `t` toggle (#1274).
+    r["colormarker.toggle-default"].menu_key.should eq('T')
+    r["rewriter.toggle-default"].menu_key.should eq('T')
   end
 end
 
@@ -89,14 +110,13 @@ describe "hex and whitespace letters" do
     end
   end
 
-  it "leaves the two that CANNOT take `x`, and says why" do
-    # Not drift — a real collision in each displayable view:
-    #   HistoryDetail   `x` is `detail.select-line`      → `detail.toggle-hex` stays 'e'
-    #   Repeater :response `x` is `repeater.select-line` → `repeater.toggle-resp-hex` stays 'h'
-    r["repeater.toggle-hex"].menu_key.should eq('x')
-    r["detail.toggle-hex"].menu_key.should eq('e')
+  it "spells hex `x` one level down, where select-line's `x` cannot compete" do
+    # Level 1 could not give all three `x`: the detail's and the response pane's `x` is
+    # select-line. Display… (#1274) is a keyspace of its own, so hex is `Z x` in all three.
+    %w[repeater.toggle-hex detail.toggle-hex repeater.toggle-resp-hex].each do |id|
+      r.menu_keys(id).should eq(['Z', 'x']), id
+    end
     r["detail.select-line"].menu_key.should eq('x')
-    r["repeater.toggle-resp-hex"].menu_key.should eq('h')
   end
 end
 
@@ -128,37 +148,123 @@ describe "sub-tab verbs" do
     end
   end
 
-  # WHERE close lands in the menu. `SpaceMenu#open` renders COMMON ∪ the focused pane's
-  # section, so a `:subtab` close is invisible from the body — an operator editing in a pane
-  # has to move focus to the strip first. Decoder and JWT fixed that for themselves ("Round 4",
-  # decoder_spec) and the rest inherited the old placement, which read as the majority.
-  it "files close under COMMON, so it is reachable from the body" do
-    {"decoder.close", "jwt.close", "comparer.close-subtab",
-     "mine.close-subtab", "sequence.close-subtab"}.each do |id|
-      r[id].section.should eq(:common)
+  # WHERE the strip's verbs land. They no longer have to choose: `SpaceMenu#open` draws
+  # `:subtab` ∪ `:tab` as ONE "SUB-TABS" bucket on every view of a tab that has a strip
+  # (#1055), so a `:subtab` tag is reachable from the body panes, from the strip, and from
+  # the tab bar alike. Half the family used to sit in COMMON purely to escape the old rule;
+  # now the whole family is filed where it belongs.
+  it "files every strip verb under :subtab, and the strip's search/filter under :tab" do
+    {"decoder.close", "jwt.close", "comparer.close-subtab", "mine.close-subtab",
+     "sequence.close-subtab", "repeater.close-subtab", "fuzz.close-subtab",
+     "repeater.new", "repeater.paste-curl", "fuzz.new", "decoder.new", "jwt.new", "cookie.new",
+     "notes.new", "comparer.new"}.each do |id|
+      r[id].section.should eq(:subtab)
+    end
+    {"repeater.find-subtab", "fuzz.find-subtab", "notes.find-subtab",
+     "repeater.filter-subtabs"}.each do |id|
+      r[id].section.should eq(:tab)
     end
   end
 
-  it "leaves Repeater and Fuzzer out, because `w` is taken in their editor sections" do
-    # NOT drift: `repeater.mark-word` / `fuzz.mark-word` own 'w' in `:request` / `:template`,
-    # and a COMMON entry renders alongside them — `Registry#validate_menu_keys!` would raise
-    # at boot. `^W` still closes from anywhere; only the menu row is strip-only there.
-    r["repeater.close-subtab"].section.should eq(:subtab)
-    r["fuzz.close-subtab"].section.should eq(:subtab)
-    r["repeater.mark-word"].menu_key.should eq('w')
-    r["repeater.mark-word"].section.should eq(:request)
-    r["fuzz.mark-word"].menu_key.should eq('w')
-    r["fuzz.mark-word"].section.should eq(:template)
+  it "hands `w` to close, and keeps the two editors' mark-word off it" do
+    # The collision the old placement could not solve: `repeater.mark-word` / `fuzz.mark-word`
+    # owned 'w' in `:request` / `:template`, and the bucket now renders alongside them, so
+    # `Registry#validate_menu_keys!` would raise at boot. The PANE verb moved, not the
+    # strip's — `w` close is one of the nine letters that must read the same on all nine
+    # strips. It moved to `W`, and then to the palette (#1282): `^K` is its key.
+    {"repeater.mark-word" => :request, "fuzz.mark-word" => :template}.each do |id, section|
+      r[id].palette_only?.should be_true
+      r[id].menu_key.should be_nil
+      r[id].section.should eq(section)
+    end
   end
 
-  it "puts rename on `e` everywhere it can" do
-    # One letter across the family. JWT is the documented exception: `jwt.toggle-mode` owns
-    # 'e' in its COMMON group, and the menu shows COMMON plus the focused section.
-    {"repeater", "fuzz", "comparer", "decoder", "mine", "sequence"}.each do |prefix|
-      r["#{prefix}.rename-subtab"].menu_key.should eq('e')
+  it "puts rename on `e` on every strip that has one" do
+    # One letter across the family, with no exception left. The key audit reached for the `r`
+    # the STRIP binds, which is the better answer wherever it is available — and it is
+    # available on only four of the nine. On the other four, COMMON's 'r' is `*.run` /
+    # `repeater.send`, the menu echo of `^R`, and COMMON renders inside the :subtab view: a
+    # rename does not displace the Run letter. Two spellings for one action across the nine
+    # strips is precisely what the SUB-TABS bucket exists to end, so rename is 'e' on all of
+    # them and the strip's raw `r` chord is untouched.
+    {"repeater", "fuzz", "comparer", "decoder", "mine", "sequence", "jwt", "cookie"}.each do |prefix|
+      r["#{prefix}.rename-subtab"].menu_key.should eq('e'), prefix
     end
-    r["jwt.rename-subtab"].menu_key.should eq('r')
-    r["jwt.toggle-mode"].menu_key.should eq('e')
+    # The four that could not have taken 'r', and why — pinned so the reason outlives the memo.
+    {"repeater" => "repeater.send", "fuzz" => "fuzz.run",
+     "mine" => "mine.run", "sequence" => "sequence.run"}.each do |_prefix, runner|
+      r[runner].menu_key.should eq('r'), runner
+      r[runner].section.should eq(:common), runner
+    end
+    # JWT and Cookie held 'e' for their lens toggle and put rename on 'r'; both toggles moved
+    # to 'm', and then to the palette (#1282): `^T` is their key.
+    r["jwt.toggle-mode"].palette_only?.should be_true
+    r["cookie.toggle-mode"].palette_only?.should be_true
+    # Notes derives its chip label from the body text, so it has no rename. `notes.edit` still
+    # gave 'e' up (to 'o'): the strip's nine read the same on all nine strips, including the
+    # one that lacks the action (#1274 WP6, `Registry#validate_intents!`).
+    r["notes.rename-subtab"]?.should be_nil
+    r["notes.edit"].menu_key.should eq('o')
+  end
+
+  it "gives the strip the SAME nine letters on all nine tabs" do
+    # The whole point of the bucket: one table to learn, not nine. A tab that lacks an
+    # intent simply omits the row — it never spends that letter on something else. `t` is
+    # Mark sub-tab, the strip's own raw `t`, so the Repeater's Tag moved to `g` (#1274).
+    {"new" => 'n', "close" => 'w', "duplicate" => 'd', "rename" => 'e', "mark" => 't',
+     "find" => 'f', "filter" => '/', "mark-all" => 'T', "mark-clear" => 'N', "tag" => 'g'}.each do |intent, key|
+      r.each do |v|
+        next unless Gori::Verb::Registry::SUBTAB_SECTIONS.includes?(v.section)
+        next unless v.id.ends_with?(intent) || v.id.ends_with?("#{intent}-subtab") ||
+                    v.id.ends_with?("#{intent}-subtabs") || v.id.ends_with?("subtab-#{intent}")
+        v.menu_key.should eq(key)
+      end
+    end
+  end
+
+  it "puts sub-tab search on the `f` the strip binds, in every tab that has a strip" do
+    # `f` on the strip opens this picker in all of them; the menu said 's' on Repeater and
+    # Notes, which is a letter the strip does not answer to. It is also one of the nine the
+    # SUB-TABS bucket now reserves in EVERY view of those tabs, so what held 'f' had to move
+    # whatever else was true: `repeater.fuzz` went to 'F' and has since moved into Send flow
+    # to… (#1274), and `notes.find` → 's', the letter `notes.find-subtab` vacated, so the pair
+    # is a straight swap.
+    {"repeater", "fuzz", "mine", "sequence", "comparer", "decoder", "jwt", "cookie", "notes"}
+      .each do |prefix|
+        r["#{prefix}.find-subtab"].menu_key.should eq('f'), prefix
+      end
+    r.menu_keys("repeater.fuzz").should eq(['>', 'f'])
+    r["notes.find"].menu_key.should eq('s')
+    # Send to Fuzzer is one letter in every scope now: the family table's.
+    r.menu_keys("history.fuzz").should eq(['>', 'f'])
+  end
+end
+
+# `Verbs.registry` calls `validate_menu_keys!` and `validate_chords!` on its way out, so the
+# shipped key set is checked at BOOT. This pins that it stays checked, and pins what the chord
+# sweep covers: every OS profile, not just the one this binary was built for. `OVERRIDES` ships
+# empty today, so all three resolve to the same keymap — the point is that a future per-OS
+# substitution cannot introduce a collision on a profile nobody runs the suite on.
+describe "the shipped key set boots clean on every OS profile" do
+  it "has no space-menu collision and no chord collision or dead capital" do
+    r = Gori::Verbs.registry
+    r.validate_menu_keys!
+    r.validate_chords!
+    r.validate_intents!
+  end
+
+  it "resolves the same effective chords on macOS, Linux and Windows" do
+    r = Gori::Verbs.registry
+    per_os = Gori::Verb::OsProfile::Os.values.map do |os|
+      keys = {} of String => Array(String)
+      r.each { |v| keys[v.id] = Gori::Verb::Keymap.effective_chords(v, os).map(&.label) }
+      keys
+    end
+    per_os.each(&.should(eq(per_os.first)))
+    # …and every keymap they build is loadable, which is what the TUI does at start-up.
+    Gori::Verb::OsProfile::Os.values.each do |os|
+      Gori::Verb::Keymap.build(r, os)
+    end
   end
 end
 
@@ -167,29 +273,40 @@ end
 describe "Rewriter rule keys" do
   r = Gori::Verbs.registry
 
-  it "binds every rule action except toggle" do
+  it "binds every rule action, and leaves the two that shadow a Global key to the menu" do
     plain = ->(k : String) { typed_chord(k) }
     r["rewriter.add"].chords.should contain(plain.call("a"))
     r["rewriter.edit"].chords.should contain(plain.call("e"))
     r["rewriter.delete"].chords.should contain(plain.call("d"))
-    r["rewriter.scope"].chords.should contain(plain.call("s"))
     r["rewriter.move-up"].chords.should contain(typed_chord("k", shift: true))
     r["rewriter.toggle-default"].chords.should be_empty # menu-only: ⇧X is the wipe chord elsewhere
+    # global ⇄ project is menu-only since the key audit's F7: `s` is the Global scope lens,
+    # and a scoped chord always beats the Global fallback, so this list quietly cost an
+    # operator the lens key for an action used when a rule is FILED, not while triaging.
+    r["rewriter.scope"].chords.should be_empty
+    r["rewriter.scope"].menu_key.should eq('s')
   end
 
-  it "leaves `x` to the controller, because the KEYMAP has no focus dimension" do
-    # `rewriter.select-line` binds bare `x` in this same SCOPE for the preview pane. Two
-    # `section:`s never render together so the space menu is fine with `x` meaning two
-    # things — but `Keymap#lookup` is keyed by scope alone and returns ONE id, so a chord on
-    # `rewriter.toggle` would shadow one of them. `RewriterController#handle_list_key` runs
-    # only when the LIST has focus, which is the disambiguation the keymap cannot express.
-    r["rewriter.toggle"].chords.should be_empty
+  it "takes a REAL chord on `t`, because F4 moved the toggle off `x` entirely" do
+    # This verb had no chord at all, and the reason was structural: `rewriter.select-line`
+    # binds bare `x` in this same SCOPE for the preview pane, `Keymap#lookup` is keyed by
+    # scope alone and returns ONE id, so a chord on `rewriter.toggle` shadowed one of them —
+    # which is why the toggle was hand-rolled in `RewriterController#handle_list_key` and `x`
+    # was not rebindable here.
+    #
+    # On `t` the two never meet, so the verb is an ordinary chord with an ordinary gate: the
+    # `available:` lambda asks `rewriter_rule_list_focused?`, which is exactly the pane the
+    # deleted arm ran in.
+    r["rewriter.toggle"].chords.should eq([typed_chord("t")])
+    r["rewriter.toggle"].menu_key.should eq('t')
     r["rewriter.select-line"].chords.should contain(typed_chord("x"))
-    r["rewriter.toggle"].menu_key.should eq('x') # still the letter, in its own section
     r["rewriter.select-line"].section.should eq(:preview)
     r["rewriter.toggle"].section.should eq(:rules)
-    # Colormarker COULD take the chord: it has no read pane, so nothing else claims `x`.
-    r["colormarker.toggle"].chords.should contain(typed_chord("x"))
+    # …and the other three rule lists say it the same way.
+    {"colormarker.toggle", "probe-rules.toggle", "oast.toggle-provider"}.each do |id|
+      r[id].chords.should eq([typed_chord("t")]), id
+      r[id].menu_key.should eq('t'), id
+    end
   end
 end
 

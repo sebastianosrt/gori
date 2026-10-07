@@ -111,28 +111,53 @@ module Gori::Tui
       true
     end
 
-    # READ: structure local; x/y and Global breath defer to the keymap.
+    # READ: structure local; every command letter defers to the keymap. `i`/`↵` (INSERT) used
+    # to be arms here and are now `editor.insert` / `editor.insert-enter` in `Scope::Editor`;
+    # `x`/`y` were already `notes.select-line` / `notes.copy`.
     private def handle_read(ev : Termisu::Event::Key, c : Char?) : Bool
       return true.tap { @host.open_space_menu } if ev.key.space? && !ev.ctrl? && !ev.alt?
       key = ev.key
       selecting = ev.shift?
+      growing = selecting || editor_line_held? # vertical arms only: see RepeaterController
       case
-      when key.enter? then @notes.enter_insert!
-      when c == 'i'   then @notes.enter_insert!
+      when key.enter? then return false # editor.insert-enter
       when nav_up?(ev)
-        if @notes.at_top?
+        if @notes.at_top? && !growing # ⇧↑ / a held `⇧V` grows in place, never leaves
           save_notes
           @host.request_focus(:subtabs)
         else
           @notes.read_move(-1, 0, selecting: selecting)
         end
       when nav_down?(ev)              then @notes.read_move(1, 0, selecting: selecting)
-      when key.left?                  then @notes.read_move(0, -1, selecting: selecting)
-      when key.right?                 then @notes.read_move(0, 1, selecting: selecting)
+      when editor_read_sideways(ev)   then nil # ←/→ h/l, ⌥ by word
       when @notes.read_motion_key(ev) then nil # Page keys + ⇧Home/⇧End — the shared editor set
       when c && !ev.ctrl? && !ev.alt? && !c.control?
         return false
       end
+      true
+    end
+
+    # --- Verb::Scope::Editor — the whole Notes body is one text editor ---
+    def editor_pane? : Bool
+      true
+    end
+
+    def editor_text_buffer : {TextArea, TextReadState}?
+      @notes.read_edit_buffer
+    end
+
+    def editor_enter_insert : Bool
+      @notes.enter_insert!
+      true
+    end
+
+    def editor_exit_insert : Bool
+      @notes.exit_insert!
+      true
+    end
+
+    def editor_undo : Bool
+      @notes.undo
       true
     end
 
@@ -170,6 +195,7 @@ module Gori::Tui
     def handle_click(rect : Rect, mx : Int32, my : Int32) : Bool
       @host.focus_body
       body = notes_body_rect(rect)
+      @press_on_editor = false
       # NOR/INS chip on the editor top border toggles insert (same as ↵ / esc).
       if Frame.mode_badge_hit(mx, my, body.y, body.right - 1, body.x + 1, @notes.insert_mode?)
         if @notes.insert_mode?
@@ -179,15 +205,32 @@ module Gori::Tui
         end
         return true
       end
+      # `notes_body_rect` is what the EDITOR was drawn into: the filter bar above it and the
+      # link-preview row carved off its last line are not it. `TextArea#click_to_cursor` clamps
+      # rather than refusing, so a press on the preview row used to jump the caret to the last
+      # visible line and arm a drag from a row that carries no text at all.
+      return true unless body.contains?(mx, my)
+      @press_on_editor = true # the motion that continues this press belongs to the editor
       @notes.click_to_cursor(body, mx, my)
       true
     end
+
+    # Whether the last press landed on the EDITOR rather than on the chip its border carries.
+    # `supports_drag?` is asked with no coordinates — `drag_press_target?` runs it right after
+    # the click — and the whole tab body is the editor, so "true" was the honest answer while
+    # `drag_to_cursor` refused every gesture the pane was not already in INSERT for.
+    #
+    # That refusal is gone (#1124), so the flag has to say it instead: pressing the NOR/INS
+    # chip and twitching the mouse would otherwise toggle the mode and then drag a band open
+    # from a cell of the border — and, under `settings:mouse` drag-copy, put it on the
+    # clipboard. `IssuesController#@detail_press` is the same guard for the same reason.
+    @press_on_editor = false
 
     # --- mouse drag + double-click (see TabController#supports_drag?) ---
     # No focus/save side effects here: the press that started the gesture already did those,
     # and re-running them per motion event would churn while the pointer moves.
     def supports_drag? : Bool
-      true
+      @press_on_editor
     end
 
     def handle_drag(rect : Rect, mx : Int32, my : Int32) : Nil
@@ -198,6 +241,10 @@ module Gori::Tui
       body = notes_body_rect(rect)
       # The NOR/INS chip is a button, not text — a double-click there is two toggles.
       return false if Frame.mode_badge_hit(mx, my, body.y, body.right - 1, body.x + 1, @notes.insert_mode?)
+      # …and `select_word_at` clamps like the press does, so the rows the editor was NOT drawn
+      # into would otherwise take a word from the last visible line — a band `y` then copies,
+      # off a row the pointer was never on. Same test as the press above.
+      return false unless body.contains?(mx, my)
       @notes.select_word_at(body, mx, my)
     end
 
@@ -295,10 +342,6 @@ module Gori::Tui
       true
     end
 
-    def filter_fields : Array(String)
-      %w[name] # notes have no HTTP context; free-text covers each note's body text
-    end
-
     def filter_subjects : Array(Repeater::SubtabFilter::Subject)
       @notes.filter_rows.map do |(title, body)|
         Repeater::SubtabFilter::Subject.new(title, body, "", "", [] of String)
@@ -318,10 +361,10 @@ module Gori::Tui
 
     def body_hint(focus : Symbol) : String
       if @notes.insert_mode?
-        "type to edit · ⇧arrows select · ^Y copy · esc read · ^N new · ^W close · ^G goto · ^F find · ^1-9 · ↑ sub-tabs"
+        keys("type to edit · ⇧arrows select · ^Y copy · esc read · ^N new · ^W close · {editor.goto-line} goto · {editor.find} find · ^1-9 · ↑ sub-tabs")
       else
         y = Hotkeys.binding_label(@host.session.registry, "notes.copy", "y")
-        "i/↵ edit · ⇧arrows select · #{y} copy · space cmds · ^N new · ^W close · ^G goto · ^F find · esc sub-tabs"
+        keys("{editor.insert}/↵ edit · ⇧arrows select · #{y} copy · space cmds · ^N new · ^W close · {editor.goto-line} goto · {editor.find} find · esc sub-tabs")
       end
     end
 
@@ -344,12 +387,6 @@ module Gori::Tui
       save_notes
       @notes.switch_note(idx)
       refresh_link_preview
-    end
-
-    # The dirty part of the cross-session reload guard (the shell adds the
-    # active+focused part). A dirty note must not be clobbered by a peer's commit.
-    def locked? : Bool
-      @notes.dirty?
     end
 
     # --- sub-tab lifecycle (also invoked by the shell's shared strip machinery) ---
@@ -384,7 +421,9 @@ module Gori::Tui
       @notes.new_note
       @notes.enter_insert!
       @host.focus_body
-      @host.status("new note (#{@notes.count}) — ^1-9 switch · ^W close · esc sub-tabs")
+      # `⇧1-9`, not `^1-9` — same reason as the Repeater's arrival hint: Ctrl+digit is the
+      # alias that many terminals never deliver, and the strip above says `⇧1-9 jump`.
+      @host.status("new note (#{@notes.count}) — ⇧1-9 switch · ^W close · esc sub-tabs")
     end
 
     # Create a blank note without focusing the Notes tab (link-picker "create +
@@ -434,10 +473,7 @@ module Gori::Tui
       msg = "duplicated note"
       if refs = batch_subtab_refs
         batch = duplicate_marked_subtabs(refs, "note") { |i| @notes.duplicate_at(i) }
-        unless batch
-          @host.status("#{refs.size} sub-tabs marked — duplicate is capped at #{Runner::BATCH_SUBTAB_CAP}")
-          return
-        end
+        return unless batch
         msg = batch
       else
         @notes.duplicate_current
@@ -462,8 +498,12 @@ module Gori::Tui
         do_notes_close
         return
       end
+      # By identity at answer time: a peer reload under the modal can move the selection.
+      ref = subtab_ref(@notes.current_index)
       @host.confirm("CLOSE NOTE", "Close “#{@notes.current_label}”?\nIts text will be discarded.",
-        confirm_label: "close", danger: true) { do_notes_close }
+        confirm_label: "close", danger: true) do
+        (idx = ref && subtab_index_of(ref)) ? do_notes_close(idx) : @host.status("already closed")
+      end
     end
 
     private def close_marked_notes(refs : Array(SubtabRef)) : Nil
@@ -480,8 +520,8 @@ module Gori::Tui
       false
     end
 
-    private def do_notes_close : Nil
-      close_note_at(@notes.current_index)
+    private def do_notes_close(idx : Int32 = @notes.current_index) : Nil
+      close_note_at(idx)
       refresh_link_preview
       @host.status("closed note (#{@notes.count} open)")
     end
@@ -507,18 +547,25 @@ module Gori::Tui
     # Copy selection (or current line) in READ mode.
     def notes_copy : Nil
       text = @notes.copy_text
-      if text.empty?
-        @host.status("nothing to copy")
-        return
-      end
-      written = Clipboard.copy(text)
-      @host.status("copied #{written}b to clipboard#{Clipboard.note(written, text)}")
+      copy_text(text)
     end
 
     # The selection (or current line) text without the clipboard write — for the
     # "Send selection to" flow. Gated upstream by read_selection_active?.
-    def notes_selection_text : String
+    def selection_text : String
       @notes.copy_text
+    end
+
+    def selection_active? : Bool
+      @notes.selection?
+    end
+
+    def select_line : Nil
+      @notes.select_line
+    end
+
+    def clear_selection : Nil
+      @notes.clear_selection
     end
 
     # Copy the entire current note (space menu).

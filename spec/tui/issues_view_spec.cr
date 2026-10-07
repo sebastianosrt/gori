@@ -64,6 +64,25 @@ describe Gori::Tui::IssuesView do
     end
   end
 
+  # Painting it muted is the signal while you TYPE; this is the one for after you pressed ↵ and
+  # got an empty list, where "no issues match" and "you spelled the field wrong" were one answer.
+  it "names a misspelled filter field instead of reporting an empty list" do
+    with_store do |store|
+      store.insert_issue("SQL injection", Gori::Store::Severity::Critical, "acme.test", nil)
+      view = IssuesView.new
+      view.reload(store)
+      view.start_query
+      "sevrity:high".each_char { |c| view.query_insert(c) }
+      view.stop_query
+
+      b = MemoryBackend.new(80, 10)
+      view.render(Screen.new(b), Rect.new(0, 0, 80, 10))
+      rows = (0...10).map { |y| b.row(y) }.join("\n")
+      rows.should contain("unknown field `sevrity:`")
+      rows.should contain("did you mean `severity:`")
+    end
+  end
+
   it "still paints a real field, alias included, as a field" do
     with_store do |store|
       store.insert_issue("SQL injection", Gori::Store::Severity::Critical, "acme.test", nil)
@@ -152,7 +171,7 @@ describe Gori::Tui::IssuesView do
     end
   end
 
-  it "renders the '‹ list' back marker on the detail's top frame border (framed path)" do
+  it "renders the breadcrumb on the detail's top frame border (framed path)" do
     with_store do |store|
       store.insert_issue("SQL injection", Gori::Store::Severity::Critical, "acme.test", nil)
       view = IssuesView.new
@@ -164,7 +183,10 @@ describe Gori::Tui::IssuesView do
       BodyChrome.framed(screen, Rect.new(0, 0, 80, 16), true) do |inner|
         view.render(screen, inner, focused: true)
       end
-      backend.row(0).includes?("‹ list").should be_true
+      row = backend.row(0)
+      row.includes?("‹ ISSUES").should be_true
+      row.includes?("1/1").should be_true
+      row.includes?("SQL injection").should be_true
     end
   end
 
@@ -206,13 +228,156 @@ describe Gori::Tui::IssuesView do
     end
   end
 
+  # #1123 / #1122. `seed_notes` used to `set_text` unconditionally, and `TextArea#set_text`
+  # zeroes the caret and the scroll — so the two callers that re-seed text NOBODY changed
+  # dragged the reading position back to line 0: `i` on the way into INSERT, and the
+  # data_version tick, which fires on this session's own captures ~1.3×/s. `notes_copy_text`
+  # is the public read of where the caret is standing (it copies the caret's line).
+  it "keeps the notes caret when entering INS over unchanged text (#1123)" do
+    with_store do |store|
+      id = store.insert_issue("XSS", Gori::Store::Severity::Medium, "acme.test", nil)
+      store.update_issue(id, notes: "line0\nline1\nline2\nline3")
+      view = IssuesView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      view.notes_insert_mode?.should be_false # a fresh detail opens in READ, at the top
+      view.notes_copy_text.should eq("line0")
+
+      view.notes_read_move(3, 0)
+      view.notes_copy_text.should eq("line3")
+      view.enter_notes_insert!
+      view.notes_insert_mode?.should be_true
+      view.notes_copy_text.should eq("line3") # …INS opens where they were reading, not at the top
+    end
+  end
+
+  it "keeps the notes caret across an external-change tick (#1122)" do
+    with_store do |store|
+      id = store.insert_issue("XSS", Gori::Store::Severity::Medium, "acme.test", nil)
+      store.update_issue(id, notes: "line0\nline1\nline2\nline3")
+      view = IssuesView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      view.notes_read_move(2, 0)
+      view.notes_copy_text.should eq("line2")
+
+      # The poll fires on every commit, ours included — three of them must move nothing.
+      3.times { view.refresh_detail(store, announce: true).should be_false }
+      view.notes_copy_text.should eq("line2")
+
+      # …but a peer's REAL write still lands, and resets the caret with the document it
+      # replaced: the text under it is no longer the same one the caret was placed in.
+      store.update_issue(id, notes: "peer0\npeer1")
+      view.refresh_detail(store, announce: true).should be_false # not dirty → seeded, not announced
+      view.notes_copy_text.should eq("peer0")
+    end
+  end
+
+  it "keeps the notes caret across a save (#1123)" do
+    with_store do |store|
+      id = store.insert_issue("XSS", Gori::Store::Severity::Medium, "acme.test", nil)
+      store.update_issue(id, notes: "line0\nline1\nline2")
+      view = IssuesView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      view.notes_read_move(2, 0)
+      view.enter_notes_insert!
+      "!".each_char { |c| view.notes_insert(c) }
+      view.save_notes(store).should be_true
+      store.get_issue(id).not_nil!.notes.should eq("line0\nline1\n!line2")
+      # The re-seed is a no-op on the bytes — the buffer already holds what was committed — so
+      # the caret stays on the line that was being edited.
+      view.notes_copy_text.should eq("!line2")
+      # …and the BASELINE moved with the write. A pane left dirty against its own save reports
+      # a peer conflict it invented, on every tick, and never adopts a real peer write again.
+      view.notes_dirty?.should be_false
+      view.notes_conflict?(store).should be_false
+      view.refresh_detail(store, announce: true).should be_false
+    end
+  end
+
+  # A buffer handed to a DIFFERENT issue must not carry the previous one's undo history: the
+  # skip-if-unchanged guard in `seed_notes` keeps the caret AND the stack, and `set_text` was
+  # the only thing that used to clear the latter.
+  it "does not replay a previous issue's undo into an identical writeup" do
+    with_store do |store|
+      a = store.insert_issue("A", Gori::Store::Severity::Low, nil, nil)
+      b = store.insert_issue("B", Gori::Store::Severity::Low, nil, nil)
+      store.update_issue(b, notes: "X")
+      view = IssuesView.new
+      view.reload(store)
+      view.select_index(1) # newest-first → A is second
+      view.open_detail(store).should be_true
+      view.enter_notes_insert!
+      view.notes_insert('X')
+      view.save_notes(store).should be_true
+      store.get_issue(a).not_nil!.notes.should eq("X")
+
+      view.close_detail
+      view.select_index(0) # B — byte-identical notes, so nothing is replaced
+      view.open_detail(store).should be_true
+      view.notes_read_undo.should be_true
+      view.@notes.text.should eq("X") # …not A's pre-edit ""
+      view.notes_dirty?.should be_false
+      view.save_notes(store)
+      store.get_issue(b).not_nil!.notes.should eq("X")
+    end
+  end
+
+  # The READ selection's anchor indexes the buffer it was made in. `set_text` drops the
+  # EDITOR's anchor and cannot reach this one, so a stale band survived into the next document
+  # and `y` copied a span measured against a writeup that was gone.
+  it "drops the READ selection when the notes document is handed over" do
+    with_store do |store|
+      a = store.insert_issue("A", Gori::Store::Severity::Low, nil, nil)
+      b = store.insert_issue("B", Gori::Store::Severity::Low, nil, nil)
+      store.update_issue(a, notes: "a0\na1\na2")
+      store.update_issue(b, notes: "b0\nb1\nb2")
+      view = IssuesView.new
+      view.reload(store)
+      view.select_index(1) # A
+      view.open_detail(store).should be_true
+      view.notes_read_move(2, 0)
+      view.notes_select_line
+      view.notes_selection?.should be_true
+
+      view.close_detail
+      view.select_index(0) # B
+      view.open_detail(store).should be_true
+      view.notes_selection?.should be_false
+      view.notes_copy_text.should eq("b0") # the caret line, not a span from A's buffer
+    end
+  end
+
+  # A DIFFERENT issue starts at the top even when its writeup is byte-identical — the case the
+  # `seed_notes` guard above cannot tell apart on the bytes alone.
+  it "starts a newly opened detail at the top of identical notes" do
+    with_store do |store|
+      a = store.insert_issue("A", Gori::Store::Severity::Low, nil, nil)
+      b = store.insert_issue("B", Gori::Store::Severity::Low, nil, nil)
+      store.update_issue(a, notes: "same0\nsame1\nsame2")
+      store.update_issue(b, notes: "same0\nsame1\nsame2")
+      view = IssuesView.new
+      view.reload(store)
+      view.select_index(1) # newest-first → A is second
+      view.open_detail(store).should be_true
+      view.notes_read_move(2, 0)
+      view.notes_copy_text.should eq("same2")
+
+      view.close_detail
+      view.select_index(0) # B — same bytes, different row
+      view.open_detail(store).should be_true
+      view.notes_copy_text.should eq("same0")
+    end
+  end
+
   it "discards notes edits on cancel (^W) without persisting" do
     with_store do |store|
       id = store.insert_issue("XSS", Gori::Store::Severity::Medium, nil, nil)
       view = IssuesView.new
       view.reload(store)
       view.open_detail(store)
-      view.start_notes_edit
+      view.enter_notes_insert!
       "junk".each_char { |c| view.notes_insert(c) }
       view.cancel_notes_edit
       view.notes_insert_mode?.should be_false
@@ -287,7 +452,7 @@ describe Gori::Tui::IssuesView do
       view.severity_delta(2, store) # medium -> critical
       store.get_issue(id).not_nil!.severity.should eq(Gori::Store::Severity::Critical)
 
-      view.start_notes_edit
+      view.enter_notes_insert!
       view.notes_insert_mode?.should be_true
       "poc".each_char { |c| view.notes_insert(c) }
       view.save_notes(store)
@@ -582,8 +747,11 @@ describe "Issues verbs" do
     keymap.lookup(typed_chord("]"), Gori::Verb::Scope::IssuesDetail).should eq("nav.next-tab") # the Global chord; severity is a menu row
     keymap.lookup(typed_chord("}"), Gori::Verb::Scope::IssuesDetail).should eq("issue.status-up")
     keymap.lookup(typed_chord("t"), Gori::Verb::Scope::IssuesDetail).should eq("issue.edit-title")
-    keymap.lookup(typed_chord("o"), Gori::Verb::Scope::IssuesDetail).should eq("issue.open-flow")
+    # `o` is UNBOUND in this scope: `issue.open-flow` opened "the linked flow", which is what
+    # `s` does on RELATED's first row now that the primary flow IS that row.
+    keymap.lookup(typed_chord("o"), Gori::Verb::Scope::IssuesDetail).should be_nil
     keymap.lookup(typed_chord("r"), Gori::Verb::Scope::IssuesDetail).should eq("issue.repeater-flow")
+    reg["issue.open-flow"]?.should be_nil
     # export is a chord-less Global palette verb; the FORMAT comes from a picker, not the id
     reg["issues.export"]?.try(&.scope).should eq(Gori::Verb::Scope::Global)
     keymap.lookup(typed_chord("e", shift: true), Gori::Verb::Scope::Issues).should eq("issues.export-key")

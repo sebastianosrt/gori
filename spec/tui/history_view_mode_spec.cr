@@ -4,7 +4,7 @@ require "../support/memory_backend"
 include Gori::Tui
 
 # The History VIEW mode (#776): a named QL query the list ANDs over the filter bar, the way the
-# ⇧S scope lens does. What is pinned here is the behaviour that has no visible symptom until it
+# `s` scope lens does. What is pinned here is the behaviour that has no visible symptom until it
 # has already shown the operator the wrong flows.
 
 private def add_flow(store, source : Gori::FlowSource::Kind, host = "h.test", status = 200)
@@ -97,7 +97,7 @@ describe "HistoryView — view mode" do
     end
   end
 
-  it "draws v:all muted at rest and v:name left of f:follow when one is on" do
+  it "draws v:all muted at rest and v:name left of ⌁follow when one is on" do
     with_store do |store|
       view = HistoryView.new
       view.reload(store)
@@ -108,24 +108,24 @@ describe "HistoryView — view mode" do
       view.reload(store)
       row = screen_rows(view).first
       row.should contain("v:history")
-      # `Frame.right_text_chain` draws rightmost-first, so "left of f:follow" is an ordering
+      # `Frame.right_text_chain` draws rightmost-first, so "left of ⌁follow" is an ordering
       # claim about the rendered row, not about the array.
-      row.index("v:history").not_nil!.should be < row.index("f:follow").not_nil!
+      row.index("v:history").not_nil!.should be < row.index("⌁follow").not_nil!
     end
   end
 
   it "draws the DEFAULT view's chip whole — the one everybody looks at was the one being cut" do
-    # `History + Repeater` is 18 columns against VIEW_CHIP_NAME_MAX's 14, so the chip a fresh
+    # `History + Repeater` is 18 columns against VIEW_CHIP_NAME_MAX's 16, so the chip a fresh
     # project opens on read `v:History + Re…`. `CHIP_LABELS` is what stops the most-seen chip
     # on the bar from being the one wearing an ellipsis.
     with_store do |store|
       view = HistoryView.new
       view.set_view(Gori::SavedViews.default_view(store))
       view.reload(store)
-      # Its neighbour immediately after it: a truncated label would read `v:history+rpt…`, and
+      # Its neighbour immediately after it: a truncated label would read `v:history+repea…`, and
       # an ellipsis anywhere else on this row belongs to the filter hint, not to the chip.
       row = screen_rows(view).first
-      row.should contain("v:history+rptr f:follow")
+      row.should contain("v:history+repeater ⌁follow")
       row.should_not contain("v:History")
     end
   end
@@ -141,7 +141,7 @@ describe "HistoryView — view mode" do
   end
 
   it "lowercases an operator's own view name in the chip, and still truncates it" do
-    # The chip is a mode indicator beside `f:follow` and `⇧S scope:off`, not a place a name is
+    # The chip is a mode indicator beside `⌁follow` and `s scope:off`, not a place a name is
     # quoted — so a saved view's casing goes the same way a builtin's does. The picker, the CLI
     # and MCP keep the name the operator typed.
     with_store do |store|
@@ -152,7 +152,7 @@ describe "HistoryView — view mode" do
 
       view.set_view(Gori::SavedViews::View.new("2", "A Name Far Too Long To Fit", "src:proxy", "project"))
       view.reload(store)
-      screen_text(view).should contain("v:a name far to…")
+      screen_text(view).should contain("v:a name far too …")
     end
   end
 
@@ -210,7 +210,21 @@ describe "HistoryView — view mode" do
       # The bar's own branch, not the first-run card: the note explains WHY (the view is also
       # narrowing) and the hint points back at the thing they just typed.
       text.should contain("/ to edit the filter")
-      text.should contain("v:history+rptr also narrows to")
+      text.should contain("v:history+repeater also narrows to")
+    end
+  end
+
+  it "names the colon form of a comparison typed without one, ahead of the view note" do
+    with_store do |store|
+      add_flow(store, Gori::FlowSource::Kind::Proxy, "keep.test", 500)
+      view = HistoryView.new
+      view.set_view(Gori::SavedViews.default_view(store))
+      view.set_query("status>=400")
+      view.reload(store)
+      view.rows.should be_empty
+      text = screen_text(view)
+      text.should contain("did you mean `status:>=400`?")
+      text.should_not contain("also narrows to")
     end
   end
 
@@ -223,7 +237,7 @@ describe "HistoryView — view mode" do
       view.reload(store)
       view.rows.should be_empty
       # The bar is on screen and still does not explain the empty list — the same reason the
-      # ⇧S lens gets a note beside it.
+      # `s` lens gets a note beside it.
       screen_text(view).should contain("v:history also narrows to src:proxy")
     end
   end

@@ -1,3 +1,7 @@
+# Drives termisu's reader over a pipe fd, which the Windows reader does not read (it reads the
+# console, `termisu/windows.cr`); the pins below run on every POSIX job.
+{% skip_file if flag?(:win32) %}
+
 require "../spec_helper"
 
 # Guards the carried patch in `src/gori/tui/paste_end_marker_patch.cr` by asserting the
@@ -82,7 +86,37 @@ describe "the termisu pin the carried paste patch is written against" do
     lock = File.read(File.join(__DIR__, "..", "..", "shard.lock"))
     pinned = lock[/termisu:.*?commit\.([0-9a-f]{40})/m, 1]?
 
-    pinned.should eq("df6e907e6fe27f2cc70b9f855dff996d08398ad1")
+    pinned.should eq("ca964e5f9256990d9d1e6aa5ca3aa1fb2635fb6b")
+  end
+end
+
+# The behavioural examples below cannot see a drifted override. The patch defines both
+# `parse_paste_escape` and its callee, so the pair stays self-consistent whatever upstream does
+# and every example passes over a frozen copy that has diverged. #1125 is what that looks like:
+# upstream rewrote `read_paste_end_tail` in the same bump, this file's pin fired, and the
+# re-read still concluded "pin moved only". So compare each surviving override's signature
+# against the installed shard, the same way `input_idle_backoff_spec.cr` does.
+describe "the carried paste patch's overrides" do
+  it "still match the signatures termisu defines" do
+    upstream = File.read(File.join(__DIR__, "..", "..", "lib", "termisu",
+      "src", "termisu", "input", "parser.cr"))
+    patch = File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui",
+      "paste_end_marker_patch.cr"))
+
+    {/private def parse_paste_escape[^\n]*/}.each do |signature|
+      found = upstream[signature]?
+      found.should_not be_nil
+      patch[signature]?.should eq(found)
+    end
+  end
+
+  # The override this bump retired. It must stay retired: re-adding a frozen copy of a method
+  # upstream now gets right is the "keeps applying when it should not" failure by hand.
+  it "no longer freezes read_paste_end_tail" do
+    patch = File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui",
+      "paste_end_marker_patch.cr"))
+
+    patch.should_not contain("def read_paste_end_tail")
   end
 end
 

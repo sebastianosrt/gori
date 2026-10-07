@@ -47,6 +47,23 @@ describe Gori::Tui::ScopeRuleOverlay do
     ov.handle_key(skey(Termisu::Input::Key::Enter)).should eq(:commit)
   end
 
+  it "sends a printable typed on kind, type or Save to the pattern field" do
+    ov = ScopeRuleOverlay.adding # opens on kind
+    stype(ov, "127.0.0.1")
+    ov.pattern.should eq("127.0.0.1")
+    ov.kind.should eq("include")
+
+    ov2 = ScopeRuleOverlay.adding
+    ov2.handle_key(skey(Termisu::Input::Key::Down)) # type
+    stype(ov2, "a")
+    ov2.match_type.should eq("host")
+    ov2.handle_key(skey(Termisu::Input::Key::Down)) # Save
+    ov2.on_save_row?.should be_true
+    stype(ov2, "b")
+    ov2.on_save_row?.should be_false
+    ov2.pattern.should eq("ab")
+  end
+
   it "commits from the Save row and cancels on esc" do
     ov = ScopeRuleOverlay.adding
     ov.handle_key(skey(Termisu::Input::Key::Down))
@@ -169,7 +186,7 @@ describe "ProjectView#ov_commit" do
       view = ProjectView.new(Gori::Scope.load(store), overrides)
 
       view.ov_add_start
-      "10.0.0.1 staging.acme.test".each_char { |c| view.ov_input(c) }
+      "10.0.0.1 staging.acme.test".each_char { |c| view.ov_field.not_nil!.insert(c) }
       view.ov_commit.should eq(:ok)
       overrides.connect_address("staging.acme.test").should eq("10.0.0.1")
 
@@ -180,12 +197,12 @@ describe "ProjectView#ov_commit" do
       overrides.connect_address("staging.acme.test").should eq("10.0.0.1")
 
       view.ov_add_start
-      "10.0.0.9 staging.acme.test".each_char { |c| view.ov_input(c) }
+      "10.0.0.9 staging.acme.test".each_char { |c| view.ov_field.not_nil!.insert(c) }
       view.ov_commit.should eq(:dup) # a DIFFERENT row already maps that host
       overrides.connect_address("staging.acme.test").should_not eq("10.0.0.9")
 
       view.ov_add_start
-      "not-an-ip host.test".each_char { |c| view.ov_input(c) }
+      "not-an-ip host.test".each_char { |c| view.ov_field.not_nil!.insert(c) }
       view.ov_commit.should eq(:invalid)
     ensure
       store.close

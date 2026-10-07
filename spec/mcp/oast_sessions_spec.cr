@@ -228,16 +228,18 @@ describe "MCP OAST sessions" do
     end
   end
 
-  it "exposes the read tool but gates resume/release behind --read-only" do
+  it "hides unusable session controls behind --read-only" do
     with_store do |store|
       tools = tools_for(store, allow_actions: false)
       names = JSON.parse(JSON.build { |j| tools.list(j) }).as_a.map(&.["name"].as_s)
       names.should contain("list_oast_sessions")
-      names.should_not contain("oast_resume")
-      names.should_not contain("oast_release")
-      r = tools.call("oast_resume", JSON.parse(%({"id":1})))
-      r.is_error.should be_true
-      r.error_code.should eq("TOOL_DISABLED")
+      {"oast_poll", "oast_payload", "oast_resume", "oast_release"}.each do |name|
+        names.should_not contain(name)
+        args = name == "oast_resume" || name == "oast_release" ? %({"id":1}) : %({"session_id":"oast_missing"})
+        r = tools.call(name, JSON.parse(args))
+        r.is_error.should be_true
+        r.error_code.should eq("TOOL_DISABLED")
+      end
     end
   end
 
@@ -265,6 +267,101 @@ describe "MCP OAST transport failures" do
       r.error_code.should eq("NETWORK_ERROR")
       r.retryable.should be_true
       r.text.should contain("OAST register failed")
+    end
+  end
+end
+
+# `oast_start` mints an ad-hoc registration that dies with the process — which meant an agent
+# could START a listener and still have NO way to reach the blind rules that need an
+# `oast_sessions` row: `Probe::OutOfBand::StoreMinter` mints every blind SSRF/XXE/command-
+# injection/RFI payload against one (so `probe_scan{active:true}` ran those rules inert and its
+# empty result said nothing about blind vulnerabilities), `list_oast_sessions` could not show
+# the agent its own listener, and `oast_resume` had nothing to re-open in a later process.
+# `persist:true` is that row.
+#
+# custom-http registers with NO network round trip, so the whole flow specs without a server.
+describe "MCP oast_start persist" do
+  it "writes a project session an agent can list, poll into, and resume later" do
+    with_store do |store|
+      tools = tools_for(store)
+      Gori::Probe::OutOfBand.available?(store).should be_false
+
+      res = ok_json(tools, "oast_start",
+        %({"provider":"custom-http","server":"https://oob.example/hits","persist":true}))
+      row = res["store_session_id"].as_i64
+      row.should be > 0
+      # The registration outlives this process, and the result SAYS so — oast_stop no longer
+      # deregisters it, which is the one behaviour change persist makes.
+      res["registration"].as_s.should contain("kept")
+      store.flush
+
+      # The row is what arms the out-of-band probe rules.
+      Gori::Probe::OutOfBand.available?(store).should be_true
+      # …and it is stamped live NOW, because `StoreMinter` picks the most-recently-POLLED
+      # session and this one is about to be polled.
+      store.get_oast_session(row).not_nil!.last_poll_at.should_not be_nil
+
+      listed = ok_json(tools, "list_oast_sessions", "{}")["sessions"].as_a
+      listed.size.should eq(1)
+      listed.first["id"].as_i64.should eq(row)
+      # The agent can find its own live handle again without a second start.
+      listed.first["session_id"].as_s.should eq(res["session_id"].as_s)
+
+      # Stopping keeps it resumable — its payloads are planted out in the world right now.
+      stopped = ok_json(tools, "oast_stop", %({"session_id":#{res["session_id"].as_s.to_json}}))
+      stopped["registration"].as_s.should eq("kept")
+      ok_json(tools, "oast_resume", %({"id":#{row}}))["store_session_id"].as_i64.should eq(row)
+    end
+  end
+
+  it "stays ad-hoc without persist, and says which it is" do
+    with_store do |store|
+      tools = tools_for(store)
+      res = ok_json(tools, "oast_start",
+        %({"provider":"custom-http","server":"https://oob.example/hits"}))
+      res["store_session_id"].raw.should be_nil
+      res["registration"].as_s.should contain("dies with this process")
+      store.flush
+      store.oast_sessions.should be_empty
+      Gori::Probe::OutOfBand.available?(store).should be_false
+    end
+  end
+
+  # #1192: a global provider has no project row id to record, so it is recorded by its key —
+  # and an ad-hoc kind + host as "", so no saved provider on that endpoint can lend it a token.
+  it "records a GLOBAL provider by its key, and an ad-hoc registration as none" do
+    # In memory only: `add_oast_provider` saves settings.json, which a later spec would reload.
+    second = "b2"
+    Gori::Settings.oast_providers = [Gori::Settings::OastProvider.new("a1", "First", "custom-http", "https://oob.example/hits", "A", true),
+                                     Gori::Settings::OastProvider.new(second, "Second", "custom-http", "https://oob.example/hits", "B", true)]
+    begin
+      with_store do |store|
+        tools = tools_for(store)
+        row = ok_json(tools, "oast_start", %({"provider_id":"g_#{second}","persist":true}))["store_session_id"].as_i64
+        adhoc = ok_json(tools, "oast_start",
+          %({"provider":"custom-http","server":"https://oob.example/hits","token":"T","persist":true}))["store_session_id"].as_i64
+        store.flush
+        store.get_oast_session(row).not_nil!.provider_key.should eq("g_#{second}")
+        store.get_oast_session(adhoc).not_nil!.provider_key.should eq("")
+        listed = Gori::Oast::Sessions.list(store)
+        listed.find!(&.id.==(row)).provider.should eq("Second")
+        listed.find!(&.id.==(adhoc)).provider_key.should be_nil
+      end
+    ensure
+      Gori::Settings.oast_providers = [] of Gori::Settings::OastProvider
+    end
+  end
+
+  it "records the SAVED provider it registered through, so the session comes back named" do
+    with_store do |store|
+      pid = store.insert_oast_provider("lab collab", "custom-http", "https://oob.example/hits",
+        nil, true, 0)
+      store.flush
+      tools = tools_for(store)
+      row = ok_json(tools, "oast_start", %({"provider_id":"p_#{pid}","persist":true}))["store_session_id"].as_i64
+      store.flush
+      store.get_oast_session(row).not_nil!.provider_id.should eq(pid)
+      Gori::Oast::Sessions.list(store).first.provider.should eq("lab collab")
     end
   end
 end

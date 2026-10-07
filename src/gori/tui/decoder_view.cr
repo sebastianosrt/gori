@@ -10,6 +10,7 @@ require "./viewport"
 require "./gutter"
 require "./text_field"
 require "../decoder"
+require "../hotkeys"
 require "./subtab_marks"
 
 module Gori::Tui
@@ -21,6 +22,7 @@ module Gori::Tui
   # only) — render is a pure read, per the render-hot-path discipline.
   class DecoderView
     include SubtabRef # a sub-tab strip may hold a mark on this view (#683)
+    @registry : Verb::Registry? = nil
     record Regions, input : Rect, chain : Rect, pipeline : Rect, output : Rect
 
     # The ^X display cycle: auto (text, base64 fallback for binary) → hex → base64.
@@ -28,6 +30,10 @@ module Gori::Tui
 
     # Custom sub-tab chip label (nil = derive from the chain spec); set by rename.
     property name : String? = nil
+
+    def set_registry(registry : Verb::Registry) : Nil
+      @registry = registry
+    end
 
     # How much of a step's output feeds its PIPELINE preview. A multiple of 3 so the
     # base64 of the prefix IS the prefix of the base64 (no phantom padding mid-row), and
@@ -196,7 +202,8 @@ module Gori::Tui
       # is forced (HEX/B64), muted for AUTO (which just follows the bytes). Replaces the
       # old title-embedded mode label so the chord is discoverable in place.
       name, forced = out_mode_badge
-      Frame.toggle_badge(screen, card.right - 1, card.y, card.x + header.size + 4, "^X", name, forced)
+      Frame.toggle_badge(screen, card.right - 1, card.y, card.x + header.size + 4,
+        key_label("decoder.mode", "^X"), name, forced)
       render_output(screen, card.inset(1, 1), result, focused: active)
     end
 
@@ -463,8 +470,12 @@ module Gori::Tui
       name, _ = out_mode_badge
       min_x = card.x + output_header(result).size + 4
       !Frame.right_badge_hit(mx, my, card.y, card.right - 1, min_x, [
-        {:mode, "^X", name},
+        {:mode, key_label("decoder.mode", "^X"), name},
       ] of {Symbol, String, String}).nil?
+    end
+
+    private def key_label(id : String, fallback : String) : String
+      @registry.try { |r| Hotkeys.binding_label(r, id, fallback) } || fallback
     end
 
     # Whether the OUTPUT is scrolled to the top — ↑ here pops focus up to CHAIN
@@ -543,7 +554,20 @@ module Gori::Tui
     # it never paints past the body. Selected row lights ACCENT_BG (palette style).
     def render(screen : Screen, chain_rect : Rect, inner : Rect) : Nil
       return if !@open || @matches.empty?
-      w = ({@matches.max_of(&.size) + 2, 18}.max).clamp(1, chain_rect.w)
+      # The dropdown starts two cells in, past the "› " prompt, but was clamped to the FIELD's
+      # full width — so a match as long as the card (`quoted-printable-encode` on a narrow
+      # body, or any saved chain the operator named at length) ran two cells past the field
+      # and painted outside the body rect altogether. Clamped to the room left from `x`, and
+      # to the FIELD rather than the body: this floats under the chain field, so its right
+      # edge is the field's, which also leaves the CHAIN card's corner standing.
+      #
+      # NOT `{…, 1}.max`: flooring the room at one cell does not bound anything, it just moves
+      # the same overflow to a narrower body (measured: still outside the pane at widths 2-4).
+      # A body with no room for the dropdown gets no dropdown.
+      x = chain_rect.x + 2
+      room = chain_rect.right - x
+      return if room <= 0
+      w = ({@matches.max_of(&.size) + 2, 18}.max).clamp(1, room)
       max_h = {inner.bottom - (chain_rect.y + 1), 1}.max
       h = {@matches.size, 8, max_h}.min
       return if h <= 0
@@ -551,7 +575,6 @@ module Gori::Tui
       # taller than the 8-row fold; move() clamps @selected against the full list, which is
       # `@matches` — the same list the loop below indexes).
       @scroll = Viewport.scroll_to_show(@selected, @scroll, h, @matches.size)
-      x = chain_rect.x + 2
       y = chain_rect.y + 1
       (0...h).each do |i|
         idx = @scroll + i

@@ -16,7 +16,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   def authorize_seed_sitemap : Nil
     ep = sitemap_controller.view.selected_endpoint
     return (@toast = "select an endpoint to send") unless ep
-    id = @session.store.representative_flow_id(ep[:host], ep[:method], ep[:target])
+    id = sitemap_flow_id(ep)
     return (@toast = "no captured request for this path — capture it, or use Discover") unless id
     added, skipped = authorize_controller.seed_flows([id])
     goto_tab(:authorize) if added > 0
@@ -28,7 +28,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   private def authorize_seed_toast(added : Int32, skipped : Int32) : String
     return "authorize: already queued" if added == 0 && skipped > 0
     return "those flows are no longer available" if added == 0
-    base = "authorize: loaded #{added} request#{added == 1 ? "" : "s"}"
+    base = "authorize: loaded #{Gori.plural(added, "request")}"
     return "#{base}, #{skipped} already queued" if skipped > 0
     "#{base} — ^R to run"
   end
@@ -63,7 +63,8 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     # Every OTHER identity's name, so the form can refuse a duplicate: two rows under one
     # label in the results table would leave no way to tell which session produced which.
     taken = all.each_with_index.compact_map { |(id, i)| i == idx ? nil : id.name }.to_a
-    form = AuthorizeIdentityOverlay.new(editing, idx, taken)
+    labels = editing ? Gori::SessionRefresh.step_labels(@session.store, editing) : [] of String
+    form = AuthorizeIdentityOverlay.new(editing, idx, taken, labels, @session.registry)
     form.on_commit = -> { authorize_controller.apply_identity(idx, form.build_identity) }
     # Both paths — saved or cancelled — return to a FRESHLY built list, so it shows whatever
     # the commit just wrote.
@@ -91,9 +92,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     authorize_controller.remove_selected
   end
 
-  def authorize_filter : Nil
-    authorize_controller.authorize_filter
-  end
+  forward authorize_filter : Nil, to: authorize_controller
 
   def authorize_clear : Nil
     authorize_controller.clear
@@ -109,10 +108,6 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
 
   def authorize_toggle_passive : Nil
     authorize_controller.toggle_passive
-  end
-
-  def authorize_passive? : Bool
-    authorize_controller.passive?
   end
 
   def authorize_identities : Nil

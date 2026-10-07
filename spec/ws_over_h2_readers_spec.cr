@@ -101,6 +101,13 @@ describe "Store::FlowDetail#websocket? — one predicate, both transports" do
     end
   end
 
+  it "recognises the websocket member inside an HTTP/1.1 Upgrade list" do
+    with_store do |store|
+      h1_ws_flow(store, upgrade: "h2c, websocket").websocket?.should be_true
+      h1_ws_flow(store, upgrade: "websocket-v2").websocket?.should be_false
+    end
+  end
+
   # The ANSWER is required on both sides. A handshake the origin rejected never opened a
   # socket, and HAR must keep exporting it as the ordinary failed request it is.
   it "is false for a handshake the origin refused, on either transport" do
@@ -135,14 +142,14 @@ describe "Store::FlowDetail#websocket? — one predicate, both transports" do
       h2 = h2_ws_flow(store, [{"out", 1, "hi".to_slice}])
       h2.websocket?.should be_true
       Gori::Repeater::WsEngine.replayable?(String.new(h2.request_head)).should be_true
-      Gori::Repeater::WsEngine.upgrade_request?(String.new(h2.request_head)).should be_false
-      Gori::Repeater::WsEngine.extended_connect_request?(String.new(h2.request_head)).should be_true
+      Gori::Proxy::WS.upgrade_request?(String.new(h2.request_head)).should be_false
+      Gori::Proxy::WS.extended_connect_request?(String.new(h2.request_head)).should be_true
 
       h1 = h1_ws_flow(store, [{"out", 1, "hi".to_slice}])
       h1.websocket?.should be_true
       Gori::Repeater::WsEngine.replayable?(String.new(h1.request_head)).should be_true
-      Gori::Repeater::WsEngine.upgrade_request?(String.new(h1.request_head)).should be_true
-      Gori::Repeater::WsEngine.extended_connect_request?(String.new(h1.request_head)).should be_false
+      Gori::Proxy::WS.upgrade_request?(String.new(h1.request_head)).should be_true
+      Gori::Proxy::WS.extended_connect_request?(String.new(h1.request_head)).should be_false
     end
   end
 end

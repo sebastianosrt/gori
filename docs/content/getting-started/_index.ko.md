@@ -1,6 +1,6 @@
 +++
-title = "시작하기"
-description = "gori를 설치하고, CA를 신뢰하고, 첫 요청을 캡처합니다."
+title = "gori 설치와 첫 요청 캡처"
+description = "gori를 설치하고 CA를 신뢰한 뒤 터미널 프록시로 첫 HTTP 요청을 캡처합니다."
 weight = 10
 +++
 
@@ -24,7 +24,7 @@ gori는 **HTTP/1.1, HTTP/2, WebSocket, gRPC, Server-Sent Events**를 이해하�
 
 ## 다음 단계 {#next-steps}
 
-- [설치](/ko/getting-started/installation/): Homebrew, AUR, Nix, Docker, 바이너리, 또는 소스에서 빌드
+- [설치](/ko/getting-started/installation/): Homebrew, Chocolatey, AUR, Nix, Docker, 바이너리, 또는 소스에서 빌드
 - [빠른 시작](/ko/getting-started/quick-start/): 캡처, 단축키, 그리고 첫 Repeater
 - [Playbooks](/ko/playbooks/): 스코핑부터 리포트까지, 워크플로우별 따라하기 문서
 - [AI 설정](/ko/getting-started/ai-setup/): AI 에이전트를 MCP로 프로젝트에 연결

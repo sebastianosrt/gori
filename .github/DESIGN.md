@@ -47,6 +47,34 @@ verb registry; they reach feature parity by calling the same engines ([§2](#s2)
 convention rather than a shared code path. That gap is real, known, and under decision in
 issue #357.
 
+**The space menu is one menu per tab, not one per focus level.** `Verb::Definition#section`
+is a FOCUS-AREA axis, and for a long time it gated visibility straight through: the card was
+`COMMON ∪ the focused pane's section`, so the sub-tab strip's own verbs — new, close,
+duplicate, rename, mark, find, filter — showed only while the strip had focus. From a body pane
+the operator had to walk focus up a level before `Space` would offer to close the sub-tab
+they were looking at. With `⇧1`–`⇧9` landing anywhere on the strip, *what `Space` offers must
+not depend on which row the cursor happens to be on*. So on the nine tabs that carry a strip
+(Repeater, Fuzzer, Miner, Sequencer, Decoder, JWT, Cookie, Comparer, Notes) the `:subtab` and
+`:tab` sections are drawn as one `SUB-TABS` bucket on **every** view: expanded where the strip
+or the tab bar has focus, and one `T` **Sub-tabs…** row in a pane (§7, 2026-09-25). The two
+sections were always the same idea (the strip's actions, and the strip's search/filter); only
+the focus level that revealed them differed.
+
+**The bucket spells an intent with the same letter on all nine strips** — `n` new, `w` close,
+`d` duplicate, `e` rename, `t` mark, `f` find, `/` filter, `T` mark-all, `N` clear-marks (the
+Repeater adds `g` tag) — and a tab that lacks an intent omits the row rather than spending the
+letter elsewhere. That is what makes it one table to learn instead of nine, and it is the
+reason the bucket is worth a rule of its own: the nine are reserved in COMMON, which shares the
+strip-focused card, and a pane view reserves only `T`.
+
+**When a letter collides, the PANE mnemonic moves, not the strip's.** A strip letter has to
+read the same on all nine strips, so moving it costs nine tabs to save one pane; a pane letter
+costs exactly one pane. The exception is a pane letter that is the tab's primary verb — which
+is why rename is `e` and not `r`: `r` is Send/Run (with `Ctrl-R` beside it) in four of the
+nine, and no uniform strip letter is worth taking the key those tabs exist for.
+`Registry#validate_menu_keys!` sweeps the merged views at build time, so a collision is a
+boot-time raise rather than a silently unreachable row.
+
 <a id="p2"></a>
 
 ### P2: not assigned
@@ -244,17 +272,19 @@ rule set, through one chokepoint: `Gori::Outbound` (`src/gori/outbound.cr`). The
 `Fuzz::Sender` and `Repeater::Sender` take it as a **constructor argument**, so an ungated
 sender does not compile (P5). It carries two layers:
 
-- **Layer 1**, up front and once: the include/allowlist decision. Its strictness is the only
+- **Layer 1**, before side effects: the include/allowlist decision. Its strictness is the only
   thing that legitimately varies per surface, and the variants are named rather than
   re-derived at each call site: `Outbound.agent` (MCP, refusing anything not included,
   including an unconfigured project), `Outbound.cli` (`gori run`, where an unconfigured
   project stays permissive), `Outbound.interactive` (TUI, no up-front gate because the
-  operator typed the target).
+  operator typed the target). A Repeater send is judged on its binding-expanded
+  request-target (`Plan#scope_requests`), and the sender asks again on the real wire.
 - **Layer 2**, per send: Sandbox mode always, plus explicit EXCLUDE rules for an automated
   sweep. Identical on every surface, and applied even when Layer 1 was waived.
 
 Both layers judge the URL anchored on the host actually being **dialled**, not the one in the
-request line (`Outbound.scope_url`). A raw request may deliberately carry an absolute-form
+request line (`Outbound.scope_url`). A refusal never prints an expanded target, which may
+carry a live credential. A raw request may deliberately carry an absolute-form
 request line pointing somewhere else, which is a legitimate Host-header, cache-poisoning, or
 SSRF test and still goes out verbatim (P7); scoping on that spoofed host would let an anchored
 include rule authorise a send to a different origin.
@@ -318,6 +348,47 @@ Width is measured, never assumed: `Screen.draw_width` reports the cells a string
 occupy, and views that draw per grapheme cluster sum the width per cluster so a wide
 character is never half-drawn.
 
+The tab bar is **nine numbered slots** (`Chrome::MAX_SLOTS`), and the digits are the primary
+way to move between them: `1`-`9` for a slot, `0` for everything else, `⇧1`-`⇧9` and `⇧0` for
+the same two gestures one level down on the sub-tab strip. Four consequences are load-bearing.
+
+`0` opens a **filtered picker**, not a dropdown. Nine slots against a twenty-one tab catalog
+leaves twelve tabs off the bar, and twelve is a list you type at rather than one you walk;
+the ⋯ dropdown it replaced had no filter, could not reach a tab that WAS on the bar, and
+carried a key table of its own. It is `FilterPickerOverlay`, the same card the sub-tab picker
+is, so "find me a tab" answers to one set of keys at both levels.
+
+The **temporary tenth tab is unnumbered**. Jumping to a hidden tab force-shows it at the far
+right of the bar; it is where the operator is standing rather than a slot they arranged, so it
+wears no `N:` and `nav.posN` never resolves to it. A digit painted on the bar and a digit in
+the keymap have to agree, or the bar lies about itself — hence `visible_slots` returns the
+strip AND the slot count rather than letting a caller infer one from the other.
+
+**Shifted digits are normalised in `Keybind`, not bound as punctuation.** A kitty-protocol
+terminal reports `⇧3` as `3` plus a shift flag; every other terminal sends `#`. Folding the
+punctuation onto `Chord.new("3", shift: true)` — exactly as a typed capital is folded onto
+shift+lowercase — keeps ONE chord in the keymap, one label in Help, and one rebind target.
+Binding the punctuation instead would have meant two bindings per key and a Help sheet that
+was right on half the terminals.
+
+**The default nine are chosen, not truncated to.** `DEFAULT_HIDDEN` names twelve tabs so the
+factory bar is Project · Target · History · Intercept · Repeater · Fuzzer · Probe · Issues ·
+Notes — capture, triage, record — and the cap never fires on a fresh install. `TABS` keeps its
+own order regardless: reconcile uses it to slot a newly-added tab beside its catalog
+neighbours in an existing config, so it must keep meaning "where this tab lives relative to
+the others", not "the default bar".
+
+An operator who saved their own layout keeps it, truncated by **position**: their first nine
+survive in their order, because that order is what their fingers learned, and re-deriving a
+"better" nine from a bar someone arranged is the shell overruling them. The fold is announced
+**once** (`Runner.settle_tab_slots` persists the truncated layout, so the notice cannot
+repeat) and NAMES the tabs that moved — a tab vanishing off the bar with no explanation is the
+one outcome this migration exists to prevent. A saved layout that is byte-identical to the
+pre-slots default is the exception: its owner never chose those fifteen tabs, so it is dropped
+rather than truncated and they simply get the new default. The cap is a setting
+(`Settings.tab_slots?`, default on); off, the bar is unbounded and scrolls as it used to,
+`1`-`9` still reach its first nine and `0` still reaches everything.
+
 <a id="s6"></a>
 
 ## §6 Data model
@@ -331,9 +402,55 @@ migrations in `src/gori/store/schema.cr`.
   truth.
 - **Sitemap node**: one node per distinct URL segment (P3), with operator path tags.
 - **Issue**: the final output, a human-confirmed finding, triaged, optionally linked to the
-  flow, note, or session that evidences it.
+  flow, note, or session that evidences it. `flow_id` is the flow it was FILED from — the seed
+  `insert_issue` links in the same transaction, and the first row of everything that answers
+  "what backs this issue" (the RELATED card, the report's Related list, the JSON/MCP `links`).
+  It is not a separate kind of relation; see the 2026-09-12 entry for why it stays a column and
+  what a schema fold would have to answer.
+- **Frozen evidence**: an immutable copy of ONE exchange — request, response, provenance and
+  a SHA-256 of each — taken from a Flow or a Repeater tab at the moment it proved a finding,
+  so retention and the next send cannot reach it. Issue membership is mutable and
+  many-to-many (`evidence_issue_links`); the bytes and hashes are neither. A snapshot whose
+  last Issue link is removed is KEPT as an orphan, findable in the project-wide archive, and
+  only its own explicit delete removes it. A Repeater freeze also reports REQUEST DRIFT: the
+  row's request is mutable and its response is not rewritten with it, so `repeaters` keeps a
+  SHA-256 of the request each send went out with and `Evidence.from_repeater` compares it
+  against the request the row holds at freeze time. Decided THEN, from two digests, rather
+  than stored on the snapshot — a frozen copy is a statement about its own bytes, and a
+  `drifted` column on it would be a statement about a live row that can change afterwards
+  (and could not even be recomputed once the tab is closed). Over the SAVED request bytes,
+  not the wire: the send seam expands `$NAME` and overlays the active slot, so a wire digest
+  would call every tab using either one drifted. A NULL digest is NOT RECORDED, never a
+  verdict, so a response persisted before the column existed keeps freezing as it did.
+  ONE verb files it. "Link…" and "Link & freeze…" used to sit side by side, which made the
+  operator answer "pointer or bytes?" at the moment of FILING — a question about the storage
+  model, asked when their attention is on the finding, and whose answer was almost always
+  "bytes". So `↵` on an ISSUE row freezes whenever the ref has an exchange, the link is the
+  primary act (a refusal, a declined gate or the quota changes what is KEPT, never whether the
+  link happened), and the refusal is NAMED in the same toast. The TUI is the surface with an
+  operator and a hint line, so it can decide by default; the headless surfaces stay
+  MECHANISM-named — `links add` / `add_link` are pointers, `evidence freeze --link` /
+  `freeze_evidence` are pointer-plus-copy — because an agent or a script composes verbs and a
+  verb that silently did two things would be a worse contract than two that each do one.
+  Probe's automatic issue filing does NOT freeze: a snapshot is the operator saying "these
+  bytes proved it", and an unconfirmed finding filed by a rule has not said that, nor should
+  it spend a bounded budget to guess.
+- **Retest**: an Issue's REPRODUCIBLE check — ordered `issue_retest_steps` (each a Repeater
+  session, a role, and at most one assertion) plus a bounded `issue_retest_runs` history and
+  its per-step rows. Kept OUT of `entity_links`, deliberately: a link answers what material
+  is related, a step additionally carries order, role, assertion and execution state, and
+  folding the two would make unlinking a piece of evidence delete a test step. Unlike frozen
+  evidence it CASCADES with the Issue — a run summary is a statement about one issue's check
+  and means nothing detached from it. A step references its Repeater session live (it sends
+  what the tab holds at run time); a result row COPIES what it sent, because a run is read
+  weeks later and a row that re-resolved would describe a request that never ran.
 - **Note**: the running scratchpad and report.
 - **Sessions**: persisted Repeater / Fuzzer / Miner / Sequencer / OAST workbench state.
+- **Operator message**: a line the operator sends from the TUI to an attached agent session;
+  delivered by the first route that answers — inbox socket, `codex queue`, then the
+  unconfirmable `claude/channel` push — and, for anything none of them carried, by the next
+  tool result or the `operator_messages` poll. Every attempt is recorded as an
+  `agent_delivery` event.
 
 Directories are `0700` (`Paths::DIR_MODE`) and the DB, plus its `-wal` and `-shm`
 sidecars, are `0600` (`Store.harden_permissions`).
@@ -398,7 +515,8 @@ window therefore publishes when no UI-bearing holder is: no row, a row a view-on
 wrote, or a holder's row older than `UI_STATE_TAKEOVER`. Both windows write only when their
 own view MOVES, so two idle windows never trade the row, and the holder's write is
 unconditional — any activity there reclaims it. The row carries `holds_capture` so the reader
-can weigh whose view it is.
+can weigh whose view it is. Since #1091 the row also carries the operator's SELECTION; the
+2026-09-18 entry below says why that is relayed as a resolved set rather than as its inputs.
 
 ### 2026-07-25: this document restored
 
@@ -1869,7 +1987,11 @@ watching TUI reload rules/scope/bindings on each beat. So presence is a per-proc
 `CaptureLock` + `CaptureStatus`: the flock is the truth about liveness (the kernel frees it on
 SIGKILL, where no `ensure` runs) and the JSON body is decoration. Readers sweep any marker whose
 lock they can take. The TUI polls the directory on the DV tick OUTSIDE `apply_external_change`,
-because a marker moves no `data_version`.
+because a marker moves no `data_version`. #1091 added a second kind — a gori TUI *window* — and
+gave it its own directory rather than a field in the body: `count` must stay parse-free for the
+project picker's render path, `parse_entry` has to fall back to a kind when a body will not
+parse, and a bound `Tools` always has its own `mcp` marker, so a body-carried kind would have
+made "is a window open?" answerable only by a reader that never forgets to filter.
 
 ### 2026-08-28: CVSS in issues — optional wire representation with live derivation
 
@@ -2308,3 +2430,2443 @@ and capture throughput on 10k/100k/500k fixtures. With 500k 1KB bodies, an absen
 held the scheduler for 2.7–3.0 seconds synchronously versus 9–11 ms with query controls;
 allocations and total query time were comparable. This is cooperative scheduling, not a
 hard deadline: a single regex callback or filesystem operation cannot be preempted.
+
+### 2026-09-11: a named stdin flag reads a pipe, and a terminal is refused
+
+Refines: [P0](#p0), [P4](#p4). Issue #1034.
+
+`--request-stdin` shipped on the rule that a flag the operator NAMED makes blocking until EOF
+the answer to what they asked for: a `^D` notice on a tty, then the read. That treated a
+terminal as a quiet pipe with a human on the far end. It is not one, and each difference lands
+on exactly this door:
+
+- The line discipline **echoes**. The raw request the flag exists to keep out of the process
+  listing and the shell history — `Cookie`, `Authorization`, a PII body — goes into the
+  scrollback instead, and under a PTY-driven harness into the captured transcript. The flag
+  closed one copy of the secret and opened another.
+- **`^D` is not EOF.** In canonical mode it flushes the pending line, so a request with no
+  trailing newline takes two — one to deliver the last line, one on the now-empty line — and a
+  driver that sends one hangs.
+- **`MAX_CANON`** truncates a line at 1024/4096 bytes before gori is handed an octet.
+
+Driving termios is not out of reach — `Termisu::Termios` already runs the TUI's pane, and its
+`Terminal::Mode.password` clears ECHO — but it answers only the first bullet. Canonical mode
+still flushes on `^D` and still truncates at `MAX_CANON`; raw mode removes keyboard EOF
+outright. There is no setting under which a terminal delivers a byte-exact multi-line request
+and then ends, so the door is refused rather than half-built (P0) and the refusal names the
+spellings that work (P4). `Run.stdin_terminal_error` is the one verdict and
+`Run.read_stdin_text` the one door.
+
+**What the rule covers:** every stdin road an operator names by FLAG — `--request-stdin`,
+`--notes-stdin`, and the four that spell stdin `-` (`sequence --tokens`,
+`authorize --identities`, `rewriter --response-file`, and `-` on a `--…-file` flag) — plus a
+PATH that resolves to a terminal (`--request-file /dev/stdin` under a tty), which
+`read_input_file` checks on the open it was already making.
+
+A WORDLIST path is covered too, through `Gori::TtyPath.terminal?` — one predicate for the
+three loaders (`Fuzz::Payload::WordlistFile`, `Miner::Wordlist`, `Discover::Wordlist`), each
+raising what its own error funnel already catches. The predicate stats before it opens:
+`character_device?` is true for every terminal and false for a FIFO, so the probe never opens
+the named pipe whose open would BLOCK until a writer arrives — the one source the lazy
+wordlist reader exists to serve. That pre-check is why the predicate has one home rather than
+three copies.
+
+**What it does not:** the IMPLICIT stdin roads (`fuzz`/`mine`/`sequence` sources, `decoder`,
+`jwt`, `cookie`, `notes`) keep their own `unless STDIN.tty?` fallback — there a terminal means
+"no source was given", not "the operator asked for this one". They do share the explicit
+doors' `IO::Error` rescue now (`Run.read_stdin_fallback`): fd 0 closed by a cron or systemd
+unit used to reach the operator as a Crystal backtrace on all seven.
+
+A pipe and a `< file` redirect are non-tty file descriptors and are unchanged, byte-for-byte,
+so no script or CI job moves. A pty-backed but non-interactive fd 0 — `ssh -t`, `docker -t`,
+`script -q -c` — IS refused, deliberately: gori cannot tell it from an operator's terminal
+without reading termios flags the harness may have set either way, and refusing with a named
+alternative beats echoing a secret into a transcript on a guess.
+
+`spec/cli/run/stdin_terminal_spec.cr` drives both arms against real file descriptors (an
+`IO.pipe`, a redirect, and a `/dev/ptmx` master) and sweeps `src/gori/cli/` for a direct STDIN
+read that carries neither the explicit guard nor an implicit road's own `STDIN.tty?` check.
+
+### 2026-09-12: ↵ shows the exchange in place, and a second key navigates
+
+Refines: [P1](#p1), [P4](#p4). The Issues detail's RELATED card (#1038 follow-up).
+
+RELATED lists two kinds of row and `↵` used to answer them two different ways: a LIVE row
+teleported to History/Repeater/Fuzzer/Miner, a FROZEN row opened a read-only card over the
+detail. One key, two behaviours, in one list — and which one you got depended on a badge two
+columns to the left of the cursor. The project-wide Evidence tab already had the right
+grammar, `↵ open · s source`, so RELATED takes it: **↵ SHOWS the row's exchange in place, `s`
+GOES to the tab it lives in.** Each key does one thing on every row.
+
+A LIVE row is shown through an `Evidence::Snapshot` of the source as it is now, on the same
+card the frozen copy uses — not through the History drill-in, even for a flow that has a live
+id to hand it. The argument is the one already written above `EvidenceViewer`: the drill-in's
+verbs act on a live id (delete it, link it, probe it, send it to the Repeater), every one of
+them would have to be gated behind "you are only reading", and one missed gate is an operator
+deleting the flow they thought they were reading. ↵ on a RELATED row is a READ; reading must
+not put destructive verbs one keystroke from the reader. The card's one action, `f`, only
+ever ADDS — it freezes what is on screen onto the open issue and flips the title to
+`FROZEN EVIDENCE #N` without closing.
+
+The snapshot comes from `Evidence.snapshot_for`, the builder the freeze itself uses, so what ↵
+shows and what `f` would keep are the same bytes by construction rather than by two code paths
+agreeing. Its refusal sentences are written for a freeze ("…then freeze the exchange"); ↵ keeps
+the FACT verbatim from that one builder and re-points only the advice at the key this path has
+(`s`), and only when the source is still there for `s` to open.
+
+A LIVE view says so everywhere the frozen one says "frozen": the title (`LIVE hist #12`), the
+provenance line (`as it is now · not frozen`), the border slot, and the chip strip (`live copy
+— retention or the next send can change it`). It also names REQUEST DRIFT, which a frozen card
+can never carry because the freeze gate asks about it first — a live card is looking straight
+at a Repeater tab whose request was edited after its stored response, and not saying so would
+be the card presenting two halves as one exchange.
+
+**Fuzz and miner rows are the honest exception.** A session is a template plus a run and has
+no single exchange to put on a card, so ↵ there navigates, and the hint token swaps to
+`↵ open session` rather than promising a view that cannot exist. It is read off
+`Evidence.freezable?` — the same predicate the freeze gate and the `f` token read — so the
+three cannot disagree about which rows have an exchange.
+### 2026-09-12: the primary flow is the first related row
+
+Refines: [P1](#p1), [P4](#p4). The Issues detail's RELATED card, continuing the ↵/`s` entry above.
+
+An Issue relates to traffic four ways — `issues.flow_id`, `entity_links`, frozen evidence,
+retest steps — and it used to PRESENT the first of them as a different KIND of thing from the
+rest. The detail drew `flow  GET /login → 200` as a meta row above the RELATED card; the
+Markdown report wrote `- **Flow:** …` above its `### Related` list; and both had to hide the
+flow from the list underneath (`Links.dedupe_issue_flow`) so it would not appear twice. Three
+places spelling one fact, and the operator arriving at the card with one question — what backs
+this issue — got the answer split across a line and a list in two vocabularies.
+
+So the primary flow is simply the FIRST RELATED ROW. `Links.issue_links` is the one ordering:
+primary first, exactly once, then the other links in link order, then the frozen copies. The
+row is LIVE-badged like any other pointer, which makes every key on the card mean one thing on
+every row — `s` opens it in History (the act the removed `o` had its own key for), `↵` shows
+its bytes, `f` freezes them, `r` sends it to the Repeater. The meta block drops from four rows
+to three and NOTES gains the row, which is the pane an operator reads and types in.
+
+`r` moved with it. It used to read `issues.flow_id` and nothing else — a card verb acting on a
+fact the card did not show, while the cursor sat on a row it ignored — and now takes the row
+under the cursor: a live flow's capture, or a FROZEN row's frozen request through
+`duplicate_evidence_into_repeater`, the builder the Evidence tab's own `r` calls, so the
+WebSocket-handshake caveat cannot drift into two wordings. A cursor on a row it cannot send —
+a fuzz or miner session, a live Repeater row `s` already opens — FALLS BACK to the first flow
+row, because that is what the key meant before it looked at the cursor at all.
+
+A `flow_id` whose `entity_links` row is missing SYNTHESISES the row (`id = 0`, never removable
+by id) rather than dropping it. `insert_issue` has written that link since the table existed,
+so the shapes that reach it are an issue filed before that migration, an imported project, or
+a link deleted by SQL — and in all three the issue's own seed would otherwise vanish from the
+card and the report. A pruned flow is NOT one of them: `detach_flow_refs` nulls `issues.flow_id`
+along with the link, so an issue whose evidence was pruned has no primary rather than a
+dangling one.
+
+**The column stays.** `issues.flow_id` is the seed `insert_issue` links from in one
+transaction, the source of the SARIF result's `webRequest`/`webResponse`, and what
+`gori run issues create --flow`, MCP `create_issue(flow_id:)`, the Probe analyzer's automatic
+filing and the Sequencer's promotion all write. It is also kept as a field in the JSON export
+and in MCP `get_issue`/`list_issues`, documented there as "the first linked flow" — the compat
+spelling of `links[0]`.
+
+What a later SCHEMA fold would need, in the order it would have to answer them:
+
+- **The five writers.** Every one passes a flow id positionally to `insert_issue`; folding the
+  column means each writes a link instead, and `insert_issue` loses a parameter that four
+  surfaces' argument validation is currently written against (`--flow`'s range and existence
+  refusals, `create_issue`'s two `flow_id` errors).
+- **SARIF.** `Export.sarif` reads `f.flow_id` per issue to build `webRequest`/`webResponse` and
+  the result's location. Without the column it would have to pick a flow out of the links —
+  which means the ORDER in `entity_links` becomes load-bearing for a document format, where
+  today it is only a display order.
+- **Order itself.** `list_links` orders by `(created_at, id)`, and the primary is first only
+  because `insert_issue` writes it in the issue's own transaction. A fold needs an explicit
+  rank (a column on `entity_links`, or a `role`), or "the first one" stops being a fact.
+- **The JSON/MCP field.** `flow_id` would become derived (`links[0]` where kind is flow) or be
+  dropped, which is a breaking change for a reader that has only ever read the field.
+- **The dedupe that is left.** The "Manage links" card still takes the primary OUT
+  (`Links.dedupe_issue_flow`), because it lists REMOVABLE pointers and the primary is a column
+  — removing its row there would delete an `entity_links` row and change nothing on screen. A
+  fold is exactly what would make the primary removable, and that card is where it would show.
+### 2026-09-12: the editor keys are verbs, and the focus dimension is a scope at the head of the chain
+
+Eleven text-editor panes answered `i`, `↵`, `x`, `y` and `b` with a hand-rolled arm in their
+controller's `handle_body_key`, which the Runner dispatches *before* the keymap. So those keys
+were not rebindable, did not appear in the hotkey editor as anything that worked, and silently
+shadowed whatever the keymap held for the same letter — including chords the verbs beside them
+already declared. `repeater.select-line` had carried `x` since it was written and could never
+fire; `project.select-line` and `project.copy` had their chords REMOVED to stop advertising a
+rebind that moved nothing; the Repeater response carried a bare `b` that aliased the global
+`^B` in one pane and nowhere else. KEY_AUDIT §1.4/§2d/§2e is the full list.
+
+The root cause is one sentence: **`Keymap#lookup` is keyed by `Scope` alone, and a `Scope` names
+a TAB.** The Repeater binds one scope across a request EDITOR and a read-only RESPONSE, so
+"`↵` starts typing here, `↵` re-sends there" was not a thing two chords could say, and the
+second meaning had to be hand-rolled. Every arm in the audit is a pane disambiguating itself
+because the table could not.
+
+The fix is a **scope CHAIN** rather than a second key in the table. `Verb::Scope::Editor` is
+consulted first, then the active tab's scope, then Global, each link gated by `available?`
+(`Runner#resolve_verb_id`). Editor joins the chain only while a text-editor pane holds focus —
+`TabController#editor_pane?`, which every editing controller answers — and drops out the moment
+focus leaves. Two properties follow, and they are the whole argument for the chain over the
+alternatives:
+
+- **The tab keeps its vocabulary.** Editor sits AHEAD of the tab scope, not instead of it, so
+  `{repeater.copy}`, the Notes sub-tab keys and the Global breath keys all still resolve behind
+  it. A per-pane scope that REPLACED the tab's would have cost every editor pane the rest of
+  its tab.
+- **The read-only pane beside an editor is not an editor pane**, so Editor is absent from the
+  chain there. That is what lets `↵` be `editor.insert` in the Repeater request and
+  `repeater.send-enter` in the response with two ordinary chords — the exact case the keymap
+  could not express — and it keeps `insert_key_refusal` meaningful, since the pane that refuses
+  `i` is by definition the pane the Editor scope is not on.
+
+The alternative considered was an `available:` gate reading the focused pane, which is what
+`read_edit.cr` already does for `x`/`y`. It works for a verb that exists once per tab and does
+not scale to a verb that should exist ONCE: `editor.insert` would have become nine near-identical
+registrations, and a keyset respelling the family would have had to name all nine.
+
+**Editor is a KEYMAP scope, not a MENU scope.** The space menu renders exactly one `Scope`, and
+an EDITOR bucket merged into the eight tab menus has no collision-free set of mnemonics — the
+letters free across all eight are `G I J Q U W X Z b j u z`, and `SpaceMenu#verb_for` is a
+first-match find, so a clash makes one entry silently unreachable. The editor family is
+discoverable instead through the hint strips (which name it with `{editor.insert}` tokens, so a
+rebind reaches them), the Help sheet's verb rows, and `settings:keys`.
+
+What did NOT become a verb, and why: **`esc`** and **`^Z`/`^F`/`^G`** are registered but sit in
+`Hotkeys::FIXED_IDS`, because a hardcoded handler answers each before the keymap and always
+must — `esc` is how you leave a pane that is swallowing every printable, and the three Ctrl
+chords are guard-claimed (`CLAIMED_CTRL_LETTERS`). They are declared so Help can name them and
+so a keyset has a row to give a second, bare spelling. **⇧arrow selection** stays structural:
+`Keybind.from_event` encodes it, but the extend-selection semantics live inside `TextArea` /
+`ReadPane` motion, not in a chord. And **nothing that edits was added** — no delete-line, no
+open-line, no join. A READ-mode pane is a caret, a selection and a copy; naming keys for
+operations that do not exist would make the keyset a promise the editors cannot keep.
+
+### 2026-09-12: an editor keyset is a mapping, and the order is user > keyset > profile > default
+
+Vim users stumble on exactly one gesture in gori's editors: READ mode is helix-shaped, so `x`
+selects the line and `y` then copies the selection, where the same hand wants `V` then `y`.
+Everything else in the pane — `i` in, `esc` out, `y` copies, ⇧arrows extend — gori already
+spells the way vim does.
+
+So the answer is a **keyset**: a named bundle of key overrides for the small, fixed set of
+editor verbs, which is precisely what `OsProfile::OVERRIDES` already is, one layer up. It is
+NOT an emulation, and the distinction is load-bearing rather than modest. An emulation implies
+an operator-pending grammar (`d` waiting for a motion), registers, counts and text objects,
+and gori's READ pane has none of those to drive — a `ReadPane` is a caret, a selection and a
+copy. `Verb::Keyset::VIM` therefore contains only rows that RESPELL a verb that already
+exists, and the things it cannot offer are named in `docs/content/guide/hotkeys.md` rather
+than approximated: `gg`/`dd`/`yy` (a `Chord` is one keystroke), `:42` (`Verb::Reserved` keeps
+bare `:` for the command line), and delete (there is no delete-line in a READ pane to bind).
+
+**The order is `user > keyset > OS profile > declared`** (`Keymap.effective_chords`), and that
+ranking is the feature. A keyset placed ABOVE a per-verb rebind would mean picking `vim`
+silently undid work the operator did in `settings:keys`; below it, a keyset is a better
+DEFAULT that a single rebind can still overrule. It is also why `Hotkeys.default_for` — what
+the editor's "reset" row reverts to — takes the keyset: reverting to the `x` a verb file
+declares would hand a `vim` operator a key their keyset does not use, from a button labelled
+"default". Each layer REPLACES rather than merges, and a keyset row keeps `pinned_chords` for
+the same reason a user override does: nothing may carry `^Y` off with `y` and leave a pane
+with no way to copy in INS.
+
+Two safety properties, both checked rather than argued. `Registry#validate_chords!` now sweeps
+the full (OS profile × keyset) matrix, because a keyset substitutes a BUNDLE at once —
+`vim` moves fifteen select-line verbs onto `⇧V` in one step — so a verb that later claimed one
+of those letters in one of those scopes would shadow silently and only for the operators who
+picked that keyset. And `spec/verb/keyset_spec.cr` sweeps the vim bare letters (`u` `/` `a`
+`g` `⇧G`) against the eight scopes an editor pane can belong to: the Editor scope sits ahead
+of the tab scope, which `validate_chords!` cannot see, so a hit there is a DISPLACEMENT that
+must be documented rather than discovered. The one intentional hit is `u` in the Repeater's
+read-only response, where Unicode escape display takes priority; the request editor still
+resolves `u` in the leading Editor scope to `editor.undo`.
+
+What the keyset deliberately leaves alone: the enable/disable `x` on the four rule lists (that
+`x` is a state change, not a selection — KEY_AUDIT F4; since the entry below, all four toggles
+are `t` and there is no such `x`), and `intercept.select-line`, which
+ships keyless because the Intercept queue spends nearly every letter. A keyset respells keys;
+it does not hand one to a pane whose author decided against it.
+
+### 2026-09-12: one bare letter, one question — the settled key grammar
+
+Refines: [P4](#p4). The key-consistency audit's F2/F3/F4/F6/F7, on top of #1050, #1051 and
+the first-moves pass (#1054).
+
+gori's bare letters had drifted into meaning different things on tabs a hand moves between in
+one gesture. The audit measured it — 586 verbs, 34 scopes, 639 chord bindings — and the answer
+is not "one universal per letter" but **one question per letter**, settled below. A new pane
+action takes a letter from this table only if it answers that letter's question; otherwise it
+starts at L3 (the space menu), which is what the key budget in `docs/content/guide/hotkeys.md`
+has always said.
+
+| Key | The question it answers |
+|---|---|
+| `↵` | show this row **in place** |
+| `o` | open this row's own detail — `↵`'s alias, and nothing else (Sitemap is the named exception: `↵` expands a tree node there) |
+| `s` | go to the tab this row lives in; where a row has no source, the Global scope lens |
+| `d` | delete or dismiss the selected row |
+| `y` | copy |
+| `t` | flip this row's flag — mark on a list, enable/disable on a rule list |
+| `a` | add a new row here |
+| `e` | edit the selected row |
+| `/` | filter this list |
+| `f` | freeze (evidence contexts) · find (the sub-tab strip — a different tier) |
+| `r` | send this to the Repeater |
+| `^R` | run |
+| `w` | swap A ⇄ B |
+| `x` | select this line |
+| `⇧X` | wipe this tab (asks first) |
+| `space` | this tab's command menu |
+
+Three exceptions are deliberate and are documented rather than resolved, because each is a
+tab's own loop key and internally coherent:
+
+- **Intercept `f` = forward**, with `⇧F` = forward all. That tab's `f`/`⇧F` family reads as one
+  thing, and forwarding is what an operator does there many times a minute.
+- **History → Repeater and Repeater send stay `^R`**, which predates this table.
+- **The Project ACTIVITY feed's `s` cycles the source chip.** Folding it into that pane's `/`
+  bar needs the bar to parse `source:`/`level:`/`actor:`; it is a free-text query handed to
+  `events_recent(query:)`, and the chips are separate SQL parameters.
+
+This entry settles the half the two entries above it left open. The keyset one records that
+it "deliberately leaves alone… the enable/disable `x` on the four rule lists (that `x` is a
+state change, not a selection — KEY_AUDIT F4)" — F4 is settled here, so there is no such `x`
+left to leave alone: all four toggles are `t`, and `⇧V` under the vim keyset now reaches a
+select-line verb in every editor-capable scope with nothing else wearing the letter.
+
+Two mechanisms keep the table true rather than aspirational. `Registry#validate_chords!` and
+`#validate_menu_keys!` run at boot for every OS profile and raise on a same-scope chord
+collision, a dead capital-letter chord, or two verbs deriving one space-menu key inside one
+displayable view. Neither can see a CONTROLLER arm that claims a letter the registry also
+binds — the shape that made four verbs rebindable in the Hotkeys editor and inert in practice
+— so `spec/tui/one_key_one_meaning_spec.cr` sweeps every scope per letter, and a body that
+declines a key by name is the pattern to copy (`SequencerController#handle_body_key`).
+
+A space-menu **mnemonic** is a different keyspace from a chord: it is reached after `space`, it
+need only be unique within one displayable view, and it is a stable action identity. Where a
+chord moves and its old letter still reads best in the menu, the letter stays — `probe.open-
+evidence` is `s` on the body and `o` in the menu, and both swaps are `w` on the body and `s` in
+the menu. What a menu letter must never do is name a key the tab answers differently: that is
+why the sub-tab strip's letters and its menu's letters were unified (#1055), and why
+`sitemap.tag` gave `T` up to `sitemap.mark-all`.
+
+### 2026-09-17: a slot header copied off the wire is a snapshot, and stays byte-literal
+
+Refines: [P4](#p4), [P7](#p7). Extends the 2026-08-17 *Authorize identities are session slots*
+entry. Issue #1086.
+
+A slot could only be built from a login RESPONSE. When the login response set no cookie and
+carried no `Authorization`, and the credential was sitting in the authenticated REQUESTS
+captured right after it, there was no sanctioned path at all: the operator read the value with
+their own eyes and pasted it into an env var. That is the one move an agent client cannot make
+— reading a credential into the model's context is exactly what gori's `[REDACTED]` defaults
+exist to avoid — so the copy has to happen server-side, from flow to slot, with the value never
+crossing a surface.
+
+**The caller names the headers; gori detects nothing.** `create_session_slot{from_request_flow_id,
+copy_headers}` and `gori run session from-request <id> --copy-header NAME` copy exactly the
+named request headers, last wire field per name, and refuse atomically on a missing name. A
+`Cookie:` jar comes across whole or not at all. The alternative — guessing which of
+`X-API-Key`, a CSRF pair or a bespoke signature triplet is the credential, and which crumb of a
+browser cookie jar is the session — is a heuristic that both over- and under-reaches, and the
+operator already knows the answer.
+
+**Three headers are refused by name** (`SessionFromFlow::REFRAMING_HEADERS`): `Content-Length`,
+`Transfer-Encoding`, `Host`. A slot is applied to a DIFFERENT message than the one it was
+copied from, and the 2026-08-17 entry's first line — the overlay is header-only, so
+Content-Length never moves and the body is byte-exact — is exactly what an upserted copy of one
+would break. None of the three is a credential, so the refusal costs the feature nothing. It is
+a refusal rather than a silent drop: a caller that named one asked for it.
+
+**A captured value is not re-read as syntax.** That is the clause this entry narrows. The
+2026-08-17 entry says a `$NAME` inside a slot's own header value resolves against that slot's
+table; that holds for the overlay an OPERATOR wrote, and must not hold for bytes gori lifted
+off the wire. A session cookie that happens to contain `$BIND.SESSION` is a cookie, not a
+reference, and expanding it would send a value the origin never minted — the provenance axis
+again (P7: the axis is where the bytes came from, not what they look like). So a slot carries
+`literal_headers`, the names whose values came from a flow, and `resolve_values`,
+`Env.slot_literals`, and the env-syntax migration all skip them. Both flow-built paths mark
+their headers, `from-flow` included: it was always a snapshot of response bytes and the
+difference only became visible once a marker existed to state it.
+
+The marker is keyed by header NAME because `overlay_head` upserts by name — for a name typed
+twice only the LAST row reaches the wire. The identity form reconstructs the marker from the
+displayed text on every save (`AuthorizeIdentityOverlay#surviving_literals`) and keeps it only
+while that last row is still the captured bytes: editing it, or adding a hand-written row under
+the same name, makes the name manual again. Anything looser sends a hand-written `$BIND.TOKEN`
+as its own spelling, which is a 401 whose cause is invisible.
+
+What this deliberately does not do: scope the slot to the flow's host. A slot applies to every
+send that names it with `--slot`, host-scoping would be a second scope language beside §3, and
+the honest answer for now is that one slot is one identity — said in the CLI banner, the MCP
+tool description and the reference docs rather than enforced.
+
+
+### 2026-09-18: the operator's selection is relayed, not re-derived
+
+Refines: [P4](#p4), [P5](#p5). Extends the 2026-07-26 *verb registry is a TUI concern* entry.
+Issue #1091.
+
+An operator who had marked four rows in History could not hand them to an agent. `ui_state`
+carried the active tab, the focused pane and ONE cursor flow id, so "do X with what I selected"
+ended in reading ids off the screen and pasting them — the exact move the whole MCP surface
+exists to remove, and the one an agent cannot make on its own.
+
+**The payload carries the ANSWER of the target rule, never its inputs.** Every batch-capable
+verb in the TUI reads one resolver — `Runner#history_target_flow_ids`, `IssuesView#target_ids`,
+`SitemapView#target_keys`, `InterceptView#target_ids`, `TabController#target_subtab_indices` —
+and each spells the same rule: the marks if any are set, else the cursor row (and, where a
+detail overlay is open, the flow it pins, which is what the keys on screen would act on). So the
+row publishes `ids` plus `target_source`, and deliberately not a `marked_ids`/`cursor_id` pair
+for the reader to combine. A rule re-derived on a second surface is a rule that drifts, and it
+would drift first in the case the feature was built for.
+
+**This is the argument the verb registry never had.** The 2026-07-26 entry names the blocker
+for reaching the 318 verbs from CLI or MCP: a verb takes its target from TUI selection state
+instead of naming it, and what is missing is an argument schema, not registry wiring.
+`list_history{ids}` is that argument for the one shape that matters most, supplied through the
+`ui_state` facade — the registry stays a TUI concern, and `Tui::` is still not reachable from
+`mcp/`.
+
+**Sitemap addresses pairs, so it gets its own key.** A sitemap mark is `{host, path}`, not an
+integer, and it reports `nodes` with no `ids` key at all rather than a polymorphic array whose
+element type depends on a sibling field. `kind` is what a reader branches on. It carries the raw
+mark keys and not `target_endpoints`, which resolves through the current tree and silently drops
+a key the tree no longer holds — a narrowing of the operator's selection on its way out.
+
+**The gate is a change detector, not a heartbeat.** What it leaves OUT is as deliberate as
+what it holds: the live `/` filter text moves on every keystroke, and including it turned
+typing a query into ~3 `settings` commits a second — each one a commit that bumps
+`data_version` and makes every watching TUI reload rules, scope and bindings, which is the
+churn the 2026-08-27 presence entry gives as its reason for not being a DB row. The visible
+row count covers the same ground at the moment the debounced search actually lands, and the
+payload still carries the text, read at write time. The same line separates the two mark
+counts: the identity reads an O(1) unpruned size (a stale cache key is harmless, and the
+prune itself moves it) while the payload prunes, because a phantom there is a lie.
+
+**The publish gate is derived, not counted.** The row is rewritten only when
+`Runner#ui_state_identity` moves, and no mark gesture touches any of its four original members —
+which is why marking four rows published nothing at all. The added component reads the same
+state the payload serialises (`SelectionIdent`: mark count, cursor, visible rows, query, view,
+scope lens, marked chips) rather than a revision counter bumped at each of the ~14 mutators.
+A counter is an unbounded obligation whose missed bump reproduces exactly this bug, and no
+payload spec can see the drift because the payload reads the state and the gate reads the
+counter. The audit that makes the derived form sound: in all four views an add only arrives from
+a gesture that moves the count, and a removal only from a prune that lowers it. The accepted
+residual is named rather than hidden — a reload that leaves count, cursor and row total
+identical while sliding one marked row out of the window leaves `marked_hidden_count` stale
+until the next gesture, which is a decoration field and self-healing.
+
+**Liveness is evidence, not proof.** A `ui_state` row has no expiry and the TUI writes it only
+when the view MOVES, so an old timestamp under a live window means the operator is sitting
+still, not that the row is stale. The window marker and `recorded_at` answer different questions
+and neither corrects the other: the tool reports both, adds a note when they look like they
+disagree, and answers `tui.unknown` rather than `live:false` when it has no database path to
+look beside. A selection is capped at 200 ids with `marked_count` kept true and `truncated` said
+out loud, and that cap sits under `list_history{ids}`'s own, so a relayed History selection is
+always fetchable in one call.
+
+### 2026-09-20: MCP has two eras, and the request says which one
+
+Refines: [P1](#p1). MCP `2026-07-28`.
+
+MCP removed its own handshake. Through `2025-11-25` a session opened with `initialize` and
+everything after it inherited the version negotiated there; `2026-07-28` made the protocol
+stateless — every request carries its protocol version and the client's capabilities in
+`_meta`, every result names a `resultType`, list results carry cache hints, and
+`server/discover` is the one RPC a server MUST implement so a client can ask what it is
+talking to before it commits. gori now serves both, from one stdio process.
+
+**The era is read per request and never latched.** Under the modern revision there is
+nothing to latch it to: the spec is explicit that an open connection is not a session and
+that a client may interleave unrelated conversations over one stdio process. `Server#era_of`
+reads `_meta` on every request, and the only server-side state left is what it always was —
+job handles, OAST sessions, the project binding — each named by an explicit identifier the
+client passes back, which is what the statelessness rule actually asks for.
+
+**The era decides the envelope, never what a tool does.** `tools/call` dispatches into the
+same handler either way; what changes is `resultType`, the `_meta` server identity and the
+cache hints around it. That is deliberate: a second surface for a second revision is a second
+thing to keep in step, and [§2](#s2)'s whole argument is that parity survives only
+where there is one implementation under the surfaces. A legacy result is byte-identical to
+what it was, which is not politeness but the spec's own rule — a missing `resultType` reads as
+`complete`.
+
+**A handshake client is answered with a handshake revision, even when it asks for a modern
+one.** `initialize` IS the legacy opening; naming `2026-07-28` back would promise per-request
+semantics to a client that has already opened a session and has no way to switch. A version
+we do not speak is refused with `-32022` and the list we do — and that refusal is load-bearing
+in the other direction too: for a dual-era client probing us on stdio, a *recognised* modern
+error is how it learns the server is modern and must NOT fall back to `initialize`. Which is
+also why `server/discover` is the one request exempted from the metadata gate — answered
+when it names no version at all, and when it names one but declares no capabilities:
+refusing "tell me what to say" for not having said it first sends that client back to the
+handshake for no reason, and a bootstrap probe has nothing to declare yet. The VERSION half
+of the gate still applies to it, because that refusal is the signal.
+
+**Cache hints are `private`, and discovery's TTL is zero.** A cached response is keyed by
+method plus params, and `{"method":"tools/list"}` is the same key for every gori on the
+machine — so `public` would let a shared cache serve one operator's `--tools`-narrowed
+catalogue to a different server's client. Nothing there is user-specific; it is
+SERVER-specific, which the cache key cannot see. `tools/list` is otherwise cacheable, because the
+catalogue is a pure function of the start-up flags — with one exception that the TTL is read
+off rather than asserted beside: a read-only server that is still unbound advertises
+`create_project` and loses it on the first bind, so while that is ahead of us the answer is
+zero. `server/discover` gets `ttlMs: 0` outright, because its `instructions` name the bound
+project and `switch_project` moves that mid-session — the same drift `instructions_text`
+already warns every client about (#1003), answered here by refusing to let a client cache the
+sentence that would go stale.
+
+**What a stateless server may write to stdout closes three doors, and gori walked through
+all three.** The revision allows exactly a response, a notification belonging to a request
+in flight, and a notification on an acknowledged `subscriptions/listen` stream. A
+conformance sweep found gori doing none of those correctly: the `claude/channel` push
+(#1090) is a free-running courier frame, so the capability is now declared to the handshake
+era only — the socket, Codex-queue, tool-result and poll routes carry the same message off-stream, for
+every client, which is why nothing the operator can see is lost. `subscriptions/listen` is
+answered rather than refused, with the empty filter the spec asks for when a server supports
+no notification type, then closed the way a server closes a stream it is ending itself;
+holding it open was never an option, because one worker fiber runs one request at a time and
+a stream that never delivers would starve every tool call behind it. And a batch member that
+has declared a modern revision is refused, because the array frame does not exist there —
+receiving batches stays, since `2025-03-26` made that mandatory and we still advertise it.
+
+**The catalogue may not move, so the one tool that moved it stopped.** `tools/list` "MUST
+NOT vary per-connection or as a side effect of other requests on the connection", and
+`create_project` was listed on a live `unbound?` — a read-only client that bound a project
+lost a tool mid-session. It is now advertised always and refuses at call time, which is
+where its gate always was; the listing was only ever telling the client what exists. That
+is also what lets the cache hint be a flat number instead of a state-dependent one, and
+`spec/mcp/protocol_spec.cr` asserts the invariant rather than a comment claiming it — the
+failure is invisible from inside one connection, because the client is holding a list it was
+told to trust.
+
+**An unknown tool is a protocol error, and a tool that ran and failed is not.** The spec
+names the split and puts "Unknown tool" on the protocol side with the code. gori answered
+both with `isError`, which files a name that never reached a tool in the bucket a client is
+told to hand back to the model for a retry. The `--tools` refusal moves with it, and its
+sentence — written to tell an agent where the rest of the catalogue went — survives as the
+error's `message`. What stays a tool result is every code from a tool that actually ran.
+
+**`readOnlyHint` is derived from the gate, with the exceptions spelled.** The hint a client
+uses to decide what it may run unattended defaults to `!gated`, because `--read-only` serves
+exactly the tools that neither mutate nor dial — one declaration, so the hint and the gate
+cannot drift apart. The flag exists for the two populations where they disagree, and is
+refused by the macro anywhere it would be redundant: gated READS (`fuzz_status`, `list_jobs`,
+`preview_rule` — gated because the workbench they report on is), and ungated WRITERS that
+gate themselves (`switch_project`, `create_project`, `probe_scan` whose `active: true` sends,
+`oast_poll` which dials and files what it catches, and the two message tools). `read_only`
+with `agent_action` is a compile error: an agent action is by definition a mutation or an
+outbound send. `openWorldHint` is emitted only where it can be answered — `false` beside a
+read tool, and left to the spec's conservative default everywhere else, because an action
+tool may or may not reach the network and the population that does includes the fuzzer.
+
+### 2026-09-20: absent is not one thing — a filtered tool and a gated tool differ
+
+Refines: [P1](#p1), [P4](#p4). `--tools` + `instructions`.
+
+`instructions` is the first thing an MCP client hands the model, and it is read as fact. Under
+`--tools='list_*'` it named ten tools `tools/list` did not carry, beginning with the sentence
+that opens it: "Call ql_reference before writing queries", on a server with no ql_reference.
+The mechanism to prevent that already existed and was already used — the operator-messages
+note asks `advertises?` before it is appended — it had simply never reached the rest of the
+text.
+
+**Every sentence that names a tool is now assembled from the tools that exist**, clause by
+clause, and a sentence whose subject is entirely absent is dropped rather than shipped naming
+nothing. The backstop for a name added later without that treatment is one sentence that
+appears only under a filter: the surface was narrowed on purpose, and `tools/list` is the
+authority.
+
+**But `--read-only` is not `--tools`, and the difference is the whole point of that
+paragraph.** A gated tool is absent and restorable — saying so is why the read-only sentence
+exists, and it legitimately names tools the current listing does not carry. A filtered tool is
+absent and not coming back. `Tools#advertises?` reads everything *but* the gate — the `--tools`
+filter and the operator's Preferences permission switches (see the 2026-09-27 entry) — which
+makes it exactly the predicate for "would this be here if the gate were lifted" — so the
+read-only paragraph runs its names through the same call and promises only what a restart
+would actually restore.
+
+**And the catalogue's cost is now said out loud on every start.** 179 tools is ~197 KB, about
+50,000 tokens an MCP client loads before the first question and keeps for the session;
+`--tools` is the lever, and it was announced only to the operators who had already found it.
+
+### 2026-09-20: a cancelled request stops the work, and the tools layer is only ever asked
+
+Refines: [P4](#p4), [P1](#p1). MCP `notifications/cancelled` (#1103).
+
+The spec's MUST for a cancellation ("MUST NOT send any further messages for it") was met and
+its two SHOULDs ("stop processing the cancelled request", "free associated resources") were
+not. For every short tool that was invisible. For `probe_scan{active:true}` it was the
+opposite of P4: a client that had withdrawn its request still had real attack probes sent on
+its behalf, up to `PROBE_ACTIVE_MAX_FLOWS` flows of them, and the resource gori was failing to
+free was a third party's server. "Cancel and retry" did not work either — the retry queued
+behind the run the client had abandoned.
+
+**The seam is a predicate, and it lives on `Tools#call`.** `Server#handle_tools_call` knows
+the JSON-RPC id and the tools layer must not learn it, so the transport hands down a
+`Proc(Bool)` closed over the key — one optional argument on the one method every tool call
+already passes through, rather than a token threaded through 179 handlers that 176 of them
+would ignore. It is held for the life of that call and cleared in an `ensure`: the worker
+serves one request at a time, so a predicate that outlived its call would answer the next
+tool's poll with a previous caller's cancellation. The engines below it take `stop : Proc(Bool)`
+or a core-owned token (`Repeater::Minimize::Stop`, which grew a second way to be armed for
+callers that can only be asked) and know nothing about MCP — `Probe`, `Repeater` and `Retest`
+stay on the core side of §2.1.
+
+**The non-consuming read is a separate method from the consuming one.** `Server#cancelled?`
+DELETES the key, because at the write sites it is a one-shot suppression. A running tool
+polling that one would clear the flag on its first read and the answer would be written after
+all — so `cancel_probe` asks without consuming, and the end-to-end spec asserts the empty
+output that pins the difference.
+
+**Which tools stop is a listed decision, not an emergent one.** `probe_scan`,
+`minimize_repeater` and `run_retest` poll it; the list on `Tools#call` names them and says why
+each of the others does not. Two of those reasons are worth keeping: `cookie_crack` is pure
+CPU over a wordlist with no outbound and no yield point, so the reader fiber never runs during
+it and the notification is not even parsed until it finishes — a check there would be code
+that cannot fire, and what it would be protecting is the operator's own CPU. And the `*_start`
+tools are deliberately exempt: they return a `job_id` immediately, so cancelling the call that
+started one would suppress the id while the job ran on, which is the opposite of what the
+client asked for. `stop_job` is that surface.
+
+**What a stopped run leaves behind is what really happened.** A cancelled request gets no
+response at all, so nothing here shapes a partial report — the job is only to stop. A retest's
+sends keep their History rows and its run row keeps its `Skipped` remainder (P7: record the
+wire; with no answer owed to the caller that row is the operator's only trace). A scan writes
+nothing mid-run, and the one thing it does write — the out-of-band promotion — is skipped,
+because it exists to put those findings in a report the stopped run does not have. The one
+place a stop had to be given a new refusal is `minimize_repeater`'s `apply`: a stop during
+calibration aborts, but a stop mid-search returns `aborted: false` with the removals proven so
+far, and applying those would rewrite the stored request under a caller who will never learn
+the session changed.
+
+### 2026-09-20: a delivery route is ranked by what it can confirm, and a shut door is not the end of the chain
+
+Four routes carry an operator message to an attached agent (#1090), and "best available first"
+turned out to name two different orderings. The one that shipped put the `claude/channel` push
+at the head because it is the newest and the most native; the ordering that survives review
+puts it LAST, because it is the only one that cannot say whether it landed.
+
+**The route that reports back outranks the one that does not.** The inbox socket and `codex
+queue` both answer — a write that lands or a CLI that says why not — so either of them retires
+the message from the poll backstop (`AgentDelivery::CARRIED`). A channel push to a session that
+never registered the channel is dropped without a word. Putting it first meant `mcp.channels`,
+an opt-in preview, silently took the socket away from every Claude Code session not launched
+with the development-channels flag: the one route that wakes an idle session, traded for a
+frame nobody could tell had been discarded. The setting's own description said the push rides
+"on top of" the socket; the code said "instead of". Confirmability is what breaks the tie, and
+it is the same axis `CARRIED` already uses — the ordering and the retirement rule now read off
+one fact instead of two.
+
+**A route that fails falls through; only a route that ANSWERS ends the chain.** The socket
+route used to commit on the existence of the path. A path is not a listener:
+`/tmp/cc-socks/<pid>.sock` outlives the process that bound it and pids are reused, so a `gori
+mcp` under another client can find a dead Claude socket at its parent's pid — and committing to
+it cost the `codex queue` hand-off that would have worked. What the failed attempt said is
+carried into whatever row does land, because the operator gets one delivery row per message and
+a refusal the chain walked away from is otherwise invisible.
+
+**A cursor that only advances when something goes out does not advance.** The tool-result carry
+(layer four) computed its next cursor and then discarded it on the `nil` return — the path it
+takes on nearly every call. Its idle gate (`high <= @messages_cursor`) therefore never closed
+against a feed that grows for any other reason, and the event feed is the firehose every gori
+action writes to: each tool call on the surface paid an unindexed `kind = 'agent_message'` walk
+of the whole feed rather than the one `MAX(id)` scalar it advertised (0.96ms against 0.005ms
+over 50k rows, growing with the project), and five of another session's messages wedged the
+layer for good. Advancing a cursor past rows that will never be sent is not marking them
+delivered — nothing is emitted on that path, so there is nothing a failed emit could take back.
+The courier and `operator_messages` had the rule right; the third reader of the same feed did
+not, which is the argument for `each_event_of_kind` owning it.
+
+### 2026-09-21: an empty gori upstream adopts the process proxy convention
+
+Refines: [P4](#p4), [P5](#p5). Issue #1114.
+
+`network.upstream_proxy` being blank used to mean that every gori-owned dial was direct, even
+when the process had been launched with `HTTP_PROXY`, `HTTPS_PROXY`, or `ALL_PROXY`. That is a
+surprising split from the command-line tools gori is commonly run beside, and it made a
+container or a corporate workstation silently bypass its required egress proxy.
+
+**The environment is a last-resort route, not a second settings table.** The existing
+operator-owned decision remains the authority: project destination gates, project pins, the
+ordered `upstream_rules` table (including `direct`), and a non-empty global scalar all win
+before the environment is consulted. Only an empty global scalar reaches the environment
+fallback, and `NO_PROXY` / `no_proxy` is applied there. This keeps a deliberate gori exception
+from being overridden by ambient process state while still making an unconfigured install
+behave like its surrounding tools.
+
+**The original scheme is part of the route query.** HTTP origins choose `HTTP_PROXY` and then
+`ALL_PROXY`; HTTPS origins choose `HTTPS_PROXY`, `HTTP_PROXY`, and then `ALL_PROXY`, with
+uppercase names preferred over their lowercase compatibility spellings. The dialer carries
+the origin scheme to the one `Settings.upstream_route` seam so the capture path, engines,
+updater, and OAST traffic do not each invent a precedence rule. A malformed selected value is
+an invalid route and fails closed; it never silently falls through to a direct origin.
+
+**Environment URL schemes follow the established convention only at that boundary.** An
+environment `http://` value is a plaintext HTTP CONNECT hop and `https://` means TLS to that
+proxy; credentials in process URI userinfo are accepted because they are not persisted. The
+persisted `network.upstream_proxy` `https://` spelling remains the historical plaintext form,
+so adopting the convention cannot reinterpret an existing settings file.
+
+**Loopback is direct before `NO_PROXY` is read.** `localhost` and any loopback or unspecified
+address literal (`127.0.0.0/8`, `::1`, `0.0.0.0`, `::`) never take the environment route, whether
+or not `NO_PROXY` names them — the same answer Go's `httpproxy` and curl give. A profile that
+exports `HTTP_PROXY` for the corporate egress does not mean "send my own machine's traffic
+there", and doing so both failed every local test and disclosed the local request-target to a
+third party. It keys on the DESTINATION only — a proxy that itself sits on `127.0.0.1` is still
+used for a remote target — and it holds on every dial, the TLS passthrough relay and the blind
+CONNECT tunnel included: those now ask for the TLS origin's variable, and a loopback target
+still answers "direct" before that variable is read. The carve-out belongs to the environment
+arm only: a rule, scalar, or project pin that routes loopback through a proxy is an operator
+decision and still wins.
+
+### 2026-09-22: the MCP surface answers about itself before it answers about the project
+
+Refines: [P1](#p1), [P4](#p4). Issues #1136, #1138, #1140, #1142.
+
+Four defects found by driving the stdio server directly, and one shape under all of them: a
+question about the *call* was answered as though it were a question about the *data*.
+
+**The envelope is checked before the message is read as one.** `handle_message` looked at
+`method` and nothing else, so `{"jsonrpc":"1.0"}`, a message carrying no version member at
+all, and ids of every JSON shape were executed — and answered in a `"jsonrpc":"2.0"` frame,
+which rewrites the client's message into one it never sent and teaches a client that ships a
+serialisation bug that it speaks 2.0. `envelope_error` is the one predicate, read by the
+reader's `ping` fast path and by the worker, so the two fibers cannot disagree about what a
+request is. An id the spec does not allow is answered at `null` (the spec's own rule for a
+request whose id cannot be determined); a legal id is echoed, because a client is holding a
+promise for it.
+
+**A schema that omits `additionalProperties` is a promise the validator breaks.** gori refuses
+any undeclared argument — a mistyped `verbatm:true` left `verbatim` off and the caller measured
+a request it never sent — while all 179 root schemas said, in JSON Schema, that extras were
+fine. The client was handed one contract and scored against another, so a typo it could have
+caught locally travelled to the server instead. `additionalProperties: false` now closes them.
+
+**The `_`-prefixed exemption is honoured and not advertised, and that asymmetry is the
+point.** Spelling it in the schema needs `patternProperties`, which is outside the JSON Schema
+subset several clients accept when they convert an MCP `inputSchema` into their provider's
+tool schema — one unparseable keyword on all 179 tools costs such a client the whole
+catalogue, to promise an extension MCP puts in `params._meta` rather than in
+`params.arguments`. So the validator stays the more PERMISSIVE of the two. Only one direction
+of disagreement can hurt a caller: a schema that promises more than the validator accepts
+sends a legal-looking call to its refusal, while a validator that accepts more than the
+schema promised can never surprise a caller who followed the schema.
+
+**What the name IS comes before whether a project is bound.** `Tools#call` ran the unbound
+gate first, so on an unbound server a typo and a tool `--tools` had hidden both came back
+"no project bound" — masking a protocol error, and sending the agent to bind a project so it
+could retry a call that was never going to exist. `UNKNOWN_TOOL` is a protocol error (the
+transport turns it into -32602, per the 2026-09-20 entry above); `NO_PROJECT` is a tool result
+the model is meant to act on. Classify the name, then gate the project.
+
+**And the recovery out of the unbound state follows the filter, like every other sentence.**
+The 2026-09-20 entry made `instructions` name only the tools `tools/list` carries; the
+`NO_PROJECT` error, `project_info`'s note, the two tool descriptions that point at a binder,
+and the startup log were all still naming three fixed tools. `Tools#project_recovery` is the
+one home, and `instructions` appends the same words rather than dropping the sentence, so the
+first text the model reads and the error it hits ten calls later do not disagree.
+
+**A lister is not a binder.** The recovery set is `list_projects, create_project,
+switch_project`, but only the last two BIND: `list_projects` reads a page and changes nothing.
+A server that serves it alone can therefore hand the agent every project's name and then
+refuse every one of them — the same retry loop, entered from the other side — so
+`unbindable?` asks for a PICKER (`Tools::PROJECT_PICKERS`), not for any of the three.
+`Server#unbound_note` had always drawn that line in prose ("list_projects to see available
+projects" against the two that "pick"); it is now the predicate as well. When no picker is
+served the honest answer is that the recovery is not in the agent's hands at all — the
+operator has to restart — and that is said once at start-up on stderr, from both unbound
+entry points (`--no-project` and the degrade-to-unbound path a bad database takes), because
+stderr is the only surface the operator who made the mistake is looking at.
+
+### 2026-09-23: the catalogue's weight is measured, not written down, and a profile is a list of names
+
+Refines: [P4](#p4). `--tools` profiles, #1137.
+
+Every number gori had written about its own MCP catalogue was wrong by the time #1137 measured
+it: the guide said about 160 tools, and 53 under `--read-only`, of a 179/62 registry; the
+`--tools` help and two comments said ~43k tokens of a `tools/list` past 200 KB. A size compiled
+into help text or prose drifts the moment a tool lands. So the weight is measured where it is
+spent: `gori mcp` builds the listing it is about to serve (`Tools.catalogue_json`, on a storeless
+instance — exact, because the listing may not vary with the connection) and logs its size on
+every start. The guide keeps one table of counts and sizes, and
+`spec/mcp/catalogue_size_spec.cr` fails when a row drifts from the build.
+
+**The full catalogue stays the default.** Narrowing it is a trade the operator makes, and a
+default that hid the workbench would read to an agent exactly like a gori without it — the
+failure `--tools` already refuses to produce by accident.
+
+**A profile is a list of names, never a glob.** `--tools=@recon` and `@minimal` resolve inside
+the same spec grammar, so they compose (`@minimal,send_request`, `-@recon`). A glob would let a
+profile grow with the registry — `list_*` gains every new lister — which is the silent growth
+#1137 was filed about, moved inside the lever meant to contain it. A tool joins a profile by
+being written into `ToolFilter::PROFILES`. Every profile keeps both project pickers, since
+`switch_project` has nothing to switch to on a host with no project yet (#1136), and a
+member's description may not send the agent to a tool the profile leaves out: the model reads
+it as fact, and each such pointer is a call spent on `UNKNOWN_TOOL`. The spec holds the
+exceptions — mentions that are not instructions — in a list with a reason each.
+
+### 2026-09-23: a command that names one setting pins it; a card saved whole folds
+
+`gori run project network set KEY VALUE` (#1115) writes the same `net.*` rows as the TUI's
+Project settings card, and deliberately does NOT share the card's rule that a value equal to
+the global is stored as "inherit". The card needs that rule: it is saved whole from what it
+displayed, so it cannot tell a value the operator typed from an inherited one left alone, and
+without the fold every save would freeze a copy of the global into the project. A command
+that names one key has no such ambiguity — `set` says pin, `unset` says inherit — and folding
+there is wrong in one case that matters: an empty `upstream_proxy` is a DIRECT pin, while
+"inherit" still lets `upstream_rules` and `HTTPS_PROXY` route the project through a proxy. So
+the command pins and says so when the pin equals the global; the card keeps folding.
+
+Both surfaces keep the one invariant that is about safety rather than ergonomics: credentials
+pin the upstream they were validated against, in the same write (`set_settings`), so a busy
+store cannot leave a password beside an address it was never entered for.
+
+**A per-send override edits the send, not the session.** `repeater send --path` (#1116) sends
+the session's request to another target and leaves the stored request AND its last response
+alone: storing another endpoint's answer beside the row would show the tab a response to a
+request it does not hold, and make the next `--diff` compare against the wrong endpoint. The
+same line holds for `--headers-only` / `--max-body` (#1119): they shape what is printed, never
+what is sent, stored or recorded.
+
+### 2026-09-23: a generated User-Agent follows the handshake it rides on, and a header set is not a token
+
+`$GEN.USER_AGENT` (#1112) drew from every browser alike, so with the `chrome` TLS preset most
+sends claimed Firefox or Safari over a Chrome-shaped ClientHello, the mismatch bot management
+keys on first. #1153 narrows the plain name to the family of the preset the dial will really
+use: the send's own override (#844) when it has one, else the destination's `outbound_tls`
+rule, judged on the dialed host exactly as `Upstream.dial_tls_result` judges it. It applies to
+`https`/`wss` only, and `curl` or no preset leaves the whole list. The explicit
+`USER_AGENT_CHROME`/`_FIREFOX`/`_SAFARI` names stay the operator's choice. The narrowing
+never leaves the list in force: with an operator list (#1154) that has none of the preset's
+browser, the plain name keeps drawing from the whole operator list. An engagement may require
+an identifying UA, and the plain name promised the operator's list, not a browser.
+
+The mint happens before the dial, so the send path has to carry the dial to it:
+`Env::Generation.for_dial(host, scheme, tls_preset)`, used by Repeater, Fuzz (and so Authorize,
+Miner, Sequencer and Probe through `Fuzz::Sender`), Discover and Intercept. The failure the
+issue named is a *forgotten* site, which is silent: one leftover `Generation.new` on a send
+path mints a Firefox UA over a Chrome hello and no test notices. So
+`spec/send_seam_generation_spec.cr` sweeps `src/gori` and holds every dial-less construction to
+a named reason and count, and every send-side expansion to a passed context, the same shape
+as the stdin-door sweep. The family is resolved lazily, so a fuzz run that never names the
+token never pays the preset lookup.
+
+`Sec-CH-UA` stays out of `$GEN`. Chromium sends it; Firefox and Safari do not send the header
+at all. A token can change a value but cannot delete the line it sits on, so `sec-ch-ua:
+$GEN.…` is wrong for two of the three families whatever it mints. And its brand list carries
+Chromium's per-major GREASE entry, which gori would have to reproduce exactly rather than
+approximate. If gori grows client hints, they belong to the TLS preset, as a header set the
+preset owns and emits only when it is a Chromium one.
+
+### 2026-09-23: the `chrome` preset owns its client hints, read off the User-Agent the request carries
+
+#1174 answers the header-set question the #1153 entry left open. Under the `chrome` preset
+(the send's override, else the destination rule, resolved as `$GEN.USER_AGENT` resolves it),
+every gori-originated `https` request gets the three low-entropy hints Chrome sends by default:
+`sec-ch-ua`, `sec-ch-ua-mobile`, `sec-ch-ua-platform`. The issue's three questions:
+
+**Where it is applied.** At the send seam, on the final bytes: `Env.client_hints` runs after
+`$NAME` expansion and after the slot overlay, as the last header-only pass. It does not mint
+beside `$GEN.USER_AGENT`. It reads whatever User-Agent the request carries at that point, a
+`$GEN` mint, the slot's header or a literal, and derives the brand list's seed and version
+from that UA's own major. The two cannot disagree, because one is computed from the other.
+Every seam that calls `overlay_slot` also calls `client_hints`, and
+`spec/send_seam_generation_spec.cr` holds the two counts equal per file. The one named
+exception is the intercept forward: those are a client's own bytes on the proxy path, and a
+browser that sent no hints must not gain them in transit. Field-native h2 sends take neither
+pass, for the reason `Sender#send_fields` gives. The preset lookup runs only once the head
+contains `Chrome/` at all, so a run that never sends a Chrome UA still never pays for it,
+which keeps the promise the #1153 entry made about lazy resolution.
+
+**Operator bytes win (P7).** A request that already has any `sec-ch-ua*` header (including a
+high-entropy one) belongs to the operator, and gori adds nothing beside it. Completing a
+partial set would mix two sources in one header family. A typed User-Agent is never touched;
+the hints follow it. There is no mismatch warning. gori-written hints cannot mismatch, so the
+only possible mismatch is between hints and a UA the operator typed, and that may be the test
+itself (probing a UA/client-hint consistency check). Under the `chrome` preset, a User-Agent
+of another browser gets no hints. The handshake/UA disagreement it shows is #1153's open
+warning question, and a per-send warning across a fuzz run would be noise, not signal.
+
+**Where the algorithm comes from.** It is ported from Chromium at
+`ab1ade5d1fa5f1c0b2bf80ab48d9b9cb25aa3c95` (`components/embedder_support/user_agent_utils.cc`:
+GREASE brand, stable shuffle, platform; `base/version_info/version_info.h`: OS names; blink's
+`user_agent_metadata.cc`: RFC 8941 serialization). The spec replays the vectors from that
+revision's `user_agent_utils_unittest.cc`, not from captures: a capture shows the output for
+one seed, and the unit tests pin the function itself. Faithfulness decides what gets no
+hints: only a UA in the exact shape Chrome's `BuildUserAgentFromOSAndProduct` writes counts.
+Edge, Opera and other Chromium browsers append a product token and send a brand their own
+code chooses, which Chromium's source does not state, so they get none. That includes the
+built-in corpus's Edge line. A WebSocket handshake gets none either, because Chromium's
+source does not establish that hints are sent there. Header names are lowercase and go
+immediately before `User-Agent`, the order Chrome uses on a navigation.
+
+### 2026-09-23: a report that leaves the machine redacts credential headers; an interchange document does not
+
+`gori run issues --format sarif` (and the TUI's SARIF export) writes `Authorization`,
+`Cookie`, `Set-Cookie` and the API-key headers as `[REDACTED]` unless `--include-sensitive`
+is passed (#1191). The line is the one #1002 drew for `history --format json`: a structured
+document meant for another system (a code-scanning upload, a CI artifact, a dashboard) takes
+the redacted default, and HAR stays verbatim because an interchange document has to carry the
+message in full to be replayed. SARIF cannot replay anything, since its `headers` object
+already combines repeated fields, so it belongs on the redacted side. The predicate moved to
+`Redact.sensitive_header?` (redact/headers.cr) so the exporter asks the same list as MCP and
+the CLI without depending on a surface. The TUI export has no opt-in, the same choice its
+evidence export makes. The Markdown issue report still embeds each linked flow's head
+verbatim. It is a human-readable report rather than a machine feed, and changing it is a
+separate decision.
+
+### 2026-09-24: a search across projects reads each database raw and read-only, never through `Store.open`
+
+Refines: [P5](#p5), [P6](#p6). #1229.
+
+The picker's `^F` searches the captured flows of every registered project (`Gori::ProjectSearch`),
+so an explicit search now opens project databases, which the picker's render path still never
+does (see 2026-08-27). `Store.open` is the facade P5 names, and it is the wrong door here even
+with `read_only: true`: it still migrates a stale schema and refuses a newer one, and a host with
+hundreds of projects spans a dozen schema versions, so one keystroke would have migrated most of
+them. The search goes around it in the one direction that cannot change state. Each database is
+opened through the C API with `SQLITE_OPEN_READONLY`, because the shard hardcodes
+`READWRITE | CREATE` and ignores `mode=ro`, and only the `flows` columns and `flows_fts` that V1
+created are queried, plus V4's `fts_dirty` where it exists, so the bodies the index has not reached
+yet are scanned under the indexer's own rule (`Store.body_fts_text`). A read-write connection is not a reader, since closing the last one
+checkpoints the WAL into the db file. A READONLY one never does, which was measured against a live
+writer and a crashed session's WAL on macOS and Linux. The exception is a WAL database with no
+`-wal` beside it, a cleanly closed project on Linux, where READONLY creates a fresh `-wal` stamped
+now and `Project#last_modified` would reorder every project list around the search. That shape is
+read with `immutable=1`, chosen from the file header rather than from a failed open, and re-read
+once if the file changed during the read. The work is cooperative (P6): one database at a time, a
+`QueryControl` progress handler so a keystroke cancels mid-query, and a 100 ms busy budget rather
+than the store's five seconds, because SQLite's busy wait blocks the single-threaded scheduler.
+
+### 2026-09-24: a gori shell is one terminal's environment, and gori does not adopt its own injection
+
+Refines: [P4](#p4), the 2026-09-21 entry. #1238.
+
+`gori run shell` and the palette's **Open shell** point one terminal's tools at gori (`Gori::ShellEnv`),
+the way **Open browser** points one browser. Nothing global changes. The proxy variables and the
+trust variables live in that shell, and the only file written is a CA bundle under `~/.gori/shell/`.
+
+**The bundle keeps what the terminal already trusted.** Most trust variables (`SSL_CERT_FILE`,
+`CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, …) replace a tool's store rather than add to it, so pointing
+them at gori's root alone breaks every host gori does not intercept. The bundle is the operator's
+own `SSL_CERT_FILE` (else the system roots) plus gori's root, named by the hash of its content.
+A regenerated CA, an updated system store or a different enterprise bundle therefore gets a new
+file rather than a stale one, and a bundle that already holds the root is reused as it is. A CA
+variable the terminal set for one tool keeps its own base in the same way.
+
+**The address comes from the capture, not from settings.** The CLI reads `CaptureStatus` only
+while the capture lock is held, because the live port can differ from the configured one after a
+fallback. The marker now also records the CA the session signs with, since `--ca-dir` is chosen
+per process and another process cannot derive it.
+
+**The environment arm skips a value a gori shell exported.** A gori started inside the shell would
+otherwise adopt the parent as its upstream through the 2026-09-21 fallback, and every request it
+made would be captured twice. Only the exact value the shell wrote (`GORI_SHELL=1` plus
+`GORI_PROXY`) is skipped. An explicit rule, scalar or project pin still chains on purpose. The
+shell records what it replaced or unset as `GORI_SHELL_ORIG_<NAME>`, and the environment arm falls
+back to that record, so a nested gori still reaches the terminal's own egress proxy and its
+`NO_PROXY`. A shell opened inside a shell starts its trust from the same record rather than from
+the outer bundle, which would otherwise keep the outer gori's root trusted.
+
+**The TUI hands its terminal to `gori run shell`, not to `$SHELL`.** Crystal's runtime ignores
+SIGPIPE, and an ignored signal survives `exec`. A shell spawned directly passed that on to every
+pipeline, so `yes | head` printed "Broken pipe". The CLI resets it right before its own `exec`.
+The handoff also uses termisu's `full_cooked` rather than `suspend`'s cooked mode, which leaves
+OPOST and ICRNL off. An editor sets its own termios and never noticed, but a shell passes that
+state to every command it runs. Open shell here is refused while intercept is on, because held
+requests are released from a screen the shell is covering.
+
+### 2026-09-24: a pasted curl command is operator bytes read with curl's meaning, minus curl's own identity
+
+Refines: [P7](#p7). #1244.
+
+A curl command an operator pastes (Repeater → Paste cURL, Import: cURL, `--curl`, MCP `curl`) is
+theirs, so it is read with curl's meaning of every flag, measured against curl 8.7.1 on a raw
+listener, and not with `gori run send`'s. The two disagree on `-b`, which is a cookie in curl and
+a body in `send`, and Chrome's "Copy as cURL" emits cookies with `-b`. Where curl sends the bytes
+as typed, so does the import: a `-H` line keeps its spacing and its argv position, a CR/LF inside
+`-H` or `-X` goes out as written (curl does the same), and a stated `Content-Length` stays beside a
+longer body. Where curl REFUSES, so does the import, for example on whitespace or a control byte in
+the URL. `--request-target` is curl's own verbatim door and is honoured. Two things are left out on
+purpose. curl's `User-Agent: curl/…` and `Accept: */*` describe the client that ran the command,
+not the request the command describes, and keeping them would break the export round trip,
+because a capture with no User-Agent exports with no `-H` for one. Transport flags (`-k`, `-x`,
+`-L`, `--resolve`) are ignored and named, since gori dials through its own settings. The
+round trip `Export::Curl` → `Import::Curl` returning the same bytes is the contract
+(`spec/curl_round_trip_spec.cr`). Holding the export to it found two cases where running the
+exported command sent something other than the capture: curl collapses `..` path segments and
+adds a form Content-Type to a body that had none. The export now writes `--path-as-is` and
+`-H 'Content-Type:'` for those cases.
+
+### 2026-09-24: unknown rewrite labels stay inert until this binary understands them
+
+#1242. A settings file or project database may have been written by a newer gori. Project
+databases have no constraint on the rewriter enum columns, and settings parsing historically
+clamped an unrecognised label to that field's live default. Thus a future `short_circuit` op
+could become `replace` in an older binary and rewrite traffic. Keep each raw label beside its
+total enum projection in `MatchRule`; `inert?` is the shared gate for replacement and
+short-circuit selection. Settings saves retain the raw strings, non-string values and unrecognised extra keys, keeping those rows inert so newer fields do not widen matching, and reordering any inert neighbour is refused in both scopes. TUI, CLI and MCP list the raw
+labels and explain the unsupported fields; they refuse to edit, duplicate, reorder or enable such a rule while
+allowing deletion. Unknown ops count as might-execute so profile import requires `--allow-commands`. The scope is the rewriter grammar fields (`target`, `part`, `op`, and
+`match_kind`), plus unrecognised keys on settings rules, so the guard also covers a label added to an existing enum.
+
+### 2026-09-24: a fuzz run can end itself, and the archive need not keep every row
+
+#1240. Refines [P4](#p4) (the operator decides what leaves the machine) and [P6](#p6). Two
+additions, both surface-neutral through `Plan.build`.
+
+`stop_on` lets a run end when its work is done rather than when the payloads run out: a match
+count (`Config#stop_after_matches`) or a SEPARATE match/filter condition
+(`Matcher#stop_condition`). The condition is a `Matcher` used as a spec container, never
+`build`-called — `Matcher#build` evaluates it through `matches_precomputed?` on the same
+decoded body/text/metrics it computed for the run's own verdict, so a stop condition costs no
+second decode. The trigger is `Engine#record_result`, the one bookkeeping path `worker_loop`
+and `run_race` share, and it is exactly `stop`: in-flight requests finish. An operator stop
+that lands first wins: an in-flight row meeting the condition afterwards is still flagged
+`stop_hit`, but the verdict stays `stopped`. "Stop when the body
+no longer says `Invalid password`" is a condition with only a filter regex — the matcher's
+existing way of expressing absence. Calibration sends are not results, so they never trip it.
+A new terminal verdict `Terminal::ConditionMet` names the ending; it is an enum so a consumer
+`case`s it exhaustively rather than mapping an unknown string to `:error`. The CLI exits 0 on
+it (the condition was the goal), and race mode refuses the pair (`StopOnError`): a race group
+is released in one write, with no per-response verdict to fire on.
+
+`keep: interesting` (`Fuzz::Keep`) filters the ARCHIVE only — the CLI/MCP saved run and the
+TUI spool behind Shift-S — never the live pane or MCP's live cache. It keeps the rows
+`Result#interesting?` names (matched, plus error/chain-error/re-send/incomplete/stop rows),
+the one predicate every retention decision reads so the surfaces cannot drift on "interesting".
+The run's counters stay whole-run and `idx` stays the engine's payload index, so a kept row
+holds its real position and the gaps are the dropped rows; `fuzz_runs.keep` records the policy
+so a filtered archive reads "12 of 100,000 kept" instead of a lost run. Pause-on-condition is
+deliberately left out: it needs a plain pause verb first, and the engine's pause still drains
+the worker buffer (`Engine#pause` parks only the dispatcher).
+### 2026-09-24: JSON Unicode decoding is a view, and `u` belongs to the read-only response
+
+Refines: [P4](#p4), [P7](#p7). #1248.
+
+Pretty-printing a request is a write-back action, so it only adds JSON whitespace. It must keep
+string escape spellings, duplicate members, number tokens, lone surrogates and even invalid
+UTF-8 bytes inside strings as the operator entered them. The response and History detail have
+a separate `u` view toggle: it decodes valid `\\uXXXX` escapes for display, marks the decoded
+ranges, and leaves the captured bytes and copy/search data untouched. Hidden Unicode and
+control characters render as named badges, with emoji joiners/selectors retained in context.
+
+In the Repeater, the response is read-only and outside `Scope::Editor`, so its default `u`
+action occupies that tab-scope chord; the request editor remains in `Scope::Editor`, where
+vim's `u` still means undo. An explicit user rebind wins over that default in keymap collision
+resolution. The English and Korean hotkey guides and `spec/verb/keyset_spec.cr` record this
+cross-scope exception.
+
+### 2026-09-25: response mocking is a short-circuit sub-kind, and map-local is its one fall-through
+
+#1237 grows the #511 stub into a directory (Map Local), a snapshot of a captured response, and
+close/reset/hang faults with a delay. They are a `respond` sub-kind of `op = short_circuit`
+(`match_rules.respond`/`respond_args`, V33), not new `RuleOp` members. An older binary reads an
+unknown op as inert only since #1242. It reads a `dir` row as a stub whose body file is a
+directory, and a `fault` row as a stub with an empty head, and every release since #511 answers
+both with the 502 stub. A `respond` label or `respond_args` key this binary does not know keeps
+the row inert, on the #1242 terms.
+
+The request path of a `dir` rule is the client's bytes naming a local file, which is a new sink.
+It is confined rather than repaired or passed through ([P7](#p7) governs the wire, not the
+filesystem). The path is percent-decoded once. Dot segments, dotfiles, NUL and backslash are
+refused before any filesystem call. The file's realpath must sit under the root's. A refusal is
+a recorded 404 and never reaches the origin.
+
+"A claimed request never reaches the origin" gains exactly one exception: a `dir` rule with
+`fallthrough`, for a file that is simply absent. It declines at claim time, before anything is
+answered or dialed, and the next rule (or the origin) takes the request. A refused path, a
+missing root and every other sub-kind still fail closed.
+
+A delay and a hang pin a fiber, an fd and an accept slot, so they are bounded twice ([P6](#p6)):
+120 s per wait, and 256 held connections process-wide. Past the cap a hang closes at once, a
+delay is skipped, and the flow says which. The rule that answered is recorded as text in
+`flows.source_ref`, so a mocked response stays attributable after the rule is edited or
+deleted. A mock from History is a decoded snapshot, never a reference, because flow ids are
+reused.
+
+### 2026-09-25: a saved fuzz run points at its stop row; the engine names it, not the rows
+
+#1270. Completes the #1240 entry above. A `condition_met` run now records which result tripped
+it as `fuzz_runs.stop_idx` (V34), carried from `Engine#check_stop_condition` on
+`DoneEvent#stop_index` and written by the checked terminal update — only on a `condition_met`
+finish, and only when the run's own archive holds that `idx`, so a `save_failed`/`stopped` run
+never points at evidence that is not there.
+
+One run-level pointer, not a per-row `stop_hit` column, because the rows cannot say which of
+them it was. An `after_matches` stop trips on a plain match whose `stop_hit?` is false; with
+concurrency, in-flight rows that finish after the stop can meet the condition too, so the
+lowest flagged `idx` is not the row that fired; and an operator stop that lands first leaves a
+flagged row on a run with no stop at all. Only the engine sees the ordering, so it names the
+row — and `record_result` judges it BEFORE the blocking `ResultEvent` send, with no yield since
+`@matched` moved, or a worker parked on a full event buffer resumes to read another worker's
+match as its own Nth. Every surface reads the run's field: the TUI marks the row whose index matches
+(`FuzzerView#stop_row?`, live and reopened alike), the CLI and MCP print/emit `stop_index`.
+The live per-row `stop_hit` flag stays live-only. A run saved before V34 reads NULL — not
+recorded — and nothing backfills it, for the same three reasons.
+
+### 2026-09-25: JavaScript references are derived rows, never flows, and a scan marker is per flow
+
+Refines: [P3](#p3), [P4](#p4), [P6](#p6), [P7](#p7). #1243.
+
+`JsRefs` reads endpoint literals out of JS responses and inline scripts already in the store and
+persists them in `js_refs` (V35). They are NOT written as flows, not even Pending ones: a flow
+reads as "a request was attempted" in History, QL, HAR and the OpenAPI export, and nothing was
+sent. They attach to the Sitemap at the tree level only (`Sitemap.attach_js_refs!`, after the
+build and before tags and folds) and never through `Store#sitemap_entries`, so every consumer
+of the traffic read — OpenAPI, `Diff`, `representative_flow_id`, tag confirmation — stays
+traffic-only, and a reference node never carries a method, so every "N paths" count is still
+a count of traffic.
+
+Persisting was chosen over the parameter inventory's recompute-per-read because the tree reloads
+on every data_version tick and re-lexing megabyte bundles per reload is the cost the inventory
+avoids only by being asked rarely. The rows are projections of their flow's body and are
+deleted with it in all four delete paths (`delete_flow_one`, `clear_flows`, `Store#prune`,
+`prune_old_flows`). Which flows were scanned is a per-flow marker (`js_ref_scans`), not a
+watermark: `flows.id` was a reused rowid before V39, so after a `history clear` new captures got ids below
+any "scanned up to" mark. The marker carries the extractor's `VERSION`, so changing extraction
+rescans without a migration, and it is written in the same transaction as the flow's rows, so
+a rolled-back batch leaves the flow unscanned rather than marked done with nothing.
+
+A literal is page-authored bytes: it resolves through `Url.resolve`/`Url.parse` and
+`Headers.safe_url?`, like a crawled href (a separator is encoded, CR/LF is refused). A
+root-relative literal in an external script resolves against the page its captured request's
+`Referer` names, and against the script's own origin — flagged `guessed` — only without one.
+Everything that passes those filters is stored, and scope and host visibility are applied at
+READ time, because a reference dropped at scan time could never come back once its flow is
+marked scanned. The host rule: a host the project has traffic for is shown; one it never
+captured is shown only when a scope include names it, which keeps a bundle's `www.w3.org`
+namespaces out of the tree without a hard-coded denylist.
+
+The scan is on demand only for now; a background mode on the Analyzer's passive fiber would tie
+references to the Probe mode, where "off" would silently mean "no references". Relative
+literals without a leading `/`, `.map`/JSON bodies, and copying the page's credentials into a
+Repeater request built from a reference are all left out on purpose.
+
+### 2026-09-25: a session slot refreshes itself before a send, never after a response
+
+#1233. A slot was a static snapshot and said so ("No auto-login … gori acting behind the
+operator's back (P4)"), so a long Fuzz, Authorize, Retest or agent run went on after the token
+expired and collected 401s. A slot now carries `refresh` (Repeater session ids, in order) and
+`refresh_before` (`off` | `jwt-exp` | `ttl=`), and `Gori::SessionRefresh` replays the steps —
+by hand, or before a send the policy says is due. This narrows the old refusal rather than
+reversing it: gori runs only requests the operator put in the slot's list, under a policy the
+operator set on it, and every one is logged (History `src:refresh`, one `session` event, the
+`⟳`/`!` chip). What gori still never does is decide from a RESPONSE that it should log in
+again. Retry-after-401 is out because it produces wrong answers, not just complexity: in
+Authorize the 401 is the verdict, a fuzz row would stand for two requests, race mode cannot
+retry, and a refresh that itself 401s needs loop protection against an account lockout.
+
+- **A step is sent AS the slot, not by activating it.** `activate` is process-global and would
+  hand every in-flight send in another tab the refreshing identity. `PlanOptions#refresh_slot`
+  resolves the step's `$BIND.*` from that slot's table (`Env.expand_bindings(as_slot:)`),
+  observes its response into that table (`Bindings#observe(as_slot:)`), and writes no overlay —
+  the login must not carry the stale credential it replaces (open question 1: no overlay).
+- **The before-send hook is asked for every identity a send goes out as** (open question 2):
+  the active slot at `Repeater::Sender#wire`, every `Fuzz::Sender` send (race: before the group
+  is dialled), Discover, the Miner hook backend — and each Authorize identity by name in
+  `send_one`, since that sender wears no active slot. It lives in a leaf
+  (`session_refresh/hook.cr`) so the send seams do not depend on the Repeater, and it answers
+  only while its binding table is `Env.layer`, so a hook a closed project left behind is inert.
+  An automatic refresh uses the SURFACE's gate (`Outbound.interactive`/`.cli`/`.agent`) and
+  never inherits a send's own waiver; a manual one may pass its own.
+- **Failure never blocks the send and never repeats quickly** (open question 3): single-flight
+  per slot (a closed `Channel` wakes every waiter; no `-Dpreview_mt`, so a latch is enough), a
+  30 s cooldown after a failure, automatic refresh off after 3 in a row until a manual refresh
+  succeeds. A slot whose last refresh failed is due again after its cooldown whatever its
+  policy reads: a TTL counted from a step-1 CSRF that DID rebind would otherwise call the slot
+  fresh while its session token stayed stale — which is also why a TTL counts from the last
+  SUCCESSFUL refresh, or before one from the OLDEST claimed binding, never the newest. A
+  refresh whose steps all answered but rebound none of the slot's claimed bindings, or that
+  leaves a `jwt-exp` slot still inside its skew, counts as a failure: "succeeded but still due"
+  is a login before every send with no cooldown in front of it.
+- **Never on the TUI's event loop.** A before-send refresh asked from the UI fiber
+  (`SessionRefresh.ui_fiber`) runs on a fiber of its own and that one send goes out with the
+  value it has; the Repeater's send takes `wire_bytes` on its send fiber so the common path
+  waits for the fresh value there. An automatic refresh re-reads the slot list first, so a
+  step whose tab was closed is refused rather than resolved to whatever took its id.
+- **A `gori run` command reads through a read-only store**, so a refresh there writes its
+  History rows and event through a writable handle the same project already holds, or holds
+  them for the next writable open of that project (`hand_over`, keyed on the database path) —
+  never into another project's.
+- **A deleted step detaches, it does not re-bind.** `Store#delete_repeater` negates the id in
+  the slot blob in the same transaction (#1160's encoding), editing the JSON in place so a key
+  this build does not know survives. `SessionSlots#reload` prunes per-slot binding tables only
+  when an IDENTITY field moved (`SessionSlot#same_identity?`), or closing a step's tab would
+  have wiped every slot's live token in every process.
+- **Per process**, like the values themselves: a TUI refresh does not update a running
+  `gori mcp`, and `gori run session refresh` rebinds a table that ends with the command.
+
+### 2026-09-25: a menu outside the registry borrows the app's letters
+
+Refines: [P1](#p1). #1274.
+
+The Project Picker runs before any project is open, so its space menu is a hand-rolled table
+rather than registry verbs. It had drifted into its own dialect: rename `r`, export `e`, clear
+marks `n`, letters matched case-blind, an unmapped key ignored, and Import jumping behind
+Delete once marks were set. An operator learns one set of mnemonics, so a menu outside the
+registry spells a shared intent with the app's letter (rename `e`, export `E`, clear marks `N`,
+delete `d`, open `o`), matches case-sensitively, dismisses on an unmapped key with the same
+j/k/h/l fallback, and keeps one row order whether or not marks exist, with the destructive
+entry last. Caps Lock no longer reaches the picker's lower-case entries, as it never did in the
+app. `ProjectPicker.space_entries` and `.space_key` are pure so `spec/tui/project_marks_spec.cr`
+can pin the letters.
+
+### 2026-09-25: a space-menu letter is checked against every key its tab answers first
+
+Refines: the 2026-09-12 entry above. #1274 WP0.
+
+That entry's rule — a menu letter must never name a key the tab answers differently — had no
+check. `validate_menu_keys!` compares menu against menu and `validate_chords!` chord against
+chord; nothing compared the two. `spec/tui/menu_letter_meaning_spec.cr` now does, and it looks
+past the keymap's single scope because the operator's keystroke does:
+
+- **every OS profile × editor keyset.** `vim` respells a bundle (⇧V select-line, editor `/`
+  `a` `g` `⇧G`), so a letter clean under `helix` can clash for the operators who picked `vim`.
+- **the Editor scope**, which `Runner#resolve_verb_id` consults ahead of the tab while a text
+  editor pane has focus — helix `i` is "insert" in the Repeater request pane.
+- **the sub-tab strip's raw keys** (`r` rename, `t` mark, `h/j/k/l` move), which the keymap
+  cannot see and which share the card with COMMON when the strip has focus.
+- **the Global fallback**, for a letter the tab leaves unbound: a menu `c` whose space was
+  dropped stops capture, and an `i` holds all traffic. The scope lens is the one Global
+  whose fall-through is harmless (a reversible view filter), and the only one excused.
+
+Exceptions are listed as exact `{menu verb, other meaning}` pairs with a reason, never as a
+`(scope, letter)`, so a later row on the same letter is still caught; an entry that stops
+violating fails the spec until its line is deleted. The list started as the 67 pairs standing
+when the guard landed, and the #1274 work packages shrink it. The guard covers the SHIPPED
+defaults — a user rebind that recreates a clash is the Hotkeys editor's `Conflicts` check.
+
+### 2026-09-25: the menu's movement keys never run a destructive or outbound row
+
+Refines: the entry above. #1274 WP1, first stage.
+
+Inside the space menu `j`/`k`/`h`/`l` move the selection only when the open card does not use
+that letter, so one reflexive keystroke moved in one card and ran an action in the next — and
+in the JWT and Cookie cards `k` cleared the session, in the Decoder's `l` its input, with no
+prompt and no undo. The first stage keeps that fallback and moves every row that destroys,
+overwrites or reaches out off the four letters:
+
+- **Every workbench clear is `K` and asks first** (JWT, Cookie, Decoder, Notes), skipping the
+  prompt only when the session is already empty — `notes_clear`'s rule, now shared. JWT and
+  Cookie **load decoded** overwrite the encode editors and are `L`.
+- **OAST listen is `r`**, as `r` runs every other tab's job, and resume is `R`, its chord.
+- **Probe's bulk dismissals are `G`/`H`**, the capital forms of the one-issue `c`.
+- **Destructive bands close the card.** `SpaceMenu#split_semantic` used to append a
+  half-tagged bucket's untagged rows after DANGER and WIPE, so Notes led with Clear. The
+  untagged band now sits ahead of them, which is what GROUP_ORDER always promised.
+
+Whether the fallback stays and `h`/`j`/`k`/`l` stop being menu letters altogether (Link is `k`
+on six tabs) is settled after the grouped menu lands, when most cards fit one column.
+
+### 2026-09-25: a pane-local key is declared on the verb, not hidden in its gate
+
+Refines: the R1 guard entry above. #1274 WP2 #3, #4, #13.
+
+The Repeater's bare `p` (pretty bodies) and `⇧D` (diff) and the Fuzzer's `v` (distribution
+sidebar) were bound tab-wide, so they fired in the request and template panes, whose menus
+spell the same letters for pretty-print-request, the decoder chain and clear-selection. An
+`available:` lambda could have hidden the key there, but the guard cannot read a lambda, and
+the palette would have lost the row as well.
+
+- **`Definition#chord_sections`** names the sections (the controller's `command_section`) in
+  which the verb's chords fire; nil means the whole scope. It gates the KEY only: the palette
+  and the space menu still follow `available?` and `section`.
+- **Out of its sections the press walks on**, like an unavailable verb (`Keymap#resolve`, the
+  scope chain `Runner#resolve_verb_id` now calls). So a gate on a letter Global binds would reach
+  capture, intercept or the lens. The R1 guard models that walk, and a gated key is no clash
+  for a menu row drawn only in other sections.
+- `ExecContext#focused_section` is the value it is checked against, and the same one the
+  space menu renders for.
+
+A later R1 exception whose two meanings live in different panes of one tab can take this
+instead of an allowlist line.
+
+### 2026-09-25: a menu letter in UI text is read from the registry
+
+Refines: the two entries above. #1274 WP3/WP8.
+
+Help's verb-id rows resolved a chord through the keymap, but a menu-only verb has no chord, so
+the row printed its hand-typed `space → X` unchecked — and three had drifted (Tag subtab `a`
+for `t`, gRPC reframe `F` for `R`, and a row naming `oast.promote`, which never existed). The
+same literal sat in toasts and hint strips, and in the Sitemap filter's `tag:` help (`T` for
+`m`).
+
+- **`Hotkeys.menu_path` is the one place a menu path is spelled.** A Help row whose verb has
+  no chord prints it; hint text writes `{space:verb.id}`, which `Hotkeys.expand` resolves next
+  to `{verb.id}`. When the menu grows a second level, that function is what changes.
+- **No registry never prints the token.** It reads "the space menu" instead — the
+  `{fuzz.sort}` footer bug in a new shape is what this rules out.
+- **`spec/verb/hint_token_expands_spec.cr` scans `src/gori`** for a literal `space → <key>`
+  outside comments, and every `{space:…}` token must name a verb with a menu row. A row named
+  by its TITLE ("space → Mine parameters") names no letter and is left alone.
+
+### 2026-09-25: a recurring intent spells its menu letter once, in a lexicon
+
+Refines: the 2026-09-12 bare-key table. #1274.
+
+That table settled bare letters by question, but the space menu's letters were still chosen row
+by row, and they drifted the same way: seven list filters said `f` in the menu while their key
+was `/`. A verb now declares `intent:` and `Verb::Lexicon` supplies the letter, so the grammar
+holds by construction rather than by review — a verb with an intent cannot also spell a
+`mnemonic:`. 288 of the 466 menu rows declare one; 277 of them were already on the letter.
+
+- **Two tiers.** A *reserved* letter (`/` `d` `x` `y` `Y` `S` `t` `T` `N` `X`, and the strip's
+  own actions) is spent on nothing else anywhere in a scope that has the intent. A *preferred*
+  letter is the intent's where it exists and free for a local row elsewhere; reserving all
+  thirty-odd app-wide would leave a dozen letters for the rows that are genuinely one tab's.
+- **Boot refuses what has no exceptions** (`Registry#validate_intents!`): an unknown intent, an
+  intent beside a mnemonic, a menu `X` on anything but a `:wipe` verb in group `:wipe`, and a
+  pane verb wearing one of the strip's nine (`n w d e t f / T N`) on a tab that has a strip —
+  even a strip that lacks that action, since the nine read the same on all nine strips.
+- **The spec holds what needs judgement** (`spec/verb/lexicon_spec.cr`): the reserved sweep, and
+  a menu verb whose id names an intent (`…filter`, `…copy`, `…delete`) must declare it, so a new
+  row cannot opt out silently. Both keep exact-row allowlists that fail once an entry is stale.
+- **An intent on one tab is not an entry**, and some recurring rows stay untagged until another
+  decision lands: Link `k` and add-host `h` (the `h`/`j`/`k`/`l` decision), go to source and
+  Probe's open, History/Detail delete `D`, file-as-issue on Probe `p` and Evidence/Diff `i`
+  (Diff's `a` is pick A), Miner's filter `F` (its strip owns `/`), Notes' find `s`.
+
+### 2026-09-25: the palette's typed search finds the focused tab's actions
+
+Revises: "the palette and the space menu are disjoint" (`Registry#for_scope`'s comment). #1282,
+first stage.
+
+The space menu is the only surface that lists a tab's actions, and it has no query line, so every
+action anyone might ever need had to be a row on it. The palette already is the typed-search
+surface, so its search now covers them too:
+
+- **Browse stays app control.** With an empty query the palette is today's curated Global list,
+  exactly.
+- **Typed search is scope-aware.** `Ctrl-P` captures the same `ActionContext` (scope, section,
+  sub-tabs bucket, marks banner) `Space` does, and both list from `Registry#for_view`, so they
+  cannot disagree about "what can I do here". The palette keeps the actions with no menu letter.
+  They rank first under THIS TAB, ahead of Global's matches. Each group is ranked on its own, so
+  rows do not jump between groups while you type.
+- **Captured, then re-checked.** Availability is read before the palette takes `@overlay`, since
+  some gates read it (an open History detail). A tab pick is re-checked after the palette closes.
+  Closing the palette puts back a History detail it was opened over, so the pick runs where its
+  chord would (P1).
+- **The space menu still has no query line.** Search already has a home.
+
+Editor-scope verbs are not searched: the space menu does not list them either. Which rows move
+off the space menu into palette-only placement is stage 2, after the grouped menu lands.
+
+
+### 2026-09-25: the space menu gets a second level, for verb families
+
+Refines: [P1](#p1) and the R1 guard entry above. #1274 WP9.
+
+A tab's cross-tool sends were eight rows and eight letters each, and the letters drifted per tab
+(Send to Fuzzer was `z` on History and `F` on the Repeater). A `Verb::Family` now draws them as
+one row, **`>` Send flow to…**, whose card lists the members. Every member is still a
+`Definition` and runs through `Definition#call`; only the menu's presentation is new.
+
+- **Membership reuses `intent`.** A family's letter table (intent → level-2 letter, in row order)
+  is the only place a member's letter is spelled, so one intent reads one letter in every scope
+  by construction. Lexicon intents and family intents are disjoint, and boot refuses a member
+  that also spells a `mnemonic:`.
+- **`pinned:` keeps a member at level 1 too**, on its own letter: Send to Repeater stays `r`
+  (`R` on the Fuzzer and Miner) and is also `> r` everywhere. Only a pinned member keeps a
+  `mnemonic:`; `menu_key` is the level-1 key alone, and nil for an unpinned member.
+- **A family row is static.** It is drawn whenever the view registers a member, never decided by
+  `available?` and never collapsed into a lone member. With nothing available the card says so
+  instead of dismissing, so `space > r` typed blind cannot fall through to the pane's bare `r`.
+  The row sits in its family's band, in the first bucket that holds a member.
+- **R1 governs level 1 only.** A family key is checked like any menu letter (the guard sweeps
+  `family:<id>` rows); level-2 letters are reached after two keys, never by a dropped space, so
+  they are exempt. They are never `h`/`j`/`k`/`l`, which a sticky card needs for navigation and
+  which keeps the pending `hjkl` decision open.
+- **Validation is per view at both levels**: level 1 is every row's key (family keys included),
+  level 2 is one member per intent per view — per view and not per scope, since the Repeater's
+  request and response panes never render together.
+- **`esc` and `⌫` go back one level**; `esc` at level 1 closes, and an unmapped key closes the
+  whole menu. A sticky family re-opens its card after a member runs unless that member opened
+  something of its own, and `ExecContext#menu_state` draws a row's `●`/`○` or value. Both wait
+  for the toggle families.
+- **One tool-letter table** (`Verb::TOOL_LETTERS`) serves this card and the Send selection to…
+  picker, so Sequencer is `s` in both. Decoder keeps the `d` that picker taught first, so Discover
+  is `D`. With Discover gone from level 1, History's and the detail's Delete take the lexicon
+  `d` (the entry above listed them as waiting on this).
+
+### 2026-09-25: the toggles are two sticky families that show their state
+
+Refines: the entry above. #1274 WP9.
+
+The view and transport toggles cost a level-1 letter each, and one toggle read three letters:
+hex was `e` in the History detail, `x` in the Repeater request pane and `h` in its response pane,
+because select-line owns `x` in two of the three. Two families now hold them.
+
+- **`Z` Display…** holds what changes how a pane *draws* what it holds: hex, pretty, Unicode
+  escapes, whitespace, diff, envelope/decoded, static assets, follow, columns, the Sitemap's
+  folds and JS references, the Fuzzer's matched-only and distribution lenses, and the
+  Comparer's pane and fold. A write-back (pretty-print request, pretty-print template) changes
+  the request and stays a direct row, and so does the Fuzzer's sort, the key a results triage
+  presses most. The key is not `V`: under the `vim` keyset `⇧V` selects a line in every pane
+  the row is drawn in, which the R1 guard reports.
+- **`P` Protocol…** holds what changes what a Repeater or Fuzzer request *sends*: HTTP/2,
+  SNI, auto Content-Length, the WebSocket key, gRPC reframe and field editor, and the TLS
+  fingerprint. Fuzzer Save results takes the export `E` to free `P`.
+- **Sticky, with a state column.** After a member runs the card comes back at the same row,
+  and `ExecContext#menu_state` draws `●`/`○` or a value (the TLS preset's name). The tab in
+  front answers through `TabController#menu_state`; the shell answers for its own flags
+  (pretty, whitespace, the static lens). The card stays closed when the member opened
+  something — an overlay, a picker, a prompt, or a pane that took the keys
+  (`TabController#pane_captures_keys?`: INSERT, the SNI field, the request hex editor, the
+  gRPC field list) — or moved focus; `SpaceMenu.resume_sticky?` is that decision.
+- **A member is a toggle.** `^T` drops a `§` marker on a tab with no envelope/decoded split, a
+  write, so Display…'s envelope row is its own verb (`repeater.toggle-envelope`), listed only
+  where there is a split. The History detail's Copy flow copied the raw request, which Copy as…
+  already offers, and is gone.
+
+### 2026-09-25: a menu letter is never h, j, k or l
+
+Closes: the WP1 first-stage entry above ("settled after the grouped menu lands"). #1274.
+
+Inside the space menu `j`/`k`/`h`/`l` move the selection only when the open card does not use
+that letter. With Link on `k` in six tabs and add-host on `h`, the same reflex moved in one card
+and acted in the next, and a sticky family card, which stays up after a row ran, made the next
+reflex keystroke likelier still. The fallback stays; the letters go.
+
+- **No row wears one, at either level.** `Registry#validate_intents!` refuses a level-1 letter
+  (a pinned member included, and a letter derived from a chord as much as a mnemonic) in
+  `Family::NAV_LETTERS`, and `Family#validate!` refuses one as a family's key or a level-2
+  letter. Global and Editor draw no card and are exempt (`Registry::NO_SPACE_MENU`).
+- **The movers take lexicon letters.** Link… and Manage links are `:link` → `L`, add-host is
+  `:scope_add` → `H`. Discover's run stepping is `J`/`K` (`[`/`]` are Global tab switching, which
+  a dropped space would reach), the Fuzzer's list paste `A`, and Activity's level filter `v` in
+  the menu while its bare `l` stays.
+- The Project Picker's hand-rolled menu already had no row on the four; it keeps the same
+  fallback.
+
+### 2026-09-25: the space menu is for the frequent, the palette for the long tail
+
+Closes: the #1282 first-stage entry above ("which rows move off the space menu … is stage 2").
+#1282.
+
+Once the palette's typed search found a tab's actions, a rare action no longer needed a
+space-menu row to be reachable, and the busiest cards were still two or three columns (the
+Repeater request pane drew 30 rows, the Fuzzer template 28). A verb now declares where it is
+listed: `menu: :palette` (`Verb::Placement`) gives it no space-menu row at either level, and
+the palette's search finds it from its own tab. The default stays `:space`.
+
+- **The criterion.** A row goes to the palette when it only repeats a direct chord for an
+  editing or navigation convenience (Mark word `^K`, Decoder Save/Load `^S`/`^O`, a rule
+  list's reorder `⇧K`/`⇧J`), or when it is a once-a-session configuration action (Minimize
+  request, Use as refresh for slot…, Change prefix). The first set is 37 verbs; the busiest
+  views drop to 25 and 22 rows.
+- **Nothing else changes about the verb.** Its chords fire as before, it runs through
+  `Definition#call`, and its `available?` gate is the palette's too. It keeps its `intent`:
+  the placement is where it is listed, the intent is what it means, and the letter comes back
+  from the lexicon if the verb ever returns to the menu.
+- **No row means no letter rules.** `menu_key` is nil, so the boot validators and the R1
+  guard have nothing to check. `Registry#validate_intents!` refuses a palette-only verb that
+  spells a `mnemonic:` (a letter no card draws), belongs to a family or is pinned (its family
+  would draw it), or is hidden (the palette would not list it either).
+- **Every surface names the route that exists.** `Hotkeys.route` is the menu path for a menu
+  row, and for a palette-only verb its effective chord, else `^P → <title>` spelled from the
+  palette's own effective chord. Help's key column and every `{space:…}` token go through it,
+  so a hint never sends the operator to a row the verb does not have.
+- **Not a row budget.** Which rows move is decided per verb against the criterion, never by
+  counting a view's rows, so adding an unrelated verb cannot push another one off the menu.
+
+### 2026-09-25: the SUB-TABS bucket is one row in a pane, and expanded on the strip
+
+Revises: #1055 ("the bucket rides along with every pane view"). #1274 Decision 8.
+
+#1055 made the strip's actions reachable from every level of a tab, which was right, but by
+drawing all of them in every pane card: nine or ten rows of the Repeater request pane's 25 were
+the strip's, and the nine letters were reserved in every pane, which is what pushed Mark word,
+the JWT/Cookie lens toggles and others off their natural letters.
+
+- **Discoverable as one row.** A pane view draws the bucket as **`T` Sub-tabs…**
+  (`Registry::SUBTABS_FOLD`), whose card is the whole bucket on the letters it already had. It
+  is not a registered family: membership is the section, and each row's level-2 letter is its
+  own `menu_key`, the nine that were already uniform on all nine strips. The row is static,
+  like a family row.
+- **Expanded where the strip is focused.** With the strip or the tab bar focused the strip is
+  the context, so the bucket stays at level 1 and there is no Sub-tabs… row. `n` from the strip
+  is `T n` from a pane; `Hotkeys.menu_path` prints the pane path unless told the strip has focus
+  (the palette's hint column knows).
+- **`T` keeps its reflex.** It was Mark all sub-tabs; from a pane it is now `T T`.
+- **Frequent rows stay direct.** `pinned:` now also keeps a SUB-TABS verb at level 1 in the pane
+  views (Paste cURL, `U`); New and Close keep `^N`/`^W`.
+- **Letters.** The strip's nine stay reserved for COMMON, which shares the strip-focused card;
+  a pane verb is free of them except `T`, which `validate_menu_keys!` checks per view. The freed
+  letters are not reassigned here.
+- **Mark sub-tab joins the menu** on `t`, the strip's own raw `t` (the active chip only, without
+  the strip's step right, which from a pane would switch the sub-tab being edited). Tag moved to
+  `g`, which ends the one standing R1 pair between a menu letter and the strip's raw keys other
+  than rename's `r`.
+
+### 2026-09-26: a family's key works bare, and a chip reads its path from the registry
+
+Refines: the verb-family entries and "a menu letter in UI text is read from the registry"
+above. #1295.
+
+- **A family may bind its own key bare** (`Verb::Family#chord`). Send flow to… does: `>` opens
+  its card from any tab that has a member, through the menu's own open and descend
+  (`Runner#open_space_family`), so the bare key and `space >` are one path. It is bound once per
+  scope by a hidden verb (`Registry#register_family_openers`), never Global, and the R1 guard
+  reads that verb as the family row's own meaning. Display… and Protocol… keep `space`: `Z` and
+  `P` are letters a pane may still want.
+- **A chip is a menu path too.** A border badge or a tight hint spells it with
+  `Hotkeys.menu_chip` (`␣Pr`), and the guard that refuses a literal `space → X` refuses a
+  literal `␣X`. A view takes the session's registry from its controller; without one the chip
+  is a bare `␣`.
+- **One chord may advertise two verbs** when one of them answers both panes: the Repeater's
+  `^X` toggles the focused pane's hex, so the response row declares `chord_of:` and shows it. A
+  scope still binds a chord to one verb; boot checks the chord is live in the row's section.
+- **A family row joins a band only beside another row of it.** Where nothing else of its
+  bucket is in the family's band, the row stays with the untagged rows, so no card draws a
+  header over the family row alone (ProbeDetail's `─ SEND ─`).
+- **Show all is one Display… intent** (`:show_all`, `a`): Probe's closed issues and the Params
+  tab's standard headers are the same lens, on the letter both tabs already answer bare.
+
+### 2026-09-26: no level-1 `c` or `i` where the tab leaves the letter to Global
+
+Closes: #1274 Decision 10 (the eight Global fall-through pairs in the R1 guard). #1295.
+
+Global binds three bare letters, `c` (stop capture), `i` (hold all traffic) and `s` (the scope
+lens). On a tab that does not bind the letter itself, a menu row on it is one dropped `space`
+away from the Global action, and for `c` and `i` that action is silent and changes what the
+proxy does. The scope lens stays excused: it is a view filter the next `s` undoes.
+
+- **The rows move.** `:set_status`, `:duplicate_rule` and the new `:clear_marks` (the Repeater
+  and Fuzzer marker clears, one intent now) are `C` in the lexicon, so each moves on every tab
+  at once. JWT's Copy attack token is `C`, like Copy re-signed token in the pane beside it.
+  Diff's Add issue is `F`, its own `⇧F`, since `a` is Diff's pick-A.
+- **The guard is the rule.** The R1 guard already reports a Global fall-through; with the
+  eight allowlist lines gone, a new `c`/`i` row on such a tab fails it, and the only way back is
+  an allowlist line with a reason. A tab that binds the letter itself (Probe's `c` dismiss) is
+  unaffected, because the press never reaches Global.
+
+### 2026-09-26: the other R1 pairs, closed by a rule or a move
+
+Refines: the R1 guard entry above. #1295.
+
+- **vim motions are a rule, not eight allowlist lines.** Under the `vim` keyset an editor pane
+  answers `a` `g` `⇧G` `/` and `⇧V` with append, top, bottom, find and select line, and eight
+  menu rows share those letters. A dropped space there runs the motion a vim hand expects,
+  which moves or selects and never writes, sends or deletes, so the guard exempts those verbs
+  by id (`VIM_MOTIONS`) under that keyset only. Undo (`u`) and helix's `i` insert are not in
+  it, and an example fails if an exempt verb moves into an acting band (send, triage, danger,
+  wipe) or out of the vim table.
+- **The strip's rename key is `e`.** The menu's Rename is `e` on all nine strips and its `r`
+  is Send/Run on four of them, so the strip moves to the menu's letter rather than the menu to
+  the strip's, and strip `r` does nothing (`^R` still sends from the Repeater strip). The
+  project picker already renamed on `e`.
+- **The Fuzzer's Save results is `⇧E`,** the Export chord of four tabs. Its `⇧S` was also
+  what a typed menu `S` (Send selection to…, on every Fuzzer view) sends to the keymap.
+
+### 2026-09-26: later reversals in the #1274 entries, and the rules their review added
+
+Refines: the 2026-09-25 #1274/#1282 entries and "no level-1 `c` or `i` where the tab leaves the
+letter to Global" above. #1274, #1295.
+
+The log is append-only, so the statements that later entries overturned are named here instead
+of being edited in place.
+
+- **Pane rows and the strip's nine.** The lexicon entry has boot refuse a pane verb on any of
+  the strip's nine letters. Since the SUB-TABS fold only COMMON reserves them, and a pane view
+  reserves only `T` (`validate_menu_keys!`).
+- **The Miner's filter `F`.** The lexicon entry's reason, "its strip owns `/`", went with the
+  fold. The row keeps `F`; the reason no longer holds.
+- **Pane-local keys.** The pane-local key entry's reason, that the request and template menus
+  spell `p`, `⇧D` and `v` for other rows, now holds only for the Fuzzer template's `v` (Clear
+  selection). The gate stays: in those panes the lenses draw nothing.
+- **Write-backs.** The toggles entry keeps pretty-print request and pretty-print template as
+  direct rows. Both are palette-only on `^U` now, and so is the decoder chain (`^Q`).
+- **Save results.** The toggles entry gives it the export `E`. It is palette-only, on `⇧E`.
+- **Discover's `J`/`K` and the Fuzzer's list paste `A`.** The h/j/k/l entry gives them menu
+  letters. All three are palette-only (list paste keeps `^L`).
+- **The tab bar is app-level focus.** With the tab bar focused, `Space` still lists the tab's
+  rows, but a bare key resolves Sidebar → Global. A tab's own loop letter that Global also binds
+  (`c` or `i`, such as Probe's `c` Dismiss) therefore stops capture or holds traffic there, not
+  the row's action. That is accepted: on the tab bar the Global keys win by design, and the tab
+  keeps its letter everywhere else. The R1 guard models the tab bar and allowlists these pairs
+  by name, so "the press never reaches Global" above holds everywhere but the tab bar.
+- **A pane that owns its keys has its own scope.** Help and the Project tab's NETWORK settings
+  pane are `Scope::Help` and `Scope::ProjectSettings`, verb-less, not History's `Body`: a
+  borrowed scope drew that tab's static family rows and answered its bare family keys.
+- **The keymap's layering reaches the family openers and the hints.** A chord a configured layer
+  (user, keyset or OS row) puts on a Global verb keeps a family's bare opener off it on every
+  tab (`Keymap.global_claims`); `space >` still opens the card. `Hotkeys.binding_for` never
+  advertises a chord the keymap fires as another verb in that scope (`Keymap.displaced?`), so a
+  footer, Help or the palette does not name a default an override took.
+- **`chord_of` names an owner, never a chain.** The target has a chord of its own and no
+  `chord_of`, in the same scope with that chord live in the row's section; boot refuses anything
+  else (`Registry#check_chord_of!`). The Hotkeys editor shows the borrowed key as "(via
+  <owner>)" and sends an edit to the owner's row.
+- **The hint scan reads every spelling of a path.** Besides `space → X` and `␣X`, it refuses an
+  arrowless `space X` / `Space X` and a spaced `␣ X` chip in a non-comment source line.
+
+### 2026-09-26: timing analysis lives in the Repeater, is synchronous, and compares a pair (#1246)
+
+The differential timing oracle from PortSwigger's "Listen to the whispers" — send two variants
+many times and judge which is slower by response ORDER and quartiles, not eyeballed latency — is
+the measurement layer on top of the #1236 synchronized-release race. Three decisions, so a later
+reader does not re-litigate them:
+
+- **Repeater, not the Comparer** (the issue's title said `feat(comparer)`). The Comparer is a
+  static two-sample diff: `ComparerSlot` holds a snapshot's bytes, the diff rows are memoized, and
+  there is no repetition, engine hookup or async-result channel anywhere in it. The selection this
+  feature wants is two LIVE drafts sharing one origin and transport — which is exactly what the
+  marked sub-tab gesture (`t`) and `collect_race_members` already produce for `repeater.send-race`.
+  So the verb is `repeater.timing-analysis`, a sibling of send-race, and reuses its collector,
+  origin/transport signature check, and off-fiber launch. Folding a run loop into the Comparer
+  would have fought its whole design.
+- **Synchronous, not a background job.** gori's other repeated-sampling tools (Fuzzer, Sequencer,
+  Miner, Discover) are start/status/results/stop jobs because they can run unbounded. Timing is a
+  bounded pair-vs-pair measurement (`Stats::MAX_ITERATIONS`), so it is one call that returns a
+  `Report`, the shape `race_requests` has — one MCP tool, one CLI subcommand, and the TUI wraps the
+  same call in a fiber for progress + an esc-cancel, rather than four job verbs per surface.
+- **A pair only in v1.** The engine (`Repeater::Timing`) races whatever it is handed, but the order
+  test and the verdict are defined over two variants; `>2` is left to a later change, as the issue
+  scoped it.
+
+The math is a pure `Repeater::Timing::Stats` (percentile quartiles + a two-sided binomial sign test
+on the order bias, `Math.erfc` for the tail, a `SMALL_SAMPLE` floor that clamps to Inconclusive) and
+a shared `Timing::Present` renderer, the `Sequencer::Stats`/`Present` split — so the CLI `--format
+json` and the MCP tool cannot drift, and the TUI card reuses `Spark` for the distribution.
+
+### 2026-09-26: Display… and Protocol… open bare too, and R1 sweeps level 2 behind a dead key
+
+Revises: "a family's key works bare" above ("Display… and Protocol… keep `space`") and the
+verb-family entry's "R1 governs level 1 only". #1310.
+
+A level-2 letter is not always reached after two keys. With no bare binding for `Z`, a dropped
+`space` made `Z` a no-op and read the member letter bare: `Z c` (Columns…) stopped capture on
+History, `P c` (auto Content-Length) did the same in the Repeater, `P 2` (HTTP/2) jumped to the
+second tab, and `Z x` selected a line under the helix keyset. Before the families, those rows were
+capitals, which never reach Global.
+
+- **Both toggle families bind their key bare**, `⇧Z` and `⇧P`, as Send flow to… binds `>`:
+  a hidden opener per scope that has a member, never Global. No scope, keyset or Global bound
+  either key where a member is drawn; `⇧P` stays previous-item in the detail views and the
+  Comparer, which have no Protocol… member. The member letters do not move, so one intent still
+  reads one letter on every tab.
+- **The R1 guard sweeps level 2 wherever the family key answers nothing** (`bare_answer`: the
+  Editor link, the tab's scope where the chord is live in every view of the row, then Global),
+  checking each member letter as it checks a level-1 row. A family with a working bare key is
+  not swept, because its letters are only ever read inside the card.
+- **The strip answers its raw keys, then Global.** A focused strip keeps its own navigation,
+  mark and picker keys (`> f` opens the sub-tab picker and the Comparer's `Z t` marks the chip),
+  then resolves an unhandled chord in `Scope::Global` only. It never dispatches into the active
+  tab or Editor scope, so `?` works there without typing through into the pane.
+
+### 2026-09-27: MCP permission groups are a third reason a tool is absent
+
+Preferences › AI › MCP permissions switches off groups of `gori mcp` tools from gori itself, where
+`--read-only` and `--tools` are decided in the agent's install. Four groups — `send`, `intercept`,
+`write`, `projects` (`Settings::MCP_PERMISSIONS`) — all on by default. Reading is never a group.
+
+- **Declared per tool, next to its handler**: `@[Tool(permission:)]`, required on every
+  `agent_action` tool by the registry macro, and on every other writer by
+  `spec/mcp/tool_permissions_spec.cr`, which names the operator channel as the one exemption.
+  A group never splits a `requires:` workflow.
+- **The same two answers as `--read-only`**: absent from `tools/list` and refused with
+  `TOOL_DISABLED`, and the three predicates compose (`Tools.serves?`). `advertises?` reads the
+  switches, because a restart without `--read-only` does not bring a switched-off tool back.
+- **The arguments decide where one mode sends**: `Tools#call_denied_permission` is the one place
+  for that — `probe_scan{active}` and `set_probe_mode` raised to an active mode are `send`. A new
+  call-shaped sender goes there, not into its handler.
+- **Latched at start and never fail-open.** Read once per `gori mcp` process, like `channels`. A
+  settings file the start could not read in full is re-read for this section alone, and denies
+  every group when even that fails.
+- **Its own settings section** (`mcp_permissions`), because the save merge reconciles whole
+  sections: sharing `mcp` with `channels` let one window's stale copy of the denials win.
+- **Groups are capabilities, not destinations.** Intercept control still lets an agent forward
+  an edited held request, and those bytes reach the target with Send traffic off. Turning off
+  both is what stops an agent's bytes reaching a target; the docs say so.
+
+### 2026-09-27: what the operator is owed from the agent channel while nobody is watching
+
+#1090 made the channel a notification, not a mailbox: a TUI seeds its tails at the feed's end
+when it opens. Three follow-ups keep that rule and carve out what the operator is owed.
+#1322, #1323, #1324.
+
+- **Replies get a watermark, not a replay.** `agent_reply_seen` in the project's `settings`
+  table (two projects are two feeds) records the last reply a window showed. It moves forward
+  only. A window writes it when its live drain announces a reply, when the ring opens and when
+  it closes. The next window to open pushes ONE addressed note for `(watermark, cursor]`, whose
+  detail lists the newest fifty. Delivery rows and every other feed row keep the seed-at-now rule.
+- **"Addressed to the operator" is the kind; who is speaking is the source.** `gori run notify`
+  writes the `agent_reply` shape under a new `script` source (`actor: cli`), so one drain and one
+  watermark serve both, and the ring's `ai` marker, which reads the source, stays off a shell loop.
+- **A question is closed by exactly one message.** An `ask_operator` question is an
+  `agent_question` row with no state column. It stays open until an `agent_message` with
+  `in_reply_to` exists, and that message is also how the answer travels, so every delivery route
+  carries it without a route of its own. `Store#insert_event_unless` checks and inserts in one
+  `BEGIN IMMEDIATE` transaction, so the operator's answer and the expiry cannot both land.
+- **The asker expires its own question.** The `gori mcp` courier closes an unanswered question
+  when its time is up. It is the one process that must hear about it, and with no TUI open
+  nothing else would write it. The TUI also stops offering it on the clock and when the asker's
+  marker is gone, because an answer addressed to a dead pid is read by nobody.
+- **A question never takes focus.** It is a ring note Miss Ring holds, plus an `ask:N` chip. The
+  card opens only from the ring's `↵`, the chip or `app.answer-agent`, because a card that
+  appeared mid-edit would turn the next keystroke into an answer. `esc` means "later", and `x` is
+  the explicit dismissal the agent hears. An answer is a request, like any operator message: the
+  frame says it authorizes nothing, and scope still decides what is sent.
+
+### 2026-09-27: `flows.id` and `h2_connections.id` are AUTOINCREMENT, switched in place (#1343)
+
+Both were `INTEGER PRIMARY KEY` without AUTOINCREMENT, so a clear or a delete of the newest
+flows handed the next capture an id that had named another flow, and every holder of one (a
+mark, a link, frozen evidence, an MCP cursor or job result, a peer process that never saw the
+delete) pointed at the wrong traffic. #1342 patched the consumers that were visibly wrong. V39
+removes the cause: an id, once issued, is never issued again. The consumer guards stay as
+defence in depth.
+
+- **In place, not rebuilt.** AUTOINCREMENT does not change a table's on-disk format, only how
+  the next rowid is picked, so `Schema.autoincrement_in_place` edits the stored CREATE text and
+  bumps `schema_version`, the change SQLite documents for format-preserving edits. 2–7 ms at
+  1 GB and at 3.4 GB. The V10-style rebuild that #552 measured and refused on open (16 s at
+  50k flows) is 5–7 s per GB under the write lock with its verification, and it leaves the file
+  twice its size until a compact, because the old table's pages go to the freelist.
+- **The rebuild stays as the definition and the fallback.** V39's statements are the rebuild, so
+  a bare connection replays one definition, and `migrate!` runs them whenever the edit is
+  refused, the CREATE text is not the one V1 wrote, or the edited text does not reparse to the
+  same columns (the savepoint puts the old text back first). The edit lifts
+  SQLITE_DBCONFIG_DEFENSIVE for its statements, because macOS's system libsqlite3 has it on and
+  refuses `writable_schema`.
+- **The fallback proves its copy before any DROP.** `verify_v39_copy` compares every non-BLOB
+  column of every row, by value and storage class (`IS` alone compares under column affinity,
+  so a TEXT `'443'` equals the INTEGER a copy converted it to), plus BLOB lengths, sampled BLOB
+  bytes, the FTS rowids at both ends and every `h2_connections` row. A mismatch rolls the whole
+  upgrade back. A disk that fills during the copy is reported with the free space it needs
+  (about twice the project file), not as a bare SQLITE_FULL.
+- **Seeded past every reference, not `MAX(id)`.** `sqlite_sequence` starts above every column
+  that can hold a flow id, the FTS rowids and the negated evidence sources, so an emptied table
+  cannot hand a stranded reference its id back. V10's rule, applied to `flows`.
+- **A read-only open may migrate it.** `Store.open(read_only: true)` already upgrades a stale
+  schema; at milliseconds that stays acceptable. The cross-project search reads raw and never
+  migrates, and the column set it reads did not change.
+- **Not done here.** `entity_links` still deletes a flow's links rather than keeping them as
+  `(stale)`, and the History marks, colour memos and MCP `since` check still guard against a
+  reused id. Each can be relaxed on its own now that ids are monotonic.
+
+### 2026-09-27: eight more tables get AUTOINCREMENT, the way `flows` did (#1344)
+
+Extends V10 (fuzz and miner sessions) and the `flows` entry above to every other table whose id
+leaves the process: `repeaters`, `probe_custom_rules`, `probe_issues`, `issues`, `match_rules`,
+`scope_rules`, `host_overrides` and `fuzz_runs`. Each was `INTEGER PRIMARY KEY` without
+AUTOINCREMENT, so deleting the newest row or wiping the table gave the next insert an id that had
+named another row. The holder is usually another process (`gori mcp`, `gori run`, a peer TUI),
+which never saw the delete. The audit reproduced three cases. A promoted Probe finding linked its
+issue to an unrelated Repeater tab. A recreated custom rule inherited `custom_p_<id>` and with it
+the deleted rule's suppressions and dismissed rows. `add_retest_step` with a wiped issue's id
+passed the gone-issue guard. V40 does all eight in one migration.
+
+- **In place per table, rebuilt where it must be.** `migrate_v40` hands every eligible table to
+  V39's `autoincrement_in_place`, now given a table list, in one edit: the same savepoint, cookie
+  read-back and column-shape check. The edit is a blind `replace()` of the rowid phrase, so
+  eligibility (V39's too) is anchored to what gori writes: the first column is
+  `id INTEGER PRIMARY KEY`, the phrase appears once in any case or spacing, and the text has no
+  AUTOINCREMENT, CHECK, GENERATED or comment. A crafted archive with the real clause lowercased
+  and the phrase inside a CHECK would otherwise have the edit land in the CHECK and fail every
+  row. As a second guard, `PRAGMA quick_check` must pass on each edited table before the
+  savepoint is released. An ADD COLUMN appends a plain declaration and leaves the rowid clause
+  alone, so every table any gori wrote is eligible. A table that is not, or all eight when SQLite refuses the
+  edit, takes the V10-shaped rebuild, which V40's statements spell and a bare replay runs.
+  `Schema::TableRebuild` spells each table once and derives the copy, the swap and the seed.
+  One table that must be rebuilt does not cost the others their edit. On a 466 MiB project with
+  5,000 Repeater tabs (50 MB of responses), 10,000 findings and 100k flows: 16 ms in place,
+  about 0.2 s rebuilt.
+- **The rebuild proves its copy before any DROP.** `verify_rebuilt_copies` checks the column list
+  on both sides, then totals (count, MIN/MAX id, `SUM(length())` per column), then every column of
+  every row, BLOBs included, by value and storage class (V39's `v39_same`). These tables are
+  small enough for that; the `flows` fallback samples its BLOB bytes. A mismatch rolls the whole
+  upgrade back, and a disk that fills names the tables it was rebuilding.
+- **Seeded past everything that still names a row.** That covers the columns and polymorphic refs
+  (negated, detached ones by magnitude), the session slots' refresh steps and the disabled-rule
+  set in `settings`, and the custom rule codes in findings, suppressions and OAST probes. It also
+  covers the provenance a flow carries in `source_ref`: a Repeater tab id, `issue #N step M`,
+  `project rule #N`. That text is read from `idx_flows_list`, which covers it, never from `flows`.
+  Only an integer below 2^62 counts, judged per reference before its maximum is taken, so one
+  odd value (an imported file named `issue #999…`, text in an id column) cannot hide the real
+  ones beside it. No gori issues such an id, and a sequence at the top of int64 would fail every
+  later insert with SQLITE_FULL.
+- **The consumer guards stay.** Detached retest and refresh steps, `evidence_source_alive?` and
+  the Repeater evidence count still guard, because a database upgraded from before V40 can hold
+  references that were already re-bound. Closing a Repeater tab now also clears
+  `probe_issues.sample_repeater_id`, since a pointer at a closed tab opens nothing. That runs on
+  the writer fiber at every close, so V40 adds a partial index on the column, on either path,
+  rather than scan every finding ([P6](#p6)).
+- **Not migrated.** `extract_rules`, `oast_providers`, `color_rules`, `saved_views` and
+  `entity_links` keep reusable ids. Where one leaves the process the surfaces address it another
+  way. A saved view's pointer is cleared by the saved setting on every surface
+  (`SavedViews.clear_active_if`). A link is removed by its (owner, ref) pair, which is UNIQUE, and
+  never by its row id.
+
+### 2026-09-28: the in-place AUTOINCREMENT edit reads no row, and `since` trusts the high-water mark
+
+Two statements above are overturned here rather than edited in place. The #1344 entry's "as a
+second guard, `PRAGMA quick_check` must pass on each edited table" no longer holds, and neither
+does the #1343 entry's listing of the MCP `since` check among the guards against a reused id.
+
+#1344 added `quick_check` on every edited table as a second guard behind eligibility. On `flows`
+that walks the whole table, every body's overflow chain included: 10–16 s through `migrate!` on a
+3.3 GB project, against 0.1–0.15 s without it, measured. That undid V39's reason for editing in
+place: a peer waiting on the 5 s `busy_timeout` got `database is locked` on the first open after
+an upgrade, and `gori mcp --read-only` held the write lock as long.
+
+- **Eligibility is the guard, and it is read from the text.** What `quick_check` caught, an edit
+  that landed somewhere other than the rowid clause, is what eligibility rules out before the
+  edit: the phrase exactly once and as the first column, no CHECK, GENERATED, comment or
+  AUTOINCREMENT, and now no WITHOUT ROWID tail either (SQLite refuses AUTOINCREMENT there). Under
+  those conditions the blind `replace()` can only extend the rowid clause, so a read-back of the
+  edited text would compare it with itself and was not added. The cookie read-back and the
+  column-shape check stay. A spec cuts a body's overflow chain on disk and requires the edit to
+  succeed regardless, so a check that reads rows cannot come back unnoticed.
+- **MCP `since` is judged against the high-water mark.** `list_history` refused a cursor above
+  `MAX(id)`, which before V39 meant the ids had restarted. Afterwards it meant "the newest flow was
+  deleted" or "history was cleared", and the refusal sent a tailing agent back to since=0 to
+  re-read everything, although the next capture lands above its cursor. The bound is now the
+  highest id ever issued (`sqlite_sequence`, or `MAX(id)` where that row is missing).
+  A cursor beyond it was not issued by the project as it stands and is still refused, without
+  guessing why.
+
+### 2026-09-28: scope and the sandbox are their own MCP permission group (#1348)
+
+The 2026-09-27 groups put the five scope writers (`add_scope_rule`, `update_scope_rule`,
+`delete_scope_rule`, `set_scope_enabled`, `set_sandbox`) under `write`, so an operator could not
+let an agent record issues and notes without also letting it widen the scope or turn the sandbox
+off. They now sit in a fifth group, `scope` ("Change scope & sandbox"), and `write` no longer
+covers them. #1327 was untagged but already on main, so a `write: false` written by that build
+must not read as "scope allowed" after the upgrade: an absent `scope` beside a denied `write`
+is denied, and the serializer writes `scope: true` for the one combination that needs it.
+
+- **It fences the fence, not the send.** `allow_unscoped:true` still lifts Layer 1 for a send
+  with this group off; Layer 2 (the sandbox and explicit excludes) still applies to the bound
+  project. Stopping an agent's out-of-scope sends is Send traffic's switch, the same
+  "capabilities, not destinations" rule as Intercept control. Two writers outside the group also
+  move where a request lands, and are deliberately left where they are: host overrides (`write`)
+  remap an in-scope hostname's address, and `projects` can bind a project with no sandbox.
+- **Reading stays ungrouped.** `list_scope` is served with the group off: an agent that is
+  told SCOPE_BLOCKED still needs to see why. The hints that name `add_scope_rule` (`list_scope`,
+  `ql_explain`'s `scope:` note, `list_history`'s `in_scope` note) name the operator instead
+  when it is not served (`Tools#add_scope_rule_hint`), the way `no_binder_recovery` does for
+  the binders. So does a SCOPE_BLOCKED remedy (`Tools#scope_remedy`): "add an include" becomes
+  the operator's beside `allow_unscoped:true`, and "delete the EXCLUDE rule", which no waiver
+  lifts, names only the operator.
+
+### 2026-09-28: `sequencer_sessions` is AUTOINCREMENT too (#1354)
+
+V10 left `sequencer_sessions` out because no link can name a session (`LinkRefKind` has no
+`Sequencer` variant), and #1344 did not revisit it. A link is not the only holder. A peer TUI
+keeps each tab's row id, and closing the newest session and opening another handed that id to the
+new row. A peer whose tab was locked (unsaved edit, collection running) then took the new row for
+its own tab in `reconcile`, and its next save overwrote the other operator's session. An Activity
+row's `goto_session_id` opened the new session the same way. The test for leaving a table out is
+"can anything outside this process hold its id", not "can a link name it".
+
+- **V41 moves it the way V40 moved eight tables.** `migrate_v40` became
+  `move_to_autoincrement(conn, rebuilds, version)`, shared by V40 and V41: in place where the
+  CREATE text is gori's, the verified rebuild otherwise. The seed reads the events that point at a
+  Sequencer session and any `sequencer` link, filtered like every other seed.
+
+### 2026-09-29: a fuzz result's shape is a versioned fingerprint of its answer, and one aggregator clusters it (#1351)
+
+The Distribution sidebar answers "how are the metrics spread", not "which responses are actually
+different". Every result now carries `Fuzz::Result#shape`, and `Fuzz::Clusters` groups rows by it
+for the TUI, `gori run fuzz show --clusters` and MCP `fuzz_results` / `get_fuzz_run`. The issue's
+four open questions, answered:
+
+- **What the key holds.** The outcome (a response, or a failed send folded to a coarse
+  `Shape::ErrorClass`, since raw error text quotes hosts, ports and timings), status, gRPC
+  status, the incomplete/timed-out flags, the WebSocket close code (folded in by
+  `Result#with_ws`, the one seam that has it), the set of header names minus the ones that vary
+  per response or with body size, the normalized `Location` and `Content-Type` values, and the
+  decoded body with the job's own payload bytes masked (as generated, as spliced after a `¦chain`,
+  HTML-escaped in each server's quote spelling (`&#39;`, `&#039;`, `&#x27;`, `&#34;`, `&apos;`),
+  percent- and JSON-escaped, the last also Go-style `\u003c`), numbers and id-like tokens
+  folded to one value marker (a random hex id is sometimes all digits), whitespace runs folded. NOT
+  `length`, `words` or `lines`: a reflected payload moves all three, which is the split the
+  masking exists to prevent; a cluster reports their range. No JSON-structure parse: the token
+  normalization already folds values, and a structural walk would be a second decode (P6).
+- **Stable across runs, within one `Shape::VERSION`.** FNV-1a over a versioned normalization, not
+  Crystal's per-process seeded `#hash`, because the id is persisted (`fuzz_results.shape`, V42)
+  and compared between a live job and its saved run. A normalization change bumps the version,
+  which changes every id rather than silently merging old rows with new ones. Rows saved before
+  V42 have no shape; they cluster by `Shape.approximate` (outcome + words/lines) in a separate key
+  space and every surface marks those clusters approximate.
+- **The representative is the lowest-index member.** Live results arrive out of order and a saved
+  run is read in index order; the lowest index is the one rule both pick the same row under, and
+  it makes offset paging deterministic (ties break on it too).
+- **Opt-in arguments, not a `fuzz_clusters` tool.** `clusters: true` and `cluster: "<id>"` on the
+  two tools that already page a run's rows keep one paging contract and one place an agent looks.
+  The default row page is byte-identical.
+
+Bounded throughout: the fingerprint reads the decoded body's first 16,384 NORMALIZED units (a
+masked payload, a value, a word, a whitespace run or a punctuation byte each count one), capped at
+256 KiB raw, plus one bit for whether the body went on (~46 µs on a large page, 0 B/op,
+`bench/fuzz_shape_bench.cr`). Units, not bytes: a result page that echoes the query at its top
+shifts every later byte by the payload's length, so a raw-byte window ended at a different place
+for every payload and split the very cluster it existed to form. The price is that a difference
+far below the window does not split a shape; the cluster's length range still shows it.
+`Clusters` holds at most 4096 shapes and
+counts later new ones as `overflow_rows`, and a saved run aggregates from the keyset-paged scalar
+stream. There is deliberately no SQL `GROUP BY` twin: legacy rows cannot be grouped in SQL, and a
+second implementation of one predicate is the drift the Scope SQL/in-memory pair already taught.
+A live MCP job's aggregate sees every result while its row cache keeps only `interesting?` rows,
+so a cluster of ordinary answers may list no member rows; the page says so (`members_retained`,
+`members_note`) instead of implying the cluster is empty. The TUI's header drawn from a cluster's
+metrics-only representative (its members all evicted from the display window) says the row left
+the window, never "not retained", and seeds no Repeater/Comparer tab.
+
+Known gaps, each a heuristic trade-off rather than an oversight:
+
+- A needle is tried where a normalized unit starts, never inside a letter/digit token, and it
+  has no word boundary. The two pull against each other: masking inside tokens would catch a
+  marker spliced into an existing value (`user=adm§x§` echoed as `admx'`), and masking anywhere
+  already lets a common-word payload (`div`, `header` from a content-discovery list) mask the
+  page's own markup, so identical 404s split. Neither is fixed by a rule the fingerprint can
+  apply to one response alone; the second is the one worth revisiting (e.g. not masking a
+  plain-word needle inside markup).
+- A failed send's class is read off its message text, so a host name in the message can pick
+  it (`tls-gw.example.com`). A structured error kind on `Repeater::Result` is the real fix.
+- A gRPC body is hashed as its wire bytes, so a payload that changes a message's length
+also changes its 5-byte prefix and varint lengths, and a gRPC sweep can split one answer into a
+few shapes by payload length. Deframing with `Grpc.scan_wire` first is the fix when it matters;
+`grpc_status` is already its own key part, so a denied call never merges with a granted one.
+
+### 2026-09-29: a wordlist is a file in a global catalog, and a bare name reads the working directory first (#1353)
+
+`~/.gori/wordlists` was a convention only the TUI Fuzzer knew: its completion listed it, and inserted
+an absolute path because the engine opened whatever it was handed relative to the working directory.
+CLI, MCP, Miner and Discover took a path and nothing else, so a list saved once could not be picked
+by name outside one text field. `Gori::WordlistCatalog` is the naming and placement layer over that
+directory, and nothing more.
+
+- **The contents stay files.** Not `settings.json` and not a project database: a file keeps the
+  global-versus-project boundary (a project never inherits a list; a name is something the operator
+  typed), reads lazily (`Fuzz::WordlistFile` walks a multi-GB list without materializing it) and is
+  what an operator already drops in that directory by hand.
+- **One resolution rule, in one place.** `WordlistCatalog.resolve` returns a value containing `/`
+  unchanged, byte for byte, and looks a bare name up in the current directory first and the catalog
+  second, so a file you have right here still beats a saved list of the same name. A bare name found
+  nowhere comes back as typed and the consumer reports it in its own words, now saying where it
+  looked. `Fuzz::WordlistFile`, `Fuzz::Presets` (the `NAME:FILE` merge), `Miner::Wordlist` and
+  `Discover::Wordlist` call it, so the CLI, MCP and the TUI Fuzzer agree without a per-surface copy.
+  The TUI cookie-crack field does not: it takes an inline secret list as well as a path, and a bare
+  word there resolving to a file would replace a secret the operator typed.
+- **The bytes are never normalized.** A blank line and a `#` line are payloads to the Fuzzer and
+  formatting to the Miner and Discover (`merge_user_file`), and both are right for their tool. The
+  catalog writes and copies verbatim and lists from `stat`; a line count reads at most 32 MiB and a
+  value preview only happens on request, bounded. Values appear in no listing.
+- **A name is a filename, never a path.** Letters and digits of any script, `_ . + -` and inner
+  spaces, at most 200 bytes, never leading with `.` or `-`. No separator or control character can
+  occur, and the staging file (`.NAME.gori….tmp`) is a hidden name the catalog never lists.
+- **Writes are atomic, owner-only, and never an accident.** `DurableFile` stages the file at 0600 in
+  the 0700 directory. Without `overwrite` the install is a hard link, which fails when the name is
+  taken, so a save that races another lands as a refusal and not a replace; the `exists?` before it
+  only stops a doomed save from staging gigabytes. A symlink a save would write through, or replace,
+  is refused (delete it first), and `rename` moves a link as a link.
+- **MCP treats it as a write.** `save_wordlist`, `rename_wordlist` and `delete_wordlist` sit in the
+  `write` group (the catalog is a global record an operator lets an agent keep), work with no project
+  bound, and `delete_wordlist` needs `confirm:true` like the other irreversible ones. `get_wordlist`
+  returns values only with `include_values:true`.
+- **The history remembers names, and the path when the name would lie.** `Settings.canonical_wordlist`
+  is the key: a catalog list and the absolute path an older gori inserted are one entry.
+  `Settings.remembered_wordlist` is what is stored, the name unless a file of that name in the working
+  directory would shadow it (a bare name reads the directory first). There the path is kept, because
+  the pick was inserted as a path for exactly that reason and the entry must not turn into the
+  working-directory file the next time. The completion asks `resolve` when it inserts — its rule is
+  not copied — so it still writes the shorter spelling whenever the name is enough. Two spellings
+  that differ only by that shadow share a key, so starring or recording one replaces the other rather
+  than listing a file the history cannot tell apart twice. The LIVE Run-row estimate stats the same
+  `resolve_path` the engine opens.
+- **Every writer goes through the catalog.** The Params `w` export used to write its own 0644 file
+  and replace one of the same name. It now saves through `save_values`: 0600 like the rest, and a
+  second press in the same second takes the next free `-2`, `-3` name rather than failing.
+
+### 2026-09-29: a project payload source is read by the plan builder, and secrets stay out unless asked (#1352)
+
+Fuzzer and Miner could only take values typed, listed in a file, or generated, while the project
+already held the target's own vocabulary. `Gori::PayloadFrom` is a QL selector plus a projection
+(`param-names`, `param-values`, `path-segments`, `js-endpoints`, `extracted`), and a surface only
+parses its own syntax into a normalized `Spec`.
+
+- **The plan builder reads the project.** `Fuzz::ProjectSource` and `Miner::PlanOptions#project_names`
+  are built with nothing resolved, and `Plan.build` resolves them against `PlanOptions#project`,
+  before the sets are paired with the pipeline. That is the same seam every tool has, so the CLI, MCP
+  and the TUI cannot differ on caps, secrets or refusals, and the resolved size is what the preflight
+  and the confirm already count. The read is never on the proxy path or the Store writer (P6): it is
+  the parameter inventory's newest-first, id-cursor-paged walk, one flow in hand at a time.
+- **Strict, bounded, reproducible.** The QL is refused for an unknown field, a dropped term (which
+  would broaden the selection) or a regex that cannot compile. Flows, distinct values, total bytes
+  and one value's length are capped, and what ended a read is on its report. `js-endpoints` is one
+  store read (`JS_REF_READ_MAX`), so it applies one less than that as its value cap and the report
+  names the cap that applied; `max_flows` does not bound it. The order is the walk's,
+  first sighting wins. An empty source is a refusal, because a zero-request run reads as "nothing
+  there".
+- **Values are the captured value (P7).** A source does not trim, filter for framing bytes or
+  re-encode. `param-values` are decoded once, as `Params` reads them, so a query or form position's
+  own rule encodes them once; `path-segments` stay as captured, which is what a path position takes.
+  A value holding CR, LF or NUL is kept and counted, because dropping it would decide for the operator
+  which captured bytes are payloads.
+- **Secrets are opt-in, and the opt-in is reported.** The default reads query, form, multipart and
+  JSON only, and withholds any value `ParamInventory::Sensitivity` would mask (the same policy, now
+  public, rather than a second list of secrets), a JavaScript endpoint with a credential-shaped
+  segment included. Names are not withheld: a name is not a value. `extracted` is credential
+  material by nature and refuses without the opt-in. Every report carries the policy and, on MCP,
+  no value at all. The opt-in is an argument the caller passes, as `get_flow`'s `include_sensitive`
+  is: an agent that may read a flow's raw headers may also ask for these, and the run says
+  `SENSITIVE INCLUDED`.
+- **Nothing live becomes durable.** `extracted` re-applies the stored extract rules (their host glob,
+  their condition, `TokenExtract`) to stored responses, as a History display column does. The
+  memory-only binding table (#501) is not read, and saving a list from project data is its own
+  explicit act (`wordlist save --payload-from`, `save_wordlist{payload_from}`) that names the project.
+  A value a one-value-per-line file cannot carry (it holds a line break) is left out of that save
+  and counted, through `WordlistCatalog.one_per_line`: the predicate `save_values` refuses on, so
+  what a file cannot hold is decided in one place.
+- **A run with no named project reads nothing.** `--request` and stdin are deliberately outside any
+  project, so a source there is refused rather than pointed at the most recent project.
+- **Miner precedence is fixed.** Explicit names, the project's names, the built-in list, then the
+  user wordlist, first sighting wins. The TUI Miner popup keeps its no-text-field rule and keeps
+  seeding neighbour names itself; the Fuzzer's payload editor gets a Project type.
+- **Left for later.** Provenance is per source (query, projection, counts), not per value; a
+  per-value flow id would cost memory the caps are there to bound.
+
+### 2026-09-29: a request-time macro is a gate on WHEN saved sessions run, and a failure is never a clean row (#1350)
+
+Refines: [P1](#p1), [P6](#p6), [P7](#p7). Issue #1350, the follow-up to #1233.
+
+A form token or nonce that rotates on every page load dies long before its session does, so #1233's
+clock (`jwt-exp`, a `ttl`) cannot refresh it: a sweep gets `200` for its first candidate and `403`
+for the rest, and reads as "the payloads were tried". A macro is a list of saved Repeater sessions a
+Fuzzer or Miner run replays BEFORE a candidate. It adds no extraction and no injection mechanism.
+
+- **Extraction and injection are the ones that exist.** The steps go through `Repeater::Plan`, so the
+  existing extract rules (`TokenExtract`, `Bindings#observe`) rebind `$BIND.NAME`, and the candidate
+  resolves it at send time (`Fuzz::Sender#send`) or through the active slot's header overlay. The
+  placeholder is `$BIND.NAME`; `§…§` is a payload position, and reusing it for a non-fuzzing value
+  would have made one marker mean two things. Steps are sent as the ACTIVE slot, overlay included,
+  the opposite of a #1233 refresh, which must not carry the credential it replaces: a CSRF page
+  needs the session the candidates are sent as, and the rebind lands in the table they resolve from.
+- **`Config#request_macro` is the whole interface.** A surface parses its own input (`--macro*`,
+  MCP `macro_*`, the ADVANCED rows / the mine popup) into a `RequestMacro::Spec`; `Plan.build`
+  freezes the sessions, validates them, and builds a `Lane`. Nothing surface-specific exists below
+  that line. The error is a `Gori::Error`, not a `PlanError::Reason` (three surfaces `case` that
+  exhaustively, and the sentence names sessions and extract rules, which read the same everywhere);
+  `Fuzz::ChainError` is the precedent.
+- **An epoch is the unit of sharing, and a barrier is what makes it true.** `every N` means a value is
+  used by the next N candidates; the steps of epoch k+1 do not start until every candidate of epoch
+  k has left. Without the barrier, "N candidates share a value" is a hope: a slow candidate could
+  pick up the next epoch's value at its send. The consequence is stated in the plan before the first
+  request: `every 1` (the default) serialises the run, because a one-time value cannot be shared by
+  two workers without changing the test, and `every N` leaves `min(concurrency, N)`. Candidates are
+  counted in the order they reach the gate. A race is one unit (the steps run once, before the
+  group is dialled) and the cadence must cover the group, or it is refused rather than silently
+  shared. Answers to the issue's open questions: the steps run before the first candidate (it opens
+  the first epoch); a failed macro skips the candidate or stops the run, and never sends the last
+  value; `$BIND.NAME` only.
+- **A failure is an error row, never a clean one.** The candidate is not sent; its row carries
+  `RequestMacro::ERROR_PREFIX`, is counted in `errors`, and is not retried (the steps would fail again
+  against the endpoint that just failed). A failed run opens no epoch, so the next candidate tries
+  again. `skip` ends the run after `FAILURE_LIMIT` failures in a row (#1233's reasoning: a broken
+  login must not be sent once per payload), `stop` on the first; ending a run is the engine's act,
+  through the `ErrorEvent` every surface already turns into `error`. A budget spent or a stop between
+  two steps is the run ending, not the macro breaking, and is not counted. There is no "send anyway
+  with the last value": that row's verdict would be about a stale token.
+- **The steps are the run's traffic.** Layer 1 at build and on every run (a scope edited mid-run
+  stops the next one) and Layer 2 as `sweep_block`, not `send_block`: an automated sweep's traffic
+  holds an operator's exclude. They are charged to `max_requests` through `Budget` (`CappedBackend`
+  implements it, so `Progress#requests` counts them), held to the run's rate through its `pace`, and
+  a stop lands between two steps. A Miner probe the gate refused after the cap had charged it is
+  refunded, since the cap sits outside that decorator; a `reserve` that does not fit sticks
+  `cap_reached?`, so that refund cannot reopen the budget and let the mine mark every remaining
+  name tested. The plan-time race budget counts the macro's one run of steps with the group, and
+  calibration holds back one candidate plus its steps, because neither can be split at the cap.
+- **A macro that cannot change what is sent is refused.** Extraction and injection meet at a
+  `$BIND.NAME` in the request the candidate goes out as. If no candidate can name a binding the steps
+  rebind (a captured template is sent as captured and substitutes nothing, `Fuzz::Sender#evidence?`),
+  every candidate would carry the stale value and the sweep would report `403` as verdicts, so the
+  plan refuses, naming the two ways out. Same for a project with no enabled extract rule, and a step
+  holding live `§…§` markers or a WebSocket handshake.
+- **Where it hooks.** The Fuzzer gates each candidate attempt in the engine (`candidate_send`,
+  `ws_send`, `race_send`, the calibration samples; not a redirect hop, which carries no template).
+  The Miner has no fixed candidate list, so it gates each request the engine puts on the wire with a
+  `Fuzz::Backend` decorator (`Miner::MacroBackend`), like `HookBackend`, which is what reaches the
+  baseline: an app that rotates a token per request answers an un-tokened calibration probe with
+  the same `403` as a candidate.
+- **Visible, and never a value.** History rows with source `macro` (`source_ref` `macro step N`), one
+  event per failure (capped per run), a plan line before the run, a tally in `Progress`. Messages carry
+  binding names and counts. The TUI Miner popup, which has no text field, picks one saved session by
+  id from the project; several steps and `expect` are CLI and MCP. Left for later: a per-slot
+  macro (the steps a slot owns and a run can borrow); per-worker token contexts, which would let a
+  per-request macro keep its concurrency for a target whose token is per connection rather than per
+  session; and recording the macro on a saved fuzz run, which is a `fuzz_runs` column and so a
+  schema change for a reporting field. Until then a saved run's macro is in the plan line it
+  printed, the `macro`-sourced History rows, and the `macro:`-prefixed rows of any candidate it
+  failed.
+
+### 2026-09-30: a profile may serve a tool in one mode, and one table spells every argument alias (#1392–#1395)
+
+Refines: [P1](#p1), [P4](#p4). `gori mcp` — `ToolFilter`, `Tools#tool`, `Tools#call`.
+
+- **A profile can withhold arguments, and naming the tool lifts it.** `@recon` needed the passive
+  `probe_scan` that fills the triage list it already carried, and not the active half that sends.
+  Splitting the tool in two would have grown every catalogue to serve one profile, so a `Profile`
+  carries `withheld` (tool → arguments): they leave that tool's emitted schema, so the argument
+  validator — harvested from the same output — refuses them with no second list, and `Tools#call`
+  answers a SET one with `TOOL_DISABLED` naming the spec (a `false` is dropped, since it asks for
+  the mode that is served). The description has to follow the schema, or it advertises a refused
+  mode. Any other term that selects the tool (a name, a glob, the "everything" a leading
+  subtraction starts from) serves it whole: the profile is a default, the operator's term a decision.
+- **Aliases are one table, advertised and folded, never `required`.** `Tools::ARG_ALIASES` names
+  alias → canonical per tool. `tool` emits the alias as a copy of the canonical's schema (every
+  schema is `additionalProperties:false`, so an unadvertised alias is refused client-side) and
+  drops the canonical from `required`, because "one of these two" is not expressible at the top
+  level in the schema subset clients accept and `required: ["id"]` rejects `{flow_id}`; `call`
+  enforces the requirement instead, naming both. `call` folds the alias before dispatch, so no
+  handler knows aliases exist; two spellings with different values are refused.
+- **A read tool may write per call, and is then treated as a writer for that call.** `probe_scan`
+  (`active`, now `persist`) was the one case; `export_openapi{output_path}` joins it. Such a tool
+  is `read_only: false`, refused per call under `--read-only` and under the permission group the
+  mode belongs to (`call_denied_permission`), and logged as an agent action per call
+  (`agent_action?`) — while its report-only mode stays served everywhere.
+- **The default body is small only when the rest is reachable.** `get_flow` and a recorded or saved
+  `send_request` inline `AUTO_BODY_BYTES` of a body when the call names no size, with a `more`
+  pointer to `get_response_body_chunk`. An unrecorded send keeps the full default: cutting a body
+  there would leave its tail nowhere to be paged from. `outputSchema` and a shorter text form were
+  declined: MCP says structured output SHOULD be mirrored in text, and gori declares no schema
+  the `{items}` wrapper could contradict (see `Server#emit_structured`).
+
+### 2026-09-30: a Sitemap root is an origin, and a tag still belongs to the host (#1371)
+
+Refines: [P3](#p3), [P7](#p7). #1371, #1372.
+
+The tree was rooted on the bare host, so `http://h:19021`, `http://h:19022` and `https://h:8443`
+were one root: `paths` output could not be turned back into a URL, and every row action resolved
+"the path on this host" to whichever service answered it last (Discover from a host row guessed
+`https://<host>`). A root is now one ORIGIN — scheme, host and port (`Sitemap::Origin`, labelled
+by `Url.authority`) — built from `Store#sitemap_origin_entries`, and everything read off a row
+keeps to it: `representative_flow_id` and `js_ref_sightings` take the scheme and port, the
+parameter inventory keys its rows by origin, the OpenAPI target set is keyed by `Sitemap::Origin`,
+and the CLI and MCP narrow the same two reads with `--origin` / `origin`.
+
+- **Identity and host questions are kept apart.** A row's identity (marks, anchors, expand
+  state) is its root's label; a question a host answers — a `host` scope rule, a scope marker, a
+  `string` scope seed (port-free by `QL::URL_EXPR_NO_PORT`) — is asked about `Node#host`. The
+  label is display, never a key into host-keyed data.
+- **A tag stays keyed on (host, path).** V17's key is the host, and `sitemap tag --host` and
+  `set_sitemap_tag` name one. A memo therefore shows under every origin of its host, and a commit
+  stamps all of them in place. Per-origin tags would be a key change on three surfaces and a
+  schema version; nothing asked for one.
+- **The host-level tree stays for the retest diff.** `Sitemap.build` over (host, method, target)
+  triples is what `Diff::Templates` folds: it compares hosts across two engagements, where the
+  ports a service ran on need not match. MCP `list_sitemap` keeps `collapse_transport` as its
+  documented host-level merge.
+- **A JavaScript reference is keyed by origin too (V43).** `js_refs` was `UNIQUE(host, path,
+  flow_id)`, so a bundle naming `http://h:8080/p` and `https://h/p` kept one; the rebuild adds
+  scheme and port and copies the rows as they are, so nothing is rescanned. A reference to an
+  origin the tree lacks grows a root when its host is known, and not when that origin has captured
+  traffic a lens hid (`JsRefNode#origin_captured`), which is re-derived after any delete: flow ids
+  are never reused (V39), so rows were deleted exactly when the count grew by less than the
+  newest id did.
+- **Cost.** The origin read selects five columns of the same covering index; at 100k flows it is
+  6.6 ms against the host read's 4.5 ms, on a reload that runs only while the tab is active. With
+  hide-static on it reads the wide index rather than `idx_flows_sitemap_nonstatic`, which lacks
+  scheme and port; widening that index is a migration of its own and was not needed to stay
+  covering and sort-free.
+
+### 2026-09-30: `gori run` defaults are for scripts: a pinned default project, one JSON shape, curl's letters (#1383, #1386, #1387)
+
+Refines: [P1](#p1), [P7](#p7). Issues #1383–#1389, from dogfooding 0.7.1.
+
+A script reads what the CLI prints and nothing else, so a default a human would notice and correct
+is a default a script silently obeys. Three were wrong in that way.
+
+- **The default project is pinned, not guessed.** "Most recently active" is a fact about the last
+  WRITE, so `notes create --project demo` re-aimed every later `--project`-less command. The CLI now
+  reads, in order, `GORI_PROJECT` and a persisted `gori run project switch` pin before that fallback
+  (`CLI::Run.default_project`), and a pin that names nothing is REFUSED, never skipped — falling
+  through to the recent project is exactly the re-aim the pin exists to stop. This is `gori run`
+  resolution only: `ProjectRegistry.default_of` is unchanged, the TUI opens what the operator picks,
+  and MCP keeps its own binding (`GORI_MCP_PROJECT`, the workspace). Not done: making an explicit
+  `--project` write leave the recent-project order alone; that order is the db's mtime, shared with
+  the TUI picker, and the pin makes it irrelevant to a script.
+- **`json` is one document, `jsonl` is lines, on every command.** `history` and `capture` answered
+  `json` with JSON Lines while every other command answered with an array, so `| jq length` meant
+  two things. Streaming stays streaming: `history` writes its array row by row, and `capture` opens
+  its array at once and closes it from the printer's `ensure` on `--for`, `--max` or a signal, so
+  what a consumer collects is always one document. `fuzz`'s array is written in index order through
+  a reorder buffer that holds only the concurrency window. `--json` is registered by the same
+  helper as `--format` (`CLI::Run.format_flag`) so it cannot be missing from a new command.
+- **A curl-shaped command takes curl's letters.** `gori run send` borrowed curl's shape and gave
+  `-b` the body; a curl user's `-b 'admin=1'` became a body on a GET. `-d` is the body now (POST and
+  a form Content-Type unless `-X`/`-H` say otherwise), `-b` the cookie, joined with curl's `;`. A
+  `-b` value with no `=` — a cookie-jar file to curl, and the shape of an old `-b '{"a":1}'` body —
+  is refused rather than sent. The defaults live in the CLI's option handling, not in
+  `Repeater::UrlRequest.structured`, which MCP shares and whose `body` never meant curl's `-d`.
+
+Two shared seams moved down to make the parity real rather than copied: the send-error classifier
+(`Repeater::SendError`, formerly MCP's `network_error_kind`/`send_error_code`/`send_retryable?`) and
+Match & Replace for a direct send (`Repeater::RequestRules`, formerly MCP's
+`maybe_apply_request_rules`). Renaming the flags whose meaning differs across commands (`--target`,
+`--header`, `-n`, `--unsafe`, `--owner/--id`) is left to additive aliases; a rename would break the
+scripts this entry is about.
+
+### 2026-09-30: TUI key routes stop at the owning scope, and hints follow live bindings (#1374, #1375)
+
+Refines: the 2026-09-25 R1 entry above.
+
+- A focused sub-tab strip answers its raw navigation and mark keys, then resolves an unhandled
+  chord in `Scope::Global` only. The active tab and Editor scopes never receive a strip key.
+- Key chips and help text that name a rebindable action derive the key from the registry. When a
+  pane is unfocused, its state chips name the state instead of implying its key is active there.
+- Intercept's empty-state card only shows forward, drop, filter and direction keys while its body
+  is focused; otherwise it tells the operator to focus the body first.
+- `↑` at the first line in Repeater INS is editor motion; only READ mode can hand that edge to
+  the focus ring. Capture-off is a yellow `OFF` signal in the top-bar listener chip.
+
+### 2026-09-30: cancelling a one-shot MCP send closes its socket (#1391)
+
+Refines: [P4](#p4), [P1](#p1). MCP `notifications/cancelled` (#1391).
+
+The 2026-09-20 cancellation decision treated `send_request` and `send_websocket` as indivisible
+one-shot work. That left a silent origin holding the only MCP worker until its timeout, blocking
+every later tool call even though the reader had already handled the cancellation. The request's
+own cancellation remains cooperative: while an HTTP or WebSocket engine owns its one-shot socket,
+a bounded watcher polls the same non-consuming predicate and closes that socket when the client
+cancels. HTTPS has two ownership phases: the shared dial watches the underlying transport socket
+while OpenSSL performs the TLS handshake, then the sender watches the completed SSL socket during
+the exchange. TCP connect itself keeps its existing timeout. The watcher is joined before the
+engine returns, so cancellation releases both the connection and its fiber; no default timeout
+changes. Loopback TLS specs cover a silent post-handshake read and an origin that stalls after
+ClientHello, including the SSL close-from-watcher path. The server still emits no response for a
+cancelled JSON-RPC id, as required by MCP.
+
+**The worker stays serial.** `Store` reads have a WAL pool and writes still funnel through its
+single writer, but the shared `Tools` instance also carries per-call cancellation state, current
+project bindings, and operator-note claims. Running nominally read-only calls beside a send would
+need a broader per-call state and project-switching design; closing the canceled send already lets
+the queued call proceed promptly without adding that concurrency surface.
+
+### 2026-09-30: denied MCP permissions leave a bounded Activity marker
+
+An attempted call to a switched-off Preferences permission is evidence that the operator's gate
+refused an action, even though no handler ran. Record it as `agent_permission_denied`, separate
+from `agent_action` so readers do not treat a refusal as executed work. Keep only the tool and
+permission group; never persist the call arguments. Coalesce repeated denials for the same
+tool/group for the lifetime of that MCP server's binding to a project, so a retry loop writes one
+row rather than one per call. The existing project event retention remains the outer disk bound.
+The globally read-only MCP mode has a read-only store and therefore cannot write this marker;
+neither can an unbound server with no project event feed.
+
+### 2026-09-30: a bare-LF response head is accepted, framed off its LF reading, and never reused
+
+Refines: [P7](#p7), and the response half of the framing rule (`Http1.framing_ambiguous?`).
+
+An origin that ends its response-head lines on a bare LF (`HTTP/1.1 200 OK\n…\n\nbody`) was
+never framed: every head reader stopped only on CRLFCRLF, so a close-delimited origin's reply
+reached the client as nothing and a keep-alive one stalled to the head deadline, while the same
+page rendered direct. RFC 9112 §2.2 lets a recipient accept a lone LF and browsers do; embedded
+devices and legacy CGI are exactly what an operator points gori at.
+
+- **Responses only.** `Http1.read_response_head_result` is the one upstream response reader (the
+  proxy, `Repeater::Engine` and so every active tool, the WebSocket handshake) and also ends a
+  head on its EARLIEST blank line, `\n\n`, `\r\n\n` and `\n\r\n` included — once a start-line
+  has arrived, so a stray `\n\n` in front of the next response is read past as before. A request
+  head stays CRLFCRLF-only: its peer is the operator's own client, which is why the request rule
+  is the blunt one.
+- **A CRLF-only reader is still a party.** It does not stop at a bare-LF blank line; it reads on
+  to the next CRLFCRLF (`…\r\nX: a\n\r\nContent-Length: 5\r\n\r\n`). When that CRLFCRLF is
+  already buffered and the two readings frame the body differently, the reader returns the
+  LONGER head, which then parses strictly and is refused by `framing_ambiguous?`. "Differently"
+  is the framing values disagreeing, or, with the same values, a body being declared at all
+  (a Content-Length other than 0, any Transfer-Encoding): the body then starts at a different
+  byte for each reader. With no body declared only the head/body split inside the one message
+  differs — a close-delimited body ends at the close for every reader, a length-0 one ends at
+  gori's head and the rest stays on a connection gori retires and flags — so that head is
+  kept. The same rule now covers a CRLFCRLF head that a lenient reader ends early, which main
+  forwarded framed by the longer head. The cost, accepted: an
+  LF-only head that declares a length, followed in the same segment by a body holding a CRLF
+  blank line, is refused too, because a strict reader genuinely frames that message otherwise.
+  A CRLFCRLF not yet buffered cannot be seen; the next two points bound that.
+- **The terminator picks the reading.** `parse_response_head` reads a head ENDED on a bare-LF
+  blank line on LF (a CR before the LF goes with it); every other head keeps the strict CRLF
+  scan, including a CRLFCRLF head with a bare LF inside, which `framing_ambiguous?` keeps
+  comparing as before. For an LF-terminated head the comparison is between two LF-lenient
+  readers, and a lone CR, an obs-fold or whitespace before the colon on a framing header is
+  still refused. Stored heads take the same parse, so Probe, export, evidence and MCP see the
+  status and headers, and `strip_header_lines` (Alt-Svc, WebSocket extensions) walks the same
+  lines, so it still never sees a field the parse does not.
+- **Bytes stay as they came.** Nothing rewrites an LF to CRLF, on the wire or in the capture.
+  Response Match&Replace is not applied to such a head (the flow says so): every rewrite helper
+  frames a head as CRLF lines, and a rewritten bare-LF head ends somewhere else for the client.
+  A held one is split at the same blank line the reader used (`Http1.response_head_end`).
+- **One response per connection.** A connection on which any head of the exchange (an interim
+  1xx included) ended on a bare-LF blank line is never reused (`ClientConn#origin_keep_alive?`,
+  `ConnPool.reusable_response?` via `Result#lf_framed?`), and the proxy checks the retired
+  socket for bytes waiting past the framed body without blocking (`Proxy::SocketResidue`, the
+  pool's checkout probe, moved under the proxy for this) and says so on the flow — the leftover
+  can no longer surface as the next request's response. `send_pipeline` is left alone (a group
+  send on one socket is the operator's own desync test); Probe's request_smuggling treats a
+  bare-LF leg of its differential as inconclusive rather than a Critical.
+- **Visible.** Probe's passive `bare_lf_response` flags any bare LF in a response head.
+
+h2 has no line endings and is unaffected.
+
+### 2026-10-01: a held message is evidence; the intercept editor expands only the names the operator typed (#1416)
+
+Refines: [P7](#p7), and the parity invariant for the intercept edit (AGENTS.md "Three surfaces").
+
+The TUI intercept editor ran the `$ENV`/`$GEN` pass, with every escape consumed, over the whole
+buffer, and that buffer is seeded from the held message's own bytes. So appending one byte to a
+request line substituted a project secret into a captured `a=$ENV.FOO`, minted a value for a
+captured `$GEN.UUID`, turned `pa$$word` into `pa$word`, and resynced Content-Length to match —
+for a held response too. CLI `intercept edit` and MCP `intercept_forward_edit` forward verbatim,
+so the same edit put different bytes on the wire depending on the surface.
+
+- **Per name, the Repeater's evidence rule.** A name the held message arrived with stays literal
+  (`Env.literal_keys` of the seed, passed to `Env.expand_wire(literal:)`, which covers GEN as
+  well as ENV in the one pass); a name the operator types is still a reference, which keeps
+  #524's typed `Authorization: Bearer $ENV.TOKEN`. When a typed name collides with a captured
+  one, gori cannot tell the occurrences apart and evidence wins. The set is re-derived from the
+  seed bytes on `Env.highlight_rev`, and the editor is handed the same bytes to paint.
+- **No escape is consumed** (`unescape: Owns::None`): a `$$` in captured bytes is two bytes the
+  client sent. The accepted cost is the one every evidence path already pays — an operator's own
+  `$$ENV.X` is forwarded as typed.
+- **Not head-only.** Expanding the head and treating the body as bytes would still substitute
+  into a client header or query string that carries `$ENV.X`; the axis is provenance, not where
+  in the message the byte sits.
+- **The surfaces still differ, by design and only there.** CLI and MCP expand nothing; the TUI
+  additionally resolves names the operator typed into the held message. Neither expands or
+  unescapes a `$` the client sent (both still resync Content-Length and promote the head's bare
+  LFs, which are the edit's framing, not its tokens).
+
+### 2026-10-02: READ-mode editors delete and paste; `dd`/`yy` are a two-press operator, not a chord
+
+Refines: the 2026-09-12 keyset entry (a keyset is a mapping) and R1 of "one bare letter, one
+question". Both said there is no delete in a READ pane, so a keyset had nothing to put on `dd`.
+The operator asked for the edit itself: in gori's helix grammar, select and then act (`x` then
+`d` / `y`, and `p`); under the vim keyset, `dd`, `yy` and `p`.
+
+- **One engine, replayed through the pane's own key path** (`Tui::ReadEdit`). A READ-mode edit
+  enters INSERT, hands the span to the editor, and replays ⌫ or a paste through the same
+  `handle_key` a refused bulk paste uses (`Runner#replay_paste`). It never splices a buffer
+  itself, because eight panes each do their own work after an edit — Content-Length, the
+  Fuzzer's `§` guard, a note's save — and a direct splice would skip it. `p` is therefore the
+  operator's own paste in every respect P7 cares about. Leaving INSERT goes through the pane's
+  `editor_exit_insert`, which now does what `esc` does everywhere: an Issue's notes save there,
+  and a save refused over a peer's rewrite keeps INSERT and its own message.
+- **The paste register is gori's own** (`Tui::Register`), filled by every `Clipboard.copy` and
+  every READ-mode delete. It does not read the system clipboard: OSC 52's read half is refused
+  or prompted for by most terminals, and `pbpaste`/`wl-paste` exist on no SSH session. Outside
+  text still arrives by terminal paste, which opens INSERT (#1124). A delete fills the register
+  only, so it never overwrites the operator's system clipboard. Whole-line copies and deletes
+  are LINEWISE and paste as lines below the caret's line; the writer states it.
+- **`dd` / `yy` are held by the Runner, not the keymap.** `editor.delete-line` and
+  `editor.yank-line` are keyless verbs the vim keyset puts on `d` and `y`; the first press arms
+  (`Runner#finish_editor_op`), the same verb again runs it on the caret's line, `esc` cancels,
+  and any other key cancels with a word. The second press is taken ahead of the digit family,
+  so `d2` cannot jump to tab 2. There are no motions after an operator, no counts and no named
+  registers: `dw` is cancelled, not guessed at.
+- **R1 gains a rule-based exemption, `EDITOR_EDITS`** (`spec/tui/menu_letter_meaning_spec.cr`).
+  Inside a text editor `d`, `y` and `p` are the editor's letters. A dropped `space` before the
+  menu's `d` (Duplicate, Delete issue) or `y` (Copy) edits or copies the text in that pane: one
+  buffer, undoable (a delete in one `^Z`, a paste the way a terminal paste in that pane undoes),
+  and a toast that says what happened. The set names verbs, and the guard holds
+  each member to Scope::Editor, READ-only availability and the `:none` band; it is never a send,
+  a triage or a wipe. The same pass stopped treating a row drawn only on the sub-tab strip as an
+  editor view, since `Runner#editor_pane?` needs body focus.
+- **The verbs never gate on "is there a selection".** A false `available?` would let `d` fall to
+  the tab's own `d`, which deletes the selected flow, issue or rule in sixteen scopes. In an
+  editor pane the letter is the editor's; a `d` with nothing to delete says so.
+
+### 2026-10-03: how far the vim keyset goes, and the four tests a new vim key has to pass
+
+Refines: the 2026-09-12 keyset entry and the 2026-10-02 READ-edit entry. gori is a proxy whose
+text panes hold requests, notes and tokens; a vim hand should not trip on its reflexes there,
+but gori is not becoming vim. A review of the keyset found it short on the basics: `h`/`l`
+moved only in the Repeater, a line selection grown by one row cut mid-line on a delete, and
+`esc` left the pane with the selection still armed for the next `d`. Fixing those and adding
+`w`/`b` and `⇧A`/`⇧I` drew the line this entry records. A vim key is added only when it passes
+all four:
+
+1. **The operation already exists in the editors.** The keyset names keys; it does not grow
+   editing operations (2026-09-12). `w`/`b` are the editor's ⌥←/→ word step; `⇧A`/`⇧I` are
+   End/Home then INSERT, as `a` is one column then INSERT. `e` (end of word) has no such
+   operation and is not offered.
+2. **One keystroke, or the one two-press operator.** `dd`/`yy` stay the only sequences
+   (2026-10-02). No counts, no motion after an operator, no text objects, no `.` repeat, no
+   `:` commands. `g` alone is the top.
+3. **It takes no key gori already answers in that pane.** A menu letter it meets is fine when
+   the vim key only moves, selects or starts typing (`VIM_MOTIONS`); a live binding is not.
+   That is why `$` (it arrives as ⇧4, the Global sub-tab jump) and `0` (Go to tab) are left
+   to End and Home.
+4. **A vim hand does it without thinking in a pane holding a request.** Move, select a line,
+   delete or yank it, paste, undo, find, start typing. `x`, `o`/`O`, `J`, `r`, `c`, `v`,
+   `n`/`N`, marks and macros fail this test or test 1, and stay in INSERT or out.
+
+Where a fix is not vim-specific it is not keyset-gated: `h j k l` in every READ pane, a line
+selection that stays whole lines under ⇧↑/⇧↓, and `esc` over a READ selection clearing it
+(`Runner#handle_key`, ahead of every pane's own `esc`) apply under both keysets. The one
+vim-only behaviour is the plain `j`/`k` that grows a `⇧V` selection, which is what makes `V`
+usable at all, and with it `g`/`⇧G` grow the selection to an edge (`V` `G` `d`); the keyset
+is named at select time (`TextReadState#select_line`), so the wizard's practice pad answers in
+the keyset it is showing. At a pane's first or last line a held `⇧V` counts as a selection
+being grown (`TabController#editor_line_held?`, ORed into each READ ladder's `selecting`), so
+`k`/`j` there stay in the pane instead of handing focus on with the lines still armed; ⇧↑/⇧↓
+follow the same rule in every ladder now, as Project and Issues already documented.
+
+Discoverability goes to a playground in Preferences → Keys (the wizard's pad plus each
+keyset's full key list), not to more keys. It only tries: the keyset is set on the row above
+it, and a second setter in the card was one more way for the two to disagree.
+
+### 2026-10-03: Repeater scope follows the final request-target
+
+Refines: [§3](#s3) and the 2026-09-03 `verbatim` entry above.
+
+That entry deliberately left Layer 1 on `Plan#bytes` while Layer 2 followed the send seam, to
+avoid matching a path include against a live binding. The split let a strict MCP or CLI scope
+allow a draft path and then send a different, binding-expanded path. Every up-front Layer-1
+gate (MCP, `gori run`, Retest, macros, session refresh) now reads `Plan#scope_requests`, the
+same side-effect-free prediction Layer 2 already used, so a refused send fires no session
+refresh first. `Repeater::Sender` repeats Layer 1 on the real wire, which a refresh can still
+move. Refusals never print the expanded target. `verbatim` still decides whether bindings
+resolve; when they do, the scope rule follows the bytes that leave gori.
+
+### 2026-10-04: the held Intercept editor opens in READ, and catch holds requests by default
+
+Refines: the 2026-09-12 entry "the editor keys are verbs, and the focus dimension is a scope at
+the head of the chain", which the Intercept's held-message editor had never joined.
+
+A first-time walkthrough found two Intercept defaults that disagreed with the rest of gori.
+`⇥` into the held message opened it in INS, so the `i` that the tour, the Repeater and the
+Fuzzer all teach as "enter INS" became a byte (`iGET /…`). The pane now opens in READ when the
+focus ring enters it, through the same `EditorPane` / `TextReadState` seam the Repeater and
+Fuzzer use: it joins `Scope::Editor`, `i`/`↵` enter INS, `esc` steps INS → READ → queue, and
+the border draws the real mode. `↵`/`e` on the queue still mean "edit" and go straight to INS.
+Holding is unchanged. READ navigation and selection leave the buffer alone; the READ edits
+(`d`, `p`, `dd`, undo) reach it through `Scope::Editor`, which replays them through the pane's
+own INS path (`ReadEdit`), so they mark the hold edited exactly as typing does. A forward of a
+hold nobody edited is still the held bytes verbatim (P7).
+
+Catch defaulted to both legs, so forwarding a request held its response too and the client hung
+until a second `f`, while the tour said "Intercept holds each request". The default is now
+requests only, and `c` cycles requests → responses → both. An explicitly chosen direction
+(TUI, `gori run intercept direction`, MCP `intercept_set_direction`) behaves exactly as before.
+The cost is that a `status:` condition, which only a response can match, now needs `c` set to
+responses or both before it holds anything. Every surface says so rather than refusing it, since
+either half can change next: the TUI condition bar and its toasts, and a `note` beside the
+`intercept_set_filter` / `intercept_set_direction` ack and on `gori run intercept filter` /
+`direction` (`Interceptor.direction_note`, over `InterceptFilter.response_fields`).
+
+### 2026-10-04: the setup wizard no longer asks for an editor keyset
+
+Reverses the wizard's KEYS step (#1462); the keyset itself and the Preferences → Keys
+playground (2026-10-03 entry above) are unchanged.
+
+A first run asked "how should a text editor's READ keys feel?" with a practice pad, before the
+user had opened a single editor. That is jargon and a decision a beginner cannot make yet, and
+the default (helix-ish) serves them fine. The wizard is now NETWORK → THEME → COMPANION →
+REVIEW and never writes `editor_keyset`, so re-running `gori wizard` keeps a choice made in
+Preferences. REVIEW's Editor keys row shows the saved keyset and the palette entry that changes it
+(Settings: Keys, its title read from the registry; no chord, since REVIEW's Shortcuts row can
+change the palette's modifier before finish). MIN_H stays 15: REVIEW was already the tallest step.

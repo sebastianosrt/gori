@@ -8,8 +8,7 @@ module Gori
         {"authorize [<id>…]", "Replay requests under several identities to find broken access control"},
       ])]
       private def self.cmd_authorize(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         flow_ids = [] of Int64
         query : String? = nil
         limit = Authorize::Plan::DEFAULT_LIMIT
@@ -19,9 +18,12 @@ module Gori
         insecure = false
         timeout = Authorize::ACTIVE_TIMEOUT
         format = :text
-        positional = [] of String
 
-        parser = OptionParser.new do |p|
+        # `-q '-path:/x'` reads as another flag unless it is rewritten to `--query=…` first —
+        # the same normalization history/probe do. (Negation terms are NOT lifted out of argv
+        # here the way they are there: a positional on this command is a flow id, not a query,
+        # so a bare `-path:/x` is a usage error rather than a term to fold in.)
+        positional = parse_args(normalize_query_flag(args), "gori run authorize") do |p|
           p.banner = "Usage: gori run authorize [<flow-id>…] [options]\n\n" \
                      "Replay each selected flow under every IDENTITY — a header overlay standing in\n" \
                      "for an admin session, a low-privilege user, an anonymous client — and judge\n" \
@@ -37,42 +39,48 @@ module Gori
           p.on("--flow=ID", "Replay this captured flow (repeatable; same as a positional id)") { |v| flow_ids << parse_flow_id(v, "gori run authorize") }
           p.on("-qQL", "--query=QL", "Also replay every flow matching this QL query (host: path: status: …)") { |v| query = v }
           p.on("-nN", "--limit=N", "Max flows --query may contribute (default #{Authorize::Plan::DEFAULT_LIMIT})") { |v| limit = parse_count(v, "--limit") }
-          p.on("--identities=FILE", "Identity set as JSON ('-' = stdin); default: the project's saved set") { |v| identities_file = v }
-          p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
+          p.on("--identities=FILE", "Identity set as JSON ('-' = stdin, which needs a pipe or a redirect — a terminal is refused); default: the project's saved set") { |v| identities_file = v }
+          project_options(p, proj, "read")
           p.on("--unsafe-methods", "Also replay POST/PUT/PATCH/DELETE — each identity re-runs the side effect") { unsafe_methods = true }
+          # `probe --active`'s spelling of the same permission (#1389).
+          p.on("--unsafe", "Alias for --unsafe-methods") { unsafe_methods = true }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("-k", "--insecure-upstream", "Do not verify upstream TLS certificates") { insecure = true }
           p.on("--timeout=SEC", "Per-request connect + idle timeout (seconds)") { |v| timeout = parse_count(v, "--timeout").seconds }
-          p.on("--format=FMT", "Output: text (default) | json (one array at the end) | jsonl (streamed)") { |v| format = parse_format(v, [:text, :json, :jsonl]) }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          # BOTH halves: the second is everything after a `--`, which a handler binding only the
-          # first silently discards (see spec/cli_spec.cr's source guard). Here that would drop
-          # flow ids — `gori run authorize -- 42` would refuse with "no request selected".
-          p.unknown_args { |before, after| positional = before + after }
-          p.invalid_option { |f| abort "gori run authorize: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run authorize: missing value for #{f}" }
+          format_flag(p, [:text, :json, :jsonl], "Output: text (default) | json (one array at the end) | jsonl (streamed)") { |f| format = f }
         end
-        # `-q '-path:/x'` reads as another flag unless it is rewritten to `--query=…` first —
-        # the same normalization history/probe do. (Negation terms are NOT lifted out of argv
-        # here the way they are there: a positional on this command is a flow id, not a query,
-        # so a bare `-path:/x` is a usage error rather than a term to fold in.)
-        parser.parse(normalize_query_flag(args))
+        refresh_verify_upstream(!insecure)
         positional.each { |s| flow_ids << parse_flow_id(s, "gori run authorize") }
         # An unrecognized/uncompilable term makes the selection BROADER than asked, and every
         # extra row here is `identities.size` more requests on a target.
         query.try { |q| Run.warn_query_terms("authorize", q) }
 
+        # …and ABOVE the read, because the read can block: "no flow id and no --query" is
+        # complete the moment the arguments are parsed, and reporting it after a `-` pipe has
+        # been drained (and the project opened, and scope loaded) spends the operator's
+        # generator on a verdict nothing in it could change. The condition has one home in the
+        # builder and the sentence one home below, so neither is re-derived here.
+        if Authorize::Plan.no_selection?(flow_ids, query)
+          authorize_plan_abort(Authorize::Plan.no_target_error)
+        end
+
         # Read the identity file BEFORE opening anything: an unreadable path is the operator's
         # typo, and it should not cost a project open (or a scope load) to hear about it.
-        identities_json = identities_file.try { |f| read_input_file(f, "gori run authorize", stdin: true) }
+        identities_json = identities_file.try do |f|
+          read_input_file(f, "gori run authorize", stdin: true,
+            noun: "identity set", flag: "--identities=-")
+        end
+        if (raw = identities_json) && (why = Authorize.explicit_json_error(raw))
+          abort "gori run authorize: --identities: #{why}"
+        end
 
-        store = open_store(resolve_read_project(project_name, db_path))
+        project = resolve_read_project(proj.name, proj.db)
+        store = open_store(project)
         # Authorize ALWAYS has a project in play (the flows and the identities both come out of
         # one), so this is `project_outbound`, never the optional variant: an omitted --project
         # resolves the most-recently-active project, which is exactly the case where
         # short-circuiting on "no --project given" would drop Sandbox containment.
-        outbound = project_outbound(project_name, db_path, allow_unscoped)
+        outbound = project_outbound(project, allow_unscoped)
         plan = begin
           # `overrides` is a SNAPSHOT off the read connection already open here, not a second
           # `open_store` the way `cli_host_overrides` does it for fuzz/mine/sequence: those
@@ -119,8 +127,8 @@ module Gori
       private def self.run_authorize(plan : Authorize::Plan, format : Symbol) : Nil
         total = plan.targets.size
         ids = plan.identities.size
-        STDERR.puts "authorizing #{total} request#{total == 1 ? "" : "s"} × #{ids} identities " \
-                    "(#{plan.identities.map(&.name).join(", ")}) = #{plan.total_sends} requests"
+        STDERR.puts "authorizing #{Gori.plural(total, "request")} × #{ids} identities " \
+                    "(#{CLI::Output.term_safe(plan.identities.map(&.name).join(", "))}) = #{plan.total_sends} requests"
         report_authorize_skips(plan.skipped)
 
         buffered = [] of Authorize::Target
@@ -235,7 +243,7 @@ module Gori
 
       private def self.report_authorize_skips(skipped : Array(Authorize::Skipped)) : Nil
         return if skipped.empty?
-        STDERR.puts "skipped #{skipped.size} flow#{skipped.size == 1 ? "" : "s"} · #{Authorize::Plan.skip_tally(skipped)}"
+        STDERR.puts "skipped #{Gori.plural(skipped.size, "flow")} · #{Authorize::Plan.skip_tally(skipped)}"
         skipped.each { |s| STDERR.puts "  #{authorize_skip_text(s)}" }
       end
 
@@ -254,9 +262,12 @@ module Gori
       # every run-producing tool (fuzz, mine, discover, sequence) draws it this way.
       private def self.emit_authorize_target(t : Authorize::Target, format : Symbol, index : Int32,
                                              buffered : Array(Authorize::Target)) : Nil
+        # `json` holds every target until the drain ends, so it keeps only what
+        # `authorize_array_json` prints — the request and body bytes are the TUI's
+        # (`Target#without_bytes`).
         case format
         when :jsonl then puts CLI::Output.authorize_target_json(t)
-        when :json  then buffered << t
+        when :json  then buffered << t.without_bytes
         else
           puts "" if index > 0
           puts CLI::Output.authorize_target_text(t)
@@ -335,9 +346,12 @@ module Gori
             "[{\"name\":\"anonymous\",\"remove\":[\"Cookie\"]}]. An entry with no \"name\" is " \
             "skipped and a malformed file reads as empty, so check the JSON parsed"
           else
-            "this project has no identities saved besides the baseline — add them in the TUI " \
-            "Authorize tab, or pass --identities FILE with at least one, e.g. " \
-            "[{\"name\":\"anonymous\",\"remove\":[\"Cookie\"]}]"
+            # Identities ARE session slots (`Authorize::Identity`), so the headless way to save
+            # one is `session add` — named first, because a CLI user reading this has no TUI open.
+            "this project has no identities saved besides the baseline — add them with " \
+            "`gori run session add --name NAME --set 'Cookie: …'` or `--remove Cookie` (every session slot is an identity; " \
+            "`gori run session list` shows them) or in the TUI Authorize tab, or pass " \
+            "--identities FILE with at least one, e.g. [{\"name\":\"anonymous\",\"remove\":[\"Cookie\"]}]"
           end
         in Authorize::PlanError::Reason::DuplicateIdentity
           "two identities are called #{(ex.detail || "?").inspect} — in --identities, or in the " \

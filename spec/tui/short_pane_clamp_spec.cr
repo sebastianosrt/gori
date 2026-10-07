@@ -67,9 +67,9 @@ describe "FuzzerView CONFIG pane on a short pane" do
 end
 
 # `handle_detail` matched no arm for Home/End/PgUp/PgDn and its trailing `true` swallowed
-# them, and FuzzerController defines no `body_scroll`, so the Runner's
-# `page_nav_delta` → `body_scroll` fallback could not cover for it either. This pane was the
-# only ReadPane consumer in the tree with neither path.
+# them, and FuzzerController had no `body_scroll` (it has one for RESULTS only since #1443),
+# so the Runner's `page_nav_delta` → `body_scroll` fallback could not cover for it either.
+# This pane was the only ReadPane consumer in the tree with neither path.
 private def detail_view : FuzzerView
   body = (0...40).map { |i| "line #{i} ................" }.join("\n")
   view = FuzzerView.new
@@ -111,23 +111,23 @@ end
 
 describe "RepeaterView RESPONSE border chrome on a narrow pane" do
   # `Frame.chip` does not clip (its sibling `Frame.toggle_badge` documents the opposite
-  # contract). The three chips need ~40 columns from `rect.x + 12`, and RESPONSE is a
+  # contract). The three chips need ~27 columns from `rect.x + 12`, and RESPONSE is a
   # half-width split pane, so below ~88 cols the cluster ran through this card's own '╮'
   # and on over the OUTER frame's border — the row came out one cell longer than every
   # sibling row, ending in "p:pretty" instead of a corner.
-  it "keeps the chips inside the card at 80 columns" do
+  it "keeps the chips inside the card on a narrow pane" do
     Gori::Settings.pretty_bodies_default = false
     view = RepeaterView.new
     view.load_blank
-    b = MemoryBackend.new(80, 24)
-    view.render(Screen.new(b), Rect.new(0, 0, 80, 24))
+    b = MemoryBackend.new(70, 24)
+    view.render(Screen.new(b), Rect.new(0, 0, 70, 24))
 
     y = (0...24).find { |r| b.row(r).includes?("RESPONSE") }
     y.should_not be_nil
     row = b.row(y.not_nil!).rstrip
     row.should end_with("╮")                  # the card's own top-right corner survives
     row.includes?("p:pretty").should be_false # the chip that did not fit is dropped whole
-    row.includes?("d:diff").should be_true    # the ones that fit are still drawn
+    row.includes?("⇧D:diff").should be_true   # the ones that fit are still drawn
   end
 
   # Wide enough and every chip is back — the fix is a fit test, not a removal.
@@ -141,7 +141,7 @@ describe "RepeaterView RESPONSE border chrome on a narrow pane" do
     y = (0...24).find { |r| b.row(r).includes?("RESPONSE") }.not_nil!
     row = b.row(y).rstrip
     row.should end_with("╮")
-    row.includes?("d:diff").should be_true
+    row.includes?("⇧D:diff").should be_true
     row.includes?("^X:hex").should be_true
     row.includes?("p:pretty").should be_true
   end

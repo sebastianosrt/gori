@@ -1,4 +1,6 @@
 require "json"
+require "../../raw_json"
+require "../../utf8"
 require "./types"
 require "../../ascii_bytes"
 require "../../miner/inject"
@@ -90,10 +92,11 @@ module Gori
         private def introspection_response?(result : Repeater::Result) : Bool
           ct = response_content_type(result)
           return false unless ct.empty? || ct.includes?("json") || ct.includes?("graphql")
-          decoded, _ = Proxy::Codec::ContentDecode.decode(result.head, result.body, BODY_CAP)
-          bytes = decoded || result.body
-          return false if bytes.nil? || bytes.empty?
-          INTROSPECTION_RESULT.matches?(String.new(bytes[0, {bytes.size, BODY_CAP}.min]).scrub)
+          bytes = decoded_body(result.head, result.body)
+          return false unless bytes
+          # `Utf8.text` rather than `String#scrub` — same repair, but a valid body (which a JSON
+          # introspection result always is) skips the character walk. See `Gori::Utf8`.
+          INTROSPECTION_RESULT.matches?(Utf8.text(bytes))
         end
 
         # The shared gate both `plan` and `dedup_key` funnel through, returning {probe_method,
@@ -147,7 +150,10 @@ module Gori
           end
           return false unless AsciiBytes.contains_ci?(capped, QUERY_KEY)
           q = begin
-            JSON.parse(String.new(capped).scrub).as_h?.try(&.["query"]?).try(&.as_s?)
+            # Twin of the same gate in `Passive::Tech`, down to the `Utf8.text` spelling: the
+            # prefilter above has already decided this body is worth parsing, so the repair only
+            # has to not cost a full character walk on the valid bodies that reach it.
+            RawJson.parse(Utf8.text(capped)).as_h?.try(&.["query"]?).try(&.as_s?)
           rescue JSON::ParseException
             nil
           end
@@ -202,39 +208,12 @@ module Gori
           parts.size == 3 ? parts[2] : "HTTP/1.1"
         end
 
-        private def header_named?(line : String, name : String) : Bool
-          (c = line.index(':')) ? line[0...c].strip.downcase == name : false
-        end
-
         # Content-Length / Content-Type / Transfer-Encoding — the framing headers this rule sets or
         # drops itself; keeping a captured one would misframe the fixed probe body.
         private def body_framing_header?(line : String) : Bool
           return false unless c = line.index(':')
           name = line[0...c].strip.downcase
           name == "content-length" || name == "content-type" || name == "transfer-encoding"
-        end
-
-        private def path_only(origin_target : String) : String
-          qi = origin_target.index('?')
-          qi ? origin_target[0...qi] : origin_target
-        end
-
-        private def probe_status(result : Repeater::Result) : Int32
-          if r = result.response
-            return r.status
-          end
-          Proxy::Codec::Http1.parse_response_head(result.head).status
-        rescue
-          0
-        end
-
-        private def response_content_type(result : Repeater::Result) : String
-          if r = result.response
-            return (r.headers.get?("Content-Type") || "").downcase
-          end
-          (Proxy::Codec::Http1.parse_response_head(result.head).headers.get?("Content-Type") || "").downcase
-        rescue
-          ""
         end
       end
     end

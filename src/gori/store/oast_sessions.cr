@@ -68,14 +68,14 @@ module Gori
 
     def oast_sessions : Array(OastSessionRecord)
       list = [] of OastSessionRecord
-      @db.query("SELECT id, created_at, provider_id, kind, server_url, correlation_id, secret, private_key_pem, token, last_poll_at FROM oast_sessions ORDER BY id") do |rs|
+      @db.query("SELECT id, created_at, provider_id, kind, server_url, correlation_id, secret, private_key_pem, token, last_poll_at, provider_key FROM oast_sessions ORDER BY id") do |rs|
         rs.each { list << read_oast_session(rs) }
       end
       list
     end
 
     def get_oast_session(id : Int64) : OastSessionRecord?
-      @db.query("SELECT id, created_at, provider_id, kind, server_url, correlation_id, secret, private_key_pem, token, last_poll_at FROM oast_sessions WHERE id = ?", id) do |rs|
+      @db.query("SELECT id, created_at, provider_id, kind, server_url, correlation_id, secret, private_key_pem, token, last_poll_at, provider_key FROM oast_sessions WHERE id = ?", id) do |rs|
         return read_oast_session(rs) if rs.move_next
       end
       nil
@@ -83,10 +83,10 @@ module Gori
 
     def insert_oast_session(provider_id : Int64?, kind : String, server_url : String,
                             correlation_id : String, secret : String, private_key_pem : String?,
-                            token : String?) : Int64
+                            token : String?, provider_key : String? = nil) : Int64
       exec_task ->(c : DB::Connection) {
-        c.exec("INSERT INTO oast_sessions (created_at, provider_id, kind, server_url, correlation_id, secret, private_key_pem, token) VALUES (?,?,?,?,?,?,?,?)",
-          now_us, provider_id, kind, server_url, correlation_id, secret, private_key_pem, token)
+        c.exec("INSERT INTO oast_sessions (created_at, provider_id, kind, server_url, correlation_id, secret, private_key_pem, token, provider_key) VALUES (?,?,?,?,?,?,?,?,?)",
+          now_us, provider_id, kind, server_url, correlation_id, secret, private_key_pem, token, provider_key)
         nil
       }
     end
@@ -101,28 +101,6 @@ module Gori
         c.exec("UPDATE oast_sessions SET last_poll_at=? WHERE id=?", now_us, id)
         nil
       }
-    end
-
-    def delete_oast_session(id : Int64) : Nil
-      exec_task ->(c : DB::Connection) {
-        c.exec("DELETE FROM oast_callbacks WHERE session_id = ?", id)
-        c.exec("DELETE FROM oast_sessions WHERE id = ?", id)
-        nil
-      }
-    end
-
-    # Incremental (watermark) load: callbacks with id > since_id, oldest first. Callbacks are
-    # append-only, so the caller keeps @max_seen_id and never re-selects the whole table.
-    def oast_callbacks(session_id : Int64, since_id : Int64 = 0) : Array(OastCallbackRecord)
-      list = [] of OastCallbackRecord
-      @db.query("SELECT id, session_id, created_at, provider_uid, protocol, method, source_ip, full_id, raw_request, raw_response FROM oast_callbacks WHERE session_id = ? AND id > ? ORDER BY id", session_id, since_id) do |rs|
-        rs.each do
-          list << OastCallbackRecord.new(
-            rs.read(Int64), rs.read(Int64), rs.read(Int64), rs.read(String), rs.read(String),
-            rs.read(String?), rs.read(String?), rs.read(String), rs.read(Bytes), rs.read(Bytes?))
-        end
-      end
-      list
     end
 
     # Watermark load across ALL sessions: callbacks with id > since_id, oldest first. One
@@ -142,7 +120,7 @@ module Gori
 
     # How many callbacks a session has on file. Counted in SQL rather than by loading rows:
     # the session LIST (three surfaces render one) wants the number beside every session, and
-    # `oast_callbacks` above reads every raw request/response blob to get it.
+    # `oast_callbacks_since` above reads every raw request/response blob to get it.
     def oast_callback_count(session_id : Int64) : Int32
       @db.query_one("SELECT COUNT(*) FROM oast_callbacks WHERE session_id = ?", session_id, as: Int64).to_i32
     end
@@ -185,7 +163,8 @@ module Gori
     private def read_oast_session(rs : DB::ResultSet) : OastSessionRecord
       OastSessionRecord.new(
         rs.read(Int64), rs.read(Int64), rs.read(Int64?), rs.read(String), rs.read(String),
-        rs.read(String), rs.read(String), rs.read(String?), rs.read(String?), rs.read(Int64?))
+        rs.read(String), rs.read(String), rs.read(String?), rs.read(String?), rs.read(Int64?),
+        rs.read(String?))
     end
   end
 end

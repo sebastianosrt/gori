@@ -49,7 +49,7 @@ describe Gori::Fuzz::Persistence do
         3_i64, [String.new(Bytes[0xff])], 0, 200, 2_i64, 1, 1, 99_i64, nil, true, true, "hit",
         Bytes[0x48, 0x00], Bytes[0xff, 0x00], Bytes[0x47, 0xff], true,
         "transform failed", 7, "denied", true, 2, Bytes[0x47, 0xfe],
-        ws_close_code: 1008, ws_frames_in: 5)
+        ws_close_code: 1008, ws_frames_in: 5, shape: -0x1234_5678_9abc_def0_i64)
 
       saved.append(result).should be_true
       saved.finish(1_i64, 1_i64, 2_i64, "done", 88_i64).should be_true
@@ -69,6 +69,14 @@ describe Gori::Fuzz::Persistence do
       rebuilt.resent_count.should eq(2)
       rebuilt.grpc_status.should eq(7)
       rebuilt.ws_close_code.should eq(1008)
+      # The shape fingerprint (#1351) — signed, since it is the FNV-1a 64 bits — through every
+      # projection, and the preview's trailing LENGTH() reads still land on their own columns.
+      rebuilt.shape.should eq(-0x1234_5678_9abc_def0_i64)
+      store.get_fuzz_result_summary(saved.run_id, 3_i64).not_nil!.shape.should eq(-0x1234_5678_9abc_def0_i64)
+      preview = store.get_fuzz_result_preview(saved.run_id, 3_i64, 16, 16, 16, 16).not_nil!
+      preview.row.shape.should eq(-0x1234_5678_9abc_def0_i64)
+      preview.request_size.should eq(2)
+      preview.wire_size.should eq(2)
     end
   end
 
@@ -98,7 +106,7 @@ describe Gori::Fuzz::Persistence do
       saved.append(oversized).should be_true
       saved.append(persistence_result(1_i64, Bytes[0x47])).should be_true
       saved.finish(2_i64, 0_i64, 0_i64, "done").should be_true
-      store.fuzz_results(saved.run_id).map(&.idx).should eq([0_i64, 1_i64])
+      fuzz_result_page(store, saved.run_id).map(&.idx).should eq([0_i64, 1_i64])
     end
   end
 
@@ -139,16 +147,74 @@ describe Gori::Fuzz::Persistence do
     end
   end
 
-  it "makes flush and finish FIFO barriers and finish idempotent" do
+  it "under keep: interesting stores only the interesting rows while the counters stay whole-run" do
+    with_persistence_store do |store|
+      saved = Gori::Fuzz::Persistence.new(store,
+        Gori::Fuzz::SavedRunMeta.new(nil, "http://keep.test", "sniper", 4_i64, keep: "interesting"))
+      saved.keep.should eq(Gori::Fuzz::Keep::Interesting)
+      # A bare unmatched row is dropped (accepted, not a failure — the return is true)…
+      saved.append(persistence_result(0_i64)).should be_true
+      # …while a matched row and an errored row are kept.
+      matched = Gori::Fuzz::Result.new(1_i64, ["p1"], nil, 200, 2_i64, 1, 1, 10_i64, nil, true, false, "hit")
+      errored = Gori::Fuzz::Result.new(2_i64, ["p2"], nil, nil, 0_i64, 0, 0, 10_i64, "boom", false, false, nil)
+      saved.append(matched).should be_true
+      saved.append(errored).should be_true
+      # The whole-run counters `finish` records are independent of the archive filter.
+      saved.finish(3_i64, 1_i64, 1_i64, "done").should be_true
+      # 3 sent, 1 kept-as-matched + 1 kept-as-error = 2 rows stored; the unmatched one dropped.
+      store.fuzz_result_count(saved.run_id).should eq(2_i64)
+      saved.written.should eq(2_i64)
+      # The idx of a kept row is its real payload position — the dropped row leaves a gap at 0.
+      fuzz_result_page(store, saved.run_id).map(&.idx).should eq([1_i64, 2_i64])
+      run = store.get_fuzz_run(saved.run_id).not_nil!
+      run.sent.should eq(3_i64)
+      run.keep.should eq("interesting")
+      run.filtered?.should be_true
+    end
+  end
+
+  it "records the stop row a condition_met finish names, behind the rows still pending" do
+    with_persistence_store do |store|
+      saved = Gori::Fuzz::Persistence.new(store,
+        Gori::Fuzz::SavedRunMeta.new(nil, "http://stop.test", "sniper", 9_i64))
+      3.times { |i| saved.append(persistence_result(i.to_i64)).should be_true }
+      # No flush: the stop row is still in the pending batch when `finish` is called, and the
+      # Store's existence check has to see it committed ahead of the terminal update.
+      saved.finish(3_i64, 0_i64, 0_i64, "condition_met", stop_idx: 2_i64).should be_true
+      store.get_fuzz_run(saved.run_id).not_nil!.stop_idx.should eq(2_i64)
+    end
+  end
+
+  it "records no stop row for a run that did not end condition_met" do
+    with_persistence_store do |store|
+      stopped = Gori::Fuzz::Persistence.new(store,
+        Gori::Fuzz::SavedRunMeta.new(nil, "http://stop.test", "sniper", 9_i64))
+      stopped.append(persistence_result(0_i64)).should be_true
+      stopped.finish(1_i64, 0_i64, 0_i64, "stopped", stop_idx: 0_i64).should be_true
+      store.get_fuzz_run(stopped.run_id).not_nil!.stop_idx.should be_nil
+
+      # A save that failed is `save_failed` whatever verdict the caller passed; its archive is
+      # not whole, so it cannot vouch for a stop row either.
+      failed = Gori::Fuzz::Persistence.new(store,
+        Gori::Fuzz::SavedRunMeta.new(nil, "http://stop.test", "sniper", 9_i64))
+      failed.append(persistence_result(0_i64)).should be_true
+      failed.abort(reason: "test abort").should be_true
+      failed.finish(1_i64, 0_i64, 0_i64, "condition_met", stop_idx: 0_i64).should be_false
+      rec = store.get_fuzz_run(failed.run_id).not_nil!
+      rec.status.should eq("save_failed")
+      rec.stop_idx.should be_nil
+    end
+  end
+
+  it "makes finish a FIFO barrier and idempotent" do
     with_persistence_store do |store|
       saved = Gori::Fuzz::Persistence.new(store,
         Gori::Fuzz::SavedRunMeta.new(nil, "http://barrier.test", "sniper", 2_i64))
       saved.append(persistence_result(0_i64)).should be_true
       saved.append(persistence_result(1_i64)).should be_true
 
-      saved.flush.should be_true
-      store.fuzz_result_count(saved.run_id).should eq(2_i64)
       saved.finish(2_i64, 0_i64, 0_i64, "done", 123_i64).should be_true
+      store.fuzz_result_count(saved.run_id).should eq(2_i64)
       saved.finish(99_i64, 99_i64, 99_i64, "error", 999_i64).should be_true
       run = store.get_fuzz_run(saved.run_id).not_nil!
       run.sent.should eq(2_i64)
@@ -180,7 +246,7 @@ describe Gori::Fuzz::Persistence do
         7_i64, [String.new(Bytes[0xff])], 2, 206, 3_i64, 2, 1, 55_i64, "partial", true,
         true, "token", Bytes[0x48, 0xff], Bytes[0x00, 0xfe], Bytes[0x47, 0xfd], true,
         "chain", 13, "internal", true, 4, Bytes[0x47, 0xfc],
-        ws_close_code: 1002, ws_frames_in: 9)
+        ws_close_code: 1002, ws_frames_in: 9, shape: 42_i64)
       source.append(original).should be_true
       source.finish(1_i64, 1_i64, 5_i64, "done").should be_true
       source_record = store.get_fuzz_result(source.run_id, 7_i64).not_nil!

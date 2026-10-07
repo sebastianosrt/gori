@@ -1,10 +1,11 @@
 +++
-title = "Sequencer"
+title = "Token Randomness Testing"
 description = "Grade the randomness of session tokens, CSRF tokens, and reset codes for predictability."
 weight = 60
 
 [extra]
 group = "Workbenches"
+shot = "sequencer"
 +++
 
 If a session cookie, CSRF token, password-reset code, or API key is predictable, an attacker can forge or guess it. The **Sequencer** collects a sample of tokens and grades how random they really are, the gori counterpart of Burp Sequencer or the Caido Sequencer.
@@ -14,13 +15,13 @@ If a session cookie, CSRF token, password-reset code, or API key is predictable,
   <figcaption>Sending a captured flow to the <strong>Sequencer</strong> auto-detects the session cookie and lets you set the sample size and concurrency before collecting.</figcaption>
 </figure>
 
-The **Sequencer** tab is hidden by default. Reveal it from the tab-bar `⋯` menu or the command palette (`Ctrl-P` → **Go to Sequencer**).
+The **Sequencer** tab is off the bar by default. Press **`0`** and type "seq", or use the command palette (`Ctrl-P` → **Go to Sequencer**); give it one of the nine slots in Preferences → **Network & Tabs** → **Tabs**.
 
 ## Two Ways to Feed It
 
-**Live.** Point it at a request that hands out a fresh token, and gori replays that request many times, pulling the token out of each response. From **History**, select the flow that sets the token and `Space` → **Send to Sequencer**; gori auto-detects the likely session cookie. Tune the token location and sample size with `c` (reconfigure), then `Ctrl-R` to collect and `Ctrl-X` to stop.
+**Live.** Point it at a request that hands out a fresh token, and gori replays that request many times, pulling the token out of each response. From **History**, select the flow that sets the token and `Space` `>` `s` (**Send flow to…** → **Send to Sequencer**). A **SEND TO SEQUENCER** card opens over the current tab with the likely session cookie auto-detected; set the token location, sample goal and concurrency there, and **Start** collects in the background without leaving the tab. On the Sequencer tab, `c` reconfigures a session, `Ctrl-R` collects again, and `Ctrl-X` stops.
 
-**Manual.** Already have a list of tokens? Paste them (one per line) for a pure statistical analysis with no network traffic.
+**Manual.** Already have a list of tokens? Select them in a text pane (one per line) and `Space` `S` (**Send selection to…**) → `s` **Sequencer** for a pure statistical analysis with no network traffic. Each send from another tab opens a new manual session; a send made on the Sequencer tab itself, while an idle manual session is focused, appends to it and re-analyzes. Headless, the same is `gori run sequence --tokens FILE`.
 
 Extract the token from any of these locations:
 
@@ -36,7 +37,7 @@ Live collection defaults to **concurrency 1**, because session tokens are often 
 
 ## Reading the Grade
 
-The headline is **effective entropy** in bits: a conservative estimate of how much real unpredictability each token carries, measured across the sample. The rating follows from it:
+The headline is **effective entropy** in bits: a conservative estimate of how much real unpredictability each token carries, measured across the sample. It sets the base rating, and every statistical test below that fails drops it one tier:
 
 | Rating | Effective entropy |
 |--------|-------------------|
@@ -51,13 +52,13 @@ A small sample (fewer than ~20 usable tokens) softens hard failures to warnings 
 
 ### Structure Is Not Secret
 
-Real tokens usually carry a skeleton: a `sess_v1_` prefix, a version byte, base64 padding. The **Structure** row reports how many positions never vary across the sample, and every byte-level test then measures the *varying* region only.
+Real tokens usually carry a skeleton: a `sess_v1_` prefix, a version byte, base64 padding. The **Structure** row reports how many positions never vary across the sample, and every byte-level test then measures the *varying* region only. A position that varies over only a small slice of the alphabet, like a UUIDv4's variant nibble (`8`/`9`/`a`/`b`), counts as partially fixed: the tests skip it too, and it adds only its own measured entropy to the estimate.
 
 That distinction decides the grade. A token of `sess_v1_` plus 24 random hex characters looks like a 19-character alphabet if you count the prefix, which is not a power of two, which switches off the entire bit-test battery as not-applicable; chi-square and compression then fail on a distribution skewed purely by the prefix. Measured against the varying region instead, the same sample is what it actually is: lower-hex, full battery active, every row passing.
 
 For a token whose random part is a *suffix* behind a variable-length head (`123-<random>`), gori anchors the per-position window to whichever end carries more entropy, so the head does not drag the estimate down.
 
-The panes are **CONFIG** (source and token location), **SAMPLES** (the collected tokens), and **ANALYSIS** (the grade and the per-test breakdown), with a detail view for any one sample.
+The panes are an untitled config card (source and token location, with the `^R` RUN / `^X` STOP badge on its border), **SAMPLES** (the collected tokens), and **ANALYSIS** (the grade and the per-test breakdown), with a **TOKEN** detail view for any one sample.
 
 ## Getting the Verdict Out
 
@@ -66,8 +67,8 @@ Collected tokens are live credentials, so they are never written to disk and van
 | Action | Key | Writes |
 |--------|-----|--------|
 | Export report | `⇧E` | A Markdown report at a path you choose |
-| Export report (JSON) | palette | The same report as JSON |
-| File as issue | `Space` → `i` | An Issue in the Issues tab |
+| Export report (JSON) | the palette (`Ctrl-P`) | The same report as JSON |
+| File as issue | `Space` → `a` | An Issue in the Issues tab |
 
 **File as issue** records the grade in the Issues report, mapping Critical to `critical`, Weak to `high`, Moderate to `medium`, and Secure to `info`. The Issue carries the target, the token descriptor, the entropy figures, and the full test table as its body, plus the seeding flow as evidence. Neither the export nor the Issue contains a token value: the report is built from frequency tables and verdicts, so there is no sample in it to leak.
 

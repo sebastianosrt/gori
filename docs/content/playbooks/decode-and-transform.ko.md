@@ -13,7 +13,7 @@ group = "워크벤치"
 
 ## 1. Decoder 열고 입력 붙여넣기 {#1-open-the-decoder-and-paste-input}
 
-**Decoder** 탭을 엽니다(탭 바에서, 또는 `Ctrl-P` → **Go to Decoder**). 네 개의 카드가 위에서 아래로 쌓입니다. **INPUT**(원본 텍스트), **CHAIN**(변환기 스펙), **PIPELINE**(단계별 한 행씩), **OUTPUT**(최종 결과). 커서를 **INPUT**에 두고 다룰 값을 붙여넣습니다: 쿠키, 토큰, 캡처한 플로우에서 떼어 온 Base64 블롭.
+**Decoder** 탭을 엽니다(기본적으로 탭 바 밖에 있으니 **`0`**을 누르고 "decoder"를 입력하거나 `Ctrl-P` → **Go to Decoder**). 네 개의 카드가 위에서 아래로 쌓입니다. **INPUT**(원본 텍스트), **CHAIN**(변환기 스펙), **PIPELINE**(단계별 한 행씩), **OUTPUT**(최종 결과). 커서를 **INPUT**에 두고 다룰 값을 붙여넣습니다: 쿠키, 토큰, 캡처한 플로우에서 떼어 온 Base64 블롭.
 
 열려 있는 각 변환은 **서브탭**이며, 서브탭은 프로젝트와 함께 저장됩니다. 그래서 열어 둔 스크래치 패드는 그 프로젝트를 다시 열 때 돌아오고, 다른 프로젝트로 따라가지 않습니다.
 
@@ -27,13 +27,13 @@ group = "워크벤치"
 base64-decode | jwt-decode
 ```
 
-결과를 해시하거나 다시 인코딩하는 단계를 붙이세요: `sha256`, `url-encode`, `hex-encode`. 별칭은 기본 이름으로 해석되고(`b64` → `base64-encode`), 자동완성이 애매한 이름을 채워 줍니다. 전체 목록은 인코딩, 진법, 압축, `jwt-decode`, 해시(`md5` … `sha512`, `crc32`), 이스케이프/텍스트 변환을 아우릅니다. `gori run decoder list`(또는 [Decoder 가이드](/ko/guide/decoder/#converters))가 각각을 카테고리와 방향과 함께 출력합니다.
+결과를 해시하거나 다시 인코딩하는 단계를 붙이세요: `sha256`, `url-encode`, `hex-encode`. 별칭은 기본 이름으로 해석되고(`b64` → `base64-encode`), 자동완성이 애매한 이름을 채워 줍니다. 전체 목록은 인코딩(유니코드 정규화 포함), 진법, 압축, 역직렬화(MessagePack, CBOR, Java, PHP, pickle…), `jwt-decode`와 세션 쿠키 디코더, 해시(`md5` … `sha512`, `crc32`), 이스케이프/텍스트 변환을 아우릅니다. `gori run decoder list`(또는 [Decoder 가이드](/ko/guide/decoder/#converters))가 각각을 카테고리와 방향과 함께 출력합니다.
 
 같은 체인이 헤드리스로도 실행되며, 값은 인수나 stdin에서 받습니다:
 
 ```bash
 gori run decoder 'base64-decode | jwt-decode' "$TOKEN"
-echo -n secret | gori run decoder 'sha256 | hex-encode'
+echo -n secret | gori run decoder 'sha256 | base64'
 ```
 
 <figure class="tui-shot">
@@ -47,13 +47,13 @@ echo -n secret | gori run decoder 'sha256 | hex-encode'
 
 PIPELINE은 체인을 디버깅하는 곳입니다. 위에서 아래로 읽으세요. 각 행은 한 단계의 출력이고, 마지막 행이 OUTPUT으로 들어갑니다. 어떤 단계가 다룰 수 없는 입력을 받으면(Base64가 아닌 텍스트에 `base64-decode`, 토큰이 아닌 것에 `jwt-decode`) 그 행이 읽히던 데이터가 쓰레기나 오류로 바뀌는 지점이고, 그 아래 모든 행은 하류의 잡음입니다. 단계를 고치거나 체인 순서를 바꾼 뒤 다시 읽으세요.
 
-바이너리 결과의 경우 OUTPUT은 표시 모드를 순환합니다(text → hex → base64). 그래서 텍스트로는 비어 보이는 바이트가 hex로는 읽힙니다. 최종 값은 READ 모드에서 `y`로, INS에서 INPUT을 편집하는 중이라면 `Ctrl-Y`로 복사합니다.
+바이너리 결과의 경우 `Ctrl-X`로 OUTPUT의 표시 모드를 순환합니다(text → hex → base64). 그래서 텍스트로는 비어 보이는 바이트가 hex로는 읽힙니다. 최종 값은 READ 모드에서 `y`로, INS에서 INPUT을 편집하는 중이라면 `Ctrl-Y`로 복사합니다.
 
 **체크포인트.** 출력이 처음 어긋나는 PIPELINE 행을 정확히 짚을 수 있습니다. 또는 모든 행이 깨끗하고 OUTPUT이 기대한 값을 담고 있음을 확인합니다.
 
 ## 4. 이름 붙인 체인 저장·재사용 {#4-save-and-reuse-a-named-chain}
 
-다시 쓸 체인에는 이름을 붙일 값어치가 있습니다. `Ctrl-S`(또는 space 메뉴의 **Save chain by name**)로 저장하세요. 이미 있는 이름으로 저장하면 갱신됩니다. 나중에 `Ctrl-O`로 불러오면 저장한 모든 항목 위로 피커가 열리며(각 이름이 그 스펙과 나란히 표시됩니다), 타이핑으로 필터하고 `Ctrl-X`로 강조된 항목을 삭제합니다.
+다시 쓸 체인에는 이름을 붙일 값어치가 있습니다. `Ctrl-S`(또는 팔레트의 **Save chain by name**)로 저장하세요. 이미 있는 이름으로 저장하면 갱신됩니다. 나중에 `Ctrl-O`로 불러오면 저장한 모든 항목 위로 피커가 열리며(각 이름이 그 스펙과 나란히 표시됩니다), 타이핑으로 필터하고 `Ctrl-X`로 강조된 항목을 삭제합니다.
 
 이름 붙인 체인은 설정의 `decoder` 섹션에 살고 모든 프로젝트가 공유합니다. 체인은 레시피이고, 그것에 통과시키는 것은 프로젝트에 남습니다. 저장한 이름은 그 자체로 **변환기**이기도 합니다. 한 단계로 입력하면 그 전체 스펙이 그 자리에서 실행됩니다. Decoder에서든, Repeater나 Fuzzer의 `§…§` 마커 위에서든, `gori run decoder`에서든, 인수 하나에 동일한 체인을 실행하는 MCP `decode` 도구를 통해서든요.
 

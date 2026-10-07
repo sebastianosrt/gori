@@ -10,6 +10,22 @@ private def capture(store, host, method, target)
     head: "#{method} #{target} HTTP/1.1\r\nHost: #{host}\r\n\r\n".to_slice, body: nil, source: Gori::FlowSource::Kind::Proxy))
 end
 
+private def capture_at(store, scheme, host, port, target, method = "GET")
+  store.insert_flow(Gori::Store::CapturedRequest.new(
+    created_at: 1_i64, scheme: scheme, host: host, port: port,
+    method: method, target: target, http_version: "HTTP/1.1",
+    head: "#{method} #{target} HTTP/1.1\r\nHost: #{host}\r\n\r\n".to_slice, body: nil, source: Gori::FlowSource::Kind::Proxy))
+end
+
+private def capture_image(store, host, target)
+  id = capture(store, host, "GET", target)
+  store.update_response(Gori::Store::CapturedResponse.new(
+    flow_id: id, status: 200, content_type: "image/png",
+    head: "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n\r\n".to_slice,
+    state: Gori::Store::FlowState::Complete))
+  id
+end
+
 # Rows rendering the marked-row gutter bar ('▌'; the cursor row's is the thinner '▎').
 private def marked_row_indexes(b)
   (0...20).select { |y| b.row(y).includes?("▌") }
@@ -34,6 +50,19 @@ describe Gori::Tui::SitemapView do
       backend.contains?("123").should be_true # literal id (not templated)
       backend.contains?("orders").should be_true
       backend.contains?("POST").should be_true # method annotation on leaf
+    end
+  end
+
+  # A path deeper than the pane is wide (a crawler trap) must not draw past the pane.
+  it "keeps a very deep row inside the pane" do
+    with_store do |store|
+      capture(store, "acme.test", "GET", "/" + (1..40).map { |i| "s#{i}" }.join("/"))
+      view = SitemapView.new
+      view.reload(store)
+      backend = MemoryBackend.new(60, 50)
+      view.render(Screen.new(backend), Rect.new(0, 0, 40, 50))
+      # From the first tree row: the header divider's `┤` joins the parent frame's border.
+      (3...50).each { |y| backend.row(y)[40..].strip.should eq(""), "row #{y} ran past the pane" }
     end
   end
 
@@ -98,6 +127,101 @@ describe Gori::Tui::SitemapView do
       view.render(Screen.new(b1), Rect.new(0, 0, 70, 20))
       b1.contains?("api.acme.test").should be_true
       b1.contains?("cdn.acme.test").should be_false
+    end
+  end
+
+  it "folds static assets out of the tree, and out of the Params flow set, while the lens is on" do
+    with_store do |store|
+      capture(store, "api.acme.test", "GET", "/v1/users")
+      capture_image(store, "cdn.acme.test", "/img/logo.png")
+
+      view = SitemapView.new
+      view.set_hide_static(true)
+      view.reload(store)
+      b = MemoryBackend.new(70, 20)
+      view.render(Screen.new(b), Rect.new(0, 0, 70, 20))
+      b.contains?("api.acme.test").should be_true
+      b.contains?("cdn.acme.test").should be_false
+      b.contains?("static:hidden").should be_true
+      view.params_filter.not_nil!.sql.should contain(Gori::QL.hide_static.sql)
+
+      view.set_hide_static(false)
+      view.reload(store)
+      b2 = MemoryBackend.new(70, 20)
+      view.render(Screen.new(b2), Rect.new(0, 0, 70, 20))
+      b2.contains?("cdn.acme.test").should be_true
+    end
+  end
+
+  it "shows the traffic empty state, not a lens sentence, for a project with no flows" do
+    with_store do |store|
+      view = SitemapView.new
+      view.set_hide_static(true)
+      view.reload(store)
+      b = MemoryBackend.new(70, 15)
+      view.render(Screen.new(b), Rect.new(0, 0, 70, 15), listen: {"127.0.0.1", 8070}, capturing: true)
+      b.contains?("no traffic captured").should be_true
+      b.contains?("only static assets").should be_false
+
+      capture_image(store, "cdn.acme.test", "/img/logo.png")
+      view.reload(store)
+      b2 = MemoryBackend.new(70, 15)
+      view.render(Screen.new(b2), Rect.new(0, 0, 70, 15))
+      b2.contains?("only static assets so far").should be_true
+    end
+  end
+
+  # The same silence History carries, one tab over: an unknown `field:` free-texts the whole
+  # token and matches nothing, which on an empty tree reads as "nothing was mapped".
+  it "names a misspelled filter field in the empty-state" do
+    with_store do |store|
+      capture(store, "api.acme.test", "GET", "/v1/users")
+
+      view = SitemapView.new
+      view.reload(store)
+      view.start_query
+      "pth:/v1".each_char { |c| view.query_insert(c) }
+      view.reload(store)
+
+      b = MemoryBackend.new(70, 20)
+      view.render(Screen.new(b), Rect.new(0, 0, 70, 20))
+      rows = (0...20).map { |y| b.row(y) }.join("\n")
+      rows.should contain("unknown field `pth:`")
+      rows.should contain("did you mean `path:`")
+    end
+  end
+
+  it "names the colon form of a comparison typed without one in the empty-state" do
+    with_store do |store|
+      capture(store, "api.acme.test", "GET", "/v1/users")
+
+      view = SitemapView.new
+      view.reload(store)
+      view.start_query
+      "status>=400".each_char { |c| view.query_insert(c) }
+      view.reload(store)
+
+      b = MemoryBackend.new(80, 20)
+      view.render(Screen.new(b), Rect.new(0, 0, 80, 20))
+      (0...20).map { |y| b.row(y) }.join("\n").should contain("did you mean `status:>=400`?")
+    end
+  end
+
+  # `tag:` is this bar's own field and QL knows nothing about it, so a pool taken from QL alone
+  # left the one field this surface adds as the one field it could never diagnose a typo of.
+  it "suggests its own tag: field, which QL has never heard of" do
+    with_store do |store|
+      capture(store, "api.acme.test", "GET", "/v1/users")
+
+      view = SitemapView.new
+      view.reload(store)
+      view.start_query
+      "tagg:prod".each_char { |c| view.query_insert(c) }
+      view.reload(store)
+
+      b = MemoryBackend.new(70, 20)
+      view.render(Screen.new(b), Rect.new(0, 0, 70, 20))
+      (0...20).map { |y| b.row(y) }.join("\n").should contain("did you mean `tag:`")
     end
   end
 
@@ -178,6 +302,26 @@ describe Gori::Tui::SitemapView do
     end
   end
 
+  it "uses live keys in the scope and grouping chips" do
+    previous = Gori::Settings.keymap_overrides
+    begin
+      Gori::Settings.keymap_overrides = {"scope.toggle-lens"       => ["shift-s"],
+                                         "sitemap.toggle-grouping" => ["shift-g"]}
+      with_store do |store|
+        view = SitemapView.new
+        view.set_registry(Gori::Verbs.registry)
+        view.reload(store)
+        backend = MemoryBackend.new(90, 12)
+        view.render(Screen.new(backend), Rect.new(0, 0, 90, 12))
+        backend.contains?("⇧S scope:off").should be_true
+        backend.contains?("⇧G:fold").should be_true
+        backend.contains?("g:fold").should be_false
+      end
+    ensure
+      Gori::Settings.keymap_overrides = previous
+    end
+  end
+
   it "completes a field name with Tab" do
     view = SitemapView.new
     view.start_query
@@ -190,7 +334,7 @@ describe Gori::Tui::SitemapView do
     b.contains?("method:").should be_true
   end
 
-  it "marks in-scope hosts with a scope glyph even when the ⇧S lens is off" do
+  it "marks in-scope hosts with a scope glyph even when the `s` lens is off" do
     with_store do |store|
       capture(store, "acme.test", "GET", "/api/users")
       capture(store, "cdn.vendor.test", "GET", "/app.js")
@@ -376,10 +520,11 @@ describe Gori::Tui::SitemapView do
       # Repeater/open-flow look a flow up by exact equality on flows.target, so the fold has
       # to hand them a variant, not the path it displays.
       # ...the first variant under it, in the store's ORDER BY target order.
-      view.selected_endpoint.should eq({host: "shop.demo.test", method: "GET", target: "/search?q=other"})
+      origin = Gori::Sitemap::Origin.new("http", "shop.demo.test", 80)
+      view.selected_endpoint.should eq({host: "shop.demo.test", method: "GET", target: "/search?q=other", origin: origin})
       # Scope/Discover instead mean the PATH — a query fold has a real one, unlike {uuid}.
       view.selected_scope_seed.should eq({match_type: "string", pattern: "shop.demo.test/search"})
-      view.selected_endpoint(:container).should eq({host: "shop.demo.test", method: "GET", target: "/search"})
+      view.selected_endpoint(:container).should eq({host: "shop.demo.test", method: "GET", target: "/search", origin: origin})
     end
   end
 
@@ -708,19 +853,47 @@ describe Gori::Tui::SitemapView do
       view.toggle_mark.should be_true
       view.toggle_mark.should be_true
       view.mark_count.should eq(2)
-      view.marked_keys.should eq([{"acme.test", "/a"}, {"acme.test", "/b"}]) # tree order
+      view.marked_keys.should eq([{"http://acme.test", "/a"}, {"http://acme.test", "/b"}]) # tree order
       view.marked_hidden_count.should eq(0)
 
       # The step saturates at the last row, so a third `t` there clears what the second set.
       view.toggle_mark.should be_true
-      view.marked?("acme.test", "/b").should be_false
+      view.marked?("http://acme.test", "/b").should be_false
       view.mark_count.should eq(1)
+    end
+  end
+
+  # ⇧T, the `t`/⇧T pair every other marked list carries. It was held back on the argument that
+  # a tree's mark-all "would sweep hosts and folders into the same batch as the endpoints under
+  # them" — so the set is every row carrying a METHOD, which a host and a folder never do.
+  it "marks every captured path `⇧T` can see, and never a host or a folder" do
+    with_store do |store|
+      capture(store, "acme.test", "GET", "/api/users")
+      capture(store, "acme.test", "GET", "/api/orders")
+      capture(store, "acme.test", "GET", "/health")
+
+      view = SitemapView.new
+      view.reload(store)
+      view.mark_all_visible.should eq(3)
+      view.mark_count.should eq(3)
+      view.marked_keys.should eq([{"http://acme.test", "/api/orders"}, {"http://acme.test", "/api/users"},
+                                  {"http://acme.test", "/health"}])
+      # The host row and the `/api` folder are on screen and neither is in the set.
+      view.marked?("http://acme.test", "").should be_false
+      view.marked?("http://acme.test", "/api").should be_false
+
+      # Idempotent: a second press adds nothing rather than toggling the set off.
+      view.mark_all_visible.should eq(0)
+      view.mark_count.should eq(3)
+
+      view.clear_marks
+      view.mark_count.should eq(0)
     end
   end
 
   it "keeps a marked host from lighting up the id folds under it" do
     # Regression: a fold node keeps `path` empty, exactly like its host row, so a mark keyed on
-    # (host, path) alone made `{"acme.test", ""}` mean BOTH — marking the host banded every
+    # (host, path) alone made `{"http://acme.test", ""}` mean BOTH — marking the host banded every
     # fold in the tree. A fold is not markable at all; only the host row may carry the band.
     with_store do |store|
       capture(store, "acme.test", "GET", "/users/3f2a8b1c-1234-5678-9abc-def012345678")
@@ -730,7 +903,7 @@ describe Gori::Tui::SitemapView do
       view.reload(store)
       view.toggle_mark.should be_true # the host row (selection starts there)
       view.mark_count.should eq(1)
-      view.marked?("acme.test", "").should be_true
+      view.marked?("http://acme.test", "").should be_true
 
       b = MemoryBackend.new(70, 20)
       view.render(Screen.new(b), Rect.new(0, 0, 70, 20))
@@ -758,7 +931,7 @@ describe Gori::Tui::SitemapView do
       capture(store, "acme.test", "GET", "/api/orders") # a live-capture style poll
       view.reload(store)
       view.mark_count.should eq(1) # keyed by (host, path), not by row index
-      view.marked?("acme.test", "/api/users").should be_true
+      view.marked?("http://acme.test", "/api/users").should be_true
       view.marked_hidden_count.should eq(0)
 
       # Collapsing the host takes the marked row off screen — the set is unchanged, and the
@@ -786,7 +959,7 @@ describe Gori::Tui::SitemapView do
       # The whole range is swept — the cursor walked over the fold — but only the two real
       # paths in it end up marked. The host was never in range. (Siblings sort by path, so
       # /orders precedes /users in tree order.)
-      view.marked_keys.should eq([{"acme.test", "/orders"}, {"acme.test", "/users"}])
+      view.marked_keys.should eq([{"http://acme.test", "/orders"}, {"http://acme.test", "/users"}])
       view.mark_count.should eq(2)
     end
   end
@@ -804,7 +977,7 @@ describe Gori::Tui::SitemapView do
 
       view.end_mark_gesture.should eq(2) # the two the range added
       view.mark_count.should eq(1)       # the `t` mark stays — that's what makes a gap possible
-      view.marked?("acme.test", "/a").should be_true
+      view.marked?("http://acme.test", "/a").should be_true
     end
   end
 
@@ -828,12 +1001,13 @@ describe Gori::Tui::SitemapView do
       # …and when the cursor sits outside the set, the first target in tree order does.
       view.select_index(0) # the host row — marked? no
       view.start_tag.should be_true
-      view.tag_targets.should eq([{"acme.test", "/a"}, {"acme.test", "/b"}])
+      view.tag_targets.should eq([{"http://acme.test", "/a"}, {"http://acme.test", "/b"}])
       view.tag_buffer.should eq("old")
 
       3.times { view.tag_backspace } # the seed is editable, like any pre-filled field
       "auth".each_char { |c| view.tag_insert(c) }
-      view.tag_targets.each { |(host, path)| store.set_sitemap_tag(host, path, view.tag_buffer) }
+      # What SitemapController#commit_tag does: the key names the origin, the tag the bare host.
+      view.tag_targets.each { |(key, path)| store.set_sitemap_tag(view.tag_host(key).not_nil!, path, view.tag_buffer) }
       view.apply_tag(view.tag_buffer)
       view.tagging?.should be_false
 
@@ -854,7 +1028,7 @@ describe Gori::Tui::SitemapView do
       view.reload(store)
       # No marks: the cursor row IS the target set (one rule, no "batch mode").
       view.select_index(3) # host → api → orders → users
-      view.target_keys.should eq([{"acme.test", "/api/users"}])
+      view.target_keys.should eq([{"http://acme.test", "/api/users"}])
       view.target_endpoints.map(&.[](:target)).should eq(["/api/users"])
 
       view.select_index(2) # /api/orders
@@ -924,6 +1098,159 @@ describe Gori::Tui::SitemapView do
       view.render(Screen.new(b), Rect.new(0, 0, 70, 20))
       b.contains?("shallow").should be_true
       b.contains?("s0").should be_false
+    end
+  end
+
+  # The OpenAPI export's target set (#1241): marks if any, else the cursor row — a host row
+  # as the whole host, a path row as the endpoint paths under it, a marked row as its subtree.
+  describe "#export_targets" do
+    it "reads the cursor row: a host whole, a path as the endpoints under it" do
+      with_store do |store|
+        capture(store, "acme.test", "GET", "/api/users")
+        capture(store, "acme.test", "GET", "/api/users/7")
+        capture(store, "acme.test", "GET", "/about")
+        view = SitemapView.new
+        view.reload(store)
+        targets, label = view.export_targets.not_nil!
+        acme = Gori::Sitemap::Origin.new("http", "acme.test", 80)
+        targets.should eq({acme => nil})
+        label.should eq("http://acme.test")
+
+        10.times do # walk down to the /api folder row, whatever order the tree draws it in
+          break if view.export_targets.not_nil![1] == "http://acme.test/api"
+          view.move(1)
+        end
+        targets, label = view.export_targets.not_nil!
+        label.should eq("http://acme.test/api")
+        targets[acme].should eq(Set{"/api/users", "/api/users/7"})
+      end
+    end
+
+    it "unions marked subtrees per host, and a marked host row takes the whole host" do
+      with_store do |store|
+        capture(store, "acme.test", "GET", "/a")
+        capture(store, "acme.test", "GET", "/b")
+        capture(store, "other.test", "GET", "/c")
+        view = SitemapView.new
+        view.reload(store)
+        view.move(1)     # acme.test /a
+        view.toggle_mark # marks /a, steps to /b
+        view.toggle_mark # marks /b, steps to the other.test host row
+        view.toggle_mark # marks the other.test host row
+        targets, label = view.export_targets.not_nil!
+        targets.should eq({Gori::Sitemap::Origin.new("http", "acme.test", 80)  => Set{"/a", "/b"},
+                           Gori::Sitemap::Origin.new("http", "other.test", 80) => nil})
+        label.should eq("3 marked paths")
+      end
+    end
+  end
+
+  # #1371: a root is an ORIGIN. Keyed on the host label, `http://h:19021`, `http://h:19022` and
+  # `https://h:8443` were one `h` row, and `/x` on two of them was one row too.
+  describe "one root per origin" do
+    it "draws each origin as its own root and keeps same-path rows apart" do
+      with_store do |store|
+        capture_at(store, "http", "h.test", 19021, "/x")
+        capture_at(store, "http", "h.test", 19022, "/x")
+        capture_at(store, "https", "h.test", 8443, "/only-tls")
+        view = SitemapView.new
+        view.reload(store)
+        backend = MemoryBackend.new(70, 12)
+        view.render(Screen.new(backend), Rect.new(0, 0, 70, 12))
+        {"http://h.test:19021", "http://h.test:19022", "https://h.test:8443"}.each do |label|
+          backend.contains?(label).should be_true
+        end
+
+        view.select_index(1) # /x under :19021
+        view.toggle_mark
+        view.marked_keys.should eq([{"http://h.test:19021", "/x"}])
+        view.marked?("http://h.test:19022", "/x").should be_false
+        ep = view.target_endpoints.first
+        ep[:host].should eq("h.test")
+        ep[:origin].should eq(Gori::Sitemap::Origin.new("http", "h.test", 19021))
+        view.tag_host("http://h.test:19021").should eq("h.test") # a tag is keyed on the bare host
+
+        view.clear_marks
+        view.select_index(3) # /x under :19022
+        view.selected_endpoint.not_nil![:origin].should eq(Gori::Sitemap::Origin.new("http", "h.test", 19022))
+        view.selected_url.should eq("http://h.test:19022/x")
+        view.select_index(2) # the :19022 root
+        view.selected_url.should eq("http://h.test:19022")
+        view.selected_scope_seed.should eq({match_type: "host", pattern: "h.test"})
+      end
+    end
+
+    it "narrows the Params target and the export set to the row's origin" do
+      with_store do |store|
+        capture_at(store, "http", "h.test", 19021, "/a")
+        capture_at(store, "http", "h.test", 19022, "/b")
+        view = SitemapView.new
+        view.reload(store)
+        view.select_index(2) # the :19022 root
+        t = view.selected_params_target.not_nil!
+        {t.host, t.origin, t.label}.should eq({"h.test", Gori::Sitemap::Origin.new("http", "h.test", 19022), "http://h.test:19022"})
+        targets, _ = view.export_targets.not_nil!
+        targets.should eq({Gori::Sitemap::Origin.new("http", "h.test", 19022) => nil})
+      end
+    end
+
+    # A tag is keyed on the bare host, so committing one stamps the path under every origin of
+    # that host at once — as the next reload's stamp would — not only the row that was edited.
+    it "stamps a committed tag on the same path under every origin of the host" do
+      with_store do |store|
+        capture_at(store, "http", "h.test", 19021, "/admin")
+        capture_at(store, "https", "h.test", 8443, "/admin")
+        capture_at(store, "http", "other.test", 80, "/admin")
+        view = SitemapView.new
+        view.reload(store)
+        view.select_index(1) # /admin under http://h.test:19021
+        view.start_tag.should be_true
+        "memo".each_char { |c| view.tag_insert(c) }
+        view.apply_tag(view.tag_buffer)
+        b = MemoryBackend.new(80, 12)
+        view.render(Screen.new(b), Rect.new(0, 0, 80, 12))
+        (0...12).count { |y| b.row(y).includes?("memo") }.should eq(2) # both h.test origins, not other.test
+      end
+    end
+
+    # The cursor row is pinned at start_tag; a reload that drops its root mid-edit must not leave
+    # the commit without a host to write under.
+    it "keeps a tag target's origin across a reload that hides its root" do
+      with_store do |store|
+        capture_at(store, "http", "h.test", 19021, "/a")
+        capture_at(store, "http", "other.test", 80, "/b")
+        view = SitemapView.new
+        view.reload(store)
+        view.select_index(1)
+        view.start_tag.should be_true
+        key = view.tag_targets.first[0]
+        view.start_query
+        "host:other".each_char { |c| view.query_insert(c) }
+        view.stop_query
+        view.reload(store)
+        view.tag_host(key).should eq("h.test")
+      end
+    end
+
+    # The mark key's origin must still name its bare host after a reload drops the root —
+    # otherwise the tag commit would have nothing to write the memo under.
+    it "remembers a marked origin across a reload that hides its root" do
+      with_store do |store|
+        capture_at(store, "http", "h.test", 19021, "/a")
+        capture_at(store, "http", "other.test", 80, "/b")
+        view = SitemapView.new
+        view.reload(store)
+        view.select_index(1)
+        view.toggle_mark
+        view.start_query
+        "host:other".each_char { |c| view.query_insert(c) }
+        view.stop_query
+        view.reload(store)
+        view.origin_for("http://h.test:19021").should eq(Gori::Sitemap::Origin.new("http", "h.test", 19021))
+        view.clear_marks
+        view.reload(store)
+        view.origin_for("http://h.test:19021").should be_nil # no mark holds it any more
+      end
     end
   end
 end

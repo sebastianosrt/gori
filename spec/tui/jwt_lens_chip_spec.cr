@@ -192,7 +192,7 @@ private def with_jwt_controller(&)
     Gori::Proxy::Tls::CertAuthority.load_or_create(JWT_CHIP_CA), Gori::Verbs.registry, project)
   begin
     ctl = JwtController.new(FakeHost.new(session))
-    ctl.jwt_from_text(TOKEN) # a seeded sub-tab, so the panes hold text a gesture can reach
+    ctl.session_from_text(TOKEN) # a seeded sub-tab, so the panes hold text a gesture can reach
     yield ctl, ->(b : MemoryBackend) do
       ctl.render_body(Screen.new(b), Rect.new(0, 0, W, 40), :body)
     end
@@ -359,7 +359,7 @@ describe "JWT lens chip" do
         ty = (0...40).find { |r| b2.row(r).includes?("eyJ") }.not_nil!
         ctl.handle_click(rect, 3, ty)
         ctl.handle_drag(rect, 9, ty)
-        ctl.jwt_selection_active?.should be_true
+        ctl.selection_active?.should be_true
 
         ctl.handle_click(rect, x + 1, y) # the chip: → ENCODE
         ctl.handle_drag(rect, x + 2, y)  # the motion that follows that press
@@ -384,6 +384,22 @@ describe "JWT lens chip" do
       ensure
         Gori::Settings.keymap_overrides = {} of String => Array(String)
       end
+    end
+  end
+
+  it "paints the rebound signing algorithm chord on the SECRET card" do
+    previous = Gori::Settings.keymap_overrides
+    begin
+      Gori::Settings.keymap_overrides = {"jwt.cycle-alg" => ["alt-a"]}
+      with_jwt_controller do |ctl, draw|
+        ctl.toggle_mode
+        b = MemoryBackend.new(W, 40)
+        draw.call(b)
+        b.contains?("⌥A:HS256").should be_true
+        b.contains?("^A:HS256").should be_false
+      end
+    ensure
+      Gori::Settings.keymap_overrides = previous
     end
   end
 

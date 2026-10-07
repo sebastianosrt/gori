@@ -28,9 +28,11 @@ require "./request_builder"
 require "./tool"
 require "./tool_filter"
 require "./tools/authorize"
+require "./tools/cache_deception"
 require "./tools/compare"
 require "./tools/diff"
 require "./tools/context"
+require "./tools/messages"
 require "./tools/decode"
 require "./tools/cookie"
 require "./tools/discover"
@@ -38,7 +40,9 @@ require "./tools/grpc"
 require "./tools/env"
 require "./tools/flows"
 require "./tools/fuzz"
+require "./tools/request_macro"
 require "./tools/fuzz_runs"
+require "./tools/fuzz_clusters"
 require "./tools/host_overrides"
 require "./tools/session_slots"
 require "./tools/import"
@@ -46,13 +50,18 @@ require "./tools/intercept"
 require "./tools/issues"
 require "./tools/jobs"
 require "./tools/links"
+require "./tools/evidence"
+require "./tools/retest"
 require "./tools/mine"
 require "./tools/minimize"
 require "./tools/notes"
+require "./tools/wordlists"
+require "./tools/payload_from"
 require "./tools/oast_providers"
 require "./tools/oast_sessions"
 require "./tools/probe"
 require "./tools/projects"
+require "./tools/project_archive"
 require "./tools/ql"
 require "./tools/repeater"
 require "./tools/rules"
@@ -62,6 +71,7 @@ require "./tools/scope"
 require "./tools/send"
 require "./tools/sequence"
 require "./tools/sitemap"
+require "./tools/js_refs"
 
 module Gori
   module MCP
@@ -80,9 +90,16 @@ module Gori
       # `error_code` (+ optional `field`, `retryable`, `details`) so a caller can
       # apply policy / auto-recovery without parsing the human `text`. The `Server`
       # surfaces these in `structuredContent`; see `err` and `classify`.
+      #
+      # `event_flow_id` / `event_note` are for the #124 agent-action feed only (`log_agent_action`)
+      # and never reach the client: a handler that knows WHAT it did — the History flow a send
+      # recorded, the origin it dialled — says so here, so the operator's feed can link to the
+      # flow instead of reading "send_request ok" with no pointer. Carried on the Result rather
+      # than re-parsed out of `text`, which can be megabytes.
       record Result, text : String, is_error : Bool = false,
         error_code : String? = nil, field : String? = nil,
-        retryable : Bool = false, details : JSON::Any? = nil
+        retryable : Bool = false, details : JSON::Any? = nil,
+        event_flow_id : Int64? = nil, event_note : String? = nil
       # `part` is "response" (the default, and everything this tool ever served) or "request".
       # The request cursor exists because `get_repeater_context` is the ONLY read-back of a
       # repeater's request and it caps at MCP_REPEATER_REQUEST_MAX — so bytes past the cap
@@ -121,9 +138,40 @@ module Gori
             {% raise "#{m.name}: @[Tool] takes the tool name as its one positional argument" %}
           {% end %}
           {% for key in ann.named_args.keys %}
-            {% unless %w[gated agent_action env_refresh unbound].includes?(key.stringify) %}
-              {% raise "#{m.name}: unknown @[Tool] flag '#{key}' — allowed: gated, agent_action, env_refresh, unbound" %}
+            {% unless %w[gated agent_action env_refresh unbound read_only requires permission].includes?(key.stringify) %}
+              {% raise "#{m.name}: unknown @[Tool] flag '#{key}' — allowed: gated, agent_action, env_refresh, unbound, read_only, requires, permission" %}
             {% end %}
+          {% end %}
+          {% if ann.named_args.keys.map(&.stringify).includes?("permission") %}
+            {% unless Gori::Settings::MCP_PERMISSION_KEYS.includes?(ann[:permission]) %}
+              {% raise "#{m.name}: @[Tool] permission: must be one of #{Gori::Settings::MCP_PERMISSION_KEYS}" %}
+            {% end %}
+          {% elsif ann[:agent_action] %}
+            {% raise "#{m.name}: @[Tool] agent_action needs a `permission:` group — an agent action is a mutation or an outbound send, and the operator's Preferences switch for it has to reach it" %}
+          {% end %}
+          {% if ann.named_args.keys.map(&.stringify).includes?("requires") %}
+            {% unless ann[:requires].is_a?(ArrayLiteral) && !ann[:requires].empty? %}
+              {% raise "#{m.name}: @[Tool] requires: must be a non-empty array of tool names" %}
+            {% end %}
+            {% for required in ann[:requires] %}
+              {% unless required.is_a?(StringLiteral) %}
+                {% raise "#{m.name}: every @[Tool] requires: entry must be a string literal" %}
+              {% end %}
+              {% unless tools.any? { |candidate| candidate.annotation(Tool)[0] == required } %}
+                {% raise "#{m.name}: required MCP tool #{required} is not registered" %}
+              {% end %}
+            {% end %}
+          {% end %}
+          {% if ann.named_args.keys.map(&.stringify).includes?("read_only") %}
+            {% if ann[:read_only] == !ann[:gated] %}
+              {% raise "#{m.name}: @[Tool] read_only: #{ann[:read_only]} is what `gated: #{ann[:gated] ? true : false}` already implies — drop it, or the exception list stops being readable" %}
+            {% end %}
+          {% end %}
+          # On the EFFECTIVE value, not on the spelled one: the default (`!gated`) is where
+          # this fails open. `agent_action: true` with no `gated: true` would otherwise land
+          # in READ_ONLY_TOOLS and tell a client it may run an outbound send unattended.
+          {% if (ann.named_args.keys.map(&.stringify).includes?("read_only") ? ann[:read_only] : !ann[:gated]) && ann[:agent_action] %}
+            {% raise "#{m.name}: @[Tool] agent_action is read-only here — an agent action is a mutation or an outbound send, so it needs `gated: true` (and must not carry `read_only: true`)" %}
           {% end %}
         {% end %}
 
@@ -143,6 +191,29 @@ module Gori
         # Every tool name the dispatcher answers to, in declaration (require) order.
         TOOL_NAMES = {{ tools.map { |m| m.annotation(Tool)[0] } }}
 
+        # Required companion tools, declared next to the handlers and used by `--tools` to
+        # keep a selected workflow's documented calls available. `ToolFilter` closes this
+        # graph transitively after applying the operator's include/exclude patterns.
+        TOOL_DEPENDENCIES = {
+          {% for m in tools %}
+            {% ann = m.annotation(Tool) %}
+            {% if ann.named_args.keys.map(&.stringify).includes?("requires") %}
+              {{ ann[0] }} => {{ ann[:requires] }},
+            {% end %}
+          {% end %}
+        }
+
+        # tool name → the Preferences permission group that switches it off (`permission:`).
+        # A tool absent here is served whatever the switches say.
+        TOOL_PERMISSIONS = {
+          {% for m in tools %}
+            {% ann = m.annotation(Tool) %}
+            {% if ann.named_args.keys.map(&.stringify).includes?("permission") %}
+              {{ ann[0] }} => {{ ann[:permission] }},
+            {% end %}
+          {% end %}
+        } of String => String
+
         # Tools refused under `gori mcp --read-only` (`gated: true`).
         GATED_TOOLS = Set(String){ {{ tools.select { |m| m.annotation(Tool)[:gated] }.map { |m| m.annotation(Tool)[0] }.splat }} }
 
@@ -156,6 +227,14 @@ module Gori
 
         # Tools that work with no project store open; `unbound: true`.
         UNBOUND_SAFE = Set(String){ {{ tools.select { |m| m.annotation(Tool)[:unbound] }.map { |m| m.annotation(Tool)[0] }.splat }} }
+
+        # Tools that neither mutate anything nor dial out — what `annotations.readOnlyHint`
+        # tells a client, and what decides whether it can run one without asking the human.
+        # `!gated` by default (that IS what `--read-only` serves), overridden by the
+        # `read_only:` flag on the two populations where the two disagree; reasoning and the
+        # whole exception list in mcp/tool.cr.
+        {% read_only = tools.select { |m| m.annotation(Tool).named_args.keys.map(&.stringify).includes?("read_only") ? m.annotation(Tool)[:read_only] : !m.annotation(Tool)[:gated] } %}
+        READ_ONLY_TOOLS = Set(String){ {{ read_only.map { |m| m.annotation(Tool)[0] }.splat }} }
       end
 
       # A live OAST listening session held server-side across tool calls (oast_start →
@@ -197,6 +276,12 @@ module Gori
       # that does not drain stderr then fills the pipe and parks the job fiber, wedging the
       # job at `:running`. The count itself is never capped — only the writes.
       DRAIN_LOG_CAP = 20
+
+      # Permission denials are useful audit facts, but an agent may retry the same unavailable
+      # tool in a loop. Keep one Activity marker per tool/group in this MCP process and current
+      # project binding; the event feed itself keeps its existing 50k-row project cap. No call
+      # arguments are copied into the event.
+      PERMISSION_DENIAL_EVENT_KIND = "agent_permission_denied"
 
       # Param-miner safety rails (same intent as the fuzz caps).
       MINE_MAX_REQUESTS    = 100_000_i64
@@ -251,6 +336,24 @@ module Gori
       # Default inlined-body cap for body_mode:preview (full uses Serialize::MAX_TEXT).
       BODY_PREVIEW_BYTES = 2048
 
+      # The inlined-body cap when a call names neither `body_mode` nor `max_body_bytes` and the
+      # body can be paged afterwards (#1394). `full` used to be that default: up to 64 KB —
+      # ~16k tokens — per get_flow, on the call an agent makes most, to read a flow whose body
+      # it usually only needs the start of. Most API bodies still fit whole; a larger one is cut
+      # here with a `more` pointer naming the chunk tool (`Serialize.emit_body`).
+      AUTO_BODY_BYTES = 8 * 1024
+
+      # The `more` pointer on a body the default cap cut, naming where the rest is.
+      private def body_more_hint(source : String, what : String = "body") : String
+        "cut at #{AUTO_BODY_BYTES} bytes by the default body_mode — get_response_body_chunk{#{source}} " \
+        "pages the whole #{what}; body_mode:\"full\" inlines up to #{Serialize::MAX_TEXT} bytes"
+      end
+
+      # Whether this call left the body size to the default — neither argument given.
+      private def body_auto?(h) : Bool
+        !present?(h, "body_mode") && !present?(h, "max_body_bytes")
+      end
+
       # Ceiling on the `decoder` tool's returned output string. A Decoder step can
       # produce up to 32 MiB (Decoder::MAX_OUT); returning that inline would swamp
       # the JSON-RPC channel, so truncate the display string and flag it.
@@ -265,20 +368,38 @@ module Gori
                      @project_name : String? = nil, @project_slug : String? = nil,
                      @db_path : String? = nil, @selection_source : String? = nil,
                      @workspace_root : String? = nil, @project_id : String? = nil,
-                     @bind_error : String? = nil, @tool_filter : ToolFilter? = nil)
+                     @bind_error : String? = nil, @tool_filter : ToolFilter? = nil,
+                     denied_permissions : Set(String)? = nil)
+        # A copy, never the caller's set: a later mutation there must not reach this server.
+        @denied_permissions = denied_permissions.try(&.dup) || Set(String).new
+        @permission_denial_log_db_path = @db_path
+        @permission_denials_logged = Set({String, String}).new
         # The binding table (#501) is built ONCE per bound project and kept, not rebuilt per
         # call: an MCP server is long-lived and IS an extraction source — `send_request` goes
         # through `Repeater::Sender`, so a `$SESSION` bound by a login here has to still be
         # bound on the next tool call. Rebuilding it per call would silently make every
         # binding write-only.
         @bindings = nil.as(Gori::Bindings?)
+        # The slots' refresh runner for the bound project (#1233) — see `bind_binding_layer`.
+        @refresher = nil.as(Gori::SessionRefresh::Runner?)
         # The peer's clientInfo, delivered by the initialize handshake — which can arrive
         # before OR after a project is bound, so both `client_seen` and `announce_presence`
         # know how to fill the other's gap.
         @client_name = nil.as(String?)
         @client_version = nil.as(String?)
         @presence = nil.as(AgentPresence?)
+        # #1090: the feed's end when this store was bound. `operator_messages{since:0}` reads
+        # from here, never from the project's first day — taken NOW, at bind, not at the first
+        # call: a message the operator sends between attach and the agent's first poll is
+        # exactly the one the poll layer exists to carry.
+        @messages_floor = @store.try(&.last_event_id) || 0_i64
+        # Where the piggyback (`pending_operator_note`) has read to. Its own cursor rather than
+        # the floor: it must never re-attach a message it already handed over, and a read-only
+        # server — which cannot record the delivery that would retire it — would otherwise put
+        # the same line on every tool result for the rest of the session.
+        @messages_cursor = @messages_floor
         if s = @store
+          reconcile_env_syntax(s)
           bind_project_network(s)
           Env.load_project(s)
           bind_binding_layer(s)
@@ -299,7 +420,23 @@ module Gori
         # Short-lived confirmation tokens issued by delete_project(dry_run) →
         # {db_path, issued_at_ms}. A real delete must present a matching, unexpired one.
         @delete_tokens = {} of String => {String, Int64}
+        # Set for the duration of ONE `call` when the surface can answer "has the client
+        # cancelled the request I am serving?" — see `call` and `cancel_signal`.
+        @cancelled = nil.as(Proc(Bool)?)
+        # #1090: operator messages a route in THIS process is mid-way through handing over.
+        # Three readers share one feed — the courier, the tool-result carry and
+        # `operator_messages` — and the delivery ROW that keeps them from repeating each other
+        # is only written once a hand-off has finished. A `codex queue` parks its fiber for up
+        # to ten seconds; the tool call the agent makes in that window would find the message
+        # unclaimed and carry it a second time. An id in here is "somebody is already on it".
+        @in_flight_messages = Set(Int64).new
       end
+
+      # Operator messages a route in this process carried while the store could not record it
+      # (`--read-only` has no writer). The delivery row is what keeps the courier and the
+      # tool-result carry from repeating each other, so without one each sent what the other
+      # had. Message ids belong to one feed: cleared when the server re-anchors on another.
+      getter carried_here = Set(Int64).new
 
       # Bound-only helpers call this after the unbound gate; raises only on internal misuse.
       private def store : Store
@@ -308,23 +445,250 @@ module Gori
         s
       end
 
-      private def unbound? : Bool
+      def unbound? : Bool
         @store.nil?
       end
 
-      # Re-read the per-project `$KEY` env vars from the store into the process
-      # global (Settings.project_env_vars). Cheap: one settings-row read + a JSON
-      # parse (Env.load_project). No-op when unbound. The parsed Array is assigned
-      # synchronously within `call` (no fiber yield between read and assign), so an
-      # in-flight async job fiber — which already expanded its template at build
-      # time and does not re-read env during the run — never sees a torn value.
+      # The LIVE store, or nil while unbound — for the courier, which must re-read it every
+      # tick because `bind_project` swaps it. Never cache the answer.
+      def current_store : Store?
+        @store
+      end
+
+      # The database file `current_store` reads, normalized for comparison.
+      def current_db_path : String?
+        @db_path.try { |d| File.expand_path(d) }
+      end
+
+      # Bumped by every bind that re-anchors the operator-message cursors (`bind_project`), and
+      # only by those: the courier keys its own cursor on it, so a rebind to the database
+      # already served (a new Store object over the same feed) keeps its place, while A→B→A,
+      # or a project deleted and recreated at the same path, starts over as `Tools` does.
+      getter feed_generation = 0_i64
+
+      # The client's self-declared name from the handshake (`claude-code`, …), nil before it.
+      def client_name : String?
+        @client_name
+      end
+
+      # The active `--tools` filter, or nil when the whole catalogue is served. Read by
+      # `Server#filter_note`, which has to say that the surface was narrowed on purpose.
+      getter tool_filter : ToolFilter?
+
+      # Whether `tools/list` would show `name` under the active `--tools` filter.
+      #
+      # Everything BUT the --read-only gate, deliberately — this answers "would this tool be
+      # here if the gate were lifted", which is the question the read-only sentence in
+      # `instructions` asks (it names what restarting would restore). So it reads the filter
+      # and the operator's Preferences switches, neither of which a restart without
+      # --read-only reverses. Every other reader wants `serves?` below.
+      def advertises?(name : String) : Bool
+        ((f = @tool_filter).nil? || f.allows?(name)) && denied_permission(name).nil?
+      end
+
+      # The Preferences permission group (`Settings::MCP_PERMISSIONS` key) that withholds
+      # `name` on this server, or nil when it is served as far as the switches go.
+      def denied_permission(name : String) : String?
+        Tools.denied_permission(@denied_permissions, name)
+      end
+
+      def self.denied_permission(denied : Set(String)?, name : String) : String?
+        return nil if denied.nil? || denied.empty?
+        (key = TOOL_PERMISSIONS[name]?) && denied.includes?(key) ? key : nil
+      end
+
+      # The groups switched off on this server, in Preferences order — for `instructions`.
+      def denied_groups : Array(Settings::McpPermission)
+        Settings.mcp_permission_groups(@denied_permissions)
+      end
+
+      # The group that refuses THIS call, or nil. The name decides for almost every tool; the
+      # arguments decide for the few whose one mode sends and whose other does not, and they
+      # are listed here rather than inside each handler so a new one has one place to go.
+      private def call_denied_permission(name : String, h) : String?
+        return nil if @denied_permissions.empty?
+        if key = denied_permission(name)
+          return key
+        end
+        # A read tool whose one argument WRITES a file sits behind `write` for that call.
+        if name == "export_openapi" && @denied_permissions.includes?("write") && describes?(h, "output_path")
+          return "write"
+        end
+        return nil unless @denied_permissions.includes?("send")
+        sends = case name
+                when "probe_scan" then bool_arg(h, "active", false)
+                  # Raising the mode arms the capture pipeline's AUTOMATIC active probes, so it
+                  # is a send by proxy; lowering it (or a label that is not a mode) is not.
+                when "set_probe_mode"
+                  str(h, "mode").try { |m| Probe::Mode.values.find(&.label.==(m.strip.downcase)) }.try(&.probes_actively?) || false
+                else false
+                end
+        sends ? "send" : nil
+      end
+
+      # Whether `tools/list` actually carries `name` — the `--tools` filter AND the
+      # `--read-only` gate, which are two different reasons a tool is absent and only one of
+      # which a restart reverses. Anything that tells the agent what it can CALL has to ask
+      # this one: `instructions` used to offer `delete_project` on a read-only server, where
+      # it is neither listed nor runnable.
+      def serves?(name : String) : Bool
+        Tools.serves?(@tool_filter, @allow_actions, name, @denied_permissions)
+      end
+
+      # How many tools this server's `tools/list` carries.
+      def served_count : Int32
+        Tools.served_names(@tool_filter, @allow_actions, @denied_permissions).size
+      end
+
+      # The ONE home for "is it in tools/list", asked of the two flags rather than of a
+      # server: `serves?` above reads it per name, `gori mcp` counts it for the start-up
+      # banner and refuses a `--tools` spec that leaves it empty. A second spelling of this
+      # rule is how the banner came to promise all 179 tools on a server about to advertise 62.
+      # `denied` is the third reason, the operator's Preferences switches (`denied_permission`).
+      def self.serves?(filter : ToolFilter?, allow_actions : Bool, name : String,
+                       denied : Set(String)? = nil) : Bool
+        (filter.nil? || filter.allows?(name)) && (allow_actions || !GATED_TOOLS.includes?(name)) &&
+          denied_permission(denied, name).nil?
+      end
+
+      # …and the whole set of them, in declaration order.
+      def self.served_names(filter : ToolFilter?, allow_actions : Bool,
+                            denied : Set(String)? = nil) : Array(String)
+        TOOL_NAMES.select { |name| serves?(filter, allow_actions, name, denied) }
+      end
+
+      # The `tools` array of `tools/list`, byte for byte, under these two flags — what the
+      # start-up banner weighs and what the guide's catalogue table is checked against
+      # (#1137). Built on a detached, storeless instance, which is exact rather than an
+      # approximation: the listing may not vary with anything on the connection (the
+      # 2026-07-28 MUST that `Tools#list` already keeps), so which project is bound cannot
+      # change a byte of it. A storeless `Tools` opens nothing and announces nothing.
+      def self.catalogue_json(filter : ToolFilter?, allow_actions : Bool,
+                              denied : Set(String)? = nil) : String
+        tools = new(nil, allow_actions, true, tool_filter: filter, denied_permissions: denied)
+        JSON.build { |j| tools.list(j) }
+      end
+
+      # The ONE rounding of a catalogue's size into the KB the banner prints and the guide's
+      # table states — the spec checks the table with this, so the two cannot round apart.
+      def self.catalogue_kb(bytes : Int32) : Int32
+        (bytes / 1024.0).round.to_i
+      end
+
+      # `tools/list ~203 KB`, or the bytes when there is less than half a KB of it: a
+      # one-tool `--tools` spec used to be reported as "~0 KB", the one line whose job is the
+      # cost saying there is none.
+      def self.catalogue_weight(filter : ToolFilter?, allow_actions : Bool,
+                                denied : Set(String)? = nil) : String
+        bytes = catalogue_json(filter, allow_actions, denied).bytesize
+        kb = catalogue_kb(bytes)
+        kb.zero? ? "tools/list #{bytes} bytes" : "tools/list ~#{kb} KB"
+      end
+
+      # Where `operator_messages` starts reading (see `initialize` / `bind_project`).
+      def messages_floor : Int64
+        @messages_floor
+      end
+
+      # Take an operator message out of the other readers' hands for the length of one
+      # hand-off, or answer false when somebody already has it. Released in the caller's
+      # `ensure`: a claim that leaks is a message this process would never carry again, which
+      # is the one direction this layer must not err in.
+      def claim_message(id : Int64) : Bool
+        return false if @in_flight_messages.includes?(id)
+        @in_flight_messages << id
+        true
+      end
+
+      def release_message(id : Int64) : Nil
+        @in_flight_messages.delete(id)
+      end
+
+      # How far the tool-result carry has read. Exposed for the reason `Courier#cursor` is: the
+      # rule this cursor keeps — advance past what was SCANNED, never past what matched, and
+      # advance even when nothing goes out — is only observable from here, and the one time it
+      # was not pinned it silently stopped advancing at all.
+      def messages_cursor : Int64
+        @messages_cursor
+      end
+
+      # The LIVE project binding. `bind_project` (switch_project, and create_project when it
+      # auto-binds) rewrites every one of these mid-session, so anything that reports the
+      # binding has to ask HERE rather than keep the copy it was constructed with — a second
+      # copy is a second answer, and the one the server held went stale the moment a switch
+      # landed while still being read out as the server's configuration (#1003).
+      # Only what a reader outside this class actually asks for. `project_id`/`db_path` stay
+      # private: nothing reports them from out here, and a getter with no caller is a contract
+      # no one is keeping.
+      getter project_name : String?
+      getter project_slug : String?
+      getter selection_source : String?
+      getter workspace_root : String?
+      getter bind_error : String?
+
+      # Re-read what a send expands or overlays: the per-project `$KEY` env vars from the store
+      # into the process global (Settings.project_env_vars), the global env / User-Agent
+      # sections of settings.json, and the session-slot list. Cheap: a stat, one settings-row
+      # read + a JSON parse (Env.load_project). The project half is a no-op when unbound. The
+      # parsed Array is assigned synchronously within `call` (no fiber yield between read and
+      # assign), so an in-flight async job fiber — which already expanded its template at
+      # build time and does not re-read env during the run — never sees a torn value.
       private def refresh_project_env : Nil
+        # A PEER's grammar switch, first. An MCP server reads `Settings.env_syntax` once at startup
+        # and lives for hours, so a `gori settings env-syntax` run in the operator's terminal left
+        # this process answering `list_env.syntax` with the grammar it was born under AND writing
+        # rows in that grammar into a database the switch had already marked the other way — rows
+        # the reconcile then skips forever, because `from == to`. `follow_disk` adopts, re-spells
+        # this project and hands back what it did; `Log` is this surface's only channel, since
+        # STDOUT belongs to JSON-RPC.
+        Gori::EnvMigration.follow_disk(@store, @db_path, @project_name).each { |line| Log.info { line } }
+        # The GLOBAL halves, after the grammar: settings.json's `$ENV.KEY` table (#1217) and the
+        # `$GEN.USER_AGENT` corpus (#1218). Both are read at every send, and this process loaded
+        # them once at startup — so a token the operator rotated or deleted in another terminal
+        # went on leaving from here. A `stat` when the file has not moved (`reload_section`).
+        Settings.reload_env_from_disk
+        Settings.reload_user_agents_from_disk
         return unless s = @store
         Env.load_project(s)
         # RELOAD the existing table rather than replacing it: an extract rule may have been
         # added by the TUI or `gori run` since the last call, but the VALUES this process
         # observed are its own and must survive the refresh.
         @bindings.try(&.reload)
+        # And the session-slot LIST (#1216), which `Env.overlay_slot` applies at every send.
+        # `Bindings#reload` re-reads the extract rules only, so a slot a peer deleted or edited
+        # kept overlaying its old headers until a slot tool happened to call `fresh_slots`.
+        # `SessionSlots#reload` drops the active pointer when its slot is gone, and is one row
+        # read when nothing moved.
+        @bindings.try(&.slots).try(&.reload)
+      end
+
+      # The GLOBAL halves of the three libraries that merge settings.json with the project —
+      # saved views (#1215), Match&Replace rules and colour rules/custom colours — re-read before
+      # every tool, as the TUI re-reads them on its peer tick. Every handler that lists, resolves,
+      # validates a name against or mutates one of them reads the class properties this process
+      # loaded at startup, so a peer's `gori run views add --scope global` was an unknown view
+      # here until a restart. A `stat` each when the file has not moved (`reload_section`);
+      # section-only, so nothing else this process holds is clobbered.
+      private def refresh_global_libraries : Nil
+        Settings.reload_saved_views_from_disk
+        Settings.reload_rewriter_from_disk
+        Settings.reload_colormarker_from_disk
+      end
+
+      # THE token-grammar reconcile for this surface (#env.syntax). Both bind sites call it — the
+      # constructor above and `bind_project` (switch_project / an auto-binding create_project) —
+      # because an MCP server binds a project at either, and a re-spelling that only happened at
+      # startup would leave a switched-to project reading its own drafts as literal text.
+      #
+      # BEFORE the binding layer and the project env layer are read out of the store, like the TUI's
+      # `Session.open`. Reported through `Log`, which is this surface's only channel: STDOUT belongs
+      # to JSON-RPC, and a notice on it would be a protocol violation rather than a notice.
+      private def reconcile_env_syntax(s : Store) : Nil
+        return unless path = @db_path
+        name = @project_name || File.basename(File.dirname(path))
+        lines = Gori::EnvMigration.reconcile(s, path, name).try(&.notices) || [] of String
+        Settings.take_env_syntax_global_migration.try { |g| lines << g.line }
+        lines.each { |line| Log.info { line } }
       end
 
       # Install this project's network overrides (#538) — the third caller of the loader the
@@ -348,10 +712,19 @@ module Gori
       # Publish this project's extract rules as `Env`'s send-time layer. Same per-project
       # global the TUI's `Session.open` and the CLI's `open_store` install, so `$SESSION`
       # means one thing on all three surfaces.
+      #
+      # …and the slots' REFRESH runner beside it (#1233), replaced on every bind so a
+      # `switch_project` cannot refresh the previous project's slot. An automatic refresh is
+      # gated STRICTLY (`Outbound.agent` with no waiver): a send's own `allow_unscoped` does not
+      # extend to a login request gori decided to make. Its steps verify upstream TLS exactly as
+      # `send_request` does (`--insecure-upstream`), or a lab target would take the send and
+      # refuse every login.
       private def bind_binding_layer(s : Store) : Nil
         b = Gori::Bindings.load(s, Gori::SessionSlots.load(s))
         @bindings = b
         Env.layer = b
+        @refresher = Gori::SessionRefresh::Runner.new(s, b, -> { agent_outbound(Scope.load(s), false, waiver: false) },
+          verify: @verify_upstream).install
       end
 
       # Drop any previous project's marker and lay one down beside the CURRENTLY bound
@@ -367,10 +740,15 @@ module Gori
           selection_source: @selection_source)
       end
 
-      # The `initialize` handshake carries the peer's name; the server hands it here (it may
-      # arrive before or after a bind). Store it for the next announce and, if a marker already
-      # exists, fill its name in place.
+      # The peer's name: carried once by the `initialize` handshake, and on EVERY request
+      # under the stateless revision (`_meta["io.modelcontextprotocol/clientInfo"]`), which
+      # is why this returns early when nothing moved — `update` rewrites the marker file,
+      # and a per-call rewrite would put a file write on the hot path of every tool call.
+      # Same shape `AgentPresence#update_capture` already keeps for the capture bit.
+      #
+      # Store it for the next announce and, if a marker already exists, fill its name in place.
       def client_seen(name : String?, version : String?) : Nil
+        return if @client_name == name && @client_version == version
         @client_name = name
         @client_version = version
         @presence.try(&.update(name, version))
@@ -410,6 +788,8 @@ module Gori
       RULE_PARTS     = Store::RulePart.values.map(&.label)
       RULE_OPS       = Store::RuleOp.values.map(&.label)
       RULE_MATCHES   = Store::MatchKind.values.map(&.label)
+      RESPOND_KINDS  = Store::RespondKind.values.map(&.label)
+      FAULT_KINDS    = Store::FaultKind.values.map(&.label)
       SEVERITIES     = Store::Severity.values.map(&.label)
       ISSUE_STATUSES = Store::Status.values.map(&.label)
       LINK_OWNERS    = Store::LinkOwnerKind.values.map(&.label)
@@ -429,9 +809,10 @@ module Gori
       VIEW_SCOPES_R = %w[builtin project global]
       # The event feed's `source` column, as written by every producer.
       EVENT_SOURCES = Store::EVENT_SOURCES
-      # …and its `actor` column: the surface that acted, or nothing. Written only by the two
-      # producers that can name one (`log_agent_action`, `ConfigLog.record`), both from
-      # `FlowSource.surface`.
+      # …and its `actor` column: the surface that acted, or nothing. Written only where a surface
+      # demonstrably did (`log_agent_action`, `ConfigLog.record`, the evidence-freeze line), never
+      # defaulted — see `Store#insert_event` for why an ambient default would be worse than the
+      # empty column.
       EVENT_ACTORS          = Gori::FlowSource::Surface.values.map(&.token)
       FUZZ_MODES            = Fuzz::Mode.names
       MINE_LOCATIONS        = Miner::Location.values.map(&.label)
@@ -444,6 +825,11 @@ module Gori
       # both/request/response — the intercept direction, and (minus `both`) the two sides a
       # probe rule and a diff pane name.
       INTERCEPT_DIRECTIONS = %w[both request response]
+      # What `intercept_set_direction`'s schema enum admits: the documented spellings plus the
+      # `requestonly` / `responseonly` that `intercept_list` reports, which
+      # `Interceptor::Direction.from_arg?` reads back (#1433). A schema-checking client would
+      # otherwise refuse the value it was just handed.
+      INTERCEPT_DIRECTION_ARGS = INTERCEPT_DIRECTIONS + %w[requestonly responseonly]
       # The out-of-band provider kinds, for `oast_start`'s `provider` and the saved-provider
       # tools' `kind` — one list, because they are one set and both readers run it through
       # `Oast::ProviderKind.parse?`.
@@ -455,12 +841,91 @@ module Gori
       # and the recovery is the same one sentence either way.
       private def no_project : Result
         if reason = @bind_error
-          return err("no project bound — the configured project could not be opened: #{reason}. " \
-                     "Call list_projects, then switch_project (or create_project) to continue.",
-            "NO_PROJECT")
+          return err("no project bound — the configured project could not be opened: #{reason}; " \
+                     "#{project_recovery}.", "NO_PROJECT")
         end
-        err("no project bound; call list_projects, create_project, or switch_project first",
-          "NO_PROJECT")
+        err("no project bound; #{project_recovery}", "NO_PROJECT")
+      end
+
+      # How to get OUT of the unbound state, named from what `tools/list` actually carries.
+      #
+      # This sentence used to read "call list_projects, create_project, or switch_project
+      # first" whatever the server was serving, and under `--tools='list_*,get_*,send_request'`
+      # two of those three names came back `-32602 unknown tool`: an agent following the only
+      # recovery it was given, to tools this process had been started without. Same rule as
+      # `Server#advertised` (#1136).
+      private def project_recovery : String
+        return no_binder_recovery if unbindable?
+        "call #{PROJECT_BINDERS.select { |n| serves?(n) }.join(", ")} before traffic tools"
+      end
+
+      # The whole recovery path, in the order an agent walks it: find the project, then bind
+      # it. One list, read by the sentence above and by the two tool descriptions that point
+      # at it.
+      PROJECT_BINDERS = %w[list_projects create_project switch_project]
+
+      # …of which only these two BIND. `list_projects` reads a listing and changes nothing,
+      # so a server that serves it alone can tell the agent which projects exist and then
+      # refuse every one of them — the retry loop #1142 exists to stop, arrived at from the
+      # other side. `Server#unbound_note` has always drawn this line ("list_projects to see
+      # available projects" vs. the two that "pick"); the recovery sentence now draws it too.
+      PROJECT_PICKERS = %w[switch_project create_project]
+
+      # True when nothing this server advertises can move it onto a project. That is an
+      # operator decision made at start-up (`--tools`), not something a call can undo, and
+      # both the tool-facing sentence below and `gori mcp`'s start-up log read it from here.
+      def unbindable? : Bool
+        PROJECT_PICKERS.none? { |n| serves?(n) }
+      end
+
+      # …and what to say when it is. Lower-case and lead-in-less so each caller supplies its
+      # own punctuation; `Server#unbound_note` appends the same words to `instructions`, so
+      # the first text the model reads and the error it hits ten calls later agree.
+      NO_BINDER_RECOVERY = "this server advertises no project-selection tool, so no call can " \
+                           "bind one — the operator must restart gori mcp with a project " \
+                           "(--project/--db), or include switch_project in --tools"
+
+      # …with every fix that applies: when the operator's "Manage projects" switch removed the
+      # binders, `--tools` alone cannot bring them back, and when both did, either alone fails.
+      def no_binder_recovery : String
+        return NO_BINDER_RECOVERY unless denied_permission("switch_project")
+        fixes = ["allow \"Manage projects\" in gori Preferences › AI › MCP permissions"]
+        fixes << "include switch_project in --tools" if (f = @tool_filter) && !f.allows?("switch_project")
+        "this server advertises no project-selection tool, so no call can bind one — the " \
+        "operator must restart gori mcp with a project (--project/--db), or #{fixes.join(" and ")}"
+      end
+
+      # How a hint says "add a scope rule": the tool while this server serves it, the operator
+      # once `--read-only`, `--tools` or the "Change scope & sandbox" switch has taken it away —
+      # a hint naming a tool the agent cannot call is a dead end it will try anyway.
+      def add_scope_rule_hint : String
+        serves?("add_scope_rule") ? "add a scope rule with add_scope_rule" : "ask the operator to add a scope rule"
+      end
+
+      # Whether this server lets the agent make each fix a SCOPE_BLOCKED remedy names: add an
+      # include rule, or delete (or narrow) the EXCLUDE rule that matched. One the agent cannot
+      # make is named as the operator's (`Outbound.remedy`).
+      def can_add_include? : Bool
+        serves?("add_scope_rule")
+      end
+
+      def can_edit_exclude? : Bool
+        serves?("delete_scope_rule") || serves?("update_scope_rule")
+      end
+
+      def scope_remedy(verdict : ScopeCheck) : String
+        Outbound.remedy(verdict, "allow_unscoped:true", add_include: can_add_include?, edit_exclude: can_edit_exclude?)
+      end
+
+      # `Outbound.agent` spelled for this server's refusals: the ones a core engine phrases
+      # (retest, session refresh, gRPC reflection) then offer the agent's own waiver and fix.
+      # `waiver` is left nil for a caller with no allow_unscoped to pass.
+      def agent_outbound(scope : Scope, allow_unscoped : Bool, *, waiver : Bool = true) : Outbound
+        ob = Outbound.agent(scope, allow_unscoped)
+        ob.waiver = "allow_unscoped:true" if waiver
+        ob.can_add_include = can_add_include?
+        ob.can_edit_exclude = can_edit_exclude?
+        ob
       end
 
       # Ceiling (seconds) a delete_project dry-run confirmation token stays valid.
@@ -482,18 +947,52 @@ module Gori
         max_requests : Int64?,
         started_at_ms : Int64
 
+      # What every background job carries, whatever it runs: its id, where it stands, how it
+      # ended, the stop request, and the project it ran in. Each kind adds its own counters.
+      abstract class Job
+        getter id : String
+        # :running until the runner fiber lands it terminal; each kind names its own terminal
+        # states.
+        property status : Symbol = :running
+        property error_msg : String? = nil
+        property? truncated = false
+        property ended_at_ms : Int64? = nil
+        property stop_requested_at_ms : Int64? = nil
+        getter audit : JobAudit
+        getter db_path : String?
+
+        def initialize(@id : String, @audit : JobAudit, @db_path : String?)
+        end
+
+        def stop : Nil
+          @stop_requested_at_ms ||= Time.utc.to_unix_ms
+          halt
+        end
+
+        # Tell the run itself to wind down.
+        private abstract def halt : Nil
+      end
+
       # A background fuzz run, polled by fuzz_status / fuzz_results. The runner fiber
       # only mutates these fields (single-threaded scheduler → no lock needed); the stored
       # results are capped at FUZZ_MAX_STORED and are NOT matched-only — see
       # `store_fuzz_result` for the six things a row can be kept for. `fuzz_results
       # {matched_only:true}` is the filter for a caller that wants only the matches.
-      class FuzzJob
-        getter id : String
+      class FuzzJob < Job
         getter total : Int64?
-        # :running | :done | :budget_exhausted | :stopped | :error. :budget_exhausted
-        # is a DISTINCT terminal state from :done so a run that hit the request budget
-        # before checking every candidate is not read as an exhaustive "0 matches".
-        property status : Symbol = :running
+        # `status`: :running | :done | :budget_exhausted | :condition_met | :stopped | :error.
+        # :budget_exhausted is a DISTINCT terminal state from :done so a run that hit the
+        # request budget before checking every candidate is not read as an exhaustive "0
+        # matches"; :condition_met (issue #1240) is the run's own `stop_on` ending it — it
+        # reached its goal, which is why it is neither :done (not exhaustive) nor :stopped
+        # (nobody pressed stop).
+
+        # The sentence naming what the run's `stop_on` met, when `status == :condition_met`;
+        # nil otherwise. Reported by `fuzz_status` so an agent reads WHY the run ended early.
+        property stop_reason : String? = nil
+        # The `index` of the result that tripped it (`Fuzz::DoneEvent#stop_index`, issue #1270)
+        # — set with `stop_reason`, and what a `save_results` run records as `stop_index`.
+        property stop_index : Int64? = nil
         property sent = 0_i64
         # Requests on the wire (`Fuzz::Progress#requests`): the `max_requests` unit.
         property requests = 0_i64
@@ -534,7 +1033,6 @@ module Gori
         # A terminal failure observed while the drain must stay logically running until Done
         # flushes the permanent tail; otherwise project switching can rebind the store mid-job.
         property? terminal_error = false
-        property error_msg : String? = nil
         # How many times the drain / history-record rescues have fired for this job. Those
         # rescues log, and they sit on the per-EVENT path: a persistent failure (a broken
         # store, a full disk) fires once per result, so an unbounded log would write one
@@ -544,6 +1042,9 @@ module Gori
         # `switch_project`/`delete_project` for the rest of the session. Callers still see
         # the true count in `error_msg`; only the LOGGING is capped (see LOG_CAP).
         property drain_errors = 0
+        # Every result's response shape (#1351), fed before the selective row cache below, so
+        # `fuzz_results{clusters:true}` counts the whole run rather than the rows it kept.
+        getter clusters = Fuzz::Clusters.new
         getter results = [] of Fuzz::Result
         # How many of `results` the matcher REJECTED — the counter `FUZZ_MAX_STORED_UNMATCHED`
         # is enforced against, so a run's failures can never crowd its findings out of the
@@ -553,37 +1054,50 @@ module Gori
         # History flow ids for the stored results, index-aligned with `results`; nil when
         # record_history was off, the record failed, or the row was not one it records.
         getter result_flow_ids = [] of Int64?
-        property? truncated = false
+        # Unique History provenance refs, aligned with `result_flow_ids`. A job may still be
+        # running when a peer clears History, so the same job can produce a later row under a
+        # reused id; the per-result ref prevents the older result from binding to that row.
+        getter result_flow_source_refs = [] of String?
+        property history_ref_seq = 0
         property? history_truncated = false
         property recorded_flows = 0
-        property ended_at_ms : Int64? = nil
-        property stop_requested_at_ms : Int64? = nil
         getter record_history : Symbol
         getter origin : Fuzz::Origin
         getter? http2 : Bool
-        getter audit : JobAudit
 
-        getter db_path : String?
+        # The run's engine, for the queries that are safe to ask while it is live (the macro's
+        # tally, `fuzz_status`).
+        getter engine : Fuzz::Engine
 
-        def initialize(@id : String, @total : Int64?, @engine : Fuzz::Engine,
+        def initialize(id : String, @total : Int64?, @engine : Fuzz::Engine,
                        @record_history : Symbol, @origin : Fuzz::Origin, @http2 : Bool,
-                       @audit : JobAudit, @db_path : String? = nil)
+                       audit : JobAudit, db_path : String? = nil)
+          super(id, audit, db_path)
         end
 
-        def stop : Nil
-          @stop_requested_at_ms ||= Time.utc.to_unix_ms
+        private def halt : Nil
           @engine.stop
+        end
+
+        # `fz_N` restarts at 1 in every `gori mcp` process, so a bare `fz_1:1` recorded by
+        # ANOTHER server on this project (or before a switch_project) matched this job's ref, and
+        # `fuzz_results` credited that process's flow to this job. The per-process nonce is what
+        # makes the ref this job's alone.
+        HISTORY_REF_NONCE = Random::Secure.hex(3)
+
+        def next_history_source_ref : String
+          @history_ref_seq += 1
+          "#{@id}@#{HISTORY_REF_NONCE}:#{@history_ref_seq}"
         end
       end
 
       # A background param-mining run, polled by mine_status / mine_results. Like FuzzJob,
       # only the runner fiber mutates these (single-threaded → no lock). `total` is the
       # name count (the stable denominator); issues are capped at MINE_MAX_STORED.
-      class MineJob
-        getter id : String
+      class MineJob < Job
         getter total : Int64
-        # :running | :done | :budget_exhausted | :stopped | :error (see FuzzJob).
-        property status : Symbol = :running
+        # `status`: :running | :done | :budget_exhausted | :stopped | :error (see FuzzJob).
+
         property names_done = 0_i64
         property sent = 0_i64
         property found = 0
@@ -595,26 +1109,19 @@ module Gori
         property baseline_warning : String? = nil
         # The calibration note — informational, never a downgrade (see `Miner::BaselineEvent`).
         property baseline_note : String? = nil
-        property error_msg : String? = nil
         getter results = [] of Miner::Finding
-        property? truncated = false
-        property ended_at_ms : Int64? = nil
-        property stop_requested_at_ms : Int64? = nil
-        getter audit : JobAudit
-
-        getter db_path : String?
         # The run's engine. Exposed for its PURE reporting queries (`skipped_names` /
         # `present_names` / `candidate_names`), which are derived from the loaded wordlist, the
         # base request and the config's locations — so they are safe to read from the status
         # fiber while the run is live.
         getter engine
 
-        def initialize(@id : String, @total : Int64, @engine : Miner::Engine, @audit : JobAudit,
-                       @db_path : String? = nil)
+        def initialize(id : String, @total : Int64, @engine : Miner::Engine, audit : JobAudit,
+                       db_path : String? = nil)
+          super(id, audit, db_path)
         end
 
-        def stop : Nil
-          @stop_requested_at_ms ||= Time.utc.to_unix_ms
+        private def halt : Nil
           @engine.stop
         end
       end
@@ -622,32 +1129,37 @@ module Gori
       # An async token-collection run tracked for the sequence_* tools. Collected tokens
       # are kept in-memory ONLY to compute the randomness report — they are secrets and are
       # never returned over the wire (sequence_results exposes the report, not the tokens).
-      class SequenceJob
-        getter id : String
+      class SequenceJob < Job
         getter goal : Int32
-        property status : Symbol = :running # :running | :done | :stopped | :error
+        # `status`: :running | :done | :budget_exhausted | :stopped | :error (see FuzzJob). Here
+        # :budget_exhausted means the collection ended UNDER `goal`, so the randomness report
+        # rests on a shorter sample than the caller asked for — which is not a fact a verdict
+        # of WEAK or CRITICAL carries on its own face.
+
         property collected = 0
         property sent = 0
+        # Requests actually put on the wire — `Sequencer::Engine#wire_requests`, the same
+        # `backend.sent + extra_requests` sum `FuzzJob#requests` carries. `sent` above counts
+        # collection ATTEMPTS, and a retry or a pool re-send charges only this one, so with
+        # `retries` (up to 1000 here) the two diverge by a wide margin and only this one
+        # answers "how much load did the run put on the target". (The BUDGET is a third
+        # number: `max_requests` and SEQUENCE_MAX_REQUESTS are enforced against
+        # `CappedBackend#sent`, which counts calls.) It was collected by the engine, carried
+        # on every event, and dropped at the drain.
+        property requests = 0_i64
         property errors = 0
-        property error_msg : String? = nil
         getter tokens = [] of String
-        property? truncated = false
-        property ended_at_ms : Int64? = nil
-        property stop_requested_at_ms : Int64? = nil
-        getter audit : JobAudit
 
-        getter db_path : String?
-
-        def initialize(@id : String, @goal : Int32, @engine : Sequencer::Engine, @audit : JobAudit,
-                       @db_path : String? = nil)
+        def initialize(id : String, @goal : Int32, @engine : Sequencer::Engine, audit : JobAudit,
+                       db_path : String? = nil)
+          super(id, audit, db_path)
         end
 
         def report : Sequencer::Stats::Report
           Sequencer::Stats.analyze(@tokens)
         end
 
-        def stop : Nil
-          @stop_requested_at_ms ||= Time.utc.to_unix_ms
+        private def halt : Nil
           @engine.stop
         end
       end
@@ -659,10 +1171,10 @@ module Gori
       # proc to the engine so it is polled between identities too), so the fiber has nothing to
       # drive but the accumulation below. `stop` is therefore a FLAG this job owns rather than
       # a call into an engine — the plan is a struct and the loop reads the proc.
-      class AuthorizeJob
-        getter id : String
+      class AuthorizeJob < Job
         getter plan : Authorize::Plan
-        property status : Symbol = :running # :running | :done | :stopped | :error
+        # `status`: :running | :done | :stopped | :error.
+
         # Requests whose FULL identity set was replayed. A request the stop cut short mid-set
         # yields no Target at all (see `Authorize::Engine#run`), so it is never counted here —
         # claiming "enforced" from identities that were never sent is worse than a false
@@ -693,7 +1205,6 @@ module Gori
         # Non-baseline identities served the same response as the baseline: the finding.
         property bypasses = 0
         property reviews = 0
-        property error_msg : String? = nil
         # Flows that RAISED before any send — a stored h2 pseudo-header head is the reachable
         # one. Counted and named per flow rather than failing the job: one unreplayable
         # capture in a fifty-flow selection is not a reason to throw away the other
@@ -701,16 +1212,15 @@ module Gori
         property failed = 0
         getter failures = [] of {Int64, String, String}
         getter results = [] of Authorize::Target
-        property? truncated = false
-        property ended_at_ms : Int64? = nil
-        property stop_requested_at_ms : Int64? = nil
+        # Every request with a bypass, past AUTHORIZE_MAX_STORED too: `bypasses` is promised
+        # complete, and the stored-rows cap silently dropped the ones after it. Bounded by the
+        # send cap like the job itself, and head-only like `results`.
+        getter bypassed = [] of Authorize::Target
         property? stop_requested = false
-        getter audit : JobAudit
 
-        getter db_path : String?
-
-        def initialize(@id : String, @plan : Authorize::Plan, @audit : JobAudit,
-                       @db_path : String? = nil)
+        def initialize(id : String, @plan : Authorize::Plan, audit : JobAudit,
+                       db_path : String? = nil)
+          super(id, audit, db_path)
         end
 
         # The selection's size, snapshotted from the plan so a status read never walks it.
@@ -734,22 +1244,20 @@ module Gori
           @plan.identities.find(&.baseline?).try(&.name)
         end
 
-        def stop : Nil
-          @stop_requested_at_ms ||= Time.utc.to_unix_ms
+        private def halt : Nil
           @stop_requested = true
         end
       end
 
       # An async discover (spider + directory brute-force) run tracked for the discover_* tools.
-      class DiscoverJob
-        getter id : String
-        property status : Symbol = :running # :running | :done | :stopped | :error
+      class DiscoverJob < Job
+        # `status`: :running | :done | :stopped | :error.
+
         property found = 0
         property sent = 0_i64
         property errors = 0_i64
         property queued = 0
         property stats : Discover::RunStats? = nil
-        property error_msg : String? = nil
         getter results = [] of Discover::Finding
         # Findings waiting to be written as flows. The TUI has always batched these
         # (`DiscoverController#queue_persist`); MCP wrote one transaction per finding, and
@@ -757,21 +1265,110 @@ module Gori
         # back-pressures the engine's 256-slot event channel and stalls every crawl worker.
         getter persist_buf = [] of {Store::CapturedRequest, Store::CapturedResponse?}
         property persist_at : Time::Instant = Time.instant # last flush; see DISCOVER_PERSIST_INTERVAL
-        property? truncated = false
-        property ended_at_ms : Int64? = nil
-        property stop_requested_at_ms : Int64? = nil
-        getter audit : JobAudit
+        # Findings whose flow rows were NOT written — a flush the writer rolled back (a peer
+        # holding the writer slot), a closing store, or a project switched under the job. The
+        # finding is still in `results`; the row it names does not exist. Reported on
+        # `discover_status` / `discover_results` as `unsaved_flows`, because a caller that
+        # reads a finding here and then `get_flow`s it has no other way to tell "not yet
+        # flushed" from "never will be".
+        property unsaved = 0
+        # The `results` index each `persist_buf` entry belongs to, in buffer order — nil for a
+        # finding past DISCOVER_MAX_STORED, which is persisted but has no row to carry an id.
+        # With `flow_ids`, what lets `discover_results` hand an agent the `flow_id` its
+        # `requires: get_flow` promises.
+        getter persist_owners = [] of Int32?
+        # `results` index → flow id, filled as each batch commits.
+        getter flow_ids = {} of Int32 => Int64
 
-        getter db_path : String?
-
-        def initialize(@id : String, @engine : Discover::Engine, @audit : JobAudit,
-                       @db_path : String? = nil)
+        def initialize(id : String, @engine : Discover::Engine, audit : JobAudit,
+                       db_path : String? = nil)
+          super(id, audit, db_path)
         end
 
-        def stop : Nil
-          @stop_requested_at_ms ||= Time.utc.to_unix_ms
+        private def halt : Nil
           @engine.stop
         end
+      end
+
+      # Second spellings of one argument, per tool: alias → the name the handler reads (#1393).
+      #
+      # The same object is `flow_id` on nine tools and `id` on get_flow/delete_flow; a repeater
+      # is `repeater_id` on send_request/fuzz_start and `id` on the repeater tools; toggles say
+      # `enabled` everywhere but intercept_toggle. An agent generalising from the tool it used
+      # last spent a turn on INVALID_ARGUMENT every time. Renaming would break every caller that
+      # learned the current names, so both are accepted — from ONE table, which `tool` reads to
+      # advertise the alias (every schema is `additionalProperties:false`, so an alias the
+      # schema did not name would be refused client-side) and `call` reads to fold it into the
+      # real name before dispatch, so no handler knows aliases exist.
+      #
+      # An aliased argument is not `required` in the schema: JSON Schema cannot say "one of
+      # these two" at the top level in the subset MCP clients accept, and a `required: ["id"]`
+      # would make a validating client reject `{flow_id: 7}`. `call` refuses the call with
+      # neither spelling instead (`missing_aliased`), naming both.
+      ARG_ALIASES = {
+        "get_flow"             => {"flow_id" => "id"},
+        "delete_flow"          => {"flow_id" => "id"},
+        "get_repeater_context" => {"repeater_id" => "id"},
+        "update_repeater"      => {"repeater_id" => "id"},
+        "delete_repeater"      => {"repeater_id" => "id"},
+        "move_repeater"        => {"repeater_id" => "id"},
+        "minimize_repeater"    => {"id" => "repeater_id"},
+        "intercept_toggle"     => {"enabled" => "enable"},
+      }
+
+      # Fold each alias the call used into its real name, or the refusal for a call that spelled
+      # both with different values. A JSON null is absent, as everywhere else here; equal values
+      # under both names are one argument said twice, not a conflict.
+      private def resolve_aliases(name : String, h : Hash(String, JSON::Any)) : Hash(String, JSON::Any) | Result
+        return h unless aliases = ARG_ALIASES[name]?
+        folded = h
+        aliases.each do |alias_name, canonical|
+          next unless h.has_key?(alias_name)
+          folded = folded.dup if folded.same?(h)
+          value = folded.delete(alias_name)
+          # Absent, too, when it names nothing ("", [], {}): a client that fills every property
+          # it was shown sends those beside the spelling it means (see `describes?`).
+          next unless value && describes_value?(value)
+          if present?(folded, canonical)
+            next if folded[canonical] == value
+            return err("'#{alias_name}' is another name for '#{canonical}' and the call gave them different " \
+                       "values (#{value.to_json} vs #{folded[canonical].to_json}) — pass one",
+              "INVALID_ARGUMENT", field: alias_name)
+          end
+          folded[canonical] = value
+        end
+        folded
+      end
+
+      # The refusal for a call that gave an aliased REQUIRED argument under neither name, or nil.
+      # `tool` drops such an argument from the schema's `required` (see `ARG_ALIASES`), so this
+      # is where "required" is still enforced — and it names both spellings.
+      private def missing_aliased(name : String, h : Hash(String, JSON::Any)) : Result?
+        (@aliased_required[name]? || return nil).each do |canonical|
+          next if present?(h, canonical)
+          alts = ARG_ALIASES[name].select { |_, c| c == canonical }.keys
+          return err("missing required '#{canonical}' (or #{alts.map { |a| "'#{a}'" }.join(" / ")})",
+            "INVALID_ARGUMENT", field: canonical)
+        end
+        nil
+      end
+
+      # The call's arguments minus the ones a `--tools` profile serves this tool without
+      # (`ToolFilter::Profile#withheld`), or the refusal for a call that SET one. Ahead of `unknown_args`, which would
+      # otherwise answer "unknown argument 'active'" about an argument the full catalogue has —
+      # the agent needs to hear that the operator narrowed it, and how to lift that. A `false`
+      # or null is let through and dropped: it asks for the mode the profile serves anyway,
+      # and a client that fills every property it once saw should not be refused for it.
+      private def strip_withheld(name : String, h : Hash(String, JSON::Any)) : Hash(String, JSON::Any) | Result
+        return h unless (f = @tool_filter) && (withheld = f.withheld_args(name))
+        return h unless h.keys.any? { |k| withheld.includes?(k) }
+        set = h.keys.find { |k| withheld.includes?(k) && !h[k].raw.nil? && bool_value(h[k]) != false }
+        if set
+          return err("'#{set}' is not served here: this server was started with #{f.flags}, " \
+                     "whose profile serves #{name} without #{withheld.to_a.sort.join(", ")}. Restart with " \
+                     "#{name} named in --tools to serve it whole.", "TOOL_DISABLED", field: set)
+        end
+        h.reject { |k, _| withheld.includes?(k) }
       end
 
       # Argument names a call passed that the tool does not declare.
@@ -783,7 +1380,9 @@ module Gori
       # the caller cannot see the wire, a typo has to be an error.
       #
       # Keys starting with `_` are exempt: `_meta` is JSON-RPC's own envelope extension and
-      # some clients attach it to every call.
+      # some clients attach it to every call. The exemption is not in the advertised schema
+      # (see `tool`, #1140) — being more permissive than what was promised is the direction
+      # that cannot surprise a caller, and it keeps those clients working.
       private def unknown_args(name : String, h) : Array(String)?
         allowed = declared_args[name]?
         return nil unless allowed
@@ -797,7 +1396,7 @@ module Gori
         return nil unless f
         return nil if f.allows?(name) || !TOOL_NAMES.includes?(name)
         err("tool '#{name}' is not served by this gori MCP server: it was started with " \
-            "--tools=#{f.spec.inspect}, which advertises #{f.size} of #{TOOL_NAMES.size} tools. " \
+            "#{f.flags}, which advertises #{served_count} of #{TOOL_NAMES.size} tools. " \
             "Everything available is in tools/list.", "UNKNOWN_TOOL")
       end
 
@@ -817,6 +1416,9 @@ module Gori
       end
 
       @declared_args : Hash(String, Set(String))? = nil
+      # tool → the aliased arguments its handler requires, recorded by `tool` as it drops them
+      # from the advertised `required` list (see `ARG_ALIASES`).
+      @aliased_required = {} of String => Array(String)
 
       # Emits the tools/list array. Every schema lives in its own domain file next to the
       # handler it describes (`tools/*.cr`, one `list_*_tools` each) — this method is only
@@ -830,16 +1432,20 @@ module Gori
           list_compare_tools j
           list_diff_tools j
           list_sitemap_tools j
+          list_js_refs_tools j
           list_issues_tools j
           list_probe_tools j
           list_oast_providers_tools j
           list_oast_sessions_tools j
           list_links_tools j
+          list_evidence_tools j
+          list_retest_tools j
           list_context_tools j
           list_env_tools j
           list_host_overrides_tools j
           list_session_slots_tools j
           list_notes_tools j
+          list_wordlists_tools j
           list_decode_tools j
           list_cookie_tools j
           list_sequence_tools j
@@ -847,6 +1453,7 @@ module Gori
           list_color_rules_tools j
           list_saved_views_tools j
           list_projects_tools j
+          list_project_archive_tools j
           list_scope_tools j
           list_import_tools j
           list_send_tools j
@@ -858,14 +1465,70 @@ module Gori
           list_discover_tools j
           list_grpc_tools j
           list_authorize_tools j
+          list_cache_deception_tools j
           list_jobs_tools j
         end
       end
 
       # Dispatches a tools/call by name. Any store/repeater exception is converted to
       # an is_error Result so one bad call never tears down the server loop.
-      def call(name : String, args : JSON::Any) : Result
+      #
+      # `cancelled` is the ONE seam for `notifications/cancelled` (#1103): a predicate the
+      # transport builds over the JSON-RPC id, held here for the life of this call and read
+      # by the long tools through `cancel_signal` / `cancelled?`, or by the one-shot send
+      # engines while they own a socket. It is an argument to THIS
+      # method and to nothing else — a cancel token threaded through 179 handlers would be a
+      # parameter 176 of them ignore. A caller with no cancellation channel (`gori run`, a
+      # spec) passes nothing and every tool behaves exactly as before.
+      #
+      # WHICH TOOLS STOP, and why the rest do not:
+      #
+      #   probe_scan        yes — polled between flows and between repeater tabs. The only
+      #                     tool whose runaway cost lands on a THIRD PARTY (up to
+      #                     PROBE_ACTIVE_MAX_FLOWS flows of real active probes).
+      #   minimize_repeater yes — `Minimize::Stop` polls it before every send, and `apply` is
+      #                     additionally refused after a cancel (see the tool).
+      #   run_retest        yes — `Retest::Engine` polls it before every step; the steps that
+      #                     did run keep their History rows (P7: record the wire).
+      #   timing_requests   yes — `Repeater::Timing.run` polls it between pairs; up to
+      #                     MAX_ITERATIONS pairs of real requests to the target.
+      #   cookie_crack      NO. It is pure CPU over a wordlist with no outbound and no yield
+      #                     point, so the reader fiber never runs during it and the
+      #                     notification is not even PARSED until it finishes — a check there
+      #                     would be code that cannot fire. The cost is local.
+      #   send_request /    yes — the one-shot send engines close their owned socket when the
+      #   send_websocket    predicate fires, so a silent origin cannot pin the serial worker.
+      #   fuzz/mine/        NO, by design. They return a `job_id` immediately and are stopped
+      #   discover/         with `stop_job` — cancelling the *call* that started one would
+      #   sequence/         suppress the id and leave the job running, which is the opposite
+      #   authorize _start  of what the client asked for.
+      def call(name : String, args : JSON::Any, cancelled : Proc(Bool)? = nil) : Result
+        @cancelled = cancelled
         h = args.as_h? || EMPTY_HASH
+        # WHAT the name is, before WHETHER a project is bound. These two answers belong to
+        # different layers — `UNKNOWN_TOOL` is a protocol error the transport turns into
+        # -32602, `NO_PROJECT` is a tool result the model is meant to act on — and running
+        # the project gate first collapsed them: on an unbound server a typo and a tool the
+        # `--tools` filter had removed both came back "no project bound; call list_projects
+        # …", sending the agent to bind a project so it could retry a call that was never
+        # going to exist. A bound server had always classified them correctly (#1142).
+        #
+        # A tool the filter hid must be REFUSED rather than quietly answered for a second
+        # reason: `declared_args` is harvested from `list`, so a hidden tool has no declared
+        # arg set, `unknown_args` returns nil, and dispatch would run it with every argument
+        # unchecked — a tool absent from tools/list but fully live underneath.
+        if hidden = filtered_out(name)
+          return hidden
+        end
+        # Refused like `--read-only` refuses, and for the same reason it is refused rather
+        # than answered: the tool is out of `tools/list`, so `declared_args` has no entry for
+        # it and dispatch would run it with every argument unchecked.
+        if key = call_denied_permission(name, h)
+          return permission_denied(name, key)
+        end
+        unless TOOL_NAMES.includes?(name)
+          return err("unknown tool: #{name}", "UNKNOWN_TOOL")
+        end
         if unbound? && !UNBOUND_SAFE.includes?(name)
           return no_project
         end
@@ -874,19 +1537,30 @@ module Gori
         # dispatch; runs inside this method's rescue, so a store read error becomes an
         # INTERNAL result rather than crashing the loop.
         refresh_project_env if ENV_REFRESH_TOOLS.includes?(name)
-        # A tool the filter hid must be REFUSED, not quietly answered: `declared_args` is
-        # harvested from `list`, so a hidden tool has no declared arg set, `unknown_args`
-        # returns nil, and dispatch would run it with every argument unchecked — a tool
-        # absent from tools/list but fully live underneath.
-        if hidden = filtered_out(name)
-          return hidden
-        end
+        refresh_global_libraries
+        stripped = strip_withheld(name, h)
+        return stripped if stripped.is_a?(Result)
+        h = stripped
         if (bad = unknown_args(name, h)) && !bad.empty?
           return err("unknown argument#{bad.size > 1 ? "s" : ""} for '#{name}': #{bad.join(", ")}. " \
                      "Accepted: #{declared_args[name].to_a.sort.join(", ")}",
             "INVALID_ARGUMENT", field: bad.first)
         end
-        result = dispatch_tool(name, h) || err("unknown tool: #{name}", "UNKNOWN_TOOL")
+        # After the unknown-argument check, which is what built `@aliased_required` (it lists
+        # the catalogue once, through `declared_args`).
+        resolved = resolve_aliases(name, h)
+        return resolved if resolved.is_a?(Result)
+        h = resolved
+        if missing = missing_aliased(name, h)
+          return missing
+        end
+        result = begin
+          dispatch_tool(name, h) || err("unknown tool: #{name}", "UNKNOWN_TOOL")
+        rescue ex : ArgError
+          # Answered as the handler's own early return was, so it is classified and recorded
+          # as an agent action like one — unlike the blanket `Gori::Error` rescue below.
+          err(ex.message || "invalid arguments for '#{name}'", "INVALID_ARGUMENT", field: ex.field)
+        end
         result = classify(result)
         log_agent_action(name, result) if @allow_actions && agent_action?(name, h)
         result
@@ -902,29 +1576,60 @@ module Gori
       rescue ex
         Log.warn(exception: ex) { "tool #{name} failed" }
         err("tool error: #{ex.message}", "INTERNAL")
+      ensure
+        # Never outlives its call. The worker fiber serves one request at a time, so a stale
+        # predicate would answer the NEXT tool's poll with a previous caller's cancellation.
+        @cancelled = nil
+      end
+
+      # The cancellation predicate for the call in flight, for an engine that polls one
+      # itself (`Probe::Scan`, `Retest::Engine`, `Minimize::Stop`), and the same question as
+      # a plain answer for a tool deciding one thing at one point.
+      #
+      # nil when this surface has no cancellation channel — which is what makes `stop:` a
+      # no-op rather than a behaviour change for `gori run` and for every spec that drives
+      # `Tools#call` directly.
+      private def cancel_signal : Proc(Bool)?
+        @cancelled
+      end
+
+      private def cancelled? : Bool
+        !!@cancelled.try(&.call)
       end
 
       # Whether this CALL (not just this tool) is an agent action worth recording. Most are a
-      # flat name lookup, but `probe_scan` is a READ tool whose active:true mode SENDS real
-      # requests — the argument, not the name, decides. Logging every passive rescan would
-      # bury the outbound ones it exists to surface.
+      # flat name lookup, but two READ tools have a mode that is not: `probe_scan`'s active:true
+      # SENDS real requests and persist:true WRITES findings, and `export_openapi`'s output_path
+      # writes a file — the arguments, not the name, decide. Logging every report-only call
+      # would bury the ones this exists to surface.
       private def agent_action?(name : String, h) : Bool
         return true if AGENT_ACTION_TOOLS.includes?(name)
-        name == "probe_scan" && bool_arg(h, "active", false)
+        case name
+        when "probe_scan"     then bool_arg(h, "active", false) || bool_arg(h, "persist", false)
+        when "export_openapi" then describes?(h, "output_path")
+          # A confirmed delete never moves the binding (the served project is refused), so the
+          # post-call append lands in the right feed — and it is the most destructive call on
+          # this surface. The dry run (the default) changes nothing.
+        when "delete_project" then (!bool_arg(h, "dry_run", true) rescue false)
+        else                       false
+        end
       end
 
       # #124 — record a completed agent mutation/send into the store event feed so the AI's
       # activity is visible to the human (and tailable via list_events). A failure is logged
       # too (warn) — a scope-blocked or errored send is exactly what an operator wants to see.
-      # A read-only-disabled attempt (TOOL_DISABLED) executed nothing, so it is not logged.
+      # TOOL_DISABLED attempts are handled separately: an operator-denied MCP permission gets
+      # one compact `agent_permission_denied` event, while a read-only server cannot write its
+      # store and a denied attempt there stays only in the tool reply.
       # Best-effort: feed logging never breaks the tool call it describes.
       private def log_agent_action(name : String, result : Result) : Nil
         return if result.error_code == "TOOL_DISABLED"
         return unless s = @store
         level = result.is_error ? "warn" : "info"
         outcome = result.is_error ? "failed (#{result.error_code || "error"})" : "ok"
-        s.insert_event("agent", "agent_action", level, "#{name} #{outcome}", payload: name,
-          actor: Gori::FlowSource.surface.try(&.token))
+        message = (note = result.event_note) ? "#{name} #{outcome}: #{note}" : "#{name} #{outcome}"
+        s.insert_event("agent", "agent_action", level, message, payload: name,
+          flow_id: result.event_flow_id, actor: Gori::FlowSource.surface.try(&.token))
       rescue ex
         Log.warn(exception: ex) { "event feed: failed to log agent action #{name}" }
       end
@@ -946,7 +1651,7 @@ module Gori
       @[Tool("oast_presets", unbound: true)]
       private def oast_presets_tool : Result
         presets = Oast::Presets.all.map { |p| {type: p.kind.label, name: p.name, host: p.host} }
-        Result.new(presets.to_json)
+        items_result(presets.to_json)
       end
 
       # The saved provider `provider_id` names, nil when the caller did not name one, or the
@@ -981,7 +1686,8 @@ module Gori
         found
       end
 
-      @[Tool("oast_start", gated: true, agent_action: true, unbound: true)]
+      @[Tool("oast_start", gated: true, agent_action: true, unbound: true,
+        requires: ["oast_poll", "oast_payload", "oast_stop", "oast_resume", "list_oast_providers", "list_oast_sessions"], permission: "send")]
       private def oast_start(h) : Result
         # A SAVED provider, by the id list_oast_providers prints. The provider CRUD tools next
         # door exist so an operator can configure a private collaborator once — and until this
@@ -992,19 +1698,18 @@ module Gori
         # token inline every time").
         saved = saved_oast_provider(h)
         return saved if saved.is_a?(Result)
-        if saved
-          kind = Oast::ProviderKind.parse?(saved.kind)
-          return err("saved provider #{saved.key.inspect} has an unknown kind #{saved.kind.inspect}",
-            "INVALID_ARGUMENT", field: "provider_id") unless kind
-          host = saved.host
-          token = saved.token
-        else
-          provider = str(h, "provider") || "interactsh"
-          kind = Oast::ProviderKind.parse?(provider)
-          return Result.new("unknown provider '#{provider}'", is_error: true) unless kind
-          host = str(h, "server") || Oast::Presets.all.find { |p| p.kind == kind }.try(&.host)
-          return Result.new("'server' is required for #{kind.label}", is_error: true) unless host
-          token = str(h, "token")
+        target = oast_start_target(h, saved)
+        return target if target.is_a?(Result)
+        kind, host, token = target
+        # PERSIST the registration as an `oast_sessions` row, which is what turns an ad-hoc
+        # handle into a project listener. Opt-in, because it changes what `oast_stop` means:
+        # a persisted session is stopped, never deregistered (its payloads are planted out in
+        # the world), so the registration outlives this process until `oast_release`.
+        persist = bool_arg(h, "persist", false)
+        if persist && unbound?
+          return err("'persist' writes an oast_sessions row, which needs a bound project — " \
+                     "switch_project first, or drop persist for an ad-hoc listener",
+            "NO_PROJECT", field: "persist")
         end
         # Bound the number of live sessions: each holds an Oast::Http (socket) for the
         # process life until oast_stop, so an agent that never stops them would leak.
@@ -1014,15 +1719,23 @@ module Gori
         prov = Oast::Provider.build(kind, host, token)
         http = Oast::HttpClient.new(@verify_upstream)
         session = prov.register(http)
+        row = persist ? persist_oast_session(session, saved) : nil
         # Unpredictable session id: a sequential "oast-N" is trivially guessable, so
         # a co-tenant sharing this process could poll another agent's out-of-band
         # callbacks. Secure-random hex removes the guessing surface (mirrors the
         # delete_project confirmation tokens).
         sid = "oast_#{Random::Secure.hex(8)}"
-        @oast_mcp[sid] = OastMcpSession.new(prov, session, http, kind.label)
+        @oast_mcp[sid] = OastMcpSession.new(prov, session, http, kind.label, row)
         payload = prov.generate_payload(session)
-        Result.new({session_id: sid, provider: kind.label, provider_id: saved.try(&.key),
-                    server: host, payload_url: payload}.to_json)
+        Result.new({session_id: sid, store_session_id: row, provider: kind.label,
+                    provider_id: saved.try(&.key), server: host, payload_url: payload,
+                    registration: row ? "kept until oast_release" : "dies with this process",
+                    # Say it when `persist` was asked for and did NOT happen (a busy or
+                    # unwritable store). The listener is live either way, so this is not an
+                    # error — but a caller that reads only `session_id` would go on believing
+                    # it had a project session, and out-of-band probe rules would keep finding
+                    # nothing to mint against.
+                    persist_warning: (persist && row.nil?) ? "the session could NOT be saved (store busy or unwritable) — this handle is ad-hoc, and probe_scan's out-of-band rules still have nothing to mint against" : nil}.to_json)
       rescue ex
         # A remote call that failed, not an argument that was wrong. Uncoded, `classify` files
         # every plain-message error under INVALID_ARGUMENT with `retryable:false` — so a DNS
@@ -1030,6 +1743,55 @@ module Gori
         # do not retry". `send_request` has always answered a transport failure with
         # NETWORK_ERROR + retryable (see `Tools.send_error_code`); this is the same fact.
         err("OAST register failed: #{ex.message}", "NETWORK_ERROR", retryable: true)
+      end
+
+      # Where `oast_start` should register: the {kind, host, token} triple, from the SAVED
+      # provider when one was named and from the ad-hoc arguments otherwise. Split out of
+      # `oast_start` so the register + persist + handle sequence there reads as one path
+      # rather than as a preamble of argument branches.
+      private def oast_start_target(h, saved : Oast::ProviderConfig?) : {Oast::ProviderKind, String, String?} | Result
+        if saved
+          kind = Oast::ProviderKind.parse?(saved.kind)
+          return err("saved provider #{saved.key.inspect} has an unknown kind #{saved.kind.inspect}",
+            "INVALID_ARGUMENT", field: "provider_id") unless kind
+          return {kind, saved.host, saved.token}
+        end
+        provider = str(h, "provider") || "interactsh"
+        kind = Oast::ProviderKind.parse?(provider)
+        return Result.new("unknown provider '#{provider}'", is_error: true) unless kind
+        host = str(h, "server") || Oast::Presets.all.find { |p| p.kind == kind }.try(&.host)
+        return Result.new("'server' is required for #{kind.label}", is_error: true) unless host
+        {kind, host, str(h, "token")}
+      end
+
+      # Write a fresh registration into `oast_sessions` and stamp it live, returning the row id
+      # (nil when the write did not commit — a busy store must not make this handle claim a row
+      # that is not there, so it stays ad-hoc and the caller reads `store_session_id: null`).
+      #
+      # This is the row three things need and none of them could have from MCP before:
+      # `Probe::OutOfBand::StoreMinter` mints every blind SSRF/XXE/command-injection/RFI payload
+      # against one, so an agent that started a listener still got NO out-of-band probe
+      # coverage; `list_oast_sessions` could not show the agent its own listener; and
+      # `oast_resume` had nothing to re-open after the server process ended, which for the one
+      # workbench whose findings arrive hours later is the case that matters most.
+      #
+      # `touch_oast_session` immediately, for the same reason `oast_resume` does: the minter
+      # picks the most-recently-POLLED session, and this one is about to be polled.
+      private def persist_oast_session(session : Oast::Session,
+                                       saved : Oast::ProviderConfig?) : Int64?
+        # The provider row id, and only when it IS a project row: writing a global provider's
+        # hex id there would point the column at an unrelated project row. A global provider is
+        # recorded by its key instead (`provider_key`, #1192), and an ad-hoc kind + host as "".
+        row = store.insert_oast_session(saved.try(&.project_id), session.kind.label,
+          session.server_url, session.correlation_id, session.secret,
+          session.private_key_pem, session.token,
+          provider_key: Oast::Sessions.recorded_key(saved.try(&.key)))
+        return nil if row == 0
+        session.id = row
+        store.touch_oast_session(row)
+        row
+      rescue DB::Error | SQLite3::Exception
+        nil
       end
 
       # An OAST handle read: the session, or the refusal that says WHICH mistake was made.
@@ -1053,14 +1815,14 @@ module Gori
           "NOT_FOUND", field: "session_id")
       end
 
-      @[Tool("oast_payload", unbound: true)]
+      @[Tool("oast_payload", gated: true, unbound: true, permission: "send")]
       private def oast_payload(h) : Result
         s = oast_session(h)
         return s if s.is_a?(Result)
         Result.new({session_id: str(h, "session_id"), payload_url: s.provider.generate_payload(s.session)}.to_json)
       end
 
-      @[Tool("oast_poll", unbound: true)]
+      @[Tool("oast_poll", gated: true, unbound: true, permission: "send")]
       private def oast_poll(h) : Result
         s = oast_session(h)
         return s if s.is_a?(Result)
@@ -1082,7 +1844,7 @@ module Gori
         err("OAST poll failed: #{ex.message}", "NETWORK_ERROR", retryable: true)
       end
 
-      @[Tool("oast_stop", gated: true, agent_action: true, unbound: true)]
+      @[Tool("oast_stop", gated: true, agent_action: true, unbound: true, requires: ["oast_release"], permission: "send")]
       private def oast_stop(h) : Result
         s = oast_session(h, delete: true)
         return s if s.is_a?(Result)
@@ -1098,17 +1860,20 @@ module Gori
         Result.new({stopped: sid}.to_json)
       end
 
-      @[Tool("create_project", unbound: true)]
+      @[Tool("create_project", read_only: false, unbound: true, permission: "projects")]
       private def create_project_entry(h) : Result
         return create_project(h) if unbound? || @allow_actions
         err("tool disabled (gori mcp --read-only)", "TOOL_DISABLED")
       end
 
       # Resolve body_mode (none|preview|full) + max_body_bytes into an inlined-body
-      # {cap_bytes, omit} pair. none → metadata only; preview → small cap; full
-      # (default) → the full MAX_TEXT cap. max_body_bytes tunes the cap (clamped to
-      # MAX_TEXT — larger bodies are paged with get_response_body_chunk).
-      private def body_return_opts(h) : {Int32, Bool} | Result
+      # {cap_bytes, omit} pair. none → metadata only; preview → small cap; full → the full
+      # MAX_TEXT cap. max_body_bytes tunes the cap (clamped to MAX_TEXT — larger bodies are
+      # paged with get_response_body_chunk).
+      #
+      # With NEITHER argument given the default is full, unless `auto` — a caller that has a
+      # chunk source for this body — asks for AUTO_BODY_BYTES instead (`body_auto?`).
+      private def body_return_opts(h, auto : Bool = false) : {Int32, Bool} | Result
         # Only a POSITIVE max_body_bytes overrides the cap; 0/negative falls back to
         # the mode default (Crystal treats 0 as truthy, so `max || default` alone
         # wouldn't). Use body_mode:none for a zero-byte, shape-only body.
@@ -1116,9 +1881,10 @@ module Gori
         max = (raw && raw > 0) ? raw : nil
         mode = str(h, "body_mode").try(&.strip.downcase).presence
         case mode
-        when nil, "full" then {max || Serialize::MAX_TEXT, false}
-        when "none"      then {0, true}
-        when "preview"   then {max || BODY_PREVIEW_BYTES, false}
+        when nil       then {max || (auto ? AUTO_BODY_BYTES : Serialize::MAX_TEXT), false}
+        when "full"    then {max || Serialize::MAX_TEXT, false}
+        when "none"    then {0, true}
+        when "preview" then {max || BODY_PREVIEW_BYTES, false}
         else
           # Refused by name, not defaulted. The `else` used to fold every unrecognised value
           # into `full`, which is the WORST of the three to land on by accident: a caller that
@@ -1159,15 +1925,11 @@ module Gori
       # exists to deliver, and the error named History while naming no way out. Recording is
       # bookkeeping; it must never decide whether a request is sendable.
       #
-      # `Env.head_body_boundary` is the shared answer: first of `\n\n` or `\r\n\r\n`,
-      # whichever comes earlier, and `bytes.size` when there is no terminator — in which
-      # case the whole message is the head, rather than a split landing inside the body.
+      # `Env.split_head_body` is the shared answer: first of `\n\n` or `\r\n\r\n`,
+      # whichever comes earlier, and the whole message as the head when there is no
+      # terminator, rather than a split landing inside the body.
       private def split_wire_request(bytes : Bytes) : {Bytes, Bytes?}
-        boundary = Env.head_body_boundary(bytes)
-        head = bytes[0, boundary]
-        body_size = bytes.size - boundary
-        body = body_size > 0 ? bytes[boundary, body_size] : nil
-        {head, body}
+        Env.split_head_body(bytes)
       end
 
       # Evict the OLDEST terminal (non-:running) jobs from `jobs` so it never grows past
@@ -1193,7 +1955,7 @@ module Gori
       # resolve to unrelated rows in the NEW database. Refuse the read instead of handing
       # back evidence pointers that silently changed meaning; the results are kept, so
       # switching back makes them readable again.
-      private def job_project_mismatch(job : FuzzJob | MineJob | SequenceJob | DiscoverJob | AuthorizeJob) : Result?
+      private def job_project_mismatch(job : Job) : Result?
         return nil if job.db_path == @db_path
         err("job #{job.id} ran against a different project (#{job.db_path || "unknown"}); " \
             "switch back to that project to read its results",
@@ -1202,7 +1964,7 @@ module Gori
 
       # A background job's fiber must never exit with the job still :running — that
       # hangs every poller and permanently trips jobs_running?. Land it terminal.
-      private def finalize_job(job : FuzzJob | MineJob | SequenceJob | DiscoverJob | AuthorizeJob) : Nil
+      private def finalize_job(job : Job) : Nil
         if job.status == :running
           job.status = :error
           job.error_msg ||= "job ended without a terminal event"
@@ -1235,9 +1997,12 @@ module Gori
       private def incomplete_reason(status : Symbol) : String?
         case status
         when :budget_exhausted then "budget_exhausted"
-        when :stopped          then "stopped"
-        when :error            then "failed"
-        else                        nil
+          # A run its own `stop_on` ended is not EXHAUSTIVE — it stopped before checking every
+          # candidate — so it names a reason, even though reaching the condition was the goal.
+        when :condition_met then "condition_met"
+        when :stopped       then "stopped"
+        when :error         then "failed"
+        else                     nil
         end
       end
 
@@ -1260,10 +2025,10 @@ module Gori
             j.field "concurrency", a.concurrency
             j.field "max_requests", a.max_requests
             j.field "started_at", a.started_at_ms
-            j.field "started_at_iso", Serialize.unix_micros_iso(a.started_at_ms * 1000)
+            j.field "started_at_iso", Gori.iso_micros(a.started_at_ms * 1000)
             j.field "ended_at", ended_at_ms
             if e = ended_at_ms
-              j.field "ended_at_iso", Serialize.unix_micros_iso(e * 1000)
+              j.field "ended_at_iso", Gori.iso_micros(e * 1000)
               j.field "elapsed_ms", e - a.started_at_ms
             end
           end
@@ -1323,6 +2088,44 @@ module Gori
 
       # --- helpers ------------------------------------------------------------
 
+      # TOOL_DISABLED, not UNKNOWN_TOOL: the tool exists and the operator can turn it back on,
+      # which is the one thing the agent can usefully tell them. The attempted call is recorded
+      # separately from executed agent actions, with no argument values, and repeated attempts
+      # for the same tool/group are coalesced for this project's current server binding.
+      private def permission_denied(name : String, key : String) : Result
+        log_permission_denial(name, key)
+        title = Settings.mcp_permission(key).try(&.title) || key
+        what = TOOL_PERMISSIONS[name]? == key ? "tool '#{name}'" : "this '#{name}' call (it sends traffic)"
+        err("#{what} is disabled by the operator: \"#{title}\" is switched off in gori " \
+            "Preferences › AI › MCP permissions. Ask the operator to allow it; the change applies " \
+            "when this MCP server is started again.", "TOOL_DISABLED")
+      end
+
+      # A distinct event kind keeps a refused call out of `recent_agent_actions`, which credits
+      # executed actions only. One event per (tool, permission group) and project per Tools
+      # lifetime bounds retry loops without adding a time-based query or a schema/index. The
+      # project event retention is the outer storage cap; raw arguments are deliberately absent.
+      private def log_permission_denial(name : String, key : String) : Nil
+        return unless @allow_actions
+        return unless s = @store
+
+        if @permission_denial_log_db_path != @db_path
+          @permission_denial_log_db_path = @db_path
+          @permission_denials_logged.clear
+        end
+
+        logged = {name, key}
+        return if @permission_denials_logged.includes?(logged)
+
+        event_id = s.insert_event("agent", PERMISSION_DENIAL_EVENT_KIND, "warn",
+          "#{name} denied (TOOL_DISABLED; permission=#{key})",
+          payload: name, actor: Gori::FlowSource.surface.try(&.token))
+        # `insert_event` returns 0 when its write is dropped; leave the pair retryable then.
+        @permission_denials_logged << logged if event_id > 0
+      rescue ex
+        Log.warn(exception: ex) { "event feed: failed to log denied MCP permission for #{name}" }
+      end
+
       private def gated(& : -> Result) : Result
         return err("tool disabled (gori mcp --read-only)", "TOOL_DISABLED") unless @allow_actions
         yield
@@ -1337,6 +2140,15 @@ module Gori
                       retryable : Bool = false, details : JSON::Any? = nil) : Result
         Result.new(message, is_error: true, error_code: code, field: field,
           retryable: retryable, details: details)
+      end
+
+      # A listing as `{items: […]}`, for the tools whose natural answer is a bare array. Every
+      # other tool answers an object, and a caller handling results generically should not
+      # have to special-case four of them. Keyed `items` because that is exactly how
+      # `Server#emit_structured` already wrapped their bare array for `structuredContent`, so
+      # a client reading the structured half sees the same object it always did.
+      private def items_result(array_json : String) : Result
+        Result.new(JSON.build { |j| j.object { j.field("items") { j.raw(array_json) } } })
       end
 
       # A resource-not-found error (bad flow/repeater/issue/note/rule/job id).
@@ -1521,7 +2333,7 @@ module Gori
           entry.split(',').each do |tok|
             t = tok.strip
             next if t.empty?
-            id = t.to_i64? || raise Gori::Error.new(
+            id = t.to_i64? || integral_id(t) || raise Gori::Error.new(
               "invalid #{key.inspect} entry #{t.inspect} (expected an integer id)")
             next if seen.includes?(id)
             seen << id
@@ -1529,6 +2341,15 @@ module Gori
           end
         end
         ids
+      end
+
+      # `3.0`, the shape `int` already accepts for a single id because many encoders emit every
+      # number as a float — a list entry arrives through `str_entry` as that text, and refusing
+      # it made `ids: [3.0]` fail where `id: 3.0` worked. `3.5` is still no id.
+      private def integral_id(t : String) : Int64?
+        f = t.to_f? || return nil
+        return nil unless f.finite? && f == f.trunc && f.abs <= 9_007_199_254_740_992.0
+        f.to_i64
       end
 
       # The schema for an `id_list_arg` property: the `oneOf` that advertises all three
@@ -1576,6 +2397,10 @@ module Gori
       # `present?` and a builder on `.presence` would disagree about one call.
       private def describes?(h, key : String) : Bool
         return false unless v = h[key]?
+        describes_value?(v)
+      end
+
+      private def describes_value?(v : JSON::Any) : Bool
         case raw = v.raw
         when Nil                 then false
         when String, Array, Hash then !raw.empty?
@@ -1590,15 +2415,81 @@ module Gori
         present?(h, key) ? "invalid '#{key}' (expected an integer)" : "missing required '#{key}'"
       end
 
+      # A required argument absent or unreadable, raised by `required_id` / `required_str` and
+      # answered by `call` as INVALID_ARGUMENT naming `field`.
+      class ArgError < Gori::Error
+        getter field : String
+
+        def initialize(message : String, @field : String)
+          super(message)
+        end
+      end
+
+      # The required integer argument `key`, or an `ArgError` worded by `id_error`.
+      private def required_id(h, key : String) : Int64
+        int(h, key) || raise ArgError.new(id_error(h, key), key)
+      end
+
+      # The required string argument `key`, stripped, or an `ArgError` ("missing required 'key'",
+      # then `hint`) when it is absent or blank. `blank: true` returns the value as sent and
+      # refuses only its absence — for an argument where "" means something (clear, match all).
+      private def required_str(h, key : String, hint : String? = nil, *, blank : Bool = false) : String
+        v = str(h, key)
+        v = v.try(&.strip).presence unless blank
+        v || raise ArgError.new(hint ? "missing required '#{key}' #{hint}" : "missing required '#{key}'", key)
+      end
+
       # One sentence for every MCP tool whose builder refused an env token that resolves to
       # nothing (#519). Shared rather than written per tool because, unlike the other plan
       # reasons, this one names no argument of the tool's own — the token is the whole fact
       # and the remedy is the same everywhere. Naming `set_env_var` matters more here than
       # on the other surfaces: an agent cannot see the token highlighted the way the TUI
       # operator can, so the message has to carry both the name and the way to fix it.
-      # `detail` is the builder's prefixed, comma-joined token list (`$SESSION, $TOKEN`).
+      # `detail` is the builder's spelled, comma-joined token list — `$ENV.TOKEN, $BIND.SESSION`
+      # on a namespaced install, `$SESSION, $TOKEN` on a bare one (`Env.token_list` decides), so
+      # the names an agent reads here are already in the spelling it has to write back.
       private def env_unresolved_error(detail : String?) : String
-        "unresolved env #{detail} — set it with the set_env_var tool, or remove the token"
+        refs = (detail || "").split(',').compact_map { |t| Gori::Env.parse_ref?(t) }
+        if !refs.empty? && refs.all?(&.ns.gen?)
+          # See the CLI's copy: a REGISTERED generator here is refused by POSITION, so pointing
+          # an agent back at the catalog it already spelled correctly would loop it.
+          if refs.all? { |r| Gori::Env.generator_hint?(r.name) }
+            return "#{detail} #{refs.size == 1 ? "is a generator" : "are generators"} — generators " \
+                   "mint at the send seam, in REQUEST text, and this value is resolved before the " \
+                   "request is framed, so the token would go out literally. Write the value here, " \
+                   "or remove the token"
+          end
+          return "unresolved generator #{detail} — choose a registered token from " \
+                 "list_env.generators, or remove the token"
+        end
+        "unresolved env #{detail} — #{env_unresolved_remedy(detail)}, or remove the token"
+      end
+
+      # WHAT gives the named token a value, which is not one tool: `set_env_var` writes an env var,
+      # and a BIND name has no setter at all — it is bound at SEND time by an extract rule that
+      # captures it out of a response (or by a session slot that claims it), which is the whole
+      # point of a binding and the reason `set_env_var` is the wrong advice for one. Naming it
+      # anyway told an agent to persist a live session credential into the project as a static var:
+      # stale by the next run, and precisely what `bindings.cr` documents itself as preventing.
+      #
+      # Read off the SPELLING, because that is all this shared sentence has. Under the namespaced
+      # grammar the detail carries the namespace in the bytes (`$ENV.X` / `$BIND.X`), so each half
+      # is named only when it is there; under the bare grammar a name carries no namespace and both
+      # halves apply. Parsed through `Env.parse_ref?` — the inverse of the `Env.token_list` that
+      # produced the detail — rather than by matching `"$BIND."` as text, so a non-default prefix
+      # reads the same way.
+      private def env_unresolved_remedy(detail : String?) : String
+        refs = (detail || "").split(',').compact_map { |t| Gori::Env.parse_ref?(t) }
+        bare = Settings.env_syntax.bare?
+        env = bare || refs.empty? || refs.any?(&.ns.env?)
+        bind = bare || refs.any?(&.ns.bind?)
+        gen = refs.any?(&.ns.gen?)
+        parts = [] of String
+        parts << "set it with the set_env_var tool" if env
+        parts << "bind it by capturing it with the create_extract_rule tool (a binding has no " \
+                 "setter — it is bound at send time from a response)" if bind
+        parts << "choose a registered token from list_env.generators" if gen
+        parts.join(", or ")
       end
 
       # Coerce a JSON arg to Int64. Accepts a JSON integer, an INTEGRAL float
@@ -1730,6 +2621,20 @@ module Gori
         value
       end
 
+      # An enum argument named by its `label`: `dft` when absent or blank, else the member, else
+      # the INVALID_ARGUMENT refusal — never a clamp, since clamping "globl" to project would
+      # report success for an edit the caller meant to make everywhere. Matched on `label`
+      # rather than through `parse?`, which folds separators and so accepts spellings the enum
+      # never advertises (`shortcircuit` for `short_circuit`); one list — `values` — backs the
+      # match, the refusal sentence and the schema's `enum` alike. Case is folded.
+      private def label_arg(h, key : String, enum_type : E.class, dft : E, *, strip : Bool = true) : E | Result forall E
+        raw = str(h, key)
+        raw = raw.strip if raw && strip
+        return dft if raw.nil? || raw.empty?
+        enum_type.values.find { |v| v.label == raw.downcase } ||
+          err("invalid '#{key}' (expected #{enum_type.values.join("|", &.label)})", "INVALID_ARGUMENT", field: key)
+      end
+
       # A filter argument whose column holds a CLOSED set of strings: the value, nil when the
       # caller did not narrow, or the refusal. Blank reads as absent, and the match is on the
       # normalised form — every sibling reader on this surface strips and downcases, and a
@@ -1746,6 +2651,39 @@ module Gori
       private def clamp(n : Int64?, default : Int32, max : Int32) : Int32
         return default unless n
         n.clamp(1_i64, max.to_i64).to_i
+      end
+
+      # One tool's `limit`: its default and ceiling, read by BOTH the handler's clamp and the
+      # schema (`limitprop`) so the two cannot drift (#1394). Before, the numbers lived only in
+      # description prose beside a clamp spelling them again, on 23 tools.
+      record PageLimit, default : Int32, max : Int32
+
+      private def clamp(n : Int64?, limit : PageLimit) : Int32
+        clamp(n, limit.default, limit.max)
+      end
+
+      # One call's page: what the caller asked for (nil when absent) beside the clamped values
+      # served, so `emit_page` can echo a request that was coerced rather than honoured.
+      record Page, req_off : Int64?, req_lim : Int64?, offset : Int32, limit : Int32
+
+      private def page_args(h, limit : PageLimit) : Page
+        req_off = optional_int_arg(h, "offset")
+        req_lim = optional_int_arg(h, "limit")
+        Page.new(req_off, req_lim, clamp_nonneg(req_off), clamp(req_lim, limit))
+      end
+
+      # The pagination fields of an object-returning list tool, in the order they all use:
+      # returned/offset/limit and the clamp echo, then — given a `total` — that total under
+      # `total_key` and `has_more`.
+      private def emit_page(j : JSON::Builder, pg : Page, returned : Int32,
+                            total : Int? = nil, total_key : String = "total") : Nil
+        j.field "returned", returned
+        j.field "offset", pg.offset
+        j.field "limit", pg.limit
+        emit_clamp(j, pg.req_off, pg.offset, pg.req_lim, pg.limit)
+        return unless total
+        j.field total_key, total
+        j.field "has_more", pg.offset.to_i64 + returned < total
       end
 
       private def severity_from(s : String?) : Store::Severity?
@@ -1775,19 +2713,79 @@ module Gori
         # tool also leaves the argument validator — `call` refuses it by name before that
         # matters (see `filtered_out`).
         return if (f = @tool_filter) && !f.allows?(name)
+        return if denied_permission(name)
         sb = SchemaBuilder.new
         yield sb
+        if withheld = @tool_filter.try(&.withheld_args(name))
+          # A profile serving this tool in one mode (`ToolFilter::Profile#withheld`). Dropped
+          # from the schema, so `declared_args` — harvested from this output — refuses them too.
+          withheld.each do |arg|
+            raise "internal: #{name}: withheld argument '#{arg}' is not in its schema" unless sb.properties.any? { |(pname, _)| pname == arg }
+          end
+          sb.properties.reject! { |(pname, _)| withheld.includes?(pname) }
+          sb.required.reject! { |r| withheld.includes?(r) }
+        end
+        required = sb.required
+        if aliases = ARG_ALIASES[name]?
+          # Each alias is advertised as its real argument's own schema under a one-line
+          # description, and the real argument stops being `required` (see `ARG_ALIASES`).
+          aliases.each do |alias_name, canonical|
+            schema = sb.properties.find { |(pname, _)| pname == canonical }.try(&.[1])
+            raise "internal: #{name}: alias '#{alias_name}' names no argument '#{canonical}'" unless schema
+            aliased = schema.as_h.dup
+            aliased["description"] = JSON::Any.new("alias of '#{canonical}'")
+            sb.field alias_name, JSON::Any.new(aliased)
+          end
+          targets = aliases.values.to_set
+          @aliased_required[name] = required.select { |r| targets.includes?(r) }
+          required = required.reject { |r| targets.includes?(r) }
+        end
+        read_only = READ_ONLY_TOOLS.includes?(name)
         j.object do
           j.field "name", name
           j.field "description", description
+          # The hints a client uses to decide what it may run unattended. `readOnlyHint` is
+          # the one that matters here — a workbench whose action tools send attack traffic
+          # has to be able to say which of its tools only read — and it is derived from the
+          # same `@[Tool]` declaration `--read-only` enforces (`read_only` defaults to
+          # `!gated`), so the two differ only on the short list of exceptions spelled there
+          # (see the `read_only` note in tool.cr).
+          #
+          # `openWorldHint` is emitted only where we can answer it. A read tool answers from
+          # this project's store and never dials, so it is closed-world; an action tool may
+          # or may not reach the network (send_request does, create_note does not), and the
+          # spec's default for an unstated hint is `true` — the conservative answer, and the
+          # right one for the population that includes the fuzzer. `destructiveHint` is left
+          # unstated for the same reason: its default is also the safe side.
+          j.field("annotations") do
+            j.object do
+              j.field "readOnlyHint", read_only
+              j.field "openWorldHint", false if read_only
+            end
+          end
           j.field "inputSchema" do
             j.object do
               j.field "type", "object"
               j.field "properties" do
                 j.object { sb.properties.each { |pname, schema| j.field(pname) { schema.to_json(j) } } }
               end
+              # The advertised contract, spelled the way `unknown_args` enforces it (#1140).
+              # Omitting `additionalProperties` means "extras are fine" in JSON Schema, and
+              # `call` refuses them — so a validating client was handed one contract and the
+              # model was scored against another: a typo it could have caught client-side
+              # travelled to the server and came back INVALID_ARGUMENT instead.
+              #
+              # The `_`-prefixed exemption `unknown_args` keeps is deliberately NOT advertised
+              # here. Spelling it needs `patternProperties`, which is outside the JSON Schema
+              # subset several clients accept when they convert an MCP `inputSchema` into
+              # their provider's tool schema — one unparseable keyword on all 179 tools costs
+              # every such client the whole catalogue, to promise an extension MCP puts in
+              # `params._meta` rather than in `params.arguments` anyway. So the validator
+              # stays the more PERMISSIVE of the two, which is the safe direction: a caller
+              # that followed the schema can never be surprised by it.
+              j.field "additionalProperties", false
               j.field "required" do
-                j.array { sb.required.each { |r| j.string r } }
+                j.array { required.each { |r| j.string r } }
               end
             end
           end
@@ -1820,12 +2818,30 @@ module Gori
         prop("integer", desc)
       end
 
+      # An integer argument whose default and range are machine-readable (`default`, `minimum`,
+      # `maximum`) as well as prose. Every one of these keywords is in the JSON Schema subset
+      # the MCP clients' provider conversions accept (unlike `patternProperties`, see `tool`).
+      # `minimum: 1` is the documentation of what the clamp does to a 0 or a negative — and
+      # the tools that echo a clamped value (`emit_clamp`) still say so per call.
+      private def limitprop(desc : String, limit : PageLimit) : JSON::Any
+        JSON.parse(%({"type":"integer","description":#{desc.to_json},) +
+                   %("default":#{limit.default},"minimum":1,"maximum":#{limit.max}}))
+      end
+
       private def boolprop(desc : String) : JSON::Any
         prop("boolean", desc)
       end
 
-      private def objprop(desc : String) : JSON::Any
-        JSON.parse(%({"type":"object","description":#{desc.to_json},"additionalProperties":{"type":"string"}}))
+      # A `headers` argument, declared in both shapes `RequestBuilder.header_pairs` reads: the
+      # name->value map these tools have always taken, and the `[{name, value}]` list
+      # `create_session_slot{set_headers}` and `authorize_start{identities}` take — which is
+      # what an agent reaches for once it has read one of those schemas. Declaring only the
+      # map left a validating client rejecting that call before gori ever saw it, and left the
+      # model never told the shape was legal; same reasoning as `session_headers_prop`.
+      private def header_map_prop(desc : String) : JSON::Any
+        JSON.parse(%({"description":#{desc.to_json},"oneOf":[) +
+                   %({"type":"object","additionalProperties":{"type":"string"}},) +
+                   %({"type":"array","items":{"type":"object"}}]}))
       end
 
       private def arrprop(desc : String) : JSON::Any

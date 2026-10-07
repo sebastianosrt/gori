@@ -1,5 +1,5 @@
 +++
-title = "스크립팅"
+title = "gori run 스크립팅"
 description = "gori run으로 gori를 헤드리스로 구동합니다. TUI와 같은 프로젝트·같은 엔진을 파이프라인과 CI에 맞춘 형태로 제공합니다."
 weight = 80
 
@@ -17,15 +17,19 @@ gori run <subcommand> [verb] [options]
 
 전체 서브커맨드 목록은 `gori run -h`로, 모든 플래그는 [CLI 레퍼런스](/ko/reference/cli/)에서 확인하세요.
 
-## 프로젝트 선택
+## 프로젝트 선택 {#choosing-a-project}
 
 각 프로젝트는 자체 SQLite 데이터베이스입니다. 읽기 서브커맨드는 다음 순서로 하나를 고릅니다.
 
 | 선택자 | 의미 |
 |--------|------|
 | `--db=PATH` | 특정 데이터베이스 파일 |
-| `--project=NAME` | 짧은 id, 디렉터리 슬러그, 표시 이름, 고유 id 접두사로 매칭(대소문자 무시) |
-| *(둘 다 없음)* | 가장 최근에 사용한 프로젝트 |
+| `--project=NAME` | 짧은 id, 디렉터리 슬러그, 표시 이름, 고유 id 접두사로 매칭(대소문자 무시). 한 프로젝트의 슬러그이면서 다른 프로젝트의 표시 이름인 이름, 또는 두 프로젝트가 함께 쓰는 표시 이름은 후보별 슬러그와 짧은 id를 보여 주며 거부합니다 |
+| `GORI_PROJECT=NAME` | 환경 변수로 설정하면 스크립트의 모든 명령이 읽는 프로젝트(`--project`와 같은 매칭) |
+| `gori run project switch NAME` | `project switch --clear` 전까지 유지되는 고정 |
+| *(모두 없음)* | 가장 최근에 사용한 프로젝트 |
+
+스크립트에서 피해야 할 것은 마지막 행입니다. 다른 프로젝트에 쓰기를 한 번만 해도(`notes create --project demo`) 그 프로젝트가 가장 최근에 사용한 프로젝트가 되고, 이후 `--project` 없는 명령은 모두 그쪽을 따라갑니다. 대신 스크립트 맨 위에서 `GORI_PROJECT`를 설정하세요. 존재하지 않는 프로젝트를 가리키는 `GORI_PROJECT`나 고정은 건너뛰지 않고 거부하며, 어느 규칙이 프로젝트를 골랐는지 stderr 안내가 알려 줍니다(`gori run: using project demo (from GORI_PROJECT)`).
 
 두 선택자는 우선순위가 아니라 택일입니다. **둘 다** 주면 `--db`가 조용히 이기는 게 아니라
 사용법 오류로 거절합니다. 같은 플래그 짝이 파괴적 동사(`history delete`, `history clear`,
@@ -36,58 +40,76 @@ gori run <subcommand> [verb] [options]
 
 읽기 서브커맨드는 스토어를 읽기 전용으로 열고 캡처 락을 잡지 않으므로, 라이브 TUI가 캡처 중인 프로젝트를 대상으로 실행해도 안전합니다. SQLite WAL이 읽는 쪽과 쓰는 쪽을 함께 감당합니다. `body:` 질의는 예외입니다. 검색 인덱스를 비우므로 쓰기입니다.
 
+쓰기 서브커맨드는 TUI·MCP와 같은 WAL 데이터베이스를 사용하며 Store의 writer를 통해 직렬화됩니다. TUI가 열려 있어도 실행할 수 있지만, 캡처 커밋이 SQLite writer 슬롯을 잠시 점유할 수 있습니다. 짧게 끝나는 서브커맨드의 SQLite 열기·쓰기 대기는 최대 1초입니다. 슬롯이 계속 사용 중이면 다른 gori가 프로젝트를 잠그고 있다는 안내(재시도하거나 읽기 전용 서브커맨드로 읽기)를 출력하고 0이 아닌 종료 코드로 끝납니다. 실행 내내 프로젝트를 열어 두는 서브커맨드(`discover`, `fuzz`, `import`, `probe`, `retest run`, `oast listen`/`resume`, `intercept`)는 TUI 캡처 writer와 같은 기본 5초 대기를 유지합니다. 이미 네트워크로 나간 repeater send는 응답이나 History 쓰기를 저장하지 못해도 완료된 전송 결과를 그대로 유지합니다. STDERR에 경고를 출력하고, `--format json`에는 `response_saved` / `history_saved`가 그 이유와 함께 실리므로, 스크립트는 그 쓰기 실패 하나 때문에 범용 셸 재시도로 요청을 다시 보내지 않고도 이를 구분할 수 있습니다.
+
 ```bash
 gori run history --project my-engagement -q 'status:5xx'
 gori run issues --db /path/to/project.db --format json
 ```
 
-## 스크립팅 계약
+## 스크립팅 계약 {#the-scripting-contract}
 
 `gori run`이 뱉는 JSON은 눈으로 보라고 만든 게 아니라 파싱하라고 만든, 안정적이고 문서화된 형태입니다. 다음 네 가지 규칙이 파이프를 깔끔하게 유지합니다.
 
 **STDOUT은 데이터, STDERR은 진단.** 경고, 개수, 안내, 내보내기 확인 메시지는 모두 STDERR로 갑니다. 그래서 `gori run … | jq`는 입력에서 잡담을 걸러낼 필요가 없습니다.
 
-**`--format`이 형태를 정합니다.** 대부분의 서브커맨드는 `text`(기본)와 `json`을 받고, 일부는 `jsonl`, `raw`, `har`, `paths`, `markdown`을 더합니다. 실행이 길게 이어지는 곳에서는 두 JSON 형태가 다르고, 그 차이를 알아둘 만합니다.
+**`--format`이 형태를 정합니다.** 대부분의 서브커맨드는 `text`(기본)와 `json`을 받고, 일부는 `jsonl`, `raw`, `har`, `paths`, `markdown`을 더합니다. `json`을 제공하는 모든 곳에서 `--json`은 `--format=json`과 같습니다. `json`은 언제나 **JSON 문서 하나**이고, `jsonl`은 언제나 한 줄에 객체 하나입니다.
 
 | 서브커맨드 | `--format json` | `--format jsonl` |
 |-----------|-----------------|------------------|
-| `capture`, `history` | 한 줄에 JSON 객체 하나 | `json`의 별칭, 출력 동일 |
-| `fuzz`, `mine`, `discover` | 버퍼링 후 마지막에 JSON 배열 하나 | 결과가 나올 때마다 한 줄씩 |
+| `history` | 배열 하나, 스트리밍 | 한 줄에 객체 하나 |
+| `capture` | 배열 하나, 캡처가 멈출 때(`--for`, `--max`, Ctrl-C) 닫힘 | 플로우가 완료될 때마다 객체 하나 |
+| `fuzz`, `mine`, `discover`, `authorize`, `cache-deception` | JSON 배열 하나(`fuzz`는 인덱스 순서) | 결과가 나올 때마다 한 줄씩 |
+| `sequence` | 보고서 하나 | 샘플이 나올 때마다 한 줄씩, 마지막에 보고서 |
 
-긴 스윕을 진행 중에 소비하려면 `jsonl`을, 끝에 문서 하나를 받으려면 `json`을 씁니다.
+긴 스윕을 진행 중에 소비하려면 `jsonl`을, 끝에 문서 하나를 받으려면 `json`을 씁니다(`… --format json | jq length`로 행 수를 셉니다).
 
 **종료 코드에 의미가 있습니다.**
 
 | 코드 | 의미 |
 |------|------|
 | `0` | 성공 |
-| `1` | 오류: 전송 실패, 열 수 없는 프로젝트, 적용되지 못한 변경 |
-| `3` | `gori run fuzz --fail-if-no-matches`가 정상 완료했지만 매칭이 하나도 없음 |
+| `1` | 오류: 전송 실패, 열 수 없는 프로젝트, 적용되지 못한 변경, 또는 어떤 요청도 응답을 받지 못한 스윕(`fuzz`, `mine`, `discover`, `sequence`, `authorize`, `cache-deception`) |
+| `3` | 판정 게이트: `gori run fuzz --fail-if-no-matches`가 정상 완료했지만 매칭이 하나도 없음(`--stop-on` / `--stop-after-matches`가 발동했다면 `0`), 또는 `gori run probe --fail-on=LEVEL`이 LEVEL 이상의 이슈를 보고함 |
+| `130` | SIGINT/SIGTERM으로 중단. `fuzz`, `mine`, `discover`, `sequence`, `authorize`, `repeater minimize`는 모아 둔 것을 먼저 내보내므로, `&& next-step`이 잘린 실행을 끝난 실행으로 오해하지 않습니다 |
 
-매칭이 없으면서 *동시에* 모든 전송이 실패한 fuzz 실행(대상 다운, TLS 실패, 스코프 차단)은 `3`이 아니라 `1`로 끝납니다. `--fail-if-no-matches` 없이도 스크립트가 "결과 없음"과 "대상에 닿지도 못함"을 구분할 수 있습니다.
+매칭이 없으면서 *동시에* 모든 전송이 실패한 fuzz 실행(대상 다운, TLS 실패, 스코프 차단)은 `1`로 끝나므로, `--fail-if-no-matches` 없이도 스크립트가 "결과 없음"과 "대상에 닿지도 못함"을 구분할 수 있습니다(플래그를 주면 `3`이 우선합니다).
 
 **닫힌 파이프는 오류가 아닙니다.** `gori run history | head -5`는 여느 유닉스 필터처럼 조용히 `0`으로 끝납니다.
 
 ```bash
 # 프로젝트의 모든 5xx를 JSON Lines로 뽑아 jq로
-gori run history -q 'status:5xx' --limit 500 --format json | jq -r '.url'
+gori run history -q 'status:5xx' --limit 500 --format jsonl | jq -r '.url'
 
 # 5분간 캡처해 이름 붙인 프로젝트에 쌓고, 파일로 스트리밍
 gori run capture --project ci-run --for 5m --format jsonl > flows.jsonl
 
 # 퍼저가 반사된 마커를 찾으면 CI 잡을 실패시키기
 gori run fuzz 42 --wordlist payloads.txt --mr 'gori-canary' --fail-if-no-matches
+
+# create 계열 명령의 --format json은 새로 생긴 행 그대로이고 id도 포함 — 텍스트를 긁어낼 필요 없음
+id=$(gori run repeater create -t https://api.example.com -f req.http --format json | jq .id)
+rule=$(gori run project scope add --pattern=api.example.com --format json | jq .id)
+
+# 경로마다 요청 하나, 경로마다 세션은 만들지 않음, 상태와 헤더만
+for p in /api/v1/items/{1..38}; do gori run send "https://api.example.com$p" --headers-only; done
+
+# curl의 플래그는 curl에서와 같은 뜻: -d는 본문, -b는 쿠키
+gori run send https://api.example.com/login -d 'user=a&pass=b' -b 'lang=en' --format json | jq '{status, error_kind, retryable}'
+
+# medium 이상의 결과가 하나라도 있으면 CI 잡을 실패시키기(종료 코드 3)
+gori run probe --fail-on medium
 ```
 
-## 스코프 지키기
+## 스코프 지키기 {#staying-in-scope}
 
 소켓을 여는 모든 액티브 서브커맨드는 TUI와 MCP가 쓰는 것과 같은 아웃바운드 게이트를 지납니다. 스코프 규칙이 있는 프로젝트는 그 밖의 대상을 거부하며, `--allow-unscoped`가 의도적인 예외 선언입니다. 샌드박스와 명시적 제외 규칙은 이 플래그와 무관하게 항상 적용됩니다.
 
 `--request`나 STDIN으로 원시 요청을 퍼징하면서 `--project`/`--db`를 주지 않으면 참조할 스코프 자체가 없습니다. 이때 gori는 검사한 척하지 않고 STDERR에 명시적인 unscoped 경고를 출력합니다.
 
-## 인증이 필요한 스윕
+## 인증이 필요한 스윕 {#authenticated-sweeps}
 
-세션 바인딩(`$SESSION` 같은 것들)은 그것을 관측한 gori 프로세스의 메모리에만 존재하며, 절대 저장되지 않습니다. 복원된 토큰은 이미 낡은 것이기 때문입니다. TUI에서는 한 프로세스가 전송과 뒤이은 스윕을 모두 쥐고 있으니 문제가 없지만, `gori run`은 프로세스마다 한 번만 실행됩니다.
+세션 바인딩(`$BIND.SESSION` 같은 것들)은 그것을 관측한 gori 프로세스의 메모리에만 존재하며, 절대 저장되지 않습니다. 복원된 토큰은 이미 낡은 것이기 때문입니다. TUI에서는 한 프로세스가 전송과 뒤이은 스윕을 모두 쥐고 있으니 문제가 없지만, `gori run`은 프로세스마다 한 번만 실행됩니다.
 
 `--bind-from FLOW-ID`가 그 빈틈을 메웁니다. 캡처된 플로우 하나를 먼저 재생해서, 그 응답이 같은 프로세스 안에서 fuzz·mine·sequence·discover 템플릿이 읽을 바인딩을 채우게 합니다.
 
@@ -97,7 +119,7 @@ gori run fuzz 42 --bind-from 41 --wordlist ids.txt
 
 바인딩을 정의하는 추출 규칙은 [세션 바인딩](/ko/guide/proxy/#session-bindings)을 참고하세요.
 
-## 프로세스 훅
+## 프로세스 훅 {#process-hooks}
 
 gori에는 플러그인 SDK가 없고 앞으로도 없습니다. 변환을 *계산*해야 할 때(JWT 재서명, 바디
 재압축, 독자 포맷 봉투 복호화, 진짜 탐지기 실행) 이미 가지고 있는 프로그램에 바이트를 넘기면
@@ -106,7 +128,7 @@ gori에는 플러그인 SDK가 없고 앞으로도 없습니다. 변환을 *계�
 
 | 이음매 | 위치 | 하는 일 |
 |--------|------|---------|
-| Rewriter `pipe` 액션 | Rewriter 탭, `gori run rewriter add --op=pipe`, MCP `create_rule` | 매치된 구간을 명령에 넘기고 stdout으로 교체. 프록시에서 실시간으로 |
+| Rewriter `pipe` op | Rewriter 탭, `gori run rewriter add --op=pipe`, MCP `create_rule` | 매치된 구간을 명령에 넘기고 stdout으로 교체. 프록시에서 실시간으로 |
 | Decoder `exec:` 스텝 | Decoder 탭 체인, `gori run decoder`, `§value¦chain§` 마커 | 체인의 한 스텝이 컨버터가 아니라 명령 |
 | Probe `exec` 룰 | Probe 룰, `gori run probe rules add --exec` | 구간을 명령에 넘겨 exit 0이면 발견, stdout이 근거 |
 | Miner `--hook` | `gori run mine --hook`, MCP `mine_start`의 `hook` | 조립된 요청 전체를 명령에 넘기고 그 stdout이 실제로 나가는 요청. 프로브 하나당 훅 하나 |
@@ -116,8 +138,8 @@ gori에는 플러그인 SDK가 없고 앞으로도 없습니다. 변환을 *계�
 gori run rewriter add --op=pipe --match=regex --part=body \
   --find='eyJ[A-Za-z0-9._-]+' --value='./resign.sh --key dev.pem'
 
-# base64 바디를 디코드해 내 파서에 통과시키고 예쁘게 출력한다.
-gori run decoder 'base64-decode > exec:./parse-envelope --json > json-pretty' "$BLOB"
+# base64 바디를 디코드해 내 파서에 통과시킨다.
+gori run decoder 'base64-decode > exec:./parse-envelope --json' "$BLOB"
 
 # 정규식 대신 진짜 탐지기가 판정하게 한다.
 gori run probe rules add --title 'envelope leak' --exec --pattern './detect-leak --stdin'
@@ -147,7 +169,10 @@ gori run mine 42 --locations=query --hook './sign.sh'
 없는 훅은 **이유를 밝히며 그 프로브를 건너뜁니다.** 서명 없는 요청을 보내면 앱이 거절하고 마이너는 그것을
 깨끗한 음성으로 읽을 것이기 때문입니다. 타임아웃은 같은 `hooks.timeout_secs` 예산이며 **아웃바운드 요청
 단위**입니다. 마인의 요청 수는 `--max-requests`와 자체 버킷/이분/확인 트리로 묶여 있으므로 훅 비용 총량도
-함께 묶입니다. 마이너는 왕복을 세는 지연 바운드 작업이라, 훅은 그 왕복마다 fork-and-wait 하나를 더합니다.
+함께 묶입니다. 마이너는 왕복을 세는 지연 바운드 작업이라, 훅은 그 왕복마다 fork-and-wait 하나를 더합니다. 훅은 명령이
+*계산할 수 있는* 값을 위한 것입니다. *서버가* 내주는 nonce나 CSRF 토큰은 대신
+[요청 시점 매크로](/ko/guide/repeater-and-fuzzer/#rotating-tokens-with-a-macro)(`--macro`)가 가져옵니다.
+매크로는 프로브마다 앞서 저장된 Repeater 세션을 재생합니다.
 
 **의도적으로 연결하지 않은 두 곳.** MCP `decode` 툴은 `exec:` 스텝을 거부합니다(저장된 체인
 포함). read-only·unbound로 노출되는 툴이라 순수 계산으로 남깁니다. 훅이 필요한 에이전트는 `pipe`
@@ -189,21 +214,22 @@ Rewriter 룰과 같은 신뢰 수준입니다. gori가 훅을 스스로 만들�
 결정이니 명령을 먼저 읽으세요. 그 플래그가 확인 절차이고, 대화형 프롬프트가 없으므로 스크립트에서도
 그대로 답할 수 있습니다.
 
-## 무엇을 쓸까
+## 무엇을 쓸까 {#what-to-reach-for}
 
 | 할 일 | 서브커맨드 |
 |-------|-----------|
 | CI에서 헤드리스로 트래픽 캡처 | `capture` |
 | History 질의·내보내기(HAR 포함) | `history`, `show` |
+| 세션 없이 요청 하나 보내기 | `send` |
 | 요청 재전송과 비교 | `repeater`, `compare` |
 | 페이로드 스윕, 숨은 파라미터 탐색 | `fuzz`, `mine` |
 | 엔드포인트 크롤링·브루트포스 | `discover`, `sitemap` |
 | 아이덴티티별 접근 제어 시험 | `authorize` |
 | 스캔과 트리아지 | `probe`, `issues`, `notes` |
 | 프로젝트 없이 순수 계산 | `decoder`, `jwt`, `cookie` |
-| 프로젝트·스코프·env·규칙 관리 | `project`, `rewriter`, `colormarker` |
+| 프로젝트·스코프·env·네트워크·규칙 관리 | `project`, `rewriter`, `colormarker` |
 
-## 다음 단계
+## 다음 단계 {#next-steps}
 
 - [CLI 레퍼런스](/ko/reference/cli/): 모든 서브커맨드와 플래그
 - [쿼리 언어](/ko/reference/query-language/): `-q`가 받는 필터 문법

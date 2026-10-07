@@ -25,10 +25,15 @@ module Gori
     FILTER_CATEGORIES = SCAN_CATEGORIES + [Category::CUSTOM]
 
     # Built-in rules that ship DISABLED and must be explicitly enabled in the Rules sub-tab
-    # before they run. Today only the active request-smuggling / desync detector: it sends
-    # synthetic POST bodies, and under AGGRESSIVE mode its differential-confirm leg puts a
-    # COMPLETE smuggled prefix on the wire (which, against a shared back-end pool, could affect
-    # another user) — so the user-decided posture is off-by-default, opt-in only.
+    # before they run. Two, for two different reasons:
+    #   * request_smuggling — the active desync detector sends synthetic POST bodies, and under
+    #     AGGRESSIVE mode its differential-confirm leg puts a COMPLETE smuggled prefix on the wire
+    #     (which, against a shared back-end pool, could affect another user).
+    #   * sqli_time_based — time-based blind SQLi confirms an injection purely in RESPONSE LATENCY,
+    #     so every confirming leg deliberately WAITS multiple seconds. Harmless but slow, it would
+    #     add real wall-clock to the automatic scan of every in-scope flow, so the operator opts
+    #     in when they want it (the Rules sub-tab; a manual per-flow scan honours the same switch).
+    # Both are the user-decided posture: off-by-default, opt-in only.
     #
     # The per-project `probe_disabled_rules` store records the operator's DEVIATION FROM DEFAULT,
     # so membership FLIPS meaning for these ids: for an ordinary (default-ON) rule, being in the
@@ -37,7 +42,7 @@ module Gori
     # ordinary rule on and every default-off rule off. Read AND write BOTH go through the three
     # helpers below, so the flip lives in exactly ONE place and no surface (catalog, analyzer,
     # headless scan, the toggle commands) can drift on what "disabled" means.
-    DEFAULT_DISABLED_RULES = Set{"request_smuggling"}
+    DEFAULT_DISABLED_RULES = Set{"request_smuggling", "sqli_time_based"}
 
     # Active rules that run OUT-OF-BAND: they plant an OAST payload and are confirmed by a later
     # callback (`Probe::OutOfBand`), so they can only send when the project has a registered OAST
@@ -46,7 +51,7 @@ module Gori
     # them "needs OAST" and to keep their (currently-unpayable) request cost out of the enabled
     # total. One list so the catalog, the estimate, and the badge cannot drift on which rules
     # these are.
-    OOB_RULE_IDS = Set{"ssrf_oast", "cmd_injection_oast", "xxe_oast"}
+    OOB_RULE_IDS = Set{"ssrf_oast", "cmd_injection_oast", "xxe_oast", "rfi_oast"}
 
     # Whether the analyzer/scan must SKIP rule `id`, given the project's stored disabled-id set.
     def self.rule_disabled?(id : String, stored : Set(String)) : Bool
@@ -158,6 +163,7 @@ module Gori
       "xxe_oast"                       => "An XML probe caused an OAST callback after declaring and referencing an external parameter entity. Disable DTD processing and external entity resolution in the XML parser, including external parameter entities and external DTD loading. Use a parser configuration that forbids network and file access.",
       "ssrf_oast"                      => "An out-of-band probe pointed this URL parameter at a gori-controlled OAST payload and the server called back to it — confirming the endpoint fetches an attacker-supplied URL (server-side request forgery). Validate the target against a strict allowlist of hosts/schemes, resolve and pin the destination IP (rejecting private/link-local/metadata ranges and DNS-rebinding), and never let a request parameter choose an arbitrary host to connect to. Blind SSRF reaches internal services, cloud metadata (169.254.169.254), and localhost admin panels.",
       "cmd_injection_oast"             => "An out-of-band probe appended a shell-breakout payload to this command/diagnostic parameter and the server's shell called the OAST listener back — confirming the value is concatenated into an OS command (command injection, typically remote code execution). Do not exec user input: pass arguments to a parameterized/safe API (no shell), or map the parameter to an allowlisted operation. Reject shell metacharacters and never build a command string from a request value.",
+      "rfi_oast"                       => "An out-of-band probe pointed an include-shaped parameter at a gori-controlled remote resource and the server called back — confirming remote file inclusion / execution. Do not pass request values to include/require or template loaders; use an allowlist of internal resource identifiers, disable remote URL includes, and keep uploaded or remote content non-executable.",
       "nextjs_action_no_auth"          => "A probe re-sent this Next.js server action (Next-Action) with the session Cookie / Authorization removed and still received a comparable 2xx response. Next.js does not authenticate or authorize server actions for you — enforce authentication and per-user authorization INSIDE every 'use server' function (and treat each action as a public, unauthenticated endpoint until it does). Single-shot; confirm the unauthenticated response actually contains privileged data.",
       "request_smuggling_clte"         => "A timing probe hung on a CL.TE framing conflict: the front-end framed this request by Content-Length while the back-end honoured Transfer-Encoding, so one tier blocked on a body the other had already ended — a request-smuggling / desync primitive. The front-end and back-end MUST agree on framing: reject any request carrying BOTH Content-Length and Transfer-Encoding (RFC 7230 §3.3.3), normalize/strip conflicting framing at the edge, and prefer HTTP/2 end-to-end (its length-prefixed framing removes the ambiguity). Confirm manually with the Repeater 'send group' (a complete smuggled prefix + a benign follow-up on one connection).",
       "request_smuggling_tecl"         => "A timing probe hung on a TE.CL framing conflict: the front-end honoured Transfer-Encoding (the request ended at the terminating chunk) while the back-end waited for Content-Length bytes that never arrived — a request-smuggling / desync primitive. The front-end and back-end MUST agree on framing: reject requests carrying BOTH Content-Length and Transfer-Encoding, have the edge re-chunk or strip conflicting framing, and prefer HTTP/2 end-to-end. Confirm manually with the Repeater 'send group'.",
@@ -189,6 +195,14 @@ module Gori
       "inline_js_uri"                  => "Replace javascript: URLs in href/src/action with real handlers/URLs; they execute script in the page's origin and are blocked by a script-src CSP.",
       "mixed_passive"                  => "Load images/media over HTTPS; passive http:// sub-resources on an HTTPS page are tampered in transit and downgrade the page's security indicator.",
       "reverse_tabnabbing"             => "Informational: add rel=\"noopener\" (or noreferrer) to target=\"_blank\" links. Every current browser already applies noopener implicitly to target=\"_blank\" (Chrome 88, Firefox 79, Safari 12.1), so this does not reproduce on a modern browser — it is markup hygiene, and only matters for legacy embedded webviews.",
+      "api_docs_exposed"               => "API documentation, a schema spec, or an interactive query IDE is reachable here (the evidence names which). If it is not meant to be public, require authentication or restrict it to internal networks; if it is, ensure it lists only intended endpoints and never ships a live query console (GraphiQL/GraphQL Playground) in production.",
+      "session_id_in_url"              => "A session identifier is carried in the URL, where it leaks via server logs, browser history, and the Referer header — and a link that sets it can fix a victim's session. Keep session tokens in cookies (HttpOnly, Secure, SameSite), never in the query string.",
+      "open_cross_domain_policy"       => "A Flash/Silverlight cross-domain policy grants access to all origins (domain=\"*\"), letting any site's plugin content read this origin's authenticated responses. Remove the wildcard and list only the specific origins that need access, or delete the policy file if these plugins are no longer used.",
+      "bare_lf_response"               => "The origin ends response-head lines with a bare LF instead of CRLF. Browsers and gori accept it (RFC 9112 §2.2), but a CRLF-only parser does not, so a cache, load balancer or WAF in front of this origin can disagree with the client about where the head, and therefore the body, ends — the precondition for a response desync or response splitting. Fix the server to emit CRLF line endings; until then, check how each hop in front of it frames this response.",
+      "ratelimit_bypass"               => "The rate limit was bypassed by forging a client-IP header (X-Forwarded-For / X-Real-IP). Derive the client identity from the real connection — the trusted proxy's rightmost forwarded address, or the socket peer — not from a client-controllable header.",
+      "forbidden_method_bypass"        => "The access control was bypassed by changing the HTTP method or sending a method-override header. Enforce authorization on the resource for every method (including HEAD/OPTIONS and overrides), not only the verb the client first used, and ignore X-HTTP-Method-Override unless you deliberately support it.",
+      "trace_enabled"                  => "HTTP TRACE is enabled and echoes the request back (Cross-Site Tracing), so script that can force a TRACE reads headers and cookies the browser would otherwise withhold. Disable TRACE at the web server / reverse proxy.",
+      "dangerous_methods_allowed"      => "The server advertises write or otherwise dangerous methods (PUT/DELETE/CONNECT/PATCH/TRACE) in its Allow response. Disable any method the application does not require, and ensure the remaining ones enforce authorization.",
     } of String => String
 
     TECH_REMEDIATION = "Detected technology — informational; recorded as a project fact."
@@ -305,10 +319,21 @@ module Gori
       "xxe_oast"                  => {611, "Improper Restriction of XML External Entity Reference"},
       "ssrf_oast"                 => {918, "Server-Side Request Forgery (SSRF)"},
       "cmd_injection_oast"        => {78, "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"},
+      "rfi_oast"                  => {98, "Improper Control of Filename for Include/Require Statement in PHP Program"},
       "jwt_alg_none"              => {347, "Improper Verification of Cryptographic Signature"},
       "jwt_key_injection_header"  => {347, "Improper Verification of Cryptographic Signature"},
       "jwt_weak_alg"              => {327, "Use of a Broken or Risky Cryptographic Algorithm"},
       "jwt_no_expiry"             => {613, "Insufficient Session Expiration"},
+      # --- access control / methods / rate limiting --------------------------------------
+      "forbidden_method_bypass"   => {650, "Trusting HTTP Permission Methods on the Server Side"},
+      "ratelimit_bypass"          => {799, "Improper Control of Interaction Frequency"},
+      "trace_enabled"             => {693, "Protection Mechanism Failure"},
+      "dangerous_methods_allowed" => {749, "Exposed Dangerous Method or Function"},
+      # --- information disclosure / policy -----------------------------------------------
+      "api_docs_exposed"         => {200, "Exposure of Sensitive Information to an Unauthorized Actor"},
+      "session_id_in_url"        => {598, "Use of GET Request Method With Sensitive Query Strings"},
+      "open_cross_domain_policy" => {942, "Permissive Cross-domain Policy with Untrusted Domains"},
+      "bare_lf_response"         => {444, "Inconsistent Interpretation of HTTP Requests ('HTTP Request/Response Smuggling')"},
     }
 
     # {id, name} for a finding code, or nil when the code is deliberately unmapped (see CWE).

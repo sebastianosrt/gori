@@ -152,6 +152,15 @@ describe "MCP authorize tools" do
         trials[1]["matches_baseline"].as_bool.should be_true
         results["job_complete"].as_bool.should be_true
         results["has_more"].as_bool.should be_false
+
+        # Held for the life of the job, so only the head is kept: no payload reads the request
+        # or body bytes, and every field above was computed before they were dropped.
+        stored = tools.@authorize_jobs[job_id].results[0].trials
+        stored.each do |t|
+          t.request.should be_empty
+          t.response_body.should be_nil
+          t.response_head.should_not be_nil
+        end
       end
     end
 
@@ -182,7 +191,7 @@ describe "MCP authorize tools" do
       port = start_authz_origin(enforce: true)
       with_store do |store|
         flow = seed_authz_flow(store, port)
-        store.set_setting(Gori::Store::AUTHORIZE_IDENTITIES_KEY, Gori::Authorize.serialize([
+        store.set_setting(Gori::Store::AUTHORIZE_IDENTITIES_KEY, Gori::SessionSlot.serialize([
           Gori::Authorize::Identity.as_captured,
           Gori::Authorize::Identity.new("anon", remove_headers: ["Cookie"]),
         ]))

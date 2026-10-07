@@ -1,4 +1,6 @@
+require "./ascii_bytes"
 require "./filter_ast"
+require "./utf8"
 require "./proto"
 
 module Gori
@@ -83,6 +85,12 @@ module Gori
       def url : String
         Url.request_url(scheme, host, target)
       end
+
+      # `path:`'s haystack, the way `QL::PATH_EXPR` reads it in SQL: an absolute-form target
+      # loses its scheme+authority, so the two backends agree on a plaintext proxy flow.
+      def path : String
+        Url.origin_path(target)
+      end
     end
 
     # One parsed predicate. `field` is :host/:path/:url/:method/:scheme/:status/:proto/:header/
@@ -112,7 +120,7 @@ module Gori
         if rx = pattern
           return case field
           when :host   then InterceptFilter.regex_hit?(rx, s.host)
-          when :path   then InterceptFilter.regex_hit?(rx, s.target)
+          when :path   then InterceptFilter.regex_hit?(rx, s.path)
           when :url    then InterceptFilter.regex_hit?(rx, s.url)
           when :method then InterceptFilter.regex_hit?(rx, s.method)
           when :scheme then InterceptFilter.regex_hit?(rx, s.scheme)
@@ -121,16 +129,19 @@ module Gori
           else              false
           end
         end
+        # `header:`/`body:` search the RAW bytes, never `String.new(bytes).downcase`: a WebSocket
+        # payload is as likely to be protobuf as text, and decoding would allocate per message and
+        # turn non-UTF-8 bytes into U+FFFD. `value` is already downcased by `parse_term`.
         case field
         when :host   then s.host.downcase.includes?(value)
-        when :path   then s.target.downcase.includes?(value)
+        when :path   then s.path.downcase.includes?(value)
         when :url    then s.url.downcase.includes?(value)
         when :method then s.method.compare(value, case_insensitive: true) == 0
         when :scheme then s.scheme.compare(value, case_insensitive: true) == 0
         when :status then (st = s.status) ? InterceptFilter.status_match?(st, value) : false
         when :proto  then InterceptFilter.proto_name(s.proto) == value
-        when :header then (h = s.head) ? InterceptFilter.bytes_include?(h, value) : false
-        when :body   then (p = s.payload) ? InterceptFilter.bytes_include?(p, value) : false
+        when :header then (h = s.head) ? AsciiBytes.contains_ci?(h, value.to_slice) : false
+        when :body   then (p = s.payload) ? AsciiBytes.contains_ci?(p, value.to_slice) : false
         when :never  then false # an uncompilable `~`, or a refused field — see `parse_term`
         else                    # :text — free-text substring over method/host/target
           s.method.downcase.includes?(value) || s.host.downcase.includes?(value) ||
@@ -192,6 +203,14 @@ module Gori
       QL.fields_used(source).map(&.name).uniq!.select! { |n| UNSUPPORTED_FIELDS.includes?(n) }
     end
 
+    # Fields only a RESPONSE carries (a request has no status), so a term naming one never matches
+    # at the request gate. Read off the same `QL.fields_used` tokens as `unsupported_fields`.
+    RESPONSE_FIELDS = %w[status]
+
+    def self.response_fields(source : String) : Array(String)
+      QL.fields_used(source).map(&.name).uniq!.select! { |n| RESPONSE_FIELDS.includes?(n) }
+    end
+
     # The refusal a condition naming one of those fields earns, or nil. ONE sentence, here rather
     # than at each surface, because five of them refuse it: `Bindings#validate` (so MCP
     # `create_extract_rule` and `gori run rewriter extract add` refuse an extract rule's `when:`),
@@ -219,8 +238,12 @@ module Gori
         "an exchange that has not finished has no size or duration yet"
       when "stub"
         "whether a body was stored is a CAPTURE decision, made after this gate"
+      when "static"
+        "a static asset is judged from the finished response's Content-Type and status"
       when "src"
         "a flow's source is recorded when it is captured, not while it is in flight"
+      when "cache"
+        "cannot gate a request before its response exists"
       when .includes?('.')
         # The `req.`/`resp.` half. A gate stands on one leg and already knows which, so the
         # side prefix is not narrowing anything — it is naming bytes that are not in hand.
@@ -354,7 +377,9 @@ module Gori
       when "scope"  then QL::SCOPE_VALUES
       when "src"    then QL::SOURCE_VALUES
       when "proto"  then rows ? QL::PROTO_VALUES : PROTO_VAL
-      when "stub"   then rows ? QL::STUB_VALUES : nil
+      when "stub", "static", "cache" # row-backed ONLY (see the note above); a hold gate never reaches them
+        return nil unless rows
+        field == "cache" ? QL::CACHE_VALUES : QL::FLAG_VALUES
       end
     end
 
@@ -414,7 +439,7 @@ module Gori
     end
 
     # Does this condition read a message BODY anywhere in it? Asked by a caller deciding whether
-    # to BUFFER one it would otherwise stream past (`Bindings#extracts_body?`), so this is about
+    # to BUFFER one it would otherwise stream past (`Bindings#extracts_body_for_host?`), so this is about
     # what the evaluation NEEDS, not about what the operator asked for.
     #
     # Which is why it descends into NOT where `mentions_ws?` refuses to. The two look alike and
@@ -526,6 +551,15 @@ module Gori
       !regex || REGEX_FIELDS.includes?(field_symbol(name))
     end
 
+    # Is reading this token as a field a reading of what was typed at all? See
+    # `FilterAst.field_shaped?`. Judged against QL's vocabulary, not this gate's, and that is
+    # the point: `scope:in` names a field this backend REFUSES (`UNSUPPORTED_FIELDS`), and a
+    # refusal it has a sentence for must not be swallowed as free text on the way. The shape
+    # question is "does this name a field at all"; which fields run here is `known_field?`.
+    FIELD_SHAPED = ->(f : String, _op : Char, v : String) do
+      FilterAst.field_shaped?(f, v, QL.known_field?(f), QL::SIDE_PREFIXES) { QL.suggest_field(f) }
+    end
+
     # Case-fold a term's value ONCE, at parse time, into the form `raw_match?` compares
     # against. `:status` is folded too — `status_match?` tests a literal lowercase 'x',
     # so `status:5XX` matched nothing at all before this. `:proto` is CANONICALIZED
@@ -549,37 +583,10 @@ module Gori
       end
     end
 
-    # ASCII-case-insensitive substring search over RAW bytes — a payload for `body:`, a head for
-    # `header:`. Deliberately not `String.new(bytes).downcase.includes?` — a WebSocket payload is
-    # as likely to be protobuf/msgpack as text, and decoding it would both allocate a copy of
-    # every message on a chatty socket and mangle non-UTF-8 bytes into U+FFFD before the compare.
-    # `needle` arrives already downcased from `parse_term`; a non-ASCII needle therefore matches
-    # case-sensitively, which is the same deal `host:`/`path:` strike.
-    protected def self.bytes_include?(hay : Bytes, needle : String) : Bool
-      pat = needle.to_slice
-      return true if pat.empty?
-      return false if pat.size > hay.size
-      i = 0
-      limit = hay.size - pat.size
-      while i <= limit
-        j = 0
-        while j < pat.size && ascii_fold(hay[i + j]) == pat[j]
-          j += 1
-        end
-        return true if j == pat.size
-        i += 1
-      end
-      false
-    end
-
-    private def self.ascii_fold(b : UInt8) : UInt8
-      b >= 0x41_u8 && b <= 0x5A_u8 ? b + 0x20_u8 : b
-    end
-
     # A `~` term's match, and the ONLY place this filter runs a regex. Two guards, and neither
     # is optional on this path:
     #
-    #   `.scrub` — PCRE2 RAISES `UTF-8 error: illegal byte` on an invalid byte rather than
+    #   the scrub — PCRE2 RAISES `UTF-8 error: illegal byte` on an invalid byte rather than
     #     simply not matching. The haystack here is a request target an operator or a peer put
     #     on the wire, or raw head/payload bytes; a raise from a hold gate takes down the
     #     connection fiber. This is the same hazard `Gori::SafeRegexp` exists to contain on the
@@ -587,11 +594,15 @@ module Gori
     #   `rescue` — a residual PCRE2 error (recursion/match limit on a pathological pattern) is a
     #     no-match, never an exception escaping onto the proxy path.
     #
-    # `.scrub` allocates a copy of the haystack, so a `~` term costs one string per message it
-    # is asked about. Nothing else in this filter allocates per message, and nothing pays this
-    # unless the operator wrote a `~`.
+    # Through `Gori::Utf8.subject`, not `String#scrub` — this comment used to say the scrub
+    # "allocates a copy of the haystack", which is what a valid haystack does NOT pay and is
+    # not where the cost was: `scrub` returns `self` after walking the whole string a character
+    # at a time to find nothing to repair. The cheap validity check answers the same question
+    # over the raw bytes and hands back the same String. `matches_at_byte_index?` for the twin
+    # reason (see `Fuzz::Matcher#regex_pass?`): `matches?` would count the haystack's characters
+    # to convert index 0 into byte 0.
     protected def self.regex_hit?(pattern : Regex, hay : String) : Bool
-      pattern.matches?(hay.scrub)
+      pattern.matches_at_byte_index?(Gori::Utf8.subject(hay), 0)
     rescue
       false
     end

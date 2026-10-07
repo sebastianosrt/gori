@@ -5,10 +5,22 @@
 class Gori::Tui::RepeaterView
   # The HANDSHAKE REQUEST card's right-chained badges, right-to-left — ONE list, read by the
   # draw (`render_request`, for both the badges and where the mode chip chains to) and by the
-  # hit-test below. `␣K:KEY` was drawn from one place and hit-tested from another, and the
+  # hit-test below. `␣Pw:KEY` was drawn from one place and hit-tested from another, and the
   # second one did not list it: the badge was a dead cell, while HTTP's `^L:CL`/`^U:PRETTY`
   # next to it have always been clickable.
-  WS_BADGES = [{:send, "^R", "SEND"}, {:ws_key, "␣K", "KEY"}] of {Symbol, String, String}
+  private def ws_badges : Array({Symbol, String, String})
+    [{:send, key_label("repeater.send", "^R"), "SEND"}, {:ws_key, menu_chip("repeater.toggle-ws-key"), "KEY"}] of {Symbol, String, String}
+  end
+
+  # `^L`'s name on the HTTP request border: `AUTO-LEN` when the whole chain (SEND, it, PRETTY,
+  # the widest mode chip, MARK while drawn) still fits, else `CL` — so a narrow border never
+  # drops a chip it used to draw. ONE answer, read by `render_request` and the hit-test below.
+  private def cl_badge_name(min_x : Int32, right_edge : Int32) : String
+    chips = [" #{key_label("repeater.send", "^R")}:SEND ", " #{key_label("repeater.toggle-auto-content-length", "^L")}:AUTO-LEN ",
+             " #{key_label("repeater.pretty-request", "^U")}:PRETTY ", Frame.mode_badge_label(false)]
+    chips << " #{key_label("repeater.toggle-decoded", "^T")}:MARK " if !decode_mode? && literal_markers?
+    chips.sum { |c| Screen.draw_width(c) } <= right_edge - min_x ? "AUTO-LEN" : "CL"
+  end
 
   # Border-chrome hit-test for REQUEST/RESPONSE toggle chips. Shares geometry with
   # render_request / render_response_chrome (label strings + start_x / right chain).
@@ -18,12 +30,12 @@ class Gori::Tui::RepeaterView
     target_h = {rect.h, target_card_h}.min
     # TARGET NOR/INS chip (top band) — click toggles insert like ↵/esc. The `^V` transport
     # chip chains left of it (past the SNI marker) and cycles the transport on click.
-    if my == rect.y && target_h >= 2
+    if my == rect.y && target_h >= TARGET_MIN_H
       if Frame.mode_badge_hit(mx, my, rect.y, rect.right - 1, rect.x + 8, target_insert?)
         return :target_mode
       end
       _, tls_x, tr_edge = target_chrome_chain(rect)
-      # The `␣T` fingerprint chip (#844). Tested against the SAME `tls_chip_label` the draw
+      # The `␣Pt` fingerprint chip (#844). Tested against the SAME `tls_chip_label` the draw
       # writes, at the same x the chain placed it — the geometry is inverted exactly, not
       # re-derived, which is the rule the `option_cycle` cue miss in #839 was about.
       if tls_x && mx >= tls_x && mx < tls_x + tls_chip_label.size
@@ -31,13 +43,12 @@ class Gori::Tui::RepeaterView
       end
       if transport_switchable?
         if hit = Frame.right_badge_hit(mx, my, rect.y, tr_edge, target_chip_min(rect),
-             [{:transport, "^V", transport_label}] of {Symbol, String, String})
+             [{:transport, key_label("repeater.toggle-http2", "^V"), transport_label}] of {Symbol, String, String})
           return hit
         end
       end
     end
-    content = Rect.new(rect.x, rect.y + target_h, rect.w, {rect.h - target_h, 0}.max)
-    return nil if content.h <= 0
+    content = columns_rect(rect) || return nil
     half = {(content.w - 1) // 2, 1}.max
     left = Rect.new(content.x, content.y, half, content.h)
     right = Rect.new(content.x + half + 1, content.y, {content.w - half - 1, 0}.max, content.h)
@@ -46,25 +57,22 @@ class Gori::Tui::RepeaterView
       return hit
     end
 
-    # RESPONSE: d:diff / x:hex / p:pretty (not drawn in WS/gRPC/group transcript modes)
+    # RESPONSE: d:diff / x:hex / p:pretty / u:decode (not drawn in WS/gRPC/group modes)
     unless ws_mode? || @grpc_mode || group_mode?
       if right.w >= 2 && my == right.y
         # `limit:` is render_response's own `rect.right - 1` stop. The draw breaks at the
         # first chip that would cross the card's '╮'; without the same stop here the hit
         # walked all three anyway, so on a half-width RESPONSE below ~88 columns hex and
         # pretty answered clicks on the border and past it.
-        if hit = Frame.left_chip_hit(mx, my, right.y, right.x + 12, [
-             {:diff, " d:diff "},
-             {:hex, " ^X:hex "},
-             {:pretty, " p:pretty "},
-           ] of {Symbol, String}, limit: right.right - 1)
+        chips = response_chips.map { |(id, label, _)| {id, label} }
+        if hit = Frame.left_chip_hit(mx, my, right.y, right.x + 12, chips, limit: right.right - 1)
           return hit
         end
       end
     end
 
     # REQUEST badges: ^R:SEND is always rightmost (primary action). Then CL/PRETTY (or HEX,
-    # or gRPC's ^X:MSG, or WS's ␣K:KEY) when drawn; the NOR/INS mode chip chains left of
+    # or gRPC's ^X:MSG, or WS's ␣Pw:KEY) when drawn; the NOR/INS mode chip chains left of
     # those. Decode / CHAIN splits keep chrome on the top card.
     req_card = req_split? ? decode_split(left)[0] : left
     if req_card.w >= 2 && my == req_card.y
@@ -72,26 +80,26 @@ class Gori::Tui::RepeaterView
       min_x = req_card.x + label.size + 4
       right_edge = req_card.right - 1
       badges = if @grpc_mode
-                 b = [{:send, "^R", "SEND"}] of {Symbol, String, String}
+                 b = [{:send, key_label("repeater.send", "^R"), "SEND"}] of {Symbol, String, String}
                  if @req_hex_edit
-                   b << {:req_hex, "^X", "HEX"} # editing the payload
+                   b << {:req_hex, key_label("repeater.toggle-hex", "^X"), "HEX"} # editing the payload
                  elsif @grpc_reframable
-                   b << {:req_hex, "^X", "MSG"} # click to hex-edit the unary payload
+                   b << {:req_hex, key_label("repeater.toggle-hex", "^X"), "MSG"} # click to hex-edit the unary payload
                  end
                  # Chains left of whichever hex chip is drawn — in BOTH states, matching
                  # render_request. Recompute the 5-byte length prefix over the payload, or send
                  # the captured one in front of it (DESIGN.md §7).
-                 b << {:grpc_reframe, "␣F", "FRAME"} if @grpc_reframable
+                 b << {:grpc_reframe, menu_chip("repeater.toggle-grpc-reframe"), "FRAME"} if @grpc_reframable
                  # Same condition `render_request` draws it under, so the live cells are
                  # exactly the painted ones — the rule this list already keeps for FRAME.
-                 b << {:grpc_fields, "␣E", "FIELDS"} if grpc_fields_available?
+                 b << {:grpc_fields, menu_chip("repeater.toggle-grpc-fields"), "FIELDS"} if grpc_fields_available?
                  b
                elsif ws_mode?
-                 WS_BADGES # ^R:SEND + ␣K:KEY — the list render_request draws from
+                 ws_badges # ^R:SEND + the WS key chip — the list render_request draws from
                elsif @req_hex_edit
-                 [{:send, "^R", "SEND"}, {:req_hex, "^X", "HEX"}] of {Symbol, String, String}
+                 [{:send, key_label("repeater.send", "^R"), "SEND"}, {:req_hex, key_label("repeater.toggle-hex", "^X"), "HEX"}] of {Symbol, String, String}
                else
-                 [{:send, "^R", "SEND"}, {:cl, "^L", "CL"}, {:pretty_req, "^U", "PRETTY"}] of {Symbol, String, String}
+                 [{:send, key_label("repeater.send", "^R"), "SEND"}, {:cl, key_label("repeater.toggle-auto-content-length", "^L"), cl_badge_name(min_x, right_edge)}, {:pretty_req, key_label("repeater.pretty-request", "^U"), "PRETTY"}] of {Symbol, String, String}
                end
       if hit = Frame.right_badge_hit(mx, my, req_card.y, right_edge, min_x, badges)
         return hit
@@ -99,7 +107,7 @@ class Gori::Tui::RepeaterView
       # Mode chip: drawn on every non-hex request card — plain HTTP, the WS handshake and the
       # gRPC head are all mode-switched text editors. Hex is the exception and draws none (a
       # nibble cursor has no READ/INS), so hit-testing one there would invent a live cell over
-      # a badge that was never painted — the inverse of the dead `␣K:KEY` this pass fixed.
+      # a badge that was never painted — the inverse of the dead `␣Pw:KEY` this pass fixed.
       # …and none while the FIELDS form is up, for the same reason: `render_request`'s
       # `elsif @grpc_fields` branch draws the three gRPC chips and then the form, never
       # `Frame.mode_badge` — so hit-testing one here would answer clicks on cells nothing
@@ -116,7 +124,7 @@ class Gori::Tui::RepeaterView
         if !@grpc_mode && !ws_mode? && !decode_mode? && literal_markers?
           mark_edge = Frame.mode_badge_edge(mode_edge, min_x, request_insert?)
           if Frame.right_badge_hit(mx, my, req_card.y, mark_edge, min_x,
-               [{:mark, "^T", "MARK"}] of {Symbol, String, String})
+               [{:mark, key_label("repeater.toggle-decoded", "^T"), "MARK"}] of {Symbol, String, String})
             return :mark
           end
         end
@@ -249,18 +257,6 @@ class Gori::Tui::RepeaterView
     @target_field == :sni ? (@scx = cx) : (@tcx = cx)
   end
 
-  # Pointer moved with the button held over the target card — extend from the press.
-  #
-  # READ mode only, because that is the only mode whose band `draw_target_row` paints
-  # (`active && !insert`). Extending in INSERT would plant an anchor nothing draws and
-  # `target_copy_text` would then hand back a slice the operator never saw selected — a
-  # silent selection is worse than none. The INSERT half of this field has no selection at
-  # all yet; when it grows one, this guard is what lifts.
-  def target_drag_to_cursor(rect : Rect, mx : Int32, my : Int32) : Nil
-    return if target_insert?
-    target_click_to_cursor(rect, mx, my, selecting: true)
-  end
-
   # Double-click: take the word the press already placed the caret on. Spreads from THAT
   # caret rather than hit-testing again (the same rule the request/response panes follow),
   # so the two presses of the pair cannot disagree about which character was under the
@@ -333,7 +329,7 @@ class Gori::Tui::RepeaterView
     # `+ @resp_xscroll` puts the pointer back into the DRAWN line's column space: it is 0
     # under wrap, and without it a click on a sideways-panned line lands that many columns
     # early.
-    hit = Wrap.row_index(drawn, nil, vr.a, vr.b, mx - (body.x + gw) + resp_xscroll)
+    hit = Wrap.row_index(drawn, nil, vr.a, vr.b, mx - (body.x + gw) + resp_xscroll, reveal: @reveal)
     cx = {hit - off, 0}.max.clamp(0, line_at.call(vr.li).size)
     if selecting
       @resp_cursor.move_to(vr.li, cx, selecting: true) # keeps (or plants) the anchor

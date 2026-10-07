@@ -46,6 +46,32 @@ module Gori::Tui
     # before the keymap, for the read-only panes that sit beside an editor.
     INSERT_CHORD = Verb::Chord.new("i")
 
+    # A US-layout shifted digit, folded back onto shift+digit. `⇧1`-`⇧9` jump to a sub-tab
+    # and `⇧0` opens the sub-tab find picker, and the two ways a terminal can deliver that
+    # keypress do not look alike: a terminal speaking the kitty keyboard protocol reports
+    # `1` WITH the shift flag, while every other terminal sends the punctuation character
+    # `!` with NO modifier at all. Normalised here for exactly the reason a typed capital is
+    # (see `from_event` below) — so the keymap holds ONE chord, `Chord.new("1", shift: true)`,
+    # which is also what Help and the hotkey editor display as `⇧1`.
+    #
+    # The cost is that `!@#$%^&*()` can no longer be bound as BARE chords. Nothing binds them
+    # (`Chord.new("!")` and its nine siblings appear nowhere in src/), and the shifted-digit
+    # row is worth more than ten punctuation marks nobody reached for. Typing them is
+    # untouched: every editor, filter bar and prompt reads `ev.char` upstream of the keymap,
+    # so a `#` in a note is still a `#`.
+    SHIFTED_DIGITS = {
+      '!' => '1', '@' => '2', '#' => '3', '$' => '4', '%' => '5',
+      '^' => '6', '&' => '7', '*' => '8', '(' => '9', ')' => '0',
+    }
+
+    # The rest of the US shifted punctuation row: characters that only exist WITH shift. A
+    # terminal that reports modifiers for text keys (kitty's report-all-keys, xterm's
+    # modifyOtherKeys) can deliver `>` together with the shift flag it took to type it, and
+    # `Chord(">", shift)` then matches nothing — Send flow to…'s `>`, Help's `?` and the
+    # Issues status `{`/`}` are all bound bare. The character already says shift was held, so
+    # the flag is dropped. No shipped chord spells shift with one of these.
+    SHIFTED_PUNCTUATION = Set{'~', '_', '+', '{', '}', '|', ':', '"', '<', '>', '?'}
+
     def self.from_event(ev : Termisu::Event::Key) : Verb::Chord?
       key = ev.key
       shift = ev.shift?
@@ -74,9 +100,19 @@ module Gori::Tui
             return nil
           end
           # Terminals deliver a typed uppercase letter as the char itself with no
-          # shift modifier; normalise to shift + lowercase so "shift-f" binds.
-          shift ||= c.ascii_uppercase?
-          c.downcase.to_s
+          # shift modifier; normalise to shift + lowercase so "shift-f" binds. A shifted
+          # DIGIT arrives the same way — as `!`…`)` — and folds onto shift+digit for the
+          # same reason (see SHIFTED_DIGITS).
+          if d = SHIFTED_DIGITS[c]?
+            shift = true
+            d.to_s
+          elsif SHIFTED_PUNCTUATION.includes?(c)
+            shift = false
+            c.to_s
+          else
+            shift ||= c.ascii_uppercase?
+            c.downcase.to_s
+          end
         else
           return nil
         end

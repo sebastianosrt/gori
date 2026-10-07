@@ -1,19 +1,21 @@
 require "uri"
 require "../codec/http1"
 require "../codec/body"
+require "./copy_buf_pool"
 require "../codec/content_decode"
 require "../sink"
 require "../head_rewriter"
 require "../extractor"
 require "../../interceptor"
 require "../../host_overrides"
+require "../socket_residue"
 require "../../outbound"
 require "../prefix_io"
 require "../socket_tuning"
 require "../h2/relay"
 require "../h2/frame"
 require "../tls/client_hello"
-require "../connect"
+require "../tls/tunnel"
 require "../upstream"
 require "../pump"
 require "../ws/relay"
@@ -86,8 +88,10 @@ module Gori::Proxy
   # streams the response back.
   class ClientConn
     # Max consecutive interim 1xx responses to forward before giving up — a guard
-    # against a hostile upstream streaming an unbounded run of body-less 103s.
-    MAX_INTERIM = 64
+    # against a hostile upstream streaming an unbounded run of body-less 103s. Its home is
+    # `Store::Interims::MAX_RUN`, so the h2 capture, which cannot refuse the run, stops
+    # counting at the same number.
+    MAX_INTERIM = Store::Interims::MAX_RUN
 
     # How many DISTINCT compressed-body Match&Replace refusals one connection writes to
     # `gori.log` before it stops (#745). A tunnel is pinned to one host and can only reach two
@@ -113,6 +117,14 @@ module Gori::Proxy
     # streaming path, exactly as `skip_interim_responses` does its own, so a 1.0 client never
     # sees a 1xx — and never waits on one either.
     CONTINUE_RESPONSE = "HTTP/1.1 100 Continue\r\n\r\n".to_slice
+
+    # How many connections a short-circuit `delay` or `hang` (#1237) may hold at once, across the
+    # whole process. Each one pins a fiber, an fd and one of `Server::MAX_CONNECTIONS` accept
+    # slots for up to `Store::RespondArgs::MAX_WAIT_MS`, and a page that retries a hung endpoint
+    # can open them faster than they drain — so past this, a hang closes at once and a delay is
+    # skipped, and the flow says which. An eighth of the accept slots: the rest keep serving.
+    MAX_HELD_CONNECTIONS = 256
+    @@held = Atomic(Int32).new(0)
 
     # `fixed_host`/`fixed_port` pin all requests to one origin (post-CONNECT TLS
     # tunnel); when nil the upstream is resolved per request from the target /
@@ -150,7 +162,7 @@ module Gori::Proxy
     # rewrites Host implicitly, but that is a mutation of operator-supplied bytes on the live
     # path (P7), so here it has to be asked for. What is CAPTURED is unaffected: the client's
     # original head is what History shows, exactly as with a Match&Replace-free forward.
-    def initialize(@io : IO, @scheme : String, @sink : FlowSink, @tls : TlsMitm? = nil,
+    def initialize(@io : IO, @scheme : String, @sink : FlowSink, @tls : Tls::Tunnel? = nil,
                    @fixed_host : String? = nil, @fixed_port : Int32 = 0,
                    @listener_pinned : Bool = false,
                    @tls_upstream : Bool = false, @verify_upstream : Bool = true,
@@ -197,10 +209,7 @@ module Gori::Proxy
       @upstream = nil.as(IO?)
       @up_host = nil.as(String?)
       @up_port = 0
-      # One 64 KiB copy buffer reused across every request AND response body forwarded on
-      # this connection (see `copy_buf`), so a keep-alive stream stops churning a large-object
-      # allocation per body. Lazily allocated on the first body copy.
-      @copy_buf = nil.as(Bytes?)
+      @up_tls = false
       # Why the most recent upstream dial failed, set by `open_upstream` and read only when a
       # dial returned nil — lets a failed flow distinguish unreachable from a TLS/verify
       # rejection (the #323 case, whose fix is --insecure-upstream) and from an upstream proxy
@@ -220,6 +229,21 @@ module Gori::Proxy
       # folded into the record by `response_advisory`, exactly like `@alt_svc_note` above —
       # and reset the same way, by being assigned unconditionally at that seam.
       @status_line_note = nil.as(String?)
+      # Did a head on the CURRENT upstream connection end on a bare-LF blank line — the final
+      # head or an interim one? Set by `safe_read_head`, which every response head passes
+      # through, and cleared only with the connection (`release_upstream`): such a connection
+      # is never parked (`origin_keep_alive?`), so while it is set the slot never survives.
+      @upstream_lf_framed = false
+      # Why Match&Replace left THIS response alone because its head is bare-LF-terminated
+      # (`lf_rules_skipped`), and whether bytes were waiting past its framed body when gori
+      # retired that connection (`lf_residue_note`). Per response, reset with the notes above.
+      @lf_rules_note = nil.as(String?)
+      @lf_residue_note = nil.as(String?)
+      # The interim 1xx responses the origin sent before THIS response's final head
+      # (`Store::Interims`), carried to whichever record site the response takes. Assigned
+      # unconditionally at the top of `handle_response` — seeded with what the Expect
+      # settlement relayed, if anything — which is what resets it between keep-alive requests.
+      @interims = nil.as(Store::Interims?)
       # Hosts whose h3 `Alt-Svc` strip this connection has already written to `gori.log`. The
       # advisory is the record an operator reads; the log line is for the one debugging a
       # client that stopped using QUIC, and an origin that sends `Alt-Svc` on every response
@@ -253,11 +277,13 @@ module Gori::Proxy
       @origin_dst.try(&.[0])
     end
 
-    # The connection-lifetime scratch buffer for body forwarding, allocated on first use.
-    # Safe to share across the request and response streams because they run sequentially on
-    # this one fiber (the request body is fully forwarded before the response head is read).
-    private def copy_buf : Bytes
-      @copy_buf ||= Bytes.new(Codec::Body::BUFSIZE)
+    # `Codec::Body.stream` through a 64 KiB copy buffer LENT for this one body (see
+    # CopyBufPool), so a keep-alive connection pins no buffer between bodies. A bodyless frame
+    # never touches a buffer, so it borrows none.
+    private def stream_body(src : IO, dst : IO, framing : Codec::BodyFraming, length : Int64,
+                            tee : IO) : Bool
+      return Codec::Body.stream(src, dst, framing, length, tee) if framing.none?
+      CopyBufPool.lend { |buf| Codec::Body.stream(src, dst, framing, length, tee, buf) }
     end
 
     # One-shot teardown claim shared between a relaxed-stream copy and its client-abort watcher
@@ -309,21 +335,23 @@ module Gori::Proxy
     # EOF on the response head and transparently retried for body-less requests.
     # Returns {connection, reused?} — `reused` tells the caller a stale EOF is
     # worth one redial+resend.
-    private def acquire_upstream(host : String, port : Int32) : {IO?, Bool}
-      if (up = @upstream) && @up_host == host && @up_port == port
+    private def acquire_upstream(host : String, port : Int32, tls : Bool) : {IO?, Bool}
+      if (up = @upstream) && @up_host == host && @up_port == port && @up_tls == tls
         return {up, true}
       end
       release_upstream # different origin (forward-proxy) or none yet — dial fresh
-      up = open_upstream(host, port)
+      up = open_upstream(host, port, tls)
       if up
         @upstream = up
         @up_host = host
         @up_port = port
+        @up_tls = tls
       end
       {up, false}
     end
 
     private def release_upstream : Nil
+      @upstream_lf_framed = false
       @upstream.try(&.close) rescue nil
       @upstream = nil
       @up_host = nil
@@ -343,10 +371,19 @@ module Gori::Proxy
     # It is answered HERE rather than there because only this call site knows the read was the
     # CLIENT head — `run`'s rescue also covers every response-head and body read on the way
     # through — and because `HeadTimeout#received` is only meaningful for this one.
+    #
+    # An OVERSIZED head is answered too: it used to come back as the same nil as a clean close,
+    # so a client with a 300 KB cookie saw a reset and History showed nothing at all, while the
+    # response side already recorded "response head exceeded 256 KiB".
     private def read_client_head : Bytes?
-      Codec::Http1.read_head(@io,
+      result = Codec::Http1.read_head_result(@io,
         deadline: SocketTuning::HEAD_DEADLINE, timeout_sock: SocketTuning.underlying_socket(@io),
         detect_non_http: true)
+      if result.state.too_large?
+        refuse_oversized_head(result)
+        return nil
+      end
+      result.to_legacy_head
     rescue ex : Codec::Http1::HeadTimeout
       record_silent_client if ex.received.zero? && !@saw_request
       nil
@@ -376,7 +413,7 @@ module Gori::Proxy
       end
 
       req = Codec::Http1.parse_request_head(head)
-      return handle_connect(req) if req.method.compare("CONNECT", case_insensitive: true) == 0
+      return handle_connect(req, now_us) if req.method.compare("CONNECT", case_insensitive: true) == 0
 
       started = Time.instant
       created_at = now_us
@@ -496,7 +533,7 @@ module Gori::Proxy
       # a distinct 403 so a sandbox block never reads like an upstream failure. The scope
       # URL is built lazily inside the interceptor, only while the sandbox is on.
       if (ic = @interceptor) && ic.sandbox_blocks?(scheme, host, gate_target, port)
-        record_blocked_request(sent_req, scheme, host, port, created_at)
+        record_blocked_request(record_req, scheme, host, port, created_at)
         write_sandbox_block
         return false
       end
@@ -518,7 +555,7 @@ module Gori::Proxy
         req_framing, req_len = Codec::Body.request_framing(req)
       rescue ex : Gori::Error
         reason = ex.message || "ambiguous request framing"
-        record_error(sent_req, scheme, host, port, created_at, "request framing rejected: #{reason}")
+        record_error(record_req, scheme, host, port, created_at, "request framing rejected: #{reason}")
         write_framing_reject(reason)
         return false
       end
@@ -534,7 +571,11 @@ module Gori::Proxy
       # It also has to come after `request_framing`, because answering means draining the
       # body first (see serve_short_circuit).
       if (rw = @rewriter) && (stub = rw.short_circuit(sent_head, host))
-        return serve_short_circuit(stub, req, sent_req, record_req, host, port, scheme,
+        if stub.fault
+          return serve_fault(stub, req, record_req, host, port, scheme, created_at,
+            req_framing, req_len)
+        end
+        return serve_short_circuit(stub, req, record_req, host, port, scheme,
           created_at, req_framing, req_len)
       end
 
@@ -550,7 +591,7 @@ module Gori::Proxy
       if (ic = @interceptor) && ic.intercepts_request?(
            method: sent_req.method, host: host, target: gate_target, scheme: scheme,
            port: port, head: sent_head) && holdable_body_size?(req_framing, req_len, "request")
-        return handle_held_request(ic, req, sent_req, sent_head, host, port, scheme,
+        return handle_held_request(ic, req, sent_req, sent_head, record_req, host, port, scheme,
           created_at, started, req_framing, req_len)
       end
 
@@ -560,8 +601,8 @@ module Gori::Proxy
       # (no body rule) falls straight through to zero-buffer streaming below (P6). A body
       # whose declared length exceeds MAX_REWRITE_BODY is left byte-exact (see the constant)
       # so a huge upload can't grow the proxy heap while a rule is on.
-      if (rw = @rewriter) && rewrite_request_body?(rw, req_framing, req_len)
-        return forward_request_rewriting_body(rw, req, sent_req, sent_head, host, port,
+      if (rw = @rewriter) && rewrite_request_body?(rw, req_framing, req_len, host)
+        return forward_request_rewriting_body(rw, req, sent_head, record_req, host, port,
           scheme, created_at, started, req_framing, req_len)
       end
 
@@ -588,33 +629,37 @@ module Gori::Proxy
       # body is sent twice on a stale-reuse redial.
       expects_continue = expect_continue?(req) && !req_framing.none?
       early_head = nil.as(Bytes?)
+      early_head_failure = nil.as(Codec::Http1::HeadReadResult?)
+      early_interims = nil.as(Store::Interims?)
       send_body = true
       client_gone = false
-      upstream, reused, sent = acquire_and_send(host, port, retryable) do |up|
+      upstream, reused, sent = acquire_and_send(host, port, dial_tls?(scheme), retryable) do |up|
         up.write(sent_head)
         if expects_continue
           up.flush # the head must be ON THE WIRE before there is anything to wait for
-          early_head, send_body, client_gone = settle_expectation(up)
+          early_interims = Store::Interims.new
+          early_head, early_head_failure, send_body, client_gone = settle_expectation(up, early_interims)
         end
         if send_body
-          req_complete = Codec::Body.stream(@io, up, req_framing, req_len, req_capture, copy_buf)
+          req_complete = stream_body(@io, up, req_framing, req_len, req_capture)
           up.flush
         end
         true
       end
       unless upstream && sent
         release_upstream
-        record_error(req, scheme, host, port, created_at, upstream_error_message(host, port, upstream))
+        record_error(record_req, scheme, host, port, created_at, upstream_error_message(host, port, upstream))
         write_gateway_error
         return false
       end
       if client_gone
-        # The client vanished while gori was answering its expectation. Nothing was forwarded
-        # and nothing will be; record it rather than leave the flow Pending (mirrors the same
-        # guard inside `skip_interim_responses`).
+        # The client vanished while gori was answering its expectation. Nothing more will be
+        # forwarded; record it rather than leave the flow Pending (mirrors the same guard inside
+        # `skip_interim_responses`), with any 1xx the origin had already answered with.
         release_upstream
         record_error(record_req, scheme, host, port, created_at,
-          "connection closed while answering Expect: 100-continue")
+          "connection closed while answering Expect: 100-continue",
+          interims: early_interims.try { |i| i unless i.empty? })
         return false
       end
       req_body = req_framing.none? ? nil : req_capture.to_slice
@@ -623,12 +668,13 @@ module Gori::Proxy
         body_truncated: req_capture.truncated?, body_size: req_capture.total, source: FlowSource::Kind::Proxy))
       unless req_complete # client cut the request body short — don't reuse the connection
         release_upstream
-        @sink.on_response(FlowMapper.error_response(flow_id, "client truncated request body"))
+        @sink.on_response(FlowMapper.error_response(flow_id, "client truncated request body",
+          interims: early_interims.try { |i| i unless i.empty? }))
         return false
       end
       keep = handle_response(upstream, req, flow_id, started, host, port, scheme,
         reused: reused, sent_head: sent_head, can_retry: retryable, sent_req: sent_req,
-        pre_read_head: early_head)
+        pre_read_head: early_head, pre_read_failure: early_head_failure, pre_interims: early_interims)
       # The expectation was settled without the body being pumped, so neither leg is reusable:
       # the client still owes those bytes, and gori sent the origin a head declaring a body it
       # never got — either socket's next bytes are ambiguous, which is where a desync starts.
@@ -673,67 +719,96 @@ module Gori::Proxy
       {client_head, WS::Handshake.strip_extensions(forward_head), Codec::Http1.parse_request_head(client_head)}
     end
 
-    # The intercept-hold request path: buffer the body, let the human edit/drop
-    # it, then forward via the reused upstream (with the same stale-reuse retry).
-    private def handle_held_request(ic : Gori::Interceptor, req : Codec::RawRequest,
-                                    sent_req : Codec::RawRequest, sent_head : Bytes,
-                                    host : String, port : Int32, scheme : String,
-                                    created_at : Int64, started : Time::Instant,
-                                    req_framing : Codec::BodyFraming, req_len : Int64) : Bool
-      # #728: a held request must be COMPLETE before the human can see it, so gori answers the
-      # client's `Expect: 100-continue` itself rather than blocking on a body being withheld.
-      # See `elicit_request_body` for why this path cannot ask the origin instead.
+    # The whole request body, for the two paths that must hold it before anything goes upstream
+    # (the intercept hold and a request-body rule) and whether there is one: false after
+    # recording why not. A bodiless request is `{nil, true}`, as `Body.read_complete` has it.
+    # #728: gori answers the client's `Expect: 100-continue` itself rather than blocking on a
+    # body being withheld; see `elicit_request_body` for why these paths cannot ask the origin.
+    # A body the client cut short is not held or forwarded: forwarding it under the original
+    # Content-Length would desync the upstream (mirrors the streaming path's req_complete guard).
+    private def read_whole_request_body(req : Codec::RawRequest, record_req : Codec::RawRequest,
+                                        scheme : String, host : String, port : Int32,
+                                        created_at : Int64, req_framing : Codec::BodyFraming,
+                                        req_len : Int64) : {Bytes?, Bool}
       unless elicit_request_body(req, req_framing)
-        record_error(sent_req, scheme, host, port, created_at,
+        record_error(record_req, scheme, host, port, created_at,
           "connection closed while answering Expect: 100-continue")
-        return false
+        return {nil, false}
       end
       buffered, body_complete = Codec::Body.read_complete(@io, req_framing, req_len)
       unless body_complete
-        # The client cut its request body short — there's nothing whole to hold/forward, and
-        # forwarding a short body under the original Content-Length would desync the upstream
-        # (mirrors the non-hold path's req_complete guard). Record + close instead of holding.
-        record_error(sent_req, scheme, host, port, created_at, "client truncated request body")
-        return false
+        record_error(record_req, scheme, host, port, created_at, "client truncated request body")
       end
+      {buffered, body_complete}
+    end
+
+    # The intercept-hold request path: buffer the body, let the human edit/drop
+    # it, then forward via the reused upstream (with the same stale-reuse retry).
+    #
+    # `sent_req`/`sent_head` are the origin-form wire head the human is shown and edits;
+    # `record_req` is the same request in the CLIENT's request-line form, which History keeps
+    # for every outcome that sends the client's own request (drop, an unedited forward, the
+    # error exits) — the rule the streaming path follows (#1424). Only an edit records the
+    # wire form, because then the edited bytes ARE the request and nobody sent another one.
+    private def handle_held_request(ic : Gori::Interceptor, req : Codec::RawRequest,
+                                    sent_req : Codec::RawRequest, sent_head : Bytes,
+                                    record_req : Codec::RawRequest,
+                                    host : String, port : Int32, scheme : String,
+                                    created_at : Int64, started : Time::Instant,
+                                    req_framing : Codec::BodyFraming, req_len : Int64) : Bool
+      # #728: a held request must be COMPLETE before the human can see it.
+      buffered, whole = read_whole_request_body(req, record_req, scheme, host, port, created_at,
+        req_framing, req_len)
+      return false unless whole
       # Match&Replace (request body) BEFORE the human sees it — mirroring the head, which is
       # already M&R'd into `sent_head`. A body rule re-frames to Content-Length, so re-parse
       # the (possibly rewritten) head for the hold metadata + capture.
       advisory = nil.as(String?)
-      if (rw = @rewriter) && rw.rewrites_request_body?
-        sent_head, buffered, advisory = apply_body_rewrite(sent_head, buffered, req_framing,
+      client_body = buffered
+      if (rw = @rewriter) && rw.rewrites_request_body_for_host?(host)
+        rewritten_head, buffered, advisory = apply_body_rewrite(sent_head, buffered, req_framing,
           host: host, response: false, live: true) { |e| rw.rewrite_request_body(e, host) }
+        record_req = reframed_record(record_req, sent_head, rewritten_head, buffered)
+        sent_head = rewritten_head
         sent_req = Codec::Http1.parse_request_head(sent_head)
       end
-      decision = ic.hold_request(build_message(sent_head, buffered),
+      held = build_message(sent_head, buffered)
+      decision = ic.hold_request(held,
         method: sent_req.method, target: sent_req.target,
         host: host, port: port, scheme: scheme)
       if decision.action.drop?
-        record_dropped_request(sent_req, scheme, host, port, created_at, buffered)
+        record_dropped_request(record_req, scheme, host, port, created_at, buffered)
         write_intercept_drop
         return false
       end
       # forward the decision bytes BYTE-EXACT (P7): re-parse the sent head for capture.
       # The intercept editor owns the "update Content-Length" decision (it knows what
-      # was edited) — see InterceptView#forward_bytes; the proxy must not rewrite bytes
+      # was edited) — see InterceptView#pending_edit; the proxy must not rewrite bytes
       # the human chose to send (e.g. a deliberately CL-mismatched smuggling probe).
       sent_head, edited_body = split_message(decision.bytes)
       sent_req = Codec::Http1.parse_request_head(sent_head)
+      # An edit replaces what the client sent, so History keeps the CLIENT'S OWN bytes beside
+      # the flow (#1378, V44) — `req.raw_head` and the body before any Match&Replace — and
+      # marks it edited. A forward that changed nothing keeps nothing: the flow is the original.
+      original = decision.bytes == held ? nil : build_message(req.raw_head, client_body)
+      recorded = original ? sent_req : record_req
       # Key repeater-safety on the EDITED request: if the human changed the method (e.g.
       # GET→POST), retryability must follow the method actually being sent, not the
       # original — else a now-non-idempotent request could be replayed on a stale-conn retry.
       retryable = retryable_request?(sent_req, edited_body.nil? || edited_body.empty?)
-      upstream, reused, sent = acquire_and_send(host, port, retryable) { |up| write_request(up, sent_head, edited_body) }
+      upstream, reused, sent = acquire_and_send(host, port, dial_tls?(scheme), retryable) { |up| write_request(up, sent_head, edited_body) }
       unless upstream && sent
         release_upstream
-        record_error(sent_req, scheme, host, port, created_at, upstream_error_message(host, port, upstream))
+        record_error(recorded, scheme, host, port, created_at, upstream_error_message(host, port, upstream),
+          intercept_original: original)
         write_gateway_error
         return false
       end
       stored, trunc, size = capped(edited_body)
-      flow_id = @sink.on_request(FlowMapper.request(sent_req,
+      flow_id = @sink.on_request(FlowMapper.request(recorded,
         scheme: scheme, host: host, port: port, created_at: created_at,
-        body: stored, body_truncated: trunc, body_size: size, advisory: advisory, source: FlowSource::Kind::Proxy))
+        body: stored, body_truncated: trunc, body_size: size, advisory: advisory, source: FlowSource::Kind::Proxy,
+        intercept_original: original))
       handle_response(upstream, req, flow_id, started, host, port, scheme,
         reused: reused, sent_head: sent_head, can_retry: retryable, sent_req: sent_req)
     end
@@ -747,7 +822,7 @@ module Gori::Proxy
     # stands in for. Paying for that means draining the request body first — it is still on
     # the socket, and an undrained body is read as the next request line.
     private def serve_short_circuit(stub : HeadRewriter::Stub, req : Codec::RawRequest,
-                                    sent_req : Codec::RawRequest, record_req : Codec::RawRequest,
+                                    record_req : Codec::RawRequest,
                                     host : String, port : Int32, scheme : String,
                                     created_at : Int64,
                                     req_framing : Codec::BodyFraming, req_len : Int64) : Bool
@@ -755,17 +830,31 @@ module Gori::Proxy
       # its body back for a `100 Continue` never drains. Answer it here too — the stub's own
       # status still follows, and a 1xx before it is exactly what the client is waiting for.
       unless elicit_request_body(req, req_framing)
-        record_error(sent_req, scheme, host, port, created_at,
+        record_error(record_req, scheme, host, port, created_at,
           "connection closed while answering Expect: 100-continue")
         return false
       end
-      buffered, body_complete = Codec::Body.read_complete(@io, req_framing, req_len)
+      stored, trunc, size, body_complete = drain_request_body(req_framing, req_len)
       unless body_complete
         # Nothing was answered, so this is not a short-circuited flow — record it as the
         # truncation it is (mirrors the hold / body-rewrite paths).
-        record_error(sent_req, scheme, host, port, created_at, "client truncated request body")
+        record_error(record_req, scheme, host, port, created_at, "client truncated request body")
         return false
       end
+
+      # Recorded BEFORE the answer, so a request held by a rule's delay shows in History as
+      # pending while it waits, the way a fault's does (`serve_fault`).
+      flow_id = @sink.on_request(FlowMapper.request(record_req,
+        scheme: scheme, host: host, port: port, created_at: created_at,
+        body: stored, body_truncated: trunc, body_size: size, short_circuited: true, source: FlowSource::Kind::Proxy,
+        # WHICH rule answered (#1237), as text that outlives the rule: `STUB` alone says gori
+        # answered, and this says with what, after the rule is edited or deleted.
+        source_ref: stub.ref.presence))
+
+      # A rule's `delay` (#1237): after the body is drained, so the wait measures gori's answer
+      # and not the client's upload, and on this connection's own fiber — the Rules mutex was
+      # released before the stub was built.
+      delay_note = (d = stub.delay) ? hold_for(d) : nil
 
       omit_length, send_body = stub_framing(stub, req.method)
       resp_head = build_stub_head(stub, omit_length)
@@ -779,15 +868,11 @@ module Gori::Proxy
         false
       end
 
-      stored, trunc, size = capped(buffered)
-      flow_id = @sink.on_request(FlowMapper.request(record_req,
-        scheme: scheme, host: host, port: port, created_at: created_at,
-        body: stored, body_truncated: trunc, body_size: size, short_circuited: true, source: FlowSource::Kind::Proxy))
       resp = Codec::Http1.parse_response_head(resp_head)
       # ttfb/duration stay nil on purpose. There was no round trip to measure, and a `0`
       # would render in History as an impossibly fast origin — the exact misreading the
       # short-circuit marker exists to prevent. `—` is the truth.
-      # Capped like every other capture path (`capped` eight lines above for the request,
+      # Capped like every other capture path (`capped` above for the request,
       # `CaptureBuffer` on the streaming path, the h2 assembler). The stub's body is bounded
       # only by `RuleStub::MAX_BODY_FILE_BYTES` = 8 MiB, four times the default
       # `Settings.capture_max`, and it is written PER REQUEST — so a `body_file` stub on an
@@ -804,7 +889,7 @@ module Gori::Proxy
       non_final = resp.status < 200
       @sink.on_response(FlowMapper.response(resp,
         flow_id: flow_id, body: resp_stored,
-        body_truncated: resp_trunc, body_size: resp_size,
+        body_truncated: resp_trunc, body_size: resp_size, advisory: delay_note,
         state: written && !non_final ? Store::FlowState::Complete : Store::FlowState::Aborted,
         error: if !written
           "client closed before the short-circuit response was written"
@@ -818,11 +903,140 @@ module Gori::Proxy
       keep_alive?(req, resp, omit_length ? Codec::BodyFraming::None : Codec::BodyFraming::Length)
     end
 
+    # A short-circuit FAULT (#1237): the rule answers with no response at all — the connection
+    # is closed (`close`), reset (`reset`) or held until the client gives up (`hang`).
+    #
+    # The request is recorded BEFORE the fault, so a hang shows in History as pending while it
+    # holds, and the flow is then finished Aborted — the intercept-drop precedent, plus the
+    # `short_circuited` mark, because the origin never saw this request either.
+    #
+    # The body is drained first unless the client is withholding it for `Expect: 100-continue`:
+    # a fault writes no bytes, so it sends no self-issued 100 either, and reading a withheld body
+    # would block until the timeout. Draining matters for `close`: unread bytes in the kernel's
+    # receive buffer turn a close into an RST on most stacks.
+    #
+    # Every outcome returns false, so `run`'s ensure closes the connection. None of this spawns
+    # a fiber, and nothing else reads `@io` here — which is what makes the raw-socket close in
+    # `reset_client` safe under TLS (read the `sync_close` comment in `tls/tunnel.cr`).
+    private def serve_fault(stub : HeadRewriter::Stub, req : Codec::RawRequest,
+                            record_req : Codec::RawRequest,
+                            host : String, port : Int32, scheme : String, created_at : Int64,
+                            req_framing : Codec::BodyFraming, req_len : Int64) : Bool
+      # A withheld body is not read at all: `None` records it as absent, as before.
+      framing = expect_continue?(req) ? Codec::BodyFraming::None : req_framing
+      stored, trunc, size, body_complete = drain_request_body(framing, req_len)
+      unless body_complete
+        record_error(record_req, scheme, host, port, created_at, "client truncated request body")
+        return false
+      end
+      flow_id = @sink.on_request(FlowMapper.request(record_req,
+        scheme: scheme, host: host, port: port, created_at: created_at,
+        body: stored, body_truncated: trunc, body_size: size, short_circuited: true,
+        source: FlowSource::Kind::Proxy, source_ref: stub.ref.presence))
+      notes = [] of String
+      if (d = stub.delay) && (note = hold_for(d))
+        notes << note
+      end
+      done =
+        case stub.fault
+        when Store::FaultKind::Reset
+          reset_client ? "injected reset" : "injected close (a TCP reset is not available on this connection)"
+        when Store::FaultKind::Hang
+          hang_client(stub.hang || Store::RespondArgs::DEFAULT_HANG_MS.milliseconds)
+        else
+          "injected close"
+        end
+      message = "#{done} by #{stub.ref}"
+      message += "; #{notes.join("; ")}" unless notes.empty?
+      @sink.on_response(FlowMapper.aborted_response(flow_id, message))
+      false
+    end
+
+    # Wait `span` while counted against `MAX_HELD_CONNECTIONS`. Nil when it waited, or the
+    # note a flow carries when the cap made it skip the wait.
+    private def hold_for(span : Time::Span) : String?
+      return held_cap_note("delay") unless acquire_hold
+      begin
+        sleep span
+      ensure
+        release_hold
+      end
+      nil
+    end
+
+    private def acquire_hold : Bool
+      if @@held.add(1) >= MAX_HELD_CONNECTIONS
+        @@held.sub(1)
+        return false
+      end
+      true
+    end
+
+    private def release_hold : Nil
+      @@held.sub(1)
+    end
+
+    private def held_cap_note(what : String) : String
+      "#{what} skipped: #{MAX_HELD_CONNECTIONS} connections are already held by short-circuit delays and hangs"
+    end
+
+    # `SO_LINGER 0`, then close the RAW socket, so the client sees an RST rather than a FIN.
+    # Through the `::Socket` object and never a bare `LibC.close`, so Crystal marks it closed:
+    # the TLS close that `run`'s ensure still performs then fails on a closed socket (rescued)
+    # instead of writing a close_notify into an fd number something else may have reused.
+    # False when there is no socket to reset (a non-TCP transport) or the option is refused —
+    # the caller then records the close it actually sent.
+    private def reset_client : Bool
+      sock = SocketTuning.underlying_socket(@io) || return false
+      begin
+        sock.linger = 0
+      rescue
+        return false
+      end
+      sock.close rescue nil
+      true
+    end
+
+    # Hold the connection without answering until the client leaves or `limit` passes, then
+    # let the caller close it. A real deadline: each read gets only what is LEFT, because a
+    # per-read timeout alone would let a client that sends a byte every few seconds hold the
+    # connection forever. Reading (rather than sleeping) is what notices the client going away.
+    private def hang_client(limit : Time::Span) : String
+      return "injected close (#{held_cap_note("hang")})" unless acquire_hold
+      started = Time.instant
+      deadline = started + limit
+      sock = SocketTuning.underlying_socket(@io)
+      outcome = "released after"
+      begin
+        if sock
+          buf = Bytes.new(512)
+          loop do
+            left = deadline - Time.instant
+            break if left <= Time::Span.zero
+            sock.read_timeout = left
+            if @io.read(buf) == 0
+              outcome = "client closed after"
+              break
+            end
+          end
+        else
+          sleep limit
+        end
+      rescue IO::TimeoutError
+        # the deadline — "released after"
+      rescue
+        outcome = "client closed after"
+      ensure
+        release_hold
+      end
+      "injected hang (#{outcome} #{(Time.instant - started).total_seconds.round(1)}s)"
+    end
+
     # {omit_length, send_body} for a stub answering `method`. Content-Length is prohibited on
     # a 1xx/204, so it is left off entirely there; a 304 and a HEAD response keep it — it
     # describes the entity that WOULD be sent — but carry no body of their own.
     private def stub_framing(stub : HeadRewriter::Stub, method : String) : {Bool, Bool}
-      head_only = method.compare("HEAD", case_insensitive: true) == 0
+      head_only = method == "HEAD"
       omit_length = stub.status == 204 || (100..199).includes?(stub.status)
       {omit_length, !head_only && !omit_length && stub.status != 304}
     end
@@ -842,38 +1056,31 @@ module Gori::Proxy
     # The Match&Replace request-body path (no intercept): buffer the whole body,
     # rewrite the entity, re-frame the head (Content-Length), and forward. A body was
     # sent, so the request is never auto-retryable. Structurally this is the hold path
-    # minus the human — same buffer + capped-capture + reused-upstream forwarding.
+    # minus the human — same buffer + capped-capture + reused-upstream forwarding. History
+    # records `record_req` (the client's request-line form), re-framed alongside the wire head.
     private def forward_request_rewriting_body(rw : HeadRewriter, req : Codec::RawRequest,
-                                               sent_req : Codec::RawRequest, sent_head : Bytes,
+                                               sent_head : Bytes, record_req : Codec::RawRequest,
                                                host : String, port : Int32, scheme : String,
                                                created_at : Int64, started : Time::Instant,
                                                req_framing : Codec::BodyFraming, req_len : Int64) : Bool
-      # #728: a body rule needs the whole entity before the head can be re-framed and sent, so
-      # (as on the hold path) gori answers the client's `Expect: 100-continue` itself.
-      unless elicit_request_body(req, req_framing)
-        record_error(sent_req, scheme, host, port, created_at,
-          "connection closed while answering Expect: 100-continue")
-        return false
-      end
-      buffered, body_complete = Codec::Body.read_complete(@io, req_framing, req_len)
-      unless body_complete
-        # Client cut the body short — forwarding it under the original length would desync
-        # the upstream (mirrors the streaming path's req_complete guard). Record + close.
-        record_error(sent_req, scheme, host, port, created_at, "client truncated request body")
-        return false
-      end
-      sent_head, fwd_body, advisory = apply_body_rewrite(sent_head, buffered, req_framing,
+      # #728: a body rule needs the whole entity before the head can be re-framed and sent.
+      buffered, whole = read_whole_request_body(req, record_req, scheme, host, port, created_at,
+        req_framing, req_len)
+      return false unless whole
+      rewritten_head, fwd_body, advisory = apply_body_rewrite(sent_head, buffered, req_framing,
         host: host, response: false, live: true) { |e| rw.rewrite_request_body(e, host) }
+      record_req = reframed_record(record_req, sent_head, rewritten_head, fwd_body)
+      sent_head = rewritten_head
       sent_req = Codec::Http1.parse_request_head(sent_head) # head may have been re-framed
-      upstream, reused, sent = acquire_and_send(host, port, false) { |up| write_request(up, sent_head, fwd_body) }
+      upstream, reused, sent = acquire_and_send(host, port, dial_tls?(scheme), false) { |up| write_request(up, sent_head, fwd_body) }
       unless upstream && sent
         release_upstream
-        record_error(sent_req, scheme, host, port, created_at, upstream_error_message(host, port, upstream))
+        record_error(record_req, scheme, host, port, created_at, upstream_error_message(host, port, upstream))
         write_gateway_error
         return false
       end
       stored, trunc, size = capped(fwd_body)
-      flow_id = @sink.on_request(FlowMapper.request(sent_req,
+      flow_id = @sink.on_request(FlowMapper.request(record_req,
         scheme: scheme, host: host, port: port, created_at: created_at,
         body: stored, body_truncated: trunc, body_size: size, advisory: advisory, source: FlowSource::Kind::Proxy))
       handle_response(upstream, req, flow_id, started, host, port, scheme,
@@ -887,8 +1094,8 @@ module Gori::Proxy
     # reuse safe against a server that closed an idle connection. A non-replayable
     # request (any body, or a mutating method) is never auto-resent — the caller
     # fails it so the client decides. Returns {upstream, reused?, ok}.
-    private def acquire_and_send(host : String, port : Int32, retryable : Bool, & : IO -> Bool) : {IO?, Bool, Bool}
-      upstream, reused = acquire_upstream(host, port)
+    private def acquire_and_send(host : String, port : Int32, tls : Bool, retryable : Bool, & : IO -> Bool) : {IO?, Bool, Bool}
+      upstream, reused = acquire_upstream(host, port, tls)
       return {nil, false, false} unless upstream
       # Re-arm the per-request upstream timeout: a REUSED socket may carry a relaxed (untimed)
       # state from a prior streamed (SSE/chunked) response. A freshly dialed one already has it
@@ -897,7 +1104,7 @@ module Gori::Proxy
       ok = send_guard { yield upstream }
       if !ok && reused && retryable
         release_upstream
-        upstream, reused = acquire_upstream(host, port)
+        upstream, reused = acquire_upstream(host, port, tls)
         SocketTuning.arm(upstream, Settings.io_timeout) if upstream
         ok = upstream ? send_guard { yield upstream } : false
       end
@@ -932,19 +1139,30 @@ module Gori::Proxy
     # deliberately handed back UNPARSED so every gate below (interim handling, framing, M&R,
     # intercept) runs on it exactly as if `read_response_head` had produced it; the one thing it
     # skips is the stale-reuse redial, which cannot apply once a head has been read.
+    # `pre_read_failure` carries an unfinished or rejected head from that same settlement; its
+    # bytes have already been consumed, so it is recorded and the upstream connection retired.
+    # `pre_interims` is what that settlement relayed ahead of either one — the 100 or 103 the
+    # origin answered the expectation with — so the record keeps them.
     private def handle_response(upstream : IO, req : Codec::RawRequest, flow_id : Int64,
                                 started : Time::Instant, host : String, port : Int32, scheme : String,
                                 *, reused : Bool, sent_head : Bytes, can_retry : Bool,
-                                sent_req : Codec::RawRequest, pre_read_head : Bytes? = nil) : Bool
-      if pre_read_head
-        resp_head = pre_read_head
-      else
-        resp_head, upstream = read_response_head(upstream, host, port, reused, sent_head, can_retry)
-      end
-      if resp_head.nil?
-        @sink.on_response(FlowMapper.error_response(flow_id, "no response from upstream"))
+                                sent_req : Codec::RawRequest, pre_read_head : Bytes? = nil,
+                                pre_read_failure : Codec::Http1::HeadReadResult? = nil,
+                                pre_interims : Store::Interims? = nil) : Bool
+      @interims = pre_interims.try { |i| i unless i.empty? }
+      if pre_read_failure
+        record_response_head_failure(flow_id, pre_read_failure)
         release_upstream
         return false
+      elsif pre_read_head
+        resp_head = pre_read_head
+      else
+        read_result, upstream = read_response_head(upstream, host, port, dial_tls?(scheme), reused, sent_head, can_retry)
+        unless resp_head = read_result.head?
+          record_response_head_failure(flow_id, read_result)
+          release_upstream
+          return false
+        end
       end
       resp = Codec::Http1.parse_response_head(resp_head)
 
@@ -954,6 +1172,8 @@ module Gori::Proxy
       # Judged HERE — on the peer's final head, before Match&Replace or the Alt-Svc seam get
       # to it — because it is a fact about what the ORIGIN sent, not about what a rule made.
       @status_line_note = status_line_note(resp)
+      @lf_rules_note = nil
+      @lf_residue_note = nil
       ttfb = (Time.instant - started).total_microseconds.to_i64
 
       # The h3 `Alt-Svc` strip (settings `network.strip_alt_svc`), before the rules so a rule
@@ -1028,9 +1248,9 @@ module Gori::Proxy
       # and a body-scoped extract rule records that it had no body to read. A body whose
       # declared length exceeds MAX_REWRITE_BODY is likewise left byte-exact (see the constant)
       # so one huge download can't grow the proxy heap while a rule is on.
-      if buffer_response_body?(resp, resp_framing, resp_len)
-        return forward_response_rewriting_body(upstream, req, sent_req, flow_id, host, port,
-          scheme, resp, sent_resp_head, resp_framing, resp_len, ttfb, started, extract_ref)
+      if buffer_response_body?(resp, resp_framing, resp_len, host)
+        return forward_response_rewriting_body(upstream, req, sent_req, flow_id, host,
+          resp, sent_resp_head, resp_framing, resp_len, ttfb, started, extract_ref)
       end
 
       relaxed = relax_for_streaming_response(resp, resp_framing, upstream)
@@ -1061,32 +1281,33 @@ module Gori::Proxy
         # otherwise tear a quiet tunnel down). Keepalive (both legs) reaps a truly dead peer.
         SocketTuning.relax(@io)
         SocketTuning.relax(upstream)
-        if websocket_upgrade?(resp)
-          # `@rewriter` carries Match & Replace (#500 step 1) and `@interceptor` the message
-          # hold (step 2) into the tunnel; `ctx` is the 101 handshake's identity, which both
-          # scope on — a WebSocket message has no authority, scheme or path of its own. The
-          # relay asks each lens ONCE, here, whether it can reach this host; a socket that
-          # answers "no" to both keeps the byte-exact pump (P6/P7).
-          # `target` here is what `Interceptor#intercepts_ws?` scopes every message on, so it
-          # takes the same gate-side recovery as the two HTTP gates (see `gate_target`) —
-          # otherwise a handshake with a malformed request line hands the WS message gate an
-          # empty path and every frame on that socket escapes a path-scoped rule.
-          ws_ctx = WS::Context.new(host: host, port: port, scheme: scheme,
-            method: sent_req.method, target: Codec::Http1.gate_target(sent_req))
-          # frames until close
-          WS::Relay.run(@io, upstream, flow_id, @sink, @rewriter, ws_ctx, @interceptor, notice: ws_notice)
-        else
-          # A 101 that is NOT a WebSocket — kubectl exec/attach/port-forward speaks
-          # `Upgrade: SPDY/3.1` and the Docker Engine API `Upgrade: tcp` — is relayed
-          # byte-exact and deliberately NOT decoded (see `Pump`). That decision used to be
-          # invisible: the WebSocket branch above carries `notice:` and this one said nothing
-          # anywhere, so a `101 / complete / empty transcript` flow could not be told from one
-          # gori simply failed to capture (#736). Recorded AFTER the tunnel returns, because
-          # `blind_tunnel` only comes back when both directions are closed and the byte counts
-          # are what make this a report rather than a guess. Exactly one per connection —
-          # this branch `return false`s immediately below, so there is nothing to rate-limit.
-          moved = Pump.blind_tunnel(@io, upstream) # non-WS upgrade: raw pipe until close
-          record_opaque_upgrade(flow_id, resp, req, host, sent_req.target, moved)
+        begin
+          if websocket_upgrade?(resp)
+            # `@rewriter` carries Match & Replace (#500 step 1) and `@interceptor` the message
+            # hold (step 2) into the tunnel; `ctx` is the 101 handshake's identity, which both
+            # scope on — a WebSocket message has no authority, scheme or path of its own. The
+            # relay asks each lens ONCE, here, whether it can reach this host; a socket that
+            # answers "no" to both keeps the byte-exact pump (P6/P7).
+            # `target` here is what `Interceptor#intercepts_ws?` scopes every message on, so it
+            # takes the same gate-side recovery as the two HTTP gates (see `gate_target`) —
+            # otherwise a handshake with a malformed request line hands the WS message gate an
+            # empty path and every frame on that socket escapes a path-scoped rule.
+            ws_ctx = WS::Context.new(host: host, port: port, scheme: scheme,
+              method: sent_req.method, target: Codec::Http1.gate_target(sent_req))
+            # frames until close
+            WS::Relay.run(@io, upstream, flow_id, @sink, @rewriter, ws_ctx, @interceptor, notice: ws_notice)
+          else
+            # A 101 that is NOT a WebSocket — kubectl exec/attach/port-forward speaks
+            # `Upgrade: SPDY/3.1` and the Docker Engine API `Upgrade: tcp` — is relayed
+            # byte-exact and deliberately NOT decoded (see `Pump`). Record its notice only
+            # after the tunnel returns, when its direction byte counts are known (#736).
+            moved = Pump.blind_tunnel(@io, upstream) # non-WS upgrade: raw pipe until close
+            record_opaque_upgrade(flow_id, resp, req, host, sent_req.target, moved)
+          end
+        ensure
+          # A 101 is printed/countable only when its tunnel ends. WebSocket frame writes above
+          # are synchronous, so this follows the complete captured transcript.
+          @sink.on_tunnel_complete(flow_id)
         end
         return false
       end
@@ -1135,7 +1356,7 @@ module Gori::Proxy
         # body as the next response, don't reuse the upstream).
         if interim_has_body?(resp)
           @sink.on_response(FlowMapper.error_response(flow_id, "malformed interim 1xx response (declared a body)",
-            head: resp.raw_head))
+            head: resp.raw_head, interims: @interims))
           release_upstream
           return nil
         end
@@ -1143,33 +1364,49 @@ module Gori::Proxy
         # body-less 103s can't spin this fiber forever / flood the client (per-conn DoS).
         interim_seen += 1
         if interim_seen > MAX_INTERIM
-          @sink.on_response(FlowMapper.error_response(flow_id, "too many interim 1xx responses (>#{MAX_INTERIM})"))
+          @sink.on_response(FlowMapper.error_response(flow_id, "too many interim 1xx responses (>#{MAX_INTERIM})",
+            interims: @interims))
           release_upstream
           return nil
         end
+        # Each one is kept for the record as the origin sent it (capped, see `Store::Interims`),
+        # marked with whether the client got it — a 1.0 client below never does.
+        interims = @interims ||= Store::Interims.new
         # RFC 9110 §15.2 / RFC 7231: a proxy MUST NOT forward a 1xx to an HTTP/1.0
         # client (it can't parse it). Read past it for everyone; forward only to 1.1.
-        if req.version == "HTTP/1.1"
+        relay = req.version == "HTTP/1.1"
+        if relay
           begin
             @io.write(resp_head) # forward byte-exact (P6/P7); no rewrite on interim
             @io.flush
           rescue
             # Client gone mid-1xx (Stop / max-time / RST). Every other exit from this
             # method records on_response; an unguarded raise left the flow Pending forever.
-            @sink.on_response(FlowMapper.error_response(flow_id, "connection closed while forwarding interim 1xx response"))
+            interims.add(resp.status, resp_head, relayed: false)
+            @sink.on_response(FlowMapper.error_response(flow_id, "connection closed while forwarding interim 1xx response",
+              interims: @interims))
             release_upstream
             return nil
           end
         end
-        resp_head = safe_read_head(upstream)
-        if resp_head.nil?
-          @sink.on_response(FlowMapper.error_response(flow_id, "upstream closed after interim 1xx response"))
+        interims.add(resp.status, resp_head, relayed: relay)
+        read_result = safe_read_head(upstream)
+        unless resp_head = read_result.head?
+          record_response_head_failure(flow_id, read_result, "upstream closed after interim 1xx response")
           release_upstream
           return nil
         end
         resp = Codec::Http1.parse_response_head(resp_head)
       end
       {resp_head, resp}
+    end
+
+    private def record_response_head_failure(flow_id : Int64,
+                                             result : Codec::Http1::HeadReadResult,
+                                             empty_message : String = "no response from upstream") : Nil
+      message = result.state == Codec::Http1::HeadReadResult::State::Empty ? empty_message : result.failure_message("response head",
+        deadline: SocketTuning::HEAD_DEADLINE)
+      @sink.on_response(FlowMapper.error_response(flow_id, message, head: result.bytes, interims: @interims))
     end
 
     # Does this request withhold its body until it is answered? RFC 9110 §10.1.1: `Expect` is a
@@ -1196,10 +1433,10 @@ module Gori::Proxy
     # and the client's body being pumped (#728). Reached only through the caller's
     # `expects_continue` gate, so the client is HTTP/1.1, asked, and declared a body — this takes
     # no request: every 1xx it relays is one the client is entitled to and waiting for.
-    # Returns `{early_head, send_body, client_gone}`:
+    # Returns `{early_head, read_failure, send_body, client_gone}`:
     #
     #   - the origin sent `100 Continue` → relay it VERBATIM to the client (P6/P7: the origin's
-    #     own bytes, never a reconstruction) and pump the body: `{nil, true, false}`.
+    #     own bytes, never a reconstruction) and pump the body: `{nil, nil, true, false}`.
     #   - the origin sent some OTHER well-formed 1xx first — 103 Early Hints, 102 Processing —
     #     which is relayed the same way but settles NOTHING. RFC 9110 §10.1.1 makes only the 100
     #     (or a final status) the permission to send a withheld body, so treating a 103 as the
@@ -1210,20 +1447,27 @@ module Gori::Proxy
     #     it can decide without reading the body, both of which RFC 9110 §10.1.1 explicitly
     #     allows — then it does NOT want the body, and pumping one at a server that has stopped
     #     reading is how a request gets smuggled into the next response's framing. Hand the head
-    #     back for relay and send nothing: `{head, false, false}`. A malformed 1xx (one declaring
+    #     back for relay and send nothing: `{head, nil, false, false}`. A malformed 1xx (one declaring
     #     a body) takes this branch too, on purpose: `skip_interim_responses` already knows how
     #     to refuse it, and it gets a flow_id to record against, which this point does not have.
-    #   - the origin closed / reset before answering → `{nil, false, false}`. Uploading a body
-    #     into a dead socket buys nothing; `handle_response` reads the EOF and records
+    #   - the origin closed / reset before answering → `{nil, nil, false, false}`. Uploading a
+    #     body into a dead socket buys nothing; `handle_response` reads the EOF and records
     #     "no response from upstream".
+    #   - the origin started a head but timed out or exceeded the cap → `{nil, failure, false, false}`.
+    #     The later response handler records the failure and the received bytes.
     #   - nothing arrived within EXPECT_CONTINUE_WAIT → gori writes the 100 ITSELF and pumps the
-    #     body: `{nil, true, false}`. An origin that ignores the expectation is normal and
+    #     body: `{nil, nil, true, false}`. An origin that ignores the expectation is normal and
     #     conformant, and it is waiting for exactly the bytes the client is refusing to send, so
-    #     SOMEONE has to move first. If that write fails the client is gone: `{nil, false, true}`.
+    #     SOMEONE has to move first. If that write fails the client is gone:
+    #     `{nil, nil, false, true}`.
     #     (Cost of the self-issued 100: a duplicate is possible when the origin's own 100 lands
     #     just after the deadline. RFC 9110 §15.2 requires a client to tolerate 1xx it did not
     #     even ask for, so a second one is harmless.)
-    private def settle_expectation(upstream : IO) : {Bytes?, Bool, Bool}
+    #
+    # Every origin 1xx it relays is also added to `interims`, for the flow's record — marked
+    # unrelayed when the client was gone before the write landed. The 100 gori writes itself
+    # is not: the origin never sent it.
+    private def settle_expectation(upstream : IO, interims : Store::Interims) : {Bytes?, Codec::Http1::HeadReadResult?, Bool, Bool}
       # ONE budget for the whole settlement, not one per read. A per-iteration timeout is no
       # timeout at all against an origin that emits a 103 every EXPECT_CONTINUE_WAIT - 1ms: it
       # never technically times out and the exchange never finishes. Each pass gets only what is
@@ -1238,51 +1482,57 @@ module Gori::Proxy
         answer = read_head_within(upstream, left)
         if answer.is_a?(NoAnswer)
           # Nothing will ever come: don't spend the client's body on a dead socket.
-          return {nil, false, false} if answer.gone?
+          return {nil, nil, false, false} if answer.gone?
           break # Silent — the origin is ignoring the expectation; gori answers it below.
         end
-        resp = Codec::Http1.parse_response_head(answer)
-        return {answer, false, false} unless interim_response?(resp) && !interim_has_body?(resp)
+        read_result = answer.as?(Codec::Http1::HeadReadResult)
+        head = if read_result
+                 read_result.head? || return {nil, read_result, false, false}
+               else
+                 answer.as(Bytes)
+               end
+        resp = Codec::Http1.parse_response_head(head)
+        return {head, nil, false, false} unless interim_response?(resp) && !interim_has_body?(resp)
         begin
-          @io.write(answer)
+          @io.write(head)
           @io.flush
         rescue
-          return {nil, false, true}
+          interims.add(resp.status, head, relayed: false) # the record's copy: it never arrived
+          return {nil, nil, false, true}
         end
+        interims.add(resp.status, head) # the record's copy; the relay above is unchanged
         # THE settlement: only a 100 releases the body.
-        return {nil, true, false} if resp.status == 100
+        return {nil, nil, true, false} if resp.status == 100
         # Reuse the run cap `skip_interim_responses` enforces rather than inventing a second
         # ceiling. A peer that exceeds it gets its body withheld and the connection handed on
         # as-is: the remaining 1xx are still on the socket, and `skip_interim_responses` — which
         # holds a flow_id — refuses the run there and records "too many interim 1xx responses".
         # Across the two stages a hostile origin therefore buys at most 2 × MAX_INTERIM relays.
         relayed += 1
-        return {nil, false, false} if relayed >= MAX_INTERIM
+        return {nil, nil, false, false} if relayed >= MAX_INTERIM
       end
       # The budget ran out, or the wait could not be bounded at all (a non-socket upstream —
       # specs, a future transport). Either way, blocking is the one thing that must not happen.
-      write_own_continue ? {nil, true, false} : {nil, false, true}
+      write_own_continue ? {nil, nil, true, false} : {nil, nil, false, true}
     end
 
-    # Why `read_head_within` came back without a head. The two are NOT interchangeable: an
-    # origin that merely stayed quiet is still reading and still wants the body, while one that
-    # closed or reset will never answer and there is nothing left to send a body to.
+    # Why the first byte did not arrive within the Expect wait. Once a byte arrives,
+    # read_head_within returns a detailed head result so a timeout or oversize keeps its bytes.
     enum NoAnswer
       Silent
       Gone
     end
 
     # Reads ONE response head, giving up if the first byte does not arrive within `wait`.
-    # Returns the head, or which kind of non-answer ended the wait: `Gone` for EOF / reset / a
-    # head that stopped mid-way, `Silent` for the timeout and for a non-socket IO whose read
-    # cannot be bounded at all (the caller must never read `Silent` as "keep waiting").
+    # Returns the head result once bytes arrive, `Gone` for EOF/reset before the first byte,
+    # or `Silent` when the origin did not answer before the short wait.
     #
     # Only the FIRST byte is on the short clock. Once the origin has started to speak, the head
     # is finished under the connection's normal timeout via `safe_read_head` (with the peeked
     # byte pushed back through a `PrefixIO`, the same handoff `handle_connect` uses) — a short
     # deadline spanning the whole head would abandon a partially-consumed response on the socket,
     # which is a desync, not a timeout. That is the one part of `wait` this method cannot honour.
-    private def read_head_within(upstream : IO, wait : Time::Span) : Bytes | NoAnswer
+    private def read_head_within(upstream : IO, wait : Time::Span) : Bytes | NoAnswer | Codec::Http1::HeadReadResult
       sock = SocketTuning.underlying_socket(upstream)
       return NoAnswer::Silent unless sock
       saved = sock.read_timeout
@@ -1303,7 +1553,8 @@ module Gori::Proxy
       return (gone ? NoAnswer::Gone : NoAnswer::Silent) unless first
       # The origin started to speak and then stopped: a truncated head is no more an answer than
       # an EOF, and the socket it left behind cannot be written a body either.
-      safe_read_head(PrefixIO.new(Bytes[first], upstream)) || NoAnswer::Gone
+      result = safe_read_head(PrefixIO.new(Bytes[first], upstream))
+      result.head? || result
     end
 
     # gori's own `100 Continue` to the client. False when the client is gone.
@@ -1350,7 +1601,7 @@ module Gori::Proxy
       Codec::Body.response_framing(resp, method)
     rescue ex : Gori::Error
       @sink.on_response(FlowMapper.error_response(flow_id, "response framing rejected: #{ex.message}",
-        head: resp.raw_head))
+        head: resp.raw_head, interims: @interims))
       release_upstream
       nil
     end
@@ -1378,6 +1629,7 @@ module Gori::Proxy
         # so a body-scoped rule is told it had nothing to read rather than silently missing.
         observe_delivered(extract_ref, sent_resp_head, nil)
         resp_complete = stream_response_body(upstream, resp_framing, resp_len, resp_capture, relaxed)
+        @lf_residue_note = lf_residue_note(upstream) if resp_complete
       rescue
         record_streamed_response(sent_resp, resp_framing, resp_capture, flow_id, ttfb, started,
           state: Store::FlowState::Aborted, error: "connection closed mid-response")
@@ -1408,11 +1660,11 @@ module Gori::Proxy
     private def stream_response_body(upstream : IO, resp_framing : Codec::BodyFraming,
                                      resp_len : Int64, resp_capture : Codec::CaptureBuffer,
                                      relaxed : Bool) : Bool
-      return Codec::Body.stream(upstream, @io, resp_framing, resp_len, resp_capture, copy_buf) unless relaxed
+      return stream_body(upstream, @io, resp_framing, resp_len, resp_capture) unless relaxed
       latch = TeardownLatch.new
       spawn watch_client_abort(upstream, latch)
       begin
-        Codec::Body.stream(upstream, @io, resp_framing, resp_len, resp_capture, copy_buf)
+        stream_body(upstream, @io, resp_framing, resp_len, resp_capture)
       ensure
         # Claim teardown so a still-parked watcher can't close `upstream` after we hand it back.
         # Losing the claim means the watcher already fired (client gone, upstream closed under the
@@ -1446,7 +1698,7 @@ module Gori::Proxy
         flow_id: flow_id, body: resp_framing.none? ? nil : resp_capture.to_slice,
         ttfb_us: ttfb, duration_us: duration,
         body_truncated: resp_capture.truncated?, body_size: resp_capture.total,
-        state: state, error: error, advisory: response_advisory(nil)))
+        state: state, error: error, advisory: response_advisory(nil), interims: @interims))
     end
 
     # The buffered response-body path (no intercept): buffer the whole body, rewrite the entity,
@@ -1464,19 +1716,21 @@ module Gori::Proxy
     # so the two surfaces cannot disagree about what a descriptor means.
     private def forward_response_rewriting_body(upstream : IO, req : Codec::RawRequest,
                                                 sent_req : Codec::RawRequest, flow_id : Int64,
-                                                host : String, port : Int32, scheme : String,
+                                                host : String,
                                                 resp : Codec::RawResponse, sent_resp_head : Bytes,
                                                 resp_framing : Codec::BodyFraming, resp_len : Int64,
                                                 ttfb : Int64, started : Time::Instant,
                                                 extract_ref : ExtractRef? = nil) : Bool
-      buf = IO::Memory.new
-      resp_complete = Codec::Body.stream(upstream, buf, resp_framing, resp_len, Codec::DiscardIO.new, copy_buf)
+      buf = Codec::Body.presized_capture(resp_framing, resp_len)
+      resp_complete = stream_body(upstream, buf, resp_framing, resp_len, Codec::DiscardIO.new)
+      @lf_residue_note = lf_residue_note(upstream) if resp_complete
       rw = @rewriter
-      # `live` is false when only a body-scoped EXTRACT rule brought this response here: no
-      # rewrite rule lost its chance, so there is nothing to say about one.
+      # `live` is false when only a body-scoped EXTRACT rule brought this response here, or
+      # when a rewrite rule exists only for another host: no applicable rewrite lost its
+      # chance, so there is nothing to say about one.
       sent_resp_head, fwd_body, advisory = apply_body_rewrite(sent_resp_head, buf.to_slice, resp_framing,
-        host: host, response: true, live: !!rw.try(&.rewrites_response_body?)) do |e|
-        rw && rw.rewrites_response_body? ? rw.rewrite_response_body(e, host) : e
+        host: host, response: true, live: !!rw.try(&.rewrites_response_body_for_host?(host))) do |e|
+        rw && rw.rewrites_response_body_for_host?(host) ? rw.rewrite_response_body(e, host) : e
       end
       sent_resp = Codec::Http1.parse_response_head(sent_resp_head) # head may have been re-framed
       stored, trunc, size = capped(fwd_body)
@@ -1499,7 +1753,7 @@ module Gori::Proxy
       @sink.on_response(FlowMapper.response(sent_resp,
         flow_id: flow_id, body: stored, ttfb_us: ttfb, duration_us: duration,
         body_truncated: trunc, body_size: size, state: state, error: error,
-        advisory: response_advisory(advisory)))
+        advisory: response_advisory(advisory), interims: @interims))
       # Reuse iff the origin kept its side AND we read the whole body; a truncated body
       # was forwarded short, so close the client connection (return false) rather than
       # block its next keep-alive request on the missing bytes.
@@ -1509,45 +1763,36 @@ module Gori::Proxy
     end
 
     # Reads the response head, transparently redialing + resending ONCE if a
-    # REUSED idle keep-alive turned out stale (immediate EOF) and the request is
-    # replayable (body-less). Returns {head, upstream} — `upstream` may be a fresh
-    # connection after a retry, so callers must rebind their local.
-    private def read_response_head(upstream : IO, host : String, port : Int32,
-                                   reused : Bool, sent_head : Bytes, can_retry : Bool) : {Bytes?, IO}
-      resp_head = safe_read_head(upstream)
-      if resp_head.nil? && reused && can_retry
+    # REUSED idle keep-alive turned out stale (zero-byte EOF/reset) and the request
+    # is replayable (body-less). A timeout or a rejected head is origin activity,
+    # not a stale socket. Returns {outcome, upstream}.
+    private def read_response_head(upstream : IO, host : String, port : Int32, tls : Bool,
+                                   reused : Bool, sent_head : Bytes, can_retry : Bool) : {Codec::Http1::HeadReadResult, IO}
+      result = safe_read_head(upstream)
+      if result.retryable_empty_read? && reused && can_retry
         release_upstream
-        fresh, _ = acquire_upstream(host, port)
+        fresh, _ = acquire_upstream(host, port, tls)
         if fresh
           upstream = fresh
-          resp_head = safe_read_head(fresh) if write_request(fresh, sent_head, nil)
+          result = safe_read_head(fresh) if write_request(fresh, sent_head, nil)
         end
       end
-      {resp_head, upstream}
+      {result, upstream}
     end
 
-    # `Codec::Http1.read_head` returns nil on a graceful EOF, but a RESET upstream
-    # (RST, not FIN — e.g. a dead/killed backend) raises instead. Left uncaught, that
-    # unwinds past the already-recorded Pending flow to `run`'s blanket rescue, which
-    # closes the connection without ever marking the flow — it sits in History as
-    # "waiting for response…" forever. Treat a reset the same as a graceful EOF (nil)
-    # so the caller's existing "no response from upstream" handling covers it too.
-    #
-    # The read is bounded the same way the CLIENT head read is (`handle_request` above, and the
-    # sibling `Repeater::Engine#read_response_head`): a slowloris ORIGIN dripping the response
-    # head one byte at a time keeps resetting the per-read `io_timeout` armed in
-    # `acquire_and_send`, so without a total head-assembly deadline this fiber, the client fd,
-    # the upstream fd and one of `Server`'s MAX_CONNECTIONS permits are pinned for as long as
-    # the origin cares to trickle (P6). `read_head_deadlined` restores the socket's baseline
-    # read_timeout in its own ensure, so the body read that follows is untouched, and
-    # `underlying_socket` returning nil (a non-socket IO) keeps the original loop. The
-    # IO::TimeoutError it raises is caught below as a nil head — the caller's existing
-    # "no response from upstream" path, so no new failure mode.
-    private def safe_read_head(io : IO) : Bytes?
-      Codec::Http1.read_head(io,
+    # This keeps clean EOF, reset, timeout, and rejected heads distinct. The total assembly
+    # deadline prevents a slowloris origin from pinning a fiber, client fd, upstream fd or
+    # Server connection permit (P6); the codec restores the socket's baseline timeout before
+    # the body read. A non-socket IO skips the deadline as before.
+    # A bare-LF-terminated head is accepted here (`read_response_head_result`); the upstream
+    # that sent one is never parked for reuse (`origin_keep_alive?`).
+    private def safe_read_head(io : IO) : Codec::Http1::HeadReadResult
+      result = Codec::Http1.read_response_head_result(io,
         deadline: SocketTuning::HEAD_DEADLINE, timeout_sock: SocketTuning.underlying_socket(io))
-    rescue
-      nil
+      if (head = result.head?) && Codec::Http1.lf_terminated_head?(head)
+        @upstream_lf_framed = true
+      end
+      result
     end
 
     # Apply response-head Match&Replace; returns the (possibly rewritten) head +
@@ -1557,7 +1802,38 @@ module Gori::Proxy
       return {resp_head, resp} unless rw
       rewritten = rw.rewrite_response(resp_head, host)
       return {resp_head, resp} if rewritten == resp_head
+      return lf_rules_skipped({resp_head, resp}) if Codec::Http1.lf_terminated_head?(resp_head)
       {rewritten, Codec::Http1.parse_response_head(rewritten)}
+    end
+
+    # A response head ended on a bare-LF blank line is forwarded byte-exact, untouched by
+    # Match&Replace, and the flow says so. Every rewrite helper here models a head as CRLF lines
+    # up to a CRLFCRLF (`reframe_to_length`, `restore_framing_headers`, the rule engine's own
+    # split), so a rule applied to one hands the client a MIXED head: `…\n\n\r\nContent-Length:
+    # 7\r\n\r\n` ends, for the client, at the first `\n\n`, and the re-framed tail becomes the
+    # next response on a connection gori keeps alive. Skipping is the smallest change that
+    # cannot do that; teaching every helper a second line model is not, and the bytes the
+    # operator is testing stay canonical (P7). Returns `unchanged`, for the caller's shape.
+    private def lf_rules_skipped(unchanged : T) : T forall T
+      @lf_rules_note = "Match&Replace was NOT applied to this response: its head ends lines on a " \
+                       "bare LF, and gori's rewrites frame a head as CRLF lines, so a rewritten head " \
+                       "could end somewhere else for the client than for gori (a response desync). " \
+                       "The response was forwarded byte-exact."
+      unchanged
+    end
+
+    # Bytes already waiting on an upstream that gori framed off a bare-LF head, checked without
+    # blocking once the body is read. That connection is retired rather than reused, so the
+    # leftover can no longer be recorded as the NEXT request's response — which is what used to
+    # surface it (`status_line_note`). Say so on THIS flow instead: those bytes are either more
+    # of this response (a strict reader's body) or another response gori never framed.
+    private def lf_residue_note(upstream : IO) : String?
+      return nil unless @upstream_lf_framed
+      return nil unless SocketResidue.state(upstream).residue?
+      "bytes were waiting on the upstream connection past this response's framed body. Its head " \
+      "ends on a bare-LF blank line, so gori framed it off the lenient reading and closed the " \
+      "connection instead of reusing it; a parser that frames this response differently reads " \
+      "those bytes as body, or as the next response (a response desync)"
     end
 
     # The intercept-hold response path: buffer the (non-streaming) body, let the
@@ -1572,10 +1848,11 @@ module Gori::Proxy
       # Buffer the body, tracking completeness (Codec::Body.read drops it). A
       # truncated/misframed body must NOT leave the upstream parked — its stray
       # unread bytes would become the next reused request's response (desync).
-      buf = IO::Memory.new
+      buf = Codec::Body.presized_capture(resp_framing, resp_len)
       # tee into a discard sink, not a second IO::Memory — the body is already buffered in
       # `buf`; a throwaway IO::Memory would hold the whole response a second time.
-      resp_complete = Codec::Body.stream(upstream, buf, resp_framing, resp_len, Codec::DiscardIO.new, copy_buf)
+      resp_complete = stream_body(upstream, buf, resp_framing, resp_len, Codec::DiscardIO.new)
+      @lf_residue_note = lf_residue_note(upstream) if resp_complete
       # `buf` is filled once and never written again, and build_message copies head+body into
       # a fresh buffer, so `buf.to_slice` is a stable view — no defensive dup (which would hold
       # the whole body a second time). Mirrors the non-hold M&R path above.
@@ -1584,26 +1861,28 @@ module Gori::Proxy
       # re-frames the head to Content-Length; `resp` (status/version/Connection) is
       # untouched by that, so keep it as the origin's framing/keep-alive truth.
       advisory = nil.as(String?)
-      if (rw = @rewriter) && rw.rewrites_response_body?
+      if (rw = @rewriter) && rw.rewrites_response_body_for_host?(host)
         sent_resp_head, body, advisory = apply_body_rewrite(sent_resp_head, body, resp_framing,
           host: host, response: true, live: true) { |e| rw.rewrite_response_body(e, host) }
       end
+      # Labelled from `sent_req`, the request the hold gate matched: after an edit at the request
+      # hold, the client's `req` names a method that never went out (#1433).
       decision = ic.hold_response(build_message(sent_resp_head, body),
-        flow_id: flow_id, method: req.method, target: "#{resp.status} #{resp.reason}",
+        flow_id: flow_id, method: sent_req.method, target: "#{resp.status} #{resp.reason}",
         host: host, port: port, scheme: scheme)
       duration = (Time.instant - started).total_microseconds.to_i64
       if decision.action.drop?
-        @sink.on_response(FlowMapper.aborted_response(flow_id, "dropped by intercept",
-          ttfb_us: ttfb, duration_us: duration))
+        @sink.on_response(FlowMapper.aborted_response(flow_id, Gori::Interceptor::DROP_RESPONSE_REASON,
+          ttfb_us: ttfb, duration_us: duration, interims: @interims))
         write_intercept_drop
         release_upstream
         return false
       end
       # Forward the decision bytes BYTE-EXACT (P7); the editor already synced
-      # Content-Length for an edited body (InterceptView#forward_bytes). Keeping the
+      # Content-Length for an edited body (InterceptView#pending_edit). Keeping the
       # proxy byte-exact also preserves the head verbatim for a HEAD/304/204 response
       # forwarded unedited (whose Content-Length describes the entity, not the bytes).
-      out_head, out_body = split_message(decision.bytes)
+      out_head, out_body = split_message(decision.bytes, response: true)
       sent_resp = Codec::Http1.parse_response_head(out_head)
       delivered = true
       begin
@@ -1628,12 +1907,14 @@ module Gori::Proxy
           out_head, out_body || Bytes.empty)
         @sink.on_response(FlowMapper.response(sent_resp,
           flow_id: flow_id, body: stored, ttfb_us: ttfb, duration_us: duration,
-          body_truncated: trunc, body_size: size, advisory: response_advisory(advisory)))
+          body_truncated: trunc, body_size: size, advisory: response_advisory(advisory),
+          interims: @interims))
       else
         @sink.on_response(FlowMapper.response(sent_resp,
           flow_id: flow_id, body: stored, ttfb_us: ttfb, duration_us: duration,
           body_truncated: trunc, body_size: size, advisory: response_advisory(advisory),
-          state: Store::FlowState::Aborted, error: "connection closed while forwarding held response"))
+          state: Store::FlowState::Aborted, error: "connection closed while forwarding held response",
+          interims: @interims))
       end
       # Reuse the upstream iff we read the WHOLE body cleanly AND the origin kept its
       # side alive. Origin side keys on sent_req (what the origin received); the CLIENT
@@ -1725,11 +2006,11 @@ module Gori::Proxy
     # path whose whole job is to relay. If that changes, it changes there first.
     #
     # So the refusal is delivered where an operator actually looks: a `gori.log` line, and an
-    # error flow for the CONNECT itself. CONNECT is otherwise never a captured flow — the
-    # reserved-host and self-loop refusals above record nothing — but those refuse BEFORE the
-    # 200, where the client still gets an answer it can read. This one cannot, so the record is
-    # the only thing left, and a row saying which rule or setting refused the tunnel is worth
-    # more than a socket that closes for no stated reason.
+    # error flow for the CONNECT itself. The upstream tunnel path records dial failures too;
+    # the reserved-host and self-loop refusals above still record nothing because they happen
+    # before the 200 and the client gets a usable local answer. This refusal happens after the
+    # 200, which an h2 client cannot read, so History is the only place left to name why the
+    # tunnel died.
     private def refuse_h2c(req : Codec::RawRequest, host : String, port : Int32,
                            reason : String) : Nil
       advice = "The client committed to HTTP/2 by sending the preface, so there is nothing to " \
@@ -1948,9 +2229,10 @@ module Gori::Proxy
     # did to the head on its own account, and what is wrong with the head the origin sent.
     # Newline-separated, which is the shape `Store::FlowRow#advisories` splits back apart.
     private def response_advisory(body : String?) : String?
-      notes = [body, @alt_svc_note, @status_line_note].compact
-      return nil if notes.empty?
-      notes.join("\n")
+      # Almost every response has nothing to say: skip the two Arrays that answer nil.
+      return nil if body.nil? && @alt_svc_note.nil? && @status_line_note.nil? &&
+                    @lf_rules_note.nil? && @lf_residue_note.nil?
+      [body, @alt_svc_note, @status_line_note, @lf_rules_note, @lf_residue_note].compact.join("\n")
     end
 
     # The sentence for a response whose start-line is not a status line, or nil for one that
@@ -2092,8 +2374,17 @@ module Gori::Proxy
     # download nor open a tunnel the sandbox refuses. Reading Settings here (not in the
     # Tunnel) is what makes the bypass cover the h2c-in-CONNECT branch too: the byte peek
     # below never happens for a passthrough host.
-    private def handle_connect(req : Codec::RawRequest) : Bool
-      host, port = Upstream.split_host_port(req.target, 443)
+    private def handle_connect(req : Codec::RawRequest, created_at : Int64) : Bool
+      host, port =
+        begin
+          Upstream.split_connect_host_port(req.target, 443)
+        rescue ex : Gori::Error
+          parsed_host, _ = Upstream.split_host_port(req.target, 443)
+          reason = ex.message || "invalid CONNECT authority"
+          record_error(req, "https", parsed_host, 0, created_at, reason)
+          write_bad_request(reason)
+          return false
+        end
 
       # A LISTENER-pinned connection is not a forward proxy. The destination was settled before
       # this request existed — a reverse listener's declared origin, or the client's own SOCKS5
@@ -2117,8 +2408,15 @@ module Gori::Proxy
       if (tls = @tls) && !Settings.tls_passthrough?(host)
         intercept_tunnel(req, host, port, tls)
       else
-        upstream = Upstream.dial(host, port, overrides: @host_overrides, pin: dial_pin)
+        # `origin_scheme: "https"`: a CONNECT is the client asking for the tunnel an `https://`
+        # URL needs, and the MITM branch's own dial (`dial_tls_result`) already says so. The
+        # default `"http"` picked `HTTP_PROXY`, so an environment exporting only `HTTPS_PROXY`
+        # sent this — the one shape that proxy exists to carry — direct instead (#1114).
+        upstream, dial_error = Upstream.dial_result(host, port, overrides: @host_overrides,
+          pin: dial_pin, origin_scheme: "https")
+        @last_dial_error = dial_error
         unless upstream
+          record_error(req, "https", host, port, created_at, upstream_error_message(host, port, nil))
           write_gateway_error
           return false
         end
@@ -2145,7 +2443,7 @@ module Gori::Proxy
     # the tunnel consumes it — which is why this returns Nil and `handle_connect` falls through
     # to its own `false`.
     private def intercept_tunnel(req : Codec::RawRequest, host : String, port : Int32,
-                                 tls : TlsMitm) : Nil
+                                 tls : Tls::Tunnel) : Nil
       @io.write("HTTP/1.1 200 Connection Established\r\n\r\n".to_slice)
       @io.flush
       # Peek to route the tunnel. THREE outcomes, not two, and each one decided on enough
@@ -2304,7 +2602,7 @@ module Gori::Proxy
     end
 
     # The CONNECT half of the reserved-host route (see handle_connect). Answers 200, then peeks
-    # ONE byte: a TLS ClientHello (0x16) goes to the TlsMitm seam, anything else is a plaintext
+    # ONE byte: a TLS ClientHello (0x16) goes to the TLS tunnel, anything else is a plaintext
     # CONNECT tunnel (`curl --proxytunnel` at port 80) and is served in the clear rather than
     # forced into a doomed handshake.
     #
@@ -2317,7 +2615,7 @@ module Gori::Proxy
       tls = @tls
       unless sa && tls && tls.serve_landing?
         # Same shape as the CONNECT self-loop refusal: refuse before the 200, record nothing
-        # (CONNECT is never a captured flow), and above all never dial the reserved name.
+        # for this local answer, and above all never dial the reserved name.
         return write_gateway_error
       end
 
@@ -2337,9 +2635,23 @@ module Gori::Proxy
     # Resolves {host, port, scheme, forward_head}. Absolute-form request targets
     # (forward-proxy plain HTTP, e.g. `GET http://h/p`) are rewritten to
     # origin-form for the upstream; the captured truth keeps the original bytes.
-    private def open_upstream(host : String, port : Int32) : IO?
-      if @tls_upstream
-        sock, err = Upstream.dial_tls_result(host, port, verify: @verify_upstream,
+    # Whether a request with this `scheme` reaches its origin over TLS: always on a listener
+    # that dials TLS (a CONNECT tunnel, a TLS reverse/transparent listener), and for an
+    # absolute-form `https://` target on a plaintext listener. The recorded scheme comes from
+    # the request, so a dial that ignored it sent an `https://` request's path, cookies and body
+    # in cleartext while History read https. Derived per call, not stored: a keep-alive
+    # connection can carry an http:// and an https:// request back to back.
+    private def dial_tls?(scheme : String) : Bool
+      @tls_upstream || (@fixed_host.nil? && scheme == "https")
+    end
+
+    private def open_upstream(host : String, port : Int32, tls : Bool) : IO?
+      if tls
+        # A listener that dials TLS for every request was handed its verify policy; a plaintext
+        # listener dialling one `https://` request takes the tunnel's — the same `-k` — or, with
+        # no tunnel (the transparent and h2c listeners), the process-wide setting `-k` moves.
+        verify = @tls_upstream ? @verify_upstream : (@tls.try(&.verify_upstream?) || (@tls.nil? && Settings.verify_upstream?))
+        sock, err = Upstream.dial_tls_result(host, port, verify: verify,
           overrides: @host_overrides, pin: dial_pin)
         @last_dial_error = err
         sock
@@ -2539,13 +2851,23 @@ module Gori::Proxy
       host.includes?(':') && !host.starts_with?('[') ? "[#{host}]" : host
     end
 
+    # Splices `origin_target` over the request-target's own bytes and copies everything else
+    # verbatim (P7): the method, the version, and whatever the client put after them. Rebuilding
+    # the line as `method SP target SP version CRLF` kept only the first three space-separated
+    # tokens, so `GET http://h/p?a b HTTP/1.1` went upstream as `GET /p?a b` — the space-in-URL
+    # payload lost its version — and `… HTTP/1.1 INJECTED` lost the trailing token, while History
+    # kept the client's bytes and no longer matched what was sent.
     private def rewrite_request_line(req : Codec::RawRequest, origin_target : String) : Bytes
       raw = req.raw_head
-      nl = raw.index(0x0a_u8) || return raw # no LF at all? leave as-is
-      header_block = raw[(nl + 1)..]        # everything after the first CRLF
-      io = IO::Memory.new
-      io << req.method << ' ' << origin_target << ' ' << req.version << "\r\n"
-      io.write(header_block)
+      start = req.method.bytesize + 1
+      target = req.target.to_slice
+      # `parse_request_head` split the line on single spaces, so the target sits right after
+      # the method and its separator. Anything else is a head this was not parsed from.
+      return raw unless raw.size >= start + target.size && raw[start, target.size] == target
+      io = IO::Memory.new(raw.size) # origin-form is usually shorter: one allocation
+      io.write(raw[0, start])
+      io << origin_target
+      io.write(raw[(start + target.size)..])
       io.to_slice
     end
 
@@ -2558,10 +2880,67 @@ module Gori::Proxy
       {body[0, Settings.capture_max].dup, true, body.size.to_i64}
     end
 
-    private def record_error(req, scheme, host, port, created_at, message) : Nil
+    # A request body a short-circuit or fault answers without forwarding (#1237): drained off
+    # the socket so the connection stays framed, and stored exactly as `capped` would store it
+    # (the first `capture_max` octets, the truncation mark, the true size) without holding more
+    # than that. Buffering the whole entity first, as this path did, let a client grow the heap
+    # by whatever it chose to send — nothing bounds a chunked upload — while all the path needs
+    # is to get past the bytes. Returns {stored, truncated, size, complete}.
+    private def drain_request_body(framing : Codec::BodyFraming, len : Int64) : {Bytes?, Bool, Int64?, Bool}
+      return {nil, false, nil, true} if framing.none?
+      capture = Codec::CaptureBuffer.new(Settings.capture_max, capture_hint(framing, len))
+      complete = Codec::Body.stream(@io, Codec::DiscardIO.new, framing, len, capture)
+      trunc = capture.truncated?
+      {capture.to_slice, trunc, trunc ? capture.total : nil, complete}
+    end
+
+    private def record_error(req, scheme, host, port, created_at, message, *,
+                             intercept_original : Bytes? = nil, interims : Store::Interims? = nil) : Nil
       flow_id = @sink.on_request(FlowMapper.request(req,
-        scheme: scheme, host: host, port: port, created_at: created_at, body: nil, source: FlowSource::Kind::Proxy))
-      @sink.on_response(FlowMapper.error_response(flow_id, message))
+        scheme: scheme, host: host, port: port, created_at: created_at, body: nil, source: FlowSource::Kind::Proxy,
+        intercept_original: intercept_original))
+      @sink.on_response(FlowMapper.error_response(flow_id, message, interims: interims))
+    end
+
+    # The client's head outgrew `MAX_HEAD_BYTES` before its CRLFCRLF: record what arrived, answer
+    # 431 and close, since the rest of the head is still on the socket and cannot be framed.
+    #
+    # The flow names where the request was going the way a forwarded one would
+    # (`resolve_forward`: an absolute-form target's own scheme and authority), so a scope or a
+    # `host:` lens finds it. Closing with the rest of the head unread would make the kernel send
+    # an RST that can reach the client before the 431 does — the reset this answer replaces — so
+    # the tail is drained first, bounded in bytes and time (RFC 9112 §9.6, lingering close).
+    private def refuse_oversized_head(result : Codec::Http1::HeadReadResult) : Nil
+      req = Codec::Http1.parse_request_head(result.bytes)
+      host, port, scheme = begin
+        h, p, sch, _ = resolve_forward(req)
+        {h, p, sch}
+      rescue
+        {@fixed_host || req.host? || "", @fixed_port, @scheme}
+      end
+      record_error(req, scheme, host, port, now_us, result.failure_message("request head"))
+      @io.write("HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_slice)
+      @io.flush
+      linger_drain
+    rescue
+    end
+
+    LINGER_MAX_BYTES = 1 << 20
+    LINGER_DEADLINE  = 2.seconds
+
+    # Reads and discards what the client is still sending, until it stops or a bound is hit, so
+    # the close that follows does not reset a reply the client has not read yet.
+    private def linger_drain : Nil
+      SocketTuning.underlying_socket(@io).try(&.read_timeout = 500.milliseconds)
+      deadline = Time.instant + LINGER_DEADLINE
+      buf = Bytes.new(16 * 1024)
+      total = 0
+      while total < LINGER_MAX_BYTES && Time.instant < deadline
+        n = @io.read(buf)
+        break if n.zero?
+        total += n
+      end
+    rescue
     end
 
     # A connection whose bytes are not HTTP (MQTT, AMQP, a raw TLS ClientHello, a binary RPC),
@@ -2742,7 +3121,7 @@ module Gori::Proxy
       flow_id = @sink.on_request(FlowMapper.request(req,
         scheme: scheme, host: host, port: port, created_at: created_at,
         body: stored, body_truncated: trunc, body_size: size, source: FlowSource::Kind::Proxy))
-      @sink.on_response(FlowMapper.aborted_response(flow_id, "dropped by intercept (request)"))
+      @sink.on_response(FlowMapper.aborted_response(flow_id, Gori::Interceptor::DROP_REQUEST_REASON))
     end
 
     private def write_intercept_drop : Nil
@@ -2802,22 +3181,16 @@ module Gori::Proxy
       io.to_slice
     end
 
-    # Split a forwarded message back into head (through CRLFCRLF) + body remainder.
-    private def split_message(raw : Bytes) : {Bytes, Bytes?}
-      idx = index_crlf_crlf(raw)
-      return {raw, nil} unless idx
-      head_end = idx + 4
+    # Split a forwarded message back into head (through CRLFCRLF) + body remainder. A RESPONSE
+    # head ends where `read_response_head_result` would end it — the earliest blank line, a
+    # bare-LF one included (`Http1.response_head_end`) — so a held bare-LF response is recorded
+    # with the head the client reads, not the whole message (or a head cut at a CRLFCRLF that
+    # sits in its body).
+    private def split_message(raw : Bytes, *, response : Bool = false) : {Bytes, Bytes?}
+      head_end = response ? Codec::Http1.response_head_end(raw) : AsciiBytes.index(raw, "\r\n\r\n".to_slice).try(&.+(4))
+      return {raw, nil} unless head_end
       body = head_end < raw.size ? raw[head_end..].dup : nil
       {raw[0, head_end].dup, body}
-    end
-
-    private def index_crlf_crlf(raw : Bytes) : Int32?
-      i = 0
-      while i + 3 < raw.size
-        return i if raw[i] == 0x0d_u8 && raw[i + 1] == 0x0a_u8 && raw[i + 2] == 0x0d_u8 && raw[i + 3] == 0x0a_u8
-        i += 1
-      end
-      nil
     end
 
     # Ceiling on a body Match&Replace will buffer to rewrite. A body rule can't stream —
@@ -2883,14 +3256,15 @@ module Gori::Proxy
     # to buffer. Extracted from handle_response so the dispatch stays flat (it just tests +
     # branches).
     #
-    # Two things can need it, and neither pays anything when it is not configured: a
-    # Match&Replace body rule (which rewrites the entity) and a body-scoped extract rule
-    # (which reads it). Both predicates are lock-free atomic counts, so the overwhelmingly
-    # common no-rule response is one integer compare away from the streaming path (P6).
+    # Two things can need it: a Match&Replace body rule (which rewrites the entity) and a
+    # body-scoped extract rule (which reads it). Narrow each to this response's request host
+    # before buffering; forward-proxy connections can carry unrelated hosts on one socket.
+    # Both retain a lock-free fast path when no body rule exists (P6).
     private def buffer_response_body?(resp : Codec::RawResponse,
-                                      framing : Codec::BodyFraming, len : Int64) : Bool
-      return false unless @rewriter.try(&.rewrites_response_body?) ||
-                          @extractor.try(&.extracts_body?)
+                                      framing : Codec::BodyFraming, len : Int64,
+                                      host : String) : Bool
+      return false unless @rewriter.try(&.rewrites_response_body_for_host?(host)) ||
+                          @extractor.try(&.extracts_body_for_host?(host))
       (framing.length? || framing.chunked?) && !sse?(resp) && resp.status != 101 &&
         rewritable_body_size?(framing, len)
     end
@@ -2934,8 +3308,9 @@ module Gori::Proxy
 
     # Whether the request-body Match&Replace path applies: a body rule is live, there IS a
     # body, and it's small enough to buffer. Extracted from handle_request (see above).
-    private def rewrite_request_body?(rw : HeadRewriter, framing : Codec::BodyFraming, len : Int64) : Bool
-      rw.rewrites_request_body? && !framing.none? && rewritable_body_size?(framing, len)
+    private def rewrite_request_body?(rw : HeadRewriter, framing : Codec::BodyFraming,
+                                      len : Int64, host : String) : Bool
+      rw.rewrites_request_body_for_host?(host) && !framing.none? && rewritable_body_size?(framing, len)
     end
 
     # Apply a body Match&Replace to a buffered wire body and return {head, forward_body}.
@@ -2974,6 +3349,10 @@ module Gori::Proxy
                                    host : String, response : Bool, live : Bool,
                                    & : Bytes -> Bytes) : {Bytes, Bytes?, String?}
       return {head, wire_body, nil} if wire_body.nil? || wire_body.empty?
+      if response && live && Codec::Http1.lf_terminated_head?(head)
+        # See `lf_rules_skipped`: the re-frame below would mix line endings into this head.
+        return lf_rules_skipped({head, wire_body, nil})
+      end
       if Codec::ContentDecode.content_encoded?(head)
         return {head, wire_body, compressed_skip_advisory(head, host, response: response, live: live)}
       end
@@ -2992,17 +3371,10 @@ module Gori::Proxy
     # conditions, and both are required:
     #
     #   - a body rule is LIVE for this direction — the caller's `live`, above;
-    #   - a body rule MATCHES THIS HOST — `rewrites_body_for_host?`, the host-narrowed
-    #     predicate #526 added for the h2 downgrade gate. Without it a rule scoped to
+    #   - a body rule MATCHES THIS HOST and direction — the host-narrowed
+    #     predicate #526 first added for the h2 downgrade gate. Without it a rule scoped to
     #     `alpha.test` would annotate every compressed flow on every other host with a claim
     #     that it failed to fire there.
-    #
-    # That predicate folds the two directions into one question (it was written for a gate that
-    # downgrades for either), so the pair can be satisfied by a REQUEST-side rule matching this
-    # host while the live RESPONSE-side rule is scoped elsewhere. The sentence stays true under
-    # that reading — a body rule matching this host did not run on this body — and the
-    # alternative is a second host-scoped predicate per direction for a case that needs two
-    # rules pointing in opposite directions to occur at all.
     #
     # It takes the rewriter's lock (once per refused body, never on the fast path): reached only
     # with a body rule live somewhere AND a compressed body in hand, which is the same bargain
@@ -3010,7 +3382,12 @@ module Gori::Proxy
     private def compressed_skip_advisory(head : Bytes, host : String, *,
                                          response : Bool, live : Bool) : String?
       return nil unless live
-      return nil unless @rewriter.try(&.rewrites_body_for_host?(host))
+      applies = if rw = @rewriter
+                  response ? rw.rewrites_response_body_for_host?(host) : rw.rewrites_request_body_for_host?(host)
+                else
+                  false
+                end
+      return nil unless applies
       side = response ? "response" : "request"
       codings = Codec::ContentDecode.declared_codings(head)
       # `content_encoded?` also fails closed on an obs-folded encoding header, where the coding
@@ -3048,23 +3425,22 @@ module Gori::Proxy
       end
     end
 
+    # The recorded counterpart of a request-body rewrite: when `apply_body_rewrite` re-framed the
+    # wire head (`before` → `after`), re-frame the client-form `record_req` to the same body, so
+    # History keeps the client's request line with the length that went on the wire (#1424). A
+    # rewrite that matched nothing returns the head untouched, and so does this (P7).
+    private def reframed_record(record_req : Codec::RawRequest, before : Bytes, after : Bytes,
+                                body : Bytes?) : Codec::RawRequest
+      return record_req if after == before
+      Codec::Http1.parse_request_head(reframe_to_length(record_req.raw_head, body.try(&.size) || 0))
+    end
+
     # Rebuild a message head framed as `Content-Length: len`: drop any Transfer-Encoding
     # and Content-Length header (a rewritten body invalidates both), append the fresh
     # Content-Length, and keep every other header verbatim in order. Preserves the head's
     # own line ending (CRLF or bare LF) so the re-parsed head stays well-formed.
     private def reframe_to_length(head : Bytes, len : Int32) : Bytes
-      text = String.new(head)
-      eol = text.index("\r\n") ? "\r\n" : "\n"
-      section = text.split(eol + eol, 2).first # headers up to the blank line
-      lines = section.split(eol)
-      io = IO::Memory.new(head.size + 32)
-      io << lines.first << eol # request / status line, untouched
-      lines[1..].each do |line|
-        next if header_line_named?(line, "transfer-encoding") || header_line_named?(line, "content-length")
-        io << line << eol
-      end
-      io << "Content-Length: " << len << eol << eol
-      io.to_slice
+      rebuild_without_framing(head) { |io, eol| io << "Content-Length: " << len << eol }
     end
 
     # Force `sent_head`'s body-framing headers (Content-Length / Transfer-Encoding) to match
@@ -3081,17 +3457,25 @@ module Gori::Proxy
       sent_framing = framing_header_lines(sent_head)
       return sent_head if orig_framing == sent_framing # rewrite didn't touch framing → byte-exact
 
-      text = String.new(sent_head)
+      # The framing that matches the streamed body.
+      rebuild_without_framing(sent_head) { |io, eol| orig_framing.each { |line| io << line << eol } }
+    end
+
+    # `head` with its Transfer-Encoding and Content-Length lines dropped, every other line
+    # verbatim in order, the block's framing lines (written with the head's own line ending,
+    # CRLF or bare LF, which it is handed) appended, then the blank line.
+    private def rebuild_without_framing(head : Bytes, &) : Bytes
+      text = String.new(head)
       eol = text.index("\r\n") ? "\r\n" : "\n"
       section = text.split(eol + eol, 2).first # headers up to the blank line
       lines = section.split(eol)
-      io = IO::Memory.new(sent_head.size + 32)
+      io = IO::Memory.new(head.size + 32)
       io << lines.first << eol # request / status line, untouched
       lines[1..].each do |line|
         next if header_line_named?(line, "transfer-encoding") || header_line_named?(line, "content-length")
         io << line << eol
       end
-      orig_framing.each { |line| io << line << eol } # the framing that matches the streamed body
+      yield io, eol
       io << eol
       io.to_slice
     end
@@ -3119,12 +3503,12 @@ module Gori::Proxy
     # Is this response an event stream? `Sse.sse?` and not a `downcase.includes?` scan, which
     # is the brittle test that module's own header says it exists to replace — and which every
     # OTHER surface had already left behind: `Proto.classify` asks `Sse.sse?`, `QL` compiles
-    # `proto:sse` to `LIKE 'text/event-stream%'`, and History's EVENTS pane asks
-    # `Sse.event_stream?`. A substring match makes this the only reader that says yes to a
-    # `Content-Type` merely CARRYING the token in a parameter — and this is the reader with
-    # side effects: `application/json; profile="urn:x:text/event-stream"` on a Content-Length
-    # body took the streaming path, so the intercept response hold was skipped, a Match&Replace
-    # body rule no-opped, and the client connection was closed instead of kept alive, while
+    # `proto:sse` to an exact media-type essence, and History's EVENTS pane asks
+    # `Sse.event_stream?`. A substring/prefix match makes this the only reader that says yes to
+    # a `Content-Type` merely carrying the token in a parameter or a longer subtype. This
+    # reader has side effects: `application/json; profile="urn:x:text/event-stream"` on a
+    # Content-Length body took the streaming path, so the intercept response hold was skipped,
+    # a Match&Replace body rule no-opped, and the client connection was closed instead of kept alive, while
     # every display and query surface reported an ordinary JSON flow.
     private def sse?(resp : Codec::RawResponse) : Bool
       Gori::Sse.sse?(resp.headers.get?("Content-Type"))
@@ -3136,17 +3520,25 @@ module Gori::Proxy
     rescue
     end
 
+    private def write_bad_request(reason : String) : Nil
+      body = "#{reason}\n"
+      @io.write("HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n" \
+                "Content-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n".to_slice)
+      @io.write(body.to_slice)
+      @io.flush
+    rescue
+    end
+
     private def get_or_head?(req : Codec::RawRequest) : Bool
-      req.method.compare("GET", case_insensitive: true) == 0 ||
-        req.method.compare("HEAD", case_insensitive: true) == 0
+      req.method == "GET" || req.method == "HEAD"
     end
 
     # Serve the welcome + CA-download page (see the two guards in handle_request: a direct
     # hit on the listener, or a request for the reserved host).
-    # The CA bytes/fingerprint/path come through the TlsMitm seam so this stays decoupled
-    # from the FFI cert code; a HEAD request gets headers only. Best-effort — a write error
+    # The CA bytes/fingerprint/path come from the tunnel as plain types, not the FFI cert
+    # code; a HEAD request gets headers only. Best-effort — a write error
     # just drops the connection like every other canned response here.
-    private def serve_self_page(req : Codec::RawRequest, tls : TlsMitm, self_addr : {String, Int32}) : Nil
+    private def serve_self_page(req : Codec::RawRequest, tls : Tls::Tunnel, self_addr : {String, Int32}) : Nil
       @io.write(tls.self_page_reply(req.method, req.target, listen_display(self_addr)))
       @io.flush
     rescue
@@ -3180,6 +3572,12 @@ module Gori::Proxy
     # to the upstream request means the origin closes, even if the client's request didn't.
     private def origin_keep_alive?(sent_req : Codec::RawRequest, resp : Codec::RawResponse,
                                    resp_framing : Codec::BodyFraming) : Bool
+      return false if resp.malformed?
+      # A head ended on a bare-LF blank line was framed off the LENIENT reading. Never park
+      # the socket behind it: if that framing was wrong, the leftover goes with the closed
+      # connection instead of being read as the NEXT request's response (the same rule as
+      # `ConnPool.reusable_response?`). Any head of the exchange counts, an interim 1xx too.
+      return false if @upstream_lf_framed
       return false if resp_framing.close_delimited?
       return false if sent_req.headers.lists?("Connection", "close")
       return false if resp.headers.lists?("Connection", "close")

@@ -22,10 +22,9 @@ module Gori
       private def cookie_verify_tool(h) : Result
         cookie = str(h, "cookie")
         return Result.new("missing required 'cookie'", is_error: true) if cookie.nil? || cookie.strip.empty?
-        secret = str(h, "secret")
-        return Result.new("missing required 'secret'", is_error: true) if secret.nil?
+        secret = required_str(h, "secret", blank: true)
         ok = cookie_verify(cookie.strip, secret, h)
-        Result.new(JSON.build { |j| j.object { j.field "valid", ok; j.field "format", cookie_resolved_format(cookie.strip, h) } })
+        Result.new({valid: ok, format: cookie_resolved_format(cookie.strip, h)}.to_json)
       rescue ex : Cookie::CookieError
         Result.new(ex.message || "not a decodable cookie", is_error: true)
       end
@@ -39,6 +38,9 @@ module Gori
         wordlist = str(h, "wordlist").try(&.presence)
         if inline.empty? && wordlist.nil?
           return Result.new("provide 'secrets' (array) and/or 'wordlist' (file path)", is_error: true)
+        end
+        if why = wordlist.try { |w| wordlist_stream_refusal(w) }
+          return Result.new(why, is_error: true)
         end
         found = cookie_crack_search(c, inline, wordlist, h)
         Result.new(JSON.build do |j|
@@ -65,15 +67,14 @@ module Gori
       private def cookie_forge_tool(h) : Result
         format = str(h, "format").try(&.downcase)
         return Result.new("missing required 'format' (flask/rack/django)", is_error: true) if format.nil? || format.empty?
-        secret = str(h, "secret")
-        return Result.new("missing required 'secret'", is_error: true) if secret.nil?
+        secret = required_str(h, "secret", blank: true)
         # An explicitly-present but uncoercible 'timestamp' is a named refusal, not a
         # silent "now" (optional_int_arg raises Gori::Error → INVALID_ARGUMENT). Absent
         # still defaults to now. Negatives can't be a signed-cookie timestamp — refuse.
         ts = optional_int_arg(h, "timestamp") || Time.utc.to_unix
         raise Gori::Error.new("invalid 'timestamp' (must not be negative)") if ts < 0
         cookie = cookie_forge_build(format, secret, ts, h)
-        Result.new(JSON.build { |j| j.object { j.field "cookie", cookie; j.field "format", format } })
+        Result.new({cookie: cookie, format: format}.to_json)
       rescue ex : Cookie::CookieError # invalid JSON, missing payload/value, unknown format
         Result.new(ex.message || "invalid input", is_error: true)
       end
@@ -118,10 +119,27 @@ module Gori
       # (`str(h, "algorithm") || DEFAULT_ALGO`), so `algorithm:"SHA256"` (a plausible casing)
       # or `"sha512"` travelled down to `Django.hmac_algo` and surfaced as a raise from deep in
       # the crypto path rather than a refusal naming the argument. Its sibling `format` on
-      # these same three tools has been validated all along.
+      # these same three tools has been validated all along. This no-cookie form (cookie_forge,
+      # which mints rather than reads) defaults to SHA-256; the verify/crack tools use
+      # `django_algorithm_for`, which auto-detects from the cookie they DO hold.
       private def django_algorithm(h) : String
         a = str(h, "algorithm").try(&.strip.downcase.presence)
-        return Cookie::Django::DEFAULT_ALGO if a.nil?
+        a.nil? ? Cookie::Django::DEFAULT_ALGO : validate_django_algo(a)
+      end
+
+      # The verify/crack form: an explicit 'algorithm' is validated and honored, but when it is
+      # absent the algorithm is read off the cookie's own signature length (sha1 = 20 bytes,
+      # sha256 = 32) instead of defaulting to sha256 — so a real SHA-1 `sessionid` does not come
+      # back `valid:false` / uncracked under the sha256 default even with the correct secret.
+      # Same "auto until you pin it" contract the Cookie tab's algorithm badge and `gori run
+      # cookie` give; a cookie whose algorithm can't be told falls back to the default.
+      private def django_algorithm_for(cookie : String, h) : String
+        a = str(h, "algorithm").try(&.strip.downcase.presence)
+        return validate_django_algo(a) if a
+        Cookie.detect_django_algo(cookie) || Cookie::Django::DEFAULT_ALGO
+      end
+
+      private def validate_django_algo(a : String) : String
         unless Cookie::Django::SUPPORTED_ALGOS.includes?(a)
           raise Cookie::CookieError.new("unknown algorithm #{a.inspect} (use #{Cookie::Django::SUPPORTED_ALGOS.join("/")})")
         end
@@ -139,7 +157,7 @@ module Gori
         when "rack"  then Cookie::Rack.verify(cookie, secret)
         when "django" then Cookie::Django.verify(cookie, secret,
           salt: str(h, "salt") || Cookie::Django::DEFAULT_SALT,
-          algorithm: django_algorithm(h))
+          algorithm: django_algorithm_for(cookie, h))
         else raise Cookie::CookieError.new("unrecognized cookie format")
         end
       end
@@ -150,7 +168,7 @@ module Gori
         when "rack"  then Cookie::Rack.crack(cookie, secrets)
         when "django" then Cookie::Django.crack(cookie, secrets,
           salt: str(h, "salt") || Cookie::Django::DEFAULT_SALT,
-          algorithm: django_algorithm(h))
+          algorithm: django_algorithm_for(cookie, h))
         else raise Cookie::CookieError.new("unrecognized cookie format")
         end
       end
@@ -176,7 +194,7 @@ module Gori
           s.field "secret", strprop("the candidate signing secret"), required: true
           s.field "format", enumprop("force a format (default auto-detect)", Cookie::FORMATS)
           s.field "salt", strprop("Flask/Django signing salt (Flask default 'cookie-session', Django 'django.core.signing')")
-          s.field "algorithm", enumprop("Django HMAC algorithm (default #{Cookie::Django::DEFAULT_ALGO})", Cookie::Django::SUPPORTED_ALGOS)
+          s.field "algorithm", enumprop("Django HMAC algorithm (auto-detected from the signature length when unset)", Cookie::Django::SUPPORTED_ALGOS)
         end
 
         tool j, "cookie_crack",
@@ -185,10 +203,10 @@ module Gori
           "and/or a 'wordlist' file path. Pure offline compute: no network. Returns {found, secret, format}." do |s|
           s.field "cookie", strprop("the raw cookie value"), required: true
           s.field "secrets", strarrprop("inline candidate secrets to try (in order)")
-          s.field "wordlist", strprop("path to a newline-delimited wordlist file")
+          s.field "wordlist", strprop("path to a newline-delimited wordlist file, or the name of a saved list (list_wordlists)")
           s.field "format", enumprop("force a format (default auto-detect)", Cookie::FORMATS)
           s.field "salt", strprop("Flask/Django signing salt")
-          s.field "algorithm", enumprop("Django HMAC algorithm (default #{Cookie::Django::DEFAULT_ALGO})", Cookie::Django::SUPPORTED_ALGOS)
+          s.field "algorithm", enumprop("Django HMAC algorithm (auto-detected from the signature length when unset)", Cookie::Django::SUPPORTED_ALGOS)
         end
 
         tool j, "cookie_forge",

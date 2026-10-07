@@ -1,0 +1,109 @@
+require "../spec_helper"
+require "../../src/gori/mcp/inbox"
+
+private alias Inbox = Gori::MCP::ClaudeInbox
+
+# A stand-in for the CLI's inbox: accepts one connection, reads it to EOF, hands back the lines.
+private def with_inbox(&)
+  posix_only!("Claude Code's inbox is a Unix socket gori only looks for on POSIX")
+  dir = File.tempname("gori-inbox")
+  Dir.mkdir_p(dir)
+  path = File.join(dir, "1.sock")
+  server = UNIXServer.new(path)
+  got = Channel(Array(String)).new(1)
+  spawn do
+    if client = server.accept?
+      got.send(client.gets_to_end.lines)
+      client.close
+    end
+  end
+  begin
+    yield path, got
+  ensure
+    server.close rescue nil
+    FileUtils.rm_rf(dir)
+  end
+end
+
+describe Gori::MCP::ClaudeInbox do
+  it "names the socket after the parent pid, env first, both directory shapes" do
+    c = Inbox.candidates(4242_i64)
+    c.should contain("/tmp/cc-socks/4242.sock")
+    c.any?(&.ends_with?("/4242.sock")).should be_true
+    c.size.should be >= 2
+  end
+
+  it "discovers only a path that is a live socket" do
+    posix_only!("File.symlink needs Developer Mode")
+    # This spec may itself run under a Claude Code session, whose env names a real socket:
+    # clear it so the pid candidates are the only ones in play, and restore it after.
+    saved = ENV["CLAUDE_CODE_MESSAGING_SOCKET"]?
+    ENV.delete("CLAUDE_CODE_MESSAGING_SOCKET")
+    begin
+      Inbox.discover(1_i64 << 40).should be_nil # no such pid, no such file
+      with_inbox do |path, _|
+        # the env override is trusted only when it names THIS parent pid (the fake is 1.sock):
+        # a server under Codex, or under a nested Claude session, inherits the OUTER session's
+        # socket and must not write there
+        ENV["CLAUDE_CODE_MESSAGING_SOCKET"] = path
+        Inbox.discover(1_i64).should eq(path)
+        Inbox.discover(1_i64 << 40).should be_nil
+        Inbox.discover(1_i64, uid: "4294967294").should be_nil # a socket another user owns
+        uid = Inbox.uid
+        Inbox.ours?(path, uid).should be_true
+        link = File.join(File.dirname(path), "2.sock")
+        File.symlink(path, link)
+        Inbox.ours?(link, uid).should be_false # a planted link is not followed to our socket
+        File.chmod(File.dirname(path), 0o777)
+        Inbox.ours?(path, uid).should be_false # a directory others can write lets them swap it
+        File.chmod(File.dirname(path), 0o700)
+        # the same socket spelled another way still gets the token it is owed
+        ENV["CLAUDE_CODE_MESSAGING_TOKEN"] = "t"
+        ENV["CLAUDE_CODE_MESSAGING_SOCKET"] = path.sub("/1.sock", "//1.sock")
+        Inbox.token_for(path).should eq("t")
+        ENV.delete("CLAUDE_CODE_MESSAGING_TOKEN")
+      end
+    ensure
+      ENV.delete("CLAUDE_CODE_MESSAGING_SOCKET")
+      ENV["CLAUDE_CODE_MESSAGING_SOCKET"] = saved if saved
+    end
+  end
+
+  it "hands the token only to the socket the env var names" do
+    saved = {ENV["CLAUDE_CODE_MESSAGING_SOCKET"]?, ENV["CLAUDE_CODE_MESSAGING_TOKEN"]?}
+    begin
+      ENV["CLAUDE_CODE_MESSAGING_TOKEN"] = "outer-token"
+      ENV["CLAUDE_CODE_MESSAGING_SOCKET"] = "/tmp/cc-socks/1.sock"
+      Inbox.token_for("/tmp/cc-socks/1.sock").should eq("outer-token")
+      Inbox.token_for("/tmp/cc-socks/2.sock").should be_nil
+    ensure
+      {"CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN"}.each_with_index do |k, i|
+        (v = saved[i]) ? (ENV[k] = v) : ENV.delete(k)
+      end
+    end
+  end
+
+  it "writes the auth line when a token is known, then the user line, and closes" do
+    with_inbox do |path, got|
+      Inbox.deliver(path, "hello", token: "tok").should be_nil
+      lines = got.receive
+      lines.size.should eq(2)
+      JSON.parse(lines[0])["type"].should eq("auth")
+      JSON.parse(lines[0])["token"].should eq("tok")
+      u = JSON.parse(lines[1])
+      u["type"].should eq("user")
+      u["message"]["role"].should eq("user")
+      u["message"]["content"].should eq("hello")
+    end
+    with_inbox do |path, got|
+      Inbox.deliver(path, "no token", token: nil).should be_nil
+      got.receive.size.should eq(1)
+    end
+  end
+
+  it "reports a refused or missing socket instead of raising" do
+    reason = Inbox.deliver("/nonexistent/gori-inbox.sock", "x", token: nil)
+    reason.should_not be_nil
+    reason.not_nil!.should contain("not accepting")
+  end
+end

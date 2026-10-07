@@ -1,5 +1,6 @@
 require "termisu"
 require "./screen"
+require "./line_edit"
 require "./theme"
 require "./line_field_read"
 
@@ -113,18 +114,6 @@ module Gori::Tui
       @sel.selection_text(@value, @caret)
     end
 
-    def selection_span : {Int32, Int32}?
-      @sel.selection_span(@caret)
-    end
-
-    def clear_selection : Nil
-      @sel.clear_selection
-    end
-
-    def select_all : Nil
-      @caret = @sel.select_line(@value.size)
-    end
-
     # Cut the selected run out and park the caret where it was. Returns whether anything
     # went — callers gate on it exactly as `TextArea#delete_selection`'s callers do.
     def delete_selection : Bool
@@ -210,6 +199,16 @@ module Gori::Tui
       true
     end
 
+    # ^U — delete from the caret back to the start of the line as one undo step.
+    def delete_to_start : Bool
+      return false if @caret == 0
+      push_undo
+      @sel.clear_selection
+      @value = @value[@caret..]
+      @caret = 0
+      true
+    end
+
     # See `TextArea#word_char?` — the two must agree, or ⌥←/→ and a double-click would
     # disagree about where a word ends in the same value.
     private def word_char?(c : Char) : Bool
@@ -258,15 +257,9 @@ module Gori::Tui
       true
     end
 
-    # A modified ⌫. Same shape as `TextArea#word_delete_key?`, and load-bearing for the same
-    # reason: a terminal sends ⌥⌫ as ESC + 0x7F and termisu maps the payload through
-    # `Key.from_char`, which has no name for DEL — so it arrives as Unknown + Alt carrying
-    # that char, not as Backspace.
+    # A modified ⌫ — `LineEdit.word_delete_key?`, which says why the `char` half matters.
     def word_delete_key?(ev : Termisu::Event::Key) : Bool
-      return false unless ev.ctrl? || ev.alt?
-      return true if ev.key.backspace?
-      c = ev.char
-      !!c && (c == '\u{7F}' || c == '\b')
+      LineEdit.word_delete_key?(ev)
     end
 
     # --- pointer --------------------------------------------------------------

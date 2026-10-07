@@ -6,13 +6,6 @@ module Gori::Proxy::Codec
   module Brotli
     AVAILABLE = {{ !flag?(:without_native_codecs) }}
 
-    # Decode a brotli stream, tolerant of truncation (a capture-capped body EOFs
-    # mid-stream → returns what was produced). `max_out` caps output as a
-    # decompression-bomb guard.
-    def self.decode(input : Bytes, max_out : Int32) : Bytes
-      decode_full(input, max_out)[0]
-    end
-
     # :ditto: — plus whether the stream ENDED cleanly (the decoder reported SUCCESS rather
     # than running out of input or erroring).
     #
@@ -75,7 +68,10 @@ module Gori::Proxy::Codec
 end
 
 {% unless flag?(:without_native_codecs) %}
-  @[Link(pkg_config: "libbrotlidec")]
+  # The lib names are what MSVC links (`brotlidec.lib`); it ignores pkg-config, so the
+  # static `brotlicommon` that pkg-config pulls in through Requires.private is named too.
+  @[Link("brotlidec", pkg_config: "libbrotlidec")]
+  @[Link("brotlicommon", pkg_config: "libbrotlicommon")]
   lib LibBrotliDec
     fun create_instance = BrotliDecoderCreateInstance(alloc : Void*, free : Void*, opaque : Void*) : Void*
     fun destroy_instance = BrotliDecoderDestroyInstance(state : Void*) : Void

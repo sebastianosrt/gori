@@ -48,22 +48,86 @@ module Gori::Tui
       end
     end
 
-    # A "‹ list" back affordance riding the top-left border of a detail drill-in, where
-    # `inner` is the framed interior (the frame sits one column outside it, as produced
-    # by BodyChrome.framed / rect.inset(1, 1)). Advertises that ←/esc return to the list
-    # behind the detail — the whole point being discoverability, since users miss the
-    # status-bar "esc back". Rides the border at Frame.card's title column so it reads as
-    # a control on the frame; call it AFTER the frame so it overwrites the hairline cleanly.
-    def self.list_back_hint(screen : Screen, inner : Rect, bg : Color = Theme.bg) : Nil
+    # The breadcrumb a detail drill-in rides on its top-left border, where `Frame.card`
+    # would put a title: ` ‹ HISTORY · 12/123 · GET api.demo.test/v1/me `. `inner` is the
+    # framed interior (the frame sits one column outside it, as produced by
+    # BodyChrome.framed / rect.inset(1, 1)).
+    #
+    # It replaces a bare ` ‹ list `, which named neither WHERE you were nor WHAT you had
+    # opened — the drill-in's whole identity problem. Once the detail replaces the tab body
+    # the card loses its title and the tab bar renders exactly as it does over the list, so
+    # nothing on screen said "this is one row of History". The old hint also advertised a
+    # control that did not exist: no tab hit-tested those cells, and in History `←` did not
+    # even close (it walked panes and clamped), so the one glyph pointing the way out named
+    # a key that did nothing there.
+    #
+    # `pos` is the cursor's place in the list behind ("12/123"). It is also the affordance
+    # for the item step — without a visible position, stepping is a key nobody finds.
+    record Crumb, tab : String, subject : String, pos : String? = nil do
+      # The full run, padded the way every other border decoration in this module pads
+      # itself. ONE derivation, read by the draw AND by the click hit-test, so the `‹`
+      # cannot be drawn in cells the pointer misses.
+      def text : String
+        parts = [@tab]
+        if pos = @pos
+          parts << pos
+        end
+        parts << @subject unless @subject.empty?
+        " ‹ #{parts.join(" · ")} "
+      end
+    end
+
+    # Where the crumb lands: the border row above `inner`. nil when there is no room — so a
+    # narrow pane simply has no crumb rather than a clipped one that overwrites the frame's
+    # top-right ╮ (at inner.x + inner.w).
+    #
+    # There is no `row` parameter and there must not be: the crumb rides `inner.y - 1`, which
+    # IS the list rail's divider when a rail is up and the card's own top border when it is
+    # not (see DrillIn.rail_split), so no caller has to be rail-aware to place it.
+    def self.crumb_rect(inner : Rect, crumb : Crumb) : Rect?
       y = inner.y - 1
-      # ` ‹ list ` is 8 cells from inner.x + 1; require inner.w > 8 so its trailing cell
-      # stays left of the frame's top-right ╮ (at inner.x + inner.w) — never clobber it.
-      return if y < 0 || inner.w <= 8
-      screen.text(inner.x + 1, y, " ‹ list ", Theme.accent, bg, Attribute::Bold)
+      return nil if y < 0 || inner.w <= 8
+      w = {Screen.draw_width(crumb.text), inner.w - 2}.min
+      return nil if w < 6
+      Rect.new(inner.x + 1, y, w, 1)
+    end
+
+    # The CLICKABLE run within that: ` ‹ TAB `, and not the position or the subject after it.
+    #
+    # The hit rect used to be the whole crumb — 45-60 columns of muted label — so a click
+    # anywhere on the path text left the drill-in, while the only part drawn as a control was
+    # the accent `‹` and the bright tab name. A button you cannot see is as wrong as a label
+    # that acts like one; this is the run that LOOKS pressable, so it is the run that is.
+    def self.crumb_hit_rect(inner : Rect, crumb : Crumb) : Rect?
+      r = crumb_rect(inner, crumb) || return nil
+      Rect.new(r.x, r.y, {Screen.draw_width(crumb.tab) + 4, r.w}.min, 1)
+    end
+
+    # Draws it. Call AFTER the frame, like every border decoration here — it overwrites the
+    # hairline. The `‹` is accent-bold because it IS the button (its hit-test is
+    # `crumb_hit_rect`, the run this draws bright); the rest stays muted so the subject does
+    # not compete with the content underneath.
+    #
+    # `meta` rides the same row, right-aligned: the keys that CHANGE the position the crumb
+    # just printed. It is what the drill-in shows when there is no list rail to hang those
+    # keys off (the rail prints them in its own gutter, beside the row each one lands on), so
+    # the affordance does not depend on the terminal being tall enough for a rail. Dropped
+    # whole when it would collide with the crumb, like every other border decoration here.
+    def self.crumb(screen : Screen, inner : Rect, crumb : Crumb, bg : Color = Theme.bg,
+                   meta : String? = nil) : Nil
+      r = crumb_rect(inner, crumb) || return
+      screen.text(r.x, r.y, crumb.text, Theme.muted, bg, width: r.w)
+      screen.text(r.x + 1, r.y, "‹", Theme.accent, bg, Attribute::Bold)
+      screen.text(r.x + 3, r.y, crumb.tab, Theme.text_bright, bg, Attribute::Bold,
+        width: {r.w - 3, 0}.max)
+      return unless meta && !meta.empty?
+      mx = inner.right - 1 - Screen.draw_width(meta) - 2
+      return if mx <= r.right
+      screen.text(mx, r.y, " #{meta} ", Theme.muted, bg)
     end
 
     # A short right-aligned annotation riding a card's TOP border, right of the title —
-    # "2/2 enabled", "lens:off · 3", "4 entries". Rides the hairline the way `list_back_hint`
+    # "2/2 enabled", "lens:off · 3", "4 entries". Rides the hairline the way `crumb`
     # does, so it costs no interior row.
     #
     # Every card that wanted one used to hand-roll this, and the copies had drifted into
@@ -266,7 +330,9 @@ module Gori::Tui
             on ? Attribute::Bold : Attribute::None)
         end
       elsif value = options[selected]?
-        tx = screen.text(tx, y, value, lit_col, bg, Attribute::Bold)
+        # Clipped to the room left of the cue: a value wider than the row (a long Discover
+        # start path) otherwise ran over the card border (#1373).
+        tx = screen.text(tx, y, value, lit_col, bg, Attribute::Bold, width: right - tx - cue_w)
       end
       focused ? screen.text(tx, y, cue, Theme.muted, bg) : tx
     end
@@ -277,8 +343,8 @@ module Gori::Tui
     # drawn, or `right_edge + 1` when nothing fit, so the caller can size what sits left of it.
     #
     # This is the filter-bar cluster four views had each written out: History's
-    # `count · ⇧S scope · f:follow`, Sitemap's `count · ⇧S scope · g:fold`, and the bare
-    # `count · ⇧S scope` in Issues and Probe. Same shape, four copies, and they had already
+    # `count · s scope · ⌁follow`, Sitemap's `count · s scope · g:fold`, and the bare
+    # `count · s scope` in Issues and Probe. Same shape, four copies, and they had already
     # drifted on the gap — a TWO-column step after the count, a ONE-column step between the
     # chips, in the same method. `toggle_badge` is not this: it fills a `" chord:NAME "` pill,
     # where these are plain fg-coloured words on the bar.
@@ -326,7 +392,7 @@ module Gori::Tui
 
     # A left-aligned mode/toggle chip at (x,y), returning the x past it. `lit` (active)
     # paints bright text on an accent fill; off is a muted, background-less label. Used
-    # for keyed toggle chips on a pane's top border (e.g. Repeater's `d:diff`/`x:hex`).
+    # for keyed toggle chips on a pane's top border (e.g. Repeater's `⇧D:diff`/`^X:hex`).
     def self.chip(screen : Screen, x : Int32, y : Int32, label : String, lit : Bool) : Int32
       screen.text(x, y, label, lit ? Theme.text_bright : Theme.muted, lit ? Theme.accent_bg : Theme.bg)
     end
@@ -502,6 +568,44 @@ module Gori::Tui
         edge = x
       end
       nil
+    end
+
+    # The theme swatch: a strip in the theme's OWN palette (not the active one), its canvas
+    # colour framing five accent ticks, so a theme is previewed without making it active.
+    SWATCH_W = 7
+
+    def self.theme_swatch(screen : Screen, x : Int32, y : Int32, name : String) : Nil
+      pal = Theme.palette(name)
+      return unless pal
+      ticks = {pal.accent, pal.green, pal.yellow, pal.red, pal.syn_header}
+      screen.cell(x, y, ' ', pal.bg, pal.bg)
+      ticks.each_with_index { |c, i| screen.cell(x + 1 + i, y, '█', c, pal.bg) }
+      screen.cell(x + 6, y, ' ', pal.bg, pal.bg)
+    end
+
+    # The selection band on row `y` of a bordered card `box`: the row inside the border filled
+    # with the accent band when `selected` (the panel otherwise) and the `▎` bar in its first
+    # cell. Returns that fill, for the row's own text.
+    def self.row_band(screen : Screen, box : Rect, y : Int32, selected : Bool) : Color
+      bg = selected ? Theme.accent_bg : Theme.panel
+      screen.fill(Rect.new(box.x + 1, y, box.w - 2, 1), bg)
+      screen.cell(box.x + 1, y, selected ? '▎' : ' ', Theme.accent, bg)
+      bg
+    end
+
+    # One row of a theme picker `w` cells wide: the selection band and bar, a radio, the name,
+    # and the swatch right-aligned — one cell short of the row's end when `gauge_col` leaves
+    # its last column to a scroll gauge drawn inside the list.
+    def self.theme_row(screen : Screen, x : Int32, y : Int32, w : Int32, name : String,
+                       selected : Bool, gauge_col : Bool = false) : Nil
+      bg = selected ? Theme.accent_bg : Theme.panel
+      screen.fill(Rect.new(x, y, w, 1), bg)
+      screen.cell(x, y, selected ? '▎' : ' ', Theme.accent, bg)
+      screen.cell(x + 2, y, selected ? '◉' : '◯', selected ? Theme.accent : Theme.muted, bg)
+      sx = x + w - (gauge_col ? 1 : 0) - SWATCH_W
+      name_w = {sx - (x + 4) - 1, 1}.max
+      screen.text(x + 4, y, name, selected ? Theme.text_bright : Theme.text, bg, width: name_w)
+      theme_swatch(screen, sx, y, name)
     end
   end
 end

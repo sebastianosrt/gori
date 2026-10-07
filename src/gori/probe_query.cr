@@ -1,5 +1,5 @@
-require "./store"
-require "./filter_ast"
+require "./triage_filter"
+require "./probe/issue" # FILTER_CATEGORIES — the one list `category:` and `--category` share
 
 module Gori
   module Probe
@@ -27,31 +27,64 @@ module Gori
         "code"     => ["code"],
       }
 
-      # Canonical names, separator included, in completion order — what `ProbeView` splices
-      # over a half-typed token on ↹.
-      FIELDS = ALIASES.keys.map { |n| "#{n}:" }
+      include TriageFilter
 
-      KNOWN = ALIASES.values.flatten.to_set
+      # What each field means ON THIS BAR — not `QL::FIELD_HELP`, for the reason
+      # `Issues::Filter::FIELD_HELP` spells out: `status:` here is a triage state, not an HTTP
+      # code, and QL's `host:` line advertises a `host~` regex this parser refuses.
+      FIELD_HELP = {
+        "severity" => "info low medium high critical — takes >= <= > <",
+        "status"   => "triage state — open confirmed fp resolved (closed = any non-open)",
+        "category" => "which check found it — #{FILTER_CATEGORIES.join(" ")}",
+        "host"     => "the finding's host — substring",
+        "code"     => "the rule's code — substring",
+      }
 
-      # Does this backend implement `name`, with this separator? The predicate
-      # `FilterAst.spans` asks before painting a token as a FIELD (see its `known` argument).
-      # `regex` is always false here: only QL and the intercept gate implement `~`, so a
-      # `title~admin` is free-texted whole and must not be coloured as a match nobody performs.
-      def self.known_field?(name : String, regex : Bool = false) : Bool
-        !regex && KNOWN.includes?(name.downcase)
+      # This backend's own SYNTAX / WORTH KNOWING for the `?` reference, for the reason
+      # `Issues::Filter::SYNTAX_HELP` gives: the boolean grammar is shared `FilterAst`, the
+      # fields and the regex are not.
+      SYNTAX_HELP = [
+        {"category:tech severity:high", "space = AND (both must hold)"},
+        {"host:api OR host:cdn", "OR; NOT > AND > OR, ( ) to group"},
+        {"-category:tech", "leading - excludes — so does NOT category:tech"},
+        {"NOT (severity:info OR severity:low)", "NOT or -( negates a whole group"},
+        {"severity:>=high", ">= <= > < = on severity"},
+        {"code:\"missing csp\"", "quotes keep spaces inside one term"},
+        {"reflected", "a bare word searches title, host and code"},
+      ]
+
+      CAVEATS = [
+        {"there is no regex", "code~x-frame free-texts the whole token — see known_field?"},
+        {"status:closed", "any non-open triage state: confirmed, fp or resolved"},
+        {"no status: term", "the list shows OPEN findings only — name a status to see the rest"},
+        {"an empty value passes all", "even negated: -host: filters nothing, so a half-typed exclusion cannot blank the list"},
+        {"one row per code+host", "findings are grouped before this filter ever sees them"},
+      ]
+
+      # ↹ candidates for the token under `cx` — field names until a `:` is typed, then values.
+      # Punctuation rides through on `FilterAst::Cursor`, so `-cat` → `-category:`, which the
+      # old `[/\S*\z/]` tokenizer could not complete. `hosts` and `codes` are the caller's
+      # pools, read off the in-memory issue list.
+      def self.suggestions(query : String, cx : Int32, hosts : Array(String) = [] of String,
+                           codes : Array(String) = [] of String) : Array(String)
+        complete(query, cx) { |field| value_pool(field, hosts, codes) }
       end
 
-      private record Term, kind : Symbol, op : Symbol, text : String, negate : Bool
-
-      def self.parse(query : String) : Filter
-        new(FilterAst.build(FilterAst.parse(query)) { |t| build_term(t) })
-      end
-
-      def initialize(@tree : FilterAst::Tree(Term)?)
-      end
-
-      def empty? : Bool
-        @tree.nil?
+      # nil when the field has no closed vocabulary to offer — a name that completes over an
+      # EMPTY value list reads as a closed field with nothing in it.
+      #
+      # `category:` completes from `FILTER_CATEGORIES`, the one list the CLI and the MCP tools
+      # already validate against, rather than a copy: this bar and `--category` must not come
+      # to disagree about which lenses exist.
+      private def self.value_pool(field : String, hosts : Array(String),
+                                  codes : Array(String)) : Array(String)?
+        case CANONICAL[field]?
+        when "severity" then SEVERITY_VALUES + SEVERITY_SAMPLES
+        when "status"   then STATUS_VALUES
+        when "category" then FILTER_CATEGORIES
+        when "host"     then hosts
+        when "code"     then codes
+        end
       end
 
       # True when the query explicitly constrains status (status:/st:, possibly negated),
@@ -62,24 +95,17 @@ module Gori
         @tree.try(&.leaves.any? { |t| t.kind == :status }) || false
       end
 
-      def apply(issues : Array(Store::ProbeIssue)) : Array(Store::ProbeIssue)
+      # Either shape: the Probe tab filters its list projection (`ProbeIssueRow`), and every
+      # field a term reads is on both.
+      def apply(issues : Array(T)) : Array(T) forall T
         return issues if @tree.nil?
         issues.select { |i| matches?(i) }
       end
 
-      def matches?(i : Store::ProbeIssue) : Bool
+      def matches?(i : Store::AnyProbeIssue) : Bool
         tree = @tree
         return true unless tree
         eval(tree, i)
-      end
-
-      private def eval(tree : FilterAst::Tree(Term), i : Store::ProbeIssue) : Bool
-        case tree.op
-        in .leaf? then match_term(tree.leaf, i)
-        in .not?  then !eval(tree.children.first, i)
-        in .and?  then tree.children.all? { |c| eval(c, i) }
-        in .or?   then tree.children.any? { |c| eval(c, i) }
-        end
       end
 
       # Never drops a term; an empty value is resolved in match_term, which here makes
@@ -104,16 +130,7 @@ module Gori
         Term.new(:text, :eq, tok.downcase, negate)
       end
 
-      private def self.split_op(value : String) : {Symbol, String}
-        return {:ge, value[2..]} if value.starts_with?(">=")
-        return {:le, value[2..]} if value.starts_with?("<=")
-        return {:gt, value[1..]} if value.starts_with?(">")
-        return {:lt, value[1..]} if value.starts_with?("<")
-        return {:eq, value[1..]} if value.starts_with?("=")
-        {:eq, value}
-      end
-
-      private def match_term(t : Term, i : Store::ProbeIssue) : Bool
+      private def match_term(t : Term, i : Store::AnyProbeIssue) : Bool
         # An incomplete term (e.g. mid-typing `host:` or `-host:`) filters nothing — match all.
         # (Previously a NEGATED empty term matched nothing and blanked the whole list.)
         return true if t.text.empty?
@@ -128,44 +145,9 @@ module Gori
         t.negate ? !hit : hit
       end
 
-      private def free_text(text : String, i : Store::ProbeIssue) : Bool
+      private def free_text(text : String, i : Store::AnyProbeIssue) : Bool
         return true if text.empty?
         i.title.downcase.includes?(text) || i.host.downcase.includes?(text) || i.code.downcase.includes?(text)
-      end
-
-      private def match_severity(t : Term, sev : Store::Severity) : Bool
-        target = severity_value(t.text)
-        return false unless target
-        cmp = sev.value <=> target
-        case t.op
-        when :ge then cmp >= 0
-        when :gt then cmp > 0
-        when :le then cmp <= 0
-        when :lt then cmp < 0
-        else          cmp == 0
-        end
-      end
-
-      private def severity_value(name : String) : Int32?
-        case name
-        when "info"             then 0
-        when "low"              then 1
-        when "medium", "med"    then 2
-        when "high"             then 3
-        when "critical", "crit" then 4
-        else                         nil
-        end
-      end
-
-      private def match_status(name : String, status : Store::Status) : Bool
-        case name
-        when "open"                 then status.open?
-        when "confirmed", "conf"    then status.confirmed?
-        when "false-positive", "fp" then status.false_positive?
-        when "resolved", "done"     then status.resolved?
-        when "closed"               then !status.open?
-        else                             false
-        end
       end
     end
   end

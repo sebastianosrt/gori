@@ -1,5 +1,6 @@
 require "../spec_helper"
 require "../support/memory_backend"
+require "../support/tui_probes"
 
 include Gori::Tui
 
@@ -77,6 +78,58 @@ describe Gori::Tui::InterceptView do
       backend2 = MemoryBackend.new(100, 12)
       view.render(Screen.new(backend2), Rect.new(0, 0, 100, 12))
       backend2.contains?("`scope:` is not available here").should be_false
+    end
+  end
+
+  # A name QL does not have EITHER is a typo, and on a hold gate it is the worst of the three:
+  # an unknown field free-texts the whole token, so the condition holds nothing and the only
+  # symptom is a queue that never fills.
+  it "says so when the catch condition misspells a field" do
+    tmp_interceptor do |ic|
+      view = InterceptView.new
+      view.reload(ic)
+      view.start_query
+      "hostt:api".each_char { |c| view.query_insert(c) }
+      backend = MemoryBackend.new(100, 12)
+      view.render(Screen.new(backend), Rect.new(0, 0, 100, 12))
+      backend.contains?("unknown field `hostt:`").should be_true
+      backend.contains?("did you mean `host:`").should be_true
+    end
+  end
+
+  # The bar and the row under it judge one token with one vocabulary — QL's, which is what
+  # `InterceptFilter::FIELD_SHAPED` paints from. Narrowed to the gate's own nine names, the two
+  # disagreed: `sizee:8080` was painted muted and then passed over in silence.
+  it "diagnoses the same token the bar paints, out of the same vocabulary" do
+    tmp_interceptor do |ic|
+      view = InterceptView.new
+      view.reload(ic)
+      view.start_query
+      "sizee:8080".each_char { |c| view.query_insert(c) }
+      backend = MemoryBackend.new(100, 12)
+      view.render(Screen.new(backend), Rect.new(0, 0, 100, 12))
+      x, y = 0, 0
+      (0...12).each do |row|
+        at = backend.row(row).index("sizee:8080")
+        x, y = at, row if at
+      end
+      backend.fg_at(x, y).should eq(Theme.muted) # SpanKind::UnknownField
+      backend.contains?("did you mean `size:`").should be_true
+    end
+  end
+
+  # ...and a field QL HAS that this gate refuses keeps its own sentence: it is not a typo, and
+  # calling it one would say it is searched as text when it compiles to a never-match.
+  it "does not file a refused field as a misspelling" do
+    tmp_interceptor do |ic|
+      view = InterceptView.new
+      view.reload(ic)
+      view.start_query
+      "scope:in".each_char { |c| view.query_insert(c) }
+      backend = MemoryBackend.new(100, 12)
+      view.render(Screen.new(backend), Rect.new(0, 0, 100, 12))
+      backend.contains?("`scope:` is not available here").should be_true
+      backend.contains?("unknown field").should be_false
     end
   end
 
@@ -347,6 +400,30 @@ describe Gori::Tui::InterceptView do
         view.preview_copy_text.should eq("GET")
       end
     end
+
+    # The focus ring opens the editor in READ: the caret and the band are the read state's, and
+    # an INS ⇧arrow selection is still there to copy after `esc`.
+    it "selects and copies in READ, and keeps an INS selection across esc" do
+      tmp_interceptor do |ic|
+        hold_req(ic, "acme.test", "/e", "GET /e HTTP/1.1\r\nHost: acme.test\r\n\r\n")
+        view = InterceptView.new
+        view.reload(ic)
+        view.render(Screen.new(MemoryBackend.new(110, 16)), Rect.new(0, 0, 110, 16))
+        view.pane_advance(1)
+        view.text_read?.should be_true
+        3.times { view.read_move(0, 1, selecting: true) }
+        view.preview_selection?.should be_true
+        view.preview_copy_text.should eq("GET")
+
+        view.enter_insert! # INS resumes from the READ caret, column 3
+        view.edit_move(1, 0)
+        4.times { view.edit_move(0, 1, selecting: true) }
+        view.exit_insert!
+        view.text_read?.should be_true
+        view.preview_copy_text.should eq("t: a")
+        view.held_edit_id.should be_nil # navigation and selection never dirty the hold
+      end
+    end
   end
 
   it "edits a held request and forwards the edited bytes" do
@@ -607,7 +684,7 @@ describe "Intercept filter bar" do
       view.reload(ic)
       backend = MemoryBackend.new(100, 8)
       view.render(Screen.new(backend), Rect.new(0, 0, 100, 8))
-      backend.row(0).includes?("c:ALL").should be_true   # default direction chip (c cycles it)
+      backend.row(0).includes?("c:REQ").should be_true   # default direction chip (c cycles it)
       backend.row(0).includes?("i:CATCH").should be_true # master catch toggle badge
       backend.contains?("/ condition").should be_true    # field hint
     end
@@ -615,12 +692,39 @@ describe "Intercept filter bar" do
 
   it "reflects the interceptor's catch direction after a cycle" do
     tmp_interceptor do |ic|
-      ic.cycle_direction # Both → RequestOnly
+      ic.cycle_direction # RequestOnly → ResponseOnly
       view = InterceptView.new
       view.reload(ic)
       backend = MemoryBackend.new(100, 8)
       view.render(Screen.new(backend), Rect.new(0, 0, 100, 8))
-      backend.row(0).includes?("c:REQ").should be_true
+      backend.row(0).includes?("c:RES").should be_true
+    end
+  end
+
+  it "shows rebound catch keys only while the body owns focus" do
+    previous = Gori::Settings.keymap_overrides
+    begin
+      Gori::Settings.keymap_overrides = {"intercept.direction" => ["shift-c"],
+                                         "intercept.toggle"    => ["shift-i"]}
+      tmp_interceptor do |ic|
+        view = InterceptView.new # the default direction, REQ
+        view.menu_registry = Gori::Verbs.registry
+        view.reload(ic)
+
+        focused = MemoryBackend.new(100, 8)
+        view.render(Screen.new(focused), Rect.new(0, 0, 100, 8), focused: true)
+        focused.row(0).should contain("⇧C:REQ")
+        focused.row(0).should contain("⇧I:CATCH")
+
+        unfocused = MemoryBackend.new(100, 8)
+        view.render(Screen.new(unfocused), Rect.new(0, 0, 100, 8), focused: false)
+        unfocused.row(0).should contain("DIR:REQ")
+        unfocused.row(0).should contain("CATCH:ON")
+        unfocused.row(0).should_not contain("⇧C")
+        unfocused.row(0).should_not contain("⇧I")
+      end
+    ensure
+      Gori::Settings.keymap_overrides = previous
     end
   end
 
@@ -664,6 +768,25 @@ describe "Intercept filter bar" do
       ic.set_filter("method:POST") # a peer, after the bar closed, with no further revision
       view.reload(ic)
       view.query.should eq("method:POST")
+    end
+  end
+
+  it "drops the host: pool's store when the bar is reopened without one" do
+    with_store do |store|
+      store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "https", host: "acme.test", port: 443,
+        method: "GET", target: "/", http_version: "HTTP/1.1",
+        head: "GET / HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice,
+        body: Bytes.empty, source: Gori::FlowSource::Kind::Proxy))
+      view = InterceptView.new
+      view.start_query(store)
+      "host:ac".each_char { |c| view.query_insert(c) }
+      view.query_suggestions.should eq(["host:acme.test"])
+
+      view.cancel_query
+      view.start_query
+      "host:ac".each_char { |c| view.query_insert(c) }
+      view.query_suggestions.should be_empty
     end
   end
 
@@ -787,7 +910,7 @@ describe "Intercept filter bar" do
       view.reload(ic)
       backend = MemoryBackend.new(100, 12)
       view.render(Screen.new(backend), Rect.new(0, 0, 100, 12))
-      backend.row(0).includes?("c:ALL").should be_true # bar on the top row
+      backend.row(0).includes?("c:REQ").should be_true # bar on the top row
       backend.contains?("QUEUE").should be_true        # queue card still drawn below
       backend.contains?("acme.test/login").should be_true
     end
@@ -946,9 +1069,9 @@ describe "Intercept verbs (P1)" do
         view.toggle_edit
         # A pure peek is byte-exact (P7): opening the editor must not mutate a held message.
         view.forward_bytes(it0).should eq(Bytes[0x00, 0xFF, 0x10, 0x82])
-        view.hex_set_nibble('d') # high nibble of byte 0
-        view.hex_set_nibble('e') # low nibble of byte 0 — the cursor now sits on byte 1
-        view.hex_delete          # drop the byte under the cursor (0xFF)
+        view.hex_key(hex_ev('d'))                         # high nibble of byte 0
+        view.hex_key(hex_ev('e'))                         # low nibble of byte 0 — the cursor now sits on byte 1
+        view.hex_key(hex_ev(Termisu::Input::Key::Delete)) # drop the byte under the cursor (0xFF)
         view.forward_bytes(it0).should eq(Bytes[0xDE, 0x10, 0x82])
         view.pending_edit.not_nil![0].should eq(it0.id)
         # No Content-Length line spliced in, and no CRLF normalisation: a WS payload has no
@@ -964,7 +1087,7 @@ describe "Intercept verbs (P1)" do
         view = InterceptView.new
         view.reload(ic)
         view.toggle_edit
-        view.hex_set_nibble('f')
+        view.hex_key(hex_ev('f'))
         view.stop_edit
         view.toggle_edit                                     # back onto the SAME row — the in-progress edit survives
         view.forward_bytes(bin).should eq(Bytes[0xF1, 0x02]) # the high nibble of byte 0

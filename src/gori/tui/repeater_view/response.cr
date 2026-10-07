@@ -59,6 +59,11 @@ class Gori::Tui::RepeaterView
   end
 
   # --- response pane (focus == :response) ---
+  # The response pane shows the diff against the previous response (`repeater.toggle-diff`).
+  def resp_diff? : Bool
+    @resp_mode == :diff
+  end
+
   def toggle_resp_mode : Nil
     @resp_mode = @resp_mode == :response ? :diff : :response
     @scroll = 0
@@ -81,26 +86,35 @@ class Gori::Tui::RepeaterView
     @resp_pretty_applied
   end
 
+  private def resp_unicode_escape_count : Int32
+    resp_view.unicode_escape_count
+  end
+
+  private def resp_unicode_decoded? : Bool
+    @decode_unicode && resp_unicode_escape_count > 0
+  end
+
   # The last send's {head, body} as WIRE BYTES — nil when nothing has been sent, or when the
-  # send errored and there is no response to hand out.
+  # send errored and no response head was received.
   #
   # For a consumer that needs the RESPONSE ITSELF rather than the pane's rendering of it: the
   # desktop preview (`Gori::ExternalOpen`) decodes the body against this head, which the plain
-  # lines `resp_copy_all_text` produces could not be reconstructed from. `result.ok?` is the
-  # same gate `resp_hex_bytes` below uses, and for the same reason.
+  # lines `resp_copy_all_text` produces could not be reconstructed from.
   def response_wire : {Bytes, Bytes?}?
     result = @result
-    return nil unless result && result.ok?
+    return nil unless result && (result.ok? || !result.head.empty?)
     {result.head, result.body}
   end
 
   # Combined head+body of the last result (hex source), cached; nil when not sent
-  # or errored. Invalidated when a new result is applied (reset_result_caches).
+  # or no bytes were received. Invalidated when a new result is applied (reset_result_caches).
   private def resp_hex_bytes : Bytes?
     return @resp_hex_bytes if @resp_hex_bytes
     result = @result
-    return nil unless result && result.ok?
-    @resp_hex_bytes = combine(result.head, result.body)
+    return nil unless result
+    body = result.body
+    return nil if result.head.empty? && (body.nil? || body.empty?)
+    @resp_hex_bytes = combine(result.head, body)
   end
 
   # Scroll the response pane by `delta` DRAWN rows. In hex the pane draws its own fixed
@@ -161,6 +175,24 @@ class Gori::Tui::RepeaterView
     size, line_at = resp_line_source
     return false if size <= 0
     cy = @resp_cursor.cy.clamp(0, size - 1)
+    @resp_cursor.move_to(cy, dir < 0 ? 0 : line_at.call(cy).size, selecting: selecting)
+    ensure_resp_visible(@resp_last_h) if @resp_last_h > 0
+    true
+  end
+
+  # ⌃Home / ⌃End in the response pane: the caret to the very start or end of the card it is
+  # in, ⇧ extending — `TextArea#to_buffer_start`/`#to_buffer_end`, the request editor beside
+  # it — with the view following, so ⌃End puts the last line on the pane's bottom row.
+  #
+  # A direct jump, not `resp_move(±huge)`: under wrap that walks every visual row of the body
+  # laying out each line, and on a split column it crosses cards only from a boundary line,
+  # so the same key would land in either card depending on where the caret was. Staying in
+  # the card is the request column's rule too (each of its panes is its own TextArea).
+  def resp_buffer_edge(dir : Int32, selecting : Bool = false) : Bool
+    return false unless resp_navigable?
+    size, line_at = resp_line_source
+    return false if size <= 0
+    cy = dir < 0 ? 0 : size - 1
     @resp_cursor.move_to(cy, dir < 0 ? 0 : line_at.call(cy).size, selecting: selecting)
     ensure_resp_visible(@resp_last_h) if @resp_last_h > 0
     true
@@ -228,7 +260,7 @@ class Gori::Tui::RepeaterView
     return nil if size <= 0
     _, line_at = resp_line_source
     li, dcx = Wrap.step_caret(@resp_cursor.cy, @resp_cursor.cx + off, dr, size,
-      drawn_at, resp_layout_fn(@resp_last_cw, drawn_at))
+      drawn_at, resp_layout_fn(@resp_last_cw, drawn_at), reveal: @reveal)
     {li, {dcx - off, 0}.max.clamp(0, line_at.call(li).size)}
   end
 

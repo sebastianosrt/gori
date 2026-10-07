@@ -6,6 +6,7 @@ require "../store"
 require "./engine"
 require "./identity"
 require "./passive"
+require "../plural"
 
 module Gori::Authorize
   # Why one option set cannot become a runnable authorize run.
@@ -117,7 +118,7 @@ module Gori::Authorize
     # becomes `identities.size` real requests, so an uncapped query turns a browse into a
     # replay of the whole session.
     property limit : Int32
-    # Explicit identities as JSON — the shape `Authorize.parse_json` already reads, so a
+    # Explicit identities as JSON — the shape `SessionSlot.parse_json` already reads, so a
     # `--identities FILE`, an MCP `identities` array serialized back, and the project's own
     # stored blob are one format. Nil falls back to the project's saved set.
     property identities_json : String?
@@ -215,13 +216,6 @@ module Gori::Authorize
       @targets.size * @identities.size
     end
 
-    # The skip tally as one line ("2 not a safe method to repeat · 1 outside project
-    # scope"), or nil when nothing was skipped. A FALLBACK for a surface with nothing better
-    # to say — `skipped` is the structured form every surface should prefer.
-    def skip_summary : String?
-      @skipped.empty? ? nil : Plan.skip_tally(@skipped)
-    end
-
     # Replay every target under every identity, yielding each finished `Target` as it lands.
     # Returns the number of FLOWS replayed (each one is `identities.size` requests).
     #
@@ -259,6 +253,23 @@ module Gori::Authorize
       sent
     end
 
+    # "Neither a flow id nor a query" — the ONE argv-only refusal in this builder, split out
+    # so a surface can ask it before it has a store, or a pipe, to ask it with. `resolve_flows`
+    # is still its only raiser; nothing re-derives the condition next to a caller.
+    #
+    # `gori run authorize --identities -` used to drain the operator's identity generator,
+    # resolve the project and open the store before reporting a mistake that was complete the
+    # moment the arguments were typed (#1034). The surface now asks HERE first and formats the
+    # answer through the same `PlanError::Reason` arm it always did, so the sentence, the
+    # flags it names and the exhaustive `case` stay in one place.
+    def self.no_selection?(flow_ids : Array(Int64), query : String?) : Bool
+      flow_ids.empty? && query.try(&.strip).presence.nil?
+    end
+
+    def self.no_target_error : PlanError
+      PlanError.new(PlanError::Reason::NoTarget, "no flows selected")
+    end
+
     def self.build(options : PlanOptions, outbound : Gori::Outbound) : Plan
       # Selection FIRST, identities second. `partition` needs both, but only this order
       # reports the right mistake: a bare `gori run authorize` in a project with no saved
@@ -290,9 +301,9 @@ module Gori::Authorize
       raw = options.identities_json ||
             options.store.setting(Store::AUTHORIZE_IDENTITIES_KEY)
       # A malformed blob degrades to an empty list rather than raising — see
-      # `Authorize.parse_json`. That is right on the project-open path and wrong here, so
+      # `SessionSlot.parse_json`. That is right on the project-open path and wrong here, so
       # the emptiness is what gets named, with `detail` saying which source produced it.
-      list = Authorize.parse_json(raw)
+      list = SessionSlot.parse_json(raw)
       reject_duplicate_names(list)
       reject_multiple_baselines(list)
       list = [Identity.as_captured(baseline_name(list))] + list unless list.any?(&.baseline?)
@@ -357,9 +368,7 @@ module Gori::Authorize
     # the only one a "capped" warning may be built from (see `Plan#query_capped?`).
     private def self.resolve_flows(options : PlanOptions) : {Array(Store::FlowDetail), Int32}
       query = options.query.try(&.strip).presence
-      if options.flow_ids.empty? && query.nil?
-        raise PlanError.new(PlanError::Reason::NoTarget, "no flows selected")
-      end
+      raise no_target_error if no_selection?(options.flow_ids, query)
       details = [] of Store::FlowDetail
       # A pruned/unknown id contributes nothing rather than raising: it is not a flow that
       # was declined, it is a flow that no longer exists, and `NoFlows` below is what fires
@@ -413,6 +422,14 @@ module Gori::Authorize
         raise PlanError.new(PlanError::Reason::BadQuery,
           "query #{query.inspect} did not match any field", query)
       end
+      # A term QL cannot use is DROPPED, which widens the selection — and every extra row is
+      # `identities.size` real requests. History only warns about that; a replay refuses it.
+      dropped = QL.analyze(query, scope: lens).ignored
+      unless dropped.empty?
+        raise PlanError.new(PlanError::Reason::BadQuery,
+          "query #{query.inspect} has terms QL cannot use (#{dropped.join(", ")}); dropping them " \
+          "would select MORE flows than asked", query)
+      end
       if filter.uses_fts?
         # `drain_fts!`, not `index_pending!`: that one reports a batch that lost SQLite's single
         # writer slot to a capturing peer as "0 indexed" and returns there, rows still dirty, so
@@ -428,7 +445,7 @@ module Gori::Authorize
         # CLI's top-level `rescue ex : Error` (cli.cr) prints this verbatim; MCP's `call` returns
         # it verbatim too.
         if (pending = options.store.drain_fts!) > 0
-          raise Gori::Error.new("#{pending} flow#{pending == 1 ? "" : "s"} could not be indexed for " \
+          raise Gori::Error.new("#{Gori.plural(pending, "flow")} could not be indexed for " \
                                 "free-text search (this project's writer is busy — another gori is " \
                                 "capturing it), so #{query.inspect} cannot see all of them and this " \
                                 "run would replay fewer flows than asked while reporting a clean " \
@@ -499,7 +516,7 @@ module Gori::Authorize
       Passive.skip_reason(detail, identities)
     end
 
-    # The per-reason tally: the `NothingToSend` detail AND what `Plan#skip_summary` renders,
+    # The per-reason tally: the `NothingToSend` detail AND the report of a partial run,
     # one implementation so the refusal and the report of a partial run agree.
     def self.skip_tally(skipped : Array(Skipped)) : String
       counts = Hash(Symbol, Int32).new(0)

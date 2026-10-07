@@ -51,43 +51,34 @@ private def motion_key(k : Termisu::Input::Key, *, shift = false, alt = false, c
 end
 
 describe Gori::Tui::TextArea do
-  # Issue #278: syntax-highlighted editors (Repeater request) used to collapse `\t` to
-  # zero columns in Highlight.draw while the caret advanced by column_width (≥1), so
-  # parking the caret on a tab overwrote the next glyph ("pushed characters together").
-  describe "tab / zero-width control cells (issue #278)" do
-    it "draws an embedded tab as a space without collapsing neighbours" do
+  # Named control badges must take the same columns in plain and syntax-highlighted editors.
+  describe "named control badges in text areas" do
+    it "draws an embedded tab badge without collapsing neighbours" do
       b = render_req_tab("x,\ty", 0, cursor: false)
-      b.row(0).rstrip.should eq("x, y")
+      b.row(0).rstrip.should eq("x,⟨TAB⟩y")
     end
 
-    it "keeps the next glyph visible when the caret sits on the tab" do
-      # Before the fix: Highlight collapsed the tab, caret painted a space at col 2 → "x,"
-      # (the 'y' was overwritten). After: "x, y" with the space under the caret.
+    it "keeps the next glyph visible when the caret sits on the tab badge" do
       b = render_req_tab("x,\ty", 2, cursor: true) # cx on '\t'
-      b.row(0).rstrip.should eq("x, y")
-      b.row(0)[2].should eq(' ') # tab cell
-      b.row(0)[3].should eq('y') # neighbour intact
+      b.row(0).rstrip.should eq("x,⟨TAB⟩y")
+      b.row(0)[2..].should start_with("⟨TAB⟩y")
     end
 
     it "does not double-paint the next glyph when the caret is just past the tab" do
-      # Before: caret at cx=3 used column_width prefix=3 on a 2-col collapsed draw → "x,yy"
       b = render_req_tab("x,\ty", 3, cursor: true) # cx on 'y'
-      b.row(0).rstrip.should eq("x, y")
-      b.row(0)[0, 4].should eq("x, y")
+      b.row(0).rstrip.should eq("x,⟨TAB⟩y")
+      b.row(0)[0..].should start_with("x,⟨TAB⟩y")
     end
 
-    it "handles a JSON body with a tab after a comma (the issue screenshot case)" do
+    it "handles a JSON body with a tab after a comma" do
       body = "{\"a\":1,\t\"b\":2}"
       tab_i = body.index('\t').not_nil!
-      # No caret: tab is a space cell, not deleted
-      render_req_tab(body, 0, cursor: false).row(0).rstrip.should eq("{\"a\":1, \"b\":2}")
-      # Caret on the tab: does not swallow the following quote
+      expected = "{\"a\":1,⟨TAB⟩\"b\":2}"
+      render_req_tab(body, 0, cursor: false).row(0).rstrip.should eq(expected)
       on_tab = render_req_tab(body, tab_i, cursor: true)
-      on_tab.row(0).rstrip.should eq("{\"a\":1, \"b\":2}")
-      on_tab.row(0)[tab_i + 1].should eq('"')
-      # Caret after the tab: no doubled quote
+      on_tab.row(0).rstrip.should eq(expected)
       after = render_req_tab(body, tab_i + 1, cursor: true)
-      after.row(0).rstrip.should eq("{\"a\":1, \"b\":2}")
+      after.row(0).rstrip.should eq(expected)
     end
   end
 
@@ -404,6 +395,30 @@ describe Gori::Tui::TextArea do
     end
   end
 
+  describe "#replace_line" do
+    it "is an undo step of its own by default" do
+      ta = TextArea.new("CL: 1\nab")
+      ta.replace_line(0, "CL: 9")
+      ta.undo
+      ta.text.should eq("CL: 1\nab")
+    end
+
+    # A derived line (the auto Content-Length) joins the step of the edit that caused it, and
+    # does not end the typing run it rides along with (#1417).
+    it "folds into the current step with fold: true" do
+      ta = TextArea.new("CL: 2\nab")
+      ta.move(1, 0)
+      ta.end_of_line
+      ta.insert('c')
+      ta.replace_line(0, "CL: 3", fold: true)
+      ta.insert('d')
+      ta.replace_line(0, "CL: 4", fold: true)
+      ta.text.should eq("CL: 4\nabcd")
+      ta.undo # the whole run, reflection included
+      ta.text.should eq("CL: 2\nab")
+    end
+  end
+
   describe "#match_count / #replace_matches (^F find&replace)" do
     it "counts and replaces every occurrence, case-insensitively like the search" do
       ta = TextArea.new("Admin admin\nADMIN x")
@@ -495,6 +510,13 @@ describe Gori::Tui::TextArea do
       ta = TextArea.new("a\r\nb\r\n")
       ta.set_text_keeping_eols("a\nb\nc\n")
       ta.wire_text.should eq("a\nb\nc\n")
+    end
+
+    it "keeps request head terminators when only the body line count moves" do
+      ta = TextArea.new("POST /x HTTP/1.1\r\nHost: h\r\n\r\nold\r\nbody")
+      ta.set_text_keeping_head_eols("POST /x HTTP/1.1\nHost: h\n\nnew\nbody\nexpanded")
+      ta.wire_text.should start_with("POST /x HTTP/1.1\r\nHost: h\r\n\r\n")
+      ta.wire_text.should eq("POST /x HTTP/1.1\r\nHost: h\r\n\r\nnew\nbody\nexpanded")
     end
 
     it "is a no-op on a buffer that had no CRs to restore" do

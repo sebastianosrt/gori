@@ -12,6 +12,7 @@ require "../fuzz"
 require "../repeater/flow_request"
 require "./viewport"
 require "./subtab_marks"
+require "./seeded_session"
 
 module Gori::Tui
   # The view for ONE token-randomness session (a sub-tab under the Sequencer tab). The
@@ -22,6 +23,7 @@ module Gori::Tui
   # Mirrors MinerView's session shape; collected tokens stay in-memory (never persisted).
   class SequencerView
     include SubtabRef # a sub-tab strip may hold a mark on this view (#683)
+    include SeededSession
     PANE_ORDER      = [:config, :samples, :analysis]
     REPORT_THROTTLE = 25 # recompute the report every N new samples while running
 
@@ -61,6 +63,7 @@ module Gori::Tui
       @focus = :config
       @sel = 0
       @scroll = 0
+      @samples_last_h = 0 # sample rows the last frame drew — the PgUp/PgDn step
       # "Following" the live tail means the cursor sits on the newest sample, exactly as
       # HistoryView's `@follow` means it sits on `follow_index`. It is what makes `append_sample`
       # drag the cursor down while a run streams — and moving the cursor off the last row
@@ -125,15 +128,7 @@ module Gori::Tui
     end
 
     def apply_peer_session(rec : Store::SequencerSessionRecord) : Nil
-      @target = rec.target
-      @request = rec.request
-      @http2 = rec.http2?
-      @sni = rec.sni || ""
-      @evidence = !rec.flow_id.nil? # see restore
-      @name = rec.name
-      apply_config_json(rec.config)
-      @last_synced_config = rec.config
-      @dirty = false
+      restore(rec) # the request-side fields only — focus, results and a running job are untouched
     end
 
     def session_side_matches?(rec : Store::SequencerSessionRecord) : Bool
@@ -145,74 +140,15 @@ module Gori::Tui
         @last_synced_config == rec.config
     end
 
-    # --- persistence accessors ---
-    def request_bytes : Bytes
-      @request
-    end
-
-    def http2? : Bool
-      @http2
-    end
-
-    def sni_override : String?
-      s = @sni.strip
-      s.empty? ? nil : s
-    end
-
-    def same?(other : SequencerView) : Bool
-      object_id == other.object_id
-    end
-
-    def same?(oid : UInt64) : Bool
-      object_id == oid
-    end
-
-    def dirty? : Bool
-      @dirty
-    end
-
-    def clear_dirty : Nil
-      @dirty = false
-    end
-
-    def mark_config_synced(config : String) : Nil
-      @last_synced_config = config
-    end
-
-    def request_line : String
-      String.new(@request[0, {@request.size, 256}.min]).each_line.first? || ""
-    end
-
-    def request_method : String
-      request_line.strip.split(' ').first? || ""
-    end
-
     def summary(max : Int32 = 32) : String
-      if @config.mode.manual?
-        s = "manual (#{@config.manual_tokens.size} tokens)"
-        return s.size > max ? "#{s[0, max - 1]}…" : s
-      end
-      parts = request_line.strip.split(' ')
-      s = "#{parts[0]?} #{parts[1]?}".strip
-      s = "request" if s.empty?
-      s.size > max ? "#{s[0, max - 1]}…" : s
-    end
-
-    def label(max : Int32 = 18) : String
-      if (n = @name) && !(t = n.strip).empty?
-        return t.size > max ? "#{t[0, max - 1]}…" : t
-      end
-      summary(max)
+      s = @config.mode.manual? ? "manual (#{@config.manual_tokens.size} tokens)" : SeededSession.request_summary(@request)
+      SeededSession.clip(s, max)
     end
 
     def target_origin : String
       return "manual" if @config.mode.manual?
       scheme, host, port = Repeater::FlowRequest.parse_target(@target)
       "#{scheme}://#{host}:#{port}"
-    end
-
-    def target : String
-      @target
     end
 
     # The host an Issue filed from this session belongs to. nil for a manual paste, which has
@@ -248,10 +184,6 @@ module Gori::Tui
       @focus = :analysis
     end
 
-    def at_top? : Bool
-      @focus == :config
-    end
-
     def samples_at_top? : Bool
       @sel == 0
     end
@@ -263,10 +195,6 @@ module Gori::Tui
 
     def analysis_at_top? : Bool
       @analysis.at_top?
-    end
-
-    def analysis : ReadPane
-      @analysis
     end
 
     # The ANALYSIS card's interior — the rect `render_analysis` draws into, so the row cursor's
@@ -299,18 +227,16 @@ module Gori::Tui
       @follow = (@sel == follow_index)
     end
 
+    # The PgUp/PgDn step: the sample rows the last frame drew, minus two of overlap.
+    def samples_page_rows : Int32
+      {@samples_last_h - 2, 1}.max
+    end
+
     # The row a following cursor sits on. Samples are appended oldest-first, so the live tail
     # is always the last index (HistoryView's `follow_index` picks an end per sort order).
     private def follow_index : Int32
       return 0 if @samples.empty?
       @samples.size - 1
-    end
-
-    # ↑/↓ (⇧ to select) walk the report rows; the wheel scrolls the viewport and leaves the
-    # cursor put — the split every read pane in the tree makes.
-    def analysis_scroll(d : Int32) : Nil
-      sync_analysis
-      @analysis.move(d, 0)
     end
 
     def analysis_move(d : Int32, selecting : Bool) : Nil
@@ -379,10 +305,6 @@ module Gori::Tui
       return if @samples.empty?
       @token.reset
       @focus = :detail
-    end
-
-    def detail_scroll(d : Int32) : Nil
-      with_token { @token.move(d, 0) }
     end
 
     def detail_move(d : Int32, selecting : Bool) : Nil
@@ -476,13 +398,26 @@ module Gori::Tui
       @engine.try(&.stop)
     end
 
+    # The progress denominator this session reports against — `Engine#total`'s answer,
+    # spelled here because the view has to be able to ask it without an engine.
+    #
+    # `@config.goal` is only ever the LIVE-replay denominator. A manual session counts its
+    # non-blank pasted tokens, and `Config#goal` sits at its 500 default there because the
+    # config overlay's samples cycler never applies to a paste. `ProgressEvent` carries the
+    # right number and `DoneEvent` does not, so the terminal apply had to re-derive it and
+    # read `config.goal` instead: analysing 30 pasted tokens finished at "30/500 collected"
+    # over a 6%-full progress bar, a run that had in fact completed every sample it had.
+    def progress_goal : Int32
+      @config.mode.manual? ? @config.manual_tokens.count { |t| !t.empty? } : @config.goal
+    end
+
     def begin_run : Nil
       @running = true
       @stop_requested = false
       @collected = 0
       @sent = 0
       @errors = 0
-      @goal_display = @config.mode.manual? ? @config.manual_tokens.count { |t| !t.empty? } : @config.goal
+      @goal_display = progress_goal
       @samples.clear
       @samples_rev += 1
       @report = nil
@@ -537,10 +472,6 @@ module Gori::Tui
     def budget_note : String
       "budget exhausted · #{@collected} of #{@goal_display} tokens collected — " \
       "raise max requests to finish (the verdict below rests on this sample)"
-    end
-
-    def collected_count : Int32
-      @samples.count(&.token)
     end
 
     def selected_sample : Sequencer::Sample?
@@ -603,6 +534,8 @@ module Gori::Tui
         "invalid target — use scheme://host[:port]/path"
       in Sequencer::PlanError::Reason::NoTokenLoc
         "set a token location first"
+      in Sequencer::PlanError::Reason::BadPosition
+        "set a byte range as A:B (B greater than A)"
       in Sequencer::PlanError::Reason::UnresolvedEnv
         "unresolved env #{ex.detail} — add it in the Project tab's ENV pane"
       end
@@ -690,9 +623,11 @@ module Gori::Tui
     end
 
     private def render_config(screen : Screen, rect : Rect, focused : Bool) : Nil
-      Frame.card(screen, rect, "SEQUENCER", border: focused ? Theme.focus_gold : Theme.border, bg: Theme.bg)
+      # No border TITLE — see MinerView#render_summary: the tab bar and the sub-tab strip above
+      # already name this tab. SAMPLES/ANALYSIS below keep theirs; those name panes.
+      Frame.card(screen, rect, border: focused ? Theme.focus_gold : Theme.border, bg: Theme.bg)
       chord, name = @running ? {"^X", "STOP"} : {"^R", "RUN"}
-      Frame.toggle_badge(screen, rect.right - 1, rect.y, rect.x + "SEQUENCER".size + 4, chord, name, @running)
+      Frame.toggle_badge(screen, rect.right - 1, rect.y, rect.x + 2, chord, name, @running)
       x = rect.x + 2
       y = rect.y + 1
       # Guarded like every line below it: on a 1-2 row card `rect.y + 1` is the bottom
@@ -756,6 +691,7 @@ module Gori::Tui
       screen.text(inner.x + 16, inner.y, "TOKEN", Theme.muted, Theme.bg)
       screen.text(inner.right - 5, inner.y, "LEN", Theme.muted, Theme.bg)
       cap = inner.h - 1
+      @samples_last_h = cap
       ensure_visible(cap)
       cap.times do |i|
         idx = @scroll + i
@@ -999,7 +935,7 @@ module Gori::Tui
       cfg, _, _ = pane_rects(rect)
       return nil if cfg.empty?
       chord, name = @running ? {"^X", "STOP"} : {"^R", "RUN"}
-      Frame.right_badge_hit(mx, my, cfg.y, cfg.right - 1, cfg.x + "SEQUENCER".size + 4,
+      Frame.right_badge_hit(mx, my, cfg.y, cfg.right - 1, cfg.x + 2,
         [{:run, chord, name}] of {Symbol, String, String})
     end
   end

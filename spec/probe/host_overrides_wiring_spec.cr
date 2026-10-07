@@ -29,7 +29,15 @@ module Gori::Probe
   class Analyzer
     def spec_execute_active(rule : Active::Rule, plan : Active::Plan,
                             detail : Store::FlowDetail) : Int32?
-      execute_active(rule, plan, detail)
+      execute_active(rule, plan, detail, worker_sender(detail))
+    ensure
+      release_worker_sender
+    end
+
+    # The kept-alive worker sender WITHOUT releasing it between calls, the way consecutive tasks
+    # for one origin see it.
+    def spec_worker_sender(detail : Store::FlowDetail) : Fuzz::Sender
+      worker_sender(detail)
     end
   end
 end
@@ -259,6 +267,22 @@ describe "Probe::Analyzer honours the project host overrides (live TUI)" do
     end
   end
 
+  # The worker keeps one sender per origin across tasks, and a pool dials once — so an override
+  # added mid-run kept riding the parked socket to the old address while tasks kept coming.
+  it "rebuilds the kept-alive sender when the host's override changes" do
+    with_ov_store do |store|
+      scope = Gori::Scope.load(store)
+      ov = Gori::HostOverrides.load(store)
+      detail = store.get_flow(seed_flow(store, 9)).not_nil!
+      analyzer = Gori::Probe::Analyzer.new(store, scope,
+        Channel(Gori::Store::FlowEvent).new(1), Gori::Probe::Mode::Active, false, overrides: ov)
+      first = analyzer.spec_worker_sender(detail)
+      analyzer.spec_worker_sender(detail).should be(first)
+      ov.add("nonexistent.invalid", "127.0.0.1:9").should be_true
+      analyzer.spec_worker_sender(detail).should_not be(first)
+    end
+  end
+
   it "reaches nothing when the analyzer was given no overrides (control run)" do
     responder = Responder.new
     begin
@@ -329,7 +353,7 @@ describe "host overrides reach every dialer (source-grep guard)" do
     }
     root = File.expand_path(File.join(__DIR__, "..", ".."))
     offenders = [] of String
-    Dir.glob(File.join(root, "src", "**", "*.cr")).sort.each do |path|
+    glob_files(root, "src", "**", "*.cr").sort.each do |path|
       rel = Path[path].relative_to(root).to_s
       lines = File.read_lines(path)
       lines.each_with_index do |line, i|

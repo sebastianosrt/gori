@@ -97,6 +97,42 @@ describe "Gori::Tui::ReadPane soft wrap" do
     pane.at_top?.should be_true
   end
 
+  # `at_bottom?` is `at_top?`'s mirror — what a controller consults to decide whether ↓ should
+  # leave for the pane BELOW — and it takes a switch `at_top?` never needed, because the two
+  # edges are not asked by the same kind of pane.
+  it "is not 'at bottom' while the caret sits on a continuation row of the last line" do
+    pane = wrapped_pane(["first", "#{"q" * 200}"])
+    render_wrapped(pane, w: 40, h: 8)
+    pane.move(1, 0) # onto the wrapped last line's first row
+    pane.cursor.cy.should eq(1)
+    pane.at_bottom?.should be_false # rows of it still below the caret
+    8.times { pane.move(1, 0) }     # walk to the end of it
+    pane.at_bottom?.should be_true
+  end
+
+  # …and the other half of that switch. A pane whose ↓ is `goto_line` steps LOGICAL lines, so
+  # the wrapped remainder of its last line is the same entry rather than a row to step onto.
+  # Asking the visual question there answers false forever while `goto_line` has already
+  # clamped — the key does nothing at all, which is exactly what Probe's AFFECTED URLS list did
+  # on any finding whose last URL wrapped.
+  it "answers 'at bottom' on the last LINE when the caller steps logically" do
+    pane = wrapped_pane(["first", "#{"q" * 200}"])
+    render_wrapped(pane, w: 40, h: 8)
+    pane.goto_line(1)
+    pane.cursor.cx.should eq(0) # a logical step parks at the line start, mid-wrap
+    pane.at_bottom?.should be_false
+    pane.at_bottom?(visual: false).should be_true
+  end
+
+  # An EMPTY pane has no caret to move, so the key has nowhere else to go and must not become a
+  # no-op — the same choice `IssuesView#links_at_bottom?` makes for a link list with no links.
+  it "answers 'at bottom' for a pane with no rows at all" do
+    pane = wrapped_pane([] of String)
+    render_wrapped(pane, w: 40, h: 8)
+    pane.at_bottom?.should be_true
+    pane.at_bottom?(visual: false).should be_true
+  end
+
   # Home is a LOGICAL line start, so from a caret parked several rows into a wrapped line it
   # has to pull the ANCHOR back with it — otherwise the caret jumps to a row above the window
   # and the next frame's `ensure_visible` is the only thing that saves it.
@@ -246,6 +282,24 @@ describe "Gori::Tui::ReadPane soft wrap" do
     b.row(1)[10, 3].should eq("RED")
     b.fg_at(10, 1).should eq(Theme.red)
     b.fg_at(9, 1).should eq(Theme.text)
+  end
+
+  # `styled_at` is resolved ONCE PER LOGICAL LINE, not once per drawn row — the same rule the
+  # plain `line_at` has always had, and the more important of the two since styling tokenises
+  # the line where materialising it only slices. A 4 KB JSON line filling a wrapped Intercept
+  # preview was being re-tokenised once per visual row, every frame.
+  it "resolves styled_at once per logical line however many rows it wraps to" do
+    text = "z" * 200 # 5 visual rows at w=40
+    pane = Gori::Tui::ReadPane.new(wrap: true)
+    pane.source(2, ->(_i : Int32) { text })
+    calls = [] of Int32
+    styled = ->(i : Int32) do
+      calls << i
+      Highlight::Line{Highlight::Span.new(text, Theme.text)}
+    end
+    render_wrapped(pane, w: 40, h: 8, styled_at: styled)
+    # 8 rows drawn: 5 from line 0 and 3 from line 1 — two resolutions, not eight.
+    calls.should eq([0, 1])
   end
 
   # A single grapheme cluster wider than the pane still gets a row of its own — `Wrap.layout`

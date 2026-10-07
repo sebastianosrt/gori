@@ -44,6 +44,32 @@ private def start_mcp_http_origin(body : String, extra_headers = "") : Int32
   port
 end
 
+# A response binds a request-target value for the next send. Records each request line so
+# the scope-gate example can prove an out-of-scope bound path never reaches this origin.
+private def start_mcp_binding_origin(seen : Array(String)) : Int32
+  origin = TCPServer.new("127.0.0.1", 0)
+  port = origin.local_address.port
+  spawn do
+    conn = origin.accept?
+    if conn
+      begin
+        conn.read_timeout = 5.seconds
+        head = Gori::Proxy::Codec::Http1.read_head(conn)
+        if head
+          seen << String.new(head).lines.first.to_s.strip
+          conn << "HTTP/1.1 200 OK\r\nX-Route: /admin\r\nContent-Length: 0\r\n\r\n"
+          conn.flush
+        end
+      rescue
+      ensure
+        conn.close rescue nil
+      end
+    end
+    origin.close rescue nil
+  end
+  port
+end
+
 # One-shot origin that writes RAW response bytes (framing and all), so a test can hand the
 # engine a chunked body with a trailer section, an 8-bit header value, or two conflicting
 # Content-Length lines — shapes `start_mcp_http_origin` cannot express.
@@ -704,6 +730,47 @@ describe Gori::MCP::Server do
       end
     end
 
+    it "checks a binding-expanded request-target before recording the send" do
+      with_env_syntax(Gori::Env::Syntax::Bare) do
+        with_store_env do |store|
+          scope = Gori::Scope.load(store)
+          scope.add("include", "string", "/$route")
+          scope.enable
+          Gori::Bindings.load(store).add("route", "", Gori::ExtractKind::Header, "X-Route").should be_nil
+          seen = [] of String
+          port = start_mcp_binding_origin(seen)
+          first = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_request","arguments":{"url":"http://127.0.0.1:#{port}/seed","allow_unscoped":true}}})
+          raw = "GET /$route HTTP/1.1\r\nHost: 127.0.0.1:#{port}\r\n\r\n"
+          second = JSON.build do |j|
+            j.object do
+              j.field "jsonrpc", "2.0"
+              j.field "id", 2
+              j.field "method", "tools/call"
+              j.field "params" do
+                j.object do
+                  j.field "name", "send_request"
+                  j.field "arguments" do
+                    j.object do
+                      j.field "url", "http://127.0.0.1:#{port}/"
+                      j.field "raw", raw
+                    end
+                  end
+                end
+              end
+            end
+          end
+
+          responses = mcp_drive(store, first, second, verify_upstream: false)
+          responses[1]["result"]["isError"].as_bool.should be_true
+          responses[1]["result"]["structuredContent"]["error_code"].as_s.should eq("SCOPE_BLOCKED")
+          # Only the allowed seed request was sent and recorded. The bound value moved the
+          # second request from the included /$route path to /admin.
+          seen.should eq(["GET /seed HTTP/1.1"])
+          store.count.should eq(1)
+        end
+      end
+    end
+
     it "allows an out-of-scope send with allow_unscoped:true" do
       with_store do |store|
         store.add_scope_rule("include", "host", "example.com")
@@ -831,7 +898,7 @@ describe Gori::MCP::Server do
           "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n".to_slice,
           false, true, nil, 0)
         good = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n"
-        store.update_repeater_response(rid, good.to_slice, Bytes.empty, nil, 42_i64)
+        store.update_repeater_response(rid, good.to_slice, Bytes.empty, nil, 42_i64, request_sha256: nil)
 
         call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_websocket","arguments":{"repeater_id":#{rid},"messages":["ping"],"idle_ms":100,"allow_unscoped":true}}})
         resp = mcp_drive(store, call, verify_upstream: false)[0]
@@ -855,15 +922,48 @@ describe Gori::MCP::Server do
           "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n".to_slice,
           false, true, nil, 0)
         store.update_repeater_response(rid,
-          "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n".to_slice, Bytes.empty, nil, 42_i64)
+          "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n".to_slice, Bytes.empty, nil, 42_i64, request_sha256: nil)
 
         call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_websocket","arguments":{"repeater_id":#{rid},"messages":["ping"],"idle_ms":100,"allow_unscoped":true}}})
         resp = mcp_drive(store, call, verify_upstream: false)[0]
         resp["result"]["isError"].as_bool.should be_true
+        # The origin answered, so the handshake was delivered — not a retryable network fault.
+        payload = mcp_tool_payload(resp)
+        payload["delivered"].as_bool.should be_true
+        payload["retryable"].as_bool.should be_false
 
         row = store.get_repeater_full(rid).not_nil!
         String.new(row.response_head.not_nil!).should contain("403")
         row.response_error.not_nil!.should contain("did not upgrade")
+      end
+    end
+
+    it "sends an HTTP-only WebSocket session through send_request, not send_websocket" do
+      with_store do |store|
+        handshake = "GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+        id = store.insert_repeater("http://127.0.0.1:1", handshake.to_slice, false, false, nil, 0, ws_http_only: true)
+        t = tools_for(store)
+        r = t.call("send_websocket", JSON.parse(%({"repeater_id":#{id},"allow_unscoped":true})))
+        r.is_error.should be_true
+        r.text.should contain("send_request")
+        # send_request no longer refuses it as "use send_websocket": it reaches the dial.
+        r = t.call("send_request", JSON.parse(%({"repeater_id":#{id},"allow_unscoped":true,"record_history":false})))
+        r.text.should_not contain("use send_websocket")
+      end
+    end
+
+    it "writes a repeater_id send's answer back onto the session, as the CLI and the TUI do" do
+      with_store do |store|
+        port = start_mcp_http_origin("fresh")
+        request = "GET /x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        rid = store.insert_repeater("http://127.0.0.1:#{port}", request.to_slice, false, true, nil, 0)
+        store.update_repeater_response(rid, "HTTP/1.1 500 Old\r\n\r\n".to_slice, Bytes.empty, nil, 1_i64, request_sha256: nil)
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_request","arguments":{"repeater_id":#{rid},"allow_unscoped":true}}})
+        mcp_drive(store, call)[0]["result"]["isError"].as_bool.should be_false
+        row = store.get_repeater_full(rid).not_nil!
+        String.new(row.response_head.not_nil!).should contain("200 OK")
+        String.new(row.response_body.not_nil!).should eq("fresh")
+        row.response_request_sha256.should eq(Gori::Evidence.request_digest(request.to_slice))
       end
     end
 

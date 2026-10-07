@@ -94,7 +94,7 @@ describe "mode badges" do
   it "are never drawn behind a focus gate" do
     root = File.join(__DIR__, "..", "..", "src", "gori", "tui")
     offenders = [] of String
-    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+    glob_files(root, "**", "*.cr").sort.each do |path|
       next if File.basename(path) == "frame.cr" # the helper itself
       lines = File.read(path).lines
       lines.each_with_index do |line, i|
@@ -212,7 +212,7 @@ describe "advertised chords" do
     out = Set(String).new
     root = File.join(__DIR__, "..", "..", "src", "gori", "tui")
     paths = [File.join(root, file)]
-    paths.concat(Dir.glob(File.join(root, File.basename(file, ".cr"), "*.cr")).sort)
+    paths.concat(glob_files(root, File.basename(file, ".cr"), "*.cr").sort)
     paths.each do |path|
       File.read(path).each_line do |line|
         next if line.matches?(/^\s*#/) # prose, not a label
@@ -266,16 +266,15 @@ describe "marker actions across the two template editors" do
     {"repeater.toggle-http2", "fuzz.toggle-http2"},
   }.each do |(rep, fuzz)|
     it "gives #{rep.split('.').last} the same menu letter in both panes" do
-      registry[rep].menu_key.should eq(registry[fuzz].menu_key)
+      registry.menu_keys(rep).should eq(registry.menu_keys(fuzz))
     end
   end
 
-  it "leaves the SNI pair apart, because the Fuzzer cannot have the Repeater's letter" do
-    # NOT drift, and the one pair deliberately left unmatched: the space menu shows COMMON
-    # plus the focused section, and `fuzz.stop` already owns 's' in the Fuzzer's COMMON —
-    # the Repeater has no stop verb, so 's' was free there. Aligning would raise at boot.
-    registry["repeater.toggle-sni"].menu_key.should eq('s')
-    registry["fuzz.toggle-sni"].menu_key.should_not eq('s')
+  it "brings the SNI pair together one level down, where the Fuzzer's stop cannot compete" do
+    # They were `s` and `i` at level 1: `fuzz.stop` owns 's' in the Fuzzer's COMMON. Inside
+    # Protocol… (#1274) nothing else competes, so both are `P s`.
+    registry.menu_keys("repeater.toggle-sni").should eq(['P', 's'])
+    registry.menu_keys("fuzz.toggle-sni").should eq(['P', 's'])
     registry.find { |v| v.scope == Gori::Verb::Scope::Fuzzer && v.section == :common && v.menu_key == 's' }
       .should_not be_nil
   end
@@ -283,13 +282,15 @@ describe "marker actions across the two template editors" do
   it "gives every marker action a space-menu entry in both panes" do
     # `menu_key` nil ⇒ the verb is EXCLUDED from the space menu. That is what the Fuzzer's
     # two `chord_action` arms amounted to: no verb, so nothing to list.
-    %w(mark-word insert-marker automark clear-marks).each do |a|
+    %w(insert-marker automark clear-marks).each do |a|
       fuzz_id = a == "automark" ? "fuzz.automark" : "fuzz.#{a}"
       registry[fuzz_id].menu_key.should_not be_nil
     end
-    %w(mark-word insert-marker auto-mark clear-marks).each do |a|
+    %w(insert-marker auto-mark clear-marks).each do |a|
       registry["repeater.#{a}"].menu_key.should_not be_nil
     end
+    # Mark word is a verb in both, placed in the palette in both (#1282): `^K` is its key.
+    %w[repeater.mark-word fuzz.mark-word].each { |id| registry[id].palette_only?.should be_true }
   end
 end
 
@@ -351,5 +352,50 @@ describe "sub-tab strip hit-tests" do
     # And the split itself is derived from the same helper the renderer uses.
     split = code.join("\n")[/private def subtab_strip_split.*?\n  end/m].not_nil!
     split.should contain("BodyChrome.find_icon_split")
+  end
+end
+
+# The tutorial's mock REQUEST card is the fourth pane on this axis, and it failed BOTH ways at
+# once: it painted a `Frame.mode_badge` that answered no clicks, while the card BODY — which
+# paints no control at all — was the one live region, and what it did there was enter INSERT.
+#
+# The app it teaches does neither (#1124): a press on the chip toggles the mode, a press on the
+# body places a caret and changes no mode. The mock has no caret, so its body is inert now and
+# the chip is the live cell, which is the honest lesson.
+describe "the tutorial's mock mode badge" do
+  # Comments stripped for the reason the two source-grep rules above give: the prose explaining
+  # a rule contains the tokens the rule looks for.
+  tutorial_body = ->(signature : String) do
+    src = File.read(File.join(__DIR__, "..", "..", "src", "gori", "tui", "tutorial.cr"))
+      .lines.reject(&.lstrip.starts_with?('#')).join('\n')
+    body = src[/^\s*#{Regex.escape(signature)}.*?^    end$/m]?
+    body.should_not be_nil
+    body.not_nil!
+  end
+
+  it "is what the Edit lesson's pointer acts on, instead of the card body" do
+    body = tutorial_body.call("private def handle_shell_click(mx : Int32, my : Int32) : Nil")
+    arm = body[/if @step\.edit\?\n.*?\n\s*end/m]?
+    arm.should_not be_nil
+    arm.not_nil!.should contain("edit_badge_hit?")
+    arm.not_nil!.should contain("toggle_edit_insert")
+    # The two shapes it replaced: a one-way door into INS, opened by the whole card.
+    arm.not_nil!.should_not contain("@request_rect.contains?")
+    arm.not_nil!.should_not match(/\benter_insert\b/)
+  end
+
+  it "is hit-tested at the numbers the card draws it with" do
+    draw = tutorial_body.call("private def render_request_pane(screen : Screen, rect : Rect, focused : Bool, *,")
+    hit = tutorial_body.call("private def edit_badge_hit?(mx : Int32, my : Int32) : Bool")
+    # `min_x`: the badge is refused below it by BOTH `Frame.mode_badge` and `mode_badge_hit`,
+    # so a disagreement here is a live cell over an unpainted one (or the reverse).
+    draw[/badge_min = rect\.x \+ (\d+)/, 1].should eq(hit[/r\.x \+ (\d+)/, 1])
+    # …and the card-too-small bail, which is what stops the hit-test answering for a badge the
+    # draw returned before painting.
+    draw[/rect\.w < (\d+)/, 1].should eq(hit[/r\.w < (\d+)/, 1])
+    draw[/rect\.h < (\d+)/, 1].should eq(hit[/r\.h < (\d+)/, 1])
+    # The right edge and the row are spelled once each, and both are the card's own.
+    hit.should contain("r.right - 1")
+    draw.should contain("rect.right - 1")
   end
 end

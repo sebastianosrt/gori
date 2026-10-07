@@ -1,6 +1,7 @@
 require "./screen"
 require "./theme"
 require "./highlight"
+require "./reveal"
 
 module Gori::Tui
   # Soft wrap: one LOGICAL line → N VISUAL rows, Burp-style (the line number is printed
@@ -96,19 +97,25 @@ module Gori::Tui
     # chars stay inside whichever row their neighbours land on: a run's edges are `¦`/`§`,
     # both Grapheme_Cluster_Break=Other, so a run never straddles a cluster and a break can
     # never fall inside one.
-    def self.layout(line : String, width : Int32, conceal : Array({Int32, Int32})? = nil) : Layout
+    def self.layout(line : String, width : Int32, conceal : Array({Int32, Int32})? = nil,
+                    *, reveal : Bool = false) : Layout
       len = line.size
       # A degenerate width can't be divided into; one row, clipped by the drawer as before.
       return Layout.new(len, 1, [0]) if width <= 0
-      if (conceal.nil? || conceal.empty?) && line.ascii_only?
+      ascii = Screen.printable_ascii?(line)
+      if ascii && (conceal.nil? || conceal.empty?)
         return Layout.new(len, width, nil) # uniform grid — see Layout
       end
+      # `reveal` is Reveal.styled's visible whitespace markers. Tabs and controls can be
+      # narrower there than their default named badges, so wrap at what is actually drawn —
+      # and printable ASCII has neither, so it wraps as it always does.
+      reveal &&= !ascii
       starts = [0]
       col = 0
       i = 0
       line.each_grapheme do |g|
         n = g.size
-        w = hidden?(conceal, i) ? 0 : Screen.grapheme_cols(g.to_s)
+        w = hidden?(conceal, i) ? 0 : (reveal ? Reveal.grapheme_cols(g.to_s) : Screen.grapheme_cols(g.to_s))
         # `col > 0`: a cluster too wide for the whole row keeps its own row rather than
         # being split — the one case where a row overflows `width` on purpose.
         if col > 0 && col + w > width
@@ -119,6 +126,14 @@ module Gori::Tui
         i += n
       end
       Layout.new(len, width, starts)
+    end
+
+    def self.draw_width(line : String, reveal : Bool = false) : Int32
+      reveal ? Reveal.draw_width(line) : Screen.draw_width(line)
+    end
+
+    def self.draw_width_upto(line : String, limit : Int32, reveal : Bool = false) : Int32
+      reveal ? Reveal.draw_width_upto(line, limit) : Screen.draw_width_upto(line, limit)
     end
 
     # --- the (line, sub-row) scroll anchor -----------------------------------
@@ -261,12 +276,13 @@ module Gori::Tui
     def self.step_caret(li : Int32, cx : Int32, dr : Int32, size : Int32,
                         line_at : Int32 -> String,
                         layout_at : Int32 -> Layout,
-                        conceal_at : (Int32 -> Array({Int32, Int32})?)? = nil) : {Int32, Int32}
+                        conceal_at : (Int32 -> Array({Int32, Int32})?)? = nil,
+                        *, reveal : Bool = false) : {Int32, Int32}
       return {li, cx} if dr == 0 || size <= 0
       li = li.clamp(0, size - 1)
       lay = layout_at.call(li)
       sub = lay.row_of(cx)
-      goal = row_col(line_at.call(li), conceal_at.try &.call(li), lay.start_of(sub), cx)
+      goal = row_col(line_at.call(li), conceal_at.try &.call(li), lay.start_of(sub), cx, reveal: reveal)
       n = dr.abs
       while n > 0
         if dr > 0
@@ -293,7 +309,8 @@ module Gori::Tui
         n -= 1
       end
       target = line_at.call(li)
-      {li, row_index(target, conceal_at.try &.call(li), lay.start_of(sub), lay.end_of(sub), goal)}
+      {li, row_index(target, conceal_at.try &.call(li), lay.start_of(sub), lay.end_of(sub), goal,
+        reveal: reveal)}
     end
 
     # Whether char index `i` falls inside a concealed run. Linear in the run count, which is
@@ -321,96 +338,62 @@ module Gori::Tui
     # least showed the match once you scrolled to it. So the scan runs over the WHOLE
     # logical line and each match is clipped to the row — a straddling match is highlighted
     # on BOTH rows it occupies, which is also what the reader expects to see.
-    # `lower` is `line.downcase`, supplied by a caller that already has it. The scan needs a
-    # downcased copy of the WHOLE logical line (see above), so a wrapped line that fills the
-    # viewport would otherwise pay for one `downcase` of the entire line PER DRAWN ROW — on
-    # the Decoder OUTPUT that line can be a multi-MB minified body. A caller drawing one row
-    # at a time hoists it beside the line itself and hands it in; anything else omits it and
-    # gets exactly the old behaviour.
-    # The downcased copy `mark_search` scans, made once per LOGICAL line across a row loop.
-    # Under wrap one minified body line can fill the viewport, and a loop that downcased the
-    # line per DRAWN row paid for a copy of it forty times a frame; `ReadPane` hoisted the
-    # copy beside its cached line, and this is that hoist as an object so the seven other
-    # row loops (History detail, Repeater response) carry one line instead of a state pair.
-    class LowerMemo
-      def initialize
-        @li = -1
-        @lower = ""
-      end
-
-      # `text`'s downcase, reused while `li` is the line it was made from.
-      def for(li : Int32, text : String) : String
-        if li != @li
-          @li = li
-          @lower = text.downcase
-        end
-        @lower
-      end
-    end
-
+    #
+    # The WHOLE-line work — the downcased copy, the match walk, the ASCII verdicts and the
+    # char↔byte bookkeeping of every hit — is a `SearchScan`, built once per (line, query)
+    # and kept across rows AND frames by the pane's `SearchMemo`. Every pane with a live
+    # query calls this once per drawn row, and under wrap one minified body line fills the
+    # viewport: doing that work per row cost 1-3 full passes of a 1.6 MB line × 40 rows, 60-150
+    # ms a frame on the single scheduler the proxy runs on (P6). Per row what is left is a
+    # binary search for the first hit that reaches the row and the hits that land in it.
+    # Without a `memo` the scan is built for this one call, which is the same answer.
     def self.mark_search(screen : Screen, x : Int32, y : Int32, line : String,
                          a : Int32, b : Int32, query : String, max_x : Int32,
                          conceal : Array({Int32, Int32})? = nil, xoff : Int32 = 0,
-                         lower : String? = nil) : Nil
+                         memo : SearchMemo? = nil, *, reveal : Bool = false) : Nil
       return if query.empty? || line.empty? || a >= b
-      q = query.downcase
-      dl = lower || line.downcase
+      scan = memo ? memo.scan(line, query) : SearchScan.new(line, query)
       # Match in the downcased copy, then slice the ORIGINAL to preserve case — valid only
       # while downcase is 1:1. For the rare char that changes length under it (U+0130 'İ'
       # → "i" + U+0307) fall back to the downcased string for the COLUMN as well as the
       # slice: `i` is an index into `dl`, and measuring it against `line` put the band a
       # glyph off — the two disagree about how many chars precede the match.
-      same = dl.size == line.size
-      src = same ? line : dl
+      src = scan.src
       lo, hi = a, b
-      unless same
+      unless scan.one_to_one?
         # `a`/`b` index `line`, which the downcased copy no longer lines up with, so the
         # only row that can be marked without mapping the bounds across that difference is
         # one covering the WHOLE line — every row with soft wrap off, and the only shape the
         # retired plain-string marker ever had. A wrapped row of such a line is left unmarked
         # rather than marked at a column, or a length, that is a glyph off.
         return unless a <= 0 && b >= line.size
-        lo, hi = 0, dl.size
+        lo, hi = 0, scan.dl.size
       end
-      # The scan is BYTE-linear, and every index the draw needs rides along on it. It used
-      # to call `dl.index(q, pos)` with a CHARACTER offset, and `String#index` converts one
-      # by walking that many characters from byte 0 on EVERY call — so a token-dense line
-      # (a minified body is one long line with a match every other column) re-walked its
-      # whole prefix per match. `row_col` re-walked from the row start per match on top of
-      # that, and a char-index slice of a non-ASCII string re-walked from byte 0 a third
-      # time, which is why CJK cost 150x what ASCII did at the same match count. All three
-      # were O(line²); `bench/mark_search_bench.cr` is the harness that charts the growth.
-      #
-      # `byte_index` resumes where the last match ended; the three cursors below each walk
-      # their string once and answer a NON-DECREASING sequence of questions, which is the
-      # order the matches arrive in.
-      #
-      # Each is built on FIRST USE rather than up front, and that is measured, not tidiness:
-      # while a query is live every drawn row calls this, and most of them are rows whose
-      # logical line holds no match at all, where the whole body is one `byte_index` scan.
-      # Three cursors held alive across that scan cost it ~75% (1.3 ms → 2.3 ms over an
-      # 800k-char line) — the scan is inlined and register-bound, and a multi-MB body is ONE
-      # line, so it is the frame's cost.
-      chars = nil.as(Offsets?) # `dl` byte offset → the char index the row bounds speak
-      bytes = nil.as(Offsets?) # char index → the byte offset the drawn slice is cut at
+      # The hits are in order and do not overlap, so the ones touching the row are one run:
+      # it starts at the first hit that ENDS past the row start (`i + qn > lo`, a match that
+      # straddles the head counts) and stops at the first that starts at or past `hi`.
+      chars = scan.hit_chars
+      qn = scan.qn
+      k = chars.bsearch_index { |c| c + qn > lo }
+      return unless k
       cols = nil.as(ColRun?)   # char index → display column, i.e. `row_col` carried forward
-      qn = q.size
-      qb = q.bytesize
-      pos = 0
-      while nb = dl.byte_index(q, pos)
-        pos = nb + qb
-        i = (chars ||= Offsets.new(dl)).char_at(nb)
+      bytes = nil.as(Offsets?) # char index → the byte offset the drawn slice is cut at
+      while k < chars.size
+        i = chars[k]
+        k += 1
         break if i >= hi # matches only move right, so nothing after this one touches the row
         ma = {i, lo}.max
         mb = {i + qn, hi}.min
         next if ma >= mb # this match doesn't touch the row
-        col = x + (cols ||= ColRun.new(src, conceal, lo)).col_at(ma) - xoff
+        col = x + (cols ||= ColRun.new(src, conceal, lo, reveal, scan.src_printable?, scan.marks)).col_at(ma) - xoff
         # `row_col` is monotone in `ma` and `x`/`xoff` are fixed, so `col` only grows: once
         # the band starts at or past the clip, every later match is clipped too. Without
         # this the loop still walked a match-dense line to its end to paint nothing.
         break if {col, x}.max >= max_x
-        # One cursor, both ends, in order — it only moves forward.
-        seek = (bytes ||= Offsets.new(src))
+        # The cursor is re-seated on this hit's own (char, byte) pair, recorded by the scan's
+        # one walk, so it steps at most `qn` chars instead of walking from byte 0.
+        seek = (bytes ||= Offsets.new(src, scan.src_ascii?))
+        seek.seat(i, scan.hit_src_bytes[k - 1])
         ma_b = seek.byte_at(ma)
         seg = src.byte_slice(ma_b, seek.byte_at(mb) - ma_b)
         # Concealed chars inside the match aren't on screen; drop them so the overdraw
@@ -419,12 +402,184 @@ module Gori::Tui
         if col < x
           # Cut the columns that scrolled off the left, cluster-wise (`slice_left_text`'s
           # rule) — the base draw cut them the same way, so what is left lines up with it.
-          seg = Highlight.slice_left_text(seg, x - col)
+          seg = reveal ? Reveal.slice_left_text(seg, x - col) : Highlight.slice_left_text(seg, x - col)
           col = x
         end
         # `col < max_x` is not re-tested: the break above is that predicate, taken one match
         # earlier, and the drawn column is `{col, x}.max` either way.
-        screen.text(col, y, seg, Theme.bg, Theme.yellow, width: {max_x - col, 0}.max) unless seg.empty?
+        shown = reveal ? Reveal.rendered_text(seg) : seg
+        screen.text(col, y, shown, Theme.bg, Theme.yellow, width: {max_x - col, 0}.max) unless shown.empty?
+      end
+    end
+
+    # One pane's ^F scan cache, carried across frames: the drawn rows of a logical line, and
+    # the next frame's rows of it, share one `SearchScan`. Bounded to two entries — the last
+    # line at least `BIG` bytes (the one worth keeping: a minified body filling the viewport)
+    # and the last shorter one (the rows of a short wrapped line, cheap to rebuild) — so the
+    # short lines drawn around a body cannot evict it on every frame. A new query on a line
+    # already held keeps that line's query-independent half (`SearchText`), so typing into
+    # the ^F prompt re-walks only the matches, not the downcase and the grapheme checkpoints.
+    #
+    # An entry is keyed by the line's CONTENT and the query, not a line index: the providers
+    # hand back a fresh String for the same line after their own one-entry caches move on, and
+    # an index would survive an edit of the line it names. Identity is tried first, so the
+    # memcmp runs once per frame at most.
+    class SearchMemo
+      BIG = 4096
+
+      @big : SearchScan? = nil
+      @small : SearchScan? = nil
+
+      def scan(line : String, query : String) : SearchScan
+        big = line.bytesize >= BIG
+        held = big ? @big : @small
+        return held if held && held.for?(line, query)
+        text = held && held.text.for?(line) ? held.text : SearchText.new(line)
+        s = SearchScan.new(text, query)
+        if big
+          @big = s
+        else
+          @small = s
+        end
+        s
+      end
+
+      # Drop both entries; a pane calls this when its query goes away, so a closed ^F does
+      # not keep a multi-MB body's downcased copy alive.
+      def clear : Nil
+        @big = nil
+        @small = nil
+      end
+    end
+
+    # The query-independent half of a scan: the downcased copy, which string the band is cut
+    # from, the ASCII verdicts the per-row cursors used to recompute with a full walk each,
+    # and the grapheme checkpoints.
+    class SearchText
+      getter line : String
+      getter dl : String
+      getter src : String
+      getter? one_to_one : Bool # `downcase` kept the char count (see `mark_search`)
+      getter? dl_ascii : Bool
+      getter? src_ascii : Bool
+      @src_printable : Bool? = nil
+      @marks : ClusterMarks? = nil
+
+      def initialize(@line : String)
+        @dl = @line.downcase
+        # Match in the downcased copy, then slice the ORIGINAL to preserve case — valid only
+        # while downcase is 1:1 (see `mark_search` for the U+0130 fallback).
+        @one_to_one = @dl.size == @line.size
+        @src = @one_to_one ? @line : @dl
+        @dl_ascii = @dl.ascii_only?
+        @src_ascii = @src.same?(@dl) ? @dl_ascii : @src.ascii_only?
+      end
+
+      # Whether this is `line`'s text. A content-equal line that is a different String is
+      # adopted, so the next row's check is an identity test again.
+      def for?(line : String) : Bool
+        return true if line.same?(@line)
+        return false unless line == @line
+        @line = line
+        @src = line if @one_to_one
+        true
+      end
+
+      def src_printable? : Bool
+        v = @src_printable
+        v.nil? ? (@src_printable = Screen.printable_ascii?(@src)) : v
+      end
+
+      # The grapheme checkpoints `ColRun` resumes from, built only when a non-ASCII row asks.
+      def marks : ClusterMarks?
+        return nil if src_printable?
+        @marks ||= ClusterMarks.new(@src)
+      end
+    end
+
+    # A `SearchText` plus one query's matches in it: the retired loop's non-overlapping
+    # left-to-right `byte_index` walk over the downcased copy, verbatim, with the char index
+    # and the drawn string's byte offset of each hit recorded by one forward walk apiece.
+    class SearchScan
+      getter text : SearchText
+      getter query : String
+      getter qn : Int32
+      # Char index (in `dl`, which is also `src`'s char index) of every hit, ascending.
+      getter hit_chars : Array(Int32)
+      # Byte offset in `src` of each hit's first char.
+      getter hit_src_bytes : Array(Int32)
+
+      delegate line, dl, src, one_to_one?, src_ascii?, src_printable?, marks, to: @text
+
+      def self.new(line : String, query : String) : SearchScan
+        new(SearchText.new(line), query)
+      end
+
+      def initialize(@text : SearchText, @query : String)
+        q = @query.downcase
+        dl = @text.dl
+        @qn = q.size
+        qb = q.bytesize
+        hit_bytes = [] of Int32
+        pos = 0
+        while nb = dl.byte_index(q, pos)
+          hit_bytes << nb
+          pos = nb + qb
+        end
+        @hit_chars = if @text.dl_ascii?
+                       hit_bytes
+                     else
+                       chars = Offsets.new(dl, false)
+                       hit_bytes.map { |off| chars.char_at(off) }
+                     end
+        src = @text.src
+        @hit_src_bytes = if src.same?(dl)
+                           hit_bytes
+                         elsif @text.src_ascii?
+                           @hit_chars
+                         else
+                           seek = Offsets.new(src, false)
+                           @hit_chars.map { |c| seek.byte_at(c) }
+                         end
+      end
+
+      def for?(line : String, query : String) : Bool
+        query == @query && @text.for?(line)
+      end
+    end
+
+    # Snapshots of ONE grapheme walk of `src` from its head, one every `STRIDE` chars, so a
+    # row's column cursor starts at the nearest snapshot before the row instead of walking
+    # every cluster in front of it. A snapshot is a `dup` of the iterator itself — its state
+    # is the reader, the break state and the last char — so resuming from one yields exactly
+    # the clusters the head walk would have, including the pairing state a regional-indicator
+    # run carries across a boundary; `ColRun`'s answers cannot move. Filled lazily and only
+    # forward: a row past the last snapshot extends the table as its walk goes.
+    class ClusterMarks
+      STRIDE = 256
+
+      def initialize(src : String)
+        @pos = [0]
+        @its = [src.each_grapheme.as(Iterator(String::Grapheme))]
+      end
+
+      # A private iterator positioned where the head walk to `lo` stops — the first cluster
+      # boundary at or past `lo` — and that boundary's char index.
+      def seek(lo : Int32) : {Iterator(String::Grapheme), Int32}
+        idx = (@pos.bsearch_index { |p| p > lo } || @pos.size) - 1
+        it = @its[idx].dup
+        p = @pos[idx]
+        at_end = idx == @pos.size - 1
+        while p < lo
+          g = it.next
+          break if g.is_a?(Iterator::Stop)
+          p += g.size
+          if at_end && p >= @pos.last + STRIDE
+            @pos << p
+            @its << it.dup
+          end
+        end
+        {it, p}
       end
     end
 
@@ -448,11 +603,20 @@ module Gori::Tui
       @ci : Int32
       @bi : Int32
 
-      def initialize(s : String)
+      # `ascii` is `s.ascii_only?` (1 byte == 1 char, so both directions are the identity),
+      # passed in by a `SearchScan` that already knows it rather than re-walked per cursor.
+      def initialize(s : String, @ascii : Bool = s.ascii_only?)
         @bytes = s.to_slice
-        @ascii = s.ascii_only? # 1 byte == 1 char, so both directions are the identity
         @ci = 0
         @bi = 0
+      end
+
+      # Re-seat the cursor on a (char index, byte offset) pair the same walk produced, so
+      # the next question walks on from there. Only ever forward of the pair it replaces.
+      def seat(ci : Int32, bi : Int32) : Nil
+        return if @ascii || ci < @ci
+        @ci = ci
+        @bi = bi
       end
 
       # Character index of byte offset `at`, which must be a character boundary (a valid
@@ -510,16 +674,20 @@ module Gori::Tui
       # Concealed runs already passed; they arrive sorted (`TextArea#line_conceal`).
       @ri : Int32
       @ascii : Bool
+      @reveal : Bool
       @clusters : Iterator(String::Grapheme)?
       @pending : String::Grapheme?
 
-      def initialize(@src : String, @conceal : Array({Int32, Int32})?, lo : Int32)
+      # `ascii` is `Screen.printable_ascii?(src)` and `marks` the scan's grapheme checkpoints
+      # (nil on that ASCII path), both held by the `SearchScan` so neither is a per-row walk.
+      def initialize(@src : String, @conceal : Array({Int32, Int32})?, lo : Int32,
+                     @reveal : Bool, @ascii : Bool,
+                     @marks : ClusterMarks? = nil)
         @len = @src.size
         @lo = lo.clamp(0, @len)
         @pos = @lo
         @col = 0
         @ri = 0
-        @ascii = @src.ascii_only?
         @clusters = nil
         @pending = nil
       end
@@ -571,7 +739,7 @@ module Gori::Tui
             return @col + Screen.draw_width(g.to_s[0, t - @pos])
           end
           @pending = nil
-          @col += Screen.grapheme_cols(g.to_s)
+          @col += @reveal ? Reveal.grapheme_cols(g.to_s) : Screen.grapheme_cols(g.to_s)
           @pos = e
         end
         @col
@@ -598,17 +766,25 @@ module Gori::Tui
       # The cluster walk, built on first use and only off the ASCII path. It starts at the
       # head of the string, so the clusters before the row are consumed once, contributing
       # no columns to this row.
+      #
+      # With `marks` the head walk resumes from the nearest checkpoint of that same walk, so
+      # it stops on the same boundary with the same iterator state, minus the clusters before
+      # the checkpoint — which on a row deep into a multi-MB line was nearly all of them.
       private def clusters : Iterator(String::Grapheme)
         it = @clusters
         return it if it
-        it = @src.each_grapheme
-        @clusters = it
-        p = 0
-        while p < @lo
-          g = it.next
-          break if g.is_a?(Iterator::Stop)
-          p += g.size
+        if marks = @marks
+          it, p = marks.seek(@lo)
+        else
+          it = @src.each_grapheme
+          p = 0
+          while p < @lo
+            g = it.next
+            break if g.is_a?(Iterator::Stop)
+            p += g.size
+          end
         end
+        @clusters = it
         @pos = {p, @lo}.max
         it
       end
@@ -618,22 +794,23 @@ module Gori::Tui
     # begins at `a`, with concealed chars contributing no cells. `draw_width` semantics
     # (≥1 per cluster), matching what `Highlight.draw` / `Screen#text` actually advance —
     # so caret, selection tint, search overdraw and click all land on the same cells.
-    def self.row_col(line : String, conceal : Array({Int32, Int32})?, a : Int32, cx : Int32) : Int32
+    def self.row_col(line : String, conceal : Array({Int32, Int32})?, a : Int32, cx : Int32,
+                     *, reveal : Bool = false) : Int32
       lo = a.clamp(0, line.size)
       hi = cx.clamp(lo, line.size)
       return 0 if lo >= hi
-      return Screen.draw_width(line[lo...hi]) if conceal.nil? || conceal.empty?
+      return draw_width(line[lo...hi], reveal) if conceal.nil? || conceal.empty?
       w = 0
       pos = lo
       conceal.each do |(ra, rb)|
         next if rb <= lo
         break if ra >= hi
         s = {ra, lo}.max
-        w += Screen.draw_width(line[pos...s]) if s > pos
+        w += draw_width(line[pos...s], reveal) if s > pos
         return w if rb >= hi # cx lands inside the run → the run's own start column
         pos = {rb, pos}.max
       end
-      w + Screen.draw_width(line[pos...hi])
+      w + draw_width(line[pos...hi], reveal)
     end
 
     # Inverse of `row_col` for click hit-testing: the raw char index whose drawn cell holds
@@ -656,7 +833,7 @@ module Gori::Tui
     # holds for both settings rather than resting on the one caller that happens to re-snap
     # afterwards (`TextArea#click_to_cursor`'s `snap_cx_out_of_conceal`).
     def self.row_index(line : String, conceal : Array({Int32, Int32})?, a : Int32, b : Int32,
-                       target : Int32, nearest : Bool = false) : Int32
+                       target : Int32, nearest : Bool = false, *, reveal : Bool = false) : Int32
       lo = a.clamp(0, line.size)
       hi = b.clamp(lo, line.size)
       return lo if target <= 0
@@ -668,7 +845,7 @@ module Gori::Tui
           next
         end
         e = {Screen.cluster_end(line, i + 1), hi}.min
-        w = Screen.draw_width(line[i...e])
+        w = draw_width(line[i...e], reveal)
         return i if target < col + (nearest ? (w + 1) // 2 : w)
         if nearest && target < col + w
           run = conceal.try &.find { |(ra, rb)| e >= ra && e < rb }

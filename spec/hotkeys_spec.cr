@@ -90,6 +90,48 @@ describe Gori::Hotkeys do
       Gori::Hotkeys.binding_for(reg, "rules.edit").should be_nil
       Gori::Hotkeys.binding_for(reg, "app.notifications").should be_nil
     end
+
+    # #1297 moved Save results ⇧S → ⇧E, which was free in the Fuzzer before, so an operator
+    # may already have put another Fuzzer verb there. That rebind wins the key (`Keymap.build`
+    # writes the user layer last); the footer, Help and the palette must not keep saying ⇧E.
+    it "does not advertise a default chord a same-scope rebind took" do
+      reg = Gori::Verbs.registry
+      e = Gori::Verb::Chord.new("e", shift: true)
+      Gori::Hotkeys.binding_for(reg, "fuzz.save-results", {} of String => Array(Gori::Verb::Chord)).should eq(e)
+      took = {"fuzzer.oast-insert" => [e]}
+      km = Gori::Verb::Keymap.build(reg, Gori::Verb::OsProfile::Os::Linux, took)
+      km.lookup(e, Gori::Verb::Scope::Fuzzer).should eq("fuzzer.oast-insert")
+      Gori::Hotkeys.binding_for(reg, "fuzz.save-results", took).should be_nil
+      Gori::Hotkeys.binding_for(reg, "fuzzer.oast-insert", took).should eq(e)
+      # The same chord taken in ANOTHER scope displaces nothing: the Fuzzer still answers it.
+      elsewhere = {"repeater.send" => [e]}
+      Gori::Hotkeys.binding_for(reg, "fuzz.save-results", elsewhere).should eq(e)
+    end
+
+    it "does not advertise a family opener's chord a configured Global verb took" do
+      reg = Gori::Verbs.registry
+      gt = Gori::Verb::Chord.new(">")
+      Gori::Hotkeys.binding_for(reg, "send-flow.open.repeater", {} of String => Array(Gori::Verb::Chord)).should eq(gt)
+      took = {"nav.next-tab" => [gt]}
+      Gori::Verb::Keymap.build(reg, Gori::Verb::OsProfile::Os::Linux, took).lookup(gt, Gori::Verb::Scope::Repeater)
+        .should eq("nav.next-tab")
+      Gori::Hotkeys.binding_for(reg, "send-flow.open.repeater", took).should be_nil
+      # A tab verb elsewhere on `>` is no Global claim: the other tabs' openers keep it.
+      Gori::Hotkeys.binding_for(reg, "send-flow.open.body", {"repeater.send" => [gt]}).should eq(gt)
+    end
+
+    it "names the chord of the verb a keyless one declares `chord_of:`, and follows its rebind (#1295)" do
+      reg = Gori::Verbs.registry
+      reg["repeater.toggle-resp-hex"].chords.should be_empty
+      Gori::Hotkeys.binding_for(reg, "repeater.toggle-resp-hex").should eq(Gori::Verb::Chord.new("x", ctrl: true))
+      working = {"repeater.toggle-hex" => [Gori::Verb::Chord.new("j", ctrl: true)]}
+      Gori::Hotkeys.binding_for(reg, "repeater.toggle-resp-hex", working).should eq(Gori::Verb::Chord.new("j", ctrl: true))
+      # A chord of its own (a rebind of the row itself) wins.
+      own = {"repeater.toggle-resp-hex" => [Gori::Verb::Chord.new("o", ctrl: true)]}
+      Gori::Hotkeys.binding_for(reg, "repeater.toggle-resp-hex", own).should eq(Gori::Verb::Chord.new("o", ctrl: true))
+      # …and its default is the same borrowed chord, not "unbound" (the Hotkeys editor's reset).
+      Gori::Hotkeys.default_for(reg, "repeater.toggle-resp-hex", "auto").should eq(Gori::Verb::Chord.new("x", ctrl: true))
+    end
   end
 
   describe ".display_label / .binding_label" do
@@ -124,6 +166,72 @@ describe Gori::Hotkeys do
       # error the Help spec would catch, and here it stays visible instead of vanishing.
       Gori::Hotkeys.expand(reg, "{no.such.verb} · {oast.copy} · {\"a\":1} · {}").should eq("{no.such.verb} · {oast.copy} · {\"a\":1} · {}")
       Gori::Hotkeys.expand(reg, "no tokens here").should eq("no tokens here")
+    end
+  end
+
+  # The menu path is read off the verb's `menu_key` (the letter the space menu itself draws),
+  # never from a hand-written literal — the Help sheet printed three wrong ones that way (#1274).
+  describe ".menu_path / {space:verb.id}" do
+    it "spells a menu-only verb's path from its menu_key, and nil for no menu row" do
+      reg = Gori::Verbs.registry
+      Gori::Hotkeys.menu_path(reg, "sequence.promote").should eq("space → #{reg["sequence.promote"].menu_key}")
+      # A SUB-TABS row is inside Sub-tabs… from a pane, at level 1 on the strip (#1274).
+      Gori::Hotkeys.menu_path(reg, "repeater.tag-subtab").should eq("space → T g")
+      Gori::Hotkeys.menu_path(reg, "repeater.tag-subtab", strip_focus: true).should eq("space → g")
+      Gori::Hotkeys.menu_path(reg, "repeater.paste-curl").should eq("space → U") # pinned
+      Gori::Hotkeys.menu_path(reg, "sitemap.tag").should eq("space → m")
+      Gori::Hotkeys.menu_path(reg, "no.such.verb").should be_nil
+      # Hidden navigation verb: its chords are named keys, so it derives no menu letter.
+      Gori::Hotkeys.menu_path(reg, "sitemap.toggle").should be_nil
+    end
+
+    it "expands inside a hint, next to {verb.id} tokens, and ignores a rebind" do
+      reg = Gori::Verbs.registry
+      ov = {"fuzz.matched" => [Gori::Verb::Chord.new("q")]}
+      Gori::Hotkeys.expand(reg, "{space:fuzz.sort} sort · {fuzz.matched} matched", ov)
+        .should eq("space → o sort · q matched")
+      Gori::Hotkeys.expand(reg, "{space:fuzz.sort} sort").should eq("space → o sort")
+    end
+
+    it "never prints the raw token: no registry or no menu row reads as the space menu" do
+      reg = Gori::Verbs.registry
+      fallback = Gori::Hotkeys::MENU_PATH_FALLBACK
+      Gori::Hotkeys.expand_menu_paths(nil, "set with {space:sitemap.tag}").should eq("set with #{fallback}")
+      Gori::Hotkeys.expand(reg, "{space:no.such.verb} · {space:sitemap.toggle}").should eq("#{fallback} · #{fallback}")
+      Gori::Hotkeys.expand_menu_paths(nil, "{\"space\":1} · {sitemap.query}").should eq("{\"space\":1} · {sitemap.query}")
+    end
+  end
+
+  # A palette-only verb (`menu: :palette`, #1282) has no menu path, so a `{space:…}` token or a
+  # Help row naming it reads as the route that does exist: its chord, else the palette search.
+  describe ".menu_chip" do
+    it "spells a menu path compactly from the registry, and a bare ␣ without one (#1295)" do
+      reg = Gori::Verbs.registry
+      Gori::Hotkeys.menu_chip(reg, "repeater.toggle-grpc-reframe").should eq("␣#{reg.menu_keys("repeater.toggle-grpc-reframe").not_nil!.join}")
+      Gori::Hotkeys.menu_chip(reg, "sitemap.toggle-static").should eq("␣Zs")
+      Gori::Hotkeys.menu_chip(nil, "sitemap.toggle-static").should eq("␣")
+      Gori::Hotkeys.menu_chip(reg, "no.such-verb").should eq("␣")
+    end
+  end
+
+  describe ".route" do
+    it "is the menu path for a menu row, the chord or ^P → title for a palette-only verb" do
+      reg = Gori::Verbs.registry
+      Gori::Hotkeys.route(reg, "sitemap.tag").should eq("space → m")
+      Gori::Hotkeys.menu_path(reg, "repeater.minimize").should be_nil
+      Gori::Hotkeys.route(reg, "repeater.minimize").should eq("^P → Minimize request")
+      Gori::Hotkeys.route(reg, "decoder.save").should eq("^S")
+      Gori::Hotkeys.route(reg, "no.such.verb").should be_nil
+      Gori::Hotkeys.route(reg, "sitemap.toggle").should be_nil # hidden, no row, not palette-only
+    end
+
+    it "follows a rebind of the palette and of the verb" do
+      reg = Gori::Verbs.registry
+      ov = {"app.palette"  => [Gori::Verb::Chord.new("k", ctrl: true)],
+            "decoder.save" => [Gori::Verb::Chord.new("q")]}
+      Gori::Hotkeys.route(reg, "repeater.minimize", ov).should eq("^K → Minimize request")
+      Gori::Hotkeys.route(reg, "decoder.save", ov).should eq("q")
+      Gori::Hotkeys.expand(reg, "with {space:repeater.minimize}", ov).should eq("with ^K → Minimize request")
     end
   end
 
@@ -230,10 +338,40 @@ describe Gori::Hotkeys do
       prev_os = Gori::Settings.keymap_os
       begin
         working = {"capture.toggle" => Gori::Verb::Chord.new("g"), "scope.edit" => nil}
-        Gori::Hotkeys.apply(working, "linux")
+        Gori::Hotkeys.apply(working, "linux", Gori::Verbs.registry)
         Gori::Settings.keymap_os.should eq("linux")
         Gori::Settings.keymap_overrides["capture.toggle"].should eq(["g"])
         Gori::Settings.keymap_overrides["scope.edit"].should eq([] of String)
+      ensure
+        Gori::Settings.keymap_overrides = prev_ov
+        Gori::Settings.keymap_os = prev_os
+      end
+    end
+
+    # The editor shows the rebindable rows only, one chord each. Replacing the whole map from
+    # that working copy erased what it never showed: a newer build's verb id, and the second
+    # chord of a row the operator did not touch.
+    it "rewrites only the rows the editor showed, and keeps the ones it did not" do
+      prev_ov = Gori::Settings.keymap_overrides
+      prev_os = Gori::Settings.keymap_os
+      begin
+        Gori::Settings.keymap_overrides = {
+          "future.verb"    => ["f5"],
+          "rules.edit"     => ["m", "n"],
+          "capture.toggle" => ["g"],
+        }
+        reg = Gori::Verbs.registry
+        working = {} of String => Gori::Verb::Chord?
+        Gori::Hotkeys.rebindable_overrides(reg).each { |id, chords| working[id] = chords.first? }
+        working.delete("capture.toggle")                   # reset to default in the editor
+        working["scope.edit"] = Gori::Verb::Chord.new("j") # a new rebind
+
+        Gori::Hotkeys.apply(working, "linux", reg)
+        ov = Gori::Settings.keymap_overrides
+        ov["future.verb"].should eq(["f5"])
+        ov["rules.edit"].should eq(["m", "n"])
+        ov.has_key?("capture.toggle").should be_false
+        ov["scope.edit"].should eq(["j"])
       ensure
         Gori::Settings.keymap_overrides = prev_ov
         Gori::Settings.keymap_os = prev_os
@@ -306,6 +444,16 @@ describe "Gori::Hotkeys.expand memo" do
     ensure
       Gori::Settings.keymap_overrides = prev
     end
+  end
+
+  # A caller may name a keyset that is not the active one (the Keyset playground's practice pad
+  # does). The memo used to be keyed without it, so whichever keyset expanded a template first
+  # answered for both.
+  it "keys the memo by the keyset a caller names" do
+    reg = Gori::Verbs.registry
+    tmpl = "{notes.select-line} memo-keyset-probe"
+    Gori::Hotkeys.expand(reg, tmpl, keyset: "helix").should eq("x memo-keyset-probe")
+    Gori::Hotkeys.expand(reg, tmpl, keyset: "vim").should eq("⇧V memo-keyset-probe")
   end
 
   it "bumps the keymap revision on every keymap setter" do

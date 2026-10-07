@@ -37,7 +37,11 @@ private RESET_FIXTURE = <<-JSON
     "hooks": { "timeout_secs": 30 },
     "rewriter": { "next_rule_id": 7, "rules": [] },
     "colormarker": { "next_rule_id": 7, "rules": [], "colors": [ { "name": "mine", "hex": "#ff0000" } ] },
-    "saved_views": { "next_view_id": 7, "views": [ { "id": 1, "name": "v1", "query": "src:proxy" } ] }
+    "saved_views": { "next_view_id": 7, "views": [ { "id": 1, "name": "v1", "query": "src:proxy" } ] },
+    "redaction": { "active": "p1", "default": true, "salt": "abcd", "profiles": [ { "name": "p1", "json_fields": ["password"] } ] },
+    "mcp": { "channels": true },
+    "mcp_permissions": { "send": false },
+    "user_agents": [ "Fixture/1.0" ]
   }
   JSON
 
@@ -107,8 +111,16 @@ describe "Settings.reset_to_factory" do
       # one omits itself at its default, which is how the key disappears — plus `rewriter`,
       # `colormarker` and `saved_views`, which stay only to carry their id counters (see
       # reset_rewriter: those are what stop a project's surviving overrides — or, for views, its
-      # `history_view` pointer — from latching onto a reused id).
-      left = %w[theme mouse mouse_drag pretty_bodies network editor probe rewriter colormarker saved_views]
+      # `history_view` pointer — from latching onto a reused id), and `redaction`, which stays
+      # only to carry its placeholder SALT: every profile and switch is cleared, but discarding
+      # the key would silently break the `[REDACTED:tag]` in every artifact already exported
+      # (#1035), which is not something "put it back the way it shipped" should be able to do.
+      # `env` stays for the same kind of reason and a stronger one: a reset drops the vars and the
+      # prefix but deliberately PRESERVES the token grammar (it decides how the tokens already
+      # stored in project databases are read), and the absence of `env.syntax` no longer means a
+      # grammar at all — it means "this file predates namespaces", i.e. re-derive and re-spell. A
+      # reset that dropped the key would hand the next start a migration to run.
+      left = %w[theme mouse mouse_drag pretty_bodies network editor probe rewriter colormarker saved_views redaction env]
       Gori::Settings.document_keys.sort.should eq(left.sort)
       JSON.parse(File.read(path)).as_h.keys.sort.should eq(left.sort)
 
@@ -127,6 +139,11 @@ describe "Settings.reset_to_factory" do
       Gori::Settings.tab_prefs.should be_empty
       Gori::Settings.env_vars.should be_empty
       Gori::Settings.env_prefix.should eq(Gori::Settings::DEFAULT_ENV_PREFIX)
+      # …but NOT the token grammar: `reset_env` leaves `env_syntax` alone on purpose (it decides
+      # how tokens already stored in PROJECT databases are read, and this fixture names none, so
+      # the absence rule had already settled it — bare, under the suite's pin). The preserving case
+      # is in settings/env_syntax_spec.
+      Gori::Settings.env_syntax.should eq(Gori::Settings.env_syntax_when_absent)
       Gori::Settings.hostname_overrides.should be_empty
       Gori::Settings.oast_providers.should be_empty
       Gori::Settings.scan_rules.should be_empty
@@ -142,6 +159,10 @@ describe "Settings.reset_to_factory" do
       Gori::Settings.fuzz_recent_wordlists.should be_empty
       Gori::Settings.probe_active_notify.should eq(Gori::Settings::DEFAULT_PROBE_ACTIVE_NOTIFY)
       Gori::Settings.retention_max_flows.should eq(Gori::Settings::DEFAULT_RETENTION_FLOWS)
+      Gori::Settings.redaction_profiles.should be_empty
+      Gori::Settings.redaction_active.should eq("")
+      Gori::Settings.redaction_default?.should be_false
+      JSON.parse(File.read(path))["redaction"].as_h.keys.should eq(["salt"])
     end
   end
 
@@ -232,7 +253,7 @@ describe "Settings.reset_to_factory" do
   # meaning no reset example reached the 3-way merge at all, and the merge is where the reset
   # was leaking. Each key below is a different way to be absent from BOTH `mine` and `base`:
   #
-  #   decoder.sessions   — a LEGACY block `serialize` never writes back, so it is absent from
+  #   decoder.sessions   — a retired block `serialize` never writes back, so it is absent from
   #                        the base even though the file has it (and it holds whatever the
   #                        operator pasted into a Decoder tab — the confirm dialog names
   #                        "saved decoder chains" among the things a reset drops)

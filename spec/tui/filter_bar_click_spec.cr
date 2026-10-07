@@ -7,8 +7,8 @@ require "../../src/gori/tui/controllers/sitemap_controller"
 
 include Gori::Tui
 
-# Clicking the filter bar (#-): the chips right of the query — `v:` / `f:follow` / `⇧S scope` on
-# History, `g:fold` / `⇧S scope` on the Target tree — are the toggles their chords are, and the
+# Clicking the filter bar (#-): the chips right of the query — `v:` / `⌁follow` / `s scope` on
+# History, `g:fold` / `s scope` on the Target tree — are the toggles their chords are, and the
 # field left of them opens for editing like `/`.
 #
 # The property every example here turns on is COLUMN AGREEMENT: the chips drop individually on a
@@ -24,6 +24,7 @@ private class FilterBarFakeHost
   # the view picker is an overlay only the Runner can open.
   getter lens_toggles = 0
   getter view_pickers = 0
+  getter static_toggles = 0
   property active_tab : Symbol = :history
 
   def initialize(@session : Gori::Session)
@@ -151,6 +152,10 @@ private class FilterBarFakeHost
     @view_pickers += 1
   end
 
+  def toggle_static_assets : Nil
+    @static_toggles += 1
+  end
+
   def toggle_sandbox : Nil
   end
 
@@ -195,9 +200,16 @@ describe "HistoryView — filter bar chips are clickable" do
     view = HistoryView.new
     history_bar(view).should eq({
       :view   => "v:all",
-      :follow => "f:follow",
+      :follow => "⌁follow",
       :scope  => "s scope:off",
     })
+  end
+
+  it "shows a static:hidden chip only while the hide-static lens is on" do
+    view = HistoryView.new
+    history_bar(view).has_key?(:static).should be_false
+    view.set_hide_static(true)
+    history_bar(view)[:static].should eq("static:hidden")
   end
 
   it "follows the chip's own label when a view is active" do
@@ -220,8 +232,8 @@ describe "HistoryView — filter bar chips are clickable" do
     # dropped chip would leave live cells on chrome nobody painted.
     view = HistoryView.new
     hits = history_bar(view, w: 26)
-    hits.has_key?(:view).should be_false # "v:all" no longer fits left of f:follow
-    hits[:follow].should eq("f:follow")
+    hits.has_key?(:view).should be_false # "v:all" no longer fits left of ⌁follow
+    hits[:follow].should eq("⌁follow")
   end
 end
 
@@ -232,6 +244,13 @@ describe "SitemapView — filter bar chips are clickable" do
       :fold  => "g:fold",
       :scope => "s scope:off",
     })
+  end
+
+  it "shows a static:hidden chip only while the hide-static lens is on" do
+    view = SitemapView.new
+    sitemap_bar(view).has_key?(:static).should be_false
+    view.set_hide_static(true)
+    sitemap_bar(view)[:static].should eq("static:hidden")
   end
 
   it "claims nothing while the bar is being edited" do
@@ -277,7 +296,7 @@ describe "HistoryController — clicking the filter bar" do
       rect = Rect.new(0, 0, 110, 16)
       was = ctrl.view.follow?
 
-      ctrl.handle_click(rect, bar_col(ctrl, rect, "f:follow"), 1).should be_true
+      ctrl.handle_click(rect, bar_col(ctrl, rect, "⌁follow"), 1).should be_true
       ctrl.view.follow?.should eq(!was)
 
       ctrl.handle_click(rect, bar_col(ctrl, rect, "scope:"), 1)
@@ -285,6 +304,10 @@ describe "HistoryController — clicking the filter bar" do
 
       ctrl.handle_click(rect, bar_col(ctrl, rect, "v:"), 1)
       host.view_pickers.should eq(1)
+
+      ctrl.view.set_hide_static(true)
+      ctrl.handle_click(rect, bar_col(ctrl, rect, "static:hidden"), 1).should be_true
+      host.static_toggles.should eq(1)
     end
   end
 
@@ -302,7 +325,7 @@ describe "HistoryController — clicking the filter bar" do
     # query text: clicking the field you are typing in must not close it.
     with_controllers do |ctrl, _sitemap, host|
       rect = Rect.new(0, 0, 110, 16)
-      col = bar_col(ctrl, rect, "f:follow")
+      col = bar_col(ctrl, rect, "⌁follow")
       was = ctrl.view.follow?
       ctrl.view.start_query
       ctrl.handle_click(rect, col, 1).should be_true
@@ -324,6 +347,20 @@ describe "SitemapController — clicking the filter bar" do
 
       ctrl.handle_click(rect, bar_col(ctrl, rect, "scope:"), 1)
       host.lens_toggles.should eq(1)
+
+      ctrl.view.set_hide_static(true)
+      ctrl.handle_click(rect, bar_col(ctrl, rect, "static:hidden"), 1).should be_true
+      host.static_toggles.should eq(1)
+    end
+  end
+
+  it "reads the project's hide-static key on open, for both tabs" do
+    with_controllers do |history, sitemap, host|
+      history.view.hide_static?.should be_false
+      sitemap.view.hide_static?.should be_false
+      Gori::StaticAsset.set_hidden(host.session.store, true).should be_true
+      Gori::Tui::HistoryController.new(host).view.hide_static?.should be_true
+      Gori::Tui::SitemapController.new(host).view.hide_static?.should be_true
     end
   end
 

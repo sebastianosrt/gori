@@ -8,6 +8,18 @@ private def random_hex(count : Int32, len : Int32, seed : UInt64 = 1234_u64) : A
   Array(String).new(count) { String.build { |io| len.times { io << "0123456789abcdef"[rng.rand(16)] } } }
 end
 
+# Deterministic RFC 9562 UUIDv4s: version nibble 4, variant bits 10 (8/9/a/b).
+private def random_uuid4(count : Int32, seed : UInt64, hyphens : Bool) : Array(String)
+  rng = Random.new(seed)
+  Array(String).new(count) do
+    b = Bytes.new(16) { rng.rand(256).to_u8 }
+    b[6] = (b[6] & 0x0f_u8) | 0x40_u8
+    b[8] = (b[8] & 0x3f_u8) | 0x80_u8
+    h = b.hexstring
+    hyphens ? "#{h[0, 8]}-#{h[8, 4]}-#{h[12, 4]}-#{h[16, 4]}-#{h[20, 12]}" : h
+  end
+end
+
 # The `detail` string of the Sequential test row for a given token set — the human-readable
 # classification ("constant step N", "monotonic up/down", "non-monotonic", "corr=…", "n/a").
 private def seq_detail(tokens : Array(String)) : String
@@ -77,6 +89,8 @@ describe Gori::Sequencer::Stats do
   # ── classify: byte-set → charset label ──────────────────────────────────────────
 
   it "labels each ASCII byte-set family via the classify precedence chain" do
+    # digits only → digits (before hex check)
+    S.analyze(Array.new(5, "1234567890")).charset_label.should eq("digits")
     # digits + uppercase A–F only → upper-hex (lower-hex requires a..f, so 'A' skips it)
     S.analyze(Array.new(5, "A1B2C3")).charset_label.should eq("upper-hex")
     # both cases of hex present → neither lower- nor upper-hex, but still hex
@@ -153,10 +167,53 @@ describe Gori::Sequencer::Stats do
     seq_detail(shuffled).should eq("constant step 1 (sorted — arrival order was shuffled)")
   end
 
+  it "detects a jittered decimal counter that arrived with one pair swapped, as its hex spelling is" do
+    rng = Random.new(7_u64)
+    vals = (0...300).map { |i| 10_i64**17 + i.to_i64 * 10_i64**12 + rng.rand(10_i64**12) }
+    vals.swap(10, 11)
+    S.analyze(vals.map(&.to_s)).sequential.should be_true
+    S.analyze(vals.map { |v| "%015x" % v }).sequential.should be_true
+  end
+
   it "does not flag a shuffled sample of genuinely random numeric tokens as sequential" do
     rng = Random.new(99_u64)
     random_ints = Array.new(200) { rng.rand(1_000_000).to_s }
     S.analyze(random_ints).sequential.should be_false
+  end
+
+  # The same fix, on the HEX path — the encoding session ids are actually spelled in, and the
+  # one the decimal path's shuffle guard did not cover. Correlation with ARRIVAL order is 1.00
+  # when a `%08x` counter is collected serially and ~0.02 once concurrency lets two replays
+  # complete swapped, so the row read "Sequential: none" for a textbook counter.
+  it "detects a shuffled-order hex counter, which arrival-order correlation cannot see" do
+    ordered = (2..301).map { |i| "%08x" % i }
+    shuffled = ordered.shuffle(Random.new(42_u64))
+    S.analyze(shuffled).sequential.should be_true
+    seq_detail(shuffled).should eq("constant step 1 (sorted — arrival order was shuffled)")
+    # …and the in-order sample still reports the correlation it actually measured.
+    seq_detail(ordered).should start_with("corr=")
+  end
+
+  it "detects a shuffled hex counter behind a zero-padded constant head, and uppercase" do
+    # 32 hex digits: everything but the last three is a shared prefix, so the varying span the
+    # exact-value check reads is narrow — which is what makes a zero-padded counter tractable
+    # where a 32-digit-wide magnitude would not be.
+    wide = (1000..1299).map { |i| "%032x" % i }.shuffle!(Random.new(7_u64))
+    S.analyze(wide).sequential.should be_true
+    upper = (2..301).map { |i| "%08X" % i }.shuffle!(Random.new(7_u64))
+    S.analyze(upper).sequential.should be_true
+  end
+
+  it "does not flag a shuffled sample of genuinely random hex tokens as sequential" do
+    # The control the check has to survive: same path, same shuffle, no counter.
+    S.analyze(random_hex(300, 8, 555_u64)).sequential.should be_false
+    S.analyze(random_hex(300, 32, 556_u64)).sequential.should be_false
+  end
+
+  it "leaves a small shuffled hex sample alone, where an even sort is coincidence" do
+    # Below SMALL_SAMPLE the sorted-step trick is noise — the same gate the numeric path uses.
+    tiny = ["00000002", "0000000a", "00000006"] # sorts to an even step 4; arrival order is not
+    S.analyze(tiny).sequential.should be_false
   end
 
   it "does not claim shuffling for a large sample that truly arrived in ascending order" do
@@ -540,6 +597,134 @@ describe Gori::Sequencer::Stats do
     row.value.should eq("8/32 fixed")
     row.verdict.should eq(S::Verdict::Info)               # already priced into effective_entropy — never charged twice
     report.effective_entropy.should be_close(96.0, 0.001) # 24 hex chars × 4 bits; the prefix adds 0
+  end
+
+  # ── partially fixed columns (#1198) ─────────────────────────────────────────────────
+
+  it "rates random UUIDv4s Secure: the variant nibble is structure, not a randomness failure" do
+    # The RFC 9562 variant nibble only reads 8/9/a/b. Pooled with the random columns it failed
+    # chi-square and poker and dragged a 122-bit token to WEAK or CRITICAL — a headline that
+    # contradicted its own effective-entropy line.
+    {true, false}.each do |hyphens|
+      report = S.analyze(random_uuid4(500, 21_u64, hyphens))
+      report.partial_positions.should eq(1)
+      report.constant_positions.should eq(hyphens ? 5 : 1) # the version nibble (+ 4 hyphens)
+      report.charset_size.should eq(16)
+      report.tests.count(&.verdict.fail?).should eq(0)
+      report.tests.find { |t| t.name == "Bit bias" }.not_nil!.verdict.should eq(S::Verdict::Pass)
+      report.rating.should eq(S::Rating::Secure)
+      report.effective_entropy.should be_close(122.0, 0.05) # 30 × 4 bits + the variant's 2
+      report.tests.find { |t| t.name == "Structure" }.not_nil!.detail.should contain("1 partially fixed")
+    end
+  end
+
+  it "does not mistake a small sample of a large alphabet for a partially fixed column" do
+    # 20 draws from base64 reveal ~17 of 64 values per column; the bar scales with the sample.
+    rng = Random.new(8_u64)
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    tokens = Array.new(20) { String.build { |io| 32.times { io << alphabet[rng.rand(64)] } } }
+    S.analyze(tokens).partial_positions.should eq(0)
+  end
+
+  it "keeps a token whose varying columns are mostly two-valued Weak" do
+    # 8 random hex chars (32 bits) + 24 columns that each flip between two values (24 bits).
+    rng = Random.new(9_u64)
+    tokens = Array.new(300) do
+      String.build { |io| 8.times { io << "0123456789abcdef"[rng.rand(16)] }; 24.times { io << "8a"[rng.rand(2)] } }
+    end
+    report = S.analyze(tokens)
+    report.partial_positions.should eq(24)
+    report.effective_entropy.should be < 60.0
+    report.rating.should eq(S::Rating::Weak)
+  end
+
+  it "credits a skewed partially fixed column its measured entropy, not log2(distinct)" do
+    # Excluded from the tests, a partial column's skew would go unseen if it were still worth
+    # log2(4) = 2 bits: 32 + 24 × 2 = 80 would read MODERATE for a token worth ~37.
+    rng = Random.new(10_u64)
+    tokens = Array.new(300) do
+      String.build do |io|
+        8.times { io << "0123456789abcdef"[rng.rand(16)] }
+        24.times { io << (rng.rand < 0.97 ? '8' : "9ab"[rng.rand(3)]) }
+      end
+    end
+    report = S.analyze(tokens)
+    report.partial_positions.should eq(24)
+    report.effective_entropy.should be < 45.0
+    report.rating.should eq(S::Rating::Weak)
+  end
+
+  it "credits dependent partially fixed columns once, not once per column" do
+    # 16 random hex + 12 columns that all repeat ONE value from a-d: 64 + 2 bits, not 64 + 24.
+    # No test reads partial columns, so the joint entropy is what catches the dependence.
+    rng = Random.new(12_u64)
+    tokens = Array.new(300) do
+      c = "abcd"[rng.rand(4)]
+      String.build { |io| 16.times { io << "0123456789abcdef"[rng.rand(16)] }; 12.times { io << c } }
+    end
+    report = S.analyze(tokens)
+    report.partial_positions.should eq(12)
+    report.effective_entropy.should be < 70.0
+    report.rating.value.should be < S::Rating::Secure.value
+  end
+
+  it "still flags a millisecond-timestamp token as sequential and Critical" do
+    rng = Random.new(11_u64)
+    t0 = 1_758_600_000_000_i64
+    tokens = Array.new(300) { |i| (t0 + i * 37).to_s(16) + String.build { |io| 8.times { io << "0123456789abcdef"[rng.rand(16)] } } }
+    report = S.analyze(tokens)
+    report.sequential.should be_true
+    report.rating.should eq(S::Rating::Critical)
+  end
+
+  # `symbol_bit_ones` counts per COLUMN above `charset + 1` tokens and asks each token
+  # directly below that, because under the threshold the expansion costs more than the direct
+  # walk (and the tally would be the report's largest allocation on a corpus of few but very
+  # long tokens). Both branches answer the same question, so both are pinned here against a
+  # bias that can be written down: a two-symbol alphabet is bps = 1, so column p's bit IS its
+  # character and its bias is |ones(p) / n - 0.5|.
+  it "reports the same per-bit bias whether the sample is tallied per column or per token" do
+    wide = Array.new(16) { |i| "%04b" % i } # 16 tokens ≥ charset+1 → the per-column tally
+    S.analyze(wide).bit_bias.should eq([0.0, 0.0, 0.0, 0.0])
+
+    narrow = ["0011", "0101"] # 2 tokens < charset+1 → the direct walk
+    S.analyze(narrow).bit_bias.should eq([0.5, 0.0, 0.0, 0.5])
+  end
+
+  # Monobit, Runs, Long run and Cusum all read ONE walk of the symbol bitstream (`BitScan`).
+  # A two-symbol alphabet makes that bitstream the token TEXT itself — bps = 1, and the
+  # alphabet indices of '0' and '1' are 0 and 1 — so each row can be checked against a count
+  # taken here rather than against one of the others. A fused scan that miscounted a run
+  # boundary, reset the longest-run tracker on the wrong byte or dropped the sign of the
+  # cusum walk would move exactly one of these four and nothing else.
+  it "reads Monobit, Runs, Long run and Cusum off one and the same bitstream" do
+    rng = Random.new(99_u64)
+    tokens = Array.new(300) { String.build { |io| 64.times { io << (rng.rand(2) == 1 ? '1' : '0') } } }
+    report = S.analyze(tokens)
+
+    bits = tokens.join.to_slice.map { |b| b == '1'.ord.to_u8 ? 1 : 0 }
+    ones = bits.count(1)
+    runs = 1 + (1...bits.size).count { |i| bits[i] != bits[i - 1] }
+    longest = 0
+    cur = 0
+    prev = -1
+    bits.each do |b|
+      cur = b == prev ? cur + 1 : 1
+      prev = b
+      longest = cur if cur > longest
+    end
+    walk = 0
+    excursion = 0
+    bits.each do |b|
+      walk += b == 1 ? 1 : -1
+      excursion = walk.abs if walk.abs > excursion
+    end
+
+    row = ->(name : String) { report.tests.find { |t| t.name == name }.not_nil! }
+    row.call("Monobit").detail.should eq("ones #{((ones.to_f / bits.size) * 100).round(1)}%")
+    row.call("Runs").value.should eq(runs.to_s)
+    row.call("Long run").value.should eq(longest.to_s)
+    row.call("Cusum").value.should eq("z=#{excursion}")
   end
 
   it "handles a large single-byte corpus and invalid-UTF-8 bytes without raising" do

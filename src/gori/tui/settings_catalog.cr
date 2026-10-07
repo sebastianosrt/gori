@@ -34,7 +34,10 @@ module Gori::Tui
       # have no "default" beyond empty, and silently emptying them from a row that only says
       # "↵ open" is not a reset anyone asked for. They are still cleared by the FULL factory
       # reset, which says so.
-      resettable : Bool = true
+      resettable : Bool = true,
+      # Extra words the palette's typed search finds this section by (`Definition#keywords`):
+      # the names an operator types that the title does not say, "vim" for Keys above all.
+      keywords : Array(String) = [] of String
 
     # The Settings tab's sub-tab strip, in display order. Each group gathers the
     # catalog sections tagged with its symbol (see `sections_in`).
@@ -43,6 +46,7 @@ module Gori::Tui
       {:appearance, "Appearance"},
       {:editor, "Editor & Keys"},
       {:network, "Network & Tabs"},
+      {:ai, "AI"},
     ]
 
     # Every settings section. Order here is the palette registration order (grouped, so
@@ -76,25 +80,40 @@ module Gori::Tui
       # Hotkeys rebinds individual actions. Neither belongs in Editor — that section is
       # text-editing prefs.
       Section.new(:keys, "settings.keys", "Keys",
-        "Pick the modifier for gori's built-in shortcuts (^P ^N ^W ^1-9)", :editor, :form),
+        "Pick the modifier for gori's built-in shortcuts (^P ^N ^W ^1-9) and the editor keyset (helix-ish / vim-ish)", :editor, :form,
+        keywords: %w[vim helix keyset keybindings modifier option]),
       # Mouse sits beside Keys, not in Editor: both configure INPUT, and the Mouse toggle spent
       # its life as a lone row under "Editor" — the one heading an operator looking for pointer
       # behaviour would not open. It brings the drag-release mode with it.
       Section.new(:mouse, "settings.mouse", "Mouse",
         "Click/scroll navigation, and whether releasing a drag also copies the selection", :editor, :form),
       Section.new(:env, "settings.env", "Env",
-        "Global environment variables for $KEY substitution in requests", :editor, :opener, resettable: false),
+        "Global environment variables you can reference in requests", :editor, :opener, resettable: false),
+      # Operator DATA like Env's values (#1154): the list the USER_AGENT generators draw from.
+      # Its default — the built-in list — is reached by emptying it, not by ^R.
+      Section.new(:user_agents, "settings.user-agents", "User-Agents",
+        "Your own list for $GEN.USER_AGENT — replaces the built-in browser list", :editor, :opener, resettable: false),
       Section.new(:hotkeys, "settings.hotkeys", "Hotkeys",
-        "Rebind keyboard shortcuts (press a key) + pick an OS default profile", :editor, :opener),
+        "Rebind keyboard shortcuts (press a key) + pick an OS default profile", :editor, :opener,
+        keywords: %w[keybindings keymap shortcuts rebind]),
       # Network & Tabs
       Section.new(:network, "settings.network", "Network",
         "Edit the proxy bind address + upstream proxy", :network, :form),
       Section.new(:tabs, "settings.tabs", "Tabs",
-        "Customize the top tab bar — show/hide tabs and reorder them", :network, :opener),
+        "Customize the top tab bar — one ordered list, the top nine are the slots", :network, :opener),
       # Reachable via the Network section's "Hostname overrides" opener field, so it
       # keeps its palette verb but is not given its own tab row (in_tab: false).
       Section.new(:hosts, "settings.host-overrides", "Hostnames",
         "Edit global hostname overrides — a /etc/hosts mapping hosts to IPs the proxy dials", :network, :opener, in_tab: false, resettable: false),
+      # AI: how gori talks to the coding agents attached over MCP (#1090). Its own group,
+      # not a row under Network — an operator looking for "how do I message my agent" should
+      # not have to open the proxy-address section to find it.
+      Section.new(:mcp, "settings.mcp", "Agent messaging",
+        "How gori mcp delivers \"Tell the agent…\" messages — enable the claude/channel push as a last resort behind the inbox socket, codex queue, operator_messages poll and tool-result carry", :ai, :form),
+      # What an attached agent may DO: coarse switches over groups of `gori mcp` tools. All on
+      # by default, which is what gori mcp served before they existed.
+      Section.new(:mcp_permissions, "settings.mcp-permissions", "MCP permissions",
+        "Which tool groups an agent attached over gori mcp may use — send traffic, intercept control, project edits, scope & sandbox, project management; reading the capture is always allowed", :ai, :form),
     ]
 
     # Every section, in registration order — drives the palette verb loop.

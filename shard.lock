@@ -6,7 +6,7 @@ shards:
 
   cvss:
     git: https://github.com/hahwul/cvss.cr.git
-    version: 0.2.0
+    version: 0.3.0
 
   db:
     git: https://github.com/crystal-lang/crystal-db.git
@@ -22,5 +22,5 @@ shards:
 
   termisu:
     git: https://github.com/hahwul/termisu.git
-    version: 0.6.1+git.commit.df6e907e6fe27f2cc70b9f855dff996d08398ad1
+    version: 0.6.3+git.commit.ca964e5f9256990d9d1e6aa5ca3aa1fb2635fb6b
 

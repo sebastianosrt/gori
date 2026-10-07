@@ -9,6 +9,7 @@ require "../../decoder"
 require "../../settings"
 require "../../hotkeys"
 require "../subtab_clone"
+require "./memory_session_strip"
 
 module Gori::Tui
   # One open conversion — a "sub-tab" under the Decoder tab. Each carries its own
@@ -41,12 +42,14 @@ module Gori::Tui
   # and handle_body_key always returns true: the Decoder verbs' single-letter
   # mnemonics never collide with literal text (`:` stays literal) — they're reached
   # only from the space menu + palette. A runner-owned sub-tab strip appears from the
-  # first session (^N new · ^W close · ^1-9/←→ switch · r rename); open sessions persist
+  # first session (^N new · ^W close · ^1-9/←→ switch · e rename); open sessions persist
   # to THIS project's store (`Store::DECODER_SESSIONS_KEY`), so switching projects opens a
   # clean workbench instead of carrying the previous engagement's material across. The
   # named chains a conversion can load stay in the global settings.json — a chain spec is
   # tool config, reusable everywhere; what was run THROUGH it is project data.
   class DecoderController < TabController
+    include MemorySessionStrip
+
     SEPS = {'>', '|', ','}
 
     @sessions : Array(DecoderSession)
@@ -108,34 +111,13 @@ module Gori::Tui
       input.follow_x = true # long input lines scroll horizontally to keep the cursor visible
       result = Decoder.run(registry, input.text.to_slice, chain, run_hooks: false)
       view = DecoderView.new
+      view.set_registry(@host.session.registry)
       view.name = name
       DecoderSession.new(view, input, chain, chain.size, :input, result)
     end
 
-    # --- sub-tab strip (runner-owned chrome; shown from the first session) ---
-    def subtab_labels : Array(String)
-      @sessions.map_with_index { |s, i| "#{i + 1}:#{session_label(s)}" }
-    end
-
-    def subtab_index : Int32
-      @idx
-    end
-
-    # Show the strip from the FIRST session (not ≥2), like Repeater/Notes: a lone
-    # conversion still labels its chip and exposes the strip's space-menu.
-    def subtab_strip_shown? : Bool
-      true
-    end
-
-    # --- sub-tab filter (issue #121) ---
-    def subtab_filter_enabled? : Bool
-      true
-    end
-
-    def filter_fields : Array(String)
-      %w[name] # a conversion has no HTTP context; free-text covers the chain + input
-    end
-
+    # --- sub-tab strip: `MemorySessionStrip`, plus the filter's search (fields: the default
+    # `name` — a conversion has no HTTP context; free-text covers the chain + input) ---
     def filter_subjects : Array(Repeater::SubtabFilter::Subject)
       @sessions.map do |s|
         Repeater::SubtabFilter::Subject.new(s.view.name, "#{s.chain} #{s.input.text}", "", "", [] of String)
@@ -146,34 +128,37 @@ module Gori::Tui
     # is as often what came OUT (`admin` in a decoded JWT) as what the operator pasted in.
     # The 200-column filter detail carries only chain + a slice of input; this goes further.
     def subtab_search_extras : Array(String)
+      half = SEARCH_EXTRA_MAX // 2
       @sessions.map do |s|
+        # The INPUT is capped at half the budget; the OUTPUT gets everything left over. Two
+        # things were wrong with capping the JOINED string instead.
+        #
+        # The decode is why this override exists at all, and an input longer than the whole
+        # budget crowded it out completely: paste a 4 KB base64 blob, chain `base64-decode`,
+        # and the `admin` in the decoded claims — the exact thing the operator remembers — was
+        # unreachable by the very picker that goes past the 200-column filter to find it. A
+        # fixed half each would have been the same mistake pointing the other way: a 200-char
+        # token would have had its decode cut at 1 KB when 1.8 KB was going spare.
+        #
+        # And a chain step may produce up to `Decoder::MAX_OUT` (32 MiB), so interpolating
+        # first copied every open conversion's whole decode into a fresh String on the UI
+        # fiber just to keep the first 2 KB of it — the shape `search_extra(Bytes)` exists to
+        # avoid, and the picker builds one of these per open sub-tab.
+        text = s.input.text
+        text = text[0, half] if text.size > half
         bytes = s.result.output
-        search_extra(bytes ? "#{s.input.text} #{String.new(bytes)}" : s.input.text)
+        next text unless bytes
+        room = {SEARCH_EXTRA_MAX - text.size - 1, 0}.max # ...less the space between them
+        "#{text} #{String.new(bytes[0, {bytes.size, room}.min])}"
       end
     end
 
-    # The chip label: the custom name if set, else a compact preview of the chain
-    # spec (or "empty" when blank), capped to ~18 cols like Repeater/Notes.
-    private def session_label(s : DecoderSession) : String
-      raw = (n = s.view.name) ? n : (s.chain.strip.empty? ? "empty" : s.chain.strip)
-      raw.size > 18 ? raw[0, 17] + "…" : raw
+    # The chip label's fallback: a compact preview of the chain spec, or "empty" when blank.
+    private def session_summary(s : DecoderSession) : String
+      s.chain.strip.empty? ? "empty" : s.chain.strip
     end
 
-    # Move the active sub-tab by ±1 (strip ←/→), clamped, no wrap. No persist needed:
-    # every session keeps its own state in memory, so switching loses nothing.
-    # Filter-aware: ←/→ skip hidden chips; ^1-9 to a hidden chip escapes the filter.
-    def move_subtab(dir : Int32) : Nil
-      if t = step_visible(@idx, dir)
-        switch_to(t)
-      end
-    end
-
-    def jump_subtab(idx : Int32) : Nil
-      return unless 0 <= idx < @sessions.size
-      clear_subtab_filter if (h = subtab_hidden) && h.includes?(idx)
-      switch_to(idx) if idx != @idx
-    end
-
+    # `MemorySessionStrip#switch_to`, plus dropping the CURRENT session's popup and preedit.
     private def switch_to(idx : Int32) : Nil
       @idx = idx
       @popup.close
@@ -189,9 +174,7 @@ module Gori::Tui
       clear_subtab_filter
       @sessions << make_session("", "", nil)
       @idx = @sessions.size - 1
-      @popup.close
-      @chain_pre = ""
-      @dirty = true
+      after_change
       @host.request_focus(:body)
       @host.status("new conversion (#{@sessions.size} open)")
     end
@@ -205,33 +188,15 @@ module Gori::Tui
       clear_subtab_filter # see decoder_new
       @sessions << make_session(text, "", name)
       @idx = @sessions.size - 1
-      @popup.close
-      @chain_pre = ""
-      @dirty = true
+      after_change
       @host.goto_tab(:decoder)
       @host.status("sent selection to Decoder (#{text.bytesize}b)")
     end
 
-    # Content-only clone of the active conversion (input + chain + chip name).
-    # Duplicates the MARKED sub-tabs when the strip carries marks, the active one otherwise
-    # (`target_subtab_indices` — the one target rule).
+    # Content-only clone of the active conversion (input + chain + chip name), or of every
+    # marked one.
     def decoder_duplicate : Nil
-      msg = nil.as(String?)
-      if refs = batch_subtab_refs
-        msg = duplicate_marked_subtabs(refs, "conversion") { |i| duplicate_at(i) }
-        unless msg
-          @host.status("#{refs.size} sub-tabs marked — duplicate is capped at #{Runner::BATCH_SUBTAB_CAP}")
-          return
-        end
-      else
-        duplicate_at(@idx)
-      end
-      unstrand_from_filter
-      @popup.close
-      @chain_pre = ""
-      @dirty = true
-      @host.request_focus(:body)
-      @host.status(msg ? "#{msg} (#{@sessions.size} open)" : "duplicated conversion (#{@sessions.size} open)")
+      duplicate_sessions("conversion", "duplicated conversion")
     end
 
     # Clone sub-tab `idx` onto the end of the strip. Toast-free — the arm above says it.
@@ -241,74 +206,26 @@ module Gori::Tui
       @idx = @sessions.size - 1
     end
 
-    # Close the active conversion (^W / space menu). Keeps ≥1 — closing the last just
-    # resets it to a blank session (like Notes). The runner re-resolves focus after.
-    # ^W closes the MARKED sub-tabs when the strip carries marks, the active one otherwise
-    # (`target_subtab_indices` — the one target rule). The single close stays confirm-free as
-    # it has always been; a plural one asks, because it discards more than the operator can
-    # see at the moment they press the key.
+    # Close the active conversion (^W / space menu), or the marked ones. Keeps ≥1 — closing the
+    # last just resets it to a blank session (like Notes). The runner re-resolves focus after.
     def decoder_close : Nil
-      if refs = batch_subtab_refs
-        @host.confirm("CLOSE CONVERSIONS", "Close #{marked_subtab_phrase(refs.size)}?\nEach conversion’s input, chain and output are discarded.",
-          confirm_label: "close", danger: true) { close_marked_sessions(refs) }
-        return
-      end
-      close_at(@idx)
-      unstrand_from_filter
+      close_sessions("CLOSE CONVERSIONS", "Each conversion’s input, chain and output are discarded.",
+        "conversion closed", "conversion closed")
+    end
+
+    # Every session-set change: drop the sub-tab filter when the ACTIVE session is one it hides
+    # (a close lands the neighbour, a duplicate lands the clone, and neither is guaranteed to
+    # match the query; the batch clamp can land on a hidden chip too), close the popup and
+    # preedit, and mark the set for the next persist.
+    private def after_change : Nil
+      reveal_active_subtab
       @popup.close
       @chain_pre = ""
       @dirty = true
-      @host.status(@sessions.size == 1 ? "conversion closed" : "conversion closed (#{@sessions.size} open)")
     end
 
-    # Drop the sub-tab filter when the ACTIVE session is one it hides — a close lands the
-    # neighbour, a duplicate lands the clone, and neither is guaranteed to match the query.
-    private def unstrand_from_filter : Nil
-      clear_subtab_filter if (h = subtab_hidden) && h.includes?(@idx)
-    end
-
-    private def close_marked_sessions(refs : Array(SubtabRef)) : Nil
-      msg = close_marked_subtabs(refs)
-      unstrand_from_filter # the clamp can land on a hidden chip here too
-      @popup.close
-      @chain_pre = ""
-      @dirty = true
-      @host.status(msg)
-      @host.resolve_subtab_focus
-    end
-
-    # Nothing here is persisted, so a close can never leave a saved session behind.
-    protected def close_subtab_at(idx : Int32) : Bool
-      close_at(idx)
-      false
-    end
-
-    # Close sub-tab `idx`, keeping at least one session: the last one is REPLACED by a blank
-    # rather than removed, so the tab always has something to type into. That replacement
-    # also retires the old view object, which is what drops its mark.
-    private def close_at(idx : Int32) : Nil
-      return if idx < 0 || idx >= @sessions.size
-      if @sessions.size <= 1
-        @sessions[0] = make_session("", "", nil)
-        @idx = 0
-      else
-        @sessions.delete_at(idx)
-        # Closing a session to the LEFT slides the active one down; a bare clamp would read
-        # that as "stay put" and land the operator on its neighbour.
-        @idx -= 1 if idx < @idx
-        @idx = @idx.clamp(0, @sessions.size - 1)
-      end
-    end
-
-    # The session's output view, for the rename prompt (re-found by view identity).
-    def view_at(idx : Int32) : DecoderView?
-      (0 <= idx < @sessions.size) ? @sessions[idx].view : nil
-    end
-
-    # The object that IS sub-tab `idx`, for the strip's mark set (#683). The view, not the
-    # index: a reconcile can reorder or drop chips under a standing mark.
-    def subtab_ref(idx : Int32) : SubtabRef?
-      view_at(idx)
+    private def blank_session(old : DecoderSession) : DecoderSession
+      make_session("", "", nil)
     end
 
     # Apply a typed name to the captured sub-tab's view (the prompt held it by identity,
@@ -319,8 +236,7 @@ module Gori::Tui
     # path reaches `commit` before a tab switch or quit, so a rename was the one edit an
     # abnormal exit lost. `commit` stays dirty when the store is busy, as everywhere.
     def apply_rename(view : DecoderView, name : String) : Nil
-      clean = name.strip
-      view.name = clean.empty? ? nil : clean
+      view.name = name.strip.presence
       @dirty = true
       commit
     end
@@ -556,10 +472,43 @@ module Gori::Tui
       s.pane == :input && s.input_mode == InputMode::Insert
     end
 
+    # The CHAIN field takes text WHENEVER it is focused — there is no READ mode on a
+    # one-line spec, `route_pane_keys` sends every printable to `edit_chain`, and the
+    # converter names are full of digits (`base64`, `base32`, `sha256`, `rot13`, `utf16`).
+    # The default gate (`editor_captures_tab?`) answers for the INPUT editor alone, so `6`
+    # in `base64` jumped to the Fuzzer and took the half-typed chain with it: no chain
+    # containing a digit was typeable at all. The popup is the same field's filter, so it
+    # needs no clause of its own.
+    def body_takes_text? : Bool
+      cur.pane == :chain || editor_captures_tab?
+    end
+
     def handle_editor_tab(ev : Termisu::Event::Key) : Bool
       return false unless editor_captures_tab?
       s = cur
       s.input.insert('\t')
+      s.input.set_preedit("")
+      touch
+      true
+    end
+
+    # --- bracketed paste, in bulk (see TabController#accepts_bulk_paste?) ---
+    # The INPUT editor in INSERT — the pane a captured token or body gets pasted into. Taken
+    # a key at a time, every character re-ran the whole chain over the whole buffer
+    # (`touch`), so a paste cost its length squared: 160 KB took ~15 s on the scheduler the
+    # proxy shares. One splice, one recompute. The text is what the keystroke path would have
+    # typed — ↵ was already a newline here and ↹ a tab (`handle_editor_tab`) — minus what
+    # `Runner#buffer_bulk_paste` drops for every bulk editor (arrows and control keys the
+    # clipboard never held as text). The CHAIN line is single-line and keeps the key path.
+    def accepts_bulk_paste? : Bool
+      editor_captures_tab?
+    end
+
+    def paste_text(text : String) : Bool
+      return false unless accepts_bulk_paste?
+      s = cur
+      s.input.insert_text(text)
+      report_replaced(s.input.last_replaced) # a paste over a selection REPLACES it
       s.input.set_preedit("")
       touch
       true
@@ -599,7 +548,7 @@ module Gori::Tui
 
     def insert_key_refusal : String?
       return nil unless cur.pane == :output
-      "OUTPUT is read-only — i edits the INPUT (↹ up); intercept toggles from the tab bar"
+      keys("OUTPUT is read-only — {editor.insert} edits the INPUT (↹ up); intercept toggles from the tab bar")
     end
 
     # Focus the CHAIN field and surface the converter list (used by ↓ from INPUT and ↑
@@ -633,9 +582,9 @@ module Gori::Tui
         keys("↑/↓ move · ⇧arrows select · #{y} copy · ^F find · ↑-top chain · space cmds · {decoder.mode} mode · esc sub-tabs")
       when :input
         if s.input_mode == InputMode::Insert
-          keys("type to edit · ⇧arrows select · ^Y copy · ^F find · esc read · ↓ chain · {decoder.clear} clear · {decoder.mode} mode · ^N new · ^W close · ↑ sub-tabs")
+          keys("type to edit · ⇧arrows select · ^Y copy · {editor.find} find · esc read · ↓ chain · {decoder.clear} clear · {decoder.mode} mode · ^N new · ^W close · ↑ sub-tabs")
         else
-          keys("i/↵ edit · ⇧arrows select · #{y} copy · ^F find · space cmds · ↓/↹ chain · {decoder.mode} mode · ^N new · esc sub-tabs")
+          keys("{editor.insert}/↵ edit · ⇧arrows select · #{y} copy · {editor.find} find · space cmds · ↓/↹ chain · {decoder.mode} mode · ^N new · esc sub-tabs")
         end
       else
         ""
@@ -673,32 +622,12 @@ module Gori::Tui
       store.set_setting(Store::DECODER_SESSIONS_KEY, DecoderSessions.to_json(session_tuples))
     end
 
-    # This project's persisted sub-tabs — or, for a store that has none yet, the one-time
-    # adoption of the legacy GLOBAL settings.json block. The legacy sessions are cleared from
-    # settings.json as they move, so the FIRST project opened after the upgrade inherits the
-    # workbench and every later one starts clean (leaving them in place would seed the very
-    # cross-project carry-over this split exists to stop). A blank legacy block is dropped
-    # rather than migrated: there is nothing to inherit, and writing an empty row would only
-    # mark the project as "already migrated" for no gain.
+    # This project's persisted sub-tabs (none yet for a fresh store).
     private def restore_sessions : Array({String, String, String})
       if raw = store.setting(Store::DECODER_SESSIONS_KEY)
         return DecoderSessions.parse(raw)
       end
-      none = [] of {String, String, String}
-      legacy = Settings.decoder_sessions
-      if DecoderSessions.blank?(legacy)
-        Settings.decoder_sessions = none # nothing to inherit; keep later projects clean
-        return none
-      end
-      # Adopt into the store FIRST, and only drop the settings.json copy once that write
-      # committed — a busy store must not cost the operator the sessions it failed to take.
-      # Either way the workbench opens with them; a failed adoption just means the next open
-      # retries the migration.
-      if store.set_setting(Store::DECODER_SESSIONS_KEY, DecoderSessions.to_json(legacy))
-        Settings.decoder_sessions = none
-        Settings.drop_legacy_decoder_sessions
-      end
-      legacy
+      [] of {String, String, String}
     end
 
     # ---- output actions (also the space-menu verbs, via the runner) ----
@@ -706,8 +635,17 @@ module Gori::Tui
       cur.view.cycle_out_mode
     end
 
+    # Clearing drops the INPUT and its chain, and `TextArea#set_text` empties the editor's
+    # undo stack with them — so it asks first, the way `notes_clear` does. Nothing to lose
+    # means no prompt.
     def clear_all : Nil
       s = cur
+      return clear_session(s) if s.input.text.empty? && s.chain.empty?
+      @host.confirm("CLEAR INPUT", "Clear this session's input and chain?\nThis can't be undone.",
+        confirm_label: "clear", danger: true) { clear_session(s) }
+    end
+
+    private def clear_session(s : DecoderSession) : Nil
       s.input.set_text("")
       s.chain = ""
       s.chain_cx = 0
@@ -716,30 +654,14 @@ module Gori::Tui
       @host.status("cleared")
     end
 
-    def copy_output : Nil
-      s = cur
-      text = s.view.output_copy(s.result)
-      if text.empty?
-        @host.status("nothing to copy")
-      else
-        written = Clipboard.copy(text)
-        @host.status("output copied to clipboard#{Clipboard.note(written, text)}")
-      end
-    end
-
     def decoder_copy_selection : Nil
       s = cur
       text = case s.pane
              when :output then s.view.output_copy_text(s.result)
              when :input  then input_copy_text(s)
-             else              "" # CHAIN has no selection (`decoder_selection_active?`); see decoder_copy_all
+             else              "" # CHAIN has no selection (`selection_active?`); see decoder_copy_all
              end
-      if text.empty?
-        @host.status("nothing to copy")
-      else
-        written = Clipboard.copy(text)
-        @host.status("copied #{written}b to clipboard#{Clipboard.note(written, text)}")
-      end
+      copy_text(text)
     end
 
     # The no-selection fallback for the space-menu/palette "Copy" verb (decoder.copy):
@@ -757,17 +679,12 @@ module Gori::Tui
                # the decode under it is what they came for. The arm used to return `s.chain`.
              else s.view.output_copy(s.result)
              end
-      if text.empty?
-        @host.status("nothing to copy")
-      else
-        written = Clipboard.copy(text)
-        @host.status("copied all (#{written}b)#{Clipboard.note(written, text)}")
-      end
+      copy_text(text, "all")
     end
 
     # The focused pane's selection (or current line) text without copying — for the
     # "Send selection to" flow. Mirrors decoder_copy_selection's pane routing.
-    def decoder_selection_text : String
+    def selection_text : String
       s = cur
       case s.pane
       when :output then s.view.output_copy_text(s.result)
@@ -782,7 +699,7 @@ module Gori::Tui
     end
 
     # The INPUT pane's two selection models, one per mode — see RepeaterView#pane_selection?.
-    # `decoder_selection_active?` and `input_copy_text` change together: claiming a selection
+    # `selection_active?` and `input_copy_text` change together: claiming a selection
     # while copy still read `input_read` would offer "Copy selection" and copy the caret line.
     private def input_copy_text(s) : String
       if s.input_mode == InputMode::Insert
@@ -792,17 +709,17 @@ module Gori::Tui
       end
     end
 
-    def decoder_selection_active? : Bool
+    def selection_active? : Bool
       s = cur
       case s.pane
       when :input
-        s.input_mode == InputMode::Insert ? s.input.selection? : s.input_read.selection?
+        s.input_mode == InputMode::Insert ? s.input.selection? : s.input_read.selection?(s.input)
       when :output then s.view.output_selection?
       else              false
       end
     end
 
-    def decoder_select_line : Nil
+    def select_line : Nil
       s = cur
       case s.pane
       when :input  then s.input_read.select_line(s.input) unless s.input_mode == InputMode::Insert
@@ -810,7 +727,7 @@ module Gori::Tui
       end
     end
 
-    def decoder_clear_selection : Nil
+    def clear_selection : Nil
       s = cur
       case s.pane
       when :input  then s.input_read.clear_selection
@@ -858,32 +775,64 @@ module Gori::Tui
       s = cur
       key = ev.key
       selecting = ev.shift?
+      growing = selecting || editor_line_held? # vertical arms only: see RepeaterController
       case
-      when key.enter? then s.input_mode = InputMode::Insert
-      when c == 'i'   then s.input_mode = InputMode::Insert
+      when key.enter? then return false # editor.insert-enter
       when nav_up?(ev)
         # A ⇧↑ on the first line extends the selection to its start rather than leaving the
         # pane (same for ⇧↓ below): a selection in progress is never a focus gesture.
-        if s.input.at_top? && !selecting
+        if s.input.at_top? && !growing
           commit
           @host.request_focus(:subtabs)
         else
           s.input_read.move(s.input, -1, 0, selecting: selecting)
         end
       when nav_down?(ev)
-        s.input.at_bottom? && !selecting ? focus_chain : s.input_read.move(s.input, 1, 0, selecting: selecting)
-      when key.left?  then s.input_read.move(s.input, 0, -1, selecting: selecting)
-      when key.right? then s.input_read.move(s.input, 0, 1, selecting: selecting)
-        # Home/End/Page over the READ caret: they move the EDITOR caret, so the read cursor —
-        # which is what this mode paints — is mirrored back onto it.
+        s.input.at_bottom? && !growing ? focus_chain : s.input_read.move(s.input, 1, 0, selecting: selecting)
+      when editor_read_sideways(ev) then nil # ←/→ h/l, ⌥ by word
+      # Home/End/Page over the READ caret: they move the EDITOR caret, so the read cursor —
+      # which is what this mode paints — is mirrored back onto it.
       when key.home?, key.end?
         key.home? ? s.input.home(selecting) : s.input.end_of_line(selecting)
         s.input_read.sync_to(s.input, selecting: selecting)
       when key.page_up?   then s.input_read.move(s.input, -s.input.page_rows, 0, selecting: selecting)
       when key.page_down? then s.input_read.move(s.input, s.input.page_rows, 0, selecting: selecting)
       when c && !ev.ctrl? && !ev.alt? && !c.control?
-        return false # x/y + Global breath → keymap
+        return false # i INSERT, x/y + Global breath → keymap
       end
+      true
+    end
+
+    # --- Verb::Scope::Editor — the INPUT pane (OUTPUT is read-only, CHAIN is a field) ---
+    def editor_pane? : Bool
+      cur.pane == :input
+    end
+
+    def editor_text_buffer : {TextArea, TextReadState}?
+      editor_pane? ? {cur.input, cur.input_read} : nil
+    end
+
+    def editor_enter_insert : Bool
+      return false unless editor_pane?
+      cur.input_mode = InputMode::Insert
+      true
+    end
+
+    def editor_exit_insert : Bool
+      return false unless editor_pane?
+      commit
+      cur.input_mode = InputMode::Read
+      true
+    end
+
+    # READ-mode undo. The read cursor has to adopt the caret `undo` restored, since READ
+    # paints from `input_read` rather than from the editor's own caret.
+    def editor_undo : Bool
+      return false unless editor_read_mode?
+      s = cur
+      s.input.undo
+      s.input_read.sync_from(s.input)
+      touch
       true
     end
 
@@ -1000,8 +949,8 @@ module Gori::Tui
       when key.up?, key.lower_k?
         s.view.output_at_top? ? focus_chain : out_nav_step(s, -1, 0, selecting)
       when key.down?, key.lower_j? then out_nav_step(s, 1, 0, selecting)
-      when key.left?               then out_nav_step(s, 0, -1, selecting)
-      when key.right?              then out_nav_step(s, 0, 1, selecting)
+      when nav_left?(ev)           then out_nav_step(s, 0, -1, selecting)
+      when nav_right?(ev)          then out_nav_step(s, 0, 1, selecting)
         # Home/End/Page. ⇧←/→ used to be H-SCROLL here; the pane soft-wraps now (like the
         # Repeater's RESPONSE, which draws the same line), so there is nothing off to the side
         # to pan to and the chord goes to the character selection every other text pane gives

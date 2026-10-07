@@ -2,53 +2,7 @@ require "../proxy/codec/body"
 require "../proxy/codec/http1"
 require "./engine"
 require "./pool"
-
-# Non-blocking "is there residue in the read buffer?" — the piece Crystal's public IO has no
-# way to ask. `ConnPool#checkout_state` needs it because `read_head` reads byte-by-byte through the
-# buffered layer, which pulls a large chunk off the socket into `@in_buffer_rem`; any bytes
-# the origin left past the framed body therefore sit in THAT buffer, not on the kernel socket,
-# where an fd-level `MSG_PEEK` cannot see them. `peek` would find them but calls `fill_buffer`
-# (blocking) when the buffer is empty, which is the common clean-socket case — so it cannot be
-# used on the keep-alive fast path. Reading `@in_buffer_rem` directly is the only non-blocking
-# answer. The name is long-standing Crystal internals; if it ever changes this fails to compile
-# rather than silently misbehaving.
-module IO::Buffered
-  def gori_buffered_residue? : Bool
-    !@in_buffer_rem.empty?
-  end
-end
-
-# `SSL_pending` — bytes OpenSSL has already decrypted and is holding for the next read. Not in
-# Crystal's LibSSL bindings, and it is the half of "is this TLS socket clean?" that an fd-level
-# peek structurally cannot answer: the record is already off the kernel socket. Present in every
-# OpenSSL and LibreSSL gori can link against (it predates SSL_has_pending, which is 1.1+ and
-# would also cover a buffered-but-undecrypted record — `gori_buffered_residue?` on the UNDERLYING
-# socket covers that instead, so the older, universally available call is enough. It is that
-# check and NOT the fd peek: once Crystal's buffered layer has pulled the bytes off the socket
-# the fd is empty, so a peek reports the connection idle).
-lib LibSSL
-  fun ssl_pending = SSL_pending(handle : SSL) : Int
-end
-
-# The two things `OpenSSL::SSL::Socket` knows and does not expose, both needed to answer
-# "clean?" WITHOUT a timed read. Same shape as `gori_buffered_residue?` above: reaching into
-# stdlib internals deliberately, so a rename fails to compile rather than silently misbehaving.
-class OpenSSL::SSL::Socket
-  # Decrypted bytes waiting inside OpenSSL.
-  def gori_ssl_pending? : Bool
-    LibSSL.ssl_pending(@ssl) > 0
-  end
-
-  # The socket underneath the TLS layer, so the kernel buffer can be peeked for a record that
-  # has arrived but not been decrypted yet. `BIO` exposes its `io`; the SSL socket does not.
-  def gori_underlying_io : IO
-    {% if compare_versions(Crystal::VERSION, "1.12.0") >= 0 %}
-      @bio.to_reference.io
-    {% else %}
-      @bio.io
-    {% end %}
-  end
-end
+require "../proxy/socket_residue"
 
 module Gori::Repeater
   # HTTP/1.1 keep-alive connection pool for a sweep's sends.
@@ -147,20 +101,9 @@ module Gori::Repeater
     end
 
     # What the checkout probe found on a parked socket, right before this request would be
-    # written onto it. Three outcomes, not two, because the third one is the discriminator
-    # the class contract says it does not have (see `stale?`): a FIN that is ALREADY on the
-    # socket proves the origin never saw this request, since nothing has been written yet.
-    enum Checkout
-      # Nothing waiting. Write the request onto it.
-      Clean
-      # Unread bytes from the PREVIOUS exchange (a body past Content-Length, a HEAD-with-body).
-      # Retire: framing this request's response against them is the response-desync gori
-      # exists to DETECT, not to suffer.
-      Residue
-      # The peer's FIN arrived while the socket sat idle, before gori wrote a byte. Retire —
-      # and the re-dial that follows is a FIRST send, for ANY method.
-      Closed
-    end
+    # written onto it — `Proxy::SocketResidue::State`, which moved under the proxy so the proxy
+    # can ask the same question of an upstream it retires (see there for the three outcomes).
+    alias Checkout = Proxy::SocketResidue::State
 
     # Connections dialed (== handshakes paid) and requests served off a parked socket.
     # `dialed + reused == sends` for a run that never hit a stale retry.
@@ -213,7 +156,7 @@ module Gori::Repeater
         # check is an early retire, and THIS one, right before we write onto the socket, is the
         # reliable one: by now any straggler residue is on the wire. Without it a poisoned socket
         # would frame this request's response against the previous response's leftovers.
-        case ConnPool.checkout_state(io)
+        case Proxy::SocketResidue.state(io) # the residue probe, asked of a parked socket at checkout
         when Checkout::Closed
           # The origin's FIN was on the socket BEFORE gori wrote a byte of this request. That
           # proves what `stale?` (below) explicitly cannot: the ORIGIN NEVER SAW THIS REQUEST.
@@ -239,7 +182,7 @@ module Gori::Repeater
           return dial_and_send(bytes, keepable, method)
         end
         started = Time.instant
-        result = Repeater::Engine.exchange(io, bytes, @host, @port, started)
+        result = Repeater::Engine.exchange(io, bytes, @host, @port, started, origin_scheme: @scheme)
         if stale?(result)
           close(io)
           # Counted for BOTH outcomes below: an origin that always closes parked sockets is the
@@ -314,7 +257,8 @@ module Gori::Repeater
       # so every other value is carried across verbatim.
       Repeater::Result.new(result.head, result.body, result.response, result.duration_us,
         detail ? "#{why} (#{detail})" : why, result.incomplete?,
-        delivered: result.delivered?, timed_out: result.timed_out?, retried: result.retried?)
+        delivered: result.delivered?, timed_out: result.timed_out?, retried: result.retried?,
+        retryable_stale: result.retryable_stale?)
     end
 
     # A Crystal `IO::Error` renders the socket's `inspect` into its message, so the transport's
@@ -351,7 +295,7 @@ module Gori::Repeater
         return retried ? err.as_retried : err
       end
       @dialed += 1
-      result = Repeater::Engine.exchange(io, bytes, @host, @port, started)
+      result = Repeater::Engine.exchange(io, bytes, @host, @port, started, origin_scheme: @scheme)
       recycle(io, result, keepable, method)
       retried ? result.as_retried : result
     end
@@ -365,7 +309,7 @@ module Gori::Repeater
     # CHECKOUT (`send`), not here. Residue can arrive AFTER we would park — the origin's write
     # races our recycle — so checking here would miss a straggler and still hand a poisoned
     # socket to the next send. `reusable_response?` interrogates only the response HEAD and
-    # cannot see the leftover bytes; the checkout-time `checkout_state` is what catches them, once
+    # cannot see the leftover bytes; the checkout-time `SocketResidue.state` is what catches them, once
     # they are reliably on the wire.
     private def recycle(io : IO, result : Repeater::Result, keepable : Bool, method : String) : Nil
       if @pooling && keepable && @idle.size < @max_idle && ConnPool.reusable_response?(result, method)
@@ -375,149 +319,15 @@ module Gori::Repeater
       end
     end
 
-    # POSIX `MSG_PEEK` — read-without-consume. Not in Crystal's `LibC`, but the value is
-    # 0x02 on every platform gori targets (Linux, macOS, the BSDs).
-    MSG_PEEK = 0x02
-
-    # LAST-RESORT probe deadline, for a socket that answers to `read_timeout` but is neither a
-    # `TCPSocket` nor an `OpenSSL::SSL::Socket` gori can look inside. Every socket the pool
-    # actually parks now takes a non-blocking path (see `checkout_state`); this is what keeps a
-    # future transport correct-but-slow rather than silently unchecked.
+    # A REUSED socket that failed at the request write or produced zero-byte EOF/reset while
+    # reading its response. Per the contract at the top of this class, an IDEMPOTENT request is
+    # then re-sent once on a fresh connection; timeouts and partial/rejected heads are not.
+    # Only consulted on the `@idle.pop?` branch, so "reused" is implicit.
     #
-    # It used to be the whole TLS answer, and it cost the full deadline on every CLEAN
-    # checkout — which is the common case. MEASURED against a real TLS origin, 200 checkouts:
-    # median 1598µs (min 1105, max 5169), against 0.38µs for the plaintext fd peek. Sequential
-    # callers paid it per request: a default `gori run sequence` over https is 500 samples on
-    # one connection, so ~800ms of the run was this probe.
-    #
-    # With the two-step check in `checkout_state`, a socket parked after a real exchange now
-    # answers in 0.5µs median (max 3µs, fast path 250/250 over a live TLS origin) and this
-    # deadline is only reached when bytes are genuinely waiting.
-    DRAIN_PROBE = 1.millisecond
-
-    # What is waiting on a parked socket, asked once, right before this request is written.
-    # A parked socket must be empty, or the next request reads the leftovers as its own
-    # response — and it must be OPEN, or the next request is written into a closed pipe.
-    #
-    # For a plaintext `TCPSocket` this is an fd-level `MSG_PEEK` — Crystal's socket fd is
-    # already non-blocking (evented IO), so `recv` returns immediately: `EAGAIN`/`EWOULDBLOCK`
-    # means nothing is waiting (Clean), a byte means Residue, and 0 means the peer sent FIN
-    # (Closed). ~0.3µs, so it costs the keep-alive fast path nothing. A TLS socket hides its
-    # fd and the residue may sit in OpenSSL's decrypted buffer where a raw peek cannot see it,
-    # so it falls back to a short read probe, which naturally covers both `SSL_pending` and a
-    # kernel-buffered record.
-    #
-    # EOF used to be folded into "drained", on the reasoning that a closed parked socket is the
-    # idle-timeout race the stale-retry path already handles. That stopped being true when the
-    # idempotency gate landed: for POST/PUT/PATCH/DELETE the stale path can no longer re-send,
-    # so handing back a socket proved dead DROPPED the request. It is now its own answer — and
-    # a better one for every method, because a FIN observed BEFORE the write means the origin
-    # never saw the request at all.
-    # `MSG_PEEK` on a socket fd: read-without-consume, non-blocking because Crystal's sockets
-    # are evented. EAGAIN/EWOULDBLOCK means nothing is waiting, a byte means residue, 0 means
-    # the peer sent FIN. ~0.38µs measured. Shared by the plaintext branch and the fd half of
-    # the TLS one, so the two cannot disagree about what a peek means.
-    private def self.peek_state(sock : TCPSocket) : Checkout
-      buf = uninitialized UInt8[1]
-      n = LibC.recv(sock.fd, buf.to_unsafe.as(Void*), LibC::SizeT.new(1), MSG_PEEK)
-      return Checkout::Closed if n == 0
-      return Checkout::Residue if n > 0
-      {Errno::EAGAIN, Errno::EWOULDBLOCK}.includes?(Errno.value) ? Checkout::Clean : Checkout::Residue
-    end
-
-    # Let the transport itself say what is waiting, bounded by DRAIN_PROBE. `nil` = EOF (the
-    # peer closed); a byte = residue, and it is CONSUMED — which is fine because this only
-    # runs on a socket that is about to be retired either way, and never on the clean fast
-    # path above.
-    private def self.drain_probe_state(io) : Checkout
-      prev = io.read_timeout
-      begin
-        io.read_timeout = DRAIN_PROBE
-        io.read_byte.nil? ? Checkout::Closed : Checkout::Residue
-      rescue IO::TimeoutError
-        Checkout::Clean
-      ensure
-        io.read_timeout = prev
-      end
-    end
-
-    # Pure and class-level, like the two reuse predicates below it, so a spec can drive it
-    # against a real socket rather than only through a whole pooled send. It reads nothing off
-    # the pool — only the socket it is handed.
-    def self.checkout_state(io : IO) : Checkout
-      # 1. Residue already pulled into the buffered layer by `read_head`'s byte reads. This is
-      #    where a body-past-Content-Length or a HEAD-with-body actually lands, and it is
-      #    non-blocking, so it must be checked FIRST.
-      return Checkout::Residue if io.is_a?(IO::Buffered) && io.gori_buffered_residue?
-      # 2. Residue — or the peer's FIN — still on the kernel socket.
-      if io.is_a?(TCPSocket)
-        peek_state(io)
-      elsif io.is_a?(OpenSSL::SSL::Socket)
-        tls_checkout_state(io)
-      elsif io.responds_to?(:read_timeout=) && io.responds_to?(:read_timeout)
-        drain_probe_state(io)
-      else
-        Checkout::Clean # an IO with no timeout knob is not a pooled socket; nothing to prove
-      end
-    rescue
-      # Any probe error ⇒ do not risk writing onto this socket. Reported as Residue rather
-      # than Closed: a failed probe proves nothing about whether the peer closed, and Closed
-      # is the answer that licenses re-sending a POST.
-      Checkout::Residue
-    end
-
-    # The TLS half of `checkout_state`, in its own method because it is four ordered questions
-    # rather than one, and the ORDER is the whole design.
-    #
-    # 1. Decrypted bytes already inside OpenSSL are residue outright (`SSL_pending`), free.
-    # 2. Ciphertext Crystal's OWN buffered layer already pulled off the fd. `checkout_state`
-    #    asks the same question of THIS socket's plaintext buffer; this is the different buffer
-    #    underneath it, and neither `SSL_pending` nor the peek below can see it.
-    #    `OpenSSL::BIO.read_ex` reads through `bio.io.read` — the BUFFERED read — and
-    #    `IO::Buffered#read` calls `fill_buffer` whenever the request is under half the buffer,
-    #    pulling up to 8 KiB. OpenSSL asks for a 5-byte record header first, so EVERY record
-    #    read over-reads. `Socket#initialize` sets only `sync = true`, which is write-side;
-    #    read buffering stays on and gori never disables it. So an origin that flushes head and
-    #    body as two records leaves record 2 sitting here with `SSL_pending` at 0 (not decrypted
-    #    yet) and the fd peek at EAGAIN (kernel buffer already drained) — and without this step
-    #    the socket is handed out Clean and the next payload's response is framed against these
-    #    leftovers. Pinned by `spec/fuzz/conn_pool_checkout_spec.cr`.
-    # 3. Otherwise ask the fd whether ANYTHING is waiting. If the kernel buffer is empty too,
-    #    the socket is provably idle and this returns Clean without a read — the common case,
-    #    and what removes the ~1.6ms this branch used to cost every checkout.
-    # 4. Only when bytes ARE waiting does it fall through to the timed read. That step cannot
-    #    be skipped: a peek sees bytes but not what they MEAN. A TLS 1.3 record carrying a
-    #    NewSessionTicket has outer content type 0x17, exactly like application data — the real
-    #    type is encrypted — so nothing short of letting OpenSSL decrypt it can tell a
-    #    post-handshake message from a leftover response. Reading the content-type byte was
-    #    tried and is wrong for TLS 1.3 for that reason.
-    private def self.tls_checkout_state(io : OpenSSL::SSL::Socket) : Checkout
-      return Checkout::Residue if io.gori_ssl_pending?
-      under = io.gori_underlying_io
-      return Checkout::Residue if under.is_a?(IO::Buffered) && under.gori_buffered_residue?
-      return Checkout::Clean if under.is_a?(TCPSocket) && peek_state(under) == Checkout::Clean
-      drain_probe_state(io)
-    end
-
-    # A REUSED socket that failed BEFORE any response byte arrived. Per the contract at the
-    # top of this class, an IDEMPOTENT request is then re-sent once on a fresh connection;
-    # anything else stops here with this result. Only ever consulted on the `@idle.pop?`
-    # branch, so "reused" is implicit.
-    #
-    # It used to compare the error string to `no_response_error` exactly, which matches ONLY a
-    # clean EOF. An origin that RESET the parked socket failed with an `Errno`-derived message
-    # instead, so `stale?` said false, the request was NOT retried, and the payload surfaced a
-    # "connection reset" the origin never saw — a silent false negative in the middle of a
-    # sweep, plus `@consecutive_stale` never advanced so `STALE_GIVE_UP` could never bound the
-    # wasted redials against an origin that always resets.
-    #
-    # The discriminator is "no response byte was DELIVERED", not which IO error ended it.
-    # `response.nil?` alone is not that: `exchange` returns `response: nil` for an interim-1xx
-    # failure too (`malformed interim` / `too many interim` / `upstream closed after interim`),
-    # and by then the origin has certainly sent something. `delivered?` is false only before any
-    # response byte arrives — a clean EOF, a reset, or a write failure on a parked socket. An
-    # INCOMPLETE response (head read, body cut) carries a non-nil `response` and so is already
-    # excluded.
+    # retryable_stale? is set by the HTTP/1 exchange at the read/write site, where EOF/reset can
+    # be distinguished from a timeout, an oversized head or a read failure after bytes arrived.
+    # `response.nil?` and `delivered?` alone cannot make that distinction, and an interim-1xx
+    # failure also has no final `response` despite the origin having already answered.
     #
     # What this does NOT establish, and used to be read as establishing, is that the ORIGIN
     # never saw the request. It only means gori heard nothing back. The method gate in `send`
@@ -527,7 +337,7 @@ module Gori::Repeater
     # FIN arrived after the probe, i.e. genuinely while or after gori wrote. This is the narrow
     # ambiguous window the method gate exists for, not the whole idle-close population.
     private def stale?(result : Repeater::Result) : Bool
-      !result.error.nil? && result.response.nil? && !result.delivered?
+      !result.error.nil? && result.response.nil? && result.retryable_stale?
     end
 
     private def drain : Nil
@@ -597,6 +407,11 @@ module Gori::Repeater
       return false unless resp
       return false if resp.malformed?
       return false if resp.status == 101 # Switching Protocols — the socket is no longer HTTP/1
+      # A head ended on a bare-LF blank line was framed off the LENIENT reading, so its
+      # connection serves this one response only: a misframe then dies with the socket instead
+      # of becoming the next send's response. Same rule as the proxy's `origin_keep_alive?`, and
+      # an interim 1xx head counts too (`Result#lf_framed?`).
+      return false if result.lf_framed? || Proxy::Codec::Http1.lf_terminated_head?(resp.raw_head)
       return false if connection_close?(resp.headers)
       case resp.version
       when "HTTP/1.1" then true

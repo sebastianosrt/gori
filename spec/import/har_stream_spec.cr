@@ -69,6 +69,74 @@ describe "Import::Har.each_flow" do
     end
   end
 
+  # One byte that is not valid UTF-8 — a browser writing a response body verbatim is the
+  # ordinary way to get one. The pull parser reads the file through `IO#read_char`, so this
+  # arrives as `InvalidByteSequenceError` and NOT as the `JSON::ParseException` the walk was
+  # written around: it used to run out through `import_file` (`File::Error` only) and
+  # `CLI.run` (`Gori::Error` only) as a backtrace. It is a bad FILE, and says so.
+  it "reports a file whose bytes are not valid UTF-8 as a clean error, not a backtrace" do
+    body = %({"log":{"entries":[{"startedDateTime":"2026-06-01T12:00:00.000Z","time":1,"request":{"method":"GET","url":"https://s.test/","httpVersion":"HTTP/1.1","headers":[]},"response":{"status":200,"statusText":"OK","httpVersion":"HTTP/1.1","headers":[],"content":{"mimeType":"text/plain","text":"A\xffB"}}}]}})
+    with_har(body) do |path|
+      expect_raises(Gori::Error, /not valid UTF-8/) { Gori::Import::Har.each_flow(path) { } }
+      stream_store do |store|
+        expect_raises(Gori::Error, /not valid UTF-8/) { Gori::Import.import_file(store, :har, path) }
+      end
+    end
+  end
+
+  # `each_flow` YIELDS from inside the walk — `import_har_stream`'s block writes a chunk to
+  # SQLite and calls the progress callback in there — so the clauses that name the FILE would
+  # otherwise also speak for the consumer. A store or UI failure reported as "HAR file is not
+  # valid UTF-8", with the flow count appended to make it sound researched, is a wrong
+  # diagnosis pointed at the wrong artifact.
+  it "re-raises the caller's own exception instead of blaming the file" do
+    body = %({"log":{"entries":[#{har_entry(1)}]}})
+    with_har(body) do |path|
+      expect_raises(InvalidByteSequenceError, /consumer/) do
+        Gori::Import::Har.each_flow(path) { raise InvalidByteSequenceError.new("consumer blew up") }
+      end
+      expect_raises(IndexError, /consumer/) do
+        Gori::Import::Har.each_flow(path) { raise IndexError.new("consumer blew up") }
+      end
+    end
+  end
+
+  # The stdlib's `JSON::Any.new(pull)` raises a bare `Exception` ("Unknown pull kind") here,
+  # not a `JSON::ParseException`.
+  it "reports malformed JSON the pull parser meets as a bare Exception as a clean error" do
+    body = %({"log":{"entries":[{"request":{"url":"http://a/","headers":[{"name":"a", : "b"}]}}]}})
+    with_har(body) do |path|
+      expect_raises(Gori::Error, /not valid JSON/) { Gori::Import::Har.each_flow(path) { } }
+    end
+  end
+
+  # A read failure (EISDIR here, EIO on a dropped mount) is a plain `IO::Error`, which every
+  # surface would print as a backtrace: it has to arrive as a `Gori::Error`, named as a read.
+  it "reports a HAR it cannot read as a clean read error" do
+    dir = File.tempname("gori-har-dir")
+    Dir.mkdir(dir)
+    begin
+      expect_raises(Gori::Error, /cannot read/) { Gori::Import::Har.each_flow(dir) { } }
+    ensure
+      Dir.delete(dir)
+    end
+  end
+
+  # Each size fits Int64 on its own; their head + body and request + response sums did not,
+  # so the batch rolled back on insert or, below that, every later read of the row raised.
+  it "ignores a declared body size no wire could carry" do
+    huge = "4700000000000000000"
+    entry = har_entry(1).sub(%("headers":[]},), %("headers":[],"bodySize":#{huge},"postData":{"mimeType":"text/plain","text":"q"}},))
+      .sub(%("text":"ok"}), %("text":"ok","size":#{huge}},"bodySize":#{huge}))
+    with_har(%({"log":{"entries":[#{entry}]}})) do |path|
+      stream_store do |store|
+        Gori::Import.import_file(store, :har, path).count.should eq(1)
+        row = store.recent_flows(10).first
+        row.response_size.not_nil!.should be < 1_000
+      end
+    end
+  end
+
   it "stops where the caller cancels, without reading the rest of the file" do
     body = %({"log":{"entries":[#{har_entry(1)},#{har_entry(2)},#{har_entry(3)}]}})
     with_har(body) do |path|
@@ -144,6 +212,24 @@ describe "Import.import_file streams a HAR" do
     with_har(%({"log":{"entries":[{"request":{"method":"GET","url":""}},{"request":{"method":"GET","url":""}}]}})) do |path|
       stream_store do |store|
         expect_raises(Gori::Error, /all 2 entries were skipped as malformed/) { Gori::Import.import_file(store, :har, path) }
+      end
+    end
+  end
+end
+
+describe "Import::Har startedDateTime" do
+  # `9999-12-31T23:59:59-23:59` is year 10000 in UTC: the stored `created_at` raised in every
+  # later `Time.unix`, and the TUI's Project tab could not open the project. `2024-02-31` is
+  # well-formed but impossible, and its ArgumentError dropped the whole entry.
+  it "stamps an out-of-range or impossible date as now, and keeps the entry" do
+    before = Time.utc.to_unix_ms * 1_000
+    {"9999-12-31T23:59:59-23:59", "0001-01-01T00:00:00+23:59", "2024-02-31T00:00:00Z"}.each do |t|
+      entry = har_entry(1).sub("2026-06-01T12:00:00.000Z", t)
+      with_har(%({"log":{"entries":[#{entry}]}})) do |path|
+        result = Gori::Import::Har.parse_file(path)
+        result.skipped.should eq(0)
+        result.flows.size.should eq(1)
+        result.flows.first.request.created_at.should be >= before
       end
     end
   end

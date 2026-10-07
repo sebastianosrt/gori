@@ -1,3 +1,5 @@
+require "../embedded_list"
+require "../wordlist_catalog"
 require "./payload"
 
 module Gori::Fuzz
@@ -20,6 +22,7 @@ module Gori::Fuzz
       "format-string"     => {{ read_file("#{__DIR__}/payloads/format-string.txt") }},
       "bad-strings"       => {{ read_file("#{__DIR__}/payloads/bad-strings.txt") }},
       "command-injection" => {{ read_file("#{__DIR__}/payloads/command-injection.txt") }},
+      "cache-delimiters"  => {{ read_file("#{__DIR__}/payloads/cache-delimiters.txt") }},
     }
 
     @@cache = {} of String => Array(String)
@@ -39,7 +42,7 @@ module Gori::Fuzz
     def self.builtin(name : String) : Array(String)
       key = normalize(name)
       raw = BUILTIN_RAW[key]? || raise Gori::Error.new(unknown_message(name))
-      @@cache[key] ||= parse(raw)
+      @@cache[key] ||= EmbeddedList.parse(raw)
     end
 
     # Built-in payloads, then the optional user file (read at runtime). De-duped, order
@@ -49,6 +52,9 @@ module Gori::Fuzz
       values = builtin(name).dup
       if path = user_path.try(&.strip)
         unless path.empty?
+          # A bare name is a list in the current directory or the global catalog (#1353); a
+          # path is opened exactly as given.
+          path = WordlistCatalog.resolve_path(path)
           raise Gori::Error.new("preset merge file not found: #{path}") unless File.exists?(path)
           raise Gori::Error.new("preset merge file is a directory, not a file: #{path}") if File.directory?(path)
           raise Gori::Error.new("preset merge file not readable: #{path}") unless File::Info.readable?(path)
@@ -57,14 +63,14 @@ module Gori::Fuzz
           # chomp the line ending only, keeping leading/trailing whitespace, `#`-leading
           # lines (a SQL `#` comment, `#{7*7}` SSTI, a `#!/bin/sh` shebang are all valid
           # payloads) and blank lines (an intentional empty payload, sent by `-w` too).
-          # The strip + comment/blank skip below in `parse` is correct ONLY for the
+          # The strip + comment/blank skip in `EmbeddedList.parse` is correct ONLY for the
           # built-in `.txt` sets, whose headers document `#`/blank as comments.
           File.each_line(path, chomp: true) do |line|
             values << line
           end
         end
       end
-      dedup(values)
+      values.uniq
     end
 
     private def self.normalize(name : String) : String
@@ -73,20 +79,6 @@ module Gori::Fuzz
 
     private def self.unknown_message(name : String) : String
       "unknown payload preset: #{name.strip.inspect} (available: #{names.join(", ")})"
-    end
-
-    private def self.parse(raw : String) : Array(String)
-      out = [] of String
-      raw.each_line do |line|
-        stripped = line.strip
-        out << stripped unless stripped.empty? || stripped.starts_with?('#')
-      end
-      out
-    end
-
-    private def self.dedup(list : Array(String)) : Array(String)
-      seen = Set(String).new
-      list.select { |n| seen.add?(n) }
     end
   end
 

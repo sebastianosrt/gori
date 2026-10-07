@@ -1,6 +1,7 @@
 require "uri"
 require "../store/models"
 require "../proxy/codec/body"
+require "../proxy/codec/http1"
 require "../discover/url" # Url.default_port? — the scheme/port default predicate
 
 module Gori
@@ -15,6 +16,8 @@ module Gori
       record FlowPair, request : Store::CapturedRequest, response : Store::CapturedResponse?,
         ws_messages : Array(Store::ImportedWsMessage) = [] of Store::ImportedWsMessage
 
+      MAX_DECLARED_SIZE = 1_i64 << 50 # 1 PiB, see `capped`
+
       # Bound a stored import body to the same ceiling live capture uses, so a HAR
       # with a huge (e.g. media/base64) body can't insert an arbitrarily large,
       # never-truncated BLOB straight into the DB. Returns {stored, truncated, true_size}.
@@ -25,14 +28,47 @@ module Gori
       # have, the body arrives already truncated and is stored that way: dropping the flag
       # would present a capture-capped body as complete one hop later, which is the whole
       # thing the export marking exists to prevent. Every other import source passes nil and
-      # keeps its exact previous behaviour.
+      # keeps its exact previous behaviour. A declared size past `MAX_DECLARED_SIZE` is not a
+      # size anything sent, and near Int64::MAX it overflowed the head + body sums the store
+      # takes on insert and on every read of the row; it is ignored like an absent one.
       def self.capped(body : Bytes?, declared_size : Int64? = nil) : {Bytes?, Bool, Int64?}
         return {nil, false, nil} unless body
         size = body.size.to_i64
         max = Settings.capture_max
+        declared_size = nil if declared_size && declared_size > MAX_DECLARED_SIZE
         true_size = declared_size && declared_size > size ? declared_size : size
         return {body[0, max].dup, true, true_size} if body.size > max
         {body, true_size > size, true_size}
+      end
+
+      # Whether a timestamp parsed from an import file names an instant `Time` can hold. The
+      # parsers accept an offset that carries a legal wall-clock date past either end of the
+      # range (`9999-12-31T23:59:59-23:59` is year 10000 in UTC), and the resulting `created_at`
+      # then raises in every `Time.unix` that reads it back — the TUI's Project tab did so before
+      # its first frame, so the project could not be opened at all. An importer treats such a
+      # stamp like an unparseable one.
+      def self.representable?(time : Time) : Bool
+        Time.unix(time.to_unix)
+        true
+      rescue ArgumentError
+        false
+      end
+
+      # Add generated query parameters before a URL fragment: the query is part of the request
+      # target, while a `#fragment` is not sent and must not swallow it.
+      def self.append_query(url : String, query : String) : String
+        return url if query.empty?
+
+        if fragment_at = url.index('#')
+          base = url[0...fragment_at]
+          fragment = url[fragment_at..]
+        else
+          base = url
+          fragment = ""
+        end
+
+        separator = base.includes?('?') ? '&' : '?'
+        "#{base}#{separator}#{query}#{fragment}"
       end
 
       # A scheme is `scheme://` at the very START of the string (RFC 3986 §3.1); a
@@ -58,6 +94,13 @@ module Gori
       # the colon — a PORT (digits, then a path/query/fragment delimiter or the end) and
       # nothing else.
       SCHEME_NO_AUTHORITY = /\A[a-z][a-z0-9+.-]*:(?!\/\/)(?!\d*(?:[\/?#]|\z))/i
+
+      # An `http:`/`https:` scheme whose `//` is short or missing (`http:/h.test/x`,
+      # `https:h.test`). SCHEME_NO_AUTHORITY reads `http:/` as a `host:` with an empty port — the
+      # shape `example.com:/p` legitimately has — so the line became `https://http:/h.test/x`, a
+      # request to a host named `http`. No one names a host after the scheme, so it is a typo'd
+      # URL: skip it, never guess the missing slash.
+      HTTP_SCHEME_MANGLED = /\Ahttps?:(?!\/\/)/i
 
       # A raw control byte (CR, LF, other C0 or DEL) in the PATH or QUERY of an imported
       # URL is NOT rejected: it is the operator's own payload. Importing a HAR of a deliberately
@@ -112,6 +155,7 @@ module Gori
       def self.normalize_url(url : String) : String
         u = url.strip
         return u if u.starts_with?(HTTP_SCHEME)
+        raise Gori::Error.new("invalid URL (malformed scheme): #{url}") if u.matches?(HTTP_SCHEME_MANGLED)
         if u.matches?(LEADING_SCHEME) || u.matches?(SCHEME_NO_AUTHORITY)
           raise Gori::Error.new("invalid URL (missing scheme): #{url}")
         end
@@ -128,9 +172,17 @@ module Gori
         # matches that canonical bracket-free form and Scope host rules see ONE target, not two.
         host = host[1..-2] if host.starts_with?('[') && host.ends_with?(']')
         port = uri.port || (scheme == "https" ? 443 : 80)
+        # `URI.parse` bounds a port only by Int32, so `:65536` or `:99999` parsed and was stored as
+        # a target nothing can dial. Out of the TCP range is a parse failure, like the overflow.
+        raise Gori::Error.new("invalid URL (port out of range): #{url.inspect}") unless (1..65_535).includes?(port)
         path = uri.path.presence || "/"
         target = uri.query ? "#{path}?#{uri.query}" : path
         {scheme, host, port, target}
+      rescue URI::Error | ArgumentError | OverflowError
+        # Import callers speak Gori::Error so one malformed URL skips its entry instead of
+        # unwinding the whole collection. URI.parse raises OverflowError for a port that does
+        # not fit Int32, rather than returning an invalid URI.
+        raise Gori::Error.new("invalid URL (unparseable): #{url.inspect}")
       end
 
       # Headers are an ORDERED list of {name, value} pairs, not a map, so a repeated
@@ -267,17 +319,17 @@ module Gori
           # of advertising the prefix length as the whole entity.
           #
           # NEITHER of those reasons applies when the source stated BOTH framings — see
-          # `both_framings?`. There the pair IS the payload, so both lines go out verbatim
-          # and nothing is synthesized beside them.
+          # `preserve_request_framing?`. There the source's framing lines are the payload, so
+          # they go out in order and nothing is synthesized beside them.
           #
           # What gets re-emitted is `synthesized_length`'s answer, which is nil only when the
           # source described no length at all — a body is not the gate, since a source can state
           # a length and ship no entity.
           wire_chunked = wire_chunked?(headers, body, truncated)
-          both = both_framings?(headers)
+          preserve_framing = preserve_request_framing?(headers)
           headers.each do |k, v|
-            next if !both && k.compare("content-length", case_insensitive: true) == 0
-            next if !both && !wire_chunked && transfer_encoding?(k)
+            next if !preserve_framing && k.compare("content-length", case_insensitive: true) == 0
+            next if !preserve_framing && !wire_chunked && transfer_encoding?(k)
             b << k << ": " << v << "\r\n"
           end
           # The verbatim-body suppression is scoped to a version that FRAMES its own body
@@ -289,7 +341,7 @@ module Gori
           # sendable. So `frame_body: false` only reaches `synthesized_length` under implicit
           # framing; otherwise a length is synthesized as it always was.
           frame = frame_body || !implicit_body_framing?(http_version)
-          if !both && !wire_chunked && (length = synthesized_length(headers, body, content_length, frame))
+          if !preserve_framing && !wire_chunked && (length = synthesized_length(headers, body, content_length, frame))
             b << "Content-Length: " << length << "\r\n"
           end
           b << "\r\n"
@@ -381,6 +433,24 @@ module Gori
           return true if has_cl && has_te
         end
         false
+      end
+
+      # Preserve the framing bytes the source supplied when they describe a probe gori cannot
+      # safely rewrite: CL+TE, multiple Content-Length lines, or one line the shared HTTP/1
+      # predicate refuses to canonicalize. A lone decimal Content-Length keeps the existing
+      # body-derived rewrite behavior. Names are lstripped only to recognize an obs-folded
+      # Content-Length; the shared predicate then refuses to rewrite its indented wire line.
+      private def self.preserve_request_framing?(headers : Headers) : Bool
+        content_lengths = 0
+        has_transfer_encoding = false
+        headers.each do |(name, value)|
+          has_transfer_encoding = true if transfer_encoding?(name)
+          next unless name.lstrip.compare("content-length", case_insensitive: true) == 0
+          content_lengths += 1
+          return true if content_lengths > 1
+          return true unless Proxy::Codec::Http1.rewritable_length_header?("#{name}: #{value}")
+        end
+        content_lengths > 0 && has_transfer_encoding
       end
 
       # Whether this message is chunk-framed AS STORED — a `Transfer-Encoding` header AND a
@@ -533,10 +603,11 @@ module Gori
                                frame_body : Bool = true,
                                source : FlowSource::Kind = FlowSource::Kind::Import,
                                source_surface : FlowSource::Surface? = nil,
-                               source_ref : String? = nil) : FlowPair
+                               source_ref : String? = nil,
+                               request_head_override : Bytes? = nil) : FlowPair
         scheme, host, port, target = endpoint(url)
         stored, trunc, size = capped(body, declared_body_size)
-        head = request_head(method, target, http_version, scheme, host, port, headers, body,
+        head = request_head_override || request_head(method, target, http_version, scheme, host, port, headers, body,
           trunc ? size : nil, trunc, frame_body)
         # The `flows.method` COLUMN keeps the source's case too, matching live capture:
         # `FlowMapper.request` passes `req.method` straight through, and the consumers that
@@ -568,10 +639,12 @@ module Gori
                              frame_body : Bool = true,
                              source : FlowSource::Kind = FlowSource::Kind::Import,
                              source_surface : FlowSource::Surface? = nil,
-                             source_ref : String? = nil) : FlowPair
+                             source_ref : String? = nil,
+                             request_head_override : Bytes? = nil,
+                             response_head_override : Bytes? = nil) : FlowPair
         scheme, host, port, target = endpoint(url)
         req_stored, req_trunc, req_size = capped(req_body, declared_req_body_size)
-        req_head = request_head(method, target, http_version, scheme, host, port, req_headers, req_body,
+        req_head = request_head_override || request_head(method, target, http_version, scheme, host, port, req_headers, req_body,
           req_trunc ? req_size : nil, req_trunc, frame_body)
         # The RFC 8441 `:protocol` the importer recovered, when it could (V16). Threaded rather
         # than lifted off `req_head` here, so the decision about whether a given format's bytes
@@ -583,8 +656,9 @@ module Gori
           connect_protocol: connect_protocol,
           source: source, source_surface: source_surface, source_ref: source_ref)
         # `response_head` keeps an incoming Content-Length verbatim, so a truncated response
-        # already re-serializes with the origin's true length — no override needed on this side.
-        # It does need to KNOW the body was cut short, though, or a capped chunked response
+        # already re-serializes with the origin's true length. A raw override is used only when
+        # the source format carries a complete head. The response builder does need to KNOW the
+        # body was cut short, though, or a capped chunked response
         # loses its Transfer-Encoding (`wire_chunked?`), so cap first and tell it.
         resp_stored, resp_trunc, resp_size = capped(resp_body, declared_resp_body_size)
         # The RESPONSE's own version when the source recorded one, falling back to the
@@ -597,7 +671,7 @@ module Gori
         # the response's version: a HTTP/1.1 request answered over h2 came back as
         # `HTTP/1.1 200` with no phrase — the reason-less status line that is supposed to mean
         # the origin really sent one.
-        resp_head = response_head(resp_http_version || http_version, status, reason,
+        resp_head = response_head_override || response_head(resp_http_version || http_version, status, reason,
           resp_headers, resp_body, resp_trunc)
         content_encoding = resp_headers.find { |(k, _)| k.compare("content-encoding", case_insensitive: true) == 0 }.try(&.[1])
         resp = Store::CapturedResponse.new(

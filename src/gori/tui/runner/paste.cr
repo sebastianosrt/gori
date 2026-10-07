@@ -15,15 +15,58 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   # Only the BODY editor of a tab that says it can take one is eligible: everything else
   # (bottom prompts, pickers, overlays, single-line fields, hex edit) keeps the old
   # per-keystroke path, which is exactly what those surfaces already handle correctly.
-  private def begin_bulk_paste? : Bool
+  # The context in which a paste belongs to the tab BODY at all: no modal over it, no bottom
+  # prompt, no floating picker — each of those owns its own keymap, and a paste inside one is
+  # contained there. ONE home, because both decisions taken at a paste's start transition need
+  # exactly this set and the second one arrived as a copy of the first.
+  private def paste_body_context? : Bool
     return false unless @focus == :body && @overlay.none? && !modal_overlay?
     return false if @space_menu_open || copy_as_shown? || send_to_shown?
-    return false if @goto_open || @search_open || @rename_open || @tag_edit_open
+    !(@goto_open || @search_open || @rename_open || @tag_edit_open)
+  end
+
+  private def begin_bulk_paste? : Bool
+    # A modal that is itself a multi-line editor (the curl paste box) takes the paste whole,
+    # for the same reason a tab body does; every other modal keeps the keystroke path.
+    if ov = active_overlay
+      return ov.accepts_bulk_paste?
+    end
+    return false unless paste_body_context?
     @tabs[@active_tab]?.try(&.accepts_bulk_paste?) || false
   end
 
+  # A bracketed paste arriving at an editor pane that is in READ opens it first (#1124).
+  #
+  # `i` then ⌘V was the documented recovery — `PASTE_REFUSED` says so in as many words — and
+  # it lands in exactly the state this does: INSERT, caret where READ left it, the clipboard
+  # spliced there. So this removes a keystroke from a two-step the operator was going to take
+  # anyway; it does not invent a destination for the text. A paste is an explicit "put this in
+  # the buffer", which is why it may arm an editor that a POINTER gesture deliberately may not.
+  #
+  # Called BEFORE the two questions below rather than folded into either, because it has to
+  # change the answer to both: with the pane now in INSERT, `begin_bulk_paste?` takes the
+  # bulk-capable editors (Notes, the Repeater request, the Fuzzer template, and the Decoder /
+  # JWT / Cookie multi-line inputs) and `paste_runs_as_commands?` stops refusing the rest (the
+  # Issue notes, the Project description, the single-line TARGET, CHAIN, SECRET and SALT rows),
+  # which then get the per-keystroke path they already use in INSERT. Neither predicate needed
+  # a new clause.
+  #
+  # The guards are `paste_body_context?` — shared with `begin_bulk_paste?` — plus
+  # `subtab_filter_editing?`: a paste into the sub-tab `/` bar belongs to the bar, and arming
+  # the editor underneath it would put the clipboard in two places at once. `editor_read_mode?` is derived from `body_badge`, so a
+  # pane whose keys are already captured some other way — the Repeater's hex editor, its
+  # `^Q` chain modal, the gRPC FIELDS form — reports INSERT here and is left alone.
+  private def arm_editor_for_paste : Nil
+    return unless paste_body_context?
+    return unless tab = @tabs[@active_tab]?
+    return if tab.subtab_filter_editing?
+    tab.editor_enter_insert if tab.editor_read_mode?
+  end
+
   # Shown when a paste is refused. It names the recovery, because a paste that vanishes
-  # without a word is its own bug report.
+  # without a word is its own bug report. Since #1124 an editor pane in READ is opened rather
+  # than refused (`arm_editor_for_paste`), so what is left here is the focus that takes no
+  # text at all: the tab bar, the sub-tab strip, a list body.
   PASTE_REFUSED = "paste ignored — nothing focused takes text (i edits the pane, ↵ its fields)"
 
   # --- a paste whose END MARKER never came ---------------------------------
@@ -118,8 +161,10 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   #
   # The test is deliberately NARROW, and errs toward delivering the paste: everything modal
   # owns its own keymap and a stray paste inside it is contained, so only the surfaces that
-  # reach the SHELL's keymap answer true — the tab bar, the sub-tab strip, and a body that
-  # is not currently an editor. `:detail` is in that set for the same reason
+  # reach the SHELL's keymap answer true — the tab bar, the sub-tab strip, a body that is not
+  # currently an editor, and the space menu and its two pickers. Those three are NOT
+  # containers: the paste's first key runs a row or closes them, and the rest reach the
+  # tab's keymap (`Space` then a pasted `zc` stopped capture). `:detail` is in that set for the same reason
   # `drag_press_target?` puts it there: it is a History body drill-in, not a capturing modal,
   # so its keystrokes are the tab's.
   #
@@ -130,8 +175,8 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   # JWT input, the Fuzzer target. The sub-tab filter row reports through its own predicate.
   private def paste_runs_as_commands? : Bool
     return false unless @overlay.none? || @overlay.detail?
-    return false if modal_overlay? # palette / ⋯ menu / any migrated modal
-    return false if @space_menu_open || copy_as_shown? || send_to_shown?
+    return false if modal_overlay? # palette / any migrated modal
+    return true if @space_menu_open || copy_as_shown? || send_to_shown?
     return false if @goto_open || @search_open || @rename_open || @tag_edit_open
     return false if @tabs[@active_tab]?.try(&.subtab_filter_editing?)
     return false if @focus == :body && @tabs[@active_tab]?.try(&.body_badge) == :editor
@@ -177,7 +222,14 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     return false unless buf
     text = buf.to_s
     return false if text.empty?
-    return true if @tabs[@active_tab]?.try(&.paste_text(text))
+    # The modal the paste began over, when one took it (`begin_bulk_paste?`) — a click is
+    # swallowed mid-paste, so it is still the one on top.
+    taken = if ov = active_overlay
+              ov.paste_text(text)
+            else
+              @tabs[@active_tab]?.try(&.paste_text(text))
+            end
+    return true if taken
     replay_paste(text)
     true
   end
@@ -186,13 +238,6 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   # the same events the terminal would have produced, so every guard, confirm and escape
   # the editors apply while typing applies here too.
   private def replay_paste(text : String) : Nil
-    text.each_char do |c|
-      ev = case c
-           when '\n' then Termisu::Event::Key.new(Termisu::Input::Key::Enter, char: '\r')
-           when '\t' then Termisu::Event::Key.new(Termisu::Input::Key::Tab)
-           else           Termisu::Event::Key.new(Termisu::Input::Key::Unknown, char: c)
-           end
-      handle_key(ev)
-    end
+    text.each_char { |c| handle_key(ReadEdit.key_event(c)) }
   end
 end

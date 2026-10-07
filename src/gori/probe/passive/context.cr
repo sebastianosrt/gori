@@ -1,4 +1,5 @@
 require "../../store"
+require "../../utf8"
 require "../../proxy/codec/http1"
 require "../../proxy/codec/content_decode"
 require "./cache_control"
@@ -16,6 +17,10 @@ module Gori
         # A larger ceiling used ONLY by the client-side rules: DOM sinks in real minified SPA
         # bundles routinely sit past the 64 KiB body_text prefix, so those rules decode more.
         CLIENT_BODY_CAP = 256 * 1024
+        # Structured JSON evidence gets the same bounded ceiling, but only when a rule asks for
+        # it after the ordinary prefix was inconclusive. This keeps the common body scan at
+        # BODY_CAP while allowing an OpenAPI `paths` object to sit after a large `components` block.
+        STRUCTURED_BODY_CAP = 256 * 1024
 
         getter detail : Store::FlowDetail
         getter ws_messages : Array(Store::WsMessage)
@@ -28,8 +33,14 @@ module Gori
         @decoded_body_done = false
         @body_text : String?
         @body_text_done = false
+        @operator_body_text : String?
+        @operator_body_text_done = false
+        @operator_whole_text : String?
+        @operator_whole_text_done = false
         @client_body_text : String?
         @client_body_text_done = false
+        @structured_body_text : String?
+        @structured_body_text_done = false
         @client_scripts : Array(String)?
         @client_scripts_nocomment : Array(String)?
         @client_code : Array(String)?
@@ -38,6 +49,8 @@ module Gori
         @cache_control : Array(String)?
         @html : Bool?
         @js : Bool?
+        @binary_media : Bool?
+        @websocket : Bool?
 
         def initialize(@detail : Store::FlowDetail, @ws_messages = [] of Store::WsMessage)
         end
@@ -109,6 +122,33 @@ module Gori
           @html = !!ct_low.try(&.includes?("text/html"))
         end
 
+        # Media types whose body is binary by design: raster images, audio, video, fonts, wasm,
+        # archives. `image/svg+xml` is XML text (and an XSS carrier), so it is not one of them.
+        # `application/octet-stream` is deliberately absent: it is the sniffable type
+        # `MimeConfusion` and `ExposedConfig` read, and it labels served text files routinely.
+        BINARY_MEDIA_PREFIXES = {"image/", "audio/", "video/", "font/"}
+        BINARY_MEDIA_TYPES    = {"application/wasm", "application/font-woff", "application/x-font-woff",
+                                 "application/x-font-ttf", "application/x-font-otf",
+                                 "application/vnd.ms-fontobject", "application/zip",
+                                 "application/gzip", "application/x-gzip"}
+
+        # The response DECLARES a binary media type. Only half of `body_text`'s skip: the body
+        # must also fail UTF-8 validation, so a text error page mislabelled `image/png` is still
+        # read.
+        def binary_media? : Bool
+          b = @binary_media
+          return b unless b.nil?
+          @binary_media = binary_media_type?(ct_low)
+        end
+
+        private def binary_media_type?(low : String?) : Bool
+          return false unless low
+          semi = low.index(';')
+          media = (semi ? low[0, semi] : low).strip
+          return false if media.includes?("svg")
+          BINARY_MEDIA_PREFIXES.any? { |p| media.starts_with?(p) } || BINARY_MEDIA_TYPES.includes?(media)
+        end
+
         # A JavaScript response (external bundle / module), distinct from an HTML document with
         # inline scripts. Used to gate the client-side rules alongside html?.
         def js? : Bool
@@ -131,11 +171,30 @@ module Gori
           @resp = @detail.response_head.try { |h| Proxy::Codec::Http1.parse_response_head(h) }
         end
 
-        # A real, scorable HTTP response: excludes a 101 upgrade and the synthetic status 0
-        # (no response captured). The header/cookie/CORS/body rules gate on this.
+        # Did this flow OPEN a WebSocket? Delegates to `Store::FlowDetail#websocket?`, the ONE
+        # predicate that knows both transports gori captures a socket over — RFC 6455's
+        # `Upgrade:`/101 handshake AND RFC 8441's extended CONNECT over HTTP/2, whose handshake
+        # is answered `200` and carries no `Upgrade` header at all (#742).
+        #
+        # Every probe reader used to ask `row.status == 101` instead, which is the h1 spelling
+        # only. That cost the engine an h2 socket three different ways: its frames were never
+        # handed to `WsPayloads` (a token in a frame of a WebSocket-over-h2 app went unreported),
+        # `Tech` did not fingerprint it as a WebSocket endpoint, and — the FP half — `response`
+        # below scored the handshake as an ordinary document, so a socket answered `200` collected
+        # `missing_hsts`/`missing_csp` for headers a WebSocket handshake has no reason to carry.
+        # Memoised: it re-reads the stored request head, and several rules ask.
+        def websocket? : Bool
+          w = @websocket
+          return w unless w.nil?
+          @websocket = @detail.websocket?
+        end
+
+        # A real, scorable HTTP response: excludes a protocol upgrade (either WebSocket
+        # transport, and any other 101) and the synthetic status 0 (no response captured).
+        # The header/cookie/CORS/body rules gate on this.
         def response : Proxy::Codec::RawResponse?
           r = raw_response
-          return nil if r.nil? || row.status == 101 || row.status == 0
+          return nil if r.nil? || row.status == 101 || row.status == 0 || websocket?
           r
         end
 
@@ -169,11 +228,68 @@ module Gori
         # Decoded, capped, scrubbed response body text — computed once and shared by the rules
         # that scan the body. nil when there is no body. Slices the shared `decoded_body` buffer
         # to its first BODY_CAP bytes.
+        #
+        # Every text getter here repairs through `Utf8.text`, not a bare `String#scrub`: scrub
+        # walks the body a CHARACTER at a time and returns `self` when there was nothing to fix,
+        # so a valid body — nearly all of them — pays a full decode to be told so, while
+        # `valid_encoding?` answers the same question with a byte DFA. Measured over this file's
+        # own worst case (bench/probe_passive_bench's 256 KiB JS bundle): 0.90ms → 0.10ms, and
+        # 0.69ms → 0.08ms over the 200 KiB HTML page. The repair itself is unchanged — an
+        # invalid body still ends up scrubbed, at ~5% for the second walk. See `Gori::Utf8`.
+        #
+        # A body that is binary by declaration AND by content (`binary_media?` plus invalid
+        # UTF-8) has no text: nil, as if empty. Scrubbing one turned every stray byte into a
+        # 3-byte U+FFFD, so a 64 KiB image became ~100-190 KiB of replacement characters that
+        # every body regex then walked — ~600µs per image, on the same fiber as the rest of
+        # capture, to scan a PNG for stack traces and API keys. Nothing a body rule matches
+        # survives in compressed pixel data; a mislabelled TEXT body is still valid UTF-8 and
+        # is still read.
         def body_text : String?
           return @body_text if @body_text_done
           @body_text_done = true
           bytes = decoded_body
-          @body_text = (bytes && !bytes.empty?) ? String.new(bytes[0, {bytes.size, BODY_CAP}.min]).scrub : nil
+          return @body_text = nil if bytes.nil? || bytes.empty?
+          slice = bytes[0, {bytes.size, BODY_CAP}.min]
+          # Validated on the slice, before any copy: a real image fails within its first bytes.
+          # A cap can split the last character of a mislabelled text body, so that tail is not
+          # held against it.
+          return @body_text = nil if binary_media? && !Unicode.valid?(Context.whole_chars(slice))
+          @body_text = Utf8.text(slice)
+        end
+
+        # `body_text` WITHOUT the binary skip, for the operator's custom rules. The skip was
+        # measured against the built-ins, which match nothing in pixel data; an operator's rule
+        # can be looking for exactly what hides there (`<?php` in a GIF polyglot served as
+        # `image/gif`), and it used to see the scrubbed text.
+        def operator_body_text : String?
+          return @operator_body_text if @operator_body_text_done
+          @operator_body_text_done = true
+          @operator_body_text = body_text || begin
+            bytes = decoded_body
+            Utf8.text(bytes[0, {bytes.size, BODY_CAP}.min]) if bytes && !bytes.empty?
+          end
+        end
+
+        # `response_whole_text` over `operator_body_text`.
+        def operator_whole_text : String?
+          return @operator_whole_text if @operator_whole_text_done
+          @operator_whole_text_done = true
+          @operator_whole_text = body_text ? response_whole_text : join_region(response_head_text, operator_body_text)
+        end
+
+        # `s` without a trailing sequence the slice cut short — at most three continuation
+        # bytes and the lead byte they belong to.
+        protected def self.whole_chars(s : Bytes) : Bytes
+          i = s.size
+          back = 0
+          while i > 0 && back < 3 && s[i - 1] & 0xC0 == 0x80
+            i -= 1
+            back += 1
+          end
+          return s unless i > 0 && s[i - 1] >= 0xC0
+          lead = s[i - 1]
+          need = lead >= 0xF0 ? 4 : (lead >= 0xE0 ? 3 : 2)
+          s.size - (i - 1) < need ? s[0, i - 1] : s
         end
 
         # Decoded, larger-capped (CLIENT_BODY_CAP), scrubbed body — computed once and shared by
@@ -184,7 +300,21 @@ module Gori
           @client_body_text_done = true
           return @client_body_text = nil unless html? || js?
           bytes = decoded_body
-          @client_body_text = (bytes && !bytes.empty?) ? String.new(bytes[0, {bytes.size, CLIENT_BODY_CAP}.min]).scrub : nil
+          @client_body_text = (bytes && !bytes.empty?) ? Utf8.text(bytes[0, {bytes.size, CLIENT_BODY_CAP}.min]) : nil
+        end
+
+        # A bounded, lazy extension for structured JSON rules. It deliberately re-decodes rather
+        # than widening `decoded_body` for every rule: BodyLeaks and the other broad scans retain
+        # their measured 64 KiB hot path, while a gated API-spec check can recover a marker that
+        # is legitimately late in a large document.
+        def structured_body_text : String?
+          return @structured_body_text if @structured_body_text_done
+          @structured_body_text_done = true
+          return @structured_body_text = nil unless ct_low.try(&.includes?("json"))
+          decoded, _ = Proxy::Codec::ContentDecode.decode(
+            @detail.response_head, @detail.response_body, STRUCTURED_BODY_CAP)
+          bytes = decoded || @detail.response_body
+          @structured_body_text = (bytes && !bytes.empty?) ? Utf8.text(bytes[0, {bytes.size, STRUCTURED_BODY_CAP}.min]) : nil
         end
 
         # RAW executable JS fragments (inline <script> bodies for HTML, whole body for JS),
@@ -198,7 +328,11 @@ module Gori
         # so the DOM-XSS source->sink correlation never matches a sink or source that lived in a
         # string or comment. Memoised so the lex runs at most once per flow.
         def client_code : Array(String)
-          @client_code ||= client_scripts.map { |s| JsScan.strip(s) }
+          if c = @client_code
+            return c
+          end
+          build_client_views
+          @client_code || [] of String
         end
 
         # The fragments with ONLY comments blanked (string/template CONTENTS kept). The
@@ -206,7 +340,32 @@ module Gori
         # "message"/"__proto__" inside a live string is still seen, but the same keyword in a
         # commented-out example/debug line no longer false-matches. Memoised per flow.
         def client_scripts_nocomment : Array(String)
-          @client_scripts_nocomment ||= client_scripts.map { |s| JsScan.strip_comments(s) }
+          if c = @client_scripts_nocomment
+            return c
+          end
+          build_client_views
+          @client_scripts_nocomment || [] of String
+        end
+
+        # Both client views from ONE lex of each fragment (`JsScan.strip_both`), because on an
+        # HTML or JS flow both are live: DomXss/DomClobbering read client_code, PostMessage/
+        # PrototypePollution read client_scripts_nocomment. Two `map`s meant two full walks of
+        # the same scripts (bench/probe_passive_bench's 256 KiB bundle: 1.75ms for the pair,
+        # 2.92ms for its non-ASCII variant — see `JsScan.strip_both` for what fusing them buys).
+        # Whichever getter is asked first fills both, so the memos still make this at most once
+        # per flow; an operator who has disabled one of the two rule pairs pays the other view's
+        # emission (~8% of one walk), not a second walk.
+        private def build_client_views : Nil
+          scripts = client_scripts
+          code = Array(String).new(scripts.size)
+          kept = Array(String).new(scripts.size)
+          scripts.each do |s|
+            stripped, nocomment = JsScan.strip_both(s)
+            code << stripped
+            kept << nocomment
+          end
+          @client_code = code
+          @client_scripts_nocomment = kept
         end
 
         # --- region text for user-defined custom match rules ---------------------------------
@@ -225,7 +384,7 @@ module Gori
 
         # Raw request head (request line + headers) as scrubbed text.
         def request_head_text : String
-          @req_head_text ||= String.new(@detail.request_head).scrub
+          @req_head_text ||= Utf8.text(@detail.request_head)
         end
 
         # Decoded, capped, scrubbed request body text (nil when there is no body). A request body
@@ -238,7 +397,7 @@ module Gori
           if body && !body.empty?
             decoded, _ = Proxy::Codec::ContentDecode.decode(@detail.request_head, body, BODY_CAP)
             bytes = decoded || body
-            @req_body_text = String.new(bytes[0, {bytes.size, BODY_CAP}.min]).scrub
+            @req_body_text = Utf8.text(bytes[0, {bytes.size, BODY_CAP}.min])
           end
           @req_body_text
         end
@@ -247,7 +406,7 @@ module Gori
         def response_head_text : String?
           return @resp_head_text if @resp_head_text_done
           @resp_head_text_done = true
-          @resp_head_text = @detail.response_head.try { |h| String.new(h).scrub }
+          @resp_head_text = @detail.response_head.try { |h| Utf8.text(h) }
         end
 
         # The "whole" region — head and body joined — memoized like every other region getter.

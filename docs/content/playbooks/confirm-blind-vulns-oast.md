@@ -7,33 +7,34 @@ weight = 100
 group = "Workbenches"
 +++
 
-A blind SSRF, a blind XXE, an out-of-band injection: none of them answer you in the response. They reach out to some *other* server instead. **OAST** gives you that server: gori mints a payload URL tied to a listener, you plant it in a request, and any DNS or HTTP callback the target makes to it lands as a hit you can point to. This playbook runs one confirmation end to end in about ten minutes.
+A blind SSRF, a blind XXE, remote file inclusion, or an out-of-band injection: none of them answer you in the response. They reach out to some *other* server instead. **OAST** gives you that server: gori mints a payload URL tied to a listener, you plant it in a request, and any DNS or HTTP callback the target makes to it lands as a hit you can point to. This playbook runs one confirmation end to end in about ten minutes.
 
-> **Before you begin.** [Set up an engagement](/playbooks/set-up-an-engagement/) first, and have a candidate injection point in hand: a parameter, header, or field that might make the server fetch a URL or resolve a hostname. A callback reaches a public interaction server that sees its metadata, so only run OAST against systems you're authorized to test, and prefer a self-hosted provider for sensitive work.
+> **Before you begin.** [Set up an engagement](/playbooks/set-up-an-engagement/) first, and have a candidate injection point in hand: a parameter, header, or field that might make the server fetch a URL, include a remote file, or resolve a hostname. A callback reaches a public interaction server that sees its metadata, so only run OAST against systems you're authorized to test, and prefer a self-hosted provider for sensitive work.
 
 ## 1. Start a listener and grab a payload
 
-Open the **OAST** tab (visible by default, next to Fuzzer) and press `Ctrl-R` to start listening. gori registers with a provider (public `interactsh` by default) and mints a **payload**: a unique hostname/URL that belongs to you for this session. Copy it with `g` (get payload).
+Open the **OAST** tab (off the bar by default: press **`0`** and type "oast", or `Ctrl-P` → **Go to OAST**) and press `Ctrl-R` (or `Space` `r`, **Start listening**) to start listening; gori registers with the selected provider and begins polling. A new project has no provider yet: add one on the **Providers** sub-tab first (`a`; the public `interactsh` is prefilled). Then press `g` (get payload) to mint a **payload**, a unique hostname/URL that belongs to you for this session, and copy it. `g` starts the listener itself if you skipped `Ctrl-R`.
 
 Headless, when you want the listener in a script or an agent loop:
 
 ```bash
-gori run oast listen
+gori run oast listen         # ad-hoc: the registration dies with the process
+gori run oast listen --save  # …or keep it as a project session
 ```
 
-One caveat: `gori run oast` is a store-free, ad-hoc listener; its registration dies with the process. Only the TUI keeps a listener across a session (resume it later with `r`), so use the tab when the callback might arrive late.
+A bare `listen` is store-free and its registration dies with the process, which for a callback that arrives hours later means the payload is already dead. `--save` writes it into the project instead — `gori run oast list` shows it, `gori run oast resume ID` picks it up in a later process, and `gori run oast release ID` is the teardown. Over MCP the same switch is `oast_start` with `persist: true`. The TUI's `Ctrl-R` has always saved one; resume it with `Shift-R` (`Space` `R`, **Resume listener…**).
 
 **Checkpoint.** The OAST tab shows a live payload URL, and the **Callbacks** table is empty and waiting.
 
 ## 2. Plant the payload
 
-Take that payload URL and put it where the target might dereference it. Send the candidate request to **Repeater** (`Ctrl-R` from History) or the **Fuzzer** (`Shift-I`), then `Space` → **Insert OAST payload** to drop the URL at the cursor. Plant it in whatever might trigger a server-side fetch: a URL parameter, a `Host` or `X-Forwarded-For` header, an XML entity for XXE, a webhook field. Send the request.
+Take that payload URL and put it where the target might dereference it. Send the candidate request to **Repeater** (`Ctrl-R` from History) or the **Fuzzer** (`Shift-I`), then `Space` `O` (**Insert OAST payload**) to drop the URL at the cursor. Plant it in whatever might trigger a server-side fetch or include: a URL parameter, a file/page/template field, a `Host` or `X-Forwarded-For` header, an XML entity for XXE, or a webhook field. Send the request.
 
 **Checkpoint.** The request carrying your payload reached the target. A normal response is fine here; the point is what the *server* does next, out of band.
 
 ## 3. Watch for a callback
 
-Back on the **OAST** tab, callbacks land in the **Callbacks** table as the target's infrastructure resolves the name or connects back, each with its protocol (`dns` / `http` / `smtp`), source IP, timestamp, and the sub-identifier that tells you which payload fired. `Ctrl-X` stops polling but keeps the registration, so a payload you already planted keeps resolving; press `r` to resume later and pick up whatever the provider buffered while you were away.
+Back on the **OAST** tab, callbacks land in the **Callbacks** table as the target's infrastructure resolves the name or connects back, each with its protocol (`dns` / `http` / `smtp`), source IP, timestamp, and the sub-identifier that tells you which payload fired. `Ctrl-X` stops polling but keeps the registration, so a payload you already planted keeps resolving; press `Shift-R` to resume later and pick up whatever the provider buffered while you were away.
 
 <figure class="tui-shot">
   <img src="/images/tui/oast.svg" alt="gori OAST tab with a Callbacks table of four decrypted hits on an interactsh payload: two DNS A lookups and two HTTP GET requests, each with a source IP and the payload as destination">
@@ -46,9 +47,9 @@ Back on the **OAST** tab, callbacks land in the **Callbacks** table as the targe
 
 ## 4. Turn a hit into an Issue
 
-A callback is the strongest evidence this tool produces, so record it. Select the hit and press `Shift-F` (or `Space` → **Add issue**) to file it as an **Issue**, prefilled with its protocol and source and carrying the raw interaction as its notes. It opens at **HIGH**; `Tab` re-rates it before you commit.
+A callback is the strongest evidence this tool produces, so record it. Select the hit and press `Shift-F` (or `Space` → **Add issue**) to file it as an **Issue**, prefilled with its protocol and source and carrying the raw interaction as its notes. It opens at **HIGH**; `Tab` to the severity row and use `←` / `→` to re-rate it before you commit.
 
-**Checkpoint.** The confirmed callback is recorded as an Issue in the **Issues** tab, evidence attached.
+**Checkpoint.** The confirmed callback is recorded as an Issue in the **Issues** tab, with the raw interaction in its notes.
 
 ## Next Steps
 

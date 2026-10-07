@@ -1,9 +1,22 @@
 require "../spec_helper"
+require "../support/memory_backend"
 require "file_utils"
 require "socket"
 require "../../src/gori/tui/controllers/history_controller"
 
 include Gori::Tui
+
+private def add_peer_history_flow(store : Gori::Store, target : String, body : String,
+                                  created_at : Int64) : Int64
+  head = "POST #{target} HTTP/1.1\r\nHost: h.test\r\n\r\n".to_slice
+  id = store.insert_flow(Gori::Store::CapturedRequest.new(
+    created_at: created_at, scheme: "http", host: "h.test", port: 80,
+    method: "POST", target: target, http_version: "HTTP/1.1",
+    head: head, body: body.to_slice, source: Gori::FlowSource::Kind::Proxy))
+  store.update_response(Gori::Store::CapturedResponse.new(
+    flow_id: id, status: 200, head: "HTTP/1.1 200 OK\r\n\r\n".to_slice))
+  id
+end
 
 # What History does when the VIEW it is showing through disappears underneath it (#776).
 #
@@ -172,6 +185,113 @@ private def with_history_controller(&)
 end
 
 describe "HistoryController — the active view under a peer" do
+  it "drops path and store-tier colour memos when a peer reuses a flow id" do
+    with_history_controller do |ctrl, _host, session|
+      ctrl.view.reload_handler = nil # drive the real view synchronously in this example
+      session.colormarker.add("body:old-secret", "red", Gori::Store::MarkerStyle::Strip, "old")
+      peer = Gori::Store.open(session.project.db_path)
+      begin
+        old_id = add_peer_history_flow(peer, "/old", "old-secret", 1_i64)
+        ctrl.view.reload(session.store)
+        before = MemoryBackend.new(120, 12)
+        ctrl.view.render_list(Screen.new(before), Rect.new(0, 0, 120, 12))
+        before.contains?("/old").should be_true
+        before.grid[3][1].should eq('█')
+
+        peer.clear_flows.should be_true
+        reissue_rowids(peer)
+        add_peer_history_flow(peer, "/new", "new-secret", 2_i64).should eq(old_id)
+        session.store.flow_row(old_id).not_nil!.target.should eq("/new")
+        ctrl.on_external_change
+        ctrl.view.reload(session.store)
+        ctrl.view.rows.map(&.target).should eq(["/new"])
+
+        after = MemoryBackend.new(120, 12)
+        ctrl.view.render_list(Screen.new(after), Rect.new(0, 0, 120, 12))
+        after.contains?("/new").should be_true
+        after.contains?("/old").should be_false
+        after.grid[3][1].should eq(' ')
+      ensure
+        peer.close
+      end
+    end
+  end
+
+  # A mark is an id, and after a peer clear the next capture takes the same id: the mark moved
+  # onto a flow nobody marked, and Delete destroyed it. The preview likewise kept the old bytes.
+  it "drops a mark and the preview whose flow a peer replaced under the same id" do
+    with_history_controller do |ctrl, _host, session|
+      prev = Gori::Settings.history_preview
+      Gori::Settings.history_preview = true
+      ctrl.view.reload_handler = nil
+      peer = Gori::Store.open(session.project.db_path)
+      begin
+        old_id = add_peer_history_flow(peer, "/old", "old-body-marker", 1_i64)
+        keep_id = add_peer_history_flow(peer, "/keep", "keep", 3_i64)
+        ctrl.view.reload(session.store)
+        ctrl.view.mark_all
+        ctrl.view.select_row(ctrl.view.rows.index!(&.id.==(old_id)))
+        ctrl.view.refresh_preview(session.store)
+
+        peer.clear_flows.should be_true
+        reissue_rowids(peer)
+        add_peer_history_flow(peer, "/new", "new-body-marker", 2_i64).should eq(old_id)
+        ctrl.on_external_change
+        ctrl.view.reload(session.store)
+        ctrl.view.marked?(old_id).should be_false
+        ctrl.view.marked?(keep_id).should be_false # gone with the clear
+        ctrl.view.mark_count.should eq(0)
+
+        ctrl.view.select_row(0)
+        ctrl.view.refresh_preview(session.store)
+        b = MemoryBackend.new(140, 40)
+        ctrl.view.render_list(Screen.new(b), Rect.new(0, 0, 140, 40))
+        b.contains?("old-body-marker").should be_false
+      ensure
+        Gori::Settings.history_preview = prev
+        peer.close
+      end
+    end
+  end
+
+  # `on_external_change` goes to the active tab only, so a clear while History was in the
+  # background has to be caught on the way back in.
+  it "drops a reused-id mark on returning to the tab" do
+    with_history_controller do |ctrl, _host, session|
+      ctrl.view.reload_handler = nil
+      peer = Gori::Store.open(session.project.db_path)
+      begin
+        old_id = add_peer_history_flow(peer, "/old", "old", 1_i64)
+        ctrl.view.reload(session.store)
+        ctrl.view.mark_all
+        peer.clear_flows.should be_true
+        reissue_rowids(peer)
+        add_peer_history_flow(peer, "/new", "new", 2_i64).should eq(old_id)
+        ctrl.on_enter
+        ctrl.view.marked?(old_id).should be_false
+      ensure
+        peer.close
+      end
+    end
+  end
+
+  it "keeps marks on flows a peer change did not touch" do
+    with_history_controller do |ctrl, _host, session|
+      ctrl.view.reload_handler = nil
+      peer = Gori::Store.open(session.project.db_path)
+      begin
+        a = add_peer_history_flow(peer, "/a", "a", 1_i64)
+        ctrl.view.reload(session.store)
+        ctrl.view.mark_all
+        add_peer_history_flow(peer, "/b", "b", 2_i64)
+        ctrl.on_external_change
+        ctrl.view.marked?(a).should be_true
+      ensure
+        peer.close
+      end
+    end
+  end
+
   it "picks up a view a peer created, without a restart" do
     with_history_controller do |ctrl, _host, session|
       session.store.insert_saved_view("peer view", "status:404").should_not eq(0)

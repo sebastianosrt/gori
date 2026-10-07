@@ -8,6 +8,8 @@ abstract class Gori::Verb::ExecContext
   abstract def issues_move(delta : Int32) : Nil
   abstract def issues_open : Nil
   abstract def issue_close : Nil
+  # `⇧N`/`⇧P` inside the drill-in — open the next/previous issue without returning to the list.
+  abstract def issue_step_item(delta : Int32) : Nil
   abstract def issues_delete : Nil
   # ⇧X — delete EVERY issue in the project (after a confirm). The whole-tab wipe the
   # clear-all family shares (#899); `issues_delete` is the selection-delete beside it.
@@ -43,15 +45,31 @@ abstract class Gori::Verb::ExecContext
   # sitting next to it.
   abstract def issue_set_cvss : Nil
   abstract def issue_edit_notes : Nil
-  abstract def issues_notes_read_mode? : Bool       # detail open, notes not in INS (gates y/copy)
-  abstract def issues_copy : Nil                    # copy selection from issue notes (READ)
-  abstract def issues_copy_all : Nil                # copy all issue notes (space menu)
-  abstract def issue_edit_title : Nil               # rename + set severity via the form overlay
-  abstract def issue_open_flow : Nil                # open the linked flow's detail in History
-  abstract def issue_repeater_flow : Nil            # send the linked flow to Repeater
-  abstract def issue_links : Nil                    # open the links overlay for the open issue
-  abstract def issue_open_link : Nil                # open the selected related item in its tab
+  abstract def issues_notes_read_mode? : Bool # detail open, notes not in INS (gates y/copy)
+  abstract def issues_copy : Nil              # copy selection from issue notes (READ)
+  abstract def issues_copy_all : Nil          # copy all issue notes (space menu)
+  abstract def issue_edit_title : Nil         # rename + set severity via the form overlay
+  # `r` — the selected RELATED row into a Repeater tab (a live flow's capture, a frozen row's
+  # frozen request), falling back to the issue's first flow row. There is no `issue_open_flow`
+  # twin: `o` opened "the linked flow", which is `s` on the first RELATED row now that the
+  # primary flow IS that row.
+  abstract def issue_repeater_flow : Nil
+  abstract def issue_links : Nil # open the links overlay for the open issue
+  # ↵ SHOWS the selected RELATED row's exchange in place (a read-only viewer over the frozen
+  # copy, or over the live source as it is now); `s` GOES to the tab it lives in. One key,
+  # one action — ↵ used to mean "open a modal" on a frozen row and "teleport" on a live one.
+  abstract def issue_open_link : Nil                # show the selected related item's exchange in place
+  abstract def issue_goto_link : Nil                # open the selected related item's source in its own tab
+  abstract def issue_related_goto? : Bool           # a RELATED row is selected (every kind has a source)
   abstract def issue_link_move(delta : Int32) : Nil # move selection in the RELATED list
+  # Frozen evidence (#1038). `issue_freeze_link` copies the selected LIVE related row's
+  # current exchange into an immutable `issue_evidence` row; `issue_evidence_delete` drops
+  # the selected FROZEN row after a confirm. The two queries gate them: a freeze is offered
+  # only on a live History/Repeater row that still resolves, a delete only on a frozen one.
+  abstract def issue_freeze_link : Nil
+  abstract def issue_evidence_delete : Nil
+  abstract def issue_related_freezable? : Bool
+  abstract def issue_related_frozen? : Bool
   abstract def issues_export_pick : Nil             # ask for the format, then the path
   abstract def issues_export(format : Symbol) : Nil # :markdown | :json | :sarif → asks for the path
 end

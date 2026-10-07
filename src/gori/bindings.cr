@@ -172,6 +172,15 @@ module Gori
     # see the class doc; a slot changes WHERE a value lives, never WHETHER it persists.
     @slot_values : Hash(String, Hash(String, Bound))
 
+    # The project this table's rules come from — the one a slot's refresh steps (#1233) are
+    # read out of and recorded into.
+    getter store : Store
+
+    # Told after every `prune_slots`, with the same argument. `SessionRefresh::Runner` keys its
+    # per-slot bookkeeping (#1233) by name exactly as the tables are keyed, so it forgets a
+    # deleted slot's failure count and cooldown at the moment its table goes.
+    property on_slots_pruned : Proc(Array(String)?, Nil)? = nil
+
     def initialize(@store : Store, rules : Array(Store::ExtractRule),
                    @slots : SessionSlots? = nil)
       @mutex = Mutex.new
@@ -228,6 +237,8 @@ module Gori
         end
         @rev &+= 1
       end
+      # Outside the mutex, and even when no table was held: the listener's state is its own.
+      @on_slots_pruned.try &.call(surviving)
     end
 
     def self.load(store : Store, slots : SessionSlots? = nil) : Bindings
@@ -324,6 +335,13 @@ module Gori
       values_in(@slots.try(&.active))
     end
 
+    # `Env::Layer#active_slot_claims` — the names the active slot claims, whether or not a rule of
+    # that name exists. Read through `SessionSlots`, which has its own mutex, so this must not be
+    # called with `@mutex` held (the same discipline `values` documents).
+    def active_slot_claims : Array(String)
+      @slots.try(&.active).try(&.rules) || [] of String
+    end
+
     # `Env::Layer#slot_values` — the same read, answered for a NAMED slot instead of the active
     # one. For the caller that carries several identities through one run and cannot activate
     # each in turn (`Authorize`, whose whole measurement is that two identities resolve to two
@@ -412,13 +430,18 @@ module Gori
     #
     # `report_unbound_overlay` FIRST, and it is not a gate: with nothing bound, `$SESSION` in
     # a slot header goes out as five literal bytes and the origin answers 401 — which the
-    # operator reads as the session having been sent and rejected. See `Env.unbound_in_slot`
+    # operator reads as the session having been sent and rejected. See `Env.slot_literals`
     # for why this seam can say so when a request BODY's `$id` cannot.
-    def overlay(wire : Bytes) : Bytes
+    # ONE generation for the whole overlay, and the send seam's own when it has one: a slot
+    # with `X-Request-Id: $GEN.UUID` and `X-Correlation-Id: $GEN.UUID` sends one id, not two,
+    # and it is the id the request's own text carries. Each header value is its own
+    # `expand_bindings` call, so without a shared context every header minted separately.
+    def overlay(wire : Bytes, generation : Env::Generation? = nil) : Bytes
       slots = @slots
       return wire unless slots
       Env.report_unbound_overlay(slots.active)
-      slots.overlay(wire) { |value| Env.expand_bindings(value, guard_boundary: true) }
+      gen = generation || Env::Generation.new
+      slots.overlay(wire) { |value| Env.expand_bindings(value, guard_boundary: true, generation: gen) }
     end
 
     # `Env::Layer#active_slot_name` — the READOUT half of the two methods above. nil is
@@ -443,10 +466,6 @@ module Gori
 
     def rules : Array(Store::ExtractRule)
       @mutex.synchronize { @rules.dup }
-    end
-
-    def enabled_count : Int32
-      @mutex.synchronize { @rules.count(&.enabled?) }
     end
 
     # Why this rule may not be saved, or nil to proceed. Refused at SAVE time and named,
@@ -479,7 +498,7 @@ module Gori
         return "#{name.inspect} is not a valid binding name (letters, digits and _ only, not starting with a digit)"
       end
       if @mutex.synchronize { @rules.any? { |r| r.name == name && r.id != except_id } }
-        return "$#{name} is already written by another extract rule — one name, one writer"
+        return "#{Env.spell(name, Env::Namespace::Bind)} is already written by another extract rule — one name, one writer"
       end
       # AFTER the name checks: an unusable name is the more fundamental complaint, and reporting
       # the condition first made a form with both errors send its author to the wrong row.
@@ -707,32 +726,32 @@ module Gori
     # the `events` feed at warn level, carrying the rule name and the reason and NEVER the
     # value — `Sequencer::Extract`'s "nil on a miss rather than raising" contract was
     # already right; what was missing is that anybody heard about it.
+    #
+    # `as_slot` observes as if that slot were the send context — its claimed rules run and
+    # land in ITS table, whichever slot is active. A slot's refresh steps (#1233) are the
+    # caller: they re-authenticate one identity while another may be the context of every
+    # other tab, and `activate` is process-global. An unknown name degrades to no slot at all,
+    # the answer `slot_values` gives it.
     def observe(raw : Repeater::Result, subject : InterceptFilter::Subject,
-                flow_id : Int64? = nil) : Array(String)
+                flow_id : Int64? = nil, *, as_slot : String? = nil) : Array(String)
       return [] of String if raw.error
+      context = as_slot ? @slots.try(&.find(as_slot)) : @slots.try(&.active)
       # Not throttled: one deliberate send is one operator action, and they asked for it.
-      run(candidates(subject), raw, flow_id, entity_available: true, throttle: false)
+      run(candidates(subject, context), raw, flow_id, entity_available: true, throttle: false,
+        context: context)
     end
 
     # ── Proxy::ResponseExtract (the proxy response path, slice 2) ─────────────
 
-    # Both counts are read per response on the proxy path, so both are lock-free.
+    # Read per response on the proxy path, so lock-free.
     def extracts? : Bool
       @enabled_count.get > 0
     end
 
-    def extracts_body? : Bool
-      @body_count.get > 0
-    end
-
     # Whether a BODY-scoped extract rule that can actually MATCH `host` is live (#526/#531).
-    # `extracts_body?` above answers "is any live", which is the right question for `ClientConn`
-    # (already pinned to one host, deciding whether to pay for a buffer) and the WRONG one for
-    # the h2 downgrade gate: that gate costs the host its protocol, and a rule scoped to
-    # `alpha.test` must not cost `127.0.0.1` anything. Same split, same shape and the same
-    # atomic-count fast path as `Rules#rewrites_body_for_host?`.
-    #
-    # Once per CONNECT, so the mutex here is not on any hot path.
+    # The response buffer and h2 downgrade gates both need the host-specific answer: an
+    # unrelated body condition must not buffer this response or cost this host its protocol.
+    # Same split and atomic-count fast path as `Rules#rewrites_body_for_host?`.
     def extracts_body_for_host?(host : String) : Bool
       return false if @body_count.get == 0 # lock-free fast path
       @mutex.synchronize do
@@ -772,8 +791,9 @@ module Gori
     # And the hot-path cost the design was right to ask about is gated in TWO stages, neither
     # of which is a flag:
     #
-    #   1. `extracts_body?` — a lock-free atomic. No body-scoped rule anywhere means ClientConn
-    #      never buffers a response body at all, so nothing is decoded because nothing is held.
+    #   1. `extracts_body_for_host?` — a lock-free atomic first. No body-scoped rule anywhere
+    #      means ClientConn never buffers a response body at all, so nothing is decoded
+    #      because nothing is held.
     #   2. the rule's own host glob and `InterceptFilter` condition, evaluated BEFORE any decode
     #      (see the `candidates` call below). This is the structural difference from a
     #      Match&Replace body rule, whose `gsub` runs on EVERY response for a matching host: an
@@ -822,13 +842,14 @@ module Gori
     #
     # Both slot snapshots are taken BEFORE `@mutex`: `SessionSlots` has a mutex of its own and
     # nesting the two would make the lock order depend on which method you came in through.
-    private def candidates(subject : InterceptFilter::Subject) : Array(Compiled)
+    private def candidates(subject : InterceptFilter::Subject,
+                           context : SessionSlot? = @slots.try(&.active)) : Array(Compiled)
       slots = @slots
       claimed = nil.as(Set(String)?)
       active = nil.as(SessionSlot?)
       if slots && slots.scoped?
         claimed = slots.claimed_names
-        active = slots.active
+        active = context
       end
       matched(subject).select do |c|
         next true unless claimed && claimed.includes?(c.rule.name)
@@ -836,9 +857,7 @@ module Gori
       end
     end
 
-    # The HOST-and-CONDITION half of `candidates`, without the slot test. Its own method so
-    # `unasked` below asks the same question `candidates` does rather than a second copy of
-    # it that can drift — the difference between the two answers IS the diagnostic.
+    # The HOST-and-CONDITION half of `candidates`, without the slot test.
     private def matched(subject : InterceptFilter::Subject) : Array(Compiled)
       @mutex.synchronize do
         @compiled.select do |c|
@@ -847,51 +866,22 @@ module Gori
       end
     end
 
-    # Which slots claim `name`, in list order. Empty when no slot does — which is also the
-    # answer for a project with no slots at all.
-    def claiming_slots(name : String) : Array(String)
-      slots = @slots
-      return [] of String unless slots && slots.scoped?
-      slots.slots.select(&.claims?(name)).map(&.name)
-    end
-
-    # Rules this message MATCHED — host glob and condition both — that `candidates` did NOT
-    # ask, because a slot claims them and that slot is not the send context. One entry per
-    # rule: `{binding name, the slots claiming it}`.
+    # Every ENABLED rule that cannot be asked in the current send context whatever the
+    # response says, because a slot claims it and that slot is not active. One entry per rule:
+    # `{binding name, the slots claiming it}`.
     #
     # This is the information a caller needs to tell "the rule found nothing" apart from "the
-    # rule was not asked", and until it existed nobody could. `--bind-from` replays a flow,
-    # gets no bound name back and reports "no extract rule matched its response … check the
-    # rule's host glob, condition and selector" — three innocent things, when the actual cause
-    # is that one slot claims the rule and no slot is active. The rule matched; the selection
-    # skipped it. Measured: `session edit idA --rule SESSION` silently broke every existing
-    # `--bind-from` playbook, and `--clear-rules` silently fixed it again.
+    # rule was not asked". `--bind-from` replays a flow, gets no bound name back and reports
+    # "no extract rule matched its response … check the rule's host glob, condition and
+    # selector" — three innocent things, when the actual cause is that one slot claims the rule
+    # and no slot is active. Measured: `session edit idA --rule SESSION` silently broke every
+    # existing `--bind-from` playbook, and `--clear-rules` silently fixed it again.
     #
     # A SELECTION and not a miss, so it is deliberately not written to the `events` feed (see
     # `candidates`): that would be one row per response for every identity the operator is not
     # currently using. It is answered on demand, to the surface that has something to say.
-    def unasked(subject : InterceptFilter::Subject) : Array({String, Array(String)})
-      skipped = [] of {String, Array(String)}
-      slots = @slots
-      return skipped unless slots && slots.scoped?
-      claimed = slots.claimed_names
-      active = slots.active
-      list = slots.slots
-      matched(subject).each do |c|
-        name = c.rule.name
-        next unless claimed.includes?(name)
-        next if active.try(&.claims?(name))
-        next if skipped.any? { |(n, _)| n == name }
-        skipped << {name, list.select(&.claims?(name)).map(&.name)}
-      end
-      skipped
-    end
-
-    # `unasked` with no message in hand: every ENABLED rule that cannot be asked in the
-    # current send context whatever the response says, because a slot claims it and that slot
-    # is not active.
     #
-    # The subject-free half, because the caller that most needs this has no `Subject` to give.
+    # Subject-free, because the caller that most needs this has no `Subject` to give.
     # `gori run … --bind-from` replays a flow through `Repeater::Sender`, which runs the
     # extraction ITSELF; the CLI only ever sees "nothing bound" and has nothing left to build
     # a subject from. `Rules#report_refused`'s shape — a query a surface asks when it is about
@@ -913,14 +903,15 @@ module Gori
     end
 
     private def run(picked : Array(Compiled), raw : Repeater::Result, flow_id : Int64?,
-                    *, entity_available : Bool, throttle : Bool) : Array(String)
+                    *, entity_available : Bool, throttle : Bool,
+                    context : SessionSlot? = @slots.try(&.active)) : Array(String)
       return [] of String if picked.empty?
       bound = [] of String
       now = Time.utc
-      # The send context, read ONCE for the whole response: every rule that binds off these
-      # bytes belongs to the identity that was active when they arrived, and re-reading per
-      # rule could split one response's values across two slots.
-      active = @slots.try(&.active)
+      # The send context, read ONCE for the whole response (the caller's default argument):
+      # every rule that binds off these bytes belongs to the identity that was active when they
+      # arrived, and re-reading per rule could split one response's values across two slots.
+      active = context
       # Decided at most ONCE per response and only if a `text_only?` descriptor actually binds
       # off it — the check decodes the entity, so a project of cookie rules never pays for it.
       lossy = nil.as(Bool?)
@@ -1013,7 +1004,8 @@ module Gori
 
     private def miss(rule : Store::ExtractRule, reason : String, flow_id : Int64?) : Nil
       @store.insert_event("bindings", "extract_miss", "warn",
-        "$#{rule.name}: #{rule.token_loc.label} found nothing (#{reason})", flow_id: flow_id)
+        "#{Env.spell(rule.name, Env::Namespace::Bind)}: #{rule.token_loc.label} found nothing (#{reason})",
+        flow_id: flow_id)
     end
 
     # A bind that HAPPENED but not over the origin's bytes. Once per rule per rule revision,
@@ -1024,7 +1016,8 @@ module Gori
     private def report_scrubbed(rule : Store::ExtractRule, flow_id : Int64?) : Nil
       return unless @mutex.synchronize { @scrub_reported.add?(rule.id) }
       @store.insert_event("bindings", "extract_scrubbed", "warn",
-        "$#{rule.name}: #{rule.token_loc.label} read a response body that is not valid UTF-8 — a " \
+        "#{Env.spell(rule.name, Env::Namespace::Bind)}: #{rule.token_loc.label} read a response body " \
+        "that is not valid UTF-8 — a " \
         "regex/jsonpath descriptor has no byte-level reading, so every invalid byte was replaced " \
         "with U+FFFD before it ran and the bound value may not be the bytes the origin sent " \
         "(a cookie, header or position descriptor reads the same response byte-exact)",
@@ -1034,7 +1027,8 @@ module Gori
     private def miss_no_entity(rule : Store::ExtractRule, flow_id : Int64?) : Nil
       return unless @mutex.synchronize { @no_entity_reported.add?(rule.id) }
       @store.insert_event("bindings", "extract_no_body", "warn",
-        "$#{rule.name}: #{rule.token_loc.label} needs the response body, and this response was " \
+        "#{Env.spell(rule.name, Env::Namespace::Bind)}: #{rule.token_loc.label} needs the response " \
+        "body, and this response was " \
         "streamed rather than buffered (a server-sent-event / close-delimited / 101 body, or " \
         "one over the buffering ceiling) — the rule did not run", flow_id: flow_id)
     end

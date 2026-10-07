@@ -115,6 +115,31 @@ describe SettingsView do
     end
   end
 
+  it "shows a non-string proxy declaration and refuses to save it away" do
+    dir = File.tempname("gori-settings-proxy-nonstring")
+    Dir.mkdir_p(dir)
+    prev_home = ENV["GORI_HOME"]?
+    begin
+      ENV["GORI_HOME"] = dir
+      File.write(Gori::Settings.path, %({"network":{"upstream_proxy":8080}}))
+      Gori::Settings.load
+      v = SettingsView.new
+      v.reload(:network)
+      b = MemoryBackend.new(120, 30)
+      v.render(Screen.new(b), Rect.new(0, 0, 120, 30))
+      b.contains?("Invalid · 8080").should be_true
+
+      v.move_field(1) # edit only Bind Port
+      set_text(v, "9090")
+      v.save.should contain("must be a string")
+      Gori::Settings.upstream_route("origin.test").invalid?.should be_true
+    ensure
+      prev_home ? (ENV["GORI_HOME"] = prev_home) : ENV.delete("GORI_HOME")
+      Gori::Settings.upstream_proxy = ""
+      FileUtils.rm_rf(dir)
+    end
+  end
+
   it "toggles Verify upstream TLS off, then resets it to the default on save" do
     dir = File.tempname("gori-settings-verify")
     Dir.mkdir_p(dir)
@@ -204,6 +229,30 @@ describe SettingsView do
     ensure
       prev_home ? (ENV["GORI_HOME"] = prev_home) : ENV.delete("GORI_HOME")
       Gori::Settings.strip_alt_svc = prev
+      FileUtils.rm_rf(dir)
+    end
+  end
+
+  # A save can shorten the value under the caret (`editor` is stripped); the next ⌫ must
+  # clamp first rather than slice `v[0, -1]` and raise.
+  it "survives a backspace after a save shortened the focused value" do
+    dir = File.tempname("gori-settings-bs")
+    Dir.mkdir_p(dir)
+    prev_home = ENV["GORI_HOME"]?
+    prev = Gori::Settings.editor
+    begin
+      ENV["GORI_HOME"] = dir
+      v = SettingsView.new
+      v.reload(:editor)
+      set_text(v, "   ")
+      v.save
+      v.backspace
+      v.insert('x')
+      v.save
+      Gori::Settings.editor.should eq("x")
+    ensure
+      prev_home ? (ENV["GORI_HOME"] = prev_home) : ENV.delete("GORI_HOME")
+      Gori::Settings.editor = prev
       FileUtils.rm_rf(dir)
     end
   end
@@ -321,6 +370,7 @@ describe SettingsView do
     prev = {
       Gori::Settings.history_preview, Gori::Settings.probe_preview, Gori::Settings.issues_preview,
       Gori::Settings.history_list_order, Gori::Settings.sitemap_expand_depth, Gori::Settings.tab_numbers?,
+      Gori::Settings.tab_slots?,
     }
     begin
       ENV["GORI_HOME"] = dir
@@ -330,6 +380,7 @@ describe SettingsView do
       Gori::Settings.history_list_order = "newest"
       Gori::Settings.sitemap_expand_depth = -1
       Gori::Settings.tab_numbers = false
+      Gori::Settings.tab_slots = false
       v = SettingsView.new
       v.reload(:layout)
       v.section.should eq(:layout)
@@ -345,8 +396,11 @@ describe SettingsView do
       v.toggle_or_move(1) # all → 0
       v.move_field(1)
       v.toggle_or_move(1) # tab numbers on
+      v.move_field(1)
+      v.toggle_or_move(1) # tab bar slots on
       v.save
       Gori::Settings.tab_numbers?.should be_true
+      Gori::Settings.tab_slots?.should be_true
       Gori::Settings.history_preview.should be_true
       Gori::Settings.probe_preview.should be_true
       Gori::Settings.issues_preview.should be_true
@@ -361,9 +415,10 @@ describe SettingsView do
       Gori::Settings.history_list_order.should eq(Gori::Settings::DEFAULT_HISTORY_LIST_ORDER)
       Gori::Settings.sitemap_expand_depth.should eq(Gori::Settings::DEFAULT_SITEMAP_EXPAND_DEPTH)
       Gori::Settings.tab_numbers?.should eq(Gori::Settings::DEFAULT_TAB_NUMBERS)
+      Gori::Settings.tab_slots?.should eq(Gori::Settings::DEFAULT_TAB_SLOTS)
     ensure
       prev_home ? (ENV["GORI_HOME"] = prev_home) : ENV.delete("GORI_HOME")
-      Gori::Settings.history_preview, Gori::Settings.probe_preview, Gori::Settings.issues_preview, Gori::Settings.history_list_order, Gori::Settings.sitemap_expand_depth, Gori::Settings.tab_numbers = prev
+      Gori::Settings.history_preview, Gori::Settings.probe_preview, Gori::Settings.issues_preview, Gori::Settings.history_list_order, Gori::Settings.sitemap_expand_depth, Gori::Settings.tab_numbers, Gori::Settings.tab_slots = prev
       FileUtils.rm_rf(dir)
     end
   end
@@ -653,6 +708,40 @@ describe SettingsView do
     end
   end
 
+  # The Proxy protocol row reads "None" for a blank scalar whether the install is direct or
+  # sending everything through `$HTTPS_PROXY` — this row is where the difference shows (#1114).
+  it "shows the environment proxy in effect on its own NETWORK row, never its credentials" do
+    prev = {ENV["HTTPS_PROXY"]?, Gori::Settings.upstream_proxy, Gori::Settings.project_upstream_proxy}
+    begin
+      Gori::Settings.upstream_proxy = ""
+      Gori::Settings.project_upstream_proxy = nil
+      ENV["HTTPS_PROXY"] = "http://alice:s3cret@corp.example:3128"
+      backend = MemoryBackend.new(140, 30)
+      v = SettingsView.new
+      v.reload(:network)
+      v.render(Screen.new(backend), Rect.new(0, 0, 140, 30))
+      backend.contains?("HTTPS_PROXY → http proxy corp.e").should be_true # the modal truncates
+      backend.contains?("s3cret").should be_false
+      backend.contains?("alice").should be_false
+
+      Gori::Settings.upstream_proxy = "http://gori-proxy.test:8080"
+      backend = MemoryBackend.new(140, 30)
+      v.reload(:network)
+      v.render(Screen.new(backend), Rect.new(0, 0, 140, 30))
+      backend.contains?("shadowed · HTTPS_PROXY").should be_true
+
+      ENV.delete("HTTPS_PROXY")
+      backend = MemoryBackend.new(140, 30)
+      v.reload(:network)
+      v.render(Screen.new(backend), Rect.new(0, 0, 140, 30))
+      backend.contains?("Environment proxy").should be_true
+    ensure
+      prev[0] ? (ENV["HTTPS_PROXY"] = prev[0].not_nil!) : ENV.delete("HTTPS_PROXY")
+      Gori::Settings.upstream_proxy = prev[1]
+      Gori::Settings.project_upstream_proxy = prev[2]
+    end
+  end
+
   it "renders the Update check toggle in the GENERAL section" do
     backend = MemoryBackend.new(100, 30)
     v = SettingsView.new
@@ -666,9 +755,11 @@ describe SettingsView do
     Dir.mkdir_p(dir)
     prev_home = ENV["GORI_HOME"]?
     prev = {Gori::Settings.companion?, Gori::Settings.companion_placement,
-            Gori::Settings.companion_motion, Gori::Settings.companion_notices?}
+            Gori::Settings.companion_motion, Gori::Settings.companion_notices?,
+            Gori::Settings.companion_replies}
     begin
       ENV["GORI_HOME"] = dir
+      Gori::Settings.companion_replies = "hold"
       Gori::Settings.companion = false
       Gori::Settings.companion_placement = "body"
       Gori::Settings.companion_motion = "lively"
@@ -682,6 +773,8 @@ describe SettingsView do
       v.toggle_or_move(1) # Motion: lively → calm (choice)
       v.move_field(1)
       v.toggle_or_move(1) # Notices: on → off (bool)
+      v.move_field(1)
+      v.toggle_or_move(1) # Agent replies: hold → timed (choice)
       v.save
       Gori::Settings.companion?.should be_true
       Gori::Settings.companion_placement.should eq("bar")
@@ -689,6 +782,8 @@ describe SettingsView do
       Gori::Settings.companion_motion.should eq("calm")
       Gori::Settings.companion_lively?.should be_false
       Gori::Settings.companion_notices?.should be_false
+      Gori::Settings.companion_replies.should eq("timed")
+      Gori::Settings.companion_holds_replies?.should be_false
 
       v.reset_to_defaults
       v.save
@@ -696,10 +791,12 @@ describe SettingsView do
       Gori::Settings.companion_placement.should eq(Gori::Settings::DEFAULT_COMPANION_PLACEMENT)
       Gori::Settings.companion_motion.should eq(Gori::Settings::DEFAULT_COMPANION_MOTION)
       Gori::Settings.companion_notices?.should eq(Gori::Settings::DEFAULT_COMPANION_NOTICES)
+      Gori::Settings.companion_replies.should eq(Gori::Settings::DEFAULT_COMPANION_REPLIES)
     ensure
       prev_home ? (ENV["GORI_HOME"] = prev_home) : ENV.delete("GORI_HOME")
       Gori::Settings.companion, Gori::Settings.companion_placement = prev[0], prev[1]
       Gori::Settings.companion_motion, Gori::Settings.companion_notices = prev[2], prev[3]
+      Gori::Settings.companion_replies = prev[4]
       FileUtils.rm_rf(dir)
     end
   end
@@ -793,5 +890,50 @@ describe SettingsView do
       prev_home ? (ENV["GORI_HOME"] = prev_home) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(dir)
     end
+  end
+
+  # One row per Settings::MCP_PERMISSIONS group, all on at the factory default; a save flips
+  # exactly the groups toggled and leaves a key this gori does not draw where it was.
+  it "edits the MCP permission groups and resets them to all on" do
+    dir = File.tempname("gori-settings-mcp-perms")
+    Dir.mkdir_p(dir)
+    prev_home = ENV["GORI_HOME"]?
+    prev = Gori::Settings.mcp_denied_permissions
+    begin
+      ENV["GORI_HOME"] = dir
+      Gori::Settings.mcp_denied_permissions = Set{"future"}
+      v = SettingsView.new
+      v.reload(:mcp_permissions)
+      backend = MemoryBackend.new(140, 30)
+      v.render(Screen.new(backend), Rect.new(0, 0, 140, 30))
+      Gori::Settings::MCP_PERMISSIONS.each { |perm| backend.contains?(perm.title).should be_true }
+
+      v.toggle_or_move(1) # Send traffic: on → off
+      v.move_field(1)
+      v.toggle_or_move(1) # Intercept control: on → off
+      v.save
+      Gori::Settings.mcp_permitted?("send").should be_false
+      Gori::Settings.mcp_permitted?("intercept").should be_false
+      Gori::Settings.mcp_permitted?("write").should be_true
+      Gori::Settings.mcp_permitted?("future").should be_false
+
+      v.reset_to_defaults
+      v.save
+      Gori::Settings::MCP_PERMISSIONS.all? { |perm| Gori::Settings.mcp_permitted?(perm.key) }.should be_true
+    ensure
+      Gori::Settings.mcp_denied_permissions = prev
+      prev_home ? (ENV["GORI_HOME"] = prev_home) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(dir)
+    end
+  end
+end
+
+# termisu reads Tab as the printable '\t'; a settings text field must not take it as text.
+describe "SettingsOverlay Tab" do
+  it "does not type a tab into the focused text field" do
+    ov = SettingsOverlay.new(:editor)
+    before = ov.@view.@values.dup
+    ov.handle_key(Termisu::Event::Key.new(Termisu::Input::Key::Tab))
+    ov.@view.@values.should eq(before)
   end
 end

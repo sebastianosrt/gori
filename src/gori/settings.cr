@@ -1,7 +1,41 @@
 require "json"
 require "./paths"
+# The global-rule re-spelling `load` runs when `env.syntax` is absent. Required HERE rather than
+# left to `src/gori.cr`: this file NAMES `EnvMigration::GlobalReport`, and the bench harnesses (and
+# other small entry points) require settings.cr directly without the umbrella.
+require "./env_migration/globals"
+
+module Gori::Settings
+  # A section of scalar fields with factory defaults, as one table, so its factory reset and
+  # its writer cannot drift apart. Generates `reset_<name>` (every field back to its default)
+  # and `serialize_<name>` (the `key` object, omitted entirely while every field sits at its
+  # default, so a quiet install writes nothing and the 3-way merge has nothing to reconcile).
+  # Each field is `{"json_key", getter, DEFAULT}`; the setter is the getter less any `?`.
+  # Parsing stays hand-written beside the table: nearly every field clamps or normalizes.
+  # Defined before the section files below, which call it at their top level.
+  private macro defaulted_section(name, key, *fields)
+    private def self.reset_{{ name.id }} : Nil
+      {% for f in fields %}
+        self.{{ f[1].id.gsub(/\?$/, "") }} = {{ f[2] }}
+      {% end %}
+    end
+
+    private def self.serialize_{{ name.id }}(j : JSON::Builder) : Nil
+      return if {{ fields.map { |f| "#{f[1]} == #{f[2]}" }.join(" && ").id }}
+      j.field {{ key }} do
+        j.object do
+          {% for f in fields %}
+            j.field {{ f[0] }}, {{ f[1] }}
+          {% end %}
+        end
+      end
+    end
+  end
+end
+
 require "./settings/network"
 require "./settings/upstream_rules"
+require "./settings/project_network"
 require "./settings/outbound_tls"
 require "./settings/retention"
 require "./settings/listeners"
@@ -10,6 +44,7 @@ require "./settings/scan_rules"
 require "./settings/oast_providers"
 require "./settings/display"
 require "./settings/companion"
+require "./settings/mcp"
 require "./settings/tabs"
 require "./settings/keymap"
 require "./settings/decoder"
@@ -22,6 +57,7 @@ require "./settings/probe"
 require "./settings/discover"
 require "./settings/update"
 require "./settings/fuzzer"
+require "./settings/redaction"
 
 module Gori
   # Global, persisted user settings — the editable runtime CONFIG for one gori
@@ -42,7 +78,7 @@ module Gori
   # section). This file keeps only the orchestration shared by every section: path
   # resolution, load, save, the 3-way merge-with-disk, the top-level serialize
   # dispatcher, and the couple of generic JSON-parsing helpers (load_bool/
-  # load_bool_h/normalize_os) reused across sections.
+  # normalize_os) reused across sections.
   module Settings
     # THIS process's own serialization of the state it last read from (or wrote to) disk;
     # nil = never loaded. It's the 3-way-merge BASE at save time: a top-level section this
@@ -76,11 +112,10 @@ module Gori
 
     # A settings file is THERE and `load_raw` could not read a byte of it — EACCES on a file a
     # `sudo gori` left root-owned, a `--config` naming a directory, a transient I/O error. The
-    # separate flag exists because that rescue is silent: it sets no `load_warning` (nothing was
-    # parsed, so nothing complained) and leaves no `.corrupt` copy (`load_root` writes one where
-    # a PARSE fails, and this never got that far), so the only record that the operator's file
-    # was never seen is this bool. `load_degraded?` folds it in with two other cases; the one
-    # caller that has to tell them apart is `reset_to_factory`.
+    # separate flag exists because that rescue leaves no `.corrupt` copy (`load_root` writes one
+    # where a PARSE fails, and this never got that far), so nothing of the operator's file is
+    # kept anywhere. `save` and `reset_to_factory` both refuse on it; `load_degraded?` folds it
+    # in with two other cases.
     @@load_unreadable = false
 
     # An explicit settings file for THIS process (`gori --config PATH`), overriding both
@@ -107,12 +142,27 @@ module Gori
       @@path_override || ENV["GORI_CONFIG"]?.presence || File.join(Paths.home_dir, "settings.json")
     end
 
+    # Was this process pointed at a settings file BY NAME (`gori --config PATH`, `$GORI_CONFIG`),
+    # rather than falling back to the one under GORI_HOME?
+    #
+    # It is the question "there is no file here" cannot be answered without. At the HOME-DERIVED
+    # default path, an absent settings.json is a DATE — a fresh home, or a headless install from
+    # before namespaces — and adopting the new grammar plus re-spelling the projects is the whole
+    # upgrade. At a path the operator TYPED, the same absence is a typo: the real settings.json is
+    # still sitting under GORI_HOME saying `bare`, and adopting namespaced off a misspelled
+    # `--config` would re-spell that install's project databases against a file gori never read —
+    # and the next ordinary run, reading the real `bare` again, would reverse it lossily.
+    def self.explicit_path? : Bool
+      !(@@path_override || ENV["GORI_CONFIG"]?.presence).nil?
+    end
+
     # Load persisted values into the class properties. Tolerant: a missing or
     # malformed file leaves the defaults (or CLI-provided values) in place.
     def self.load : Nil
       @@loaded_raw = nil
       @@load_partial = false
       @@load_unreadable = false
+      @@env_syntax_unread = nil
       reset_upstream_route_errors
       # A full load rewrites every section's class properties, including the two
       # `reload_section` folds and caches. Dropping the cache here keeps "we already folded
@@ -121,18 +171,63 @@ module Gori
       # would then let the next tick skip the fold that repairs one.
       forget_reloaded_sections
       @@load_warning = nil # cleared here, not in load_root, so a file that is fixed OR removed drops it
+      # Reset per home: `load` runs repeatedly over DIFFERENT homes in one process (the project
+      # picker, `--config`, the spec suite), and "where did the grammar come from" must never be
+      # the previous home's answer — it is what decides whether this one's projects get rewritten.
+      self.env_syntax_origin = EnvSyntaxOrigin::Absent
       raw = load_raw
       unless raw
         # No file yet (first run — keep defaults, nothing to protect) or one that is there and
         # could not be READ (`@@load_unreadable`: everything below is at a factory default over
         # a file whose contents nobody has seen).
         @@load_unreadable = File.exists?(path)
+        # Said, because `save` now refuses on it and a refusal nobody can explain is a mystery
+        # "could not save settings" on every toggle.
+        if @@load_unreadable
+          note_load_warning("settings: #{path} exists but could not be read — using defaults " \
+                            "for this run, and this run will not overwrite that file")
+        else
+          # No file is a state with a perfectly good base: the defaults this process now holds.
+          # Left nil, `merge_with_disk` had nothing to merge against, so the first save wrote
+          # this process's defaults WHOLE over a file a peer created in the meantime — a
+          # `gori mcp` started on a fresh home erased the wizard's theme, bind and listeners
+          # the moment the agent saved a colour rule. Before the adoption below, for the reason
+          # `load` re-bases before it: a rewrite it makes is a genuine change.
+          @@loaded_raw = serialize
+        end
+        # "No file at the default path" and "no file at the path you named" are different facts —
+        # see `explicit_path?`. Only the first one is a date gori may act on.
+        adopt_env_syntax_for_absent_key(absent_explicit: !@@load_unreadable && explicit_path?)
         return
       end
       root = load_root(raw)
-      return unless root # present but unparseable — kept a .corrupt copy, keep defaults
+      unless root
+        # present but unparseable — kept a .corrupt copy, keep defaults. The grammar is the one
+        # exception, and `load_root` has already settled it: it is recovered TEXTUALLY from the
+        # raw file when the file still spells it, and otherwise reset to the default with a
+        # warning that says so. Resetting it here unconditionally was a silent DOWNGRADE — `save`
+        # stays armed on this path, `serialize_env` would then omit the section, and the next
+        # start would read the absence as bare forever.
+        return
+      end
       begin
         apply_sections(root)
+        # THE absence rule (see `parse_env` for why it cannot live there): a settings file read IN
+        # FULL that does not name a grammar PREDATES namespaces, so what its stored tokens are
+        # spelled in is bare. Assigned here — not left at whatever is in memory — because `load`
+        # runs repeatedly over DIFFERENT homes in one process (the project picker, `--config`, the
+        # spec suite).
+        #
+        # Only the READING is settled here. The adoption (and the migration it pulls) happens
+        # after the re-base below, and the order is load-bearing: the base is our serialization of
+        # what DISK said, so bare + un-migrated rules have to be what `@@loaded_raw` describes, or
+        # the 3-way merge reads the rewrite as "this process did not touch that section" and takes
+        # disk's un-migrated copy straight back over it.
+        #
+        # A key that is PRESENT but not a readable grammar does NOT come through here: `parse_env`
+        # has assigned the default and marked the origin `Unreadable`, and nothing may be rewritten
+        # against a value gori had to guess.
+        self.env_syntax = Env::Syntax::Bare if env_syntax_origin.absent?
       rescue
         # A malformed individual section — keep whatever loaded so far, and remember that this
         # is only HALF the operator's file: every section below the raising line is at its
@@ -141,11 +236,23 @@ module Gori
         # the #594 data loss, where `gori settings import` reported success while replacing a
         # live config with defaults.
         #
-        # Scoped to `apply_sections` ALONE, not to the whole method. `serialize` and
-        # `migrate_legacy_sections` below run only after every section applied, so a raise
-        # there leaves nothing at a default — latching the flag for those would refuse every
-        # save for the rest of the process over a file that was read in full.
+        # Scoped to `apply_sections` ALONE, not to the whole method. `serialize` below runs
+        # only after every section applied, so a raise there leaves nothing at a default —
+        # latching the flag for it would refuse every save for the rest of the process over
+        # a file that was read in full.
         @@load_partial = true
+        # Half a file proves nothing about the grammar, so the origin says `Unreadable` and no
+        # project database is re-spelled off this run (`env_syntax_stated?`).
+        #
+        # The VALUE, though, is only reset when nothing read it. `parse_env` runs in the MIDDLE of
+        # `apply_sections`, so a section BELOW it raising left a grammar the file genuinely stated
+        # — and overwriting it with a constant made this run read every token in every project
+        # under a grammar the operator's own file contradicts, over an unrelated malformed section.
+        # A `bare` opt-out torn by a bad `listeners` entry is the case: it came back namespaced.
+        # Only an origin still `Absent` (nothing assigned it) gets the fallback, and the fallback is
+        # `UNREADABLE_ENV_SYNTAX` for the same reason `recover_env_syntax_from_corrupt` uses it.
+        self.env_syntax = UNREADABLE_ENV_SYNTAX if env_syntax_origin.absent?
+        self.env_syntax_origin = EnvSyntaxOrigin::Unreadable
         note_load_warning("settings: #{path} could not be read in full — the sections gori did " \
                           "not reach are at their factory defaults, so this run will not overwrite that file")
         return
@@ -153,25 +260,111 @@ module Gori
       # Re-base on our OWN serialization of what we just read, the same rule `save` applies
       # to `mine`. See `@@loaded_raw` for why the raw text cannot be the base.
       @@loaded_raw = serialize
-      # Renamed sections, read here and NOT in `apply_sections`, so an import keeps telling the
-      # truth: `import_document` drops a key outside SECTION_KEYS before it ever reaches the
-      # parsers, and a legacy name accepted there would be reported "unrecognised … ignored"
-      # and then applied anyway — the exact failure SECTION_KEYS exists to prevent. A file on
-      # disk has no such contract: it is this install's own older state, so it migrates.
-      #
-      # AFTER the re-base, deliberately. The base is what DISK says, and disk says it under the
-      # old name; migrating first would leave the migrated section identical to the base, the
-      # merge would read that as "this process did not touch it" and take disk's — which has no
-      # such key — so the value the migration just recovered would be dropped by the very next
-      # save. Migrating after makes it a genuine change, which is what it is.
-      migrate_legacy_sections(root)
+      # LAST, so the re-base above describes the file as it was READ and the rewrite below is a
+      # genuine change to the `env` and `rewriter` sections rather than a no-op the merge discards.
+      adopt_env_syntax_for_absent_key if env_syntax_origin.absent?
     rescue
-      # `serialize` or `migrate_legacy_sections` raised. Every section from disk is already
+      # `serialize` raised. Every section from disk is already
       # applied by here, so the in-memory state is whole and `save` stays allowed — a
       # re-base that could not be computed only costs the merge its base, which is the same
       # position a first run is in. Swallowed, as it was before the partial-load guard
       # existed; `@@loaded_raw` staying nil already reports it through `load_degraded?`.
       nil
+    end
+
+    # `env.syntax` is not in this settings file (or there is no file at all). That is not a
+    # grammar, it is a DATE: the file predates namespaces, so whatever tokens this install has are
+    # spelled bare. Adopt `env_syntax_when_absent` (namespaced, for everyone), re-spell the global
+    # rewrite rules on the way, and write the key down so the question is never asked again.
+    #
+    # There are TWO exceptions, and both leave the origin `Unreadable` so that
+    # `env_syntax_stated?` is false and nothing — no project database, no global rule — is
+    # re-spelled off this run:
+    #
+    #   * `@@load_unreadable` — a settings.json IS there and could not be read (EACCES on a file a
+    #     `sudo gori` left root-owned, a `--config` naming a directory). It may well say `bare`, so
+    #     this home is left reading tokens the way its projects are most likely to be spelled: no
+    #     project database is touched over a permissions problem.
+    #   * `absent_explicit` — nothing at a path the operator NAMED (`--config /tmp/typo.json`,
+    #     `$GORI_CONFIG`). Absence is only a date at the home-derived DEFAULT path; at a typed one
+    #     it says nothing about this install, whose real settings.json is still under GORI_HOME.
+    #     Adopting off it would re-spell that install's projects against a file gori never read,
+    #     and the next ordinary run would reverse it lossily. Said out loud, because a `--config`
+    #     that names nothing is a mistake worth one line.
+    #
+    # The PROJECT databases are not this method's business. Each one carries its own marker and is
+    # reconciled the first time it is opened (`EnvMigration.reconcile`), because that is the only
+    # moment gori knows which project it is allowed to write to.
+    #
+    # A failed write is not fatal: the grammar applies to this run either way, and the next start
+    # re-derives the same answer from the same file.
+    private def self.adopt_env_syntax_for_absent_key(absent_explicit : Bool = false) : Nil
+      if absent_explicit
+        self.env_syntax = UNREADABLE_ENV_SYNTAX
+        self.env_syntax_origin = EnvSyntaxOrigin::Unreadable
+        @@env_syntax_unread = {nil.as(JSON::Any?)}
+        note_load_warning("settings: #{path} does not exist and gori was pointed at it by name " \
+                          "(--config / $GORI_CONFIG) — reading tokens as " \
+                          "#{UNREADABLE_ENV_SYNTAX.to_s.downcase} for this run and re-spelling " \
+                          "nothing, since an absence there says nothing about this install's " \
+                          "stored tokens. Fix the path, or drop the flag to use the settings " \
+                          "under GORI_HOME")
+        return
+      end
+      if @@load_unreadable
+        self.env_syntax = UNREADABLE_ENV_SYNTAX
+        self.env_syntax_origin = EnvSyntaxOrigin::Unreadable
+        return
+      end
+      target = env_syntax_when_absent
+      self.env_syntax = target
+      self.env_syntax_origin = EnvSyntaxOrigin::Absent
+      # Bare is what absence already meant, so there is nothing to re-spell and nothing to write —
+      # which is also what keeps a spec home (pinned bare) from growing a settings.json.
+      return if target.bare?
+      report = EnvMigration.migrate_global_rules(from: Env::Syntax::Bare, to: target)
+      @@env_syntax_global_migration = report
+      # ONLY when the rewrite actually moved a rule. A `load` that WRITES is not a read, and an
+      # unconditional save here was one:
+      #
+      #   * it created settings.json on a home that has none, which is the exact test the TUI's
+      #     first-run wizard is gated on (`app.cr`: `File.exists?(Settings.path)`) — so the very
+      #     first `gori` on a fresh machine adopted the grammar, wrote the file, and skipped the
+      #     wizard;
+      #   * and it created the parent directory of a `--config` that names a path that does not
+      #     exist, during read-only commands (`gori run history list --config /tmp/nope.json`).
+      #
+      # Adopting in MEMORY costs nothing to leave unwritten: `serialize_env` always emits
+      # `env.syntax`, so the first ordinary save this install makes for any other reason persists
+      # it, and until then every start re-derives the same answer from the same absence. A
+      # re-spelling of the global rules is the one thing that MUST be persisted — those bytes are
+      # now different from the file's, and `migrate_global_rules` has already put the
+      # `settings.json.pre-namespaced-<ts>` copy beside it (only if the file can be written; see
+      # `backup_settings_file`).
+      return unless report
+      # And `save` ANSWERS. A false here is the whole failure: the rules are re-spelled in memory —
+      # which this run needs, since it reads the new grammar — while the file still holds the old
+      # spelling, so the next start re-derives the same absence and tries again. Silently, on every
+      # invocation, for as long as the permissions problem lasts. Said on the channel every other
+      # degraded load uses.
+      return if save
+      note_load_warning("settings: the global rewrite rules were re-spelled to " \
+                        "#{EnvMigration.spelling(target)} for this run, but #{path} could not be " \
+                        "written — the file still holds the old spelling, so every start will " \
+                        "re-spell them again. Fix the permissions on that file, or re-run " \
+                        "`gori settings env-syntax #{target.to_s.downcase}` once it is writable")
+    end
+
+    # What the last `load`'s global-rule re-spelling did, or nil when it did nothing. Read by the
+    # surfaces that report it — one line, once, next to the per-project lines (see
+    # `EnvMigration::GlobalReport`). Cleared by whoever reports it, so a second surface in the same
+    # process does not say it twice.
+    @@env_syntax_global_migration : EnvMigration::GlobalReport? = nil
+
+    def self.take_env_syntax_global_migration : EnvMigration::GlobalReport?
+      report = @@env_syntax_global_migration
+      @@env_syntax_global_migration = nil
+      report
     end
 
     # Read each top-level section of a parsed settings document into the class properties.
@@ -222,7 +415,7 @@ module Gori
       # All four of these dereference their node directly — see `object_section`.
       if net = object_section(root, "network")
         self.bind_host = net["bind_host"]?.try(&.as_s?) || bind_host
-        self.bind_port = int_field(net, "bind_port") || bind_port
+        self.bind_port = valid_port(int_field(net, "bind_port")) || bind_port
         apply_upstream_proxy(net["upstream_proxy"]?)
         self.verify_upstream = load_bool(net, "verify_upstream", verify_upstream?)
         # The PROXY leg's own trust policy, kept next to (never folded into) verify_upstream —
@@ -253,11 +446,11 @@ module Gori
       self.tab_prefs = parse_tab_prefs(root["tabs"]?)
       self.hostname_overrides = parse_hostname_overrides(root["hostname_overrides"]?)
       parse_env(root["env"]?)
+      parse_user_agents(root["user_agents"]?)
       self.scan_rules = parse_scan_rules(root["scan_rules"]?)
       self.oast_providers = parse_oast_providers(root["oast_providers"]?)
       parse_hotkeys(root["hotkeys"]?)
       if cv = object_section(root, "decoder")
-        self.decoder_sessions = parse_decoder_sessions(cv["sessions"]?)
         self.decoder_chains = parse_decoder_chains(cv["chains"]?)
       end
       if rw = object_section(root, "rewriter")
@@ -275,6 +468,9 @@ module Gori
         pr["active_notify"]?.try(&.as_s?).try { |s| self.probe_active_notify = s }
       end
       parse_discover_prefs(root["discover"]?)
+      parse_redaction(root["redaction"]?)
+      parse_mcp(root["mcp"]?)
+      parse_mcp_permissions(root["mcp_permissions"]?)
       parse_layout(root["layout"]?)
       parse_statusline(root["statusline"]?)
       parse_display(root["display"]?)
@@ -283,27 +479,6 @@ module Gori
       parse_general(root["general"]?)
       parse_update(root["update"]?)
       Env.bump_highlight_rev
-    end
-
-    # Top-level keys written by an OLDER gori, mapped to the key that replaced them. Read on
-    # load (see `migrate_legacy_sections`) and dropped from the file by the next `save`, so a
-    # rename costs the operator nothing and leaves nothing behind.
-    LEGACY_SECTION_KEYS = {
-      # v0.1.x wrote the Miss Ring prefs under "pet".
-      "pet" => "companion",
-    }
-
-    # Apply a legacy section ONLY when the current name is absent — an install that has already
-    # been through one save carries both keys for the moment between the migration and that
-    # save, and the new one is the one that was last written.
-    private def self.migrate_legacy_sections(root : JSON::Any) : Nil
-      LEGACY_SECTION_KEYS.each do |old, new|
-        next if root[new]?
-        next unless node = object_section(root, old)
-        case old
-        when "pet" then parse_companion(node)
-        end
-      end
     end
 
     # Read the settings file; nil on missing/unreadable (a first run keeps defaults).
@@ -366,6 +541,8 @@ module Gori
     # size have not moved has not been written; a same-size rewrite still moves its mtime.
     @@reloaded_stat : Hash(String, {String, Time, Int64}) = {} of String => {String, Time, Int64}
 
+    private RACY_WINDOW = 2.seconds
+
     private def self.file_signature : {String, Time, Int64}?
       info = File.info(path)
       {path, info.modification_time, info.size.to_i64}
@@ -373,26 +550,43 @@ module Gori
       nil
     end
 
-    protected def self.reload_section(key : String, & : JSON::Any -> Nil) : Nil
+    #
+    # `absent` is what a PARSED file that lacks `key` means, for a section `serialize` omits when
+    # it is empty (`user_agents`, and `vars` under `env`): there the absence IS the peer's answer
+    # — "no global vars", "the built-in list" — and keeping memory would go on sending a deleted
+    # token. Nil (the default) keeps memory, for sections that are always written once touched.
+    # `object: false` admits a section that is not a JSON object (`user_agents` is an array).
+    protected def self.reload_section(key : String, absent : JSON::Any? = nil, object : Bool = true,
+                                      & : JSON::Any -> Nil) : Nil
       sig = file_signature
       return if sig && @@reloaded_stat[key]? == sig # not written since this section was settled
       raw = load_raw
       return unless raw
       here = {path, raw}
-      if @@reloaded_from[key]? == here
-        @@reloaded_stat[key] = sig if sig # same bytes under a new stat (our own save): settle it
-        return
-      end
+      # Same bytes under a new stat (our own save): settle it.
+      return settle_section(key, here, sig) if @@reloaded_from[key]? == here
       root = JSON.parse(raw).as_h?
       return unless root
-      node = root[key]?
-      return unless node && node.as_h?
+      node = root[key]? || absent
+      # A file that parsed and has nothing to fold for this key is settled too, so an install that
+      # never writes the section (no global views, say) costs the next call a `stat`, not a parse.
+      return settle_section(key, here, sig) unless node
+      return if object && !node.as_h?
       yield node
       rebase_section(key)
-      @@reloaded_from[key] = here
-      @@reloaded_stat[key] = sig if sig
+      settle_section(key, here, sig)
     rescue
       nil
+    end
+
+    private def self.settle_section(key : String, here : {String, String},
+                                    sig : {String, Time, Int64}?) : Nil
+      @@reloaded_from[key] = here
+      # A stamp too fresh to trust is not kept (git's "racily clean"): a filesystem with a coarse
+      # clock, Windows' for one, stamps two same-length writes a few milliseconds apart alike,
+      # so a peer's write right after this read would match it. Until the stamp ages, the
+      # content check above decides.
+      @@reloaded_stat[key] = sig if sig && sig[1] < Time.utc - RACY_WINDOW
     end
 
     # Forget what `reload_section` last folded, so the next call re-reads whatever the file says.
@@ -511,11 +705,27 @@ module Gori
           # unwritable dir / full disk — the warning still goes out, minus the recovery hint
         end
       end
+      # The token GRAMMAR is recovered here rather than defaulted with everything else, and it is
+      # recovered before the warning is built so the one line the operator sees can say whether it
+      # was (see `recover_env_syntax_from_corrupt`). It cannot be a second `note_load_warning`:
+      # that guard fires once per process, so a second call would replace the recorded text with
+      # a sentence that no longer names the unparseable file — and emit nothing.
+      grammar_note = recover_env_syntax_from_corrupt(raw)
       warning = String.build do |s|
         s << "settings: #{path} is not valid JSON — using defaults for this run"
         s << "; your file is preserved at #{path}.corrupt" if kept
+        s << "; #{grammar_note}" if grammar_note
       end
       note_load_warning(warning)
+      nil
+    end
+
+    private def self.keep_unmergeable(disk : String) : Nil
+      return unless disk.presence
+      write_private("#{path}.corrupt", disk)
+      # `Log`, not `warning_io`: this runs mid-session, where stderr is under the TUI's screen.
+      ::Log.warn { "settings: #{path} was not valid JSON when gori saved over it — kept at #{path}.corrupt" }
+    rescue
       nil
     end
 
@@ -529,11 +739,6 @@ module Gori
       @@warning_io.try(&.puts(warning))
     end
 
-    # load_bool over a Hash (the layout object), same false-preserving semantics as load_bool.
-    private def self.load_bool_h(h : Hash(String, JSON::Any), key : String, current : Bool) : Bool
-      (v = h[key]?) && !(b = v.as_bool?).nil? ? b : current
-    end
-
     private def self.normalize_os(raw : String?) : String
       down = raw.try(&.downcase)
       %w[darwin linux windows].includes?(down) ? down.not_nil! : "auto"
@@ -542,7 +747,7 @@ module Gori
     # Read a boolean field, keeping `current` when it's absent or non-bool. A plain
     # `|| current` would wrongly resurrect a stored `false` (false is falsy), so we
     # assign only when a real bool is present.
-    private def self.load_bool(node : JSON::Any, key : String, current : Bool) : Bool
+    private def self.load_bool(node : JSON::Any | Hash(String, JSON::Any), key : String, current : Bool) : Bool
       (v = node[key]?) && !(b = v.as_bool?).nil? ? b : current
     end
 
@@ -557,7 +762,13 @@ module Gori
       # #594 loss with a different door: the merge cannot recover a section it never read
       # (see `@@load_partial`), so refuse instead — reported like any other failed write,
       # which the callers already handle.
-      return false if @@load_partial
+      #
+      # A file that is there and could not be READ is the same refusal for a stronger reason:
+      # NONE of it reached memory, and nothing was kept aside (the `.corrupt` copy is written
+      # where a parse fails, not where a read does). In a directory the operator still owns —
+      # a settings.json a `sudo gori` left root-owned — the rename below lands on top of a file
+      # gori never opened. `reset_to_factory` asks the same question for the same reason.
+      return false if @@load_partial || @@load_unreadable
       Paths.ensure_dirs
       # With --config / $GORI_CONFIG the file can live outside GORI_HOME, whose directory
       # ensure_dirs above does not create. The temp+rename below would fail on a missing
@@ -567,12 +778,11 @@ module Gori
       Paths.ensure_dir(File.dirname(path), tighten: false)
       # Durable write: a torn File.write (crash / two instances / disk-full) would leave a
       # half-written settings.json that load()'s blanket rescue silently resets to factory
-      # defaults — losing theme, hotkeys, hostname overrides, tab prefs, decoder sessions.
+      # defaults — losing theme, hotkeys, hostname overrides, tab prefs, decoder chains.
       # `DurableFile` stages to a randomly-named sibling and fsyncs before the rename, which
       # is what makes those three threats actually survivable: the fixed `"#{path}.tmp"` this
-      # used to stage through was shared with every peer process AND with
-      # `drop_legacy_decoder_sessions`, so "two instances" raced on one temp file, and
-      # without the fsync the rename could still land ahead of the bytes.
+      # used to stage through was shared with every peer process, so "two instances" raced
+      # on one temp file, and without the fsync the rename could still land ahead of the bytes.
       #
       # `mine` = THIS process's serialization of its OWN in-memory state. Base the next
       # merge on it, NOT on a re-read of the file we just wrote: that file also carries a
@@ -587,6 +797,55 @@ module Gori
       true
     rescue
       false
+    end
+
+    # Assign `list` to the list-valued section property `section` and `save`, putting the old
+    # array back when the write did not commit. Every list mutator answers "did it commit", and
+    # `save` refuses outright after a half load (`@@load_partial`) or on any transient failure,
+    # so memory has to agree with that answer: a rule left live over a refused save keeps
+    # matching (or painting) in every project, and the next unrelated save that does succeed
+    # writes it to disk. These arrays are replaced wholesale, never mutated in place, so the old
+    # reference IS the snapshot. A nil `list` (no row had that id) answers false and writes
+    # nothing.
+    private macro commit(section, list)
+      if %list = {{ list }}
+        %prev = {{ section.id }}
+        self.{{ section.id }} = %list
+        save || begin
+          self.{{ section.id }} = %prev
+          false
+        end
+      else
+        false
+      end
+    end
+
+    # `list` with the row whose `id` matches replaced by the block's answer, or nil when no row
+    # does — a rule a peer deleted must not come back as an edit.
+    private def self.replace_by_id(list, id, &)
+      found = false
+      out = list.map do |r|
+        next r unless r.id == id
+        found = true
+        yield r
+      end
+      out if found
+    end
+
+    # `list` without the row whose `id` matches, or nil when no row does.
+    private def self.remove_by_id(list, id)
+      kept = list.reject { |r| r.id == id }
+      kept unless kept.size == list.size
+    end
+
+    # `list` with the row `id` swapped one slot earlier (dir < 0) / later (dir > 0), or nil when
+    # there is no such row, no slot that way, or the block refuses the pair.
+    private def self.swap_adjacent(list, id, dir, &)
+      i = list.index { |r| r.id == id }
+      return unless i
+      j = i + (dir < 0 ? -1 : 1)
+      return if j < 0 || j >= list.size || yield(list[i], list[j])
+      list.dup.swap(i, j)
     end
 
     # Durably replace the settings file, owner-only. Inside GORI_HOME the 0700 tree already
@@ -635,30 +894,34 @@ module Gori
       cur_h = (JSON.parse(current).as_h? rescue nil)
       base_h = (JSON.parse(base).as_h? rescue nil)
       disk_h = (JSON.parse(disk).as_h? rescue nil)
+      # A file a peer or a hand edit (`gori settings --edit` validates nothing) left unparseable is
+      # replaced by this write, so its bytes are set aside first, as `load_root` does at startup.
+      keep_unmergeable(disk) unless disk_h
       return current unless cur_h && base_h && disk_h
-      # Retired names are subtracted here: one is never in `cur_h` (nothing serializes it), so
-      # the rule below would read it as "I did not change this section" and copy disk's block
-      # forward for good. `load` has already folded its value into the section that replaced
-      # it, so this is the one place the old block can actually be cleared.
-      keys = (cur_h.keys + disk_h.keys).uniq! - LEGACY_SECTION_KEYS.keys
+      keys = (cur_h.keys + disk_h.keys).uniq!
       JSON.build(indent: "  ") do |j|
         j.object do
           keys.each do |k|
-            cur_v = cur_h[k]?
-            chosen = if lists = RULE_SECTION_LISTS[k]?
-                       merge_rule_section(cur_v, base_h[k]?, disk_h[k]?, lists,
-                         RULE_SECTION_COUNTERS[k]? || RULE_SECTION_COUNTER)
-                     elsif factory_reset
-                       cur_v # what a fresh install would hold — nil drops the key entirely
-                     else
-                       pick_changed(cur_v, base_h[k]?, disk_h[k]?)
-                     end
+            chosen = merge_section(k, cur_h[k]?, base_h[k]?, disk_h[k]?, factory_reset)
             j.field k, chosen if chosen
           end
         end
       end
     rescue
       current # any merge hiccup falls back to the plain write (never worse than before)
+    end
+
+    private def self.merge_section(k : String, mine : JSON::Any?, base : JSON::Any?, disk : JSON::Any?,
+                                   factory_reset : Bool) : JSON::Any?
+      if lists = RULE_SECTION_LISTS[k]?
+        merge_rule_section(mine, base, disk, lists, RULE_SECTION_COUNTERS[k]? || RULE_SECTION_COUNTER)
+      elsif list = ENTRY_SECTIONS[k]?
+        merge_entry_list(mine, base, disk, list)
+      elsif factory_reset
+        mine # what a fresh install would hold — nil drops the key entirely
+      else
+        pick_changed(mine, base, disk)
+      end
     end
 
     # The section-level rule, and the default for every key that is not a rule list: I changed
@@ -712,6 +975,19 @@ module Gori
       "saved_views" => [
         {key: "views", identity: :id, optional: false},
       ],
+      # A chain library is many decisions too, and two windows each saving a chain had both
+      # "changed the section". There is no counter: a chain's NAME is its identity, because
+      # `save_chain` already replaces a same-named entry.
+      "decoder" => [
+        {key: "chains", identity: :name, optional: true},
+      ],
+    }
+
+    # Top-level ARRAY sections of independent rows, merged entry by entry for the reason above.
+    # Their ids are random strings, so there is no counter to merge and nothing is renumbered.
+    ENTRY_SECTIONS = {
+      "scan_rules"     => {key: "scan_rules", identity: :string_id, optional: true},
+      "oast_providers" => {key: "oast_providers", identity: :string_id, optional: true},
     }
 
     # The id counter each of those sections carries, merged by MAX rather than by who changed
@@ -726,18 +1002,14 @@ module Gori
     }
     RULE_SECTION_COUNTER = "next_rule_id"
 
-    # Retired keys INSIDE a rule section, subtracted for exactly the reason LEGACY_SECTION_KEYS
-    # is subtracted at the top level: nothing serializes one, so the key-by-key rule below would
-    # read it as "I did not change this" and copy disk's block forward for good. `parse_rewriter`
-    # has already folded `presets` into `rules` in memory, so a save that touches the section is
-    # the one place the old block can actually be cleared — which is what it did while the whole
-    # section was decided as a unit, and what it has to keep doing now that it is not.
+    # Retired keys INSIDE a rule section, subtracted so a stale one is cleared by the next save:
+    # nothing serializes it, so the key-by-key rule below would read it as "I did not change
+    # this" and copy disk's block forward for good.
     #
-    # One flat list rather than one per section: `presets` was only ever a `rewriter` key, and a
-    # name retired from one of these sections is not a name another may start using. Pinned by
-    # spec/settings_spec.cr's "adopts legacy rewriter presets as DISABLED global rules", which
-    # asserts the saved file no longer mentions them.
-    LEGACY_RULE_SECTION_KEYS = ["presets"]
+    # One flat list rather than one per section: `presets` was only ever a `rewriter` key and
+    # `sessions` a `decoder` one (pasted tokens, so it must not outlive a reset), and a name
+    # retired from one of these sections is not a name another may start using.
+    LEGACY_RULE_SECTION_KEYS = ["presets", "sessions"]
 
     # Merge one rule section key by key: its lists entry by entry, its counter by high-water
     # mark, anything else by the section-level rule.
@@ -746,6 +1018,14 @@ module Gori
                                         counter_key : String = RULE_SECTION_COUNTER) : JSON::Any?
       mine_h = mine.try(&.as_h?)
       disk_h = disk.try(&.as_h?)
+      # A section made of nothing but optional lists (`decoder`) is itself omitted when they are
+      # all empty, so its absence is how "empty" is spelled. Read as unmergeable, deleting our
+      # last chain would drop the one a peer saved meanwhile.
+      all_optional = lists.all?(&.[:optional])
+      if all_optional
+        mine_h ||= {} of String => JSON::Any if mine.nil?
+        disk_h ||= {} of String => JSON::Any if disk.nil?
+      end
       # One side has no object here at all, so there is no second list to lose — and if disk's
       # is not an object, nothing about it can be trusted to be reconciled with.
       return pick_changed(mine, base, disk) unless mine_h && disk_h
@@ -762,6 +1042,7 @@ module Gori
             end
         merged[k] = v if v
       end
+      return nil if merged.empty? && all_optional
       JSON::Any.new(merged)
     end
 
@@ -843,9 +1124,8 @@ module Gori
       # `colormarker.colors` is written only when there is a colour to write, so "no key" is how
       # "no colours" is spelled, and reading it as unmergeable would drop a peer's new colour
       # along with the last one of ours. `rules` is written whenever its section is, so ITS
-      # absence means something else wrote this section — the pre-upgrade `rewriter.presets`
-      # block, or a hand edit — and the in-memory list came from a migration `pick_changed` has
-      # to carry through whole.
+      # absence means something else wrote this section — a hand edit — and the in-memory list
+      # came from a repair `pick_changed` has to carry through whole.
       return ({} of String => JSON::Any) if entries.nil? && list[:optional]
       arr = entries.try(&.as_a?)
       return nil unless arr
@@ -863,6 +1143,12 @@ module Gori
     # the parse would keep VERBATIM — which is the same question `index_entries` needs answered,
     # so both normalisations below are the parser's own (`usable_id?`, `normalize_color_name`,
     # `normalize_hex`) rather than a second spelling of them here.
+    # A decoder chain: `parse_decoder_chains` keeps a non-empty name with a string spec.
+    private def self.chain_identity(o : Hash(String, JSON::Any)) : String?
+      name = o["name"]?.try(&.as_s?)
+      name && !name.empty? && o["spec"]?.try(&.as_s?) ? name : nil
+    end
+
     private def self.entry_identity(entry : JSON::Any, identity : Symbol) : String?
       o = entry.as_h?
       return nil unless o
@@ -878,6 +1164,8 @@ module Gori
         hex = o["hex"]?.try(&.as_s?)
         return nil unless name && hex
         normalize_color_name(name) == name && normalize_hex(hex) == hex ? name : nil
+      when :name      then chain_identity(o)
+      when :string_id then o["id"]?.try(&.as_s?).presence
       end
     end
 
@@ -903,7 +1191,11 @@ module Gori
     # NOT here. The execution axis is `COMMAND_SECTIONS` below, and it is handled by REPORTING
     # rather than by exclusion — see `command_rules` for that argument in full. Adding an
     # exportable section means asking both questions, not this one.
-    SECRET_SECTIONS = ["env", "decoder"]
+    #
+    # `oast_providers` is here for its `token`: a self-hosted interactsh server's auth token, the
+    # credential `list_oast_providers` already redacts on the MCP door. A default export carried
+    # it out at 0644 with no notice.
+    SECRET_SECTIONS = ["env", "decoder", "oast_providers"]
 
     # Sections that can carry a COMMAND — the second axis. Every settings value gori hands to
     # `Process.new`/`Process.run` lives in one of these, and the list is what both ends of a
@@ -949,7 +1241,7 @@ module Gori
       theme mouse mouse_drag pretty_bodies layout statusline display companion notifications general update
       network upstream_rules outbound_tls retention listeners editor tabs hostname_overrides
       env scan_rules oast_providers hotkeys mine fuzzer probe discover decoder rewriter
-      hooks colormarker saved_views
+      hooks colormarker saved_views redaction mcp mcp_permissions user_agents
     ]
 
     # Every top-level key the current settings would write — i.e. which sections this install
@@ -969,10 +1261,21 @@ module Gori
     # (which would train the operator to ignore the notice on the export that matters).
     # Returns the sections rather than a Bool so the notice can name what is in the file
     # instead of reciting SECRET_SECTIONS at the operator.
+    # `env` counts only when it actually holds VARS. A namespaced install with no env var writes
+    # an `env` section carrying nothing but `{"syntax": "namespaced"}` — a grammar, not a
+    # credential — and firing the "this file holds secrets" notice over it is how an operator
+    # learns to ignore the notice on the export that matters.
     def self.exported_secret_sections(only : Array(String)? = nil) : Array(String)
       return [] of String unless list = only
       present = JSON.parse(serialize).as_h.keys
-      SECRET_SECTIONS.select { |s| list.includes?(s) && present.includes?(s) }
+      SECRET_SECTIONS.select do |s|
+        next false unless list.includes?(s) && present.includes?(s)
+        case s
+        when "env"            then !env_vars.empty?
+        when "oast_providers" then oast_providers.any?(&.token.presence)
+        else                       true
+        end
+      end
     end
 
     def self.export_document(only : Array(String)? = nil) : String
@@ -980,7 +1283,23 @@ module Gori
       keep = only || (doc.keys - SECRET_SECTIONS)
       JSON.build(indent: "  ") do |j|
         j.object do
-          doc.each { |k, v| j.field k, v if keep.includes?(k) }
+          # `strip_install_local` on the way OUT as well as on the way in: an exported profile carries
+          # no token grammar at all. `serialize` always writes the key now (absence means "predates
+          # namespaces", so a grammar has to be stated), and a profile that named one would decide
+          # how the IMPORTING install reads the tokens already stored in its own projects — the one
+          # thing an import is not allowed to do (see `report_env_syntax_change`).
+          #
+          # A section the strip leaves EMPTY is omitted, and that is not tidiness. `serialize_env`
+          # always writes `syntax`, so a var-less install's whole `env` section is the grammar —
+          # and exporting `{"env": {}}` shipped a profile that SAYS nothing about env and, on the
+          # importing side, was read as a section present with no vars. Nothing here may be a
+          # sentence about the importer's own token values.
+          doc.each do |k, v|
+            next unless keep.includes?(k)
+            stripped = strip_install_local(k, v)
+            next if INSTALL_LOCAL_KEYS.has_key?(k) && (h = stripped.as_h?) && h.empty?
+            j.field k, stripped
+          end
         end
       end
     end
@@ -1049,27 +1368,15 @@ module Gori
       acc
     end
 
-    # `rewriter`: the same `rules`-else-legacy-`presets` branch `parse_rewriter` takes, so a
-    # profile carrying a pre-upgrade preset block is read the way the import will read it.
-    #
-    # A node of the wrong SHAPE is skipped rather than parsed, and that is not pedantry:
+    # `rewriter`: a node of the wrong SHAPE is skipped rather than parsed, and that is not pedantry:
     # `parse_rewriter_rules` answers a non-array with THIS INSTALL'S current global rules, so
     # handing it one would report the operator's own hooks as though the profile carried them —
     # and, at the import gate, refuse an import over rules that are already on disk.
     private def self.rewriter_command_entries(node : JSON::Any, acc : Array(CommandEntry)) : Nil
       return unless node.as_h?
-      rules =
-        if raw = node["rules"]?
-          return unless raw.as_a?
-          parse_rewriter_rules(raw)
-        else
-          legacy = node["presets"]?
-          return unless legacy && legacy.as_a?
-          # Adopted DISABLED by `parse_legacy_presets`, and reported anyway: the profile is
-          # still carrying the command, and `enabled` says which of the two it is.
-          parse_legacy_presets(legacy)
-        end
-      rules.each do |r|
+      raw = node["rules"]?
+      return unless raw && raw.as_a?
+      parse_rewriter_rules(raw).each do |r|
         cmd = r.command.presence
         acc << CommandEntry.new("rewriter", r.op, r.name, cmd, r.enabled) if cmd
       end
@@ -1220,13 +1527,29 @@ module Gori
     # Narrowing this to "actually changed something" is not available cheaply: re-serializing
     # around the apply cannot tell a rejected section from one imported with the value already
     # in effect, and would report the second as skipped.
+    def self.upstream_import_refusal(err : String) : String
+      "#{err.lchop("settings: ")} in the profile — nothing was imported; fix the profile, or " \
+      "leave the section out with --sections"
+    end
+
     def self.import_document(raw : String, only : Array(String)? = nil) : Array(String)
       incoming = JSON.parse(raw).as_h
       selected = incoming.keys.select do |k|
         (only.nil? || only.includes?(k)) && SECTION_KEYS.includes?(k)
       end
-      filtered = JSON.build { |j| j.object { selected.each { |k| j.field k, incoming[k] } } }
+      filtered = JSON.build { |j| j.object { selected.each { |k| j.field k, strip_install_local(k, incoming[k]) } } }
+      counters = {rewriter_next_rule_id, colormarker_next_rule_id, saved_views_next_id}
+      locals = {rewriter_rules, colormarker_rules, saved_views}
+      # A malformed upstream declaration is FAIL-CLOSED on load: the parse drops the entry and
+      # keeps an error that refuses every route, because a proxy the operator declared must
+      # never quietly turn into DIRECT. That error lives in memory only, so an import that
+      # carried one wrote the table WITHOUT the bad entry and the next start routed its hosts
+      # direct. Refused here instead, before anything is applied or written.
+      if err = upstream_import_error(JSON::Any.new(incoming), selected)
+        raise Error.new(upstream_import_refusal(err))
+      end
       apply_sections(JSON.parse(filtered))
+      renumber_imported_ids(incoming, selected, counters, locals)
       # `save` REPORTS failure rather than raising, because a failed write must not crash the
       # TUI. Discarding that here meant a full disk, a read-only filesystem or an unwritable
       # config directory printed "imported N section(s)" and exited 0 with nothing persisted —
@@ -1237,6 +1560,121 @@ module Gori
         raise Error.new("settings were applied in memory but could not be written to #{path}")
       end
       selected
+    end
+
+    # Give every global rule, colour rule and saved view a profile brought in a FRESH id from this
+    # install's own counter, and never let that counter go backwards.
+    #
+    # Those ids are the keys of per-project state in databases this process may never open again
+    # (`rewriter_overrides`, `colormarker_overrides`, `history_view`), which is why each counter is
+    # monotonic and an id is never reused (see `rewriter_next_rule_id`). A profile's ids are
+    # another install's numbering: adopted as written, an imported rule inherited whatever a
+    # project had once said about the LOCAL rule of that number — an imported `pipe` hook listed
+    # `[disabled]` came up live in a project that had enabled a deleted rule #1. And the parse
+    # recomputes each counter from the imported ids, so a profile could also pull it back over
+    # ids already handed out here (or push it to the Int64 ceiling, where ids collide).
+    #
+    # Only a list the profile actually CARRIES is renumbered: a section without one keeps the
+    # current list (the parse's tolerant default), and those ids are already this install's.
+    #
+    # And an entry IDENTICAL to one this install holds under the same id keeps it — that is this
+    # install's own rule coming back (a profile re-imported where it was exported), and
+    # renumbering it would orphan exactly the per-project state the counters exist to protect.
+    # Fresh ids start at the local counter, above every id ever handed out here, so a kept id and
+    # a fresh one cannot meet.
+    private def self.renumber_imported_ids(incoming : Hash(String, JSON::Any), selected : Array(String),
+                                           before : {Int64, Int64, Int64},
+                                           locals : {Array(RewriterRule), Array(ColormarkerRule), Array(SavedView)}) : Nil
+      rw_next, cm_next, sv_next = before
+      # The parse recomputed each counter from the ids now in the list; renumbering makes that
+      # number meaningless, and without a list it can only be below what this install handed out.
+      if imported_list?(incoming, selected, "rewriter", "rules", "presets")
+        rules, nxt = renumber(rewriter_rules, locals[0], rw_next)
+        self.rewriter_rules = rules
+        self.rewriter_next_rule_id = nxt
+      else
+        self.rewriter_next_rule_id = {rewriter_next_rule_id, rw_next}.max
+      end
+      if imported_list?(incoming, selected, "colormarker", "rules")
+        marks, nxt = renumber(colormarker_rules, locals[1], cm_next)
+        self.colormarker_rules = marks
+        self.colormarker_next_rule_id = nxt
+      else
+        self.colormarker_next_rule_id = {colormarker_next_rule_id, cm_next}.max
+      end
+      if imported_list?(incoming, selected, "saved_views", "views")
+        views, nxt = renumber(saved_views, locals[2], sv_next)
+        self.saved_views = views
+        self.saved_views_next_id = nxt
+      else
+        self.saved_views_next_id = {saved_views_next_id, sv_next}.max
+      end
+    end
+
+    # `imported` with every entry not found verbatim in `local` given the next id from `start`,
+    # plus the counter after the last one handed out.
+    private def self.renumber(imported : Array(T), local : Array(T), start : Int64) : {Array(T), Int64} forall T
+      n = start
+      out = imported.map do |e|
+        next e if local.includes?(e)
+        e.copy_with(id: n).tap { n = next_id_after(n) }
+      end
+      {out, n}
+    end
+
+    private def self.imported_list?(incoming : Hash(String, JSON::Any), selected : Array(String),
+                                    section : String, *keys : String) : Bool
+      return false unless selected.includes?(section)
+      node = incoming[section]?.try(&.as_h?)
+      !!node && keys.any? { |k| node[k]?.try(&.as_a?) }
+    end
+
+    # An imported profile NEVER changes this install's token grammar.
+    #
+    # `env.syntax` is not a preference a profile may carry for someone else: it decides how the
+    # tokens already written into THIS install's project databases — env var names, Repeater
+    # drafts, rewrite-rule replacements, slot headers — are read, and nothing rewrites them. A
+    # teammate's profile exported to share a var table (or a theme) therefore used to reinterpret
+    # every token in every project of whoever imported it, in whichever direction their colleague
+    # happened to run. The switch is a deliberate, local act: `gori settings env-syntax`, which is
+    # what the import's STDERR note points at.
+    #
+    # Dropped from the DOCUMENT rather than restored after `apply_sections`, so nothing observes
+    # the flipped value in between (`Settings.env_syntax=` bumps the highlight revision and
+    # re-styles every open editor) and `save` cannot persist it.
+    #
+    # `Settings.load` from disk still honours the key: that file IS this install's own state.
+    #
+    # Two more keys have the same shape, so the strip is a table rather than one key:
+    #
+    #   * `env.prefix` is the other half of how a stored token is SPELLED — `$ENV.KEY` read with a
+    #     `@@` prefix is plain text — so a profile carrying it stopped every token in every
+    #     project from expanding, and said nothing.
+    #   * `redaction.salt` keys every placeholder this install has already written into an
+    #     export. Adopting a teammate's broke the correlation between yesterday's artifacts and
+    #     today's, which is the one thing `reset_redaction` refuses to do — and the default
+    #     export was handing the salt (a secret, see settings/redaction.cr) to whoever got the
+    #     profile.
+    #   * the id counters of the three rule lists are this install's numbering, and only ever
+    #     move forward from what IT has handed out — see `renumber_imported_ids`.
+    #   * `update`'s bookkeeping is this install's memory of what it checked and announced: an
+    #     exporter's `notified_version` silenced the importer's "update available" notice.
+    #   * `fuzzer.recent_wordlists` is this machine's history of absolute paths.
+    INSTALL_LOCAL_KEYS = {
+      "env"         => ["syntax", "prefix"],
+      "redaction"   => ["salt"],
+      "rewriter"    => ["next_rule_id"],
+      "colormarker" => ["next_rule_id"],
+      "saved_views" => ["next_view_id"],
+      "update"      => ["notified_version", "latest_seen", "checked_at"],
+      "fuzzer"      => ["recent_wordlists"],
+    }
+
+    private def self.strip_install_local(key : String, node : JSON::Any) : JSON::Any
+      return node unless drop = INSTALL_LOCAL_KEYS[key]?
+      h = node.as_h?
+      return node unless h && drop.any? { |d| h.has_key?(d) }
+      JSON::Any.new(h.reject(drop))
     end
 
     # Factory reset: every persisted setting back to the value a fresh install ships with,
@@ -1310,6 +1748,7 @@ module Gori
       reset_tabs
       reset_hostname_overrides
       reset_env
+      reset_user_agents
       reset_scan_rules
       reset_oast_providers
       reset_hotkeys
@@ -1322,6 +1761,9 @@ module Gori
       reset_hooks
       reset_colormarker
       reset_saved_views
+      reset_redaction
+      reset_mcp
+      reset_mcp_permissions
       # `$KEY` highlighting is cached against this revision, exactly as apply_sections does
       # after a load — the env block just changed underneath every editor showing it.
       Env.bump_highlight_rev
@@ -1353,6 +1795,7 @@ module Gori
           serialize_tabs(j)
           serialize_hostname_overrides(j)
           serialize_env(j)
+          serialize_user_agents(j)
           serialize_scan_rules(j)
           serialize_oast_providers(j)
           serialize_hotkeys(j)
@@ -1365,6 +1808,9 @@ module Gori
           serialize_hooks(j)
           serialize_colormarker(j)
           serialize_saved_views(j)
+          serialize_redaction(j)
+          serialize_mcp(j)
+          serialize_mcp_permissions(j)
         end
       end
     end

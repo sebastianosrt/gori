@@ -1,15 +1,19 @@
 require "./screen"
 require "./theme"
 require "./frame"
+require "./drill_in"
 require "./read_pane"
 require "./traffic_empty_state"
 require "../settings"
 require "../store"
 require "../scope"
+require "../hotkeys"
 require "../probe"
 require "../probe_query"
 require "./preview_split"
 require "./line_edit"
+require "./query_suggest"
+require "./suggest_popup"
 require "./issue_presentation"
 require "./viewport"
 
@@ -20,25 +24,42 @@ module Gori::Tui
   # IssuesView structurally; the issues ARE the groups (the DB upserts one row per
   # (code, host)), so there's no in-view folding.
   class ProbeView
-    include QueryBarEdit # ⌃/⌥←→ word motion, Home/End, Delete, ⌥⌫ on the `/` bar
+    @registry : Verb::Registry? = nil
+    include QueryBarPopup # the `/` bar: edits, ⌃/⌥←→ word motion, Home/End, Delete, ⌥⌫, `↓` dropdown
     # The list-over-preview layout and the severity/status vocabulary, both shared with
     # the sibling tab that lists the same records through the other lens.
     include PreviewSplit
     include PreviewPane
     include IssuePresentation
+    include DrillIn::Host # the rail/detail split, its render, and the step-key labels
 
-    QUERY_FIELDS = Probe::Filter::FIELDS
+    # See `IssuesView::QUERY_PREFIX` / `QUERY_HINT` — the sibling bar over the
+    # sibling backend, and the same two reasons: the dropdown anchors to the column the query
+    # starts in, and `cold_hint`'s defaults name a `~regex` and `size`/`dur` axes this parser
+    # does not have.
+    QUERY_PREFIX = "filter › "
+    QUERY_HINT   = QuerySuggest.cold_hint(Probe::Filter::HINT_FIELDS, help_key: true,
+      regex: false, compare: "severity")
 
     # The bar's field vocabulary — see `IssuesView::QUERY_KNOWN`, the sibling bar over the
     # sibling backend.
     QUERY_KNOWN = ->(f : String, op : Char) { Probe::Filter.known_field?(f, regex: op == '~') }
 
+    # The detail's one card. Named once because `Frame.border_meta` has to be told the title
+    # it must not overwrite, so the two would otherwise be a literal repeated at the two sites
+    # that must agree.
+    AFFECTED_TITLE = "AFFECTED URLS"
+    DESC_TITLE     = "DESCRIPTION"
+
     getter query : String
     getter mode : Probe::Mode
 
     def initialize
-      @all = [] of Store::ProbeIssue
-      @issues = [] of Store::ProbeIssue
+      # The LIST projection (no affected URLs, just their count) — see `Store#probe_issue_rows`.
+      # The two places that show URLs hold a full row of their own: `@detail`, and `@preview`
+      # for the list's bottom pane.
+      @all = [] of Store::ProbeIssueRow
+      @issues = [] of Store::ProbeIssueRow
       @counts = StaticArray(Int32, 5).new(0) # severity tallies (Info..Critical) over @all
       @tech = [] of String
       @mode = Probe::Mode::Passive
@@ -46,16 +67,35 @@ module Gori::Tui
       @scroll = 0
       @detail = nil.as(Store::ProbeIssue?)
       @detail_flow = nil.as(Store::FlowRow?)
+      # The selected row's FULL finding, for the preview pane's URL lines. Fetched by id on
+      # demand (`sync_preview`) and dropped on every reload, so it is never older than the list.
+      @preview = nil.as(Store::ProbeIssue?)
       # The AFFECTED URLS list in the detail: caret, selection, scroll and draw. The list is the
       # finding's evidence and had no caret and no copy — the one thing an operator wants out of a
       # scan issue is the URLs it fired on.
       # Soft wrap: these rows are URLs, and a URL long enough to matter is exactly the one the
       # right edge used to eat.
       @affected = ReadPane.new(wrap: true)
+      # The DESCRIPTION pane — the rule's remediation text, which used to be a single row of
+      # the meta block and was therefore never READ: `Probe.remediation` writes a sentence, the
+      # row gave it one line of a ~76-column pane, and every rule but the tersest ended in `…`.
+      # A `ReadPane`, not a `TextArea`: it is generated text, so the pane must take focus and
+      # a selection (that is what makes `y` and the space menu's copy reach it) without ever
+      # taking an edit.
+      @desc = ReadPane.new(wrap: true)
+      # What `@desc` was last sourced with — see `sync_desc`.
+      @desc_text = ""
+      # Which detail pane the keyboard and the read verbs address. See `DETAIL_PANES`.
+      @detail_focus = :affected
       @query = ""
       @qcx = 0
-      @preedit_q = ""
+      @preedit = ""
       @querying = false
+      # The `↓` completion dropdown. Closed until asked for — see `SuggestPopup`.
+      @popup = SuggestPopup.new
+      # `host:` / `code:` completion pools, rebuilt on reload — see `host_pool`.
+      @host_pool = nil.as(Array(String)?)
+      @code_pool = nil.as(Array(String)?)
       @show_closed = false # default lens: open issues only (triaged ones drop out of view)
       @scope = nil.as(Scope?)
       @pre_scope_empty = false
@@ -66,13 +106,31 @@ module Gori::Tui
       # description in place of the (absent) built-in remediation. Rebuilt on reload; a deleted
       # rule falls back to a generic note.
       @custom_desc = {} of String => String
+      # What the last `reload` read, so a caller can tell whether another would read anything
+      # new — see `issues_moved?`. -1 / nil until the first reload, which is therefore "moved".
+      @loaded_gen = -1_i64
+      @loaded_fp = nil.as({Int64, Int64, Int64}?)
+      # The tech rows the last reload read, so `reload_meta` can re-apply the scope lens to
+      # them without a query.
+      @tech_rows = [] of {String, String, String?}
+      # A peer's write, once `issues_moved?(peers: true)` has seen it: kept until the reload
+      # that reads it, since the fingerprint check is not repeated on every tick.
+      @peer_moved = false
+      @loaded_at = nil.as(Time::Instant?)
     end
+
+    def set_registry(registry : Verb::Registry) : Nil
+      @registry = registry
+    end
+
+    # When the last `reload` ran — the controller spaces live reloads off it.
+    getter loaded_at : Time::Instant?
 
     def preview_enabled? : Bool
       Settings.probe_preview
     end
 
-    # Wires the shared session Scope in (mirrors HistoryView/SitemapView) so the ⇧S
+    # Wires the shared session Scope in (mirrors HistoryView/SitemapView) so the `s`
     # lens filters this tab too, and its chip is discoverable on the filter bar.
     def set_scope(scope : Scope) : Nil
       @scope = scope
@@ -85,10 +143,9 @@ module Gori::Tui
       @issues.size
     end
 
-    # Reads the WHOLE table, deliberately, and this is the one place it still hurts: at 250k
-    # findings (a wide crawl — the rows are (code x host)) a refresh is ~107 ms, and the
-    # Runner re-runs it on every `probe_generation` bump, which during an active scan is
-    # close to every tick.
+    # Reads the WHOLE table, deliberately. It is the list projection (`probe_issue_rows`, no URL
+    # lists), and the live-refresh paths call it only when the findings actually moved
+    # (`issues_moved?`), but it is still linear in the table.
     #
     # `Store#probe_issues_page` exists and MCP uses it, but a bounded read is not a drop-in
     # here, because everything below `apply_filter` runs in Crystal over `@all`: the triage
@@ -101,10 +158,42 @@ module Gori::Tui
     # is a change to a query surface rather than to this view. Left whole until then: honest
     # and slow beats fast and misleading on a triage list.
     def reload(store : Store) : Nil
-      @all = store.probe_issues
+      # Stamped BEFORE the read: a write that lands after it moves the key again, so it is
+      # never mistaken for one this read already saw.
+      @loaded_gen = store.probe_generation
+      @loaded_fp = store.probe_issues_fingerprint
+      @peer_moved = false
+      @loaded_at = Time.instant
+      @all = store.probe_issue_rows
+      @host_pool = nil
+      @code_pool = nil
+      @tech_rows = store.probe_tech_rows
+      reload_meta(store)
+    end
+
+    # Would a `reload` read different findings than the last one did? `probe_generation` is
+    # this process's commit counter — an int compare, cheap enough for every tick. `peers`
+    # also asks the store's fingerprint (one indexed read), which is the only way to see a
+    # PEER process's write (MCP `probe_dismiss`, `gori run probe`, a second TUI): the
+    # data_version path passes it, since that is the signal a peer committed.
+    #
+    # A peer change seen once stays "moved" until a reload reads it, so a caller that defers the
+    # reload (the controller's spacing) can land it from a tick that does not pass `peers`.
+    def issues_moved?(store : Store, *, peers : Bool = false) : Bool
+      return true if @peer_moved || store.probe_generation != @loaded_gen
+      return false unless peers
+      @peer_moved = store.probe_issues_fingerprint != @loaded_fp
+    end
+
+    # Everything the tab shows that is not READ from the finding list: the MODE band, the
+    # custom rules' descriptions, the scope lens over the rows already held (the list and the
+    # tech chips), and the open detail and preview rows (each one row read by id). Cheap, so
+    # the data_version path runs it on every commit — a peer's mode, rule or SCOPE change, or
+    # a history clear detaching a sample flow, lands even when no finding moved.
+    def reload_meta(store : Store) : Nil
       @mode = store.probe_mode
-      @tech = scoped_tech(store.probe_tech_rows)
       @custom_desc = Probe.custom_rules(store).to_h { |r| {r.code, r.description} }
+      @tech = scoped_tech(@tech_rows)
       apply_filter
       refresh_detail(store)
     end
@@ -116,7 +205,7 @@ module Gori::Tui
       Probe.tech_summary(rows.map { |(code, _, ev)| {code, ev} })
     end
 
-    private def recount(base : Array(Store::ProbeIssue)) : Nil
+    private def recount(base : Array(Store::ProbeIssueRow)) : Nil
       @counts = StaticArray(Int32, 5).new(0)
       base.each do |i|
         v = i.severity.value
@@ -170,12 +259,35 @@ module Gori::Tui
       @show_closed
     end
 
-    # Re-fetch the open detail (its status/affected may have changed) and its sample flow.
+    # Re-fetch the open detail (its status/affected may have changed) and its sample flow, and
+    # the preview's row with it.
     private def refresh_detail(store : Store) : Nil
       if d = @detail
         @detail = store.get_probe_issue(d.id)
         @detail_flow = @detail.try(&.sample_flow_id).try { |fid| store.flow_row(fid) }
       end
+      @preview = nil
+      sync_preview(store)
+    end
+
+    # Point the preview pane's full row at the list selection. The list holds no URLs, so the
+    # pane's AFFECTED lines come from one row read by id — only when the selection has moved
+    # off the row already held (a reload drops it). Called before every draw of the tab, so a
+    # keypress that moved the cursor is answered on the frame it paints.
+    def sync_preview(store : Store) : Nil
+      return unless preview_enabled?
+      row = @issues[@selected]?
+      return @preview = nil unless row
+      return if @preview.try(&.id) == row.id
+      @preview = store.get_probe_issue(row.id)
+    end
+
+    # The FULL, current finding the action verbs target: the open detail, else the list
+    # selection, re-read from the store by id. A verb that writes or navigates acts on the row as
+    # it is NOW — its status, its sample flow — rather than on the list's copy, and the one that
+    # needs the URLs (copy) gets them. nil when nothing is targeted or the row is gone.
+    def fresh_target_issue(store : Store) : Store::ProbeIssue?
+      target_issue.try { |t| store.get_probe_issue(t.id) }
     end
 
     def move(delta : Int32) : Nil
@@ -183,6 +295,12 @@ module Gori::Tui
         scroll_preview(delta)
         return
       end
+      move_list(delta)
+    end
+
+    # The list cursor whatever has keyboard focus — the wheel over the list (`move` would
+    # scroll a focused preview instead).
+    def move_list(delta : Int32) : Nil
       return if @issues.empty?
       @selected = (@selected + delta).clamp(0, @issues.size - 1)
       @preview_scroll = 0
@@ -196,7 +314,7 @@ module Gori::Tui
     end
 
     # The issue under the cursor, or nil on an empty (or fully filtered) list.
-    def selected_issue : Store::ProbeIssue?
+    def selected_issue : Store::ProbeIssueRow?
       @issues[@selected]?
     end
 
@@ -210,6 +328,56 @@ module Gori::Tui
 
     def detail_open? : Bool
       !@detail.nil?
+    end
+
+    # The drill-in's breadcrumb — the twin of IssuesView#detail_crumb, and read the same two
+    # ways (render + the `‹` hit-test). `pos` counts the FILTERED list behind.
+    # The row the drill-in actually has OPEN, as an index into the filtered list — not the
+    # cursor. The two are the same at open time and a reload re-anchors the cursor by id, but
+    # keying the rail off the OPEN item is the only spelling that cannot band a row the detail
+    # is not showing (see HistoryView#detail_row_index, where live capture makes them diverge
+    # every few seconds).
+    def detail_row_index : Int32?
+      d = @detail || return nil
+      @issues.index { |i| i.id == d.id }
+    end
+
+    # First index of the window the rail shows. Private: everything outside reads
+    # `rail_rows`/`rail_cursor`, which are derived from it.
+    private def rail_start : Int32
+      here = detail_row_index || return 0
+      DrillIn.window_start(@issues.size, here)
+    end
+
+    # See DrillIn::Host.
+    def rail_cursor : Int32
+      (detail_row_index || 0) - rail_start
+    end
+
+    # The rail's window of list context around the open item — see DrillIn.
+    def rail_rows : Array(DrillIn::RailRow)
+      n = rail_count
+      return [] of DrillIn::RailRow if n == 0
+      @issues[rail_start, n].map do |i|
+        DrillIn::RailRow.new(severity_badge(i.severity), i.title, i.host.presence,
+          severity_color(i.severity))
+      end
+    end
+
+    # The drill-in as a whole: the list rail (when it fits) over the item detail. ONE entry
+    # point — see HistoryView#render_drill, which this mirrors.
+    private def render_drill(screen : Screen, rect : Rect, focused : Bool) : Nil
+      body, meta = render_rail_chrome(screen, rect, focused)
+      render_detail(screen, body, focused, step_meta: meta)
+    end
+
+    # The drill-in's breadcrumb. ONE derivation, read by `render_detail` AND by the
+    # controller's click hit-test — the `‹` is a control, and a control drawn from one rect
+    # and hit-tested against another is a dead button (which is what ` ‹ list ` was).
+    def detail_crumb : Frame::Crumb?
+      issue = @detail || return nil
+      pos = detail_row_index.try { |i| "#{i + 1}/#{@issues.size}" }
+      Frame::Crumb.new("PROBE", issue.title, pos)
     end
 
     # No issues at all (the raw list) — gates "clear all".
@@ -228,8 +396,9 @@ module Gori::Tui
       @detail_flow
     end
 
-    # The issue an action targets: the open detail, else the list selection.
-    def target_issue : Store::ProbeIssue?
+    # The issue an action targets: the open detail, else the list selection. The list's shape
+    # has no URLs — see `fresh_target_issue` for the full row.
+    def target_issue : Store::AnyProbeIssue?
       @detail || @issues[@selected]?
     end
 
@@ -243,12 +412,22 @@ module Gori::Tui
       !@query.blank? || scope_active?
     end
 
-    # Click hit-test: the MODE band (y), filter bar (y+1), header (y+2), divider (y+3),
-    # rows from y+4 — one row deeper than Issues because of the MODE band.
+    # The first FINDING-row screen-y — ONE derivation, so `render_list` and both hit-tests
+    # cannot drift. The MODE band owns `rect.y`, the filter bar `+1`, the suggestion row `+2`
+    # while the bar is being EDITED, then the column header and its divider. One row deeper
+    # than Issues throughout, because of the MODE band. See `IssuesView#list_top`.
+    private def list_top(list_rect : Rect) : Int32
+      hdr_y = list_rect.y + 2
+      hdr_y += 1 if @querying
+      hdr_y + 2 # past the column header and its divider
+    end
+
+    # Click hit-test: maps a click to a finding index, or nil past the last populated row /
+    # outside the list pane.
     def list_row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
       list_rect, _ = list_split(rect)
       return nil if mx < list_rect.x || mx >= list_rect.right
-      top = list_rect.y + 4
+      top = list_top(list_rect)
       list_h = {list_rect.bottom - top, 0}.max
       i = my - top
       return nil if i < 0 || i >= list_h
@@ -262,7 +441,7 @@ module Gori::Tui
     # an offset. See `Frame.scroll_gauge_row`.
     def gauge_row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
       list_rect, _ = list_split(rect)
-      top = list_rect.y + 4 # the band list_row_at and the gauge draw both measure
+      top = list_top(list_rect) # the band list_row_at and the gauge draw both measure
       Frame.scroll_gauge_row(Rect.new(list_rect.x, top, list_rect.w, {list_rect.bottom - top, 0}.max),
         @issues.size, mx, my)
     end
@@ -275,75 +454,138 @@ module Gori::Tui
 
     # --- `/` filter bar (live, in memory — mirrors IssuesView) --------------
 
-    def start_query : Nil
-      @querying = true
-      @qcx = @query.size
-    end
-
-    def stop_query : Nil
-      @querying = false
-    end
-
-    def cancel_query : Nil
-      @querying = false
-      @query = ""
-      @qcx = 0
-      @preedit_q = ""
+    # `QueryBarEdit`'s hook: every text change re-derives the list, in memory, and the dropdown.
+    def query_edited : Nil
       apply_filter
+      sync_popup
     end
 
-    def query_insert(ch : Char) : Nil
-      @query = "#{@query[0, @qcx]}#{ch}#{@query[@qcx..]}"
-      @qcx += 1
-      apply_filter
+    def query_suggestions : Array(String)
+      # …then the boolean operators, which no field pool can ever offer: `NOT (` is the only
+      # way to exclude a disjunction (`-` negates a TERM, not a GROUP) and it had no discovery
+      # at all. Appended HERE and not in the backend — `QuerySuggest` is a TUI module, and a
+      # parser must not require the view layer. Same seam `InterceptView` uses.
+      QuerySuggest.with_operators(Probe::Filter.suggestions(@query, @qcx, host_pool, code_pool),
+        FilterAst.token_at(@query, @qcx))
     end
 
-    def query_backspace : Nil
-      return if @qcx == 0
-      @query = "#{@query[0, @qcx - 1]}#{@query[@qcx..]}"
-      @qcx -= 1
-      apply_filter
+    # `@all`, not `@issues`: completing off the FILTERED list would offer only the values the
+    # half-typed query already matches. Memoised because `render_suggestions` runs on the draw
+    # path, and cleared by `reload`, the only thing that moves `@all`.
+    private def host_pool : Array(String)
+      pool = @host_pool
+      return pool if pool
+      @host_pool = distinct(&.host)
     end
 
-    def query_move(d : Int32) : Nil
-      @qcx = (@qcx + d).clamp(0, @query.size)
+    private def code_pool : Array(String)
+      pool = @code_pool
+      return pool if pool
+      @code_pool = distinct(&.code)
+    end
+
+    private def distinct(& : Store::ProbeIssueRow -> String) : Array(String)
+      seen = Set(String).new
+      @all.each do |i|
+        v = yield i
+        seen << v unless v.empty?
+      end
+      seen.to_a.sort!
     end
 
     def query_set_preedit(text : String) : Nil
-      @preedit_q = text
-    end
-
-    def query_complete : Bool
-      token = @query[0, @qcx][/\S*\z/]
-      return false if token.empty? || token.includes?(':')
-      if field = QUERY_FIELDS.find(&.starts_with?(token.downcase))
-        @query = "#{@query[0, @qcx - token.size]}#{field}#{@query[@qcx..]}"
-        @qcx += field.size - token.size
-        return true
-      end
-      false
+      @preedit = text
     end
 
     # --- detail / mutations ---------------------------------------------------
 
     def open_detail(store : Store) : Bool
-      issue = @issues[@selected]?
+      row = @issues[@selected]?
+      return false unless row
+      # The list row has no URLs; the detail is the full finding. Gone since the last reload (a
+      # peer deleted it) opens nothing — the next reload drops the row too.
+      issue = store.get_probe_issue(row.id)
       return false unless issue
       @detail = issue
       @detail_flow = issue.sample_flow_id.try { |fid| store.flow_row(fid) }
       @affected.reset
+      @desc.reset
+      @desc_text = ""
+      # Every drill-in arrives on its first pane. The ring survives nothing else: a detail
+      # closed with DESCRIPTION focused would otherwise reopen on another finding's remediation
+      # text, with the URL list — the reason the detail was opened — silently not taking keys.
+      @detail_focus = :affected
       true
     end
 
     def close_detail : Nil
       @detail = nil
       @affected.reset
+      @desc.reset
+      @desc_text = ""
+      @detail_focus = :affected
     end
 
-    # ↑/↓ (⇧ to select) walk the AFFECTED URLS; the wheel scrolls the viewport and leaves the
+    # --- the detail's pane ring ------------------------------------------------
+    # Top to bottom, the shape every multi-pane view in the tree uses
+    # (`IssuesView::DETAIL_PANES` is the sibling copy).
+
+    DETAIL_PANES = [:affected, :desc]
+
+    getter detail_focus : Symbol
+
+    def focus_affected! : Nil
+      @detail_focus = :affected
+    end
+
+    def focus_desc! : Nil
+      @detail_focus = :desc
+    end
+
+    def desc_focused? : Bool
+      @detail_focus == :desc
+    end
+
+    # ⇥ / ⇧⇥ inside an open detail. WRAPS, and always answers true, rather than returning false
+    # at the ends like a list-page ring does — false is how a view hands focus to the TAB BAR,
+    # and `handle_body_key`'s detail arm is gated on body focus, so the end of the ring would
+    # be a fully-drawn detail with a dead keyboard. See `IssuesView#step_detail_focus`, which
+    # this is the second copy of; `pane_advance` used to swallow ⇥ outright here because there
+    # was only one pane for it to reach.
+    def step_detail_focus(dir : Int32) : Bool
+      i = DETAIL_PANES.index(@detail_focus) || 0
+      @detail_focus = DETAIL_PANES[(i + dir) % DETAIL_PANES.size]
+      true
+    end
+
+    # The pane the keyboard and the read verbs address. ONE accessor, so a verb, a key and a
+    # click can never disagree about which pane they are acting on.
+    private def pane : ReadPane
+      desc_focused? ? @desc : @affected
+    end
+
+    # At the last row of AFFECTED URLS — the edge `↓` hands focus to DESCRIPTION from. An empty
+    # list answers true, so the crossing works on a finding whose stored URL list would not
+    # parse, which is the one shape where the pane has no caret to move at all.
+    def affected_at_bottom? : Bool
+      # `visual: false` — this pane's plain ↓ is `goto_line` (see `detail_move`), so its last
+      # row is the last URL, not the last drawn row of it. With the visual test a finding whose
+      # last affected URL wraps could never be left with ↓ at all: `goto_line` clamps at the
+      # line and the edge test says there is still a row below.
+      @affected.at_bottom?(visual: false)
+    end
+
+    # The DESCRIPTION caret has no row above it — the edge `↑` crosses back to AFFECTED on.
+    # `ReadPane#at_top?` is already visual-row aware, which is what this needs: the pane wraps,
+    # so a caret three rows into a wrapped first line still has rows above it here.
+    def desc_at_top? : Bool
+      @desc.at_top?
+    end
+
+    # ↑/↓ (⇧ to select) walk the FOCUSED pane; the wheel scrolls the viewport and leaves the
     # caret put, the split every read pane in the tree makes.
     def scroll_detail(delta : Int32) : Nil
-      with_affected { @affected.move(delta, 0) }
+      with_panes { pane.move(delta, 0) }
     end
 
     # A plain ↑/↓ steps one URL, not one drawn row. The pane soft-wraps and `ReadPane#move`
@@ -355,122 +597,208 @@ module Gori::Tui
     # ⇧arrows keep `move`'s per-row character selection — that gesture is about text, so it
     # has to be able to land inside a wrapped row. `goto_line` drops the selection, which is
     # what a plain cursor key means everywhere else in the app.
+    # A plain ↑/↓ on the URL list steps one URL, not one drawn row. That pane soft-wraps and
+    # `ReadPane#move` steps VISUAL rows there — right for a body of prose, wrong for a list
+    # whose row is the thing `↵` opens and `y` copies: a 155-character URL on an 80-column pane
+    # took three presses to reach the next entry, and the first two changed nothing about what
+    # those two keys would act on while the hint said "↑/↓ URL".
+    #
+    # DESCRIPTION takes the visual step instead, and that is not an inconsistency: its rows are
+    # not addressable things, they are the wrapped run of one sentence. A logical step there
+    # would leap the whole card in one press and make most of it unreachable.
+    #
+    # ⇧arrows keep `move`'s per-row character selection on both — that gesture is about text,
+    # so it has to be able to land inside a wrapped row. `goto_line` drops the selection, which
+    # is what a plain cursor key means everywhere else in the app.
     def detail_move(delta : Int32, selecting : Bool) : Nil
-      with_affected do
-        if selecting
-          @affected.move(delta, 0, selecting: true)
+      with_panes do
+        p = pane
+        if selecting || desc_focused?
+          p.move(delta, 0, selecting: selecting)
         else
-          @affected.goto_line(@affected.cursor.cy + delta)
+          p.goto_line(p.cursor.cy + delta)
         end
       end
     end
 
     def detail_wheel(delta : Int32) : Nil
-      with_affected { @affected.scroll_view(delta) }
+      with_panes { pane.scroll_view(delta) }
     end
 
     def detail_motion_key(ev : Termisu::Event::Key) : Bool
-      issue = @detail || return false
-      sync_affected(issue)
-      @affected.motion_key(ev)
-    end
-
-    def detail_at_top? : Bool
-      @affected.at_top?
+      return false unless @detail
+      with_panes { return pane.motion_key(ev) }
+      false
     end
 
     def detail_select_line : Nil
-      with_affected { @affected.select_line }
+      with_panes { pane.select_line }
     end
 
     def detail_clear_selection : Nil
-      @affected.clear_selection
+      pane.clear_selection
     end
 
     def detail_selection? : Bool
-      !@detail.nil? && @affected.selection?
+      !@detail.nil? && pane.selection?
     end
 
     def detail_copy_text : String
-      issue = @detail || return ""
-      sync_affected(issue)
-      @affected.copy_text
+      return "" unless @detail
+      with_panes { return pane.copy_text }
+      ""
     end
 
     def detail_copy_all : String
-      issue = @detail || return ""
-      sync_affected(issue)
-      @affected.copy_all
+      return "" unless @detail
+      with_panes { return pane.copy_all }
+      ""
     end
 
     # The AFFECTED URL the caret sits on — what `↵` navigates to. One row is one URL (the pane
     # soft-wraps, so a long URL spans several visual rows but stays one LINE), which is why the
     # caret's line index addresses the list directly. nil when no detail is open or the issue
     # has no affected URLs.
+    #
+    # …and nil while DESCRIPTION holds focus, which is what keeps `↵` honest: the verb is
+    # gated on this, so the key that opens a URL in History simply has nothing to open when the
+    # caret is sitting in a paragraph of remediation text.
     def affected_url : String?
       issue = @detail || return nil
+      return nil if desc_focused?
       sync_affected(issue)
       issue.affected[@affected.cursor.cy]?
     end
 
-    # The AFFECTED list's rect inside the detail card — the derivation `render_detail` walks, so
-    # the click and the draw address the same rows. nil when the card is too short for any.
+    # Rows the detail's meta block owns before the two cards: title, chips, detail, evidence.
+    # One more than `IssuesView::DETAIL_HEAD_ROWS` because a scanner finding splits its
+    # evidence across two lines where an Issue states one.
+    #
+    # It was FIVE until the remediation text moved into its own pane — that fifth row is the
+    # one this change reclaims.
+    DETAIL_HEAD_ROWS = 4
+
+    # Text rows the DESCRIPTION card asks for. `Probe.remediation` writes one sentence, so
+    # three wrapped rows hold every built-in rule's text on a normal-width pane and the pane
+    # scrolls for the rest (it takes focus and a caret, so a longer custom rule's description
+    # is reachable rather than clipped).
+    #
+    # A FIXED budget, and it is DESCRIPTION that gets it rather than the list — the inverse of
+    # `IssuesView`'s split, on purpose. There the fixed pane is on top; here the flexible one
+    # is, because AFFECTED URLS is the pane an operator navigates and it can hold up to the
+    # store's per-issue cap, while a remediation sentence that was given the leftovers would
+    # leave a mostly-empty card at every height.
+    DESC_VISIBLE = 3
+
+    # The AFFECTED and DESCRIPTION card rects — ONE derivation, which `render_detail`, both
+    # `*_rect` accessors and through them all four pointer hit-tests read.
+    #
+    # This is the guard `IssuesView#detail_split` was extracted for, and Probe had the same
+    # defect: `render_detail` walked `rect.y + 5` → divider → heading → list while
+    # `affected_rect` wrote out the `+ 7` that lands on, under a comment claiming it was "the
+    # derivation `render_detail` walks". They agreed by arithmetic, not by construction — and
+    # adding a second card is exactly the edit that would have broken them apart, putting every
+    # click in the URL list on the wrong row with nothing raising.
+    #
+    # CLAMPED, not merely floored. `Frame.card` needs two rows for its own frame and the
+    # container may grant fewer than both cards want (a 40x9 terminal is inside
+    # `Layout.usable?`). DESCRIPTION gives its rows up first — AFFECTED URLS is the pane that
+    # takes keys and holds the finding's evidence — and both rects stay inside `rect`, which
+    # every view owes `pane_overspill_spec`.
+    def detail_split(rect : Rect) : {Rect, Rect}
+      # CLAMPED to the pane's own bottom, which only bites when the interior is shorter than
+      # the meta block itself (a 40x6 terminal). Unclamped, both cards come back `h == 0` at a
+      # `y` PAST `rect.bottom` — nothing draws, because every draw path bails on `h < 2`, but
+      # a rect positioned outside the pane it belongs to is the shape a later hit-test reads
+      # as real. `pane_overspill_spec` measures painted cells and would never have caught it.
+      top = {rect.y + DETAIL_HEAD_ROWS, rect.bottom}.min
+      avail = {rect.bottom - top, 0}.max
+      # Leave AFFECTED a frame plus one row wherever the height allows one at all.
+      desc_h = {DESC_VISIBLE + 2, {avail - 3, 0}.max}.min
+      # …and never keep a row DESCRIPTION cannot draw with: at `h == 1` `Frame.card` paints
+      # nothing at all, so the row would be spent on neither pane.
+      desc_h = 0 if desc_h < 2
+      aff_h = avail - desc_h
+      {Rect.new(rect.x, top, rect.w, aff_h),
+       Rect.new(rect.x, top + aff_h, rect.w, desc_h)}
+    end
+
+    def affected_card_rect(rect : Rect) : Rect
+      detail_split(rect)[0]
+    end
+
+    def desc_card_rect(rect : Rect) : Rect
+      detail_split(rect)[1]
+    end
+
+    # A card's framed interior — what `ReadPane` draws into and what a click is measured
+    # against. nil when the card is too small to hold a row (`Frame.card` spends two rows and
+    # two columns on its own outline).
     def affected_rect(rect : Rect) : Rect?
-      list_y = rect.y + 7 # header row + 3 meta rows + divider + section head (see render_detail)
-      h = {rect.bottom - list_y, 0}.max
-      h > 0 ? Rect.new(rect.x + 1, list_y, {rect.w - 2, 0}.max, h) : nil
+      body_of(affected_card_rect(rect))
+    end
+
+    def desc_rect(rect : Rect) : Rect?
+      body_of(desc_card_rect(rect))
+    end
+
+    private def body_of(card : Rect) : Rect?
+      body = card.inset(1, 1)
+      body.empty? ? nil : body
+    end
+
+    # A press inside either card takes focus AND places that pane's caret — the one gesture,
+    # like clicking a pane in any other multi-pane view. A press on the chrome (the meta block,
+    # a card's own border) is not a miss to be swallowed silently; it just leaves focus where
+    # it was, which is what `nil` here means to the controller.
+    #
+    # `selecting` is the DRAG half, and it deliberately does not re-target: a drag that starts
+    # in AFFECTED and wanders into DESCRIPTION must keep extending the selection it began,
+    # not hand the anchor to the other pane mid-gesture.
+    def detail_pane_at(rect : Rect, mx : Int32, my : Int32) : Symbol?
+      aff, desc = detail_split(rect)
+      return :affected if aff.contains?(mx, my)
+      return :desc if desc.contains?(mx, my)
+      nil
     end
 
     def detail_click(rect : Rect, mx : Int32, my : Int32, selecting : Bool = false) : Nil
-      box = affected_rect(rect) || return
-      with_affected { @affected.click(box, mx, my, selecting) }
+      @detail_focus = detail_pane_at(rect, mx, my) || @detail_focus unless selecting
+      box = focused_pane_rect(rect) || return
+      with_panes { pane.click(box, mx, my, selecting) }
     end
 
     def detail_select_word(rect : Rect, mx : Int32, my : Int32) : Bool
-      box = affected_rect(rect)
-      return false unless box
-      issue = @detail || return false
-      sync_affected(issue)
-      @affected.select_word(box, mx, my)
+      @detail_focus = detail_pane_at(rect, mx, my) || @detail_focus
+      box = focused_pane_rect(rect) || return false
+      return false unless @detail
+      with_panes { return pane.select_word(box, mx, my) }
+      false
+    end
+
+    # The interior of whichever card `@detail_focus` names — the rect the focused pane was
+    # RENDERED into, which is the only one `ReadPane#click` may be measured against.
+    private def focused_pane_rect(rect : Rect) : Rect?
+      desc_focused? ? desc_rect(rect) : affected_rect(rect)
     end
 
     # `c`: one-key dismiss for the targeted issue. open → false-positive (mute), anything
     # already triaged → back to open (un-mute). Dismiss is the high-value triage action for
     # a passive scanner; the full open/confirmed/fp/resolved picker was over-built for
-    # machine-found issues (promote handles "this is real → Issue"). Returns the new state.
+    # machine-found issues (promote handles "this is real → Issue"). Returns the new state, or
+    # nil when the targeted row no longer exists (the list is re-read so it drops out).
+    #
+    # Toggles from the row's CURRENT status, not the list's copy: a peer that triaged it since
+    # the last reload would otherwise have its change undone by a toggle aimed the other way.
     def toggle_dismiss(store : Store) : Store::Status?
-      return nil unless issue = target_issue
+      return nil unless target_issue
+      unless issue = fresh_target_issue(store)
+        reload(store)
+        return nil
+      end
       next_status = Probe::Triage.toggle_dismiss(store, issue)
       reload(store)
       next_status
-    end
-
-    # Bulk-mute every OPEN issue sharing the targeted issue's code. Respects the ⇧S scope lens:
-    # dismissing "all with this code" from a scoped view must not silently mute issues on
-    # out-of-scope hosts the user can't see, and the returned count must equal what was muted.
-    # With the lens off this is every open issue carrying the code.
-    def dismiss_by_code(store : Store) : Int32
-      return 0 unless issue = target_issue
-      targets = @all.select { |i| i.code == issue.code && i.status.open? && lens_admits?(i) }
-      targets.each { |i| store.update_probe_issue_status(i.id, Store::Status::FalsePositive) }
-      reload(store)
-      targets.size
-    end
-
-    # Mute every OPEN issue on the targeted issue's host. The host is a single visible row, so
-    # the scope lens (which filters by host) already admits it — no cross-scope leak here.
-    def dismiss_by_host(store : Store) : Int32
-      return 0 unless issue = target_issue
-      n = @all.count { |i| i.host == issue.host && i.status.open? }
-      store.dismiss_probe_by_host(issue.host)
-      reload(store)
-      n
-    end
-
-    # A row is admitted by the active scope lens (always true when the lens is off).
-    private def lens_admits?(issue : Store::ProbeIssue) : Bool
-      return true unless scope_active?
-      @scope.try(&.host_in_scope?(issue.host)) == true
     end
 
     # Delete a SPECIFIC issue by id. The controller captures the id when the confirm opens, so a
@@ -500,7 +828,7 @@ module Gori::Tui
                listen : {String, Int32}? = nil, capturing : Bool = true) : Nil
       return if rect.empty?
       if @detail
-        render_detail(screen, rect, focused)
+        render_drill(screen, rect, focused)
       else
         list_rect, preview_rect = list_split(rect)
         # No preview pane at this size (or after a resize down) ⇒ snap focus back to the list,
@@ -509,25 +837,39 @@ module Gori::Tui
         render_list(screen, list_rect, focused && @preview_focus == :list,
           listen: listen, capturing: capturing)
         render_preview_pane(screen, preview_rect, focused) if preview_rect
+        # LAST: the dropdown is the only thing allowed to occlude the list.
+        render_query_popup(screen, list_rect)
       end
     end
 
     private def render_list(screen : Screen, rect : Rect, focused : Bool, *,
                             listen : {String, Int32}? = nil, capturing : Bool = true) : Nil
       render_mode_band(screen, rect)
-      render_filter_bar(screen, rect, rect.y + 1)
-      # The column header owns row 2 of the pane, so it exists only once the pane HAS one.
-      # Unguarded, a 40x9 terminal (Layout.usable?'s floor plus a row) gives this list a
-      # one-row interior and `SEV CAT TITLE` was painted on the shell's status line, over the
-      # key hints. The divider below clamps itself (see Frame.inner_divider); this row did not.
-      # Contract: `spec/tui/contract_render_bounds_spec.cr`.
-      if rect.h > 2
-        screen.text(rect.x + 1, rect.y + 2, "SEV", Theme.muted)
-        screen.text(rect.x + 7, rect.y + 2, "CAT", Theme.muted)
-        screen.text(rect.x + 14, rect.y + 2, "TITLE", Theme.muted)
+      # Row-guarded like every row below it. The MODE band owns `rect.y` here, so the bar sits
+      # one row in and a one-row rect has nowhere to put it — `Screen#text` clips to the
+      # SCREEN, not to this pane, so an unguarded call paints outside. (Issues' bar owns
+      # `rect.y` itself and needs no guard.)
+      render_filter_bar(screen, rect, rect.y + 1) if rect.y + 1 < rect.bottom
+      # The suggestion row exists only while the bar is being edited, so the column header and
+      # everything under it shift down by one for exactly that state. `list_top` is the
+      # inverse and the hit-tests read it.
+      hdr_y = rect.y + 2
+      if @querying
+        render_suggestions(screen, rect, hdr_y)
+        hdr_y += 1
       end
-      Frame.inner_divider(screen, rect, rect.y + 3, border: Frame.pane_border(focused))
-      top = rect.y + 4
+      # The column header exists only once the pane HAS that row. Unguarded, a 40x9 terminal
+      # (Layout.usable?'s floor plus a row) gives this list a one-row interior and
+      # `SEV CAT TITLE` was painted on the shell's status line, over the key hints. The
+      # divider below clamps itself (see Frame.inner_divider); this row did not.
+      # Contract: `spec/tui/contract_render_bounds_spec.cr`.
+      if hdr_y < rect.bottom
+        screen.text(rect.x + 1, hdr_y, "SEV", Theme.muted)
+        screen.text(rect.x + 7, hdr_y, "CAT", Theme.muted)
+        screen.text(rect.x + 14, hdr_y, "TITLE", Theme.muted)
+      end
+      Frame.inner_divider(screen, rect, hdr_y + 1, border: Frame.pane_border(focused))
+      top = list_top(rect)
       list_h = {rect.bottom - top, 0}.max
       @list_last_h = list_h
       return render_empty(screen, rect, top, listen: listen, capturing: capturing) if @issues.empty?
@@ -558,7 +900,7 @@ module Gori::Tui
       return if body.h < 1
       screen.fill(body, Theme.selection_dim) if active
       bg = active ? Theme.selection_dim : Theme.bg
-      lines = preview_lines(issue)
+      lines = preview_lines(issue, @preview.try { |p| p.id == issue.id ? p : nil })
       # Write the clamp back (like render_detail) so overscrolling a short preview can't inflate
       # @preview_scroll and leave later scroll-up presses dead until it drains back into range.
       @preview_scroll = @preview_scroll.clamp(0, {lines.size - 1, 0}.max)
@@ -573,7 +915,9 @@ module Gori::Tui
       Frame.scroll_gauge(screen, body, lines.size, sc, false, bg)
     end
 
-    private def preview_lines(issue : Store::ProbeIssue) : Array({Color, String})
+    # `full` is the same finding with its URLs (`sync_preview`); without it — a draw that no
+    # sync preceded — the pane says how many there are and lists none.
+    private def preview_lines(issue : Store::ProbeIssueRow, full : Store::ProbeIssue?) : Array({Color, String})
       lines = [] of {Color, String}
       lines << {Theme.text_bright, "#{severity_badge(issue.severity)}  #{issue.title}"}
       meta = "#{issue.host}  ·  #{issue.category}  ·  #{issue.status.label}  ·  ×#{Fmt.count(issue.hit_count)}"
@@ -588,14 +932,17 @@ module Gori::Tui
       end
       rem = Probe.remediation(issue.code)
       lines << {Theme.muted, rem} unless rem.empty?
-      lines << {Theme.accent, "AFFECTED (#{issue.affected.size})"}
-      issue.affected.first(8).each { |u| lines << {Theme.text, u} }
-      more = issue.affected.size - 8
-      lines << {Theme.muted, "… +#{more} more"} if more > 0
+      urls = full.try(&.affected)
+      lines << {Theme.accent, "AFFECTED (#{urls.try(&.size) || issue.affected_count})"}
+      if urls
+        urls.first(8).each { |u| lines << {Theme.text, u} }
+        more = urls.size - 8
+        lines << {Theme.muted, "… +#{more} more"} if more > 0
+      end
       lines
     end
 
-    private def draw_row(screen : Screen, rect : Rect, issue : Store::ProbeIssue,
+    private def draw_row(screen : Screen, rect : Rect, issue : Store::ProbeIssueRow,
                          y : Int32, selected : Bool, focused : Bool) : Nil
       bg = selected ? (focused ? Theme.accent_bg : Theme.selection_dim) : Theme.bg
       if selected
@@ -622,8 +969,8 @@ module Gori::Tui
         screen.text(hx, y, issue.host, Theme.muted, bg, width: {rx - hx, 0}.max)
         rx = hx - 1
       end
-      if issue.affected.size > 1
-        cnt = "×#{issue.affected.size}"
+      if issue.affected_count > 1
+        cnt = "×#{issue.affected_count}"
         cx = {rx - cnt.size, rect.x}.max
         screen.text(cx, y, cnt, Theme.muted, bg, width: {rx - cx, 0}.max)
         rx = cx - 1
@@ -633,19 +980,40 @@ module Gori::Tui
       screen.text(title_x, y, issue.title, selected ? Theme.text_bright : Theme.text, bg, width: tw)
     end
 
+    # The first token in the bar that is shaped like a field this backend does not have.
+    private def unknown_query_field : FilterAst::UnknownField?
+      return nil if @query.blank?
+      FilterAst.unknown_field(@query, FilterAst::SEPS_FIELD, QUERY_KNOWN,
+        FilterAst::EMPTY_NAMESPACES, Probe::Filter::CANDIDATE_FIELDS)
+    end
+
     private def render_empty(screen : Screen, rect : Rect, top : Int32, *,
                              listen : {String, Int32}? = nil, capturing : Bool = true) : Nil
       # Branch on a real `/` query FIRST (querying-aware hint): a blank-query empty set
       # is caused by the triage lens or the scope lens, where "esc clears the filter"
       # would mislead. Mirrors HistoryView/SitemapView's ordering.
       list_rect = Rect.new(rect.x + 1, top, {rect.w - 2, 0}.max, {rect.bottom - top, 0}.max)
+      # No row left for a list means no row for a message about one either — the suggestion
+      # row's +1 shift is what made this load-bearing (at h = 13/14 with the bar open `top`
+      # lands past the pane), and `width:` has been missing on all three since they were
+      # written: the longest overruns a 36-column interior.
+      return if top >= rect.bottom
+      w = {rect.w - 2, 0}.max
       if !@query.blank?
-        msg = @querying ? "no issues match · esc clears the filter" : "no issues match · / to edit the filter"
-        screen.text(rect.x + 1, top, msg, Theme.muted)
+        # An unknown `field:` free-texts the whole token and matches nothing — the same
+        # silence the Issues bar carries, named with the same sentence.
+        lead = if u = unknown_query_field
+                 FilterAst.unknown_field_note(u)
+               else
+                 "no issues match"
+               end
+        msg = "#{lead} · #{@querying ? "esc clears the filter" : "/ to edit the filter"}"
+        screen.text(rect.x + 1, top, msg, Theme.muted, width: w)
       elsif @pre_scope_empty && !@all.empty? && !@show_closed
-        screen.text(rect.x + 1, top, "no open issues · all #{@all.size} triaged · press a to show closed", Theme.muted)
+        screen.text(rect.x + 1, top, "no open issues · all #{@all.size} triaged · press a to show closed",
+          Theme.muted, width: w)
       elsif scope_active?
-        screen.text(rect.x + 1, top, "no issues in scope · ⇧S clears the scope lens", Theme.muted)
+        screen.text(rect.x + 1, top, "no issues in scope · s clears the scope lens", Theme.muted, width: w)
       else
         TrafficEmptyState.render(screen, list_rect, variant: :probe, listen: listen,
           capturing: capturing, scan_on: !@mode.off?,
@@ -660,7 +1028,7 @@ module Gori::Tui
       tallies_x = render_tallies(screen, rect, x + 1) # right-aligned, but never left of the mode chip
       # The CLOSED lens toggle chains left of the tallies; lit when showing closed/dismissed
       # issues, muted (its default open-only) otherwise — so the `a` chord stays in view.
-      cx = Frame.toggle_badge(screen, tallies_x, rect.y, x + 1, "a", "CLOSED", @show_closed)
+      cx = Frame.toggle_badge(screen, tallies_x, rect.y, x + 1, key_label("probe.toggle-closed", "a"), "CLOSED", @show_closed)
       unless @tech.empty?
         screen.text(x, rect.y, @tech.join(" "), Theme.green, width: {cx - x - 1, 0}.max)
       end
@@ -718,46 +1086,81 @@ module Gori::Tui
       # `render_tallies` and the same `min_x` it hands the badge.
       floor = cx + chip_w + 2
       Frame.right_badge_hit(mx, my, rect.y, tallies_left(rect, floor), floor,
-        [{:closed, "a", "CLOSED"}] of {Symbol, String, String})
+        [{:closed, key_label("probe.toggle-closed", "a"), "CLOSED"}] of {Symbol, String, String})
     end
 
     # The MODE chip's text, in one place: the draw positions everything after it from this
     # width, and so does `mode_band_hit`.
     private def mode_chip_label : String
-      " m:#{@mode.title} "
+      " #{key_label("probe.mode", "m")}:#{@mode.title} "
     end
 
     private def render_filter_bar(screen : Screen, rect : Rect, y : Int32) : Nil
       if @querying
-        prefix = "filter › "
-        screen.text(rect.x + 1, y, prefix, Theme.accent)
-        base = rect.x + 1 + prefix.size
-        screen.input_line(base, y, @query, @qcx, @preedit_q, Theme.text_bright, width: {rect.w - prefix.size - 2, 0}.max,
+        screen.text(rect.x + 1, y, QUERY_PREFIX, Theme.accent)
+        base = rect.x + 1 + QUERY_PREFIX.size
+        screen.input_line(base, y, @query, @qcx, @preedit, Theme.text_bright, width: {rect.w - QUERY_PREFIX.size - 2, 0}.max,
           colors: Highlight.filter_query(@query, Theme.text_bright, FilterAst::SEPS_FIELD,
-            known: QUERY_KNOWN))
+            known: QUERY_KNOWN, shaped: Probe::Filter::FIELD_SHAPED))
         return
       end
-      # Right cluster: a scope-lens chip (always shown so the ⇧S toggle is discoverable,
+      # Right cluster: a scope-lens chip (always shown so the `s` toggle is discoverable,
       # mirroring HistoryView/SitemapView) and, when filtering, the row count.
       # One right-anchored chain — see HistoryView#render_ql_bar.
       chips = [] of {String, Color}
       chips << {@issues.size.to_s, Theme.muted} if filtering?
       scope_on = scope_active?
-      chips << (scope_on ? {"s scope:#{@scope.try(&.size) || 0}", Theme.accent} : {"s scope:off", Theme.muted})
+      scope_chip = Hotkeys.menu_chip(@registry, "probe.scope-toggle")
+      chips << (scope_on ? {"#{scope_chip} scope:#{@scope.try(&.size) || 0}", Theme.accent} : {"#{scope_chip} scope:off", Theme.muted})
       scope_x = Frame.right_text_chain(screen, rect.right - 1, y, rect.x + 2, chips)
       left_w = {scope_x - (rect.x + 1) - 1, 0}.max
       if filtering?
         label = @query.blank? ? "(in-scope only)" : ": #{@query}"
         screen.text(rect.x + 1, y, label, Theme.text, width: left_w)
       else
-        screen.text(rect.x + 1, y, "/ filter  ·  severity:  status:open  category:tech  host:", Theme.muted, width: left_w)
+        screen.text(rect.x + 1, y, QuerySuggest.idle_hint("/ filter", Probe::Filter::HINT_FIELDS, left_w), Theme.muted, width: left_w)
       end
     end
 
-    private def render_detail(screen : Screen, rect : Rect, focused : Bool) : Nil
+    private def key_label(id : String, fallback : String) : String
+      @registry.try { |r| Hotkeys.binding_label(r, id, fallback) } || fallback
+    end
+
+    # The completion row under the bar — see `IssuesView#render_suggestions`.
+    # `Probe::Filter::FIELD_HELP_PROC`, never the default: `QuerySuggest`'s fallback is
+    # `QL::FIELD_HELP`, which would describe this bar's triage-state `status:` as an HTTP code.
+    private def render_suggestions(screen : Screen, rect : Rect, y : Int32) : Nil
+      # This row owes its own vertical bound, like the column header below it: `Screen#text`
+      # clips to the SCREEN, not to this pane, and a 40x9 terminal (`Layout.usable?`'s floor
+      # plus a row) leaves this list a one-row interior — the `↹ …` row landed on the shell's
+      # key-hint line. Contract: `spec/tui/contract_render_bounds_spec.cr`.
+      return if y >= rect.bottom
+      w = {rect.w - 2, 0}.max
+      sugg = query_suggestions
+      unless sugg.empty?
+        QuerySuggest.render(screen, rect.x + 1, y, w, sugg, Probe::Filter::FIELD_HELP_PROC)
+        return
+      end
+      return unless QuerySuggest.hint_slot?(FilterAst.token_at(@query, @qcx).core)
+      screen.text(rect.x + 1, y, QUERY_HINT, Theme.muted, width: w)
+    end
+
+    private def render_query_popup(screen : Screen, rect : Rect) : Nil
+      return unless @querying && @popup.open?
+      top = list_top(rect)
+      bounds = Rect.new(rect.x + 1, top, {rect.w - 2, 0}.max, {rect.bottom - top, 0}.max)
+      @popup.render(screen, rect.x + 1 + QUERY_PREFIX.size, top - 1, bounds,
+        Probe::Filter::FIELD_HELP_PROC)
+    end
+
+    private def render_detail(screen : Screen, rect : Rect, focused : Bool,
+                              step_meta : String? = nil) : Nil
       issue = @detail || return
-      # Back-to-list affordance on the top border (←/esc → the issue list).
-      Frame.list_back_hint(screen, rect)
+      # Back-to-list breadcrumb on the top border: which list, which row of it, and what is
+      # open. See Frame::Crumb — the `‹` is a button, hit-tested off the same rect.
+      if c = detail_crumb
+        Frame.crumb(screen, rect, c, meta: step_meta)
+      end
       w = {rect.w - 2, 0}.max
       code_label = "##{issue.code}"
       screen.text(rect.right - code_label.size - 1, rect.y, code_label, Theme.muted)
@@ -777,14 +1180,16 @@ module Gori::Tui
         Frame.tag_chip(screen, cx + 1, rect.y + 1, " #{id} ", Theme.muted)
       end
 
-      hint = detail_hint(issue.code)
-      screen.text(rect.x + 1, rect.y + 2, hint, Theme.muted, width: w) unless hint.empty?
+      # The remediation line that used to sit here is now the DESCRIPTION card below, so the
+      # meta block is a row shorter and `DETAIL_HEAD_ROWS` went 5 → 4. It was the one row of
+      # this block holding a SENTENCE rather than a field, and a `width:`-capped row ended
+      # nearly every rule's text in `…`.
       evidence = if issue.evidence
                    "detail   #{issue.evidence}"
                  else
                    "detail   (see affected URLs)"
                  end
-      screen.text(rect.x + 1, rect.y + 3, evidence, Theme.muted, width: w)
+      screen.text(rect.x + 1, rect.y + 2, evidence, Theme.muted, width: w)
       ev = if flow = @detail_flow
              "evidence #{flow.method} #{flow_location(flow)} → #{flow.status || "-"}"
            elsif fid = issue.sample_flow_id
@@ -794,17 +1199,68 @@ module Gori::Tui
            else
              "evidence (none)"
            end
-      screen.text(rect.x + 1, rect.y + 4, ev, Theme.muted, width: w)
+      screen.text(rect.x + 1, rect.y + 3, ev, Theme.muted, width: w)
 
-      y = rect.y + 5
-      Frame.inner_divider(screen, rect, y, border: Frame.pane_border(focused))
-      head = "AFFECTED URLS (#{issue.affected.size})  ·  seen ×#{Fmt.count(issue.hit_count)}"
-      screen.text(rect.x + 1, y + 1, head, Theme.accent, attr: Attribute::Bold)
-      list_y = y + 2
-      avail = {rect.bottom - list_y, 0}.max
-      return if avail <= 0
+      aff_card, desc_card = detail_split(rect)
+      render_affected_card(screen, aff_card, issue, focused && !desc_focused?)
+      render_desc_card(screen, desc_card, issue, focused && desc_focused?)
+    end
+
+    # The AFFECTED URLS card — the same correction `IssuesView`'s RELATED card is.
+    #
+    # It was an OPEN region: an `inner_divider`, a text heading, then the URL rows running to
+    # the bottom of the detail. An open-ended block reads as "the rest of this pane", not as a
+    # thing with its own edges, and the pane it sits in is a drill-in whose whole job is to be
+    # left again — so the one region an operator navigates had no outline while the frame
+    # around it did.
+    #
+    # Row-budget neutral, exactly as the Issues change was: the heading rides the top border
+    # and the card's bottom border takes the row that frees, so the list keeps every row it
+    # drew before.
+    private def render_affected_card(screen : Screen, card : Rect, issue : Store::ProbeIssue,
+                                     active : Bool) : Nil
+      return if card.h < 2 || card.w < 2
+      Frame.card(screen, card, AFFECTED_TITLE, bg: Theme.bg, border: Frame.pane_border(active))
+      # The count and `seen ×N` move into the right-aligned meta slot rather than riding the
+      # title. Both of `shared_chrome_spec`'s rules point here: a count in a card title makes
+      # the title's width a moving target, and a hand-placed right-aligned string on a card's
+      # top border is `Frame.border_meta`'s job.
+      Frame.border_meta(screen, card, AFFECTED_TITLE,
+        "#{issue.affected.size} · seen ×#{Fmt.count(issue.hit_count)}")
+      body = body_of(card) || return
       sync_affected(issue)
-      @affected.render(screen, Rect.new(rect.x + 1, list_y, w, avail), focused)
+      # `parse_affected` answers `[]` for a row whose JSON will not parse, so an empty list is
+      # reachable — and `ReadPane` draws nothing at all for one, which left a bordered card
+      # with a blank interior and no account of itself.
+      if issue.affected.empty?
+        screen.text(body.x, body.y, "(none recorded)", Theme.muted, width: body.w)
+        return
+      end
+      @affected.render(screen, body, active)
+    end
+
+    # The DESCRIPTION card — the rule's remediation text, which was a single `width:`-capped
+    # row of the meta block and so was never actually readable: `Probe.remediation` writes a
+    # sentence and the row gave it one line, ending all but the tersest in `…`. The text was
+    # in the binary, on screen, and unreadable.
+    #
+    # A pane rather than more meta rows, because a card can take FOCUS: `⇥` reaches it, the
+    # caret moves inside it, ⇧arrows select, and `y` / the space menu's Copy act on it — all of
+    # which `screen.text` could never offer. Read-only throughout; `ReadPane` has no edit path
+    # at all, which is the point rather than a limitation.
+    private def render_desc_card(screen : Screen, card : Rect, issue : Store::ProbeIssue,
+                                 active : Bool) : Nil
+      return if card.h < 2 || card.w < 2
+      Frame.card(screen, card, DESC_TITLE, bg: Theme.bg, border: Frame.pane_border(active))
+      body = body_of(card) || return
+      sync_desc(issue)
+      # A rule with no remediation text is not a bug — some custom rules carry none — but a
+      # bordered card with nothing in it says the pane failed to load. Name the absence.
+      if detail_hint(issue.code).empty?
+        screen.text(body.x, body.y, "(no description)", Theme.muted, width: body.w)
+        return
+      end
+      @desc.render(screen, body, active)
     end
 
     # Point the AFFECTED pane at the open issue's URL list. Cheap and idempotent, so every
@@ -813,9 +1269,34 @@ module Gori::Tui
       @affected.source(issue.affected)
     end
 
-    private def with_affected(&) : Nil
+    # ONE logical line, not one per wrapped row: the pane soft-wraps, so the sentence stays a
+    # single line the reader's ⇧arrows can select across and `y` copies whole. Splitting it
+    # into visual rows here would put a newline into the clipboard at every wrap point, which
+    # moves with the pane's width.
+    #
+    # Guarded on the text rather than re-sourced unconditionally the way `sync_affected` is,
+    # and the reason is `ReadPane#source`'s own: it drops the pane's wrap memo. This runs on
+    # the draw path AND on every keystroke, and this is the one Probe pane holding prose — the
+    # pane the memo exists for. `sync_affected` re-points at an array it does not rebuild;
+    # this one would re-wrap a paragraph every frame for a string that changes only when the
+    # open finding does.
+    private def sync_desc(issue : Store::ProbeIssue) : Nil
+      text = detail_hint(issue.code)
+      return if @desc_text == text
+      @desc_text = text
+      @desc.source([text])
+    end
+
+    # Points BOTH panes at the open finding before the block runs. Both, not just the focused
+    # one, and that is load-bearing rather than tidy: `detail_selection?` and `detail_copy_text`
+    # are called for whichever pane `@detail_focus` names, and a pane that has never been
+    # sourced answers `empty?` — so a ⇥ into DESCRIPTION followed by `y` would have copied ""
+    # from a pane that was fully drawn on screen. Cheap and idempotent, the same contract
+    # `sync_affected` already carried.
+    private def with_panes(&) : Nil
       issue = @detail || return
       sync_affected(issue)
+      sync_desc(issue)
       yield
     end
 

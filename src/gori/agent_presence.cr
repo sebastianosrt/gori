@@ -1,11 +1,17 @@
 require "json"
 require "./paths"
+require "./open_lock"
 
 module Gori
-  # "An agent process is attached to this PROJECT" — a per-process marker file under
-  # `<canonical db_path>.agents/`, held for the session's lifetime with an EXCLUSIVE flock.
-  # `gori mcp` announces one while it has a store bound; the TUI and the project picker read
-  # the directory to show who is attached (#815).
+  # "A process is attached to this PROJECT" — a per-process marker file in a directory beside
+  # the database, held for the session's lifetime with an EXCLUSIVE flock.
+  #
+  # Two kinds, one directory each. `gori mcp` announces an `mcp` marker under
+  # `<canonical db_path>.agents/` while it has a store bound, and the TUI and the project
+  # picker read that directory to show who is attached (#815). A gori TUI announces a `tui`
+  # marker under `<canonical db_path>.windows/` for the length of one project visit, and
+  # `get_current_context` reads THAT to tell an agent whether the selection it is relaying
+  # belongs to a window still on screen (#1091).
   #
   # The same split as `CaptureLock` + `CaptureStatus`, collapsed into one file per holder:
   # the FLOCK is the truth about liveness (the kernel releases it when the process dies, even
@@ -27,8 +33,17 @@ module Gori
   # filesystem without flock) and the server must run anyway, so every failure degrades to
   # "no marker" with one warning line — never a raise.
   class AgentPresence
-    DIR_SUFFIX = ".agents"
-    KIND_MCP   = "mcp"
+    # One directory PER KIND, and that split is load-bearing rather than tidiness (#1091).
+    # `count` must stay parse-free for the project picker's render path, so a reader can only
+    # tell an agent from a TUI window by WHERE its marker is; `parse_entry` falls back to the
+    # directory's kind when a body will not parse, which a body-carried kind could not do; and
+    # `Tools` announces its own `mcp` marker the moment it binds, so a reader that forgot to
+    # filter would find this process and call it a live TUI forever. A directory makes all
+    # three impossible instead of merely unlikely.
+    DIR_SUFFIX     = ".agents"  # KIND_MCP — #815's directory, unchanged on disk
+    TUI_DIR_SUFFIX = ".windows" # KIND_TUI — a gori TUI window attached to this project
+    KIND_MCP       = "mcp"
+    KIND_TUI       = "tui"
 
     # One live attachment, as read back from a marker. `client`/`client_version` come from the
     # MCP initialize handshake and can be absent (the client never introduced itself) or nil on
@@ -42,10 +57,26 @@ module Gori
       attached_at : Time?,
       read_only : Bool,
       selection_source : String?,
-      path : String
+      path : String,
+      # Whether the window holding this marker also holds the project's capture lock. Only a
+      # `tui` marker reports it; nil on every `mcp` one, and on a body that would not parse.
+      # A DEFAULT, because ~a dozen construction sites (specs included) predate the field.
+      holds_capture : Bool? = nil
 
-    def self.dir_for(db_path : String) : String
-      "#{Paths.canonical_file(db_path)}#{DIR_SUFFIX}"
+    # Exhaustive, and it RAISES on an unknown kind rather than defaulting. The split above is
+    # load-bearing, and a ternary's else-branch quietly makes the mapping total: a typo or a
+    # future third kind would land in `.agents`, where the picker's parse-free `count` folds
+    # it into the `mcp×N` chip and the TUI filter never finds it. Callers pass constants, so
+    # this is a compile-time-shaped mistake caught at the one place that can catch it —
+    # `announce` rescues everything anyway, so the worst case is a missing marker.
+    def self.dir_for(db_path : String, kind : String = KIND_MCP) : String
+      suffix =
+        case kind
+        when KIND_MCP then DIR_SUFFIX
+        when KIND_TUI then TUI_DIR_SUFFIX
+        else               raise ArgumentError.new("agent-presence: unknown marker kind #{kind.inspect}")
+        end
+      "#{Paths.canonical_file(db_path)}#{suffix}"
     end
 
     # Is this a real file path we can put a marker directory next to? `:memory:` and the
@@ -72,10 +103,11 @@ module Gori
     # #delete`'s rm_rf clears the directory wholesale.
     def self.announce(db_path : String, *, client : String?, client_version : String?,
                       read_only : Bool, selection_source : String?,
-                      kind : String = KIND_MCP) : AgentPresence?
+                      kind : String = KIND_MCP,
+                      holds_capture : Bool? = nil) : AgentPresence?
       return nil unless markable?(db_path)
       name = "#{Process.pid}-#{Random::Secure.hex(4)}.json"
-      dir = dir_for(db_path)
+      dir = dir_for(db_path, kind)
       tmp = File.join(dir, ".#{name}.tmp")
       file = nil
       begin
@@ -85,11 +117,11 @@ module Gori
         # 0644 like `CaptureStatus.write_at`: the body is not a secret, the 0700 project
         # directory above it is what keeps it private.
         file = File.open(tmp, "w", perm: File::Permissions.new(0o644))
-        file.flock_exclusive(blocking: false) # a fresh temp file: nothing to contend with
+        lock!(file) # a fresh temp file: nothing to contend with
         presence = new(file, File.join(dir, name), kind: kind, client: client,
           client_version: client_version, read_only: read_only,
           selection_source: selection_source, pid: Process.pid.to_i64,
-          attached_at_ms: Time.utc.to_unix_ms)
+          attached_at_ms: Time.utc.to_unix_ms, holds_capture: holds_capture)
         presence.write_payload
         File.rename(tmp, File.join(dir, name))
         presence
@@ -105,9 +137,9 @@ module Gori
     # marker whose lock CAN be taken has no living owner (flock died with its process), so
     # this is where SIGKILL'd servers get cleaned up. Never raises — the callers are a render
     # loop and a picker probe, and a filesystem hiccup must read as "nobody attached".
-    def self.live(db_path : String) : Array(Entry)
+    def self.live(db_path : String, kind : String = KIND_MCP) : Array(Entry)
       entries = [] of Entry
-      each_live(db_path) { |path| entries << parse_entry(path) }
+      each_live(db_path, kind) { |path| entries << parse_entry(path, kind) }
       entries.sort_by { |e| e.attached_at.try(&.to_unix_ms) || Int64::MAX }
     rescue
       [] of Entry
@@ -117,20 +149,59 @@ module Gori
     # picker only needs the count for its `mcp×N` chip, and it probes every project every
     # render cadence — a File.read + JSON.parse per contended marker there is wasted work on
     # the render path. Sweeps dead markers exactly as `live` does (they share `each_live`).
-    def self.count(db_path : String) : Int32
+    def self.count(db_path : String, kind : String = KIND_MCP) : Int32
       n = 0
-      each_live(db_path) { |_| n += 1 }
+      each_live(db_path, kind) { |_| n += 1 }
       n
     rescue
       0
     end
 
+    # `count`, for a caller that ACTS on the answer: nil when this process cannot tell (an
+    # in-memory database, a directory it cannot read, a flock that fails for any reason but
+    # contention) rather than the 0 `count` falls back to for a render loop. "Nobody is
+    # there" and "I cannot see" are different answers, and only one is safe to act on.
+    def self.count?(db_path : String, kind : String = KIND_MCP) : Int32?
+      return nil unless markable?(db_path)
+      n = 0
+      unsure = false
+      each_live(db_path, kind, -> { unsure = true; nil }) { |_| n += 1 }
+      unsure ? nil : n
+    rescue
+      nil
+    end
+
+    # How many gori TUI windows could show the operator a line written NOW, or nil when this
+    # process cannot tell. The one answer `reply_to_operator`, `ask_operator` and
+    # `gori run notify` (#1323) give about reach, so the three cannot disagree about what
+    # "nobody saw it" means. Asked BEFORE the write: a window seeds its cursors at the feed's
+    # end when it opens, so one that opens after the write never shows that line live, and
+    # counting it afterwards would claim it as a reader.
+    def self.tui_windows?(db_path : String?) : Int32?
+      return nil if db_path.nil? || db_path.empty?
+      count?(db_path, kind: KIND_TUI)
+    end
+
+    # That answer as the `tui` object every one of those results carries — `{live, windows}`,
+    # or `{unknown: true}` rather than a guessed 0.
+    def self.tui_json(j : JSON::Builder, windows : Int32?) : Nil
+      j.object do
+        if windows
+          j.field "live", windows > 0
+          j.field "windows", windows
+        else
+          j.field "unknown", true
+        end
+      end
+    end
+
     # Walk the marker directory, sweeping any marker whose owner is gone (its flock is free),
     # and yield the path of each LIVE one. The shared core of `live` and `count`: liveness and
     # the stale sweep are decided here once, so the two callers cannot drift on either.
-    private def self.each_live(db_path : String, & : String ->) : Nil
+    private def self.each_live(db_path : String, kind : String,
+                               unsure : Proc(Nil)? = nil, & : String ->) : Nil
       return unless markable?(db_path)
-      dir = dir_for(db_path)
+      dir = dir_for(db_path, kind)
       return unless Dir.exists?(dir)
       Dir.each_child(dir) do |child|
         # Dot-prefixed names are in-flight temp files (see `announce`) — not ours to judge
@@ -138,10 +209,20 @@ module Gori
         next if child.starts_with?('.')
         next unless child.ends_with?(".json")
         path = File.join(dir, child)
-        probe = File.open(path, "r") rescue next # flock works on a read-only fd
+        probe = begin
+          File.open(path, "r") # flock works on a read-only fd
+        rescue File::NotFoundError
+          # Gone since the listing: its owner withdrew it, or a peer swept it. Either way it
+          # is not live, which is an answer, not a "cannot tell" — a window closing while an
+          # agent replied would otherwise turn every other window's count into nil.
+          next
+        rescue
+          unsure.try(&.call)
+          next
+        end
         begin
           begin
-            probe.flock_exclusive(blocking: false)
+            lock!(probe)
             # We got the lock ⇒ the owner is gone. Sweep it; a peer sweeping the same file
             # concurrently makes the second `delete?` a no-op.
             File.delete?(path) rescue nil
@@ -150,8 +231,12 @@ module Gori
             # EAGAIN/EWOULDBLOCK is the one refusal that MEANS a live holder (same errno
             # discrimination as `OpenLock.contention?`); any other failure is "cannot tell",
             # which must neither sweep nor count.
-            next unless contention?(ex)
+            unless OpenLock.contention?(ex)
+              unsure.try(&.call)
+              next
+            end
           rescue
+            unsure.try(&.call)
             next
           end
           yield path
@@ -161,19 +246,36 @@ module Gori
       end
     end
 
-    # Was this flock failure "somebody holds it" rather than "flock does not work here"?
-    # The stdlib raises one `IO::Error` for both; the errno separates them (`open_lock.cr`
-    # spells out why these two values and why a missing os_error reads as NOT contention —
-    # here that direction skips a sweep rather than inventing a live agent).
-    private def self.contention?(ex : IO::Error) : Bool
-      err = ex.os_error
-      !err.nil? && err.in?(Errno::EAGAIN, Errno::EWOULDBLOCK)
+    # Take a marker's liveness lock without waiting; a held one raises the stdlib's "already
+    # locked" `IO::Error`, which `OpenLock.contention?` reads the same way on every platform.
+    #
+    # Windows' `LockFileEx` is mandatory, so the whole-file lock `flock_exclusive` takes there
+    # would bar every other process from READING the body, which is what a marker is for. There
+    # the lock covers one byte far past any body instead: liveness is still the lock, and the
+    # body stays readable.
+    private def self.lock!(file : File) : Nil
+      {% if flag?(:win32) %}
+        offset = LibC::OVERLAPPED_OFFSET.new
+        offset.offsetHigh = 0x4000_0000_u32
+        span = LibC::OVERLAPPED_UNION.new
+        span.offset = offset
+        overlapped = LibC::OVERLAPPED.new
+        overlapped.union = span
+        flags = LibC::LOCKFILE_EXCLUSIVE_LOCK | LibC::LOCKFILE_FAIL_IMMEDIATELY
+        if LibC.LockFileEx(LibC::HANDLE.new(file.fd), flags, 0, 1, 0, pointerof(overlapped)) == 0
+          raise IO::Error.from_winerror("Error applying file lock: file is already locked", target: file)
+        end
+      {% else %}
+        file.flock_exclusive(blocking: false)
+      {% end %}
     end
 
-    private def self.parse_entry(path : String) : Entry
+    private def self.parse_entry(path : String, kind : String) : Entry
       json = JSON.parse(File.read(path))
       Entry.new(
-        kind: json["kind"]?.try(&.as_s?) || KIND_MCP,
+        # The DIRECTORY is what the kind falls back to, never KIND_MCP: a half-written `tui`
+        # marker read as an agent would be a window this process then reports as absent.
+        kind: json["kind"]?.try(&.as_s?) || kind,
         client: json["client"]?.try(&.as_s?),
         client_version: json["client_version"]?.try(&.as_s?),
         pid: json["pid"]?.try(&.as_i64?),
@@ -181,17 +283,21 @@ module Gori
         read_only: json["read_only"]?.try(&.as_bool?) || false,
         selection_source: json["selection_source"]?.try(&.as_s?),
         path: path,
+        # `.as_bool?`, not a truthiness test: `false` ("this window is NOT the capture
+        # holder") is exactly the answer this field exists to carry, and it must stay
+        # distinguishable from an `mcp` marker, which never reports one at all.
+        holds_capture: json["holds_capture"]?.try(&.as_bool?),
       )
     rescue
       # The LOCK said someone is here; a body that will not parse (a partial write, outside
       # interference) demotes the row to "attached, name unknown" — never to absent.
-      Entry.new(kind: KIND_MCP, client: nil, client_version: nil, pid: nil,
+      Entry.new(kind: kind, client: nil, client_version: nil, pid: nil,
         attached_at: nil, read_only: false, selection_source: nil, path: path)
     end
 
     def initialize(@file : File, @path : String, *, @kind : String, @client : String?,
                    @client_version : String?, @read_only : Bool, @selection_source : String?,
-                   @pid : Int64, @attached_at_ms : Int64)
+                   @pid : Int64, @attached_at_ms : Int64, @holds_capture : Bool? = nil)
       @closed = false
     end
 
@@ -203,6 +309,20 @@ module Gori
       return if @closed
       @client = client
       @client_version = client_version
+      begin
+        write_payload
+      rescue ex
+        ::Log.warn { "agent-presence: could not update marker: #{ex.message}" }
+      end
+    end
+
+    # Follow the capture lock, which `c` moves between windows mid-session. IN PLACE on the
+    # locked fd for `update`'s reason above, and a no-op when the bit has not moved — so an
+    # idle project's poll writes nothing at all. This is NOT a heartbeat: liveness is the
+    # flock, and there is deliberately nothing here for a reader to time out on.
+    def update_capture(holds : Bool) : Nil
+      return if @closed || @holds_capture == holds
+      @holds_capture = holds
       begin
         write_payload
       rescue ex
@@ -232,6 +352,7 @@ module Gori
         attached_at_ms:   @attached_at_ms,
         read_only:        @read_only,
         selection_source: @selection_source,
+        holds_capture:    @holds_capture,
       }.to_json)
       @file.flush
     end

@@ -1,4 +1,5 @@
 require "./screen"
+require "./fmt"
 require "./theme"
 require "./frame"
 require "./text_area"
@@ -93,7 +94,10 @@ module Gori::Tui
       return if rect.w < 6 || rect.h < 2
       render_sub_strip(screen, rect, :extract, body_focused)
       _, body = sub_layout(rect)
-      Frame.card(screen, body, "EXTRACT RULES", bg: Theme.bg, border: Frame.pane_border(body_focused))
+      # No border TITLE: the sub-strip immediately above reads `Extract`. The `Rules` pane keeps
+      # its `MATCH & REPLACE` title because that names what the rules DO — it is not the chip
+      # said twice, which is the only thing being dropped here.
+      Frame.card(screen, body, bg: Theme.bg, border: Frame.pane_border(body_focused))
       inner = body.inset(1, 1)
       return if inner.empty?
       if rules.empty?
@@ -117,7 +121,8 @@ module Gori::Tui
       return if rect.w < 6 || rect.h < 2
       render_sub_strip(screen, rect, :bindings, body_focused)
       _, body = sub_layout(rect)
-      Frame.card(screen, body, "BINDINGS", bg: Theme.bg, border: Frame.pane_border(body_focused))
+      # No border TITLE — the sub-strip above already reads `Bindings`. See render_extract.
+      Frame.card(screen, body, bg: Theme.bg, border: Frame.pane_border(body_focused))
       inner = body.inset(1, 1)
       return if inner.empty?
       if rows.empty?
@@ -165,7 +170,7 @@ module Gori::Tui
       # The name paints like the `$KEY` token it IS — known once bound, unknown until then,
       # the same two colours the editors use. That is the operator's answer to "did my login
       # actually bind it" without leaving the row.
-      nm = "$#{rule.name}"
+      nm = Env.spell(rule.name, Env::Namespace::Bind)
       # `width:` like every other run on the row: an unclipped draw of a name the operator
       # typed paints straight through the card's right hairline on a narrow terminal.
       x = screen.text(x, py, nm, bound ? Theme.env_known : Theme.env_unknown, bg,
@@ -196,7 +201,7 @@ module Gori::Tui
       screen.fill(Rect.new(rect.x, py, rect.w, 1), bg)
       screen.cell(rect.x, py, selected ? '▎' : ' ', Theme.accent, bg)
       x = rect.x + 2
-      nm = "$#{row.name}"
+      nm = Env.spell(row.name, Env::Namespace::Bind)
       x = screen.text(x, py, nm, row.bound? ? Theme.env_known : Theme.env_unknown, bg,
         row.bound? ? Attribute::None : Attribute::Italic, width: {rect.right - x, 0}.max) + 1
       # WHICH TABLE this row is. `rows` emits one row per (rule, table it writes), so a rule
@@ -214,18 +219,10 @@ module Gori::Tui
       x = screen.text(x, py, row.preview, row.bound? ? Theme.text : Theme.muted, bg,
         width: {rect.right - x, 0}.max) + 2
       if x < rect.right
-        age = (t = row.bound_at) ? relative_time(now - t) : (row.enabled ? "waiting" : "rule off")
+        age = (t = row.bound_at) ? Fmt.ago_phrase(now - t) : (row.enabled ? "waiting" : "rule off")
         x = screen.text(x, py, age, Theme.muted, bg, width: {rect.right - x, 0}.max) + 2
       end
       screen.text(x, py, row.descriptor, Theme.muted, bg, width: {rect.right - x, 0}.max) if x < rect.right
-    end
-
-    private def relative_time(span : Time::Span) : String
-      secs = span.total_seconds
-      return "just now" if secs < 60
-      return "#{(secs / 60).to_i}m ago" if secs < 3600
-      return "#{(secs / 3600).to_i}h ago" if secs < 86_400
-      "#{(secs / 86_400).to_i}d ago"
     end
 
     # Visible rows in the extract / bindings list card.
@@ -322,11 +319,10 @@ module Gori::Tui
       screen.fill(Rect.new(rect.x, py, w, 1), bg)
       screen.cell(rect.x, py, selected ? '▎' : ' ', Theme.accent, bg)
       x = rect.x + 2
-      mark = rule.enabled? ? '✓' : '·'
-      screen.cell(x, py, mark, rule.enabled? ? Theme.accent : Theme.muted, bg)
+      screen.cell(x, py, rule_mark(rule), rule_mark_color(rule), bg)
       x += 2
       x = render_scope_badge(screen, rule, x, py, bg)
-      fg = rule.enabled? ? (selected ? Theme.text_bright : Theme.text) : Theme.muted
+      fg = rule.active? ? (selected ? Theme.text_bright : Theme.text) : Theme.muted
       screen.text(x, py, rule.target.request? ? "REQ" : "RES", fg, bg)
       x += 4
       tag = op_tag(rule)
@@ -344,6 +340,15 @@ module Gori::Tui
       end
       desc = describe(rule)
       screen.text(x, py, desc, fg, bg, width: {rect.right - x, 1}.max) if x < rect.right
+    end
+
+    private def rule_mark(rule : Store::MatchRule) : Char
+      return '?' if rule.inert?
+      rule.enabled? ? '✓' : '·'
+    end
+
+    private def rule_mark_color(rule : Store::MatchRule) : Color
+      rule.active? ? Theme.accent : Theme.muted
     end
 
     # WHERE the rule lives: `G` = the global library (every project), `P` = this project's own

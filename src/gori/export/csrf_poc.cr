@@ -1,3 +1,4 @@
+require "uri"
 require "./request_parts"
 
 module Gori
@@ -82,14 +83,14 @@ module Gori
                     (multipart || ct.empty? || ct == "application/x-www-form-urlencoded")
           dropped_headers_comment(b, parts, carried: carried ? "content-type" : nil)
           b << "<body onload=\"document.forms[0].submit()\">\n"
-          b << "  <form action=\"" << attr(action) << "\" method=\"" << (method == "GET" ? "GET" : "POST") << "\""
+          b << "  <form action=\"" << HTML.escape(action) << "\" method=\"" << (method == "GET" ? "GET" : "POST") << "\""
           b << " enctype=\"multipart/form-data\"" if multipart
           b << ">\n"
           fields.each do |(name, value, note)|
             if note
               b << "    <!-- " << html_comment_safe(note) << " -->\n"
             end
-            b << "    <input type=\"hidden\" name=\"" << attr(name) << "\" value=\"" << attr(value) << "\">\n"
+            b << "    <input type=\"hidden\" name=\"" << HTML.escape(name) << "\" value=\"" << HTML.escape(value) << "\">\n"
           end
           b << "    <input type=\"submit\" value=\"Submit\">\n"
           b << "  </form>\n</body>\n</html>\n"
@@ -181,9 +182,9 @@ module Gori
           next if pair.empty?
           eq = pair.index('=')
           if eq
-            pairs << {percent_decode(pair[0, eq]), percent_decode(pair[(eq + 1)..]), nil}
+            pairs << {URI.decode_www_form(pair[0, eq]), URI.decode_www_form(pair[(eq + 1)..]), nil}
           else
-            pairs << {percent_decode(pair), "", nil}
+            pairs << {URI.decode_www_form(pair), "", nil}
           end
         end
         pairs
@@ -300,42 +301,6 @@ module Gori
         return s[0, s.bytesize - 2] if s.ends_with?("\r\n")
         return s[0, s.bytesize - 1] if s.ends_with?("\n")
         s
-      end
-
-      # Percent-decode a urlencoded token: `+` → space, `%XX` → that byte, everything else
-      # verbatim. Byte-wise so a non-ASCII value survives; invalid `%XX` is left literal.
-      private def self.percent_decode(s : String) : String
-        bytes = s.to_slice
-        io = IO::Memory.new(bytes.size)
-        i = 0
-        while i < bytes.size
-          b = bytes[i]
-          if b == 0x2b_u8 # +
-            io.write_byte(0x20_u8)
-            i += 1
-          elsif b == 0x25_u8 && i + 2 < bytes.size && (hi = hex(bytes[i + 1])) && (lo = hex(bytes[i + 2]))
-            io.write_byte((hi << 4 | lo).to_u8)
-            i += 3
-          else
-            io.write_byte(b)
-            i += 1
-          end
-        end
-        String.new(io.to_slice)
-      end
-
-      private def self.hex(b : UInt8) : Int32?
-        case b
-        when 0x30_u8..0x39_u8 then (b - 0x30_u8).to_i
-        when 0x41_u8..0x46_u8 then (b - 0x41_u8 + 10).to_i
-        when 0x61_u8..0x66_u8 then (b - 0x61_u8 + 10).to_i
-        end
-      end
-
-      # HTML attribute-value escaping (inside "…"): the five that matter, so a value cannot
-      # break out of the attribute or the tag.
-      private def self.attr(s : String) : String
-        s.gsub('&', "&amp;").gsub('<', "&lt;").gsub('>', "&gt;").gsub('"', "&quot;").gsub('\'', "&#39;")
       end
 
       # Text safe to sit inside an HTML comment: `--` (which would close the comment early) and a

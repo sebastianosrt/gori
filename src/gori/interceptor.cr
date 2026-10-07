@@ -3,6 +3,7 @@ require "./env"
 require "./scope"
 require "./intercept_filter"
 require "./url"
+require "./ascii_bytes"
 
 module Gori
   # The Intercept lens (P4 — the human decides): when enabled, an in-flight HTTP
@@ -40,15 +41,36 @@ module Gori
       Drop    # discard; the proxy answers the client with a canned 502
     end
 
-    # Which leg of a flow to hold: both, requests only, or responses only. Lets a
-    # user who only cares about outgoing requests (the common case) skip the
-    # response round-trip without disabling intercept. Does NOT relax the h2→h1
-    # downgrade gate — a response can only be held on the interceptable h1 path, so
-    # the connection must stay h1 for either direction.
+    # Which leg of a flow to hold: both, requests only, or responses only. RequestOnly is the
+    # default: outgoing requests are the common case, and holding both made every forwarded
+    # request's response wait for a second decision while the client hung.
     enum Direction
       Both
       RequestOnly
       ResponseOnly
+
+      # The one reader of a `set_direction` argument, shared by `gori run intercept direction`,
+      # MCP `intercept_set_direction` and the bridge that applies them. `request` / `response`
+      # are the documented spellings; `requestonly` / `responseonly` are what every READER
+      # publishes (the bridge blob, `intercept list`, the statusline row — a documented machine
+      # contract, so it stays), and refusing them meant a value could not be read back in
+      # (#1433). Nil for anything else: the bridge refuses it rather than falling back to Both.
+      def self.from_arg?(s : String) : Direction?
+        case s.strip.downcase
+        when "both"                     then Both
+        when "request", "requestonly"   then RequestOnly
+        when "response", "responseonly" then ResponseOnly
+        end
+      end
+
+      # The documented spelling `from_arg?` reads, for a surface to enqueue.
+      def arg : String
+        case self
+        in .both?          then "both"
+        in .request_only?  then "request"
+        in .response_only? then "response"
+        end
+      end
     end
 
     # The Subject struct the conditional-intercept filter matches against.
@@ -56,6 +78,16 @@ module Gori
 
     # The decision the TUI hands back over an Item's reply channel.
     record Decision, action : Action, bytes : Bytes
+
+    # The `flows.error` a DROP records, on h1 and h2 alike. Spelled once so a surface can tell
+    # the operator's own decision from an upstream failure (`dropped?`, #1378): both are an
+    # Aborted flow with an error string, and only the string says whose outcome it was.
+    DROP_REQUEST_REASON  = "dropped by intercept (request)"
+    DROP_RESPONSE_REASON = "dropped by intercept"
+
+    def self.dropped?(error : String?) : Bool
+      error == DROP_REQUEST_REASON || error == DROP_RESPONSE_REASON
+    end
 
     # One held message awaiting a human decision. `raw` is the full head(+body)
     # that would otherwise go on the wire (truth, P7). `reply` is buffered(1) so
@@ -143,10 +175,10 @@ module Gori
       # per kind is what `Tui::InterceptView#row_label` and `InterceptController` render, so
       # they call THIS with the values they display and the composition lives once.
       #
-      # `m`/`t` default to the Item's own immutable metadata. The TUI passes the EDITED
-      # method/target instead (`InterceptView#effective_method_target`), so a queue row and a
-      # forward toast name the message the operator is actually about to send — the one
-      # reason a surface ever needs different values here.
+      # `m`/`t` default to the Item's own immutable metadata. A surface settling an EDIT
+      # passes the edited values instead (`#edited_method_target`, or `#edited_label` for the
+      # whole receipt), so a queue row and a forward ack name the message actually being sent
+      # — the one reason a surface ever needs different values here.
       #
       # `size` defaults to the HELD byte count, but a caller settling a `forward_edit` must
       # pass the size of the bytes it is ACTUALLY about to put on the wire: an edit that
@@ -165,6 +197,51 @@ module Gori
         in .ws_out?   then "#{host}#{Gori::Url.origin_path(t)} client->server #{size}B"
         in .ws_in?    then "#{host}#{Gori::Url.origin_path(t)} server->client #{size}B"
         end
+      end
+
+      # The method + target an EDIT of this message names on its start line, for the label of
+      # a forward that sends `bytes` instead of the held ones (#1430: the CLI/MCP receipt
+      # named the ORIGINAL `GET /bf2` while the origin received `DELETE /changed?x=1`). One
+      # parse for both settle paths: the TUI editor (`InterceptView#effective_method_target`)
+      # and the agent bridge (`Runner#apply_intercept_command`).
+      #
+      # For a response `target` is the "status reason" (see `#label`), so only the status
+      # line's tail is read. A WebSocket message re-reads NOTHING: its first line is a
+      # payload, not a start line, and its method/target are the handshake's, immutable.
+      #
+      # Tokens are split on whitespace RUNS: a malformed start line is a payload operators
+      # send on purpose (P7), and `GET  /changed` or a tab-separated line still names
+      # `/changed` to most origins — a single-space split read it as an empty target. A token
+      # the start line does not carry at all (an empty first line, a bare `POST`) keeps the
+      # held value: the label still has to name a method and a place, and the bytes that go
+      # out are the edit's either way — this is a projection, never a rewrite.
+      def edited_method_target(bytes : Bytes) : {String, String}
+        case kind
+        in .ws_out?, .ws_in? then {method, target}
+        in .request?
+          parts = start_line(bytes).split
+          {parts[0]? || method, parts[1]? || target}
+        in .response?
+          # "HTTP/1.1 201 CREATED" → "201 CREATED": everything after the version token.
+          line = start_line(bytes).lstrip
+          version = line.split.first? || return {method, target}
+          {method, line[version.size..].lstrip.presence || target}
+        end
+      end
+
+      # `#label` for a forward that sends `bytes`: the edited method/target AND their size,
+      # since the ack is the caller's only receipt for an irreversible action.
+      def edited_label(bytes : Bytes) : String
+        m, t = edited_method_target(bytes)
+        label(m, t, size: bytes.size)
+      end
+
+      # The first line of `bytes`, in either line-ending spelling (the intercept editor's
+      # text is LF-joined, a CLI `--raw-file` usually CRLF). Decodes only that line: a held
+      # head may run to 256 KiB and its body further.
+      private def start_line(bytes : Bytes) : String
+        nl = bytes.index('\n'.ord.to_u8) || bytes.size
+        String.new(bytes[0, nl]).rstrip('\r')
       end
     end
 
@@ -187,8 +264,8 @@ module Gori
     # are not guaranteed to be valid UTF-8 either, which is why `Gori::AsciiBytes` stays
     # byte-level for the same kind of question.
     def self.split_edit(bytes : Bytes) : {Bytes, Bool}
-      crlf = byte_index(bytes, "\r\n\r\n".to_slice)
-      lf = byte_index(bytes, "\n\n".to_slice)
+      crlf = AsciiBytes.index(bytes, "\r\n\r\n".to_slice)
+      lf = AsciiBytes.index(bytes, "\n\n".to_slice)
       idx =
         if crlf && (lf.nil? || crlf < lf)
           crlf + 4
@@ -199,27 +276,17 @@ module Gori
       {bytes[0, idx], idx < bytes.size}
     end
 
-    # First byte offset of `needle` in `hay`, or nil. `"...".to_slice` on a literal points at
-    # static data, so this allocates nothing.
-    #
-    # Guarded on the first byte before comparing the rest: a head is read by
-    # `Codec::Http1.read_head`, which permits up to 256 KiB, and `split_edit` scans it twice —
-    # so a `Slice#==` (a memcmp call) at every offset would be a quarter-million calls per
-    # lookup on the interceptor's synchronous path. Both needles start with CR or LF, which
-    # almost no offset does.
-    private def self.byte_index(hay : Bytes, needle : Bytes) : Int32?
-      first = needle[0]
-      limit = hay.size - needle.size
-      i = 0
-      while i <= limit
-        return i if hay[i] == first && hay[i, needle.size] == needle
-        i += 1
-      end
-      nil
-    end
-
     @direction : Direction
     @filter : InterceptFilter
+
+    # Why `source` may hold nothing under `dir`, or nil: it names a response-only field
+    # (`status:`) while catch holds requests only. A NOTE, never a refusal — the direction can
+    # change after the condition is set. `remedy` is the surface's own way to change it.
+    def self.direction_note(source : String, dir : Direction, remedy : String) : String?
+      return nil unless dir.request_only?
+      return nil unless field = InterceptFilter.response_fields(source).first?
+      "`#{field}:` only matches responses, and catch holds requests only — #{remedy}"
+    end
 
     def initialize(@scope : Scope)
       @mutex = Mutex.new
@@ -228,9 +295,9 @@ module Gori
       @next_id = 0_i64
       @shutting_down = false
       # Which leg(s) to hold + an optional in-memory condition that NARROWS holding
-      # (vs Scope, the global lens). Both default permissive (hold every in-scope
-      # message). Mutated by the TUI fiber, read on the proxy hot path → @mutex.
-      @direction = Direction::Both
+      # (vs Scope, the global lens). Requests only by default, and an empty condition (hold
+      # every in-scope request). Mutated by the TUI fiber, read on the proxy hot path → @mutex.
+      @direction = Direction::RequestOnly
       @filter = InterceptFilter::EMPTY
       # Monotonic counter bumped on every queue/enabled change (incl. async holds
       # from proxy fibers). The TUI compares it to know when to re-render, since
@@ -337,14 +404,14 @@ module Gori
       @mutex.synchronize { @filter.source }
     end
 
-    # Cycle the catch direction Both → RequestOnly → ResponseOnly → Both. Returns
-    # the new value; bumps revision so the TUI redraws the chip.
+    # Cycle the catch direction RequestOnly (the default) → ResponseOnly → Both → RequestOnly.
+    # Returns the new value; bumps revision so the TUI redraws the chip.
     def cycle_direction : Direction
       now = @mutex.synchronize do
         @direction = case @direction
-                     when .both?         then Direction::RequestOnly
-                     when .request_only? then Direction::ResponseOnly
-                     else                     Direction::Both
+                     when .request_only?  then Direction::ResponseOnly
+                     when .response_only? then Direction::Both
+                     else                      Direction::RequestOnly
                      end
       end
       @revision.add(1)
@@ -701,7 +768,9 @@ module Gori
     # so a failure forwards what the operator decided on.
     private def overlay_slot(item : Item, bytes : Bytes) : Bytes
       return bytes unless item.kind.request?
-      overlaid = Gori::Env.overlay_slot(bytes)
+      # The slot's `$GEN` values are minted for this item's destination, whose TLS rule the
+      # proxy's upstream dial applies (#1153).
+      overlaid = Gori::Env.overlay_slot(bytes, Gori::Env::Generation.for_dial(item.host, item.scheme))
       # Pointer identity, not `==`: `Env.overlay_slot` returns the ARGUMENT when no slot is
       # active, and a content compare would walk every byte of every forwarded message to
       # learn what the pointer already says (P6).

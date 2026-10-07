@@ -1,6 +1,7 @@
 require "./screen"
 require "./theme"
 require "./frame"
+require "./drill_in"
 require "./traffic_empty_state"
 require "./text_area"
 require "./input_mode"
@@ -11,23 +12,45 @@ require "../settings"
 require "../store"
 require "../issues_query"
 require "../links"
+require "../evidence"
+require "../retest"
+require "./fmt"
 require "./preview_split"
 require "./line_edit"
+require "./query_suggest"
+require "./suggest_popup"
 require "./issue_presentation"
+require "../plural"
+require "./project_marks"
 
 module Gori::Tui
   # The Issues tab (DESIGN.md §6: the final output — human-confirmed vulns). A
   # severity-sorted list + a detail with inline-editable notes and a severity
   # control. Created from a flow (History `F`) or blank (`n`).
   class IssuesView
-    include QueryBarEdit # ⌃/⌥←→ word motion, Home/End, Delete, ⌥⌫ on the `/` bar
+    include QueryBarPopup # the `/` bar: edits, ⌃/⌥←→ word motion, Home/End, Delete, ⌥⌫, `↓` dropdown
     # The list-over-preview layout and the severity/status vocabulary, both shared with
     # the sibling tab that lists the same records through the other lens.
     include PreviewSplit
     include PreviewPane
     include IssuePresentation
+    include DrillIn::Host # the rail/detail split, its render, and the step-key labels
 
-    QUERY_FIELDS = Issues::Filter::FIELDS
+    # The `/` bar's own label, hoisted out of `render_filter_bar` because the dropdown
+    # anchors to the column the query text starts in and must not re-measure it.
+    QUERY_PREFIX = "filter › "
+
+    # The idle bar's one-liner and the cold-start suggestion row, both GENERATED from this
+    # backend's vocabulary rather than written out. The literal they replace named `severity:`,
+    # `cvss:>=7`, `status:` and `host:` but not `title:`, and no boolean operator at all — the
+    # exact drift `QuerySuggest`'s own header cites Issues for.
+    #
+    # `regex: false` and `compare:` are not decoration. `cold_hint`'s defaults name `~regex`
+    # and `>= < on status size dur`; `Issues::Filter.known_field?` refuses `~` outright and
+    # this backend has no `size`/`dur`, so the default text would re-break what
+    # b28aaaaa fixed — a filter bar naming a field it does not have.
+    QUERY_HINT = QuerySuggest.cold_hint(Issues::Filter::HINT_FIELDS, help_key: true,
+      regex: false, compare: "severity cvss")
 
     # The bar's field vocabulary, asked per separator (`FilterAst.spans`). Without it an
     # unrecognised `hsot:` rendered in the same confident blue as a real field — the one
@@ -36,15 +59,19 @@ module Gori::Tui
     # already keeps `~` out of the question; this keeps a MISSPELLED name out of it too.
     QUERY_KNOWN = ->(f : String, op : Char) { Issues::Filter.known_field?(f, regex: op == '~') }
 
+    # The registry the detail's hints read their keys from (RELATED's `␣L`, the retest line's
+    # route), set by the controller that makes the view. Nil in a bare view, whose chip then
+    # reads `␣` alone and whose retest line names no key (`Hotkeys.menu_chip`, `.route`).
+    property menu_registry : Verb::Registry? = nil
+
     def initialize
       @all = [] of Store::Issue    # the raw store list (severity-desc)
       @issues = [] of Store::Issue # the filtered/visible subset
       @selected = 0
       @scroll = 0
       @detail = nil.as(Store::Issue?)
-      @detail_flow = nil.as(Store::FlowRow?)
       @detail_links = [] of Store::EntityLink
-      @detail_resolved = [] of Links::Resolved
+      @detail_related = [] of RelatedRow
       @links_scroll = 0
       @selected_link = 0
       @detail_focus = :links # :links | :notes — which detail region owns plain arrows
@@ -54,12 +81,7 @@ module Gori::Tui
       # apply_filter), so an index-keyed set would silently retarget. A mark the current
       # filter hides stays marked (marked_hidden_count reports it); a mark whose issue is
       # gone simply fails to resolve at the verb.
-      @marks = Set(Int64).new
-      @mark_anchor = nil.as(Int64?) # id-keyed range anchor for the ⇧arrow extend
-      # Ids the CURRENT ⇧arrow gesture added, so shrinking the range gives them back the way
-      # a GUI shift+click does. Scoped to the gesture, so marks made by `t`/⇧T outside the
-      # range are never disturbed. Cleared whenever the anchor is.
-      @mark_extent = Set(Int64).new
+      @marks = Marks(Int64).new
       @notes_mode = InputMode::Read
       @notes_read = TextReadState.new
       @notes = TextArea.new
@@ -82,8 +104,12 @@ module Gori::Tui
       # The `/` filter bar (mirrors History's QL bar but matches in memory).
       @query = ""
       @qcx = 0
-      @preedit_q = ""
+      @preedit = ""
       @querying = false
+      # The `↓` completion dropdown. Closed until asked for — see `SuggestPopup`.
+      @popup = SuggestPopup.new
+      # `host:` completion pool, rebuilt on reload — see `host_pool`.
+      @host_pool = nil.as(Array(String)?)
       # settings:layout Issues preview (list page bottom pane)
       @preview_scroll = 0
       @preview_focus = :list # :list | :preview
@@ -95,6 +121,7 @@ module Gori::Tui
 
     def reload(store : Store) : Nil
       @all = store.issues
+      @host_pool = nil
       apply_filter
       @loaded = true
     end
@@ -118,19 +145,38 @@ module Gori::Tui
         scroll_preview(delta)
         return
       end
+      move_list(delta)
+    end
+
+    # The list cursor whatever has keyboard focus — the wheel over the list (`move` would
+    # scroll a focused preview instead).
+    def move_list(delta : Int32) : Nil
       return if @issues.empty?
       @selected = (@selected + delta).clamp(0, @issues.size - 1)
       @preview_scroll = 0
-      reset_mark_anchor # a plain move re-seeds the range anchor, like a GUI list
+      @marks.reset_anchor # a plain move re-seeds the range anchor, like a GUI list
     end
 
-    # Inverts render_list's row layout (filter bar at rect.y, header at +1, divider
-    # at +2, rows from top = rect.y + 3 spanning @scroll..): maps a click to a
-    # issue index, or nil past the last populated row / outside the list pane.
+    # The first ISSUE-row screen-y — ONE derivation, so `render_list` and both hit-tests
+    # cannot drift. The filter bar owns `rect.y`; while the bar is being EDITED the suggestion
+    # row takes the next one; then the column header and its divider.
+    #
+    # Extracted before the suggestion row existed: `rect.y + 3` was written out at three
+    # sites, and a row added without this puts every click one row off — but only while the
+    # bar is open, which is a state a render assertion never reaches. Mirrors
+    # `HistoryView#list_top`.
+    private def list_top(list_rect : Rect) : Int32
+      hdr_y = list_rect.y + 1
+      hdr_y += 1 if @querying
+      hdr_y + 2 # past the column header and its divider
+    end
+
+    # Inverts render_list's row layout: maps a click to an issue index, or nil past the last
+    # populated row / outside the list pane.
     def list_row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
       list_rect, _ = list_split(rect)
       return nil if mx < list_rect.x || mx >= list_rect.right
-      top = list_rect.y + 3 # filter bar (y) + header (y+1) + divider (y+2)
+      top = list_top(list_rect)
       list_h = {list_rect.bottom - top, 0}.max
       i = my - top
       return nil if i < 0 || i >= list_h
@@ -144,7 +190,7 @@ module Gori::Tui
     # so the answer is a selection, not an offset. See `Frame.scroll_gauge_row`.
     def gauge_row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
       list_rect, _ = list_split(rect)
-      top = list_rect.y + 3 # same band list_row_at and the gauge draw measure
+      top = list_top(list_rect) # same band list_row_at and the gauge draw measure
       Frame.scroll_gauge_row(Rect.new(list_rect.x, top, list_rect.w, {list_rect.bottom - top, 0}.max),
         @issues.size, mx, my)
     end
@@ -159,19 +205,33 @@ module Gori::Tui
     # Mouse: place the inline NOTES-editor cursor at a click. `rect` is the framed
     # detail interior render() receives; the NOTES editor sits at rect.y + 6 (after
     # the badge/hint/meta/flow rows + divider + "NOTES" label), mirroring render_detail.
-    def notes_click_to_cursor(rect : Rect, mx : Int32, my : Int32) : Nil
+    #
+    # The click FOCUSES the card and places the caret; it does not change the mode (#1124).
+    # `enter_notes_insert!` used to lead this method, so aiming the caret also armed the
+    # editor — and the next bare letter was typed rather than run, which is how a `y` meant
+    # as copy became a `y` typed over the selection. The mode is entered the way the keyboard
+    # enters it (`i` / ↵) or by clicking the NOR/INS chip this card draws on its own border.
+    # See `NotesView#click_to_cursor`, which this mirrors, and `RepeaterView#place_request_caret`.
+    def notes_click_to_cursor(rect : Rect, mx : Int32, my : Int32, selecting : Bool = false) : Nil
       notes_rect = notes_body_rect(rect)
       return if notes_rect.empty?
-      @detail_focus = :notes
-      enter_notes_insert!
-      @notes.click_to_cursor(notes_rect, mx, my)
+      # Never on a DRAG: re-aiming focus mid-gesture would hand the motion a card the press
+      # did not start in. The press has already set it.
+      @detail_focus = :notes unless selecting
+      if notes_insert_mode?
+        @notes.click_to_cursor(notes_rect, mx, my, selecting: selecting)
+      else
+        # Through the read state — it owns the band READ paints, and its `click` is what
+        # COLLAPSES a standing ⇧arrow selection (`sync_from` deliberately does not).
+        @notes_read.click(@notes, notes_rect, mx, my, selecting: selecting)
+      end
     end
 
     def select_index(idx : Int32) : Nil
       return if @issues.empty?
       @selected = idx.clamp(0, @issues.size - 1)
       @preview_scroll = 0
-      reset_mark_anchor # same as the keyboard `move`: a plain click re-seeds the anchor
+      @marks.reset_anchor # same as the keyboard `move`: a plain click re-seeds the anchor
       @preview_focus = :list
     end
 
@@ -196,6 +256,63 @@ module Gori::Tui
       !@detail.nil?
     end
 
+    # The drill-in's breadcrumb. ONE derivation, read by `render_detail` AND by
+    # IssuesController's click hit-test — the `‹` is a control, and a control drawn from one
+    # rect and hit-tested against another is a dead button (which is what ` ‹ list ` was).
+    # `pos` counts the FILTERED list behind, which is what the step chords move through.
+    # The row the drill-in actually has OPEN, as an index into the filtered list — not the
+    # cursor. The two are the same at open time and a reload re-anchors the cursor by id, but
+    # keying the rail off the OPEN item is the only spelling that cannot band a row the detail
+    # is not showing (see HistoryView#detail_row_index, where live capture makes them diverge
+    # every few seconds).
+    def detail_row_index : Int32?
+      d = @detail || return nil
+      @issues.index { |i| i.id == d.id }
+    end
+
+    # Rows in the filtered list — the bound the item step clamps against.
+    def row_count : Int32
+      @issues.size
+    end
+
+    # First index of the window the rail shows. Private: everything outside reads
+    # `rail_rows`/`rail_cursor`, which are derived from it.
+    private def rail_start : Int32
+      here = detail_row_index || return 0
+      DrillIn.window_start(@issues.size, here)
+    end
+
+    # See DrillIn::Host.
+    def rail_cursor : Int32
+      (detail_row_index || 0) - rail_start
+    end
+
+    # The rail's window of list context around the open item — see DrillIn.
+    def rail_rows : Array(DrillIn::RailRow)
+      n = rail_count
+      return [] of DrillIn::RailRow if n == 0
+      @issues[rail_start, n].map do |i|
+        DrillIn::RailRow.new(severity_badge(i.severity), i.title, i.host.try(&.presence),
+          severity_color(i.severity))
+      end
+    end
+
+    # The drill-in as a whole: the list rail (when it fits) over the item detail. ONE entry
+    # point — see HistoryView#render_drill, which this mirrors.
+    private def render_drill(screen : Screen, rect : Rect, focused : Bool) : Nil
+      body, meta = render_rail_chrome(screen, rect, focused)
+      render_detail(screen, body, focused, step_meta: meta)
+    end
+
+    # The drill-in's breadcrumb. ONE derivation, read by `render_detail` AND by the
+    # controller's click hit-test — the `‹` is a control, and a control drawn from one rect
+    # and hit-tested against another is a dead button (which is what ` ‹ list ` was).
+    def detail_crumb : Frame::Crumb?
+      issue = @detail || return nil
+      pos = detail_row_index.try { |i| "#{i + 1}/#{@issues.size}" }
+      Frame::Crumb.new("ISSUES", issue.title, pos)
+    end
+
     getter notes_mode : InputMode
 
     def notes_insert_mode? : Bool
@@ -208,6 +325,73 @@ module Gori::Tui
 
     def focus_links! : Nil
       @detail_focus = :links
+    end
+
+    def focus_notes! : Nil
+      @detail_focus = :notes
+    end
+
+    # The detail's pane ring, top to bottom — the shape every multi-pane view in the tree
+    # uses (`DiscoverView#pane_advance` is the canonical copy). `@detail_focus` was always a
+    # two-value symbol; what it never had was a ring the shell's ⇥ could walk.
+    DETAIL_PANES = [:links, :notes]
+
+    # ⇥ / ⇧⇥ inside an open detail. WRAPS, and always answers true, rather than returning
+    # false at the ends like a list-page ring does.
+    #
+    # `false` is how a view tells `Runner#focus_advance` to hand focus to the TAB BAR — and
+    # `handle_detail_key` is gated on `@focus == :body` (see the arm in `runner.cr` that
+    # routes it). So the old `return false if detail_open?` left the detail fully DRAWN with
+    # every key dead, back keys included, and the very next ← switched tab. ⇥ is exactly what
+    # an operator presses to move between two panes, which made it the fastest route into a
+    # screen that looked alive and answered nothing.
+    #
+    # Two panes, and the detail is a drill-in with its own way out (`esc`, `←`, `h`), so
+    # wrapping is both what the keypress means here and the only answer that cannot strand
+    # anyone.
+    def step_detail_focus(dir : Int32) : Bool
+      i = DETAIL_PANES.index(@detail_focus) || 0
+      @detail_focus = DETAIL_PANES[(i + dir) % DETAIL_PANES.size]
+      true
+    end
+
+    # At the last RELATED row — the edge `↓` hands focus to NOTES from. An EMPTY list answers
+    # true, so `↓` reaches NOTES on an issue with no links at all: that is the shape `n`
+    # creates, and it was the one where a focus move had no visible effect whatsoever.
+    def links_at_bottom? : Bool
+      @detail_related.empty? || @selected_link >= @detail_related.size - 1
+    end
+
+    # The NOTES read caret has no row above it — the edge `↑` crosses back to RELATED on.
+    #
+    # This pane WRAPS (`@notes.wrap = true`), and `TextReadState#move` routes every `dr != 0`
+    # through `TextArea#visual_row_target`, so `↑` steps one VISUAL row, not one logical line.
+    # A wrapped first paragraph is N drawn rows of logical line 0, so testing `cursor.cy <= 0`
+    # ejected the pane on every `↑` inside it — which for prose in a ~34-column card is the
+    # normal case, not an edge. Ask the layout's owner instead: `visual_row_target(-1)` returns
+    # the position the step would land on, and a step with nowhere to go returns the caret
+    # itself (`Wrap.step_caret` breaks at the document top and re-derives the same row). It
+    # answers nil only when the pane is not wrapping at all — no width measured yet, or the
+    # app-wide preference off — and there the logical line IS the row.
+    def notes_at_top? : Bool
+      if target = @notes.visual_row_target(-1)
+        target == {@notes.cy, @notes.cx}
+      else
+        @notes_read.cursor.cy <= 0
+      end
+    end
+
+    # The NOTES read caret sits at the very start of the document — the edge `←` crosses back
+    # to RELATED on.
+    #
+    # DOCUMENT start, not line start. `ReadCursor#move` clamps the column only in its
+    # SELECTING branch; a bare `←` takes the branch below it (`read_cursor.cr:138-147`), which
+    # WRAPS a column-0 press to the previous line's end. So gating on `cx <= 0` alone stole a
+    # real motion on every note with more than one line. The caret is seeded at (0, 0) whenever
+    # the pane is entered, so `←` still reads as "back" on arrival; it stops being back exactly
+    # once you have navigated into the text, which is when you want the motion instead.
+    def notes_at_doc_start? : Bool
+      @notes_read.cursor.cy <= 0 && @notes_read.cursor.cx <= 0
     end
 
     # --- `/` filter bar ------------------------------------------------------
@@ -225,71 +409,85 @@ module Gori::Tui
     # The committed filter string (for tests / external inspection).
     getter query : String
 
-    def start_query : Nil
-      @querying = true
-      @qcx = @query.size
-    end
-
-    def stop_query : Nil # Enter: keep the filter, leave edit mode
-      @querying = false
-    end
-
-    def cancel_query : Nil # Esc: clear the filter, leave edit mode
-      @querying = false
-      @query = ""
-      @qcx = 0
-      @preedit_q = ""
+    # `QueryBarEdit`'s hook: every text change re-derives the list, in memory, and the dropdown.
+    def query_edited : Nil
       apply_filter
+      sync_popup
     end
 
-    def query_insert(ch : Char) : Nil
-      @query = "#{@query[0, @qcx]}#{ch}#{@query[@qcx..]}"
-      @qcx += 1
-      apply_filter
+    # Field names until a `:` is typed, then that field's values, then the boolean operators
+    # no field pool can offer. All of it comes from `Issues::Filter`, which is also what
+    # EVALUATES the query — so the bar cannot offer a term its own backend refuses.
+    def query_suggestions : Array(String)
+      # …then the boolean operators, which no field pool can ever offer: `NOT (` is the only
+      # way to exclude a disjunction (`-` negates a TERM, not a GROUP) and it had no discovery
+      # at all. Appended HERE and not in the backend — `QuerySuggest` is a TUI module, and a
+      # parser must not require the view layer. Same seam `InterceptView` uses.
+      QuerySuggest.with_operators(Issues::Filter.suggestions(@query, @qcx, host_pool),
+        FilterAst.token_at(@query, @qcx))
     end
 
-    def query_backspace : Nil
-      return if @qcx == 0
-      @query = "#{@query[0, @qcx - 1]}#{@query[@qcx..]}"
-      @qcx -= 1
-      apply_filter
-    end
-
-    def query_move(d : Int32) : Nil
-      @qcx = (@qcx + d).clamp(0, @query.size)
+    # Distinct hosts for `host:` completion. `@all`, not `@issues`: completing off the
+    # FILTERED list would offer only the hosts the half-typed query already matches, so
+    # narrowing a filter would shrink its own vocabulary. Memoised because `render_suggestions`
+    # runs on the draw path; `reload` is the only thing that moves `@all`, and it clears this.
+    private def host_pool : Array(String)
+      pool = @host_pool
+      return pool if pool
+      seen = Set(String).new
+      @all.each do |f|
+        h = f.host
+        seen << h if h && !h.empty?
+      end
+      @host_pool = seen.to_a.sort!
     end
 
     # IME composing text for the filter bar (underlined, doesn't touch @query).
     def query_set_preedit(text : String) : Nil
-      @preedit_q = text
-    end
-
-    # Tab-complete the field name under the cursor (severity:/status:/host:/title:).
-    def query_complete : Bool
-      # The trailing run of non-whitespace right at the cursor — "" when the prefix
-      # ends in a space (don't complete; `split.last` would grab a non-adjacent word
-      # and the slice below would mangle the query).
-      token = @query[0, @qcx][/\S*\z/]
-      return false if token.empty? || token.includes?(':')
-      if field = QUERY_FIELDS.find(&.starts_with?(token.downcase))
-        @query = "#{@query[0, @qcx - token.size]}#{field}#{@query[@qcx..]}"
-        @qcx += field.size - token.size
-        return true
-      end
-      false
+      @preedit = text
     end
 
     def open_detail(store : Store) : Bool
       issue = @issues[@selected]?
       return false unless issue
+      open_detail_issue(issue, store)
+    end
+
+    # Cross-tab navigation from Evidence must open the linked Issue even when the current
+    # Issues filter hides it. The list selection is re-anchored when the row is visible; the
+    # detail itself remains usable when it is not.
+    def open_detail_id(id : Int64, store : Store) : Bool
+      issue = store.get_issue(id)
+      return false unless issue
+      if idx = @issues.index { |row| row.id == id }
+        @selected = idx
+      end
+      open_detail_issue(issue, store)
+    end
+
+    private def open_detail_issue(issue : Store::Issue, store : Store) : Bool
       @detail = issue
-      @detail_flow = issue.flow_id.try { |fid| store.flow_row(fid) }
       reload_detail_links(store)
+      refresh_retest_summary(store)
       @links_scroll = 0
       @selected_link = 0
       @detail_focus = :links
       @notes_mode = InputMode::Read
       seed_notes(issue.notes)
+      # THE hand-over. `seed_notes` decides on the BYTES, and bytes cannot tell two issues
+      # apart — two empty writeups is the ordinary case — so the one path that really does
+      # mean "different row, start over" says so itself, for each thing the skipped `set_text`
+      # would otherwise have reset:
+      #
+      # - the CARET, so a new detail opens at the top of its writeup (`ensure_visible` pulls
+      #   the scroll up behind it on the next render);
+      # - the UNDO STACK, or undo here replays the PREVIOUS issue's edits into this buffer and
+      #   leaves it dirty against a writeup that never had them — see `TextArea#clear_undo`;
+      # - the READ SELECTION, whose anchor indexes the document being handed over.
+      @notes.to_buffer_start
+      @notes.clear_undo
+      @notes_read.clear_selection
+      @notes_read.sync_from(@notes)
       true
     end
 
@@ -297,10 +495,43 @@ module Gori::Tui
     # row that was just read (open, re-read, discard, post-save), so the lost-update baseline
     # and the announce latch move with it — a seed that skipped either would leave the pane
     # either refusing a save that has nothing to lose or accepting one that clobbers a peer.
+    #
+    # `set_text` REPLACES the buffer, and it zeroes the caret and the scroll and clears the
+    # undo stack with it. That is right when the stored writeup has MOVED and pure loss every
+    # other time — and "every other time" is what both hot callers actually pass: the
+    # data_version tick re-reads an open detail ~1.3×/s while capturing (#1122), and `i`
+    # re-seeds on the way into INSERT (#1123). Each one dragged the operator's reading
+    # position back to line 0 — the first over and over, the second exactly when they had
+    # finished scrolling to the paragraph they meant to edit.
+    #
+    # So ask the BUFFER, not the baseline: `notes_key` is the same LF projection `#text` hands
+    # back, so `@notes.text == key` is exactly "replacing the document would change nothing".
+    # It is the guard FuzzerView#reconcile and NotesView#soft_merge_from already keep in front
+    # of their own `set_text`, for this same reason. Comparing against `@notes_base` instead
+    # would answer the same in the two cases above and the WRONG way on the third: `save_notes`
+    # re-seeds with the text it just committed, and the baseline it is measured against is
+    # still the PRE-EDIT value at that moment — so the compare would call the buffer stale and
+    # land the caret back on line 1 of the writeup the operator had just finished.
+    #
+    # A discard (`^W`) is the case that still replaces: the buffer holds typed text the stored
+    # row does not, the compare says so, and the caret resets with the text it belonged to.
+    #
+    # The bookkeeping below runs either way. `@notes_base` and the announce latch belong to
+    # the ISSUE this detail is holding, not to the bytes: `open_detail_issue` re-seeds when the
+    # operator opens a DIFFERENT row, whose notes may well be byte-identical (two empty
+    # writeups is the ordinary case), and skipping them there would leave the previous issue's
+    # peer latch armed against the new one.
     private def seed_notes(text : String) : Nil
-      @notes.set_text(text)
+      key = notes_key(text)
+      unless @notes.text == key
+        @notes.set_text(text)
+        # The read anchor indexes the buffer just replaced, exactly as `@sel_anchor` did —
+        # `set_text` drops the EDITOR's and cannot reach this one, so `y` after a peer's
+        # rewrite (or a `^W`) copied a span measured against a document that is gone.
+        @notes_read.clear_selection
+      end
       @notes_read.sync_from(@notes)
-      @notes_base = notes_key(text)
+      @notes_base = key
       @notes_peer_seen = nil
     end
 
@@ -311,10 +542,11 @@ module Gori::Tui
     # this" on the first tick and refuse a save that had nothing to lose. Mirrors `split_wire`'s
     # rule rather than a blanket `\r` strip: only a segment terminator is a line ending, so a
     # lone `\r` inside a payload pasted into the writeup is content and stays.
+    #
+    # Delegated rather than spelled out again: `TextArea.normalize_lf` IS this projection, and
+    # it lives beside the `set_text` that defines it, so the two cannot drift apart.
     private def notes_key(text : String) : String
-      parts = text.split('\n')
-      last = parts.size - 1
-      parts.each_with_index.map { |p, i| i == last ? p : p.rstrip('\r') }.join('\n')
+      TextArea.normalize_lf(text)
     end
 
     # Jump to a specific issue (create-and-link "open" path). Reloads, clears a
@@ -332,22 +564,106 @@ module Gori::Tui
     def close_detail : Nil
       @detail = nil
       @detail_links = [] of Store::EntityLink
-      @detail_resolved = [] of Links::Resolved
+      @detail_related = [] of RelatedRow
+      @retest_summary = nil
       @detail_focus = :links
       @notes_mode = InputMode::Read
     end
 
+    # One row of the RELATED card: a LIVE link (resolved, possibly stale) or a FROZEN
+    # evidence copy (#1038). Exactly one of the two is set. The card lists them together
+    # because they answer the same question — "what backs this issue" — but they are
+    # different kinds of answer: a live row is a pointer that can go stale, a frozen row is
+    # the bytes and cannot. The badge in front of each says which.
+    record RelatedRow, live : Links::Resolved? = nil, frozen : Store::IssueEvidenceMeta? = nil do
+      def frozen? : Bool
+        !@frozen.nil?
+      end
+    end
+
+    # Whether two reloads' rows name the same related material. Entity-link ids are not the
+    # identity here: the primary flow may move between a stored link and `issue_links`'s
+    # synthetic id=0 row without changing what it points at. A frozen copy, on the other hand,
+    # has its own durable evidence id even after its source is gone.
+    private def same_related?(a : RelatedRow, b : RelatedRow) : Bool
+      if live = a.live
+        other = b.live || return false
+        return live.link.ref_kind == other.link.ref_kind && live.link.ref_id == other.link.ref_id
+      end
+      frozen = a.frozen || return false
+      other = b.frozen || return false
+      frozen.id == other.id
+    end
+
+    # The open issue's RETEST state as one line, or nil when it has none (#1036).
+    #
+    # Drawn only when there IS one, which is what makes the feature free for the issues that
+    # do not use it: `detail_split` already clamps RELATED to nothing on a short terminal to
+    # keep NOTES a text row, so a permanently-drawn row would take rows from the pane an
+    # operator reads and types in. Same shape as `Evidence`'s tab, which stays hidden until
+    # the project holds its first snapshot.
+    #
+    # Recomputed on a WRITE (a step added/edited/removed, a run finished), never per
+    # repaint — the hoist `Issue#cvss_score` makes for the same reason.
+    getter retest_summary : String? = nil
+
+    def refresh_retest_summary(store : Store) : Nil
+      issue = @detail
+      unless issue
+        @retest_summary = nil
+        return
+      end
+      n = store.count_retest_steps(issue.id)
+      if n == 0
+        @retest_summary = nil
+        return
+      end
+      line = "retest    #{Gori.plural(n, "step")}"
+      if r = store.last_retest_run(issue.id)
+        t = Retest::Tally.new(r.total, r.passed, r.failed, r.inconclusive, r.errored, r.blocked, r.skipped)
+        line += " · last #{r.verdict.label.upcase} (#{Retest.summary_line(t)}) #{fmt_ts(r.started_at)}"
+      else
+        line += " · never run"
+      end
+      # Retest is palette-only (#1282), so its route is the chord, never a menu letter.
+      if (reg = @menu_registry) && (route = Hotkeys.route(reg, "issue.retest"))
+        line += " · #{route}"
+      end
+      @retest_summary = line
+    end
+
+    # Rebuild the RELATED rows: the PRIMARY flow first, then the other live links in link
+    # order, then the frozen copies, oldest first. Live first so an issue's rows keep the
+    # order they have always had; a freeze appends rather than reshuffling what the operator
+    # was reading.
+    #
+    # The primary flow leads because it is what the issue was filed FROM — and it is in this
+    # list at all because the detail has no `flow` meta row any more (see `render_detail`).
+    # `Links.issue_links` is what guarantees both halves: first, and exactly once. It also
+    # SYNTHESISES the row when `issues.flow_id` has no `entity_links` row — an issue filed
+    # before `insert_issue` wrote one, a link removed by hand, a `delete_flows` that cascaded
+    # it away — so nothing an issue names can disappear from the card.
     def reload_detail_links(store : Store) : Nil
       return unless issue = @detail
-      @detail_links = store.list_links(Store::LinkOwnerKind::Issue, issue.id)
-      @detail_links = Links.dedupe_issue_flow(@detail_links, issue.flow_id)
-      @detail_resolved = Links.resolve_all(store, @detail_links)
-      @selected_link = @selected_link.clamp(0, {@detail_resolved.size - 1, 0}.max)
+      selected = selected_related
+      @detail_links = Links.issue_links(store.list_links(Store::LinkOwnerKind::Issue, issue.id), issue)
+      rows = Links.resolve_all(store, @detail_links).map { |res| RelatedRow.new(live: res) }
+      store.issue_evidence(issue.id).each { |m| rows << RelatedRow.new(frozen: m) }
+      @detail_related = rows
+      @selected_link =
+        if selected && (idx = @detail_related.index { |row| same_related?(row, selected) })
+          idx
+        else
+          @selected_link.clamp(0, {@detail_related.size - 1, 0}.max)
+        end
+      # Re-anchoring can move the index when a live row is inserted ahead of a frozen one.
+      # Keep the durable selection visible instead of leaving its band outside the old window.
+      ensure_links_visible
     end
 
     def move_links(delta : Int32) : Nil
-      return if @detail_resolved.empty?
-      @selected_link = (@selected_link + delta).clamp(0, @detail_resolved.size - 1)
+      return if @detail_related.empty?
+      @selected_link = (@selected_link + delta).clamp(0, @detail_related.size - 1)
       ensure_links_visible
     end
 
@@ -355,18 +671,65 @@ module Gori::Tui
       move_links(delta)
     end
 
-    # `@detail_resolved` is the RELATED list the detail pane windows from `@links_scroll`.
+    # `@detail_related` is the RELATED list the detail pane windows from `@links_scroll`.
     private def ensure_links_visible : Nil
       @links_scroll = Viewport.scroll_to_show(@selected_link, @links_scroll,
-        links_visible_rows, @detail_resolved.size)
+        links_visible_rows, @detail_related.size)
     end
 
+    def related_rows : Array(RelatedRow)
+      @detail_related
+    end
+
+    def selected_related : RelatedRow?
+      @detail_related[@selected_link]?
+    end
+
+    # What `r` (`issue.repeater-flow`) acts on: the row under the cursor when it carries a
+    # request this key can duplicate, else the FIRST row that does — which on any issue filed
+    # from a flow is the primary flow, RELATED's first row and what `r` has always meant here.
+    #
+    # A fallback rather than a refusal: `r` used to read `issues.flow_id` and ignore the cursor
+    # entirely, so it has to keep working from wherever the cursor happens to be sitting.
+    def repeater_target_row : RelatedRow?
+      sel = selected_related
+      return sel if sel && repeater_target?(sel)
+      @detail_related.find { |r| repeater_target?(r) }
+    end
+
+    # A frozen copy always carries a request. A live row does only when it is a flow that still
+    # resolves: a fuzz or miner session has no single exchange, a stale row has no bytes left,
+    # and a live REPEATER row is already a Repeater tab — `s` opens it, and duplicating a tab
+    # into a copy of itself is not what this key means.
+    private def repeater_target?(row : RelatedRow) : Bool
+      return true if row.frozen?
+      res = row.live || return false
+      res.link.ref_kind.flow? && !res.stale?
+    end
+
+    # The LIVE link under the RELATED cursor — nil on a frozen row as well as on none.
     def selected_resolved_link : Links::Resolved?
-      @detail_resolved[@selected_link]?
+      selected_related.try(&.live)
+    end
+
+    # The FROZEN copy under the RELATED cursor — nil on a live row as well as on none.
+    def selected_evidence : Store::IssueEvidenceMeta?
+      selected_related.try(&.frozen)
+    end
+
+    # Put the RELATED cursor on the row holding evidence `id` — where a freeze lands the
+    # cursor so the toast and the band agree about what just happened.
+    def select_evidence(id : Int64) : Nil
+      if idx = @detail_related.index { |r| r.frozen.try(&.id) == id }
+        select_link(idx)
+      end
     end
 
     # Max link rows shown in the detail pane (the rest scroll).
     LINKS_VISIBLE = 4
+
+    # Rows the last RELATED frame drew — see `links_visible_rows`.
+    @links_last_h = LINKS_VISIBLE
 
     # The hidden `]`/`[` one-step cycle. Returns whether the write COMMITTED, like the
     # picker path (`Runner#apply_issue_choice`) and `delete_ids` beside it — an
@@ -414,7 +777,7 @@ module Gori::Tui
     # --- marks (multi-select) -------------------------------------------------
 
     def marked?(id : Int64) : Bool
-      @marks.includes?(id)
+      @marks.marked?(id)
     end
 
     def mark_count : Int32
@@ -426,7 +789,7 @@ module Gori::Tui
     def marked_hidden_count : Int32
       return 0 if @marks.empty?
       visible = 0
-      @issues.each { |f| visible += 1 if @marks.includes?(f.id) }
+      @issues.each { |f| visible += 1 if @marks.marked?(f.id) }
       @marks.size - visible
     end
 
@@ -447,13 +810,13 @@ module Gori::Tui
     # The rows `y` copies from the LIST: the marks if any, else the cursor row — each as
     # `[severity] title (host)`, one per line.
     def copy_rows_text : String
-      rows = @marks.empty? ? [@issues[@selected]?].compact : @all.select { |f| @marks.includes?(f.id) }
+      rows = @marks.empty? ? [@issues[@selected]?].compact : @all.select { |f| @marks.marked?(f.id) }
       rows.map { |f| "[#{f.severity.label}] #{f.title}#{f.host ? " (#{f.host})" : ""}" }.join("\n")
     end
 
     def marked_ids : Array(Int64)
       return [] of Int64 if @marks.empty?
-      @all.compact_map { |f| f.id if @marks.includes?(f.id) }
+      @all.compact_map { |f| f.id if @marks.marked?(f.id) }
     end
 
     # The effective target set every batch verb acts on: the marks if any are set, else the
@@ -482,50 +845,35 @@ module Gori::Tui
     # lands on the row just toggled, so `t` then ⇧↓ extends from it.
     def toggle_mark : Nil
       return unless id = selected_id
-      @marks.includes?(id) ? @marks.delete(id) : @marks.add(id)
+      @marks.toggle(id)
       step_cursor(1)
-      @mark_anchor = id
-      @mark_extent.clear
     end
 
     # ⇧T — mark every issue the CURRENT filter shows, unioned with what's already marked (so
     # narrowing the filter twice accumulates rather than replaces).
     def mark_all : Nil
-      @issues.each { |f| @marks.add(f.id) }
-      @mark_anchor = selected_id
-      @mark_extent.clear
+      @marks.mark_all(@issues.map(&.id), selected_id)
     end
 
     def clear_marks : Nil
       @marks.clear
-      reset_mark_anchor
-    end
-
-    # Forget where a range gesture started (and what it had added), so the next ⇧arrow
-    # anchors at the cursor instead of sweeping back to a stale point.
-    private def reset_mark_anchor : Nil
-      @mark_anchor = nil
-      @mark_extent.clear
     end
 
     # End a ⇧arrow range gesture AND hand back everything it marked — what letting go of ⇧
     # and pressing a plain arrow does in a GUI list, where the highlight collapses instead of
-    # being left behind. Only the gesture's own ids go (@mark_extent): `t`/⇧T marks are
+    # being left behind. Only the gesture's own ids go: `t`/⇧T marks are
     # deliberate tags, and dropping those too would put a discontiguous set out of reach
     # ("mark this one, skip three, mark that one"). Returns how many marks it gave back, so
     # the caller can say so rather than let a range vanish silently.
     def end_mark_gesture : Int32
-      before = @marks.size
-      @mark_extent.each { |id| @marks.delete(id) }
-      reset_mark_anchor
-      before - @marks.size
+      @marks.end_gesture
     end
 
     # Drop specific marks — the post-batch-delete prune, so a deleted issue's id can't linger
     # in the set and inflate the next count.
     def unmark_ids(ids : Enumerable(Int64)) : Nil
-      ids.each { |id| @marks.delete(id); @mark_extent.delete(id) }
-      reset_mark_anchor if (a = @mark_anchor) && !@marks.includes?(a) && index_of(a).nil?
+      ids.each { |id| @marks.delete(id) }
+      @marks.reset_anchor if (a = @marks.anchor) && !@marks.marked?(a) && index_of(a).nil?
     end
 
     # ⇧↑/⇧↓ — extend a contiguous range from the anchor, the keyboard form of a GUI
@@ -533,23 +881,10 @@ module Gori::Tui
     # plain move/click clears it), so the first ⇧arrow always starts from where you are.
     def extend_marks(delta : Int32) : Nil
       return if @issues.empty?
-      anchor_idx = @mark_anchor.try { |a| index_of(a) }
-      unless anchor_idx
-        @mark_anchor = selected_id
-        anchor_idx = @selected
-        @mark_extent.clear
-      end
+      anchor_idx = @marks.anchor.try { |a| index_of(a) }
+      from = @selected
       step_cursor(delta)
-      lo, hi = {anchor_idx, @selected}.minmax
-      wanted = Set(Int64).new
-      (lo..hi).each { |i| @issues[i]?.try { |f| wanted.add(f.id) } }
-      # Give back what THIS gesture added but the new range no longer covers, so ⇧↑ after
-      # ⇧↓⇧↓ leaves two rows marked rather than three, while a `t`/⇧T mark the range swept
-      # over and back off survives.
-      (@mark_extent - wanted).each { |id| @marks.delete(id) }
-      added = wanted - @marks
-      @marks.concat(added)
-      @mark_extent = (@mark_extent & wanted) | added
+      @marks.extend_range(anchor_idx, from, @selected) { |i| @issues[i]?.try(&.id) }
     end
 
     # Cursor step used by the mark gestures. Deliberately NOT `move` (which redirects to
@@ -608,8 +943,9 @@ module Gori::Tui
     end
 
     # --- notes READ/INS (inline editor) ---
-    def start_notes_edit : Nil
-      enter_notes_insert!
+    # The notes buffer READ-mode edits run against (`TabController#editor_text_buffer`).
+    def read_edit_buffer : {TextArea, TextReadState}?
+      notes_focused? ? {@notes, @notes_read} : nil
     end
 
     def enter_notes_insert! : Nil
@@ -641,6 +977,16 @@ module Gori::Tui
       @notes_read.move(@notes, dr, dc, selecting: selecting)
     end
 
+    # READ-mode undo (`editor.undo`). `notes_undo` above is the INS ladder's ^Z and is gated
+    # on the mode; this one has to hand the caret `undo` restored back to the read cursor,
+    # which is what READ paints from.
+    def notes_read_undo : Bool
+      return false if notes_insert_mode?
+      @notes.undo
+      @notes_read.sync_from(@notes)
+      true
+    end
+
     def notes_scroll_wheel(step : Int32) : Nil
       @notes.scroll_view(step)
     end
@@ -662,7 +1008,7 @@ module Gori::Tui
 
     def notes_selection? : Bool
       return false unless notes_focused?
-      notes_insert_mode? ? @notes.selection? : @notes_read.selection?
+      notes_insert_mode? ? @notes.selection? : @notes_read.selection?(@notes)
     end
 
     def notes_select_line : Nil
@@ -696,10 +1042,6 @@ module Gori::Tui
       @notes.backspace if notes_insert_mode?
     end
 
-    def notes_move(dr : Int32, dc : Int32) : Nil
-      @notes.move(dr, dc) if notes_insert_mode?
-    end
-
     # INSERT-mode motion: the shared editor keymap (⇧arrows select, Page keys, ⌥←/→ by word,
     # ⌥⌫ deletes one) — see `TextArea#handle_motion_key`.
     def notes_motion_key(ev : Termisu::Event::Key) : Bool
@@ -728,21 +1070,23 @@ module Gori::Tui
       @notes.word_delete_key?(ev)
     end
 
-    # Mouse DRAG / DOUBLE-CLICK over the notes pane. The click already forced INSERT (see
-    # `notes_click_to_cursor`), so both work on the editor's own selection.
+    # Mouse DRAG / DOUBLE-CLICK over the notes pane. Each runs against the selection model
+    # the CURRENT mode owns — INS: the editor's own anchor, painted by `TextArea#render`;
+    # READ: `@notes_read`, painted by `paint_notes_read_chrome`. Both used to force INSERT first,
+    # which is what put a READ-mode word out of reach of `y` (#1124).
     def notes_drag_to_cursor(rect : Rect, mx : Int32, my : Int32) : Nil
-      return unless notes_insert_mode?
-      notes_rect = notes_body_rect(rect)
-      return if notes_rect.empty?
-      @notes.click_to_cursor(notes_rect, mx, my, selecting: true)
+      notes_click_to_cursor(rect, mx, my, selecting: true)
     end
 
     def notes_select_word(rect : Rect, mx : Int32, my : Int32) : Bool
       notes_rect = notes_body_rect(rect)
       return false if notes_rect.empty?
       @detail_focus = :notes
-      enter_notes_insert!
-      @notes.select_word_at(notes_rect, mx, my)
+      if notes_insert_mode?
+        @notes.select_word_at(notes_rect, mx, my)
+      else
+        @notes_read.select_word(@notes, notes_rect, mx, my)
+      end
     end
 
     # Live IME composing text for the notes editor (delegates to the TextArea).
@@ -769,6 +1113,18 @@ module Gori::Tui
       # `ProjectView#save` already carry.
       return false unless store.update_issue(issue.id, notes: @notes.text)
       exit_notes_insert!
+      # The BASELINE has to move with the committed write, and only this method knows the
+      # write landed. Without it the pane stayed `notes_dirty?` forever against a value only
+      # IT had written: `refresh_detail` below then took the peer-REPORT branch instead of the
+      # re-seed one, so the next data_version tick — ~1.3×/s while capturing — told the
+      # operator "notes changed by another session" about their own save. And it never
+      # recovered: `@notes_base` is refreshed nowhere else (the tick keeps taking the dirty
+      # branch, and `enter_notes_insert!` re-seeds only when clean), so the open detail stopped
+      # adopting real peer writes and `notes_conflict?` answered true for the rest of the
+      # session. Routed through `seed_notes` rather than assigning `@notes_base` by hand so the
+      # announce latch resets with it — and its guard makes the call free: the buffer already
+      # holds this document, so nothing is replaced and the caret stays where the typing left it.
+      seed_notes(@notes.text)
       # refresh_detail already re-syncs @notes from the re-fetched @detail (now that
       # notes-insert mode is off), and it nil-guards a peer-deleted issue — so no
       # separate (unsafe) set_text here.
@@ -790,7 +1146,7 @@ module Gori::Tui
     def render(screen : Screen, rect : Rect, focused : Bool = true) : Nil
       return if rect.empty?
       if @detail
-        render_detail(screen, rect, focused)
+        render_drill(screen, rect, focused)
       else
         list_rect, preview_rect = list_split(rect)
         # No preview pane at this size (or after a resize down) ⇒ snap focus back to the list,
@@ -800,6 +1156,9 @@ module Gori::Tui
         @preview_focus = :list if preview_rect.nil?
         render_list(screen, list_rect, focused && @preview_focus == :list)
         render_preview_pane(screen, preview_rect, focused) if preview_rect
+        # LAST: the dropdown is the only thing allowed to occlude the list, so it has to be
+        # painted over both panes rather than inside `render_list`.
+        render_query_popup(screen, list_rect)
       end
     end
 
@@ -813,11 +1172,25 @@ module Gori::Tui
 
     private def render_list(screen : Screen, rect : Rect, focused : Bool) : Nil
       render_filter_bar(screen, rect)
-      screen.text(rect.x + 1, rect.y + 1, "SEV", Theme.muted)
-      screen.text(rect.x + 6, rect.y + 1, "ST", Theme.muted)
-      screen.text(rect.x + 11, rect.y + 1, "TITLE", Theme.muted)
-      Frame.inner_divider(screen, rect, rect.y + 2, border: Frame.pane_border(focused))
-      top = rect.y + 3
+      # The suggestion row exists only while the bar is being edited, so the column header
+      # and everything under it shift down by one for exactly that state. `list_top` is the
+      # inverse and the hit-tests read it.
+      hdr_y = rect.y + 1
+      if @querying
+        render_suggestions(screen, rect, hdr_y)
+        hdr_y += 1
+      end
+      # Bounds-guarded like Probe's twin: `Screen#text` clips to the SCREEN, not to this pane,
+      # so on a one-row interior the header used to paint over the shell's key hints. The
+      # divider clamps itself (see `Frame.inner_divider`); this row did not.
+      # Contract: `spec/tui/contract_render_bounds_spec.cr`.
+      if hdr_y < rect.bottom
+        screen.text(rect.x + 1, hdr_y, "SEV", Theme.muted)
+        screen.text(rect.x + 6, hdr_y, "ST", Theme.muted)
+        screen.text(rect.x + 11, hdr_y, "TITLE", Theme.muted)
+      end
+      Frame.inner_divider(screen, rect, hdr_y + 1, border: Frame.pane_border(focused))
+      top = list_top(rect)
       list_h = {rect.bottom - top, 0}.max
       @list_last_h = list_h
 
@@ -838,7 +1211,7 @@ module Gori::Tui
         # distinguishable from the cursor row (which keeps the accent band) and from a cursor
         # row that is ALSO marked (accent band + full bar). Both glyphs are single-width, so
         # no column offset moves — the `top` math and list_row_at stay valid.
-        marked = @marks.includes?(f.id)
+        marked = @marks.marked?(f.id)
         bg = row_bg(selected, marked, focused)
         if selected || marked
           screen.fill(Rect.new(rect.x, y, rect.w, 1), bg)
@@ -907,8 +1280,31 @@ module Gori::Tui
         TrafficEmptyState.render(screen, list_rect, variant: :issues)
         return
       end
+      # `Screen#text` clips to the SCREEN, not to this pane, so this line owes both bounds
+      # itself. The row guard is what the suggestion row's +1 shift made load-bearing: at
+      # h = 10 or 11 with the bar open, `top` lands past the pane and the message painted over
+      # the shell's key hints. The width has been missing since the message was written — 38
+      # chars overran a 36-column interior at every height.
+      return if top >= rect.bottom
       hint = querying? ? "esc clears the filter" : "/ to edit the filter"
-      screen.text(rect.x + 1, top, "no issues match · #{hint}", Theme.muted)
+      # A `field:` this bar does not implement free-texts the WHOLE token (see
+      # `Issues::Filter.build_term`'s else), so `sevrity:high` searches title+host for that
+      # literal, matches nothing, and reads exactly like "nothing was found". Name it instead
+      # — the same sentence History and the gate say, out of the same `FilterAst` home.
+      msg = if u = unknown_query_field
+              FilterAst.unknown_field_note(u)
+            else
+              "no issues match"
+            end
+      screen.text(rect.x + 1, top, "#{msg} · #{hint}", Theme.muted,
+        width: {rect.w - 2, 0}.max)
+    end
+
+    # The first token in the bar that is shaped like a field this backend does not have.
+    private def unknown_query_field : FilterAst::UnknownField?
+      return nil if @query.blank?
+      FilterAst.unknown_field(@query, FilterAst::SEPS_FIELD, QUERY_KNOWN,
+        FilterAst::EMPTY_NAMESPACES, Issues::Filter::CANDIDATE_FIELDS)
     end
 
     private def render_preview_pane(screen : Screen, rect : Rect, focused : Bool) : Nil
@@ -954,9 +1350,9 @@ module Gori::Tui
         lines << {Theme.muted, score ? "cvss      #{sprintf("%.1f", score)}  ·  #{cvss}" : "cvss      #{cvss}"}
       end
       if fid = f.flow_id
-        lines << {Theme.muted, "evidence  flow ##{fid}"}
+        lines << {Theme.muted, "flow      ##{fid}"}
       else
-        lines << {Theme.muted, "evidence  (none — standalone issue)"}
+        lines << {Theme.muted, "flow      (none — standalone issue)"}
       end
       notes = f.notes.strip
       if notes.empty?
@@ -974,12 +1370,11 @@ module Gori::Tui
     # otherwise the applied query (+ a match count) or a usage hint.
     private def render_filter_bar(screen : Screen, rect : Rect) : Nil
       if @querying
-        prefix = "filter › "
-        screen.text(rect.x + 1, rect.y, prefix, Theme.accent)
-        base = rect.x + 1 + prefix.size
-        screen.input_line(base, rect.y, @query, @qcx, @preedit_q, Theme.text_bright, width: {rect.w - prefix.size - 2, 0}.max,
+        screen.text(rect.x + 1, rect.y, QUERY_PREFIX, Theme.accent)
+        base = rect.x + 1 + QUERY_PREFIX.size
+        screen.input_line(base, rect.y, @query, @qcx, @preedit, Theme.text_bright, width: {rect.w - QUERY_PREFIX.size - 2, 0}.max,
           colors: Highlight.filter_query(@query, Theme.text_bright, FilterAst::SEPS_FIELD,
-            known: QUERY_KNOWN))
+            known: QUERY_KNOWN, shaped: Issues::Filter::FIELD_SHAPED))
         return
       end
       # One right-anchored chain — see HistoryView#render_ql_bar.
@@ -993,11 +1388,47 @@ module Gori::Tui
         # check how the active filter is actually being read.
         qx = screen.text(rect.x + 1, rect.y, ": ", Theme.muted, width: left_w)
         screen.styled_text(qx, rect.y, @query,
-          Highlight.filter_query(@query, Theme.text, FilterAst::SEPS_FIELD, known: QUERY_KNOWN),
+          Highlight.filter_query(@query, Theme.text, FilterAst::SEPS_FIELD, known: QUERY_KNOWN, shaped: Issues::Filter::FIELD_SHAPED),
           Theme.text, width: {rect.x + 1 + left_w - qx, 0}.max)
       else
-        screen.text(rect.x + 1, rect.y, "/ filter  ·  severity:  cvss:>=7  status:open  status:closed  host:", Theme.muted, width: left_w)
+        screen.text(rect.x + 1, rect.y, QuerySuggest.idle_hint("/ filter", Issues::Filter::HINT_FIELDS, left_w), Theme.muted, width: left_w)
       end
+    end
+
+    # The completion row under the bar: what ↹ would take, what it MEANS, and what else is on
+    # offer — else the standing hint at a cold start. `Issues::Filter::FIELD_HELP_PROC`, never
+    # the default: `QuerySuggest`'s fallback is `QL::FIELD_HELP`, which would describe this
+    # bar's triage-state `status:` as an HTTP code.
+    private def render_suggestions(screen : Screen, rect : Rect, y : Int32) : Nil
+      # This row owes its own vertical bound, like the column header below it: `Screen#text`
+      # clips to the SCREEN, not to this pane, and a 40x9 terminal (`Layout.usable?`'s floor
+      # plus a row) leaves this list a one-row interior — the `↹ …` row landed on the shell's
+      # key-hint line. Contract: `spec/tui/contract_render_bounds_spec.cr`.
+      return if y >= rect.bottom
+      w = {rect.w - 2, 0}.max
+      sugg = query_suggestions
+      unless sugg.empty?
+        QuerySuggest.render(screen, rect.x + 1, y, w, sugg, Issues::Filter::FIELD_HELP_PROC)
+        return
+      end
+      # Nothing to complete. At a cold start (nothing typed, or the caret just past a space)
+      # show the standing hint so the grammar is discoverable from the moment `/` opens; on a
+      # non-empty token that matches nothing stay quiet — the operator is free-texting a word.
+      return unless QuerySuggest.hint_slot?(FilterAst.token_at(@query, @qcx).core)
+      screen.text(rect.x + 1, y, QUERY_HINT, Theme.muted, width: w)
+    end
+
+    # Anchored under the suggestion row and bounded by the list, which is the only region it
+    # may occlude. Anchored at the START of the query text, not at the token's offset within
+    # it: `Screen#input_line` scrolls its window once the query outgrows the bar, so
+    # `base + token.start` stops being the token's screen column on exactly the long queries
+    # where precision would matter.
+    private def render_query_popup(screen : Screen, rect : Rect) : Nil
+      return unless @querying && @popup.open?
+      top = list_top(rect)
+      bounds = Rect.new(rect.x + 1, top, {rect.w - 2, 0}.max, {rect.bottom - top, 0}.max)
+      @popup.render(screen, rect.x + 1 + QUERY_PREFIX.size, top - 1, bounds,
+        Issues::Filter::FIELD_HELP_PROC)
     end
 
     # Mark count, drawn right-to-left ending just left of `right_x`; returns the new left
@@ -1012,10 +1443,14 @@ module Gori::Tui
       hidden > 0 ? "#{@marks.size} marked ·#{hidden} hidden" : "#{@marks.size} marked"
     end
 
-    private def render_detail(screen : Screen, rect : Rect, focused : Bool) : Nil
+    private def render_detail(screen : Screen, rect : Rect, focused : Bool,
+                              step_meta : String? = nil) : Nil
       issue = @detail.not_nil!
-      # Back-to-list affordance on the top border (←/esc → the issue list).
-      Frame.list_back_hint(screen, rect)
+      # Back-to-list breadcrumb on the top border: which list, which row of it, and what is
+      # open. See Frame::Crumb — the `‹` is a button, hit-tested off the same rect.
+      if c = detail_crumb
+        Frame.crumb(screen, rect, c, meta: step_meta)
+      end
       w = {rect.w - 2, 0}.max
 
       # y0 — title row: a severity-coloured bullet + the bright title; #id at the right.
@@ -1051,54 +1486,140 @@ module Gori::Tui
       # you look for WHEN, and a third copy of the same string is not a third fact.
       screen.text(rect.x + 1, rect.y + 2, meta, Theme.muted, width: w)
 
-      # y3 — primary linked-flow evidence.
-      evidence = if flow = @detail_flow
-                   "evidence  #{flow.method} #{flow_location(flow)} → #{flow.status || "-"}"
-                 elsif fid = issue.flow_id
-                   "evidence  flow ##{fid} (no longer captured)"
-                 else
-                   "evidence  (none — standalone issue)"
-                 end
-      screen.text(rect.x + 1, rect.y + 3, evidence, Theme.muted, width: w)
+      # There is no `flow` meta row here any more. An issue relates to traffic four ways
+      # (`flow_id`, entity links, frozen evidence, retest steps) and the operator sees ONE
+      # question — "what backs this issue" — so the primary flow is not a separate line above
+      # the card: it is the FIRST row inside it (`reload_detail_links` → `Links.issue_links`,
+      # which puts it first exactly once and synthesises it for a flow_id whose link row is
+      # gone). A line saying `flow  GET … → 200` over a card whose first row said the same
+      # thing was the same fact twice, in two vocabularies, and `s` on that row already goes
+      # where the removed `o` went.
+      #
+      # y3 — the RETEST line, and ONLY when this issue has one (#1036). See
+      # `refresh_retest_summary`: an issue with no retest pays no row, so the two cards below
+      # keep the height they have always had.
+      render_retest_row(screen, rect, w)
 
-      # y4+ — RELATED links, then NOTES.
-      y = rect.y + 4
-      Frame.inner_divider(screen, rect, y, border: Frame.pane_border(focused))
-      rel_head = "RELATED (#{@detail_resolved.size})"
-      screen.text(rect.x + 1, y + 1, rel_head, Theme.accent, attr: Attribute::Bold)
-      unless notes_insert_mode?
-        links_hint = "space l"
-        screen.text(rect.right - links_hint.size - 1, y + 1, links_hint, Theme.muted)
+      # y3/y4+ — RELATED and NOTES, two CLOSED sibling cards.
+      #
+      # RELATED used to be an OPEN region — an `inner_divider`, a text heading, then the link
+      # rows — with the closed NOTES card directly beneath it, and an open-ended block above a
+      # closed one reads as containment: NOTES looked like it lived INSIDE RELATED.
+      #
+      # Worse, nothing in that region varied with `@detail_focus`. The divider and gauge took
+      # the pane-level `focused`, the row band took the selected INDEX, and the heading was
+      # unconditional — so `esc` out of NOTES moved focus somewhere with no signal at all, and
+      # on an issue with no links (the shape `n` creates) there was not even a band to notice.
+      # One `Frame.card` whose border reads `@detail_focus` answers both.
+      rel_card, notes_card = detail_split(rect)
+      render_related_card(screen, rel_card, focused && @detail_focus == :links)
+      render_notes_card(screen, notes_card, focused)
+    end
+
+    # y3 — the RETEST line, drawn only when this issue HAS one (see `refresh_retest_summary`).
+    #
+    # BOUNDED, like every other conditional element in this pane: `render_drill` hands over
+    # whatever the rail chrome left, with no minimum-height floor, and rows y0-y2 already fill
+    # a 3-row interior exactly. An unguarded fourth row paints outside `rect` on any issue that
+    # has a retest — the overspill `render_related_card` refuses with `card.h < 2`, and the
+    # CVSS chip refuses by measuring `room`.
+    private def render_retest_row(screen : Screen, rect : Rect, w : Int32) : Nil
+      line = @retest_summary || return
+      return if rect.y + 3 >= rect.bottom
+      screen.text(rect.x + 1, rect.y + 3, line, Theme.muted, width: w)
+    end
+
+    # The RELATED border meta: the row count, and the Manage links chip unless INS owns the
+    # keyboard. Two kinds of row share this card (see `RelatedRow`) and one total cannot say
+    # which, so once the issue holds a frozen copy the count SPLITS — `3 · 2 frozen` is three
+    # live pointers plus two immutable copies, and the live half stays the honest live count
+    # rather than the sum it used to be. An issue with no frozen rows keeps the one number it
+    # has always shown; nothing about a link-only issue changed.
+    private def related_meta(insert : Bool) : String
+      frozen = @detail_related.count(&.frozen?)
+      live = @detail_related.size - frozen
+      count = frozen == 0 ? @detail_related.size.to_s : "#{live} · #{frozen} frozen"
+      insert ? count : "#{count} · #{Hotkeys.menu_chip(@menu_registry, "issue.links")}"
+    end
+
+    # The RELATED card. Costs exactly the six rows the divider + heading + `LINKS_VISIBLE`
+    # rows used to: the heading rides the top border, so closing the card is free.
+    private def render_related_card(screen : Screen, card : Rect, active : Bool) : Nil
+      return if card.h < 2 || card.w < 2
+      Frame.card(screen, card, "RELATED", bg: Theme.bg, border: Frame.pane_border(active))
+      # The count and the Manage links chip share the RIGHT-ALIGNED meta slot instead of
+      # riding the title. Two rules meet here, both `shared_chrome_spec`'s: a hand-placed
+      # `rect.right - hint.size - 1` string is forbidden (`Frame.border_meta` is the slot), and
+      # so is a count inside a card title — it makes the title's width a moving target, which
+      # is what a badge's `min_x` is derived from. The hint half drops while INS owns the
+      # keyboard, exactly as the old inline hint did; the count never does.
+      Frame.border_meta(screen, card, "RELATED", related_meta(notes_insert_mode?))
+      body = card.inset(1, 1)
+      # The scroll window the NEXT `move_links` measures against — the `@list_last_h`
+      # convention. It has to be the rows this card ACTUALLY drew, not `LINKS_VISIBLE`: a
+      # short pane clamps the card (see `detail_split`), and a viewport wider than the card
+      # would scroll the selection to a row nothing paints.
+      @links_last_h = {body.h, 0}.max
+      return if body.empty?
+      @links_scroll = Viewport.clamp_scroll(@links_scroll, body.h, @detail_related.size)
+      if @detail_related.empty?
+        screen.text(body.x, body.y, Hotkeys.expand_menu_paths(@menu_registry, "(none — {space:issue.links} to link History/Repeater/…)"),
+          Theme.muted, width: body.w)
+        return
       end
-      list_y = y + 2
-      list_h = links_visible_rows
-      @links_scroll = Viewport.clamp_scroll(@links_scroll, list_h, @detail_resolved.size)
-      if @detail_resolved.empty?
-        screen.text(rect.x + 1, list_y, "(none — space l to link History/Repeater/…)", Theme.muted, width: w)
-      else
-        (0...list_h).each do |i|
-          idx = @links_scroll + i
-          break if idx >= @detail_resolved.size
-          res = @detail_resolved[idx]
-          active = idx == @selected_link
-          fg = res.stale? ? Theme.muted : (active ? Theme.text_bright : Theme.text)
-          # The marker column is written on EVERY row and the band is filled behind the
-          # selected one — the shape every other list in gori uses. This list drew the bar
-          # ONLY when active and then pushed the row's text one column right to make room,
-          # so the selected link was both hard to see (no band at all) and visibly out of
-          # line with its neighbours.
-          y = list_y + i
-          bg = active ? Theme.accent_bg : Theme.bg
-          screen.fill(Rect.new(rect.x + 1, y, w, 1), bg) if active
-          screen.cell(rect.x + 1, y, active ? '▎' : ' ', Theme.accent, bg)
-          screen.text(rect.x + 2, y, res.line, fg, bg, width: {w - 1, 1}.max)
+      (0...body.h).each do |i|
+        idx = @links_scroll + i
+        break if idx >= @detail_related.size
+        row = @detail_related[idx]
+        y = body.y + i
+        sel = idx == @selected_link
+        # Dim band when the pane is not focused, accent when it is — `render_list`'s own
+        # `row_bg` rule. The cursor row used to keep the accent band in both states, which
+        # is the other half of why a focus move in and out of this pane was invisible.
+        bg = sel ? (active ? Theme.accent_bg : Theme.selection_dim) : Theme.bg
+        screen.fill(Rect.new(body.x, y, body.w, 1), bg) if sel
+        screen.cell(body.x, y, sel ? '▎' : ' ', Theme.accent, bg)
+        draw_related_row(screen, body, y, row, sel, bg)
+      end
+      Frame.scroll_gauge(screen, body, @detail_related.size, @links_scroll, active)
+    end
+
+    # Gutter for the LIVE/FROZEN badge, so the two kinds' identities line up down the card.
+    RELATED_BADGE_W = 7
+
+    # `LIVE    [hist] GET a.test/x` / `FROZEN  GET a.test/x · hist #12 · 09-11 14:02 · 200 · 34KB`.
+    #
+    # The badge is what tells the two apart, and FROZEN is the one that is coloured: a live
+    # row is the default kind of row and reads as it always did; a frozen row is the thing
+    # that survives, and it says so before it says what it is. The frozen row's tail is its
+    # PROVENANCE — where it came from, and when the copy was taken — because that, not the
+    # URL, is what distinguishes two snapshots of one endpoint.
+    private def draw_related_row(screen : Screen, body : Rect, y : Int32, row : RelatedRow,
+                                 sel : Bool, bg : Color) : Nil
+      x = body.x + 1
+      text_x = x + RELATED_BADGE_W
+      text_w = {body.right - text_x, 1}.max
+      if m = row.frozen
+        screen.text(x, y, "FROZEN", Theme.syn_header, bg, attr: Attribute::Bold, width: RELATED_BADGE_W)
+        fg = sel ? Theme.text_bright : Theme.text
+        line = "#{Evidence.label(m)} · #{m.source_label} · #{fmt_ts(m.created_at)}"
+        if st = m.status
+          line += " · #{st}"
+        elsif m.error
+          line += " · ERR"
         end
-        Frame.scroll_gauge(screen, Rect.new(rect.x, list_y, rect.w, list_h),
-          @detail_resolved.size, @links_scroll, focused)
+        line += " · #{Fmt.size(m.bytes)}"
+        screen.text(text_x, y, line, fg, bg, width: text_w)
+      elsif res = row.live
+        screen.text(x, y, "LIVE", Theme.muted, bg, width: RELATED_BADGE_W)
+        fg = res.stale? ? Theme.muted : (sel ? Theme.text_bright : Theme.text)
+        screen.text(text_x, y, res.line, fg, bg, width: text_w)
       end
-      # NOTES — a real Frame.card (like Decoder INPUT) so INS/READ borders are rounded
-      # and the editor body is inset, never colliding with the outline.
-      card = notes_card_rect(rect)
+    end
+
+    # NOTES — a real Frame.card (like Decoder INPUT) so INS/READ borders are rounded
+    # and the editor body is inset, never colliding with the outline.
+    private def render_notes_card(screen : Screen, card : Rect, focused : Bool) : Nil
       return if card.h < 2
       notes_active = focused && notes_focused?
       ins = focused && notes_insert_mode?
@@ -1117,17 +1638,104 @@ module Gori::Tui
       paint_notes_read_chrome(screen, body, notes_active && !notes_insert_mode?)
     end
 
+    # Rows the detail's meta block owns before the two cards: title, chips, timestamps — plus
+    # the RETEST line when this issue has one, which is what `detail_head_rows` adds. A
+    # CONSTANT would have to be the worst case and would charge every issue for a feature most
+    # never configure.
+    #
+    # THREE since the primary flow stopped being a meta row of its own (see `render_detail`):
+    # the row it gave up goes to NOTES, which is the pane an operator reads and types in.
+    DETAIL_HEAD_ROWS = 3
+
+    # What the meta block actually costs on THIS issue. Read by `detail_split`, so the four
+    # RELATED/NOTES hit-tests in `IssuesController` invert the same arithmetic `render_detail`
+    # drew with — the property `detail_split`'s own comment exists to keep.
+    def detail_head_rows : Int32
+      @retest_summary ? DETAIL_HEAD_ROWS + 1 : DETAIL_HEAD_ROWS
+    end
+
+    # The RELATED and NOTES rects for a detail interior — ONE derivation, so `render_detail`
+    # and the four hit-tests in `IssuesController` (the NOR/INS chip, click-to-cursor, drag,
+    # double-click) can never disagree about which row a click landed on. `render_detail` and
+    # `notes_card_rect` used to derive the same arithmetic independently, with the controller
+    # reading only the second: move one and not the other and clicks land on the wrong rows
+    # with nothing raising.
+    #
+    # RELATED asks for `LINKS_VISIBLE` rows plus its own frame, which is exactly the six the
+    # divider + heading + rows cost before — so this is row-budget neutral and NOTES keeps
+    # the height it had.
+    #
+    # CLAMPED, not merely floored. `Frame.card` needs two rows for its own frame and the
+    # container may grant fewer than the meta block plus both cards want (a 40x9 terminal is
+    # inside `Layout.usable?`). RELATED gives its rows up first — NOTES is the pane you read
+    # and type in — and both rects stay inside `rect`, which every view owes
+    # `pane_overspill_spec`.
+    def detail_split(rect : Rect) : {Rect, Rect}
+      top = rect.y + detail_head_rows
+      avail = {rect.bottom - top, 0}.max
+      # Leave NOTES a frame plus one text row wherever the height allows one at all.
+      rel_h = {LINKS_VISIBLE + 2, {avail - 3, 0}.max}.min
+      # …and never keep a row RELATED cannot draw with. `Frame.card` needs two rows for its
+      # own frame, so a granted `h == 1` paints nothing at all — it just costs NOTES the row.
+      rel_h = 0 if rel_h < 2
+      notes_top = top + rel_h
+      {Rect.new(rect.x, top, rect.w, rel_h),
+       Rect.new(rect.x, notes_top, rect.w, {rect.bottom - notes_top, 0}.max)}
+    end
+
     # Outer NOTES card geometry (full width of the detail pane, under RELATED).
     def notes_card_rect(rect : Rect) : Rect
-      y0 = rect.y + 4
-      list_y = y0 + 2
-      top = list_y + links_visible_rows # immediately under the last RELATED row
-      Rect.new(rect.x, top, rect.w, {rect.bottom - top, 0}.max)
+      detail_split(rect)[1]
     end
 
     # Interior of the NOTES card (where TextArea draws) — matches Frame.card inset.
     def notes_body_rect(rect : Rect) : Rect
       notes_card_rect(rect).inset(1, 1)
+    end
+
+    # Outer RELATED card geometry (full width of the detail pane, over NOTES) — the twin of
+    # `notes_card_rect`, read off the same `detail_split` so the four RELATED hit-tests below
+    # can never disagree with `render_related_card` about which row a click landed on.
+    def links_card_rect(rect : Rect) : Rect
+      detail_split(rect)[0]
+    end
+
+    # Interior of the RELATED card (where the link rows draw) — matches Frame.card's inset.
+    # `Rect#inset` clamps at zero, so a card too short to draw one answers an empty rect and
+    # every caller below refuses on `empty?`.
+    def links_body_rect(rect : Rect) : Rect
+      links_card_rect(rect).inset(1, 1)
+    end
+
+    # Inverts `render_related_card`'s row layout: maps a click to a link index, or nil past
+    # the last populated row / outside the card. `list_row_at`'s twin, windowed from
+    # `@links_scroll` the same way the draw loop is.
+    def links_row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
+      body = links_body_rect(rect)
+      return nil if body.empty?
+      return nil if mx < body.x || mx >= body.right
+      i = my - body.y
+      return nil if i < 0 || i >= body.h
+      idx = @links_scroll + i
+      idx < @detail_related.size ? idx : nil
+    end
+
+    # The row a click on the RELATED scroll gauge asks for. The gauge rides the card's right
+    # border column — one OUTSIDE `links_body_rect`, which is why `links_row_at` cannot answer
+    # it — and `@links_scroll` is DERIVED from the selection by `ensure_links_visible`, so the
+    # answer is a selection and not an offset (see `gauge_row_at`).
+    def links_gauge_row_at(rect : Rect, mx : Int32, my : Int32) : Int32?
+      body = links_body_rect(rect)
+      return nil if body.empty?
+      Frame.scroll_gauge_row(body, @detail_related.size, mx, my)
+    end
+
+    # Put the RELATED cursor on `idx` (clamped) and scroll it into view — the pointer's
+    # `move_links`, which is relative and cannot express "this row".
+    def select_link(idx : Int32) : Nil
+      return if @detail_related.empty?
+      @selected_link = idx.clamp(0, @detail_related.size - 1)
+      ensure_links_visible
     end
 
     # The shared over-paint — see `TextReadState#paint_chrome`. This pane's own copy also
@@ -1163,8 +1771,14 @@ module Gori::Tui
       peer_notes = false
       if issue = @detail
         @detail = store.get_issue(issue.id)
-        @detail_flow = @detail.try { |f| f.flow_id.try { |fid| store.flow_row(fid) } }
         reload_detail_links(store)
+        # Beside `reload_detail_links`, and for the same reason this method exists: a peer
+        # session — an agent's MCP `add_retest_step`, another gori's `gori run retest` — can
+        # change an issue's retest while this detail is open. Without it the summary line
+        # stays as it was at open time AND `detail_head_rows` disagrees with what
+        # `render_detail` draws, so the two cards below are laid out against a row that is or
+        # is not there. Nil-safe: it re-reads `@detail` itself and clears on a deleted issue.
+        refresh_retest_summary(store)
         # get_issue returns nil when the row was deleted by a peer session (supported
         # cross-session scenario) — guard the deref, mirroring ProbeView#refresh_detail.
         # When @detail is nil the render path already falls back to the list view.
@@ -1220,8 +1834,11 @@ module Gori::Tui
       nil
     end
 
+    # The RELATED scroll window: the rows the last frame drew, floored at 1 so a
+    # never-rendered or fully-clamped card still lets `move_links` step. Written by
+    # `render_related_card`, the same shape `@list_last_h` / `list_page_rows` use.
     private def links_visible_rows : Int32
-      LINKS_VISIBLE
+      {@links_last_h, 1}.max
     end
 
     private def ellipsize(s : String, w : Int32) : String
@@ -1233,7 +1850,7 @@ module Gori::Tui
     # created_at/updated_at are unix MICROSECONDS (the issues.* unit) — to seconds
     # for Time.unix, like Project/History formatting.
     private def fmt_ts(us : Int64) : String
-      Time.unix(us // 1_000_000).to_local.to_s("%Y-%m-%d %H:%M")
+      LocalTime.format(us, "%Y-%m-%d %H:%M")
     end
 
     # `@issues` is the FILTERED list (apply_filter rebuilds it from the `/` query and from

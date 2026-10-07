@@ -1,4 +1,5 @@
 require "../spec_helper"
+require "../support/fake_context"
 
 include Gori::Verb
 
@@ -55,13 +56,36 @@ describe Gori::Verb::Keymap do
       km.lookup(Chord.new("x", ctrl: true), Gori::Verb::Scope::Body).should eq("g.x") # Global fallback
       km.lookup(Chord.new("y"), Gori::Verb::Scope::Body).should eq("b.x")
     end
-  end
 
-  describe ".parse_overrides" do
-    it "parses label strings into chords and drops garbage" do
-      parsed = Keymap.parse_overrides({"t.a" => ["ctrl-g", "nope", ""], "t.b" => [] of String})
-      parsed["t.a"].should eq([Chord.new("g", ctrl: true)])
-      parsed["t.b"].should be_empty # preserved as an unbind
+    it "can resolve only Global chords for the sub-tab strip" do
+      reg = reg_with(
+        verb("g.x", Gori::Verb::Scope::Global, Chord.new("x", ctrl: true)),
+        verb("b.x", Gori::Verb::Scope::Body, Chord.new("x", ctrl: true)),
+      )
+      km = Keymap.build(reg)
+      ctx = FakeExecContext.new
+      km.resolve_global(Chord.new("x", ctrl: true), reg, ctx).should eq("g.x")
+      km.resolve_global(Chord.new("x"), reg, ctx).should be_nil
+    end
+
+    # `>` was free before #1295 bound it to Send flow to… on eleven tabs, so an operator could
+    # have put a Global verb there. That explicit choice beats the hidden per-tab openers,
+    # which the lookup would otherwise answer first on exactly those tabs.
+    it "lets a user's Global chord win over a family opener's default" do
+      reg = Gori::Verbs.registry
+      gt = Chord.new(">")
+      km = Keymap.build(reg, OsProfile::Os::Linux, {"nav.next-tab" => [gt]})
+      openers = reg.select { |v| reg.opens_family(v.id) == :send_flow }
+      openers.size.should be > 5
+      openers.each do |opener|
+        km.lookup(gt, opener.scope).should eq("nav.next-tab"), opener.scope.to_s
+      end
+      # A tab verb the operator put on `>` still wins in its own scope, and without any
+      # override the openers are back.
+      km = Keymap.build(reg, OsProfile::Os::Linux, {"nav.next-tab" => [gt], "repeater.send" => [gt]})
+      km.lookup(gt, Gori::Verb::Scope::Repeater).should eq("repeater.send")
+      km = Keymap.build(reg, OsProfile::Os::Linux)
+      openers.each { |opener| km.lookup(gt, opener.scope).should eq(opener.id) }
     end
   end
 
@@ -106,6 +130,67 @@ describe Gori::Verb::Keymap do
           next unless c.key.size == 1 && c.key[0].ascii_letter?
           unless allowed.includes?(c.key)
             fail "Global bare '#{c.key}' on #{v.id} — L2 breath is c/i/s only (see docs/guide/hotkeys)"
+          end
+        end
+      end
+    end
+  end
+
+  # `Runner#resolve_verb_id` is `#resolve` with the live context. A verb's `chord_sections`
+  # makes its key a pane-local one: out of those sections the link stands down and the press
+  # walks on, exactly like an unavailable verb (#1274 WP2 #3/#4/#13).
+  describe "#resolve (the scope chain)" do
+    it "fires a pane-gated chord only in its sections, and walks on to Global elsewhere" do
+      gated = Definition.new("t.gated", "t.gated", "", Gori::Verb::Scope::Repeater, [Chord.new("c")],
+        chord_sections: [:response]) { |_| nil }
+      reg = reg_with(gated, verb("t.global", Gori::Verb::Scope::Global, Chord.new("c")))
+      km = Keymap.build(reg)
+      ctx = FakeExecContext.new
+      ctx.focused_section = :response
+      km.resolve(Chord.new("c"), Gori::Verb::Scope::Repeater, reg, ctx).should eq("t.gated")
+      ctx.focused_section = :request
+      # …which is why a gate must never sit on a letter Global binds: this is capture.
+      km.resolve(Chord.new("c"), Gori::Verb::Scope::Repeater, reg, ctx).should eq("t.global")
+    end
+
+    it "leaves an ungated chord live in every section" do
+      reg = reg_with(verb("t.a", Gori::Verb::Scope::Repeater, Chord.new("a")))
+      ctx = FakeExecContext.new
+      {:request, :response, :target, :subtab}.each do |sec|
+        ctx.focused_section = sec
+        Keymap.build(reg).resolve(Chord.new("a"), Gori::Verb::Scope::Repeater, reg, ctx).should eq("t.a")
+      end
+    end
+
+    # The shipped gates. In the pane whose menu spells the same letter for something else the
+    # bare key is NOTHING — not the other pane's toggle, and not a Global breath key either.
+    # Every OS profile × keyset: vim respells the editor family, and the request/template
+    # panes are editors, so the Editor link is walked first there. The last field is what the
+    # key answers in those editor panes instead: nothing, or the Editor verb on that letter
+    # (`p` pastes in the request pane, and pretty-prints only in the response).
+    {
+      {Gori::Verb::Scope::Repeater, :repeater, Chord.new("p"), "repeater.toggle-pretty", :response, [:request, :target], "editor.paste"},
+      {Gori::Verb::Scope::Repeater, :repeater, Chord.new("d", shift: true), "repeater.toggle-diff", :response, [:request, :target], nil},
+      {Gori::Verb::Scope::Fuzzer, :fuzzer, Chord.new("v"), "fuzz.dist", :results, [:template, :target, :config], nil},
+      {Gori::Verb::Scope::Fuzzer, :fuzzer, Chord.new("m"), "fuzz.matched", :results, [:template, :target, :config], nil},
+    }.each do |scope, tab, chord, id, home, elsewhere, in_editor|
+      it "answers #{chord.label} with #{id} only in #{home}" do
+        reg = Gori::Verbs.registry
+        OsProfile::Os.each do |os|
+          Keyset::Kind.each do |ks|
+            km = Keymap.build(reg, os, Keymap::NO_OVERRIDES, ks)
+            where = "#{Keyset.name_of(ks)}/#{os}"
+            km.lookup_in(chord, Gori::Verb::Scope::Global).should be_nil, where
+            ctx = FakeExecContext.new
+            ctx.current_tab = tab
+            ctx.focused_section = home
+            km.resolve(chord, scope, reg, ctx).should eq(id), where
+            elsewhere.each do |sec|
+              ctx.focused_section = sec
+              editor = sec != :config
+              ctx.editor_pane = ctx.editor_read_mode = editor
+              km.resolve(chord, scope, reg, ctx).should eq(editor ? in_editor : nil), "#{where} #{sec}"
+            end
           end
         end
       end

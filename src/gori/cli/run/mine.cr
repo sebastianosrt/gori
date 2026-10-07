@@ -6,8 +6,7 @@ module Gori
         {"mine [<id>]", "Discover hidden parameters (query/form/multipart/json/header/cookie)"},
       ])]
       private def self.cmd_mine(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         flow_id : Int64? = nil
         request_file : String? = nil
         target_override : String? = nil
@@ -19,6 +18,10 @@ module Gori
         # falling back to auto-detect (#415).
         locations : Array(Miner::Location)? = nil
         wordlist : String? = nil
+        seed_names = [] of String
+        payload_from = PayloadFromFlags.new
+        macro_flags = RequestMacroFlags.new
+        name_specs = [] of PayloadFrom::Spec
         bucket : Int32? = nil
         concurrency = 10
         rate : Float64? = nil
@@ -32,20 +35,27 @@ module Gori
         allow_unscoped = false
         bind_from : Int64? = nil
         slot : String? = nil
-        positional = [] of String
 
-        parser = OptionParser.new do |p|
+        positional = parse_args(args, "gori run mine") do |p|
           p.banner = "Usage: gori run mine [<flow-id>] [options]"
           p.on("--flow=ID", "Seed the request from a captured flow") { |v| flow_id = parse_flow_id(v, "gori run mine") }
           p.on("--request=FILE", "Read a raw HTTP request to mine") { |v| request_file = v }
-          p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
+          project_options(p, proj, "read")
           p.on("--target=URL", "Origin (scheme://host[:port]); required for --request/stdin") { |v| target_override = v }
           p.on("--http2", "Force HTTP/2") { force_h2 = true }
           p.on("--sni=HOST", "TLS SNI override") { |v| sni = v }
           p.on("-k", "--insecure-upstream", "Do not verify upstream TLS certificates") { insecure = true }
           p.on("--locations=LIST", "Where to mine: query,form,multipart,json,headers,cookies (default: auto-detect)") { |v| locations = parse_mine_locations(v) }
-          p.on("--wordlist=PATH", "Extra param-name wordlist (merged with the built-in list)") { |v| wordlist = v }
+          p.on("--wordlist=PATH", "Extra param-name wordlist: a file, or the NAME of a saved list (`gori run wordlist`); merged with the built-in list (one list)") { |v| wordlist = one_wordlist(wordlist, v, "gori run mine") }
+          p.on("--name=NAME", "Test this name FIRST, ahead of the wordlists (repeatable or comma-separated; e.g. from `gori run sitemap params`)") do |v|
+            v.split(',').each do |n|
+              s = n.strip
+              seed_names << s unless s.empty?
+            end
+          end
+          # Candidate names the project already used (#1352): tested after `--name` and BEFORE the
+          # built-in list and `--wordlist`. Only the param-names projection is a list of names.
+          payload_from_flags(p, "gori run mine", payload_from, "Candidate names") { |spec| name_specs << spec }
           p.on("--bucket=N", "Names stuffed per request before bisection (per location)") { |v| bucket = parse_count(v, "--bucket") }
           p.on("--concurrency=N", "Parallel requests (default 10)") { |v| concurrency = parse_count(v, "--concurrency") }
           p.on("--rate=RPS", "Cap requests/sec (0 = unlimited)") { |v| rate = parse_rate(v) }
@@ -54,17 +64,29 @@ module Gori
           p.on("--retries=N", "Retries on a network error") { |v| retries = parse_nonneg(v, "--retries") }
           p.on("--max-requests=N", "Hard cap on total requests sent") { |v| max_requests = parse_count(v, "--max-requests").to_i64 }
           p.on("--hook=ARGV", "Transform each assembled request through an external command (argv, no shell) before it is sent — for signed/HMAC'd APIs") { |v| hook = v }
+          # A rotating CSRF token or nonce (#1350), answered natively: Repeater sessions replayed
+          # before each request — the baseline's included — so the value they leave in the session
+          # bindings is fresh when the request resolves its $BIND.NAME. `--hook` is the same job
+          # for a scheme that needs a command to compute the value.
+          request_macro_flags(p, macro_flags, "request")
           p.on("--no-keep-alive", "Dial a fresh connection for every probe (default: reuse)") { keep_alive = false }
-          p.on("--bind-from=FLOW-ID", "Replay this captured flow FIRST so its response fills session bindings ($NAME)") { |v| bind_from = parse_flow_id(v, "gori run mine") }
-          p.on("--slot=NAME", "Send as this SESSION SLOT — its header overlay, and its binding table for $NAME") { |v| slot = v.strip }
+          p.on("--bind-from=FLOW-ID", "Replay this captured flow FIRST so its response fills session bindings ($BIND.NAME; bare syntax: $NAME)") { |v| bind_from = parse_flow_id(v, "gori run mine") }
+          p.on("--slot=NAME", "Send as this SESSION SLOT — its header overlay, and its binding table for $BIND.NAME tokens (bare syntax: $NAME)") { |v| slot = v.strip }
           p.on("--allow-unscoped", "Send even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
-          p.on("--format=FMT", "Output: text (default) | json | jsonl") { |v| format = parse_format(v, [:text, :json, :jsonl]) }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = before + after }
-          p.invalid_option { |f| abort "gori run mine: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run mine: missing value for #{f}" }
+          format_flag(p, [:text, :json, :jsonl], "Output: text (default) | json | jsonl") { |f| format = f }
         end
-        parser.parse(args)
+        refresh_verify_upstream(!insecure)
+
+        refuse_orphan_payload_from_flags("gori run mine", payload_from, !name_specs.empty?)
+        # A Miner name source is a list of NAMES. Refused before anything is read or sent, naming
+        # the flag, rather than reaching the builder's own (identical) refusal after a project open.
+        name_specs.each do |spec|
+          next if spec.projection.param_names?
+          abort "gori run mine: --payload-from #{spec.label.inspect}: a Miner name source reads parameter NAMES — " \
+                "use the param-names projection (#{spec.projection.label} is a value list; feed it to `gori run fuzz`)"
+        end
+        name_specs = name_specs.map(&.apply(payload_from.policy))
+        request_macro = request_macro_spec("gori run mine", macro_flags)
 
         abort "gori run mine: too many arguments (expected at most one <flow-id>)" if positional.size > 1
         abort "gori run mine: --request and --flow cannot be combined — pick one template source" if request_file && flow_id
@@ -75,8 +97,8 @@ module Gori
         # same way it does for a flow (whose read already hydrates them via open_store).
         # Always, not only when `flow_id` is nil: `--request` + `--flow` used to skip
         # this and then skip `open_store`, so `--slot` lied about no project.
-        hydrate_project_env(project_name, db_path) if project_name || db_path
-        text, default_target, src_h2, evidence = mine_source(flow_id, request_file, project_name, db_path)
+        hydrate_project_env(proj.name, proj.db) if proj.name || proj.db
+        text, default_target, src_h2, evidence = mine_source(flow_id, request_file, proj.name, proj.db)
 
         config = Miner::Config.new
         config.concurrency = concurrency
@@ -86,13 +108,21 @@ module Gori
         config.retries = retries
         config.max_requests = max_requests
         config.user_wordlist = wordlist
+        config.seed_names = seed_names
         config.hook = hook
         config.keep_alive = keep_alive
+        config.request_macro = request_macro
         # `--locations=` with no usable value (empty, or only blanks/commas) is an operator
         # mistake, not a request to auto-detect — abort instead of silently mining defaults.
         if (loc = locations) && loc.empty?
           abort "gori run mine: --locations was empty — name at least one of query|form|multipart|json|headers|cookies (or omit it to auto-detect)"
         end
+        # The project any `--payload-from` reads, open only for the plan build below.
+        named_project = !!(flow_id || proj.name || proj.db)
+        payload_store = open_payload_from_store("gori run mine", name_specs, named_project, proj.name, proj.db)
+        # …and the project a `--macro` reads its sessions from, on the same terms and released at
+        # the same moment: the plan freezes the steps, so nothing reads it during the run.
+        payload_store ||= open_request_macro_store("gori run mine", request_macro, named_project, proj.name, proj.db)
         options = Miner::PlanOptions.new(text,
           # A `--flow` request is CAPTURED; --request/stdin is a draft the operator authored.
           # See `Miner::PlanOptions#evidence?`.
@@ -103,7 +133,8 @@ module Gori
           # request; an explicit but unusable list is an error above, never a silent default.
           locations: locations,
           config: config, verify: !insecure, sni: sni,
-          overrides: cli_host_overrides(project_name, db_path, flow_id))
+          overrides: cli_host_overrides(proj.name, proj.db, flow_id),
+          project_names: name_specs, project: payload_store)
         # Scope gate — see cmd_fuzz / optional_project_outbound: refuse an out-of-scope host unless
         # --allow-unscoped, and enforce Sandbox + exclude rules on every send.
         # Ahead of Plan.build — see CLI::Run.preflight_bind_from (the builder's unresolved-env
@@ -113,13 +144,24 @@ module Gori
         # seed one identity and send as another.
         activate_slot(slot, "gori run mine")
         preflight_bind_from(bind_from, "gori run mine")
-        outbound = optional_project_outbound(project_name, db_path, flow_id, allow_unscoped)
+        outbound = optional_project_outbound(proj.name, proj.db, flow_id, allow_unscoped)
         plan = begin
           Miner::Plan.build(options, outbound)
         rescue ex : Miner::PlanError
           outbound.close
+          payload_store.try(&.close)
           abort "gori run mine: #{mine_plan_error(ex)}"
+        rescue ex : Gori::Error
+          # `PayloadFrom::Error` and `RequestMacro::Error` both: each builder writes its own
+          # sentence, and it reads the same on every surface.
+          outbound.close
+          payload_store.try(&.close)
+          abort "gori run mine: #{ex.message}"
         end
+        # Everything a `--payload-from` needed is in memory now: release the project before the run.
+        payload_store.try(&.close)
+        note_payload_from("gori run mine", plan.project_reports)
+        note_request_macro("gori run mine", plan.request_macro_info)
         warn_mine_locations(plan)
         origin = plan.origin
         unless origin.scheme.in?("http", "https")
@@ -127,14 +169,19 @@ module Gori
           abort "gori run mine: unsupported target scheme #{origin.scheme.inspect} (use http:// or https://)"
         end
         guard_outbound(outbound, origin.scheme, origin.host, plan.request_target, origin.port, "gori run mine")
+        # A writable handle for the run when it has a macro: the steps are recorded in History
+        # (source `macro`) and their failures logged, and that is traffic nobody typed at the time.
+        write_store = plan.request_macro ? open_store(resolve_read_project(proj.name, proj.db), long_running: true) : nil
+        attach_request_macro_store(plan.request_macro, write_store)
         begin
           # See CLI::Run.seed_bindings — a headless process holds no binding from a previous
           # invocation, so `--bind-from` replays one here. An unseeded `$NAME` ships literally
           # rather than refusing the sweep (see `Env.unbound`).
-          (fid = bind_from) && seed_bindings(fid, project_name, db_path, outbound, insecure, "gori run mine")
+          (fid = bind_from) && seed_bindings(fid, proj.name, proj.db, outbound, insecure, "gori run mine")
           run_mine_stream(plan.engine, origin.scheme, origin.host, origin.port, plan.config, format, plan.pool)
         ensure
           outbound.close
+          write_store.try(&.close)
         end
       end
 
@@ -147,7 +194,7 @@ module Gori
         in Miner::PlanError::Reason::BadTarget
           "could not determine a target host"
         in Miner::PlanError::Reason::NoLocations
-          "no applicable locations for this request"
+          (why = ex.detail) ? "no --locations applies to this request — #{why}" : "no applicable locations for this request"
         in Miner::PlanError::Reason::Wordlist
           "wordlist error: #{ex.detail}"
         in Miner::PlanError::Reason::NoNames
@@ -159,30 +206,13 @@ module Gori
         end
       end
 
-      # A location the operator named with --locations that this request cannot carry. Kept
-      # in the run rather than dropped, so say so instead of letting the name count quietly
-      # come up short.
+      # A location the operator named with --locations that this request cannot carry. Dropped
+      # from the run (see `Miner::Plan.build`), so say so instead of letting the name count
+      # quietly come up short. The sentence is the builder's, shared with the refusal.
       private def self.warn_mine_locations(plan : Miner::Plan) : Nil
         plan.inapplicable.each do |loc|
-          STDERR.puts "gori run mine: #{loc.label}: #{mine_inapplicable_reason(loc, plan.request)}, skipping"
+          STDERR.puts "gori run mine: #{loc.label}: #{Miner::Detect.inapplicable_reason(loc, plan.request)}, skipping"
         end
-      end
-
-      # "No matching existing body" is the right sentence for query/form/multipart/json when
-      # there truly is no such body — but wrong for `json` on a body that EXISTS and simply
-      # is not valid UTF-8: `Detect`/`Inject` correctly refuse to OFFER Json there (round 7 —
-      # `Miner::Inject#json_object_node_count` reports 0 rather than mining a `.scrub`-corrupted
-      # copy, since a non-UTF-8 body cannot round-trip through `JSON::Any`), but naming that
-      # refusal "no matching existing body" tells the operator the wrong thing about a request
-      # that plainly has a body. Give that one case its own accurate sentence.
-      private def self.mine_inapplicable_reason(loc : Miner::Location, request : Bytes) : String
-        if loc.json?
-          _, body, _ = Miner::Inject.split(request)
-          if !body.empty? && !String.new(body).valid_encoding?
-            return "the body is not valid UTF-8 and cannot round-trip through JSON"
-          end
-        end
-        "not applicable to this request (no matching existing body)"
       end
 
       # {raw request text (byte-exact, BEFORE Env expansion — Miner::Plan owns that),
@@ -194,11 +224,8 @@ module Gori
         if file = request_file
           {read_input_file(file, "gori run mine"), nil, false, false}
         elsif id = flow_id
-          store = open_store(resolve_read_project(project_name, db_path))
-          detail = begin
+          detail = with_store(resolve_read_project(project_name, db_path)) do |store|
             store.get_flow(id)
-          ensure
-            store.close
           end
           abort "gori run mine: no flow ##{id}" unless detail
           built = Repeater::FlowRequest.build(detail)
@@ -208,16 +235,17 @@ module Gori
             "replay it with `gori run repeater #{id} --keep-request-line` to keep it")
           {String.new(built.bytes), built.target, built.http2, true}
         elsif !STDIN.tty?
-          {STDIN.gets_to_end, nil, false, false}
+          {read_stdin_fallback(STDIN, "gori run mine", "request"), nil, false, false}
         else
           abort "gori run mine: no source — give a <flow-id>, --request FILE, or pipe a request on stdin"
         end
       end
 
-      private def self.parse_mine_locations(v : String) : Array(Miner::Location)
+      # `cmd` names the command in the refusal — `sitemap params` takes the same list.
+      private def self.parse_mine_locations(v : String, cmd : String = "gori run mine") : Array(Miner::Location)
         v.split(',').compact_map do |tok|
           next if tok.strip.empty?
-          Miner::Location.parse?(tok) || abort("gori run mine: unknown location '#{tok}' (query|form|multipart|json|headers|cookies)")
+          Miner::Location.parse?(tok) || abort("#{cmd}: unknown location '#{tok}' (query|form|multipart|json|headers|cookies)")
         end
       end
 
@@ -249,12 +277,13 @@ module Gori
         # normally and the emit below covers the interrupted path too.
         interrupted = Run.install_interrupt_trap("mine-interrupt",
           "interrupted — stopping and emitting what was found…") { engine.stop }
+        say_request_line_rewrite # the run is about to send it — see `warn_request_line_rewrite`
         engine.run do |ev|
           case ev
           when Miner::BaselineEvent then mine_baseline(ev)
           when Miner::FindingEvent  then findings << ev.finding; emit_mine_finding(ev.finding, format)
           when Miner::ProgressEvent then mine_progress(ev, total)
-          when Miner::DoneEvent     then mine_done(ev, findings.size, config); mine_connections(pool)
+          when Miner::DoneEvent     then mine_done(ev, findings.size, config); note_request_macro_result("gori run mine", ev.progress.request_macro); mine_connections(pool)
           when Miner::ErrorEvent    then had_error = true; STDERR.puts "mine error: #{ev.message}"
           end
         end

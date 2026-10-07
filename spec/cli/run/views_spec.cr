@@ -67,6 +67,40 @@ describe "gori run views --format=json" do
   end
 end
 
+module Gori::CLI::Run
+  def self.view_added_output_for_spec(store : Store, created : SavedViews::View, format : Symbol) : String
+    view_added_output(store, created, format)
+  end
+end
+
+# `views add --format json` (#1117): the listing's object for the view just written. It has no
+# `id` because the listing has none — `key` is the view's unique spelling.
+describe "gori run views add --format json" do
+  it "prints the new view's listing object" do
+    with_store do |store|
+      created = Gori::SavedViews.add(store, "acme errors", "status:>=500", "project").should_not be_nil
+      o = JSON.parse(Gori::CLI::Run.view_added_output_for_spec(store, created, :json))
+      o["key"].as_s.should eq(created.key)
+      o["name"].as_s.should eq("acme errors")
+      o["active"].as_bool.should be_false
+
+      active = Gori::SavedViews.active(store)
+      listed = Gori::SavedViews.merged(store).find! { |v| v.key == created.key }
+      listed_o = JSON.parse(JSON.build { |j| Gori::CLI::Run.view_json(j, listed, active) })
+      o.as_h.keys.should eq(listed_o.as_h.keys)
+      o.should eq(listed_o)
+    end
+  end
+
+  it "keeps both text sentences unchanged" do
+    with_store do |store|
+      Gori::CLI::Run.view_added_output_for_spec(store, view, :text).should eq("View 'acme errors' added.")
+      Gori::CLI::Run.view_added_output_for_spec(store, view(scope: "global"), :text)
+        .should eq("Global view 'acme errors' added — it appears in every project.")
+    end
+  end
+end
+
 describe "gori run history — the empty-listing sentence" do
   it "names the view that narrowed, not only the query" do
     # A `--view` that matched nothing printed a bare "no flows": the one surface with a channel
@@ -81,6 +115,18 @@ describe "gori run history — the empty-listing sentence" do
       .should eq(%(no flows match "status:200" in scope in the "Errors" view))
   end
 
+  it "names --hide-static, which can empty a listing on its own" do
+    Gori::CLI::Run.empty_listing_note(nil, nil, false, true)
+      .should eq("no flows (static assets hidden)")
+    Gori::CLI::Run.empty_listing_note("host:cdn", nil, true, true)
+      .should eq(%(no flows match "host:cdn" in scope (static assets hidden)))
+  end
+
+  it "names the colon form of a comparison typed without one" do
+    Gori::CLI::Run.empty_listing_note("status>=400", nil, false)
+      .should eq(%(no flows match "status>=400" (`status>=400` is searched as text — did you mean `status:>=400`?)))
+  end
+
   it "stays quiet about All, which excluded nothing" do
     # The caller passes nil for a non-narrowing view. Naming it would send an operator looking
     # at a lens that had no part in the answer.
@@ -90,9 +136,27 @@ describe "gori run history — the empty-listing sentence" do
 
   it "names both lenses on an empty HAR too" do
     Gori::CLI::Run.empty_har_note(nil, nil).should eq("no flows written to the HAR")
+    Gori::CLI::Run.empty_har_note(nil, nil, true).should eq("no flows written to the HAR (static assets hidden)")
     Gori::CLI::Run.empty_har_note("status:200", "Errors")
       .should eq(%(no flows written to the HAR (query "status:200", view "Errors")))
     Gori::CLI::Run.empty_har_note(nil, "Errors")
       .should eq(%(no flows written to the HAR (view "Errors")))
+  end
+end
+
+# The command ends in `abort`, so what it calls is pinned from the source: the one delete every
+# surface shares (`SavedViews.delete`, whose outcomes spec/saved_views_spec.cr drives), never a
+# bare remove that leaves the active-view pointer to a second write.
+describe "gori run views rm — the active-view pointer" do
+  it "deletes through SavedViews.delete" do
+    body = File.read("#{__DIR__}/../../../src/gori/cli/run/views.cr")
+      .split("def self.cmd_views_rm", 2)[1].split("\n      end\n", 2)[0]
+    body.should contain("case SavedViews.delete(store, view)")
+    body.should_not contain("SavedViews.remove(")
+  end
+
+  it "reports a move whose pointer could not follow it" do
+    File.read("#{__DIR__}/../../../src/gori/cli/run/views.cr")
+      .should contain("unless SavedViews.repoint_active_if(store, view, moved)")
   end
 end

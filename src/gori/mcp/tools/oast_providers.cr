@@ -39,7 +39,7 @@ module Gori
         end)
       end
 
-      @[Tool("create_oast_provider", gated: true, agent_action: true)]
+      @[Tool("create_oast_provider", gated: true, agent_action: true, permission: "write")]
       private def create_oast_provider(h) : Result
         fields = oast_provider_fields(h)
         return fields if fields.is_a?(Result)
@@ -57,7 +57,7 @@ module Gori
       # Every field an update does NOT mention keeps its current value. Replacing the whole
       # row instead would silently drop the provider's auth TOKEN whenever a caller edited,
       # say, only the name. (Same defaulting rule as update_scope_rule.)
-      @[Tool("update_oast_provider", gated: true, agent_action: true)]
+      @[Tool("update_oast_provider", gated: true, agent_action: true, permission: "write")]
       private def update_oast_provider(h) : Result
         row = oast_provider_row(h)
         return row if row.is_a?(Result)
@@ -66,8 +66,15 @@ module Gori
 
         kind_s = str(h, "kind").try(&.strip).presence
         kind = kind_s ? Oast::ProviderKind.parse?(kind_s) : Oast::ProviderKind.parse?(existing.kind)
-        return err("unknown provider kind '#{kind_s}' (expected #{OAST_KINDS.join("|")})",
-          "INVALID_ARGUMENT", field: "kind") unless kind
+        unless kind
+          # Name the kind that failed: with no `kind` passed it is the STORED one (a row a
+          # newer gori wrote), and "unknown provider kind ''" blamed an argument never sent.
+          return err("unknown provider kind '#{kind_s}' (expected #{OAST_KINDS.join("|")})",
+            "INVALID_ARGUMENT", field: "kind") if kind_s
+          return err("this provider's stored kind '#{existing.kind}' is not one this gori supports " \
+                     "(#{OAST_KINDS.join("|")}) — pass 'kind' to change it, or delete the provider",
+            "INVALID_ARGUMENT", field: "kind")
+        end
 
         name = str(h, "name").try(&.strip).presence || existing.name
         host = str(h, "host").try(&.strip).presence || existing.host
@@ -87,7 +94,7 @@ module Gori
         Result.new({"id" => "p_#{row}", "name" => name, "kind" => kind.label}.to_json)
       end
 
-      @[Tool("set_oast_provider_enabled", gated: true, agent_action: true)]
+      @[Tool("set_oast_provider_enabled", gated: true, agent_action: true, permission: "write")]
       private def set_oast_provider_enabled(h) : Result
         row = oast_provider_row(h)
         return row if row.is_a?(Result)
@@ -97,7 +104,7 @@ module Gori
         Result.new({"id" => "p_#{row}", "enabled" => enabled}.to_json)
       end
 
-      @[Tool("delete_oast_provider", gated: true, agent_action: true)]
+      @[Tool("delete_oast_provider", gated: true, agent_action: true, permission: "write")]
       private def delete_oast_provider(h) : Result
         row = oast_provider_row(h)
         return row if row.is_a?(Result)
@@ -109,8 +116,7 @@ module Gori
       # lives in the user's settings.json and is shared across every project, so this server —
       # which is bound to one project DB — must not rewrite it.
       private def oast_provider_row(h) : Int64 | Result
-        id = str(h, "id").try(&.strip).presence
-        return err("missing required 'id' (see list_oast_providers)", "INVALID_ARGUMENT", field: "id") unless id
+        id = required_str(h, "id", "(see list_oast_providers)")
         if id.starts_with?("g_")
           return err("'#{id}' is a GLOBAL provider (stored in settings.json, shared across projects) — it cannot be changed per project",
             "INVALID_ARGUMENT", field: "id")
@@ -123,8 +129,7 @@ module Gori
 
       # Validate + normalize the shared create/update field set.
       private def oast_provider_fields(h) : {String, String, String, String?, Bool} | Result
-        name = str(h, "name").try(&.strip).presence
-        return err("missing required 'name'", "INVALID_ARGUMENT", field: "name") unless name
+        name = required_str(h, "name")
         kind_s = str(h, "kind").try(&.strip).presence || "interactsh"
         # An unparseable kind would be stored verbatim and then never match a ProviderKind at
         # listen time — the provider would simply never fire. Refuse it here.
@@ -153,6 +158,8 @@ module Gori
         tool j, "oast_presets",
           "List built-in public OAST providers (interactsh servers, BOAST, webhook.site, postbin)." { }
 
+        return unless @allow_actions
+
         tool j, "oast_poll",
           "Poll an OAST session (from oast_start) for new out-of-band callbacks. Returns only " \
           "interactions not already seen on this session; each has protocol/method/source/" \
@@ -166,25 +173,29 @@ module Gori
           s.field "session_id", strprop("session id returned by oast_start"), required: true
         end
 
-        return unless @allow_actions
-
         tool j, "oast_start",
-          "Register an OAST listener and return {session_id, provider, provider_id, server, " \
-          "payload_url}. Put payload_url in a target, then oast_poll for hits. Two ways to " \
-          "pick where it registers: pass `provider_id` to use one of the operator's SAVED " \
-          "providers (list_oast_providers — it supplies the host AND the auth token, which " \
-          "you cannot read back yourself since tokens come back [REDACTED]), or pass an " \
-          "ad-hoc `provider`/`server`/`token`. With NEITHER it defaults to interactsh on a " \
-          "PUBLIC server, which means the callbacks — and the hostnames you are testing — " \
-          "land on third-party infrastructure." do |s|
+          "Register an OAST listener and return {session_id, store_session_id, provider, " \
+          "provider_id, server, payload_url}. Put payload_url in a target, then oast_poll for " \
+          "hits. Two ways to pick where it registers: pass `provider_id` to use one of the " \
+          "operator's SAVED providers (list_oast_providers — it supplies the host AND the auth " \
+          "token, which you cannot read back yourself since tokens come back [REDACTED]), or " \
+          "pass an ad-hoc `provider`/`server`/`token`. With NEITHER it defaults to interactsh " \
+          "on a PUBLIC server, which means the callbacks — and the hostnames you are testing — " \
+          "land on third-party infrastructure. Pass persist:true to make it a PROJECT listener " \
+          "— required if you want probe_scan's blind SSRF/XXE/command-injection/RFI rules to plant " \
+          "anything, since they mint against a stored session." do |s|
           s.field "provider_id", strprop("id of a saved provider from list_oast_providers (p_<n> project, g_<hex> global); supplies host + token, and cannot be combined with server/token")
           s.field "provider", enumprop("ad-hoc provider kind to register with (default interactsh)", OAST_KINDS)
           s.field "server", strprop("provider server/base URL (default: the provider's public preset)")
           s.field "token", strprop("optional provider auth token")
+          s.field "persist", boolprop("save the registration as a project OAST session (default false). It then appears in list_oast_sessions, oast_poll files its callbacks into the project, probe_scan's out-of-band rules can mint against it, and oast_resume can re-open it in a later process — but oast_stop no longer deregisters it; use oast_release for that")
         end
 
         tool j, "oast_stop",
-          "Deregister and stop an OAST session (frees the server-side registration)." do |s|
+          "Stop polling an OAST session. An ad-hoc session (oast_start without persist) is " \
+          "also DEREGISTERED, freeing the server-side registration; a persisted one keeps its " \
+          "registration so already-planted payloads keep resolving and oast_resume can re-open " \
+          "it — call oast_release to tear that one down." do |s|
           s.field "session_id", strprop("session id returned by oast_start"), required: true
         end
 

@@ -89,6 +89,39 @@ describe Gori::MCP::Server do
       end
     end
 
+    # `would_paint` is the number that answers "will I see this", and it depends on WHERE the
+    # rule would live: every global rule resolves before every project one, so a project rule
+    # can never claim a row from a global candidate. Previewing everything as a project rule
+    # reported 0 painted for a rule that paints every row.
+    it "counts what resolves ahead of a preview candidate by the scope it would live in" do
+      with_store do |store|
+        3.times do |i|
+          store.insert_flow(Gori::Store::CapturedRequest.new(
+            created_at: 1_i64, scheme: "https", host: "acme.test", port: 443,
+            method: "GET", target: "/#{i}", http_version: "HTTP/1.1",
+            head: "GET /#{i} HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice, body: nil,
+            source: Gori::FlowSource::Kind::Proxy))
+        end
+        store.insert_color_rule("host:acme", "red", Gori::Store::MarkerStyle::Full, "claims", true)
+
+        as_project = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"preview_color_rule","arguments":{"when":"host:acme"}}})
+        p1 = mcp_tool_payload(mcp_drive(store, as_project)[0])
+        p1["scope"].as_s.should eq("project")
+        p1["would_match"].as_i64.should eq(3)
+        p1["would_paint"].as_i64.should eq(0) # the project rule above it claims all three
+
+        as_global = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"preview_color_rule","arguments":{"when":"host:acme","scope":"global"}}})
+        p2 = mcp_tool_payload(mcp_drive(store, as_global)[0])
+        p2["scope"].as_s.should eq("global")
+        p2["would_match"].as_i64.should eq(3)
+        p2["would_paint"].as_i64.should eq(3) # …and cannot claim anything from a global one
+
+        # An unrecognised scope is refused, not clamped — the same answer every other tool gives.
+        bad = %({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"preview_color_rule","arguments":{"when":"host:acme","scope":"globl"}}})
+        mcp_drive(store, bad)[0]["result"]["isError"].as_bool.should be_true
+      end
+    end
+
     it "manages custom colours, which a rule can then reference on any surface" do
       before = Gori::Settings.colormarker_colors
       begin
@@ -216,6 +249,193 @@ describe Gori::MCP::Server do
     end
   end
 
+  # #1237: the short-circuit sub-kinds through MCP — the same engine and the same validator the
+  # CLI and the TUI use, so an agent cannot build a rule the others would refuse.
+  describe "mock rules (#1237)" do
+    it "creates a map-local rule and a fault rule, and lists their sub-kind" do
+      with_store do |store|
+        dir = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","pattern":"GET /static/","dir":"/srv/js","strip_prefix":"/static/","fallthrough":true}}})
+        created = mcp_tool_payload(mcp_drive(store, dir)[0])
+        created["respond"].as_s.should eq("dir")
+        fault = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","pattern":"/pay","fault":"reset","delay_ms":250}}})
+        mcp_tool_payload(mcp_drive(store, fault)[0])["respond"].as_s.should eq("fault")
+
+        rules = mcp_tool_payload(mcp_drive(store, %({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_rules"}}))[0])["rules"]
+        rules[0]["respond"].as_s.should eq("dir")
+        rules[0]["body_file"].as_s.should eq(File.expand_path("/srv/js"))
+        rules[0]["respond_args"]["strip_prefix"].as_s.should eq("/static/")
+        rules[0]["fallthrough"].as_bool.should be_true
+        rules[1]["respond"].as_s.should eq("fault")
+        rules[1]["respond_args"]["fault"].as_s.should eq("reset")
+        rules[1]["respond_args"]["delay_ms"].as_i.should eq(250)
+      end
+    end
+
+    it "refuses a shape the proxy could only fail on, with the shared validator's reason" do
+      with_store do |store|
+        {
+          %({"op":"short_circuit","pattern":"/p","fault":"reset","replacement":"200 OK"}),
+          %({"op":"short_circuit","pattern":"/p","dir":"/srv","strip_prefix":"static"}),
+          %({"op":"short_circuit","pattern":"/p","dir":"/srv","body_file":"/x"}),
+          %({"op":"short_circuit","pattern":"/p","fault":"slowloris"}),
+          %({"op":"short_circuit","pattern":"/p","replacement":"200 OK","fallthrough":true}),
+          %({"op":"short_circuit","pattern":"/p","fault":"close","delay_ms":999999}),
+          %({"op":"replace","pattern":"/p","fault":"close"}),
+        }.each do |args|
+          call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rule","arguments":#{args}}})
+          res = mcp_drive(store, call)[0]["result"]
+          res["isError"].as_bool.should be_true
+          res["structuredContent"]["error_code"].as_s.should eq("INVALID_ARGUMENT")
+        end
+        store.match_rules.should be_empty
+      end
+    end
+
+    it "snapshots a captured response with from_flow_id, and refuses one it cannot" do
+      with_store do |store|
+        flow = mcp_seed_flow(store, "acme.test", "GET", "/api/me?x=1", 200,
+          "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n", %({"isAdmin":false}).to_slice)
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","from_flow_id":#{flow}}}})
+        created = mcp_tool_payload(mcp_drive(store, call)[0])
+        created["match"].as_s.should eq("regex")
+        rule = store.match_rules.first
+        rule.host.should eq("acme.test")
+        rule.pattern.should eq("\\AGET /api/me(\\?| )")
+        rule.replacement.should eq("HTTP/1.1 200 OK\nContent-Type: application/json\n\n{\"isAdmin\":false}")
+
+        pending = mcp_seed_flow(store, "acme.test", "GET", "/pending")
+        refused = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","from_flow_id":#{pending}}}})
+        res = mcp_drive(store, refused)[0]["result"]
+        res["isError"].as_bool.should be_true
+        res["structuredContent"]["error_code"].as_s.should eq(Gori::MockFromFlow::NO_RESPONSE)
+        store.match_rules.size.should eq(1)
+      end
+    end
+
+    # A client that sends every schema property sends "" for the ones it leaves alone, so with
+    # from_flow_id an empty host or replacement keeps the flow's draft; '*' is all hosts.
+    it "keeps the draft for empty fields and takes '*' as all hosts" do
+      with_store do |store|
+        flow = mcp_seed_flow(store, "api.acme.test", "GET", "/me", 200,
+          "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n", "ok".to_slice)
+        filled = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","from_flow_id":#{flow},"host":"","replacement":"","pattern":""}}})
+        mcp_tool_payload(mcp_drive(store, filled)[0])
+        store.match_rules.last.host.should eq("api.acme.test")
+        all = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","from_flow_id":#{flow},"host":"*"}}})
+        mcp_tool_payload(mcp_drive(store, all)[0])
+        store.match_rules.last.host.should eq("*")
+        Gori::Rules.host_matches?("*", "other.test").should be_true
+      end
+    end
+
+    # A partial update keeps every sub-kind field it does not name.
+    it "updates one mock argument and keeps the others" do
+      with_store do |store|
+        create = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","pattern":"/pay","fault":"hang","hang_ms":5000}}})
+        id = mcp_tool_payload(mcp_drive(store, create)[0])["id"].as_i64
+        upd = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"update_rule","arguments":{"id":#{id},"delay_ms":100}}})
+        mcp_tool_payload(mcp_drive(store, upd)[0])["updated"].as_bool.should be_true
+        rule = store.match_rules.first
+        rule.respond.fault?.should be_true
+        rule.args.fault.should eq(Gori::Store::FaultKind::Hang)
+        rule.args.hang_ms.should eq(5000)
+        rule.args.delay_ms.should eq(100)
+      end
+    end
+
+    # Switching a rule to another answer drops what the new one does not read, as the TUI's
+    # `source:` row does — rather than carrying it over for the validator to refuse.
+    it "switches an existing rule to another answer" do
+      with_store do |store|
+        hang = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","pattern":"/pay","fault":"hang","hang_ms":5000}}})
+        id = mcp_tool_payload(mcp_drive(store, hang)[0])["id"].as_i64
+        to_close = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"update_rule","arguments":{"id":#{id},"fault":"close"}}})
+        mcp_tool_payload(mcp_drive(store, to_close)[0])["updated"].as_bool.should be_true
+        store.match_rules.first.respond_args.should eq(%({"fault":"close"}))
+
+        dir = %({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","pattern":"GET /s/","dir":"/srv","strip_prefix":"/s/"}}})
+        did = mcp_tool_payload(mcp_drive(store, dir)[0])["id"].as_i64
+        to_inline = %({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"update_rule","arguments":{"id":#{did},"respond":"inline","replacement":"200 OK"}}})
+        mcp_tool_payload(mcp_drive(store, to_inline)[0])["updated"].as_bool.should be_true
+        rule = store.match_rules.find! { |r| r.id == did }
+        rule.respond.inline?.should be_true
+        rule.respond_args.should eq("")
+        rule.body_file.should eq("")
+      end
+    end
+
+    # A client that fills every schema property sends the mocking arguments empty.
+    it "reads empty mocking arguments as absent, on a plain rule and a stub" do
+      with_store do |store|
+        blank = %("respond":"","dir":"","strip_prefix":"","fallthrough":false,"fault":"","delay_ms":0,"from_flow_id":0)
+        plain = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rule","arguments":{"pattern":"a","replacement":"b",#{blank}}}})
+        mcp_tool_payload(mcp_drive(store, plain)[0])["id"].as_i64.should be > 0
+        stub = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","pattern":"/x","replacement":"200 OK",#{blank}}}})
+        mcp_tool_payload(mcp_drive(store, stub)[0])["respond"].as_s.should eq("inline")
+      end
+    end
+
+    it "moves a dir rule's directory through body_file, and refuses two answers at once" do
+      with_store do |store|
+        dir = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","pattern":"GET /s/","dir":"/srv/a","strip_prefix":"/s/"}}})
+        id = mcp_tool_payload(mcp_drive(store, dir)[0])["id"].as_i64
+        move = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"update_rule","arguments":{"id":#{id},"body_file":"/srv/b"}}})
+        mcp_tool_payload(mcp_drive(store, move)[0])["updated"].as_bool.should be_true
+        rule = store.match_rules.first
+        rule.respond.dir?.should be_true
+        rule.body_file.should eq(File.expand_path("/srv/b"))
+        rule.args.strip_prefix.should eq("/s/")
+
+        both = %({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","pattern":"/p","dir":"/x","fault":"reset"}}})
+        mcp_drive(store, both)[0]["result"]["isError"].as_bool.should be_true
+        named = %({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","pattern":"/p","respond":"inline","replacement":"200 OK","fault":"reset"}}})
+        mcp_drive(store, named)[0]["result"]["isError"].as_bool.should be_true
+        store.match_rules.size.should eq(1)
+      end
+    end
+
+    it "switches a stub to a fault without making the caller blank the response" do
+      with_store do |store|
+        stub = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","pattern":"/p","replacement":"200 OK\\n\\nhi"}}})
+        id = mcp_tool_payload(mcp_drive(store, stub)[0])["id"].as_i64
+        upd = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"update_rule","arguments":{"id":#{id},"fault":"reset"}}})
+        mcp_tool_payload(mcp_drive(store, upd)[0])["updated"].as_bool.should be_true
+        rule = store.match_rules.first
+        rule.respond.fault?.should be_true
+        rule.replacement.should eq("")
+      end
+    end
+
+    it "names the replacement, with the format, for a stub that does not parse" do
+      with_store do |store|
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","pattern":"/x","replacement":"hello"}}})
+        res = mcp_drive(store, call)[0]["result"]["structuredContent"]
+        res["field"].as_s.should eq("replacement")
+        res["message"].as_s.should contain("status line")
+      end
+    end
+
+    it "lists the sub-kind only on a short-circuit rule" do
+      with_store do |store|
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rule","arguments":{"pattern":"a","replacement":"b"}}})
+        mcp_drive(store, call)
+        rule = mcp_tool_payload(mcp_drive(store, %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_rules"}}))[0])["rules"][0]
+        rule.as_h.has_key?("respond").should be_false
+      end
+    end
+
+    it "refuses a literal match for a pattern it drafted, which could never match" do
+      with_store do |store|
+        flow = mcp_seed_flow(store, "acme.test", "GET", "/api/me", 200, "HTTP/1.1 200 OK\r\n\r\n", "ok".to_slice)
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"create_rule","arguments":{"op":"short_circuit","from_flow_id":#{flow},"match":"literal"}}})
+        res = mcp_drive(store, call)[0]["result"]
+        res["isError"].as_bool.should be_true
+        res["structuredContent"]["message"].as_s.should contain("regex")
+        store.match_rules.should be_empty
+      end
+    end
+  end
+
   describe "match&replace rules" do
     it "creates, lists, toggles, and deletes a rule" do
       with_store do |store|
@@ -237,6 +457,38 @@ describe Gori::MCP::Server do
 
         del = %({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"delete_rule","arguments":{"id":#{id}}}})
         mcp_tool_payload(mcp_drive(store, del)[0])["deleted"].as_bool.should be_true
+        store.match_rules.should be_empty
+      end
+    end
+
+    it "lists an unknown rule as inert, refuses enable/edit, and still allows deletion" do
+      with_store do |store|
+        id = store.insert_rule(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+          "POST /pay", "HTTP/1.1 200 OK", name: "future rule")
+        store.@db.exec("UPDATE match_rules SET op = 'future_short_circuit', part = 'future_head' WHERE id = ?", id)
+
+        listed = mcp_tool_payload(mcp_drive(store, %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_rules"}}))[0])
+        rule = listed["rules"][0]
+        rule["op"].as_s.should eq("future_short_circuit")
+        rule["part"].as_s.should eq("future_head")
+        rule["inert"].as_bool.should be_true
+        rule["inert_reason"].as_s.should contain("unknown op \"future_short_circuit\"")
+
+        enable = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"set_rule_enabled","arguments":{"id":#{id},"enabled":true}}})
+        refused_enable = mcp_drive(store, enable)[0]["result"]
+        refused_enable["isError"].as_bool.should be_true
+        refused_enable["structuredContent"]["error_code"].as_s.should eq("INVALID_ARGUMENT")
+        refused_enable["structuredContent"]["message"].as_s.should contain("cannot enable")
+        store.match_rules.first.enabled?.should be_true
+
+        update = %({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"update_rule","arguments":{"id":#{id},"replacement":"changed"}}})
+        refused_update = mcp_drive(store, update)[0]["result"]
+        refused_update["isError"].as_bool.should be_true
+        refused_update["structuredContent"]["message"].as_s.should contain("cannot edit")
+        store.match_rules.first.replacement.should eq("HTTP/1.1 200 OK")
+
+        delete = %({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"delete_rule","arguments":{"id":#{id}}}})
+        mcp_tool_payload(mcp_drive(store, delete)[0])["deleted"].as_bool.should be_true
         store.match_rules.should be_empty
       end
     end
@@ -275,7 +527,7 @@ describe Gori::MCP::Server do
     it "lists presets and installs one as ordinary Match & Replace rules" do
       with_store do |store|
         presets = mcp_tool_payload(mcp_drive(store, %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_rule_presets"}}))[0])
-        presets.as_a.map(&.["key"].as_s).should contain("remove-csp")
+        presets["items"].as_a.map(&.["key"].as_s).should contain("remove-csp")
 
         add = %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_rule_from_preset","arguments":{"preset":"remove-csp"}}})
         res = mcp_tool_payload(mcp_drive(store, add)[0])
@@ -441,6 +693,30 @@ describe Gori::MCP::Server do
         resp["isError"].as_bool.should be_true
         resp["structuredContent"]["error_code"].as_s.should eq("INVALID_ARGUMENT")
         store.extract_rules.first.selector.should eq("sid") # unchanged
+      end
+    end
+
+    # The rule object `gori run rewriter extract --format json` prints too, key for key and in
+    # the same order — one listing, two surfaces.
+    it "lists an extract rule under the CLI's field names, in the CLI's order" do
+      with_store do |store|
+        id = store.insert_extract_rule("CSRF", "path:/login", Gori::ExtractKind::Position,
+          pos_start: 3, pos_end: 9, host: "acme.test", enabled: false)
+        r = tools_for(store).call("list_extract_rules", JSON.parse("{}"))
+        r.is_error.should be_false
+        payload = JSON.parse(r.text)
+        payload["count"].as_i.should eq(1)
+        rule = payload["rules"][0]
+        rule.as_h.keys.should eq(%w[id enabled name when host kind selector pos_start pos_end])
+        rule["id"].as_i64.should eq(id)
+        rule["enabled"].as_bool.should be_false
+        rule["name"].as_s.should eq("CSRF")
+        rule["when"].as_s.should eq("path:/login")
+        rule["host"].as_s.should eq("acme.test")
+        rule["kind"].as_s.should eq("position")
+        rule["selector"].as_s.should eq("")
+        rule["pos_start"].as_i.should eq(3)
+        rule["pos_end"].as_i.should eq(9)
       end
     end
 

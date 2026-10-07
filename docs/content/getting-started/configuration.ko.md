@@ -1,5 +1,5 @@
 +++
-title = "설정"
+title = "gori 설정과 루트 CA"
 description = "gori가 데이터를 저장하는 위치, 네트워크 설정 방법, 그리고 루트 CA를 다룹니다."
 weight = 40
 +++
@@ -25,7 +25,7 @@ gori settings          # print the settings.json path
 gori settings --edit   # open it in your editor
 ```
 
-파일을 직접 편집할 일은 거의 없습니다. 파일에 담기는 모든 항목은 하나의 화면, **Preferences** 모달에서 편집할 수 있으며, 네 개의 서브탭(General, Appearance, Editor & Keys, Network & Tabs)으로 묶여 있습니다.
+파일을 직접 편집할 일은 거의 없습니다. 파일에 담기는 모든 항목은 하나의 화면, **Preferences** 모달에서 편집할 수 있으며, 다섯 개의 서브탭(General, Appearance, Editor & Keys, Network & Tabs, AI)으로 묶여 있습니다.
 
 | 여는 방법 | 도착 지점 |
 |-----------|-----------|
@@ -37,17 +37,17 @@ gori settings --edit   # open it in your editor
 
 ## Network {#network}
 
-기본적으로 프록시는 `127.0.0.1:8070`에서 수신하며 대상에 직접 연결합니다. 이를 바꿀 수 있는 곳은 세 군데이며, 우선순위가 높은 순서대로:
+업스트림 설정이나 프로세스 프록시 환경변수가 없으면 프록시는 `127.0.0.1:8070`에서 수신하며 대상에 직접 연결합니다. gori 쪽 경로를 바꿀 수 있는 곳은 세 군데이며, 우선순위가 높은 순서대로:
 
-1. **프로젝트별**: **Project** 탭에서 한 프로젝트의 바인드 주소, 포트, 업스트림을 고정합니다. 해당 프로젝트에 한해 우선합니다.
+1. **프로젝트별**: **Project** 탭이나 헤드리스로 [`gori run project network`](/ko/reference/cli/#project-network)를 써서 한 프로젝트의 바인드 주소, 포트, 업스트림을 고정합니다. 해당 프로젝트에 한해 우선합니다.
 2. **CLI 플래그**: `--listen` / `--port`는 현재 프로세스에 한해 전역 기본값을 재정의하며 디스크에 기록되지 않습니다.
 3. **`settings.json`의 `network`**: 공유되는 기본값으로, 첫 실행 마법사와 Preferences → **Network**가 편집합니다.
 
-아무것도 설정되지 않으면 공장 기본값은 `127.0.0.1:8070`, 직접 연결입니다. 모든 키는 [network](/ko/reference/config/#network)를, 정확한 우선순위는 [프로젝트별 재정의](/ko/reference/config/#per-project-overrides)를 참고하세요.
+아무것도 설정되지 않으면 공장 기본값은 `127.0.0.1:8070`, 직접 연결입니다. `network.upstream_proxy`가 비어 있으면 gori는 일반적인 `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` 환경변수(소문자 표기도 지원)와 `NO_PROXY` / `no_proxy` 예외도 사용하며, `localhost`와 루프백 목적지는 항상 직접 연결합니다. 명시적인 프로젝트 업스트림, 업스트림 규칙, 또는 비어 있지 않은 gori 스칼라 설정이 이 환경변수보다 우선합니다. 모든 키는 [network](/ko/reference/config/#network)를, 정확한 우선순위는 [프로젝트별 재정의](/ko/reference/config/#per-project-overrides)를 참고하세요.
 
 ## 루트 CA {#the-root-ca}
 
-HTTPS를 인터셉트하려면 클라이언트가 gori의 루트 인증서를 신뢰해야 합니다. 이 인증서는 `~/.gori/ca`에 `root.crt.pem`과 `root.key.pem`으로 보관됩니다.
+HTTPS를 인터셉트하려면 클라이언트가 gori의 루트 인증서를 신뢰해야 합니다. 이 인증서는 `$GORI_HOME/ca`(기본값 `~/.gori/ca`)에 `root.crt.pem`과 `root.key.pem`으로 보관됩니다.
 
 ```bash
 gori ca                       # print the certificate path
@@ -71,6 +71,8 @@ gori ca import --cert root.crt.pem --key root.key.pem --yes
 같은 동작을 팔레트(**Import CA certificate**)에서도 할 수 있습니다. gori는 가져오기 전에 키가 인증서와 일치하는지, 그 인증서가 CA인지, 그리고 그 키로 실제로 리프 인증서를 서명할 수 있는지 확인합니다. 리프는 SHA-256으로 서명하므로 Ed25519 · Ed448 루트는 거부됩니다. 신뢰용으로는 `root.crt.pem`만 배포하고, `root.key.pem`은 비밀로 유지하세요. [`gori ca import`](/ko/reference/cli/#gori-ca-import)를 참고하세요.
 
 팔레트의 **Open browser** 동작은 이미 CA를 신뢰하고 프록시를 경유하는 격리된 프로파일로 설치된 브라우저를 실행합니다([빠른 시작](/ko/getting-started/quick-start/) 참조).
+
+커맨드라인 도구에는 팔레트의 **Open shell** 동작이 같은 일을 터미널에 해줍니다. **Open shell here**는 프록시와 CA 번들이 설정된 `$SHELL`에 이 터미널을 넘겨주고(그동안 gori는 계속 캡처하며, 셸을 나가면 돌아옵니다. 셸이 화면을 쓰는 동안에는 붙잡힌 요청을 넘길 수 없으므로 캡처는 켜져 있고 인터셉트는 꺼져 있어야 합니다), **Copy env**는 다른 창이 자체 환경을 평가할 수 있도록 단일 줄 명령(`eval "$(gori run shell --print ...)"`)을 클립보드에 복사합니다. 어느 터미널에서든 `gori run shell`로도 같은 일을 할 수 있습니다([`gori run shell`](/ko/reference/cli/#run-shell) 참조).
 
 ## 전체 레퍼런스 {#full-reference}
 

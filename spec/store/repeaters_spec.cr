@@ -142,7 +142,7 @@ describe "Gori::Store repeater tabs (v9)" do
       id = store.insert_repeater("https://a.test", "GET / HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
       head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n".to_slice
       body = "PONG".to_slice
-      store.update_repeater_response(id, head, body, nil, 4200_i64)
+      store.update_repeater_response(id, head, body, nil, 4200_i64, request_sha256: nil)
       r = store.repeaters.find!(&.id.==(id))
       String.new(r.response_head.not_nil!).should eq("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n")
       String.new(r.response_body.not_nil!).should eq("PONG")
@@ -153,10 +153,31 @@ describe "Gori::Store repeater tabs (v9)" do
     end
   end
 
+  it "stores the digest of the request that produced the response, and answers NULL for one \
+      persisted without it" do
+    with_store do |store|
+      req = "GET /admin HTTP/1.1\r\nHost: a.test\r\n\r\n"
+      id = store.insert_repeater("https://a.test", req.to_slice, false, true, nil, 0)
+      store.update_repeater_response(id, "HTTP/1.1 200 OK\r\n\r\n".to_slice, "ok".to_slice, nil, 1_i64,
+        request_sha256: Gori::Evidence.request_digest(req.to_slice))
+      store.get_repeater_full(id).not_nil!.response_request_sha256
+        .should eq(Gori::Evidence.request_digest(req.to_slice))
+      # The full project-open read carries it too — the freeze path is not the only reader.
+      store.repeaters.find!(&.id.==(id)).response_request_sha256.should_not be_nil
+
+      # A later response write REPLACES the digest with its own request's; the column belongs
+      # to the response beside it, not to the row's history.
+      store.update_repeater(id, "https://a.test", "GET / HTTP/1.1\r\n\r\n".to_slice, false, true, nil)
+      store.update_repeater_response(id, "HTTP/1.1 204 No Content\r\n\r\n".to_slice, nil, nil, 2_i64,
+        request_sha256: nil)
+      store.get_repeater_full(id).not_nil!.response_request_sha256.should be_nil
+    end
+  end
+
   it "repeaters_meta omits the response BLOBs (lighter reconcile poll)" do
     with_store do |store|
       id = store.insert_repeater("https://a.test", "GET / HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
-      store.update_repeater_response(id, "HTTP/1.1 200 OK\r\n\r\n".to_slice, "body".to_slice, nil, 1_i64)
+      store.update_repeater_response(id, "HTTP/1.1 200 OK\r\n\r\n".to_slice, "body".to_slice, nil, 1_i64, request_sha256: nil)
       meta = store.repeaters_meta.find!(&.id.==(id))
       meta.response_head.should be_nil # not loaded by the metadata query
       meta.response_body.should be_nil
@@ -168,10 +189,69 @@ describe "Gori::Store repeater tabs (v9)" do
   it "persists an errored send (empty head, nil body, error text)" do
     with_store do |store|
       id = store.insert_repeater("https://a.test", "GET / HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
-      store.update_repeater_response(id, Bytes.empty, nil, "connect failed: a.test:443", 0_i64)
+      store.update_repeater_response(id, Bytes.empty, nil, "connect failed: a.test:443", 0_i64, request_sha256: nil)
       r = store.repeaters.find!(&.id.==(id))
       r.response_body.should be_nil
       r.response_error.should eq("connect failed: a.test:443")
+    end
+  end
+
+  # `exec_task_ok` answers "did the batch COMMIT", and an UPDATE aimed at an id nobody has
+  # commits having matched nothing. Every headless send closes the store, dials, and reopens
+  # to write — so a `gori run repeater delete`, a TUI closing the tab or MCP `delete_repeater`
+  # inside that window used to be answered "response saved" about a row that no longer existed.
+  it "answers false for a response written to an id no row has" do
+    with_store do |store|
+      id = store.insert_repeater("https://a.test", "GET / HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
+      store.delete_repeater(id).should be_true
+      store.update_repeater_response(id, "HTTP/1.1 200 OK\r\n\r\n".to_slice, nil, nil, 1_i64,
+        request_sha256: nil).should be_false
+      store.repeater_exists?(id).should be_false
+    end
+  end
+
+  it "answers true for a response written to a live row, and says the row exists" do
+    with_store do |store|
+      id = store.insert_repeater("https://a.test", "GET / HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
+      store.repeater_exists?(id).should be_true
+      store.update_repeater_response(id, "HTTP/1.1 200 OK\r\n\r\n".to_slice, nil, nil, 1_i64,
+        request_sha256: nil).should be_true
+    end
+  end
+
+  # Same window on a minimize `--apply` (CLI and MCP): the search takes seconds, then the row is
+  # rewritten. A tab closed meanwhile must not be reported as applied.
+  it "answers false for a request update aimed at an id no row has" do
+    with_store do |store|
+      id = store.insert_repeater("https://a.test", "GET / HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
+      store.update_repeater(id, "https://a.test", "GET /min HTTP/1.1\r\n\r\n".to_slice, false, true).should be_true
+      store.delete_repeater(id).should be_true
+      store.update_repeater(id, "https://a.test", "GET /min HTTP/1.1\r\n\r\n".to_slice, false, true).should be_false
+    end
+  end
+
+  it "answers false when a peer holds the writer slot" do
+    path = File.tempname("gori-repeaters-contended", ".db")
+    store = Gori::Store.open(path, busy_timeout_ms: 1)
+    peer = DB.open("sqlite3:#{path}?journal_mode=wal&busy_timeout=1")
+    begin
+      id = store.insert_repeater("https://a.test", "GET / HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
+      lock = peer.checkout
+      begin
+        lock.exec("BEGIN IMMEDIATE")
+        store.update_repeater_response(id, "HTTP/1.1 200 OK\r\n\r\n".to_slice, nil, nil, 1_i64,
+          request_sha256: nil).should be_false
+      ensure
+        lock.exec("ROLLBACK") rescue nil
+        lock.release rescue nil
+      end
+    ensure
+      peer.close rescue nil
+      store.close
+      File.delete?(path)
+      File.delete?("#{path}-wal")
+      File.delete?("#{path}-shm")
+      File.delete?("#{path}.open.lock")
     end
   end
 
@@ -259,6 +339,50 @@ describe "Gori::Store repeater tabs (v9)" do
       store.update_repeater(id, "https://ws.test", handshake, false, true, nil,
         ws_keep_key: false, ws_http_only: false).should be_true
       store.repeaters.find!(&.id.==(id)).ws_http_only?.should be_false # …and flips back
+    end
+  end
+end
+
+# A Probe finding raised by a Repeater send names its tab, and promoting the finding links the new
+# issue to that id. Closing the tab must take the name with it, and (V40) the id must not come back.
+describe "Gori::Store delete_repeater and a Probe finding's sample tab" do
+  req = "GET / HTTP/1.1\r\nHost: a.test\r\n\r\n".to_slice
+
+  it "clears the finding's sample tab, so a promotion links no successor" do
+    with_store do |store, _|
+      r1 = store.insert_repeater("https://a.test", req, false, true, nil, 0)
+      store.upsert_probe_issue(Gori::Probe::Detection.new("missing_hsts", "headers", "a.test", "https://a.test/", "t",
+        Gori::Store::Severity::Low, repeater_id: r1))
+      store.probe_issues.first.sample_repeater_id.should eq(r1)
+      store.delete_repeater(r1).should be_true
+      store.probe_issues.first.sample_repeater_id.should be_nil
+
+      r2 = store.insert_repeater("https://other.test", "POST /admin/delete HTTP/1.1\r\nHost: other.test\r\n\r\n".to_slice,
+        false, true, nil, 0)
+      r2.should_not eq(r1) # V40: closing the newest tab no longer frees its id
+      res = Gori::Probe::Triage.promote(store, store.probe_issues.first)
+      res.promoted?.should be_true
+      store.list_links(Gori::Store::LinkOwnerKind::Issue, res.issue_id.not_nil!).should be_empty
+    end
+  end
+
+  # It runs on the writer fiber at every tab close, so it must not scan every finding.
+  it "finds the tab's findings through the partial index" do
+    with_store do |store, _|
+      plan = store.@db.query_all("EXPLAIN QUERY PLAN UPDATE probe_issues SET sample_repeater_id = NULL " \
+                                 "WHERE sample_repeater_id = ?", 1_i64, as: {Int64, Int64, Int64, String}).map(&.[3])
+      plan.join(" ").should contain("idx_probe_issues_sample_repeater")
+    end
+  end
+
+  it "leaves a finding sampled from another tab alone" do
+    with_store do |store, _|
+      keep = store.insert_repeater("https://a.test", req, false, true, nil, 0)
+      gone = store.insert_repeater("https://b.test", req, false, true, nil, 1)
+      store.upsert_probe_issue(Gori::Probe::Detection.new("missing_hsts", "headers", "a.test", "https://a.test/", "t",
+        Gori::Store::Severity::Low, repeater_id: keep))
+      store.delete_repeater(gone).should be_true
+      store.probe_issues.first.sample_repeater_id.should eq(keep)
     end
   end
 end

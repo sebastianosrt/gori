@@ -1,5 +1,7 @@
 require "json"
+require "../../raw_json"
 require "./rule"
+require "../../utf8"
 require "../../ascii_bytes"
 require "../../proxy/h2/grpc"
 require "../../sse"
@@ -38,22 +40,18 @@ module Gori
           check_frameworks(ctx, acc)
         end
 
-        # Evidence for an `Alt-Svc` advertising HTTP/3 (h3 or h3-*). An origin advertising h3
-        # may take a browser without --disable-quic onto QUIC/UDP, bypassing the TCP proxy.
+        # An `Alt-Svc` advertising HTTP/3 (h3 or h3-*). An origin advertising h3 may take a
+        # browser without --disable-quic onto QUIC/UDP, bypassing the TCP proxy.
         #
-        # A DELEGATE, and deliberately still here: `Gori::AltSvc` is the one home for the parse
-        # now that the proxy strips what this rule reports (settings `network.strip_alt_svc`).
-        # Two spellings of "advertises h3" would mean a flow flagged for a header gori had
-        # already removed, or a header removed with nothing saying so.
-        def self.alt_svc_h3_evidence(value : String) : String?
-          Gori::AltSvc.h3_evidence(value)
-        end
-
+        # `Gori::AltSvc` is the one home for the parse now that the proxy strips what this rule
+        # reports (settings `network.strip_alt_svc`). Two spellings of "advertises h3" would
+        # mean a flow flagged for a header gori had already removed, or a header removed with
+        # nothing saying so.
         private def check_alt_svc(ctx : Context, acc : Array(Detection)) : Nil
           return unless resp = ctx.raw_response
           return unless resp.headers.has?("Alt-Svc")
           resp.headers.get_all("Alt-Svc").each do |alt_svc|
-            if ev = self.class.alt_svc_h3_evidence(alt_svc)
+            if ev = Gori::AltSvc.h3_evidence(alt_svc)
               acc << tech(ctx, "tech_http3", "HTTP/3 advertised via Alt-Svc", ev)
               break
             end
@@ -90,13 +88,32 @@ module Gori
           end
         end
 
-        # 101 Switching Protocols with Upgrade: websocket, or a request that asked for WS and
-        # got a matching upgrade response (covers slightly messy origins that omit/case-fold).
+        # A socket gori actually saw open, plus one tolerance for messy origins.
+        #
+        # `ctx.websocket?` is `Store::FlowDetail#websocket?` — the ONE predicate that answers this
+        # across BOTH transports: RFC 6455's `Upgrade:`/101 handshake and RFC 8441's extended
+        # CONNECT over HTTP/2, which is answered `200` and carries no `Upgrade` header at all. The
+        # `status == 101 && Upgrade` spelling this replaced knew only the first, so an application
+        # whose WebSocket rides h2 — the shape every HTTP/2-only origin uses — was never recorded
+        # as having a WebSocket endpoint at all.
+        #
+        # The two arms after it are the tolerances this rule always had, kept verbatim so the
+        # predicate only ever WIDENS: a 101 where either side names the upgrade (the strict one
+        # additionally requires it on the REQUEST), and a request that asked to upgrade paired
+        # with a response that agreed on any status (an origin that answers 200 to an h1
+        # upgrade, or a capture whose status was lost).
         private def websocket?(ctx : Context, resp : Proxy::Codec::RawResponse?) : Bool
-          req_ws = ctx.req.headers.get?("Upgrade").try(&.downcase) == "websocket"
-          resp_ws = resp.try(&.headers.get?("Upgrade").try(&.downcase)) == "websocket"
-          status_ok = ctx.row.status == 101
-          (status_ok && (resp_ws || req_ws)) || (req_ws && resp_ws)
+          return true if ctx.websocket?
+          req_ws = upgrades_to_ws?(ctx.req.headers)
+          resp_ws = !!resp.try { |r| upgrades_to_ws?(r.headers) }
+          (ctx.row.status == 101 && (req_ws || resp_ws)) || (req_ws && resp_ws)
+        end
+
+        # `Upgrade` names the `websocket` token. A LIST-valued field (RFC 9110 §7.8), so a
+        # `Upgrade: websocket, h2c` — and a second `Upgrade:` line — carries it just as much as
+        # the bare value the equality test this replaced demanded.
+        private def upgrades_to_ws?(headers : Proxy::Codec::HeaderList) : Bool
+          headers.lists?("Upgrade", "websocket")
         end
 
         # Path-only form of the request target (strip query / absolute-form origin).
@@ -167,9 +184,9 @@ module Gori
           # (scrub cannot create or destroy an ASCII `"query"`), and the as_h?/as_s? guards below
           # still decide the outcome — so no detection is lost.
           return false unless AsciiBytes.contains_ci?(capped, QUERY_KEY)
-          text = String.new(capped).scrub
+          text = Utf8.text(capped)
           q = begin
-            JSON.parse(text).as_h?.try(&.["query"]?).try(&.as_s?)
+            RawJson.parse(text).as_h?.try(&.["query"]?).try(&.as_s?) # numbers of any size (#1200)
           rescue JSON::ParseException
             nil
           end
@@ -199,14 +216,14 @@ module Gori
         # for prototype-pollution / clobbering findings). Info, and each doubles as a project
         # tech fact via FIXED_TECH_LABELS. Nuxt implies Vue and Next implies React by design —
         # both are reported when both markers are present.
-        FRAMEWORK_MARKERS = [
+        FRAMEWORK_MARKERS = ([
           {/\bdata-reactroot\b|__REACT_DEVTOOLS_GLOBAL_HOOK__|\breact-dom(?:[.-][\w.]*)?\.js\b/, "tech_react", "React", false},
           {/\b__NEXT_DATA__\b|\/_next\/static\//, "tech_nextjs", "Next.js", false},
           {/\bwindow\.__NUXT__\b|\/_nuxt\//, "tech_nuxt", "Nuxt", false},
           {/\bdata-v-[0-9a-f]{6,10}\b|\b__VUE__\b|\bVue\.createApp\b/, "tech_vue", "Vue", false},
           {/\bng-version\s*=\s*"([^"]+)"|\bng-app\b|\[ng-version\]/, "tech_angular", "Angular", true},
           {/\bjquery[-.](\d+\.\d+(?:\.\d+)?)(?:\.min)?\.js\b|\bjQuery\.fn\.jquery\b|\/jquery(?:\.min)?\.js\b/, "tech_jquery", "jQuery", true},
-        ] of {Regex, String, String, Bool}
+        ] of {Regex, String, String, Bool}).map { |(re, code, label, has_version)| {Utf8.tolerant(re), code, label, has_version} }
 
         private def check_frameworks(ctx : Context, acc : Array(Detection)) : Nil
           return unless ctx.html? || ctx.js?

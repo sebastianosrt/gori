@@ -30,6 +30,13 @@ module Gori
         Proxy::H2::HeadCodec::PROTOCOL_MARKER.downcase,
       ]
 
+      # Headers a browser sends to its PROXY and never to an origin (#1389). `Proxy-Connection`
+      # is the one every proxy capture carries: the browser addresses it to gori, gori's codec
+      # keeps it (the capture is byte-exact), and a copied command that replays it straight at
+      # the origin sends a hop-by-hop header meant for a proxy that is not in the path. Only the
+      # EXPORTS drop it — a Repeater or Fuzzer replay of the capture still sends what was captured.
+      PROXY_ONLY_HEADERS = {"proxy-connection"}
+
       # The curl line for one request. `wire` is the request as it'd be sent (CRLF-framed,
       # env-expanded — the bytes repeater uses), `target` the "scheme://host[:port]" base that
       # resolves an origin-form request line ("GET /p HTTP/1.1") into a full URL. nil when there
@@ -88,9 +95,12 @@ module Gori
         notes = [] of String
         # The stored body is WIRE bytes. curl frames `--data-raw` itself, so the chunk framing
         # has to come off with the coding that declared it.
-        entity, transfer_encoding = unchunk(header_lines, body, notes)
+        pairs = [] of {String, String}
+        each_header(header_lines) { |n, v| pairs << {n, v} }
+        entity, transfer_encoding = unchunk(transfer_codings(pairs), body, notes)
         parts = ["curl #{shell_quote(Escape.percent_encode_non_ascii(url))}"]
         parts << "--globoff" if globbed?(url)
+        parts << "--path-as-is" if dot_segments?(url)
         if flag = version_flag(version, url)
           parts << flag
         end
@@ -104,10 +114,12 @@ module Gori
           end
         end
         te_written = false
+        content_type = false
         each_header(header_lines) do |name, value|
           down = name.downcase
+          content_type = true if down == "content-type"
           next if down == "content-length"
-          next if MARKER_HEADERS.includes?(down)
+          next if MARKER_HEADERS.includes?(down) || PROXY_ONLY_HEADERS.includes?(down)
           # curl derives Host FROM THE URL — which is the captured header only when the capture's
           # Host IS the URL's authority. When it is not, that disagreement is the request (a Host
           # header injection test is nothing else), so it has to ride on the command.
@@ -124,6 +136,14 @@ module Gori
             next
           end
           parts << "-H #{shell_quote(header_item(name, value))}"
+        end
+        # curl gives a `--data-raw` body a `Content-Type: application/x-www-form-urlencoded` of
+        # its own when the command names none — measured, curl 8.7.1 — so a capture that sent a
+        # body with NO Content-Type came out of the command with one. `-H 'Content-Type:'` is
+        # curl's "send none". Only beside a body that is actually on the command: a NUL body is
+        # omitted, and with no body curl adds nothing.
+        if !entity.empty? && !content_type && !entity.to_slice.includes?(0_u8)
+          parts << "-H #{shell_quote("Content-Type:")}"
         end
         parts << data_argument(entity) unless entity.empty?
         # LAST, like `data_argument`'s refusal and for the same reason: a `#` comment swallows
@@ -210,10 +230,12 @@ module Gori
       # `gzip, chunked` is framing over CONTENT the origin still has to inflate, so the gzip
       # layer stays on the command and on the bytes — the same split `ContentDecode` draws
       # between framing and compression, and the same reason `Content-Encoding` is untouched.
-      private def self.unchunk(header_lines : Array(String), body : String,
-                               notes : Array(String)) : {String, String?}
+      #
+      # `codings` is `transfer_codings` of the request's headers. Public for
+      # `Export::RequestParts.sendable`, whose generated clients frame their body the same way.
+      def self.unchunk(codings : Array(String), body : String,
+                       notes : Array(String)) : {String, String?}
         return {body, nil} if body.empty?
-        codings = transfer_codings(header_lines)
         return {body, nil} unless codings.last? == "chunked"
         wire = body.to_slice
         entity = String.new(Proxy::Codec::ContentDecode.dechunk(wire))
@@ -241,9 +263,9 @@ module Gori
       # Every Transfer-Encoding coding on the request, in wire order, lowercased. Across ALL
       # TE lines: a repeated field is one comma-separated list (RFC 9110 §5.3), so the final
       # coding is the last token of the last line, not of whichever line was looked at.
-      private def self.transfer_codings(header_lines : Array(String)) : Array(String)
+      def self.transfer_codings(headers : Array({String, String})) : Array(String)
         out = [] of String
-        each_header(header_lines) do |name, value|
+        headers.each do |(name, value)|
           next unless name.downcase == "transfer-encoding"
           value.split(',').each do |tok|
             t = tok.strip.downcase
@@ -327,6 +349,17 @@ module Gori
       # to the same command without the flag (measured against an AF_INET6 listener).
       private def self.globbed?(url : String) : Bool
         url.to_slice.any? { |b| b == 0x5b_u8 || b == 0x5d_u8 || b == 0x7b_u8 || b == 0x7d_u8 }
+      end
+
+      # Does the URL's PATH hold a `.` or `..` segment? curl collapses them before sending
+      # unless told `--path-as-is`, so `/a/../etc/passwd` went out as `/etc/passwd` — measured
+      # against a raw listener, curl 8.7.1. A captured traversal is exactly the request that
+      # must reach the origin as written, so the flag rides along whenever the path has one.
+      # The predicate is `Gori::Url.dot_segments?`, shared with the import that reads it back.
+      private def self.dot_segments?(url : String) : Bool
+        rest = (sep = url.byte_index("://")) ? url.byte_slice(sep + 3) : url
+        slash = rest.byte_index('/') || return false
+        Gori::Url.dot_segments?(rest.byte_slice(slash))
       end
 
       # The protocol flag for a capture whose request line says HTTP/2, else nil. curl

@@ -1,5 +1,7 @@
 require "../proxy/ws/frame"     # Proxy::WS::Shape — the frame shape a WS fuzz job carries
 require "../repeater/ws_engine" # WsEngine::DEFAULT_IDLE — the WS transport's own pacing default
+require "../request_macro/lane" # RequestMacro::Spec / Tally — a run's macro and what it reports
+require "./shape"
 
 module Gori
   # The fuzzer / intruder engine: takes a base HTTP request with marked positions,
@@ -139,7 +141,7 @@ module Gori
       chain_error : String? = nil,
       # The rendered outbound frame script, or nil for an ordinary HTTP job. When set, `bytes`
       # is the HANDSHAKE — so `Outbound.request_target(job.bytes)`, `Result#request` and
-      # `HistoryRecord.split_head_body` all keep reading an HTTP request head, and the
+      # `Env.split_head_body` all keep reading an HTTP request head, and the
       # handshake is itself part 0 of the run's position space (see `Fuzz::WsScript`).
       ws_frames : Array(WsFrame)? = nil
 
@@ -265,7 +267,33 @@ module Gori
                      @head = nil, @body = nil, @request = nil, @retried = false,
                      @chain_error = nil, @grpc_status = nil, @grpc_message = nil,
                      @timed_out = false, @resent_count = 0, @wire = nil, *,
-                     @ws_close_code : Int32? = nil, @ws_frames_in : Int32? = nil)
+                     @ws_close_code : Int32? = nil, @ws_frames_in : Int32? = nil,
+                     @stop_hit : Bool = false, @shape : Int64? = nil)
+      end
+
+      # The response-shape fingerprint (`Fuzz::Shape`, issue #1351) — the key
+      # `Fuzz::Clusters` groups rows by. Computed by `Matcher#build` over the body it already
+      # decoded, so it survives a row whose bytes the run did not keep. nil only on a row read
+      # back from a run saved before shapes were recorded; `Clusters` keys that one by
+      # `Shape.approximate`.
+      getter shape : Int64?
+
+      # This row met the run's separate STOP condition (`StopOn#condition`) — the row that
+      # ended, or paused, the sweep. Distinct from `matched?`: the condition is its own
+      # match/filter set, independent of the run's matchers, so the row that says "the login
+      # succeeded" can be one `--mc` never selected. Not persisted per row — a saved run
+      # records the verdict as its `condition_met` status and the row that TRIPPED it as
+      # `fuzz_runs.stop_idx` (`DoneEvent#stop_index`), and the row itself is kept by
+      # `interesting?`.
+      getter? stop_hit : Bool
+
+      # The row carries something the run OBSERVED beyond its metrics: a match, a failed send, a
+      # payload that did not go out as declared, a re-send (pool or `--retries`), a truncated
+      # capture, or the stop condition. The one predicate every surface keeps rows by — the
+      # CLI's printed rows, MCP's live cache and the archive's `keep: interesting` — so the
+      # three cannot come to disagree about which unmatched row was worth keeping.
+      def interesting? : Bool
+        matched? || !error.nil? || !chain_error.nil? || retried? || resent? || incomplete? || stop_hit?
       end
 
       # The same row carrying its session's WebSocket facts. A copy-returning method rather
@@ -273,12 +301,16 @@ module Gori
       # site for every `Fuzz::Result` and it reads the SYNTHESIZED `Repeater::Result` alone —
       # keeping it ignorant of `WsOutcome` is what makes "the matcher is unchanged" true rather
       # than nearly true. `Engine#run_one_ws` applies this at the one seam that has both.
+      #
+      # The close code joins the shape here, the one seam holding both: `status` is 101 for
+      # every session, so without it an accepted and a policy-closed session were one cluster.
       def with_ws(o : WsOutcome) : Result
         Result.new(@index, @payloads, @position, @status, @length, @words, @lines,
           @duration_us, @error, @matched, @incomplete, @extracted,
           @head, @body, @request, @retried, @chain_error, @grpc_status, @grpc_message,
           @timed_out, @resent_count, @wire,
-          ws_close_code: o.close_code, ws_frames_in: o.frames_in)
+          ws_close_code: o.close_code, ws_frames_in: o.frames_in, stop_hit: @stop_hit,
+          shape: Shape.with_ws(@shape, o.close_code, o.frames_in))
       end
     end
 
@@ -329,7 +361,15 @@ module Gori
       # failed send would both inflate the error tally and flip the exit code of a clean run.
       # And not dropped, which is the silent false negative this field exists to prevent.
       ws_notes : Int64 = 0_i64,
-      ws_note_reason : String? = nil
+      ws_note_reason : String? = nil,
+      # The run's request-time macro (#1350): how often its steps ran, how many failed, how many
+      # candidates that cost, and the first failure's sentence. nil for a run with no macro.
+      #
+      # Carried on Progress for the reason `blocked` / `ws_notes` are: a surface that must not
+      # render a run whose macro failed as `50 sent · 0 errors` only ever sees events. The
+      # skipped candidates ARE errors (their rows carry `RequestMacro::ERROR_PREFIX`), so
+      # `errors` already says so; this is what says WHY.
+      request_macro : Gori::RequestMacro::Tally? = nil
 
     # The prefix `Engine#follow_redirects` puts on a row's `error` when a hop it CHOSE to follow
     # failed — the gate refused the origin's `Location`, or the hop's socket died — while the
@@ -339,21 +379,71 @@ module Gori
     # plain "error ⇒ nothing arrived" reading would have thrown away a second time.
     REDIRECT_HOP_REFUSED = "redirect hop refused: "
 
-    # One durable verdict across CLI and TUI. `max_requests` is a wire-attempt budget,
+    # The most requests a run can put on the wire, as far as it is known up front: the
+    # candidate `total` bounded by a positive `max_requests` (the engine enforces that cap
+    # through `CappedBackend`, calibration and retries included). Nil when neither is known.
+    # What the surfaces' huge-run gates judge (`gori run fuzz`'s `--force`, MCP's
+    # BUDGET_EXHAUSTED), so a run the operator already capped is not refused for a candidate
+    # count it will never send (#1209).
+    #
+    # `macro_requests` is what a request-time macro's steps add to the candidates (#1350): they
+    # are the run's traffic and are charged to the same cap, so a per-request macro over a set
+    # near a gate's ceiling is over it, and saying so before the run beats stopping half of it.
+    def self.request_bound(total : Int64?, max_requests : Int64?, macro_requests : Int64 = 0_i64) : Int64?
+      cap = max_requests.try { |m| m > 0 ? m : nil }
+      return cap unless total
+      wire = total > Int64::MAX - macro_requests ? Int64::MAX : total + macro_requests
+      cap ? {wire, cap}.min : wire
+    end
+
+    # How a finished run ended. An ENUM so a consumer can `case … in` it and a new verdict is
+    # a compile error at every one of them, rather than the string it used to be — MCP mapped
+    # any status it did not know to `:error`, so adding one would have read as a failed run.
+    enum Terminal
+      Done
+      BudgetExhausted
+      ConditionMet
+      Stopped
+      Error
+
+      # The durable spelling — `fuzz_runs.status`, MCP's `status`, the CLI's JSON.
+      def label : String
+        case self
+        in Done            then "done"
+        in BudgetExhausted then "budget_exhausted"
+        in ConditionMet    then "condition_met"
+        in Stopped         then "stopped"
+        in Error           then "error"
+        end
+      end
+    end
+
+    # One durable verdict across CLI, TUI and MCP. `max_requests` is a wire-attempt budget,
     # so exhausting it before every payload completes is a partial run rather than `done`.
-    def self.terminal_status(progress : Progress, stopped : Bool, max_requests : Int64?,
-                             errored : Bool = false) : String
-      return "error" if errored
-      return "stopped" if stopped
+    #
+    # `stop_reason` is `DoneEvent#stop_reason`: non-nil when the run's own `stop_on` ended
+    # it, which is the run reaching its goal rather than being cut short — so it outranks
+    # `stopped` (the engine stopped itself; nobody pressed ^X) and the budget.
+    def self.terminal_verdict(progress : Progress, stopped : Bool, max_requests : Int64?,
+                              errored : Bool = false, stop_reason : String? = nil) : Terminal
+      return Terminal::Error if errored
+      return Terminal::ConditionMet if stop_reason
+      return Terminal::Stopped if stopped
       incomplete = if total = progress.total
                      progress.sent < total
                    else
                      true
                    end
       if (cap = max_requests) && progress.requests >= cap && incomplete
-        return "budget_exhausted"
+        return Terminal::BudgetExhausted
       end
-      "done"
+      Terminal::Done
+    end
+
+    # `terminal_verdict`'s durable spelling, for the consumers that store or print it.
+    def self.terminal_status(progress : Progress, stopped : Bool, max_requests : Int64?,
+                             errored : Bool = false, stop_reason : String? = nil) : String
+      terminal_verdict(progress, stopped, max_requests, errored, stop_reason).label
     end
 
     # Engine → consumer events. A union (not a class hierarchy) so `Channel(Event)`
@@ -361,8 +451,51 @@ module Gori
     # Result/Done/Error are never dropped.
     record ProgressEvent, progress : Progress
     record ResultEvent, result : Result
-    record DoneEvent, progress : Progress, stopped : Bool
+    # `stop_reason` is set when the run's `stop_on` ended it (`Terminal::ConditionMet`) — a
+    # sentence naming what was met, for the finish line every surface prints. `stopped` is
+    # then true as well: the engine stopped itself exactly as ^X would.
+    #
+    # `stop_index` is the `Result#index` of the row that tripped it (issue #1270), set exactly
+    # when `stop_reason` is. The engine is the only place that knows it: an `after_matches`
+    # stop trips on a row whose `stop_hit?` is false, and under concurrency other in-flight
+    # rows can meet the condition after the one that fired, so no surface can derive it from
+    # the rows. Saved runs record it as `fuzz_runs.stop_idx`.
+    record DoneEvent, progress : Progress, stopped : Bool, stop_reason : String? = nil,
+      stop_index : Int64? = nil
     record ErrorEvent, message : String
+
+    # Which result rows a run's ARCHIVE keeps — the CLI/MCP saved run and the TUI spool behind
+    # Shift-E. The live views (the TUI pane, MCP's live cache, the CLI's printed rows) are not
+    # governed by it.
+    #
+    # `Interesting` keeps the rows `Result#interesting?` names and drops the rest. The run's
+    # counters stay whole-run either way (`fuzz_runs.sent/matched/errors` count every request),
+    # and `fuzz_runs.keep` records the policy, so a saved run reads "12 of 100,000 rows kept"
+    # instead of looking like a lost archive. `idx` stays the engine's job index, so a kept row
+    # keeps its real payload position and the gaps are the dropped rows.
+    enum Keep
+      All
+      Interesting
+
+      def label : String
+        case self
+        in All         then "all"
+        in Interesting then "interesting"
+        end
+      end
+
+      def self.parse?(token : String?) : Keep?
+        case token.try(&.strip.downcase)
+        when "all"         then All
+        when "interesting" then Interesting
+        end
+      end
+
+      # Does the archive keep this row?
+      def keeps?(result : Result) : Bool
+        all? || result.interesting?
+      end
+    end
 
     alias Event = ProgressEvent | ResultEvent | DoneEvent | ErrorEvent
 
@@ -373,32 +506,23 @@ module Gori
       property concurrency : Int32
       property rps : Float64?       # requests/sec cap (nil = unlimited)
       property throttle_ms : Int32? # fixed delay between sends (alt. to rps)
-      property jitter_ms : Int32    # random 0..jitter added after each pace
       property retries : Int32      # retries on a network error
       property retry_pause : Time::Span
       property timeout : Time::Span? # per-request connect+read timeout override
       property? follow_redirects : Bool
       property max_redirects : Int32
       property? update_content_length : Bool # recompute CL after body substitution
-      # ADD a Content-Length when the template carries a body and declares none — the other
-      # half of what `update_content_length` means, and only ever read while that knob is on
-      # (`Generator` gates every `ContentLength.sync` call behind it).
+      # ON also ADDS a Content-Length when the template carries a body and declares none
+      # (#905; `Generator` passes `add_when_missing: true` to every `ContentLength.sync`),
+      # which is what the Repeater's ^L / `auto_content_length` has always done. It used to
+      # stop short of that, and the gap was silent: a template with a body and no
+      # `Content-Length` went out with nothing framing it, so an HTTP/1.1 origin read a
+      # ZERO-LENGTH body (a request body has no close-delimited form) and every payload was
+      # scored against a request the origin never read a body from.
       #
-      # DEFAULT TRUE, which is what the Repeater's ^L / `auto_content_length` has always done
-      # (`FlowRequest.resync_content_length`'s own `add_if_missing` defaults true). It used to
-      # default false, and the gap was silent: a template with a body and no `Content-Length` —
-      # hand-authored, or seeded from a capture or a repeater session that never carried one —
-      # went out with the body on the wire and nothing framing it, so an HTTP/1.1 origin read a
-      # ZERO-LENGTH body. A request body has no close-delimited form (`Connection: close`
-      # delimits a RESPONSE), so there is no second reading. The SAME request replayed from the
-      # Repeater tab worked, because that surface adds the header — and every payload of the
-      # sweep was scored against a request the origin never read a body from.
-      #
-      # Turning it off is spelled by turning `update_content_length` off — `--verbatim`, or
-      # `^O ▸ Advanced ▸ Auto Content-Length` — which is what a deliberately unframed or
-      # mis-framed request wants. `Plan#unframed_body?` reports that combination so a surface
-      # can say the body will not be framed rather than let it go quiet again.
-      property? add_content_length_when_missing : Bool
+      # OFF — `--verbatim`, or `^O ▸ Advanced ▸ Auto Content-Length` — is what a deliberately
+      # unframed or mis-framed request wants. `Plan#unframed_body?` reports that combination so
+      # a surface can say the body will not be framed rather than let it go quiet again.
       # Recompute the gRPC 5-byte length prefix after a payload is spliced into a gRPC
       # message body — the opt-in inverse of the `grpc_stale` notice, and DEFAULT FALSE.
       #
@@ -417,6 +541,19 @@ module Gori
       property? auto_calibrate : Bool # drop responses identical to the baseline
       property keep_bodies : Symbol   # :none | :matched | :all
       property max_requests : Int64?  # hard cap on total sends
+      # Stop once this many rows matched the run's own matchers (issue #1240). N=1 stops on the
+      # first hit — the shape a credential / IDOR sweep wants. nil = run to the end, which is
+      # every sweep that came before. The SEPARATE `stop_on` condition (a body regex, a status,
+      # a header, a time) rides `Matcher#stop_condition` rather than Config, because it is a
+      # match/filter predicate the matcher evaluates on the one decode it already paid for. The
+      # run lands `Terminal::ConditionMet` when either fires — its own status, not `stopped`.
+      property stop_after_matches : Int32?
+      # Which result rows the ARCHIVE keeps (the CLI/MCP saved run and the TUI spool) — the live
+      # views are never governed by it. `Keep::All` (the default) is today's behaviour: every
+      # row written. `Keep::Interesting` writes only the rows `Result#interesting?` names, so a
+      # 100k-request sweep does not grow the project by one row per request. The counters and
+      # `idx` stay whole-run; see `Fuzz::Keep`.
+      property keep : Keep
       # Reuse one connection across many sends instead of dialing per request — `ConnPool` on
       # HTTP/1.1, `H2Pool` on h2, both behind `Repeater::Pool`. On by default: a sweep pays one
       # TCP — and, on https, one TLS — handshake per WORKER rather than per request, which is
@@ -479,28 +616,37 @@ module Gori
       # the JA3/JA4 that actually goes out.
       property tls_preset : String?
 
+      # The run's request-time macro (#1350): Repeater sessions replayed before a candidate so a
+      # per-request CSRF token or nonce is fresh when the candidate resolves its `$BIND.NAME`.
+      # nil (and `off`) is every run that came before. RUN-level and carried here, like
+      # `tls_preset`, because a finished run has to be able to say which macro produced its
+      # results, and `Config` is what every surface already reads a run's settings back off.
+      # `Plan.build` turns it into a `RequestMacro::Lane` and refuses one it cannot honour.
+      property request_macro : Gori::RequestMacro::Spec?
+
       def initialize(@mode : Mode = Mode::Sniper,
                      @concurrency : Int32 = 20,
                      @rps : Float64? = nil,
                      @throttle_ms : Int32? = nil,
-                     @jitter_ms : Int32 = 0,
                      @retries : Int32 = 0,
                      @retry_pause : Time::Span = 1.second,
                      @timeout : Time::Span? = nil,
                      @follow_redirects : Bool = false,
                      @max_redirects : Int32 = 5,
                      @update_content_length : Bool = true,
-                     @add_content_length_when_missing : Bool = true,
                      @reframe_grpc : Bool = false,
                      @auto_calibrate : Bool = false,
                      @keep_bodies : Symbol = :matched,
                      @max_requests : Int64? = nil,
+                     @stop_after_matches : Int32? = nil,
+                     @keep : Keep = Keep::All,
                      @keep_alive : Bool = true,
                      @race_count : Int32? = nil,
                      @race_warmup : Bytes? = nil,
                      @ws_idle : Time::Span = Repeater::WsEngine::DEFAULT_IDLE,
                      @ws_keep_key : Bool = false,
-                     @tls_preset : String? = nil)
+                     @tls_preset : String? = nil,
+                     @request_macro : Gori::RequestMacro::Spec? = nil)
       end
     end
   end

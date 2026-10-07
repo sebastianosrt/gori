@@ -1,7 +1,7 @@
 require "./screen"
 require "./theme"
 require "./frame"
-require "./url"
+require "../url"
 require "./flow_status"
 require "./picker_overlay"
 require "../store"
@@ -25,7 +25,7 @@ module Gori::Tui
     # `scoped` — the caller drew these rows THROUGH the active Scope lens, so an empty list
     # means "nothing in scope", not "nothing captured". The picker holds rows and cannot ask
     # the Scope itself, and the two readings send the operator opposite ways: one hunts for
-    # traffic gori supposedly lost, the other presses ⇧S.
+    # traffic gori supposedly lost, the other presses `s`.
     def initialize(@rows : Array(Store::FlowRow), @target : Symbol, @scoped : Bool = false)
       # Precompute each row's filter haystack ONCE (not per keystroke) so typing into
       # a 2000-row snapshot doesn't rebuild 2000 strings on every character.
@@ -67,38 +67,8 @@ module Gori::Tui
       "#{row.method} #{row.host}#{Url.origin_path(row.target)} #{row.status}".downcase
     end
 
-    # A centred card filling most of the body area (stable height — it doesn't
-    # resize as the filter narrows). nil when there isn't room to draw.
-    def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 96}.min
-      h = area.h - 2
-      return nil if w < 30 || h < 8
-      x = area.x + (area.w - w) // 2
-      y = area.y + (area.h - h) // 2
-      Rect.new(x, y, w, h)
-    end
-
-    # Row index under (mx, my), mirroring render's list loop; nil outside the list.
-    def row_at(box : Rect, mx : Int32, my : Int32) : Int32?
-      list_h = list_height(box)
-      i = my - (box.y + LIST_OFFSET)
-      return nil if i < 0 || i >= list_h
-      return nil if mx < box.x + 1 || mx >= box.right - 1
-      ri = @scroll + i
-      ri < @filtered.size ? ri : nil
-    end
-
     def render(screen : Screen, area : Rect) : Nil
-      box = overlay_box(area)
-      unless box
-        Overlay.too_small(screen, area, "flow picker needs a larger window")
-        return
-      end
-      Frame.card(screen, box, "PICK FLOW #{@target.to_s.upcase}", border: Theme.border_focus)
-
-      list_top = render_filter(screen, box, IDLE_HINT)
-      list_h = list_height(box)
-      ensure_visible(list_h)
+      box, list_top, list_h = render_card(screen, area, "PICK FLOW #{@target.to_s.upcase}", IDLE_HINT, "flow picker needs a larger window") || return
 
       if @filtered.empty?
         # Same three-way split the Sitemap draws (sitemap_view.cr): a live filter, the lens,
@@ -116,10 +86,8 @@ module Gori::Tui
         return
       end
 
-      (0...list_h).each do |i|
-        ri = @scroll + i
-        break if ri >= @filtered.size
-        draw_row(screen, box, list_top + i, @filtered[ri], ri == @selected)
+      each_visible_row(list_top, list_h, @filtered.size) do |ry, ri|
+        draw_row(screen, box, ry, @filtered[ri], ri == @selected)
       end
     end
 

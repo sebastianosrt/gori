@@ -1,4 +1,5 @@
 require "./rule"
+require "../../utf8"
 require "../../proxy/codec/content_decode"
 
 module Gori
@@ -27,7 +28,7 @@ module Gori
 
         # `//# sourceMappingURL=…`, the legacy `//@` form, and the block-comment `/*# … */` form.
         # The value stops at whitespace, a quote, or a `*` (the block comment's terminator).
-        MARKER = /\/[\/*][#@]\s*sourceMappingURL\s*=\s*([^\s'"*]+)/
+        MARKER = Utf8.tolerant(/\/[\/*][#@]\s*sourceMappingURL\s*=\s*([^\s'"*]+)/)
         # MARKER opens on `//`, a byte pair that occurs constantly in a minified bundle (every
         # URL, every regex literal), so PCRE's first-byte optimization can't skip ahead on it and
         # a prefilter really does pay here. But the prefilter has to be a REGEX, not a
@@ -36,7 +37,7 @@ module Gori
         # it is a naive byte search, while PCRE2 memchr-skips a pure literal in 69.5µs. Same
         # trap the `includes?` guards in `debug_mode_exposed` fell into; the fix is the same, and
         # the two-stage structure is kept because here the second stage genuinely is the slow one.
-        NEEDLE = /sourceMappingURL/
+        NEEDLE = Utf8.tolerant(/sourceMappingURL/)
 
         # The comment sits at the very END of a bundle, i.e. exactly where the shared body prefix
         # (Context::CLIENT_BODY_CAP) gets cut — the big production bundles that matter most would
@@ -83,7 +84,13 @@ module Gori
           decoded, _ = Proxy::Codec::ContentDecode.decode(ctx.detail.response_head, body, TAIL_DECODE_CAP)
           bytes = decoded || body
           return nil if bytes.size <= Context::CLIENT_BODY_CAP
-          String.new(bytes[(bytes.size - TAIL_WINDOW)..]).scrub
+          # `Utf8.text`, not `String#scrub`: this runs on every capped JS response on the fiber
+          # the passive scan shares with the proxy, so ask `valid_encoding?` and repair only what
+          # needs it — 70.6µs → 8.4µs over a 16 KiB valid slice. A tail cut at a fixed byte offset
+          # CAN land mid-codepoint, and that case walks twice (validate, then scrub) for ~5% over
+          # the old spelling; a minified bundle's last 16 KiB is ASCII far more often than not,
+          # so the trade is the same one `Gori::Utf8` argues for everywhere else.
+          Utf8.text(bytes[(bytes.size - TAIL_WINDOW)..])
         end
 
         # The reference is server-controlled text landing in stored evidence + the TUI: keep it

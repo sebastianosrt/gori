@@ -100,6 +100,35 @@ describe Gori::Probe::Analyzer do
     end
   end
 
+  it "re-plans blind SQLi probes with aggressive keys when switching from Active to Aggressive" do
+    with_store do |store|
+      set_probe_rule_enabled(store, "sqli_time_based", true)
+      probe_capture_flow(store, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n",
+        target: "/search?id=42", body: "<p>results</p>")
+      scope = Gori::Scope.load(store)
+      scope.add("include", "host", "acme.test")
+
+      feed = Channel(Gori::Store::FlowEvent).new(8)
+      a = Gori::Probe::Analyzer.new(store, scope, feed, Gori::Probe::Mode::Active, true)
+      a.start
+      sleep 50.milliseconds
+
+      # Active pass planned the default base keys
+      a.@active_seen.should contain("sqli_boolean_based|acme.test:443|GET|/search|2:id@query")
+      a.@active_seen.should contain("sqli_time_based|acme.test:443|GET|/search|2:id@query")
+      a.@active_seen.should_not contain("sqli_boolean_based|acme.test:443|GET|/search|2:id@query|aggr")
+      a.@active_seen.should_not contain("sqli_time_based|acme.test:443|GET|/search|2:id@query|aggr")
+
+      # Transition to Aggressive triggers backfill, which must re-plan the wider breakouts / delay families
+      a.set_mode(Gori::Probe::Mode::Aggressive)
+      sleep 50.milliseconds
+      a.stop
+
+      a.@active_seen.should contain("sqli_boolean_based|acme.test:443|GET|/search|2:id@query|aggr")
+      a.@active_seen.should contain("sqli_time_based|acme.test:443|GET|/search|2:id@query|aggr")
+    end
+  end
+
   it "does not re-count a buffered WebSocket secret on every later frame (incremental rescan)" do
     with_store do |store|
       detail = probe_capture_flow(store,
@@ -277,7 +306,7 @@ describe Gori::Probe::Analyzer do
       # TUI delete path: memory suppress + store delete (store also writes probe_suppressions)
       a.suppress(code, host)
       store.delete_probe_issue(issue.id)
-      store.probe_suppressed?(code, host).should be_true
+      store.probe_suppressions.includes?({code, host}).should be_true
       store.count_probe_issues.should eq(store.probe_issues.size)
 
       # Simulate leave_project → open again: brand-new Analyzer loads durable suppressions
@@ -306,10 +335,10 @@ describe Gori::Probe::Analyzer do
       store.upsert_probe_issue(d)
       id = store.probe_issues.first.id
       store.delete_probe_issue(id)
-      store.probe_suppressed?("reflected_param", "xss.test").should be_true
+      store.probe_suppressions.includes?({"reflected_param", "xss.test"}).should be_true
 
       store.clear_probe_issues
-      store.probe_suppressed?("reflected_param", "xss.test").should be_false
+      store.probe_suppressions.includes?({"reflected_param", "xss.test"}).should be_false
       store.upsert_probe_issue(d)
       store.count_probe_issues.should eq(1)
     end
@@ -555,7 +584,7 @@ describe Gori::Probe, "WebSocket + Repeater sources" do
       req = "GET /api HTTP/1.1\r\nHost: repeater.test\r\n\r\n"
       resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nServer: nginx/1.25\r\n\r\n"
       id = store.insert_repeater("https://repeater.test", req.to_slice, false, true, nil, 0)
-      store.update_repeater_response(id, resp.to_slice, "<html/>".to_slice, nil, 12_i64)
+      store.update_repeater_response(id, resp.to_slice, "<html/>".to_slice, nil, 12_i64, request_sha256: nil)
       store.get_repeater(id).should_not be_nil
       # get_repeater may not load response blobs — use full repeaters list
       rec = store.repeaters.find!(&.id.== id)
@@ -585,7 +614,7 @@ describe Gori::Probe, "WebSocket + Repeater sources" do
       resp = "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: https://evil.example\r\n" \
              "Access-Control-Allow-Credentials: true\r\n\r\n"
       id = store.insert_repeater("http://acme.test", req.to_slice, false, false, nil, 0)
-      store.update_repeater_response(id, resp.to_slice, "{}".to_slice, nil, 5_i64)
+      store.update_repeater_response(id, resp.to_slice, "{}".to_slice, nil, 5_i64, request_sha256: nil)
       rec = store.repeaters.find!(&.id.== id)
       detail = Gori::Probe.detail_from_repeater(rec).not_nil!
       detail.row.method.should eq("POST")
@@ -695,14 +724,159 @@ describe "Gori::Probe.cwe" do
   it "emits cwe fields in the shared JSON shape, and omits them when unmapped" do
     mapped = Gori::Probe::Detection.new("dom_xss", "client", "acme.test", "https://acme.test/",
       "t", Gori::Store::Severity::Medium)
-    json = Gori::CLI::Output.probe_group_json(Gori::Probe.group([mapped]).first)
+    json = JSON.build { |j| Gori::Probe.group_json(j, Gori::Probe.group([mapped]).first) }
     JSON.parse(json)["cwe"].as_s.should eq("CWE-79")
     JSON.parse(json)["cwe_name"].as_s.should contain("Cross-site Scripting")
 
     tech = Gori::Probe::Detection.new("tech_server", "tech", "acme.test", "https://acme.test/",
       "t", Gori::Store::Severity::Info)
-    parsed = JSON.parse(Gori::CLI::Output.probe_group_json(Gori::Probe.group([tech]).first))
+    parsed = JSON.parse(JSON.build { |j| Gori::Probe.group_json(j, Gori::Probe.group([tech]).first) })
     parsed.as_h.has_key?("cwe").should be_false
     parsed.as_h.has_key?("cwe_name").should be_false
+  end
+end
+
+# The worker's send seam, driven directly (it runs on a spawned fiber in production) — the
+# reopen idiom `host_overrides_wiring_spec.cr` uses.
+module Gori::Probe
+  class Analyzer
+    def spec_enqueue_active(detail : Gori::Store::FlowDetail) : Bool
+      maybe_enqueue_active(detail)
+    end
+
+    def spec_active_retry : Set(Int64)
+      @active_retry
+    end
+
+    def spec_fill_active_queue(detail : Gori::Store::FlowDetail, count : Int32) : Int32
+      opts = Gori::Probe::Active::Options::DEFAULT
+      sent = 0
+      count.times do
+        select
+        when @active_jobs.send(ActiveTask.new(detail, opts, [] of String))
+          sent += 1
+        else
+          break
+        end
+      end
+      sent
+    end
+
+    def spec_worker_task(rule : Active::Rule, plan : Active::Plan, detail : Store::FlowDetail) : Int32?
+      execute_active(rule, plan, detail, worker_sender(detail))
+    end
+
+    def spec_release_worker_sender : Nil
+      release_worker_sender
+    end
+  end
+end
+
+# A keep-alive origin that counts the connections it accepted and the requests it answered.
+private class KeepAliveOrigin
+  getter accepted = 0
+  getter requests = 0
+
+  def initialize
+    @server = TCPServer.new("127.0.0.1", 0)
+    spawn do
+      while conn = @server.accept?
+        @accepted += 1
+        serve(conn)
+      end
+    rescue
+      # closed under the accept loop — teardown
+    end
+  end
+
+  def port : Int32
+    @server.local_address.port
+  end
+
+  def close : Nil
+    @server.close rescue nil
+  end
+
+  private def serve(conn : TCPSocket) : Nil
+    spawn do
+      while conn.gets("\r\n", chomp: true)
+        while (line = conn.gets("\r\n", chomp: true)) && !line.empty?
+        end
+        @requests += 1
+        conn << "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok"
+        conn.flush
+      end
+    rescue
+    ensure
+      conn.close rescue nil
+    end
+  end
+end
+
+describe "Probe::Analyzer active worker sender" do
+  # Each queued task is ONE rule against one flow, and a flow's rules are queued back to back.
+  # A sender per task paid a fresh TCP (+TLS) handshake for every one of them.
+  it "reuses one keep-alive connection across consecutive tasks to the same origin" do
+    origin = KeepAliveOrigin.new
+    begin
+      with_store do |store|
+        head = "GET /s?q=hi HTTP/1.1\r\nHost: 127.0.0.1:#{origin.port}\r\n\r\n"
+        id = store.insert_flow(Gori::Store::CapturedRequest.new(
+          created_at: 1_i64, scheme: "http", host: "127.0.0.1", port: origin.port,
+          method: "GET", target: "/s?q=hi", http_version: "HTTP/1.1", head: head.to_slice,
+          source: Gori::FlowSource::Kind::Proxy))
+        store.update_response(Gori::Store::CapturedResponse.new(
+          flow_id: id, status: 200,
+          head: "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\n".to_slice,
+          body: "ok".to_slice, duration_us: 1_i64))
+        detail = store.get_flow(id).not_nil!
+        a = Gori::Probe::Analyzer.new(store, Gori::Scope.load(store),
+          Channel(Gori::Store::FlowEvent).new(1), Gori::Probe::Mode::Active, false)
+        plans = Gori::Probe::Active::RULES.compact_map do |rule|
+          next if Gori::Probe.rule_disabled?(rule.info.id, Set(String).new)
+          plan = rule.plan(detail, Gori::Probe::Active::Options::DEFAULT)
+          plan && {rule, plan}
+        end
+        plans.size.should be >= 2
+        begin
+          plans.each { |(rule, plan)| a.spec_worker_task(rule, plan, detail) }
+        ensure
+          a.spec_release_worker_sender
+        end
+        origin.requests.should be >= plans.size
+        origin.accepted.should eq(1)
+      end
+    ensure
+      origin.close
+    end
+  end
+end
+
+describe "Probe::Analyzer active queue admission" do
+  it "coalesces each flow and retains overflow for a later retry" do
+    with_store do |store|
+      scope = Gori::Scope.load(store)
+      scope.add("include", "host", "acme.test")
+      analyzer = Gori::Probe::Analyzer.new(store, scope,
+        Channel(Gori::Store::FlowEvent).new(1), Gori::Probe::Mode::Active, true)
+
+      first = probe_capture_flow(store,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n",
+        target: "/active-first?q=hi", body: "<p>ok</p>")
+      second = probe_capture_flow(store,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n",
+        target: "/active-second?q=hi", body: "<p>ok</p>")
+      analyzer.spec_enqueue_active(first).should be_true
+      filled = analyzer.spec_fill_active_queue(first, Gori::Probe::Analyzer::ACTIVE_QUEUE - 1)
+
+      # A flow occupies one queue slot even though it may expand into many active rules on the
+      # worker. The overflowing distinct surface is not silently lost when the bounded queue is full.
+      (filled + 1).should eq(Gori::Probe::Analyzer::ACTIVE_QUEUE)
+      analyzer.spec_active_retry.should be_empty
+      analyzer.spec_enqueue_active(second).should be_false
+      analyzer.spec_active_retry.should contain(second.row.id)
+      analyzer.spec_enqueue_active(first).should be_false
+      analyzer.stop
+    end
   end
 end

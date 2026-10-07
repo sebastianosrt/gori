@@ -4,6 +4,7 @@ require "./frame"
 require "./empty_art"
 require "../bind_address"
 require "../settings"
+require "../proxy/conn/self_page"
 
 module Gori::Tui
   # Rich onboarding panels for tabs with nothing to show yet. Each variant has its
@@ -50,6 +51,8 @@ module Gori::Tui
                running : Bool = false,
                scan_on : Bool = true,
                has_provider : Bool = true,
+               body_focused : Bool = true,
+               catch_direction : String = "REQ",
                title : String? = nil) : Nil
       return if suppressed?
       return if rect.empty?
@@ -62,8 +65,7 @@ module Gori::Tui
       # of its pane — through the outer frame's bottom border and, at some heights, below the
       # status bar onto the last terminal row. Degrading to medium/minimal is what this module
       # already promises for short panes.
-      full_h = full_rows(variant, capturing: capturing, catch_on: catch_on,
-        running: running, scan_on: scan_on)
+      full_h = full_rows(variant, capturing: capturing, running: running, scan_on: scan_on)
 
       # This card is the onboarding surface — the address on it is the one the user is
       # meant to TYPE into a client, so a wildcard bind must not render as "0.0.0.0:8070".
@@ -72,47 +74,40 @@ module Gori::Tui
       # either way, so a resize can never appear to move the proxy.
       if rect.h >= full_h && rect.w >= FULL_MIN_W
         addr = BindAddress.display(host, port)
-        render_full(screen, rect, variant, headline, addr, capturing, catch_on, running, scan_on, has_provider)
+        render_full(screen, rect, variant, headline, addr, capturing, catch_on, running, scan_on,
+          has_provider, body_focused, catch_direction)
       elsif rect.h >= MED_MIN_H && rect.w >= MED_MIN_W
         addr = BindAddress.display(host, port, terse: true)
-        render_medium(screen, rect, variant, headline, addr, capturing, catch_on, running, scan_on, has_provider)
+        render_medium(screen, rect, variant, headline, addr, capturing, catch_on, running, scan_on,
+          has_provider, body_focused)
       else
         addr = BindAddress.display(host, port, terse: true)
-        render_minimal(screen, rect, variant, headline, addr, capturing, catch_on, running, scan_on, has_provider)
+        render_minimal(screen, rect, variant, headline, addr, capturing, catch_on, running, scan_on,
+          has_provider, body_focused)
       end
     end
 
     # Interior row count of each FULL card — ONE source of truth, read by the gate in `render`
     # and by the renderers below, so the two can never drift apart. Defaults let a variant whose
     # height ignores a flag omit it at the call site.
-    private def full_inner_h(variant : Symbol, *, capturing : Bool = true, catch_on : Bool = false,
+    private def full_inner_h(variant : Symbol, *, capturing : Bool = true,
                              running : Bool = false, scan_on : Bool = true) : Int32
       case variant
-      when :history   then 5 + (capturing ? 0 : 1) + 3
-      when :sitemap   then 5 + (capturing ? 0 : 1) + 3
-      when :intercept then 5 + (catch_on ? 0 : 1) + 3 + (capturing ? 0 : 1)
-      when :repeater  then 5 + 2
-      when :fuzzer    then 5 + 2
+      when :history, :sitemap, :intercept                                        then 5 + (capturing ? 0 : 1) + 3
+      when :repeater, :fuzzer, :issues, :discover, :comparer, :miner, :sequencer then 5 + 2
         # The three results-pane variants share one budget: the rows they draw, plus one blank so
         # the card is not flush against its own bottom border. In flight that is a single sentence
         # and the chord line is gone, so the card shrinks with it — at the old 3 an in-flight card
         # carried two empty rows under one line of text and read as a box that failed to fill.
-      when :fuzzer_results                                  then running ? 2 : 4
-      when :probe                                           then scan_on ? 5 + (capturing ? 0 : 1) + 2 : 4
-      when :issues                                          then 5 + 2
-      when :discover                                        then 5 + 2
-      when :comparer                                        then 5 + 2
-      when :authorize                                       then 5 + 3 # three chords — see render_authorize_full
-      when :miner                                           then 5 + 2
-      when :miner_results                                   then running ? 2 : 4
-      when :sequencer                                       then 5 + 2
-      when :sequencer_samples                               then running ? 2 : 5
-      when :oast                                            then 5 + 1 # six, and flat — see render_oast_full
-      when :notes                                           then 5 + 1
-      when :project_desc                                    then 5 + 1
-      when :project_scope, :project_overrides, :project_env then 5 + 1
-      when :project_activity                                then 5 + 1
-      else                                                       0 # unknown variant — render_full draws nothing, as before
+      when :fuzzer_results    then running ? 2 : 4
+      when :probe             then scan_on ? 5 + (capturing ? 0 : 1) + 2 : 4
+      when :authorize         then 5 + 3 # three chords — see standard_card
+      when :miner_results     then running ? 2 : 4
+      when :sequencer_samples then running ? 2 : 5
+      when :oast              then 5 + 1 # six, and flat — see render_oast_full
+      when :notes, :project_desc, :project_scope, :project_overrides, :project_env, :project_activity
+        5 + 1
+      else 0 # unknown variant — render_full draws nothing, as before
       end
     end
 
@@ -125,10 +120,9 @@ module Gori::Tui
 
     # Rows the full card needs inside `rect`: its interior plus two borders, plus the headline
     # row that rides above it for every variant except the CENTERED ones.
-    private def full_rows(variant : Symbol, *, capturing : Bool, catch_on : Bool,
+    private def full_rows(variant : Symbol, *, capturing : Bool,
                           running : Bool, scan_on : Bool) : Int32
-      full_inner_h(variant, capturing: capturing, catch_on: catch_on,
-        running: running, scan_on: scan_on) + 2 + (CENTERED.includes?(variant) ? 0 : 1)
+      full_inner_h(variant, capturing: capturing, running: running, scan_on: scan_on) + 2 + (CENTERED.includes?(variant) ? 0 : 1)
     end
 
     # `:discover` says "no runs", the phrase that pane has used for this state all along, so a
@@ -163,81 +157,87 @@ module Gori::Tui
 
     private def render_full(screen : Screen, rect : Rect, variant : Symbol, headline : String,
                             addr : String, capturing : Bool, catch_on : Bool, running : Bool,
-                            scan_on : Bool, has_provider : Bool) : Nil
-      case variant
-      when :history           then render_history_full(screen, rect, headline, addr, capturing)
-      when :sitemap           then render_sitemap_full(screen, rect, headline, addr, capturing)
-      when :intercept         then render_intercept_full(screen, rect, headline, addr, capturing, catch_on)
-      when :repeater          then render_repeater_full(screen, rect, headline)
-      when :fuzzer            then render_fuzzer_full(screen, rect, headline)
-      when :fuzzer_results    then render_fuzzer_results_full(screen, rect, headline, running)
-      when :probe             then render_probe_full(screen, rect, headline, addr, capturing, scan_on)
-      when :issues            then render_issues_full(screen, rect, headline)
-      when :discover          then render_discover_full(screen, rect, headline)
-      when :comparer          then render_comparer_full(screen, rect, headline)
-      when :authorize         then render_authorize_full(screen, rect, headline)
-      when :miner             then render_miner_full(screen, rect, headline)
-      when :miner_results     then render_miner_results_full(screen, rect, headline, running)
-      when :sequencer         then render_sequencer_full(screen, rect, headline)
-      when :sequencer_samples then render_sequencer_samples_full(screen, rect, headline, running)
-      when :oast              then render_oast_full(screen, rect, headline, has_provider)
-      when :notes             then render_notes_full(screen, rect)
-      when :project_desc      then render_project_desc_full(screen, rect)
-      when :project_scope     then render_project_scope_full(screen, rect)
-      when :project_overrides then render_project_overrides_full(screen, rect)
-      when :project_env       then render_project_env_full(screen, rect)
-      when :project_activity  then render_project_activity_full(screen, rect)
+                            scan_on : Bool, has_provider : Bool, body_focused : Bool,
+                            catch_direction : String) : Nil
+      if card = standard_card(variant)
+        render_standard_full(screen, rect, variant, headline, card)
+      elsif card = centered_card(variant)
+        render_centered_full(screen, rect, variant, card)
+      else
+        case variant
+        when :history           then render_history_full(screen, rect, headline, addr, capturing)
+        when :sitemap           then render_sitemap_full(screen, rect, headline, addr, capturing)
+        when :intercept         then render_intercept_full(screen, rect, headline, addr, capturing, catch_on, body_focused, catch_direction)
+        when :fuzzer_results    then render_fuzzer_results_full(screen, rect, headline, running)
+        when :probe             then render_probe_full(screen, rect, headline, addr, capturing, scan_on)
+        when :miner_results     then render_miner_results_full(screen, rect, headline, running)
+        when :sequencer_samples then render_sequencer_samples_full(screen, rect, headline, running)
+        when :oast              then render_oast_full(screen, rect, headline, has_provider)
+        end
       end
     end
 
     private def render_medium(screen : Screen, rect : Rect, variant : Symbol, headline : String,
                               addr : String, capturing : Bool, catch_on : Bool, running : Bool,
-                              scan_on : Bool, has_provider : Bool) : Nil
+                              scan_on : Bool, has_provider : Bool, body_focused : Bool) : Nil
       lines = case variant
               when :history
-                medium_history(headline, addr, capturing)
+                [headline, "──► proxy #{addr} ──► flows",
+                 capturing ? "HTTPS: trust the CA at #{Proxy::SelfPage::MAGIC_URL}" : capture_off_hint,
+                 "#{palette_route("browser.open", "Open browser")} · proxied, CA trusted"]
               when :sitemap
-                medium_sitemap(headline, addr, capturing)
+                [headline, "◆ proxy #{addr} → host tree", (capture_off_hint unless capturing),
+                 "#{palette_route("browser.open", "Open browser")} · or set HTTP+HTTPS proxy"].compact
               when :intercept
-                medium_intercept(headline, catch_on)
+                [headline,
+                 catch_on ? "⏸ queue empty · matching traffic pauses here" : "press #{key("i", "intercept.toggle")} to hold matching requests",
+                 medium_intercept_action_hint(body_focused)]
               when :repeater
-                medium_repeater(headline)
+                [headline, "flow ──► edit ──► send", "^N new tab · History #{key("^R", "history.repeater")} repeater"]
               when :fuzzer
-                medium_fuzzer(headline)
+                [headline, "§ template ──► payloads ──► probe", "^N new session · #{key("⇧I", "history.fuzz")} from History"]
               when :fuzzer_results
-                medium_fuzzer_results(headline, running)
+                running ? [headline, "sampling probes…"] : [headline, "^O payload sets · #{key("^R", "fuzz.run")} run"]
               when :probe
-                medium_probe(headline, scan_on)
+                if scan_on
+                  [headline, "traffic ──► scan ──► issues", "#{key("m", "probe.mode")}:MODE · capture in-scope traffic"]
+                else
+                  [headline, "press #{key("m", "probe.mode")} to enable scanning", "#{key("m", "probe.mode")}:MODE cycle OFF/PASSIVE/ACTIVE"]
+                end
               when :issues
-                medium_issues(headline)
+                [headline, "flow ──► issue ──► triage", "#{key("⇧F", "issue.create")} from History · #{key("n", "issues.new")} create"]
               when :discover
-                medium_discover(headline)
+                [headline, "target ──► crawl ──► endpoints", "Discover here (#{menu("sitemap.discover")}) · #{key("^R", "discover.run")} run"]
               when :comparer
-                medium_comparer(headline)
+                [headline, "A ──► diff ◄── B", "#{key("a", "comparer.pick-a")} pick flow A · #{key("b", "comparer.pick-b")} pick flow B"]
               when :authorize
-                medium_authorize(headline)
+                [headline, "one request ──► many identities", "Send to Authorize (#{menu("history.authorize")}) · #{key("i", "authorize.identities")} identities"]
               when :miner
-                medium_miner(headline)
+                [headline, "wordlist ──► probe ──► params", "From History/Repeater: #{menu("history.mine")} Mine parameters"]
               when :miner_results
-                medium_miner_results(headline, running)
+                running ? [headline, "probing the wordlist…"] : [headline, "#{key("^R", "mine.run")} mines this request"]
               when :sequencer
-                medium_sequencer(headline)
+                [headline, "collect ──► samples ──► entropy", "Send to Sequencer (#{menu("history.sequence")}) · #{key("^R", "sequence.run")}"]
               when :sequencer_samples
-                medium_sequencer_samples(headline, running)
+                running ? [headline, "collecting tokens…"] : [headline, "#{key("c", "sequence.configure")} token location · #{key("^R", "sequence.run")} collect"]
               when :oast
-                medium_oast(headline, has_provider)
+                if has_provider
+                  [headline, "payload ──► target ──► callback", "#{key("g", "oast.generate")} payload URL · #{key("^R", "oast.listen")} listen"]
+                else
+                  [headline, "no provider yet — ^2 Providers", "then #{key("g", "oast.generate")} for a payload URL"]
+                end
               when :notes
-                medium_notes(headline)
+                [headline, "scratchpad for this project", "^N new note · ^W close"]
               when :project_desc
-                medium_project_desc(headline)
+                [headline, "target · scope · credentials · rules", "i/↵ edit · ^E $EDITOR"]
               when :project_scope
-                medium_project_scope(headline)
+                [headline, "incl / excl ──► scope lens", "#{key("a", "scope.add-rule")} add rule · space menu"]
               when :project_overrides
-                medium_project_overrides(headline)
+                [headline, "host ──► your IP", "#{key("a", "hostoverride.add-entry")} add · #{key("e", "hostoverride.edit-entry")} edit · #{key("d", "hostoverride.delete-entry")} delete"]
               when :project_env
-                medium_project_env(headline)
+                [headline, "#{Env.spell("KEY", Env::Namespace::Env)} ──► value on send", "#{key("a", "env.add-var")} add var · space menu"]
               when :project_activity
-                medium_project_activity(headline)
+                [headline, "agents & jobs ──► one log", "#{key("s", "activity.filter-source")} source · #{key("l", "activity.filter-level")} level · ↵ open"]
               else
                 [headline]
               end
@@ -246,14 +246,14 @@ module Gori::Tui
 
     private def render_minimal(screen : Screen, rect : Rect, variant : Symbol, headline : String,
                                addr : String, capturing : Bool, catch_on : Bool, running : Bool,
-                               scan_on : Bool, has_provider : Bool) : Nil
+                               scan_on : Bool, has_provider : Bool, body_focused : Bool) : Nil
       hint = case variant
              when :history
-               "──► #{addr} ──► ^P Open browser#{capturing ? "" : " · press #{key("c", "capture.toggle")}"}"
+               "──► #{addr} · #{palette_route("browser.open", "Open browser")}#{capturing ? "" : " · tabs: #{key("c", "capture.toggle")}"}"
              when :sitemap
-               "◆ proxy #{addr} · ^P Open browser#{capturing ? "" : " · press #{key("c", "capture.toggle")}"}"
+               "◆ proxy #{addr} · #{palette_route("browser.open", "Open browser")}#{capturing ? "" : " · tabs: #{key("c", "capture.toggle")}"}"
              when :intercept
-               catch_on ? "⏸ queue empty · #{key("i", "intercept.toggle")} catch · #{key("/", "intercept.filter")} filter" : "press #{key("i", "intercept.toggle")} to enable catch"
+               minimal_intercept_hint(catch_on, body_focused)
              when :repeater
                "^N new · History #{key("^R", "history.repeater")} repeater"
              when :fuzzer
@@ -265,17 +265,17 @@ module Gori::Tui
              when :issues
                "#{key("⇧F", "issue.create")} from History · #{key("n", "issues.new")} create"
              when :discover
-               "space → Discover here · #{key("^R", "discover.run")} run"
+               "Discover here (#{menu("sitemap.discover")}) · #{key("^R", "discover.run")} run"
              when :comparer
                "#{key("a", "comparer.pick-a")} pick A · #{key("b", "comparer.pick-b")} pick B"
              when :authorize
-               "space → Send to Authorize · #{key("i", "authorize.identities")} identities"
+               "Send to Authorize (#{menu("history.authorize")}) · #{key("i", "authorize.identities")} identities"
              when :miner
-               "space → Mine parameters · #{key("^R", "mine.run")} run"
+               "Mine from History/Repeater"
              when :miner_results
                running ? "mining…" : "#{key("^R", "mine.run")} mine this request"
              when :sequencer
-               "space → Send to Sequencer · #{key("^R", "sequence.run")}"
+               "Send to Sequencer (#{menu("history.sequence")}) · #{key("^R", "sequence.run")}"
              when :sequencer_samples
                running ? "collecting…" : "#{key("c", "sequence.configure")} configure · #{key("^R", "sequence.run")} collect"
              when :oast
@@ -289,7 +289,7 @@ module Gori::Tui
              when :project_overrides
                "#{key("a", "hostoverride.add-entry")} map host→IP · space menu"
              when :project_env
-               "#{key("a", "env.add-var")} add $KEY · space prefix"
+               "#{key("a", "env.add-var")} add a variable · space menu"
              when :project_activity
                "agent calls & job results land here"
              else
@@ -352,34 +352,34 @@ module Gori::Tui
       {inner, inner.x + 1, {inner.w - 2, 1}.max}
     end
 
+    # Three steps, because the first thing a beginner misses is not the proxy but HTTPS: a
+    # client pointed at gori with its CA untrusted shows TLS errors and this list stays empty.
+    # The address appears once (step 1), and every row is sized into `min_w` so none clips.
     private def render_history_full(screen : Screen, rect : Rect, headline : String,
                                     addr : String, capturing : Bool) : Nil
-      # +3 (not +2): the intro/addr/diagram block spans through relative row 3, the
-      # divider + palette hint reach row 6, and the final "or set your client's proxy"
-      # line lands on row 7 — which the old budget pushed onto the card's bottom border.
       inner_h = full_inner_h(:history, capturing: capturing)
       desc = "Requests stream in here as they pass through the proxy."
-      inner, ix, iw = begin_card(screen, rect, :history, headline, "FLOW LOG", inner_h, Screen.display_width(desc))
+      steps = ["1 once: set your client's HTTP+HTTPS proxy to",
+               "2 HTTPS: trust gori's CA — browse #{Proxy::SelfPage::MAGIC_URL}",
+               Hotkeys.retag("  through the proxy, or #{palette_route("ca.export", "Copy CA certificate path")}")]
+      browser = "→ #{verb_title("browser.open", "Open browser")}: proxied, CA trusted"
+      min_w = (steps + [desc, "    #{addr}", "▸  ^P   #{browser}"]).max_of { |l| Screen.display_width(l) }
+      inner, ix, iw = begin_card(screen, rect, :history, headline, "FLOW LOG", inner_h, min_w)
       y = inner.y
 
       draw_wrapped_message(screen, ix, y, iw, desc)
       y += 2
-      screen.text(ix + 2, y, addr, Theme.accent, Theme.bg, Attribute::Bold, width: iw)
-      y += 1
-      screen.text(ix, y, fit_history_flow(addr, iw), Theme.muted, Theme.bg, width: iw)
-      if capturing
-        y += 1
-        screen.text(ix, y, "HTTP/3 / QUIC bypasses TCP proxy — use ^P or --disable-quic", Theme.muted, Theme.bg, width: iw)
-        y += 1
-      else
-        y += 2
-        screen.text(ix, y, "capture is OFF — press #{key("c", "capture.toggle")} to start", Theme.yellow, Theme.bg, width: iw)
+      screen.text(ix, y, steps[0], Theme.muted, Theme.bg, width: iw)
+      screen.text(ix + 4, y + 1, addr, Theme.accent, Theme.bg, Attribute::Bold, width: {iw - 4, 0}.max)
+      screen.text(ix, y + 2, steps[1], Theme.muted, Theme.bg, width: iw)
+      screen.text(ix, y + 3, steps[2], Theme.muted, Theme.bg, width: iw)
+      y += 4
+      unless capturing
+        screen.text(ix, y, capture_off_hint, Theme.yellow, Theme.bg, width: iw)
         y += 1
       end
       Frame.inner_divider(screen, inner, y, bg: Theme.bg, border: Theme.border)
-      y += 1
-      y = draw_palette_hint(screen, ix, y, iw, bullet: "▸ ")
-      screen.text(ix, y, "or set your client's HTTP+HTTPS proxy", Theme.muted, Theme.bg, width: iw)
+      draw_palette_hint(screen, ix, y + 1, iw, bullet: "▸ ", label: browser)
     end
 
     private def render_sitemap_full(screen : Screen, rect : Rect, headline : String,
@@ -408,7 +408,7 @@ module Gori::Tui
       screen.text(px, y, addr, Theme.accent, Theme.bg, Attribute::Bold, width: {ix + iw - px, 0}.max)
       y += 1
       unless capturing
-        screen.text(ix, y, "capture is OFF — press #{key("c", "capture.toggle")} to start", Theme.yellow, Theme.bg, width: iw)
+        screen.text(ix, y, capture_off_hint, Theme.yellow, Theme.bg, width: iw)
         y += 1
       end
       y = draw_palette_hint(screen, ix, y, iw, bullet: "◆ ")
@@ -416,61 +416,33 @@ module Gori::Tui
     end
 
     private def render_intercept_full(screen : Screen, rect : Rect, headline : String,
-                                      addr : String, capturing : Bool, catch_on : Bool) : Nil
-      inner_h = full_inner_h(:intercept, capturing: capturing, catch_on: catch_on)
-      msg = catch_on ? "Matching traffic pauses here for review before it continues." : "Catch is OFF — press i to hold matching requests/responses."
-      inner, ix, iw = begin_card(screen, rect, :intercept, headline, "INTERCEPT", inner_h, Screen.display_width(msg))
+                                      addr : String, capturing : Bool, catch_on : Bool,
+                                      body_focused : Bool, catch_direction : String) : Nil
+      inner_h = full_inner_h(:intercept, capturing: capturing)
+      go = queue_route(body_focused)
+      msg = catch_on ? "Catch is ON — each matching request waits here until you decide." : "Holds each matching request here until you forward or drop it."
+      flow = "request ──► ⏸ held ──► #{go}#{key("f", "intercept.forward")} forward · #{key("d", "intercept.drop")} drop"
+      catch_hint = catch_on ? "catch is ON — press to stop holding" : "catch is OFF — press to start holding"
+      direction_chip = body_focused ? " #{key("c", "intercept.direction")}:#{catch_direction} " : " DIR:#{catch_direction} "
+      direction_hint = "#{"#{go}#{key("c", "intercept.direction")}: " unless body_focused}hold requests, responses or both"
+      condition = "▸ #{go}#{key("/", "intercept.filter")} condition: only hold matches (host: path:)"
+      min_w = [msg, flow, condition, "▸ #{direction_chip}  #{direction_hint}"].max_of { |l| Screen.display_width(l) }
+      inner, ix, iw = begin_card(screen, rect, :intercept, headline, "INTERCEPT", inner_h, min_w)
       y = inner.y
 
       draw_wrapped_message(screen, ix, y, iw, msg)
       y += 2
-      screen.text(ix, y, "traffic ──► ⏸ hold ──► #{key("f", "intercept.forward")} forward · #{key("d", "intercept.drop")} drop", Theme.muted, Theme.bg, width: iw)
+      screen.text(ix, y, flow, Theme.muted, Theme.bg, width: iw)
       y += 2
-      unless catch_on
-        screen.text(ix, y, "catch is OFF — press #{key("i", "intercept.toggle")} to enable", Theme.yellow, Theme.bg, width: iw)
-        y += 1
-      end
       unless capturing
-        screen.text(ix, y, "capture is OFF — press #{key("c", "capture.toggle")} to start", Theme.yellow, Theme.bg, width: iw)
+        screen.text(ix, y, capture_off_hint, Theme.yellow, Theme.bg, width: iw)
         y += 1
       end
-      y = draw_chord_hint(screen, ix, y, iw, " i:CATCH ", "toggle catch", bullet: "⏸ ", verb: "intercept.toggle")
-      y = draw_chord_hint(screen, ix, y, iw, " c:ALL ", "cycle REQ/RES/ALL", bullet: "▸ ", verb: "intercept.direction")
-      screen.text(ix, y, "▸ #{key("/", "intercept.filter")} condition — filter what gets held", Theme.muted, Theme.bg, width: iw)
-      y += 1
-      draw_palette_hint(screen, ix, y, iw, bullet: "▸ ")
-    end
-
-    private def render_repeater_full(screen : Screen, rect : Rect, headline : String) : Nil
-      inner_h = full_inner_h(:repeater)
-      desc = "Edit a captured request and resend it — compare the response."
-      inner, ix, iw = begin_card(screen, rect, :repeater, headline, "REPEATER", inner_h, Screen.display_width(desc))
-      y = inner.y
-
-      draw_wrapped_message(screen, ix, y, iw, desc)
-      y += 2
-      screen.text(ix, y, "flow ──► edit ──► send ──► response", Theme.muted, Theme.bg, width: iw)
-      y += 2
-      Frame.inner_divider(screen, inner, y, bg: Theme.bg, border: Theme.border)
-      y += 1
-      y = draw_chord_hint(screen, ix, y, iw, " ^R ", "repeater from History", bullet: "▸ ", verb: "history.repeater")
-      draw_chord_hint(screen, ix, y, iw, " ^N ", "new blank repeater tab", bullet: "▸ ")
-    end
-
-    private def render_fuzzer_full(screen : Screen, rect : Rect, headline : String) : Nil
-      inner_h = full_inner_h(:fuzzer)
-      desc = "Probe endpoints by swapping §markers§ in a template."
-      inner, ix, iw = begin_card(screen, rect, :fuzzer, headline, "FUZZER", inner_h, Screen.display_width(desc))
-      y = inner.y
-
-      draw_wrapped_message(screen, ix, y, iw, desc)
-      y += 2
-      screen.text(ix, y, "template ──► §payloads§ ──► probe", Theme.muted, Theme.bg, width: iw)
-      y += 2
-      Frame.inner_divider(screen, inner, y, bg: Theme.bg, border: Theme.border)
-      y += 1
-      y = draw_chord_hint(screen, ix, y, iw, " ^N ", "new fuzz session", bullet: "§ ")
-      draw_chord_hint(screen, ix, y, iw, " ⇧I ", "send from History/Repeater", bullet: "▸ ", verb: "history.fuzz")
+      y = draw_chord_hint(screen, ix, y, iw, " i ", catch_hint, bullet: "▸ ", verb: "intercept.toggle")
+      y = draw_chord_hint(screen, ix, y, iw, direction_chip, direction_hint, bullet: "▸ ",
+        verb: body_focused ? "intercept.direction" : nil)
+      screen.text(ix, y, condition, Theme.muted, Theme.bg, width: iw)
+      draw_palette_hint(screen, ix, y + 1, iw, bullet: "▸ ")
     end
 
     # "FUZZ RUN", not "RESULTS": this card draws INSIDE the pane the Fuzzer titles RESULTS, and a
@@ -510,7 +482,7 @@ module Gori::Tui
         screen.text(ix + 2, y, addr, Theme.accent, Theme.bg, Attribute::Bold, width: iw)
         y += 2
         unless capturing
-          screen.text(ix, y, "capture is OFF — press #{key("c", "capture.toggle")} to start", Theme.yellow, Theme.bg, width: iw)
+          screen.text(ix, y, capture_off_hint, Theme.yellow, Theme.bg, width: iw)
           y += 1
         end
         y = draw_chord_hint(screen, ix, y, iw, " m:MODE ", "cycle scan mode", bullet: "◇ ", verb: "probe.mode")
@@ -524,106 +496,90 @@ module Gori::Tui
       end
     end
 
-    private def render_issues_full(screen : Screen, rect : Rect, headline : String) : Nil
-      inner_h = full_inner_h(:issues)
-      desc = "Track confirmed vulnerabilities you triage by hand."
-      inner, ix, iw = begin_card(screen, rect, :issues, headline, "ISSUES", inner_h, Screen.display_width(desc))
-      y = inner.y
+    # One chord line of a card: the ` CHORD ` chip, then the label. A nil `chord` draws the label
+    # as a plain indented line instead (the Miner card's closing note).
+    record ChordLine, chord : String?, label : String, verb : String? = nil, bullet : String = "▸ "
 
-      draw_wrapped_message(screen, ix, y, iw, desc)
-      y += 2
-      screen.text(ix, y, "flow ──► issue ──► triage ──► resolve", Theme.muted, Theme.bg, width: iw)
-      y += 2
-      Frame.inner_divider(screen, inner, y, bg: Theme.bg, border: Theme.border)
-      y += 1
-      y = draw_chord_hint(screen, ix, y, iw, " ⇧F ", "issue from History flow", bullet: "▸ ", verb: "issue.create")
-      draw_chord_hint(screen, ix, y, iw, " n ", "create an issue here", bullet: "▸ ", verb: "issues.new")
+    # The body two card shapes share: prose, one muted line under it, then the chord lines.
+    record CardSpec, title : String, desc : String, line : String, chords : Array(ChordLine)
+
+    # Repeater, Fuzzer, Issues, Discover, Comparer, Authorize, Miner and Sequencer all reach here
+    # from a container-level "nothing open yet" branch, so they share that shape: prose, a
+    # diagram, a divider, and the chords that open the tab. Each spends exactly `5 + 2` interior
+    # rows (Authorize `5 + 3`), which is what `full_inner_h` claims for them. Built per render,
+    # not frozen, because the chips resolve through the live registry.
+    private def standard_card(variant : Symbol) : CardSpec?
+      case variant
+      when :repeater
+        CardSpec.new("REPEATER", "Edit a captured request and resend it — compare the response.",
+          "flow ──► edit ──► send ──► response",
+          [ChordLine.new(" ^R ", "repeater from History", "history.repeater"),
+           ChordLine.new(" ^N ", "new blank repeater tab")])
+      when :fuzzer
+        CardSpec.new("FUZZER", "Probe endpoints by swapping §markers§ in a template.",
+          "template ──► §payloads§ ──► probe",
+          [ChordLine.new(" ^N ", "new fuzz session", bullet: "§ "),
+           ChordLine.new(" ⇧I ", "send from History/Repeater", "history.fuzz")])
+      when :issues
+        CardSpec.new("ISSUES", "Track confirmed vulnerabilities you triage by hand.",
+          "flow ──► issue ──► triage ──► resolve",
+          [ChordLine.new(" ⇧F ", "issue from History flow", "issue.create"),
+           ChordLine.new(" n ", "create an issue here", "issues.new")])
+      when :discover
+        CardSpec.new("DISCOVER", "Crawl a target for endpoints nothing linked.",
+          "target ──► crawl ──► endpoints",
+          [ChordLine.new(menu_chip("sitemap.discover"), "\"Discover here\" on a host"),
+           ChordLine.new(" ^R ", "run the selected crawl", "discover.run")])
+      when :comparer
+        CardSpec.new("COMPARER", "Diff two flows side by side — req or res.",
+          "A ──► diff ◄── B",
+          [ChordLine.new(" a ", "pick flow A", "comparer.pick-a"),
+           ChordLine.new(" b ", "pick flow B", "comparer.pick-b")])
+      when :authorize
+        # THREE chord lines, where the sibling cards take two. Getting a request into the queue
+        # and running it are steps the rest of the app implies; choosing who to replay as is the
+        # one this tab invented, and a card that omitted it would leave an operator on the two
+        # built-in identities with no sign there was a third thing to press.
+        CardSpec.new("AUTHORIZE", "Replay one request as several identities and diff the answers.",
+          "one request ──► many identities",
+          [ChordLine.new(" space ", "\"Send to Authorize\" on a flow"),
+           ChordLine.new(" i ", "who to replay as", "authorize.identities"),
+           ChordLine.new(" ^R ", "replay what has not run", "authorize.run")])
+      when :miner
+        CardSpec.new("MINER", "Find undocumented parameters a target takes.",
+          "wordlist ──► probe ──► params",
+          [ChordLine.new(" space ", "\"Mine parameters\" on a flow"),
+           ChordLine.new(nil, "start from History or Repeater")])
+      when :sequencer
+        CardSpec.new("SEQUENCER", "Collect tokens and measure their randomness.",
+          "collect ──► samples ──► entropy",
+          [ChordLine.new(" space ", "\"Send to Sequencer\" on a flow"),
+           ChordLine.new(" ^R ", "collect samples", "sequence.run")])
+      end
     end
 
-    # Discover, Comparer, Miner and Sequencer all reach here from a container-level "nothing
-    # open yet" branch, the same place Repeater and Fuzzer do — so they share that shape:
-    # prose, a diagram, a divider, and the two chords that open the tab. Each spends exactly
-    # `5 + 2` interior rows, which is what `full_inner_h` claims for them.
-
-    private def render_discover_full(screen : Screen, rect : Rect, headline : String) : Nil
-      desc = "Crawl a target for endpoints nothing linked."
-      inner, ix, iw = begin_card(screen, rect, :discover, headline, "DISCOVER", full_inner_h(:discover), Screen.display_width(desc))
+    private def render_standard_full(screen : Screen, rect : Rect, variant : Symbol,
+                                     headline : String, card : CardSpec) : Nil
+      inner, ix, iw = begin_card(screen, rect, variant, headline, card.title, full_inner_h(variant), Screen.display_width(card.desc))
       y = inner.y
 
-      draw_wrapped_message(screen, ix, y, iw, desc)
+      draw_wrapped_message(screen, ix, y, iw, card.desc)
       y += 2
-      screen.text(ix, y, "target ──► crawl ──► endpoints", Theme.muted, Theme.bg, width: iw)
+      screen.text(ix, y, card.line, Theme.muted, Theme.bg, width: iw)
       y += 2
       Frame.inner_divider(screen, inner, y, bg: Theme.bg, border: Theme.border)
       y += 1
-      y = draw_chord_hint(screen, ix, y, iw, " space ", "\"Discover here\" on a host", bullet: "▸ ")
-      draw_chord_hint(screen, ix, y, iw, " ^R ", "run the selected crawl", bullet: "▸ ", verb: "discover.run")
+      draw_chord_lines(screen, ix, y, iw, card.chords)
     end
 
-    private def render_comparer_full(screen : Screen, rect : Rect, headline : String) : Nil
-      desc = "Diff two flows side by side — req or res."
-      inner, ix, iw = begin_card(screen, rect, :comparer, headline, "COMPARER", full_inner_h(:comparer), Screen.display_width(desc))
-      y = inner.y
-
-      draw_wrapped_message(screen, ix, y, iw, desc)
-      y += 2
-      screen.text(ix, y, "A ──► diff ◄── B", Theme.muted, Theme.bg, width: iw)
-      y += 2
-      Frame.inner_divider(screen, inner, y, bg: Theme.bg, border: Theme.border)
-      y += 1
-      y = draw_chord_hint(screen, ix, y, iw, " a ", "pick flow A", bullet: "▸ ", verb: "comparer.pick-a")
-      draw_chord_hint(screen, ix, y, iw, " b ", "pick flow B", bullet: "▸ ", verb: "comparer.pick-b")
-    end
-
-    # THREE chord lines, where the sibling cards take two (hence `5 + 3` in `full_inner_h`).
-    # Getting a request into the queue and running it are steps the rest of the app implies;
-    # choosing who to replay as is the one this tab invented, and a card that omitted it would
-    # leave an operator on the two built-in identities with no sign there was a third thing to
-    # press.
-    private def render_authorize_full(screen : Screen, rect : Rect, headline : String) : Nil
-      desc = "Replay one request as several identities and diff the answers."
-      inner, ix, iw = begin_card(screen, rect, :authorize, headline, "AUTHORIZE", full_inner_h(:authorize), Screen.display_width(desc))
-      y = inner.y
-
-      draw_wrapped_message(screen, ix, y, iw, desc)
-      y += 2
-      screen.text(ix, y, "one request ──► many identities", Theme.muted, Theme.bg, width: iw)
-      y += 2
-      Frame.inner_divider(screen, inner, y, bg: Theme.bg, border: Theme.border)
-      y += 1
-      y = draw_chord_hint(screen, ix, y, iw, " space ", "\"Send to Authorize\" on a flow", bullet: "▸ ")
-      y = draw_chord_hint(screen, ix, y, iw, " i ", "who to replay as", bullet: "▸ ", verb: "authorize.identities")
-      draw_chord_hint(screen, ix, y, iw, " ^R ", "replay what has not run", bullet: "▸ ", verb: "authorize.run")
-    end
-
-    private def render_miner_full(screen : Screen, rect : Rect, headline : String) : Nil
-      desc = "Find undocumented parameters a target takes."
-      inner, ix, iw = begin_card(screen, rect, :miner, headline, "MINER", full_inner_h(:miner), Screen.display_width(desc))
-      y = inner.y
-
-      draw_wrapped_message(screen, ix, y, iw, desc)
-      y += 2
-      screen.text(ix, y, "wordlist ──► probe ──► params", Theme.muted, Theme.bg, width: iw)
-      y += 2
-      Frame.inner_divider(screen, inner, y, bg: Theme.bg, border: Theme.border)
-      y += 1
-      y = draw_chord_hint(screen, ix, y, iw, " space ", "\"Mine parameters\" on a flow", bullet: "▸ ")
-      draw_chord_hint(screen, ix, y, iw, " ^R ", "start mining", bullet: "▸ ", verb: "mine.run")
-    end
-
-    private def render_sequencer_full(screen : Screen, rect : Rect, headline : String) : Nil
-      desc = "Collect tokens and measure their randomness."
-      inner, ix, iw = begin_card(screen, rect, :sequencer, headline, "SEQUENCER", full_inner_h(:sequencer), Screen.display_width(desc))
-      y = inner.y
-
-      draw_wrapped_message(screen, ix, y, iw, desc)
-      y += 2
-      screen.text(ix, y, "collect ──► samples ──► entropy", Theme.muted, Theme.bg, width: iw)
-      y += 2
-      Frame.inner_divider(screen, inner, y, bg: Theme.bg, border: Theme.border)
-      y += 1
-      y = draw_chord_hint(screen, ix, y, iw, " space ", "\"Send to Sequencer\" on a flow", bullet: "▸ ")
-      draw_chord_hint(screen, ix, y, iw, " ^R ", "collect samples", bullet: "▸ ", verb: "sequence.run")
+    private def draw_chord_lines(screen : Screen, ix : Int32, y : Int32, iw : Int32, chords : Array(ChordLine)) : Nil
+      chords.each do |c|
+        if chord = c.chord
+          y = draw_chord_hint(screen, ix, y, iw, chord, c.label, bullet: c.bullet, verb: c.verb)
+        else
+          screen.text(ix + 2, y, c.label, Theme.muted, Theme.bg, width: iw)
+        end
+      end
     end
 
     # The three RESULTS-pane variants below (fuzz above, mine and sample here) all draw inside a
@@ -693,108 +649,68 @@ module Gori::Tui
       end
     end
 
-    # A CENTERED variant, so the whole rect goes to `place_art_and_card` — there is no
-    # headline row to carve off first (see CENTERED).
-    private def render_notes_full(screen : Screen, rect : Rect) : Nil
-      desc = "Your project scratchpad — observations, hypotheses, write-ups."
-      hint = "notes stack as sub-tabs · first line becomes the title"
-      inner, ix, iw = begin_centered_card(screen, rect, :notes, "NOTES", full_inner_h(:notes), {Screen.display_width(desc), Screen.display_width(hint)}.max)
-      y = inner.y
-
-      draw_wrapped_message(screen, ix, y, iw, desc)
-      y += 2
-      screen.text(ix, y, hint, Theme.muted, Theme.bg, width: iw)
-      y += 2
-      y = draw_chord_hint(screen, ix, y, iw, " ^N ", "new note tab", bullet: "▸ ")
-      draw_chord_hint(screen, ix, y, iw, " ^W ", "close current note", bullet: "▸ ")
+    # The CENTERED variants: the whole rect goes to `place_art_and_card` — there is no headline
+    # row to carve off first (see CENTERED) — and the muted line is a hint, not a diagram.
+    private def centered_card(variant : Symbol) : CardSpec?
+      case variant
+      when :notes
+        CardSpec.new("NOTES", "Your project scratchpad — observations, hypotheses, write-ups.",
+          "notes stack as sub-tabs · first line becomes the title",
+          [ChordLine.new(" ^N ", "new note tab"), ChordLine.new(" ^W ", "close current note")])
+      when :project_desc
+        # The Project tab's DESCRIPTION sub-tab with nothing written yet. Sibling cards on that
+        # tab all name their own emptiness ("no scope rules — press a to add"); this one used to
+        # render as pure void, which is why it exists.
+        CardSpec.new("PROJECT", "Target, scope, credentials, rules.", "the first thing you read on re-entry",
+          [ChordLine.new(" i/↵ ", "start writing"), ChordLine.new(" ^E ", "open in $EDITOR")])
+      when :project_scope
+        # Titled TARGETS, not SCOPE — the outer card already says SCOPE on its border, and the
+        # rules are the list of targets.
+        CardSpec.new("TARGETS", "Scope rules mark which hosts you're testing.",
+          "incl keeps a host in · excl passes it through",
+          [ChordLine.new(" a ", "add an include or exclude rule", "scope.add-rule"),
+           ChordLine.new(" space ", "rule actions")])
+      when :project_overrides
+        # DNS MAP because that is what an entry does — resolve past DNS — where "overrides" only
+        # repeats the border.
+        CardSpec.new("DNS MAP", "Pin a hostname to a chosen IP for this project.",
+          "requests resolve there before real DNS",
+          [ChordLine.new(" a ", "map a host to an IP", "hostoverride.add-entry"),
+           ChordLine.new(" space ", "override actions")])
+      when :project_env
+        # The line that names a TOKEN is built at render time (`Env.spell`), not frozen into the
+        # source: this card is the first thing an operator reads about the feature, and under
+        # the namespaced grammar a `$KEY` here would teach the one spelling that does not
+        # resolve. The prefix is a once-a-session setting, so its row is palette-only (#1282):
+        # the space menu offers only Add here, and the last bullet names the palette search that
+        # finds it, the way `Hotkeys.route` spells any palette-only verb (#1433).
+        title = verb_title("env.edit-prefix", "Change prefix")
+        CardSpec.new("VARIABLES", "Store values to reuse across requests.",
+          "#{Env.spell("KEY", Env::Namespace::Env)} in a request expands when you send",
+          [ChordLine.new(" a ", "add a variable", "env.add-var"),
+           ChordLine.new(" ^P ", "→ #{title}", "app.palette")])
+      when :project_activity
+        # Unlike its four neighbours this card asks for nothing: the pane REPORTS. So the
+        # bullets name what makes rows appear rather than a key that would create one, and the
+        # sentence names the half an operator does not expect to be here — the failures that
+        # were recorded without ever raising a notification.
+        CardSpec.new("ACTIVITY", "What agents and background jobs did to this project.",
+          "including hooks and bindings that failed quietly",
+          [ChordLine.new(" s ", "filter by source", "activity.filter-source"),
+           ChordLine.new(" space ", "all commands")])
+      end
     end
 
-    # The Project tab's DESCRIPTION sub-tab with nothing written yet. Sibling cards on that
-    # tab all name their own emptiness ("no scope rules — press a to add"); this one used to
-    # render as pure void, which is why it exists.
-    private def render_project_desc_full(screen : Screen, rect : Rect) : Nil
-      desc = "Target, scope, credentials, rules."
-      hint = "the first thing you read on re-entry"
-      inner, ix, iw = begin_centered_card(screen, rect, :project_desc, "PROJECT",
-        full_inner_h(:project_desc), {Screen.display_width(desc), Screen.display_width(hint)}.max)
+    private def render_centered_full(screen : Screen, rect : Rect, variant : Symbol, card : CardSpec) : Nil
+      inner, ix, iw = begin_centered_card(screen, rect, variant, card.title, full_inner_h(variant),
+        {Screen.display_width(card.desc), Screen.display_width(card.line)}.max)
       y = inner.y
 
-      draw_wrapped_message(screen, ix, y, iw, desc)
+      draw_wrapped_message(screen, ix, y, iw, card.desc)
       y += 2
-      screen.text(ix, y, hint, Theme.muted, Theme.bg, width: iw)
+      screen.text(ix, y, card.line, Theme.muted, Theme.bg, width: iw)
       y += 2
-      y = draw_chord_hint(screen, ix, y, iw, " i/↵ ", "start writing", bullet: "▸ ")
-      draw_chord_hint(screen, ix, y, iw, " ^E ", "open in $EDITOR", bullet: "▸ ")
-    end
-
-    # The Project tab's SCOPE card with no rules. Titled TARGETS, not SCOPE — the outer card
-    # already says SCOPE on its border, and the rules are the list of targets.
-    private def render_project_scope_full(screen : Screen, rect : Rect) : Nil
-      desc = "Scope rules mark which hosts you're testing."
-      hint = "incl keeps a host in · excl passes it through"
-      inner, ix, iw = begin_centered_card(screen, rect, :project_scope, "TARGETS",
-        full_inner_h(:project_scope), {Screen.display_width(desc), Screen.display_width(hint)}.max)
-      y = inner.y
-
-      draw_wrapped_message(screen, ix, y, iw, desc)
-      y += 2
-      screen.text(ix, y, hint, Theme.muted, Theme.bg, width: iw)
-      y += 2
-      y = draw_chord_hint(screen, ix, y, iw, " a ", "add an include or exclude rule", bullet: "▸ ", verb: "scope.add-rule")
-      draw_chord_hint(screen, ix, y, iw, " space ", "rule actions", bullet: "▸ ")
-    end
-
-    # The Project tab's HOST OVERRIDES card with no entries. DNS MAP because that is what an
-    # entry does — resolve past DNS — where "overrides" only repeats the border.
-    private def render_project_overrides_full(screen : Screen, rect : Rect) : Nil
-      desc = "Pin a hostname to a chosen IP for this project."
-      hint = "requests resolve there before real DNS"
-      inner, ix, iw = begin_centered_card(screen, rect, :project_overrides, "DNS MAP",
-        full_inner_h(:project_overrides), {Screen.display_width(desc), Screen.display_width(hint)}.max)
-      y = inner.y
-
-      draw_wrapped_message(screen, ix, y, iw, desc)
-      y += 2
-      screen.text(ix, y, hint, Theme.muted, Theme.bg, width: iw)
-      y += 2
-      y = draw_chord_hint(screen, ix, y, iw, " a ", "map a host to an IP", bullet: "▸ ", verb: "hostoverride.add-entry")
-      draw_chord_hint(screen, ix, y, iw, " space ", "override actions", bullet: "▸ ")
-    end
-
-    # The Project tab's ENVIRONMENT card with no vars. The copy hardcodes the default `$`
-    # sigil: an empty pane means a fresh project, and the live prefix rides the outer border.
-    private def render_project_env_full(screen : Screen, rect : Rect) : Nil
-      desc = "Store $KEY values to reuse across requests."
-      hint = "$KEY in a request expands when you send"
-      inner, ix, iw = begin_centered_card(screen, rect, :project_env, "VARIABLES",
-        full_inner_h(:project_env), {Screen.display_width(desc), Screen.display_width(hint)}.max)
-      y = inner.y
-
-      draw_wrapped_message(screen, ix, y, iw, desc)
-      y += 2
-      screen.text(ix, y, hint, Theme.muted, Theme.bg, width: iw)
-      y += 2
-      y = draw_chord_hint(screen, ix, y, iw, " a ", "add a $KEY variable", bullet: "▸ ", verb: "env.add-var")
-      draw_chord_hint(screen, ix, y, iw, " space ", "vars & prefix", bullet: "▸ ")
-    end
-
-    # Unlike its four neighbours this card asks for nothing: the pane REPORTS. So the bullets
-    # name what makes rows appear rather than a key that would create one, and the sentence
-    # names the half an operator does not expect to be here — the failures that were recorded
-    # without ever raising a notification.
-    private def render_project_activity_full(screen : Screen, rect : Rect) : Nil
-      desc = "What agents and background jobs did to this project."
-      hint = "including hooks and bindings that failed quietly"
-      inner, ix, iw = begin_centered_card(screen, rect, :project_activity, "ACTIVITY",
-        full_inner_h(:project_activity), {Screen.display_width(desc), Screen.display_width(hint)}.max)
-      y = inner.y
-
-      draw_wrapped_message(screen, ix, y, iw, desc)
-      y += 2
-      screen.text(ix, y, hint, Theme.muted, Theme.bg, width: iw)
-      y += 2
-      y = draw_chord_hint(screen, ix, y, iw, " s ", "filter by source", bullet: "▸ ", verb: "activity.filter-source")
-      draw_chord_hint(screen, ix, y, iw, " space ", "all commands", bullet: "▸ ")
+      draw_chord_lines(screen, ix, y, iw, card.chords)
     end
 
     # `begin_card` for a CENTERED variant: the same figure-and-card block, but centred in the
@@ -809,114 +725,20 @@ module Gori::Tui
       {inner, inner.x + 1, {inner.w - 2, 1}.max}
     end
 
-    private def medium_history(headline, addr, capturing) : Array(String)
-      lines = [headline, "──► proxy #{addr} ──► flows"]
-      if capturing
-        lines << "HTTP/3 / QUIC bypasses proxy — use ^P"
-        lines << "^P → Open browser · or set HTTP+HTTPS proxy"
-      else
-        lines << "capture is OFF — press #{key("c", "capture.toggle")} to start"
-        lines << "^P → Open browser · or set HTTP+HTTPS proxy"
-      end
-      lines
+    # The queue's keys (f/d/c//) answer only inside the Intercept body. From the tab bar a hint
+    # spells the key that gets there first ("↓ then f forward"), so it never implies a key is
+    # live where it is not. `i` needs no route: it is Global, and the tab bar answers it too.
+    private def queue_route(body_focused : Bool) : String
+      body_focused ? "" : "#{key("↓", "sidebar.enter")} then "
     end
 
-    private def medium_sitemap(headline, addr, capturing) : Array(String)
-      lines = [headline, "◆ proxy #{addr} → host tree"]
-      lines << "capture is OFF — press #{key("c", "capture.toggle")} to start" unless capturing
-      lines << "^P → Open browser · or set HTTP+HTTPS proxy"
-      lines
+    private def medium_intercept_action_hint(body_focused : Bool) : String
+      "#{queue_route(body_focused)}#{key("f", "intercept.forward")} forward · #{key("d", "intercept.drop")} drop · #{key("/", "intercept.filter")} condition"
     end
 
-    private def medium_intercept(headline, catch_on) : Array(String)
-      lines = [headline]
-      lines << (catch_on ? "⏸ queue empty · matching traffic pauses here" : "press i to enable catch")
-      lines << "#{key("f", "intercept.forward")} forward · #{key("d", "intercept.drop")} drop · #{key("/", "intercept.filter")} condition"
-      lines
-    end
-
-    private def medium_repeater(headline) : Array(String)
-      [headline, "flow ──► edit ──► send", "^N new tab · History #{key("^R", "history.repeater")} repeater"]
-    end
-
-    private def medium_fuzzer(headline) : Array(String)
-      [headline, "§ template ──► payloads ──► probe", "^N new session · #{key("⇧I", "history.fuzz")} from History"]
-    end
-
-    private def medium_fuzzer_results(headline, running) : Array(String)
-      running ? [headline, "sampling probes…"] : [headline, "^O payload sets · #{key("^R", "fuzz.run")} run"]
-    end
-
-    private def medium_probe(headline, scan_on) : Array(String)
-      if scan_on
-        [headline, "traffic ──► scan ──► issues", "#{key("m", "probe.mode")}:MODE · capture in-scope traffic"]
-      else
-        [headline, "press #{key("m", "probe.mode")} to enable scanning", "#{key("m", "probe.mode")}:MODE cycle OFF/PASSIVE/ACTIVE"]
-      end
-    end
-
-    private def medium_issues(headline) : Array(String)
-      [headline, "flow ──► issue ──► triage", "#{key("⇧F", "issue.create")} from History · #{key("n", "issues.new")} create"]
-    end
-
-    private def medium_discover(headline) : Array(String)
-      [headline, "target ──► crawl ──► endpoints", "space → Discover here · #{key("^R", "discover.run")} run"]
-    end
-
-    private def medium_comparer(headline) : Array(String)
-      [headline, "A ──► diff ◄── B", "#{key("a", "comparer.pick-a")} pick flow A · #{key("b", "comparer.pick-b")} pick flow B"]
-    end
-
-    private def medium_authorize(headline) : Array(String)
-      [headline, "one request ──► many identities", "space → Send to Authorize · #{key("i", "authorize.identities")} identities"]
-    end
-
-    private def medium_miner(headline) : Array(String)
-      [headline, "wordlist ──► probe ──► params", "space → Mine parameters · #{key("^R", "mine.run")} run"]
-    end
-
-    private def medium_sequencer(headline) : Array(String)
-      [headline, "collect ──► samples ──► entropy", "space → Send to Sequencer · #{key("^R", "sequence.run")}"]
-    end
-
-    private def medium_miner_results(headline, running) : Array(String)
-      running ? [headline, "probing the wordlist…"] : [headline, "#{key("^R", "mine.run")} mines this request"]
-    end
-
-    private def medium_sequencer_samples(headline, running) : Array(String)
-      running ? [headline, "collecting tokens…"] : [headline, "#{key("c", "sequence.configure")} token location · #{key("^R", "sequence.run")} collect"]
-    end
-
-    private def medium_oast(headline, has_provider) : Array(String)
-      if has_provider
-        [headline, "payload ──► target ──► callback", "#{key("g", "oast.generate")} payload URL · #{key("^R", "oast.listen")} listen"]
-      else
-        [headline, "no provider yet — ^2 Providers", "then #{key("g", "oast.generate")} for a payload URL"]
-      end
-    end
-
-    private def medium_notes(headline) : Array(String)
-      [headline, "scratchpad for this project", "^N new note · ^W close"]
-    end
-
-    private def medium_project_desc(headline) : Array(String)
-      [headline, "target · scope · credentials · rules", "i/↵ edit · ^E $EDITOR"]
-    end
-
-    private def medium_project_scope(headline) : Array(String)
-      [headline, "incl / excl ──► scope lens", "#{key("a", "scope.add-rule")} add rule · space menu"]
-    end
-
-    private def medium_project_overrides(headline) : Array(String)
-      [headline, "host ──► your IP", "#{key("a", "hostoverride.add-entry")} add · #{key("e", "hostoverride.edit-entry")} edit · #{key("d", "hostoverride.delete-entry")} delete"]
-    end
-
-    private def medium_project_env(headline) : Array(String)
-      [headline, "$KEY ──► value on send", "#{key("a", "env.add-var")} add var · space prefix"]
-    end
-
-    private def medium_project_activity(headline) : Array(String)
-      [headline, "agents & jobs ──► one log", "#{key("s", "activity.filter-source")} source · #{key("l", "activity.filter-level")} level · ↵ open"]
+    private def minimal_intercept_hint(catch_on : Bool, body_focused : Bool) : String
+      return "press #{key("i", "intercept.toggle")} to hold matching requests" unless catch_on
+      "⏸ queue empty · #{key("i", "intercept.toggle")} catch · #{queue_route(body_focused)}#{key("/", "intercept.filter")} filter"
     end
 
     private def draw_medium_lines(screen : Screen, rect : Rect, lines : Array(String)) : Nil
@@ -932,8 +754,22 @@ module Gori::Tui
       end
     end
 
-    private def draw_palette_hint(screen : Screen, ix : Int32, y : Int32, iw : Int32, *, bullet : String) : Int32
-      draw_chord_hint(screen, ix, y, iw, " ^P ", "Open browser", bullet: bullet)
+    # A palette row reads as the route it is — ` ^P ` → Open browser — never as a ` ^P ` chip
+    # that looks like the verb's own chord.
+    private def draw_palette_hint(screen : Screen, ix : Int32, y : Int32, iw : Int32, *, bullet : String,
+                                  label : String = "→ #{verb_title("browser.open", "Open browser")}") : Int32
+      draw_chord_hint(screen, ix, y, iw, " ^P ", label, bullet: bullet, verb: "app.palette")
+    end
+
+    # How to reach `verb` (`Tutorial.reach`: its own chord, a menu path, or `^P → <title>`);
+    # without a registry, the palette route spelled from `literal`.
+    private def palette_route(verb : String, literal : String) : String
+      return "^P → #{literal}" unless reg = registry
+      Tutorial.reach(reg, verb)
+    end
+
+    private def verb_title(verb : String, literal : String) : String
+      registry.try(&.[]?(verb)).try(&.title) || literal
     end
 
     # `literal` as written unless a registry is set and `verb` resolves — then the verb's
@@ -942,6 +778,22 @@ module Gori::Tui
     private def key(literal : String, verb : String) : String
       return literal unless reg = registry
       Hotkeys.binding_label(reg, verb, literal)
+    end
+
+    private def capture_off_hint : String
+      "capture is OFF — tab bar: press #{key("c", "capture.toggle")} to start"
+    end
+
+    # The space-menu path to a menu-only verb (`space → > D`), or "the space menu" without a
+    # registry to read it from (`Hotkeys.expand_menu_paths`).
+    private def menu(verb : String) : String
+      Hotkeys.expand_menu_paths(registry, "{space:#{verb}}")
+    end
+
+    # …and the same path as a chip: ` space > D `, or a bare ` space ` without a registry.
+    private def menu_chip(verb : String) : String
+      keys = registry.try(&.menu_keys(verb))
+      keys ? " space #{keys.join(' ')} " : " space "
     end
 
     # A ` KEY ` or ` KEY:WORD ` chip; with `verb`, KEY is resolved through #key and the
@@ -965,13 +817,6 @@ module Gori::Tui
       x = Frame.chip(screen, bx, y, Hotkeys.retag(chip_text(chord, verb)), true) + 1
       screen.text(x, y, " #{label}", Theme.text, bg, width: {ix + iw - x, 0}.max)
       y + 1
-    end
-
-    private def fit_history_flow(listen : String, max_w : Int32) : String
-      full = "client ──► #{listen} ──► flows"
-      return full if full.size <= max_w
-      short = "──► proxy ──► flows"
-      short.size <= max_w ? short : "──► #{listen} ──►"
     end
 
     # The RESULTS/SAMPLES-pane variants (fuzz/mine/token run) draw inside a pane nested a

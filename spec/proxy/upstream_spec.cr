@@ -178,6 +178,24 @@ describe Gori::Proxy::Upstream do
     end
   end
 
+  # `TCPSocket.new` on macOS 27 returned a REFUSED address as a connected socket (the event loop
+  # reads the second `connect()`'s EISCONN as success), so a dial never reached the next address.
+  # Only a host that resolves `localhost` to ::1 first AND has the quirk exercises the fix; on
+  # one without it this passes through stdlib's own fall-through. (A refused single address is
+  # "still reports a refused port as Connect", further down.)
+  describe "refused connects" do
+    it "falls through a refused address to the next one the name resolves to" do
+      server = TCPServer.new("127.0.0.1", 0) # IPv4 only: `localhost` may resolve ::1 first
+      spawn { server.accept?.try(&.close) }
+
+      sock = Gori::Proxy::Upstream.dial("localhost", server.local_address.port)
+      sock.should_not be_nil
+      sock.as?(TCPSocket).try(&.remote_address.address).should eq("127.0.0.1")
+      sock.try(&.close)
+      server.close
+    end
+  end
+
   describe "upstream proxy (CONNECT tunnel)" do
     it "tunnels a dial through the configured proxy when it answers 2xx" do
       proxy = TCPServer.new("127.0.0.1", 0)
@@ -224,6 +242,102 @@ describe Gori::Proxy::Upstream do
         Gori::Proxy::Upstream.dial("example.test", 443).should be_nil
       ensure
         Gori::Settings.upstream_proxy = ""
+        proxy.close rescue nil
+      end
+    end
+
+    it "fails a 2xx CONNECT reply that reaches EOF before its header terminator" do
+      proxy = TCPServer.new("127.0.0.1", 0)
+      pport = proxy.local_address.port
+      tunnel_data = Channel(Bytes?).new(1)
+      spawn do
+        conn = proxy.accept
+        Gori::Proxy::Codec::Http1.read_head(conn)
+        conn << "HTTP/1.1 200 Connection Established\r\nX-Test: truncated\r\n"
+        conn.flush
+        conn.close_write
+        data = Bytes.new(32)
+        count = conn.read(data)
+        tunnel_data.send(count > 0 ? data[0, count].dup : nil)
+        conn.close rescue nil
+      rescue
+        tunnel_data.send(nil)
+      end
+
+      previous = Gori::Settings.upstream_proxy
+      Gori::Settings.upstream_proxy = "127.0.0.1:#{pport}"
+      begin
+        sock, error = Gori::Proxy::Upstream.dial_result("example.test", 443)
+        if tunnel = sock
+          tunnel.write("TLS client hello".to_slice)
+          tunnel.flush
+          tunnel.close
+        end
+        sock.should be_nil
+        error.should_not be_nil
+        error.not_nil!.kind.should eq(Gori::Proxy::Upstream::DialErrorKind::Proxy)
+        error.not_nil!.detail.not_nil!.should contain("incomplete CONNECT reply")
+        error.not_nil!.detail.not_nil!.should contain("200 Connection Established")
+        tunnel_data.receive.should be_nil
+      ensure
+        Gori::Settings.upstream_proxy = previous
+        proxy.close rescue nil
+      end
+    end
+
+    # `gets` returns an over-long line in pieces; the CRLF of a header exactly MAX_CONNECT_LINE
+    # long came back alone and was read as the blank line, so an incomplete reply opened a tunnel.
+    it "calls a short status line cut off by EOF incomplete, not oversized" do
+      proxy = TCPServer.new("127.0.0.1", 0)
+      pport = proxy.local_address.port
+      spawn do
+        conn = proxy.accept
+        Gori::Proxy::Codec::Http1.read_head(conn)
+        conn << "HTTP/1.1 200 OK"
+        conn.flush
+        conn.close
+      rescue
+      end
+
+      previous = Gori::Settings.upstream_proxy
+      Gori::Settings.upstream_proxy = "127.0.0.1:#{pport}"
+      begin
+        sock, error = Gori::Proxy::Upstream.dial_result("example.test", 443)
+        sock.try(&.close)
+        sock.should be_nil
+        detail = error.not_nil!.detail.not_nil!
+        detail.should contain("incomplete CONNECT reply")
+        detail.should_not contain("oversized")
+      ensure
+        Gori::Settings.upstream_proxy = previous
+        proxy.close rescue nil
+      end
+    end
+
+    it "does not take the CRLF of a limit-long header for the terminator" do
+      proxy = TCPServer.new("127.0.0.1", 0)
+      pport = proxy.local_address.port
+      spawn do
+        conn = proxy.accept
+        Gori::Proxy::Codec::Http1.read_head(conn)
+        filler = "X-Long: " + "a" * (Gori::Proxy::Upstream::MAX_CONNECT_LINE - 8)
+        conn << "HTTP/1.1 200 Connection Established\r\n" << filler << "\r\n"
+        conn.flush
+        conn.close_write
+        sleep 1.second
+        conn.close rescue nil
+      rescue
+      end
+
+      previous = Gori::Settings.upstream_proxy
+      Gori::Settings.upstream_proxy = "127.0.0.1:#{pport}"
+      begin
+        sock, error = Gori::Proxy::Upstream.dial_result("example.test", 443)
+        sock.try(&.close)
+        sock.should be_nil
+        error.not_nil!.detail.not_nil!.should contain("incomplete CONNECT reply")
+      ensure
+        Gori::Settings.upstream_proxy = previous
         proxy.close rescue nil
       end
     end
@@ -582,6 +696,23 @@ describe Gori::Proxy::Upstream do
       # host:port semantics win — split on the LAST colon.
       Gori::Proxy::Upstream.split_host_port("127.0.0.1:19110:bogus", 80).should eq({"127.0.0.1:19110", 80})
       Gori::Proxy::Upstream.split_host_port("127.0.0.1:80", 443).should eq({"127.0.0.1", 80})
+    end
+  end
+
+  describe ".split_connect_host_port" do
+    it "accepts a hostname or explicit numeric port without changing IPv6 parsing" do
+      Gori::Proxy::Upstream.split_connect_host_port("example.com", 443).should eq({"example.com", 443})
+      Gori::Proxy::Upstream.split_connect_host_port("example.com:8443", 443).should eq({"example.com", 8443})
+      Gori::Proxy::Upstream.split_connect_host_port("[::1]:8443", 443).should eq({"::1", 8443})
+      Gori::Proxy::Upstream.split_connect_host_port("::1", 443).should eq({"::1", 443})
+    end
+
+    it "rejects an explicit port that cannot be parsed instead of using the default" do
+      ["example.com:notaport", "example.com:", "example.com:65536", "[::1]:bogus"].each do |authority|
+        expect_raises(Gori::Error) do
+          Gori::Proxy::Upstream.split_connect_host_port(authority, 443)
+        end
+      end
     end
   end
 
@@ -985,6 +1116,10 @@ describe Gori::Proxy::Upstream do
           # Answers immediately, so OpenSSL parses the reply as a TLS record and refuses —
           # the complement of the silent case above, which times out instead.
           sock.write("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_slice) rescue nil
+          # Takes the ClientHello before closing: a socket closed with it unread is reset, and
+          # Windows then discards the reply the client has not read yet.
+          sock.read_timeout = 2.seconds
+          sock.read(Bytes.new(4096)) rescue nil
           sock.close rescue nil
         end
       end
@@ -996,7 +1131,8 @@ describe Gori::Proxy::Upstream do
         err.try(&.kind).should eq(Gori::Proxy::Upstream::DialErrorKind::Tls)
         # Under verify-on this used to be indistinguishable from an untrusted certificate.
         err.try(&.kind).should_not eq(Gori::Proxy::Upstream::DialErrorKind::TlsVerify)
-        err.try(&.cause).to_s.downcase.should contain("version")
+        # Windows' OpenSSL words the same refusal "packet length too long".
+        err.try(&.cause).to_s.downcase.should match(/version|packet length/)
       ensure
         origin.close rescue nil
       end

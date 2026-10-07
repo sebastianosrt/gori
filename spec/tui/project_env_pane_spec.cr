@@ -54,7 +54,7 @@ private def env_view(store : Gori::Store, project : Gori::Project) : ProjectView
 end
 
 private def type(view : ProjectView, text : String) : Nil
-  text.each_char { |c| view.env_input(c) }
+  text.each_char { |c| view.env_field.not_nil!.insert(c) }
 end
 
 # The screen row a var's KEY is drawn on, so a hit-test can be asserted against the DRAW rather
@@ -94,6 +94,27 @@ describe "Gori::Env.load_project" do
 end
 
 describe "ProjectView ENV pane" do
+  # The card's border is the only line on the tab that says which GRAMMAR these rows are read
+  # under: `ALPHA → 1` is identical whether the editors two tabs over resolve `$ALPHA` or
+  # `$ENV.ALPHA`. It used to print the sigil alone, which under the namespaced grammar is half
+  # an answer — and the half that reads as the spelling that does NOT resolve.
+  it "carries the live token spelling in its border meta, in both grammars" do
+    tmp_store do |store, project|
+      with_project_vars([{"ALPHA", "1"}, {"BETA", "2"}]) do
+        view = env_view(store, project)
+        rect = Rect.new(0, 0, 120, 30)
+        drawn = -> do
+          b = MemoryBackend.new(rect.w, rect.h)
+          view.render(Screen.new(b), rect, focused: true)
+          (0...rect.h).map { |r| b.row(r) }.join("\n")
+        end
+
+        with_env_syntax(Gori::Env::Syntax::Bare) { drawn.call.should contain("project · $KEY · 2") }
+        with_env_syntax(Gori::Env::Syntax::Namespaced) { drawn.call.should contain("project · $ENV.KEY · 2") }
+      end
+    end
+  end
+
   it "picks the row under the pointer while the prefix editor holds the first line" do
     tmp_store do |store, project|
       with_project_vars([{"ALPHA", "1"}, {"BETA", "2"}, {"GAMMA", "3"}]) do
@@ -123,13 +144,25 @@ describe "ProjectView ENV pane" do
         view = env_view(store, project)
         view.env_add_start
         type(view, "TOKEN abc123")
-        view.env_move_cursor(-99) # ← to the head of the line
+        view.@env_field.move(-99) # ← to the head of the line
 
-        # True ⇒ "the row still has text", which is what stops the caller closing it. The old
-        # answer was about the CARET, so this ⌫ threw the whole line away.
-        view.env_backspace.should be_true
+        # A caret at 0 with text behind it makes ⌫ a no-op, never a discard of the line.
+        view.env_field.not_nil!.backspace
         view.env_commit.should eq(:ok)
         view.env_vars.should eq([{"TOKEN", "abc123"}])
+      end
+    end
+  end
+
+  it "preserves leading and trailing spaces typed after an assignment equals sign" do
+    tmp_store do |store, project|
+      with_project_vars([] of {String, String}) do
+        view = env_view(store, project)
+        view.env_add_start
+        type(view, "TOKEN=  value  ")
+
+        view.env_commit.should eq(:ok)
+        view.env_vars.should eq([{"TOKEN", "  value  "}])
       end
     end
   end
@@ -140,9 +173,10 @@ describe "ProjectView ENV pane" do
         view = env_view(store, project)
         view.env_add_start
         type(view, "ab")
-        view.env_backspace.should be_true
-        view.env_backspace.should be_true
-        view.env_backspace.should be_false # nothing left ⇒ the caller closes the row
+        Gori::Tui::ProjectController.backspace_row(view.env_field).should be_true
+        Gori::Tui::ProjectController.backspace_row(view.env_field).should be_true
+        # nothing left => false, and the caller closes the row
+        Gori::Tui::ProjectController.backspace_row(view.env_field).should be_false
       end
     end
   end
@@ -242,6 +276,8 @@ private class FakeHost
 
   getter statuses = [] of String
   getter applied_config : Gori::Settings::ProjectNetworkConfig? = nil
+  # Runs while the confirm is "up", before the action — the tick that reloads under a modal.
+  property under_modal : Proc(Nil)? = nil
 
   def initialize(@session : Gori::Session)
     @jobs = Gori::Tui::Jobs.new
@@ -267,6 +303,7 @@ private class FakeHost
   # The delete path is behind a confirm; run the action, which is what pressing "delete" does.
   def confirm(title : String, message : String, *, confirm_label : String, danger : Bool,
               return_to : Symbol = :none, &action : -> Nil) : Nil
+    @under_modal.try(&.call)
     action.call
   end
 
@@ -453,6 +490,25 @@ describe Gori::Tui::ProjectController do
     end
   end
 
+  # The global editor, the wizard and `gori run project network set` all run
+  # `Settings.bind_host_error`; this pane only checked for an empty field, so a typo'd address
+  # reached the project DB and failed every later open of the project.
+  it "refuses a bind address the other doors already refuse" do
+    with_env_controller do |c, host, _session|
+      c.view.refresh_settings
+      c.view.focus_pane(:settings)
+      c.view.select_setting(Gori::Tui::ProjectView::SETTINGS_FIELD_BASE)
+      20.times { c.handle_body_key(key(Termisu::Input::Key::Backspace)) }
+      type_keys(c, "999.999.999.999")
+      c.handle_body_key(key(Termisu::Input::Key::Enter))
+
+      host.applied_config.should be_nil
+      host.statuses.last.should contain("invalid bind IP")
+    ensure
+      Gori::Settings.project_bind_host = nil
+    end
+  end
+
   it "says a rolled-back env write did NOT save, instead of reporting success" do
     with_env_controller do |c, host, session|
       c.env_add_var
@@ -492,6 +548,24 @@ describe Gori::Tui::ProjectController do
       # The row is back, because the store still has it — see the save example above.
       c.view.env_vars.should eq([{"TOKEN", "sekrit"}])
       Gori::Settings.project_env_vars.should eq([{"TOKEN", "sekrit"}])
+    end
+  end
+
+  # The confirm names a key, and the data_version tick reloads the list under the modal: a
+  # peer's delete above the selection must not shift the delete onto a neighbour.
+  it "deletes the var the confirm named after the list reloads under it" do
+    with_env_controller do |c, host, session|
+      Gori::Env.save_project(session.store, [{"A", "1"}, {"B", "2"}, {"C", "3"}])
+      c.view.reload_env_vars
+      c.view.env_select(1)
+      c.view.selected_env_key.should eq("B")
+      host.under_modal = -> {
+        Gori::Env.save_project(session.store, [{"B", "2"}, {"C", "3"}])
+        c.view.reload_env_vars
+      }
+      c.env_delete_var
+      c.view.env_vars.should eq([{"C", "3"}])
+      host.statuses.last.should contain("deleted: B")
     end
   end
 

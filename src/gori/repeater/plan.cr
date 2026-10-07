@@ -7,6 +7,12 @@ require "./sender"
 require "./ws_engine"
 
 module Gori::Repeater
+  # The ceiling on a multi-endpoint race group (#1236). A race is sent WHOLE — never split —
+  # so every surface refuses a group over this before any dial, the same rule the Fuzzer race
+  # follows (`Fuzz::MAX_RACE_SIZE`). Set to the marked-sub-tab batch cap (`BATCH_SUBTAB_CAP`),
+  # the TUI gesture that forms a race, since that is where the largest group comes from.
+  MAX_RACE_MEMBERS = 20
+
   # Why one option set cannot become a runnable send.
   #
   # The builder never writes the user-facing sentence: every surface phrases these in its
@@ -169,6 +175,19 @@ module Gori::Repeater
     # DRAFT it expanded itself (MCP's `RequestBuilder`, the TUI editor's byte modes).
     property? evidence : Bool
 
+    # The names the EVIDENCE bytes ARRIVED with, for a surface that knows them — provenance per
+    # NAME at the SEND seam, where `$BIND`/`$GEN` resolve. nil keeps `evidence?`'s blanket skip.
+    #
+    # The sibling for the env-var pass is not a field here but a narrowed TABLE the surface
+    # hands over already subtracted (`RepeaterView#operator_env_vars`, and `Fuzz::PlanOptions#env_vars`
+    # one tree over). The send pass cannot be served that way — GEN resolves from a fixed
+    # catalog with no table to subtract from, and it must mint AT the socket — so the names
+    # travel instead. See `Sender#evidence_literals` for what went out without them.
+    #
+    # INERT on the field-native h2 path for the same reason `expand_bindings` is: nothing there
+    # expands (`build_field_native`).
+    property evidence_literals : Set(String)?
+
     # h2 ONLY: put field names on the wire with the case the operator typed. Off by default
     # because the h1 head text is both a wire format and the paste buffer — a request copied
     # from Burp or curl is conventionally title-cased and h2 requires lowercase (RFC 9113
@@ -209,6 +228,16 @@ module Gori::Repeater
     property h2_fields : Array({String, String})?
     property h2_body : Bytes?
 
+    # A session slot's REFRESH step (#1233): the request goes out AS this slot without the slot
+    # being active — its `$BIND.*` resolve out of this slot's table, its response rebinds this
+    # slot's claimed rules, and the slot's header overlay is NOT written (the login request
+    # must not carry the stale credential it is replacing). nil everywhere else. See
+    # `Sender#refresh_slot`.
+    property refresh_slot : String?
+    # The binding table `refresh_slot` names a slot of — the refreshing project's own, carried
+    # rather than read off `Env.layer`, which a project switch replaces mid-refresh.
+    property refresh_layer : Gori::Bindings?
+
     def initialize(@requests : Array(Bytes) = [] of Bytes,
                    *,
                    @expand_request : Bool = true,
@@ -216,6 +245,7 @@ module Gori::Repeater
                    @auto_content_length : Bool = true,
                    @resync_cl_after_expansion : Bool = false,
                    @evidence : Bool = false,
+                   @evidence_literals : Set(String)? = nil,
                    @preserve_field_case : Bool = false,
                    @reframe_grpc : Bool = false,
                    @h2_fields : Array({String, String})? = nil,
@@ -228,7 +258,9 @@ module Gori::Repeater
                    @verify : Bool = true,
                    @timeout : Time::Span? = nil,
                    @overrides : Gori::HostOverrides? = nil,
-                   @tls_preset : String? = nil)
+                   @tls_preset : String? = nil,
+                   @refresh_slot : String? = nil,
+                   @refresh_layer : Gori::Bindings? = nil)
     end
   end
 
@@ -335,16 +367,31 @@ module Gori::Repeater
 
     # Send bytes already taken from `wire_bytes`. Field-native ignores them, for the reason
     # `wire_bytes` states.
-    def send_wire(wire : Bytes) : Result
+    def send_wire(wire : Bytes, cancel : Proc(Bool)? = nil) : Result
       if fields = @h2_fields
-        @sender.send_fields(fields, @h2_body)
+        @sender.send_fields(fields, @h2_body, cancel)
       else
-        @sender.send_wire(wire)
+        @sender.send_wire(wire, cancel)
       end
     end
 
     def send_group : Array(Result)
       @sender.send_group(@requests)
+    end
+
+    # Fire every request in the plan as a synchronized RACE — distinct requests on the wire in
+    # one narrow window (h1 last-byte-sync, h2 single-packet), the multi-endpoint TOCTOU
+    # primitive (#1236). The members share this plan's ONE origin (the surface resolved them to
+    # it); `refusal` above already covers the whole group.
+    # Each member as Layer 1 must judge it: through the seam's binding pass, so a `$BIND.*`
+    # path is asked about where it goes, not as authored (`Sender#predict`). Field-native h2
+    # does not expand. The sender re-checks the real wire, which a refresh may still move.
+    def scope_requests : Array(Bytes)
+      @h2_fields ? @requests : @requests.map { |r| @sender.predict(r) }
+    end
+
+    def send_race : Array(Result)
+      @sender.send_race(@requests)
     end
 
     # `keep_key` sends the operator's own `Sec-WebSocket-Key` header instead of a fresh one.
@@ -353,14 +400,15 @@ module Gori::Repeater
     # survives — so it has no business in the builder the scope gate reads.
     def send_ws(messages : Array(WsEngine::OutMsg),
                 idle : Time::Span = WsEngine::DEFAULT_IDLE,
-                keep_key : Bool = false) : WsEngine::Result
-      @sender.send_ws(bytes, messages, idle, keep_key)
+                keep_key : Bool = false,
+                cancel : Proc(Bool)? = nil) : WsEngine::Result
+      @sender.send_ws(bytes, messages, idle, keep_key, cancel)
     end
 
     # The same target and gated dialer carrying different wire bytes — for a surface that
-    # rewrites the request AFTER assembly. MCP's opt-in Match&Replace parity is the only
-    # such caller: its rules key off the dialed host, which is not known until the plan
-    # resolved it, so the rewrite cannot happen before `build`.
+    # rewrites the request AFTER assembly: MCP's opt-in Match&Replace parity, whose rules key off
+    # the dialed host (not known until the plan resolved it, so the rewrite cannot happen before
+    # `build`), and `Timing.run`, which swaps a race pair's release order every other pair.
     #
     # Reusing the SAME `Sender` is the point: the scope verdict was taken against this
     # origin, and a rewrite must not be able to move the dial target out from under it.
@@ -466,17 +514,8 @@ module Gori::Repeater
           "unsupported target scheme #{scheme.inspect}", scheme)
       end
 
-      # `deferred: nil` — a DIAL TUPLE cannot defer. Every other unresolved-name site skips a
-      # DECLARED binding because a send seam re-scans the same value with `Env.expand_bindings`
-      # later; this value is read ONCE, frozen into the plan, and never
-      # looked at again — `Fuzz::Sender`/`Discover::Sender` build their ConnPool on it and the
-      # Layer-1 `Outbound#check` verdict was already taken against it, so re-resolving per send
-      # would move the dial target out from under a scope decision. Deferring bought nothing
-      # anyway: a binding value is a token observed from a response, never a hostname, a port
-      # or an SNI. Left deferred it shipped as the literal `$SESSION` — every send failing DNS,
-      # and `Outbound.scope_url` asked about `https://$SESSION/a`, a URL no rule can match, so
-      # the run was refused as out-of-scope, naming the wrong gate.
-      options.sni.try { |s| refuse_unresolved(Env.unresolved(s, deferred: nil)) }
+      # A dial value cannot defer a binding — see `FlowRequest.refuse_unresolved_dial`.
+      options.sni.try { |s| refuse_unresolved(s) }
       sni = options.sni.try { |s| Env.expand(s).presence }
       # `evidence` reaches the SENDER, not just this builder. The comment on
       # `expand_requests` says a declared session binding is deliberately left for
@@ -496,7 +535,9 @@ module Gori::Repeater
         timeout: options.timeout, overrides: options.overrides,
         preserve_field_case: options.preserve_field_case?, evidence: options.evidence?,
         expand_bindings: options.expand_bindings?,
-        reframe_grpc: options.reframe_grpc?, tls_preset: tls_preset)
+        evidence_literals: options.evidence_literals,
+        reframe_grpc: options.reframe_grpc?, tls_preset: tls_preset,
+        refresh_slot: options.refresh_slot, refresh_layer: options.refresh_layer)
       new(sender: sender, requests: wires, scheme: scheme, host: host, port: port,
         http2: options.http2?, websocket: websocket, sni: sni,
         preserve_field_case: options.preserve_field_case?,
@@ -541,7 +582,7 @@ module Gori::Repeater
         raise PlanError.new(PlanError::Reason::UnsupportedScheme,
           "unsupported target scheme #{scheme.inspect}", scheme)
       end
-      options.sni.try { |s| refuse_unresolved(Env.unresolved(s, deferred: nil)) }
+      options.sni.try { |s| refuse_unresolved(s) }
       sni = options.sni.try { |s| Env.expand(s).presence }
       tls_preset = resolve_tls_preset(options)
       # `expand_bindings: false` UNCONDITIONALLY, and not `options.expand_bindings?`: nothing on
@@ -571,31 +612,25 @@ module Gori::Repeater
         # A pre-resolved origin skips `Env.expand` because its builder already ran it —
         # but an unresolved `$HOST` survives that expansion as the literal host, and this
         # early return is the one path where nothing else would ever look at it again.
-        refuse_unresolved(Env.unresolved(o.host, deferred: nil)) # see the SNI note above
+        refuse_unresolved(o.host)
         return {normalize_scheme(o.scheme), o.host, o.port}
       end
       raw = options.target || options.default_target.presence
       raise PlanError.new(PlanError::Reason::NoTarget, "no target origin") unless raw
-      refuse_unresolved(Env.unresolved(raw, deferred: nil)) # see the SNI note above
-      url = Env.expand(raw)
-      scheme, host, port = FlowRequest.parse_target(url)
-      if host.empty? || port <= 0
-        raise PlanError.new(PlanError::Reason::BadTarget,
-          "could not determine a target host from #{url.inspect}", url)
+      begin
+        scheme, host, port = FlowRequest.dial_target(raw)
+      rescue e : FlowRequest::DialTargetError
+        raise PlanError.new(PlanError::Reason::UnresolvedEnv, e.message.to_s, e.detail) if e.unresolved?
+        bad_target(e.detail)
       end
+      bad_target(Env.expand(raw)) if port <= 0
       {normalize_scheme(scheme), host, port}
     end
 
-    # Refuse a send whose TARGET, host override or SNI still carries a token that resolves
-    # to nothing.
-    #
-    # The REQUEST half of this is gone — a `$NAME` with no value is a literal string on the
-    # wire now, everywhere, which is what makes a GraphQL query string sendable. A DIAL TUPLE
-    # is the exception the `deferred: nil` note above argues: `$` is not a legal byte in a
-    # hostname, so there is no operator test case to protect, and a literal `$SESSION` there
-    # makes `Outbound.scope_url` ask about `https://$SESSION/a` — a URL no rule can match —
-    # so the send comes back refused as OUT-OF-SCOPE, naming a gate that was never the
-    # problem. Refusing here names the real one.
+    private def self.bad_target(url : String) : NoReturn
+      raise PlanError.new(PlanError::Reason::BadTarget, "could not determine a target host from #{url.inspect}", url)
+    end
+
     # The validated per-send fingerprint override, or nil. Refuses an unknown name HERE — one
     # place, before any surface dials — so `gori run repeater`, MCP `send_request` and the TUI
     # cannot each decide differently what an unrecognised preset means (P1).
@@ -607,11 +642,13 @@ module Gori::Repeater
       Settings.tls_preset_normalize(name)
     end
 
-    private def self.refuse_unresolved(names : Array(String)) : Nil
-      return if names.empty?
-      detail = Env.token_list(names)
-      raise PlanError.new(PlanError::Reason::UnresolvedEnv,
-        "unresolved env #{detail}", detail)
+    # Refuse a send whose host override or SNI still carries a token that resolves to nothing
+    # (`FlowRequest.refuse_unresolved_dial`). The REQUEST half of this is gone — a `$NAME` with
+    # no value is a literal string on the wire now, which is what makes a GraphQL query sendable.
+    private def self.refuse_unresolved(raw : String) : Nil
+      FlowRequest.refuse_unresolved_dial(raw)
+    rescue e : FlowRequest::DialTargetError
+      raise PlanError.new(PlanError::Reason::UnresolvedEnv, e.message.to_s, e.detail)
     end
 
     # ws/wss are hand-typed spellings of http/https — the capture proxy only ever records

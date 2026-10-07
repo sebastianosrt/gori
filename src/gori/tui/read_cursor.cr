@@ -1,4 +1,5 @@
 require "./screen"
+require "./line_edit"
 require "./geometry"
 
 module Gori::Tui
@@ -13,6 +14,13 @@ module Gori::Tui
   class ReadCursor
     getter cy : Int32
     getter cx : Int32
+
+    # Whether the held selection came from `select_line` and is still WHOLE LINES by intent:
+    # a vertical step then grows it a line at a time (`extend_lines`) instead of carrying the
+    # caret's column into a char rectangle, and a delete or copy over it is linewise even where
+    # the span's shape could not say so (an empty last line ends at column 0). Every other
+    # write to the anchor drops it; `extend_lines_to` keeps it, since it keeps whole lines.
+    getter? linewise : Bool = false
 
     def initialize
       @cy = 0
@@ -36,12 +44,14 @@ module Gori::Tui
 
     def clear_selection : Nil
       @anchor = nil
+      @linewise = false
     end
 
     def reset : Nil
       @cy = 0
       @cx = 0
       @anchor = nil
+      @linewise = false
     end
 
     # Sync from an external caret (e.g. TextArea cy/cx) without disturbing selection.
@@ -61,16 +71,10 @@ module Gori::Tui
     # `highlight_spans` and `selection_text` clamp per line as they read. An anchor equal to
     # the caret collapses the selection, which `selection?` already reports as none.
     def select_range(anchor_cy : Int32, anchor_cx : Int32, cy : Int32, cx : Int32) : Nil
+      @linewise = false
       @anchor = {anchor_cy, anchor_cx}
       @cy = cy
       @cx = cx
-    end
-
-    def line_selection? : Bool
-      a = @anchor
-      return false unless a
-      ay = a[0]
-      ay != @cy
     end
 
     # Select the entire current line (anchor at col 0, caret at EOL).
@@ -83,6 +87,7 @@ module Gori::Tui
       @cy = @cy.clamp(0, size - 1)
       @anchor = {@cy, 0}
       @cx = line_at.call(@cy).size
+      @linewise = true
     end
 
     # Move the caret. `selecting` (shift held) grows/shrinks the selection from a fixed anchor.
@@ -121,6 +126,7 @@ module Gori::Tui
       # the whole TUI down (`Runner#absorb_tick_error`). The vertical branch already re-clamps;
       # this makes the horizontal one safe too, at the one place every `move` passes through.
       @cy = @cy.clamp(0, size - 1)
+      @linewise = false # a char step: what is selected now is the rectangle it paints
       if selecting
         @anchor ||= {@cy, @cx}
         if dr != 0
@@ -200,6 +206,7 @@ module Gori::Tui
     # end-of-line — see there for what that cost), so the two agree and the char rectangle is
     # the single model. A pane that wants whole lines asks for them with `extend_lines`.
     def move_to(cy : Int32, cx : Int32, selecting : Bool = false) : Nil
+      @linewise = false
       if selecting
         @anchor ||= {@cy, @cx}
       else
@@ -207,12 +214,6 @@ module Gori::Tui
       end
       @cy = cy
       @cx = cx
-    end
-
-    def click_to_cursor(rect : Rect, mx : Int32, my : Int32, scroll : Int32,
-                        lines : Array(String), gutter_w : Int32 = 0, xscroll : Int32 = 0,
-                        selecting : Bool = false) : Nil
-      click_to_cursor(rect, mx, my, scroll, lines.size, ->(i : Int32) { lines[i] }, gutter_w, xscroll, selecting)
     end
 
     # `selecting` is the DRAG half: keep (or plant) the anchor and move the caret, so the
@@ -230,25 +231,10 @@ module Gori::Tui
         row = 0
       end
       selecting ? (@anchor ||= {@cy, @cx}) : (@anchor = nil)
+      @linewise = false
       @cy = {scroll + row, size - 1}.min
       cx0 = rect.x + gutter_w
       @cx = Screen.column_for_click(line_at.call(@cy), mx - cx0 + xscroll)
-    end
-
-    # Select the WORD under the pointer (double-click). Same boundary rule as
-    # `TextArea#select_word_at` — a word is a run of key-ish chars (letters, digits, `_`,
-    # `-`) or a run of punctuation, so a URL breaks at every `/`, `?` and `=` while
-    # `Content-Type` stays whole. Whitespace (or past end-of-line) selects nothing.
-    def select_word_at(rect : Rect, mx : Int32, my : Int32, scroll : Int32,
-                       lines : Array(String), gutter_w : Int32 = 0, xscroll : Int32 = 0) : Bool
-      select_word_at(rect, mx, my, scroll, lines.size, ->(i : Int32) { lines[i] }, gutter_w, xscroll)
-    end
-
-    def select_word_at(rect : Rect, mx : Int32, my : Int32, scroll : Int32,
-                       size : Int32, line_at : Int32 -> String,
-                       gutter_w : Int32 = 0, xscroll : Int32 = 0) : Bool
-      click_to_cursor(rect, mx, my, scroll, size, line_at, gutter_w, xscroll)
-      select_word_at_cursor(size, line_at)
     end
 
     # The word half of `select_word_at`, without the hit test — for a caller that has already
@@ -261,35 +247,27 @@ module Gori::Tui
       return false if size <= 0
       @cy = @cy.clamp(0, size - 1)
       line = line_at.call(@cy)
-      cx = @cx.clamp(0, line.size)
-      # `Screen.column_for_click` rounds a POINTER to the NEAREST cluster boundary, so a
-      # double-click on the RIGHT half of a WIDE glyph — a Hangul syllable, a CJK ideograph:
-      # half of every pointer position over such text — resolves to the position AFTER it,
-      # where the word may have already ended and there is no token to take. Step back over
-      # that one glyph, and ONLY when it is wide: a 1-column cluster cannot be rounded past,
-      # so every ASCII gesture is bit-for-bit what it was (including "a double-click on a
-      # space takes nothing", which is this method's stated contract).
-      cx = Screen.step_back_over_wide(line, cx)
-      return false if cx >= line.size || line[cx].whitespace?
-      word = word_char?(line[cx])
-      a = cx
-      while a > 0 && !line[a - 1].whitespace? && word_char?(line[a - 1]) == word
-        a -= 1
-      end
-      b = cx
-      while b < line.size && !line[b].whitespace? && word_char?(line[b]) == word
-        b += 1
-      end
-      return false if a == b
+      return false unless span = LineEdit.word_span(line, @cx)
+      a, b = span
+      @linewise = false
       @anchor = {@cy, a}
       @cx = b
       true
     end
 
-    # See `TextArea#word_char?` — the two must agree, or double-click and ⌥←/→ would
-    # disagree about where a word ends in the same buffer.
-    private def word_char?(c : Char) : Bool
-      c.alphanumeric? || c == '_' || c == '-'
+    # The selection as a DOCUMENT-ORDERED {y0, x0, y1, x1}, or nil when there is none (or it is
+    # empty, see `selection?`). Each end is clamped to the line it names, the way
+    # `selection_text` clamps as it reads, so a caller can hand the span to an editor as is.
+    def selection_span(lines : Array(String)) : {Int32, Int32, Int32, Int32}?
+      a = @anchor
+      return nil unless a && selection?
+      return nil if lines.empty?
+      ay = a[0].clamp(0, lines.size - 1)
+      cy = @cy.clamp(0, lines.size - 1)
+      ax = a[1].clamp(0, lines[ay].size)
+      cx = @cx.clamp(0, lines[cy].size)
+      return nil if ay == cy && ax == cx
+      (ay < cy || (ay == cy && ax < cx)) ? {ay, ax, cy, cx} : {cy, cx, ay, ax}
     end
 
     # 0-based line indices spanned by a line-oriented selection (inclusive).
@@ -346,10 +324,6 @@ module Gori::Tui
         end
       end
       parts.join("\n")
-    end
-
-    def current_line(lines : Array(String)) : String
-      lines[@cy]? || ""
     end
 
     def current_line(size : Int32, line_at : Int32 -> String) : String

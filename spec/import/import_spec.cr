@@ -91,7 +91,7 @@ describe Gori::Import do
         JSON
 
       with_store do |store|
-        Gori::Import.import_file(store, :har, har).count.should eq(2)
+        Gori::Import.import_file(store, :har, har).count.should eq(2) # the injected part name is skipped
         rows = store.search(Gori::QL::EMPTY, 10)
         http = rows.find { |r| r.target == "/items" }.not_nil!
         chat = rows.find { |r| r.target == "/chat" }.not_nil!
@@ -368,6 +368,38 @@ describe Gori::Import do
     end
   end
 
+  it "keeps a HAR entry whose postData or response content is null, and frames multipart params with their boundary" do
+    har = File.tempname("gori", ".har")
+    begin
+      File.write(har, <<-'JSON')
+        {"log": {"entries": [
+          {"startedDateTime": "2026-06-01T12:00:00+00:00",
+           "request": {"method": "GET", "url": "https://api.test/a", "headers": [null], "postData": null},
+           "response": {"status": 200, "headers": [], "content": null}},
+          {"startedDateTime": "2026-06-01T12:00:01+00:00",
+           "request": {"method": "POST", "url": "https://api.test/up",
+             "headers": [{"name": "Content-Type", "value": "multipart/form-data; boundary=\"X B\""}],
+             "postData": {"mimeType": "multipart/form-data; boundary=\"X B\"",
+               "params": [{"name": "a", "value": "1"}, {"name": "f", "fileName": "x.txt", "contentType": "text/plain", "value": "hi"}]}}},
+          {"startedDateTime": "2026-06-01T12:00:02+00:00",
+           "request": {"method": "POST", "url": "https://api.test/inject",
+             "postData": {"mimeType": "multipart/form-data; boundary=XB",
+               "params": [{"name": "a\r\nX-Injected: 1", "value": "1"}]}}}]}}
+        JSON
+
+      with_store do |store|
+        Gori::Import.import_file(store, :har, har).count.should eq(2) # the injected part name is skipped
+        rows = store.search(Gori::QL::EMPTY, 2)
+        up = store.get_flow(rows.find!(&.target.==("/up")).id).not_nil!
+        String.new(up.request_body.not_nil!).should eq(
+          "--X B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n" \
+          "--X B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"x.txt\"\r\nContent-Type: text/plain\r\n\r\nhi\r\n--X B--\r\n")
+      end
+    ensure
+      File.delete?(har)
+    end
+  end
+
   it "overwrites a stale Content-Length to match a HAR params-only reconstructed body (R2-8)" do
     har = File.tempname("gori", ".har")
     begin
@@ -624,6 +656,25 @@ describe Gori::Import do
         result.skipped.should eq(0)
         rows = store.search(Gori::QL::EMPTY, 10).map { |r| {r.host, r.port} }.to_set
         rows.should eq({ {"example.com", 8080}, {"localhost", 3000} }.to_set)
+      end
+    ensure
+      File.delete?(urls)
+    end
+  end
+
+  # `http:/h.test/x` matched neither scheme pattern and fell to the `host:port` shape with an
+  # empty port, importing as `https://http:/h.test/x` (host `http`); `:65536` parsed because
+  # `URI.parse` bounds a port only by Int32. Both are URLs nothing can dial, so both skip.
+  it "skips a URL-list line with a mangled http scheme or an out-of-range port" do
+    urls = File.tempname("gori", ".txt")
+    begin
+      File.write(urls, "https://a.test/1\nhttp:/one-slash.test/x\nhttps:two.test/y\n" \
+                       "http://a.test:65536/\nhttps://a.test:99999/\nhttp://b.test:65535/\n")
+      with_store do |store|
+        result = Gori::Import.import_file(store, :urls, urls)
+        result.skipped.should eq(4)
+        rows = store.search(Gori::QL::EMPTY, 10).map { |r| {r.host, r.port} }.to_set
+        rows.should eq({ {"a.test", 443}, {"b.test", 65535} }.to_set)
       end
     ensure
       File.delete?(urls)
@@ -1049,6 +1100,25 @@ describe Gori::Import::Builder do
     end
   end
 
+  it "turns an overflowing URL port into a clean import error" do
+    expect_raises(Gori::Error, /unparseable/) do
+      Gori::Import::Builder.endpoint("https://api.example.test:99999999999/")
+    end
+  end
+
+  it "rejects a port outside the TCP range instead of storing an undiallable target" do
+    ["https://h.test:65536/", "http://h.test:70000/x", "https://h.test:0/"].each do |url|
+      expect_raises(Gori::Error, /port out of range/) { Gori::Import::Builder.endpoint(url) }
+    end
+    Gori::Import::Builder.endpoint("http://h.test:65535/").should eq({"http", "h.test", 65535, "/"})
+  end
+
+  it "rejects an http(s) scheme missing its slashes instead of reading the scheme as a host" do
+    ["http:/one-slash.test/x", "HTTPS:h.test/y"].each do |url|
+      expect_raises(Gori::Error, /malformed scheme/) { Gori::Import::Builder.endpoint(url) }
+    end
+  end
+
   it "stores an IPv6 host bracket-free but re-brackets it in the Host header line" do
     pair = Gori::Import::Builder.pending_request(0_i64, "https://[::1]:9443/probe")
     pair.request.host.should eq("::1") # bare, matching the CONNECT path
@@ -1250,6 +1320,25 @@ describe Gori::Import::Builder do
       head.should_not contain("Content-Length: 999")
     end
 
+    it "keeps a CL.CL pair in source order without synthesizing another length" do
+      headers = Gori::Import::Builder::Headers.new
+      headers << {"Content-Length", "4"}
+      headers << {"Content-Length", "5"}
+      head = String.new(Gori::Import::Builder.request_head("POST", "/clcl", "HTTP/1.1",
+        scheme: "http", host: "h.test", port: 80, headers: headers, body: "ABCD".to_slice))
+      head.should contain("Content-Length: 4\r\nContent-Length: 5\r\n")
+      head.scan(/^Content-Length:/im).size.should eq(2)
+    end
+
+    it "keeps a Content-Length value the repeater refuses to rewrite" do
+      headers = Gori::Import::Builder::Headers.new
+      headers << {"Content-Length", "0abc"}
+      head = String.new(Gori::Import::Builder.request_head("POST", "/bad-length", "HTTP/1.1",
+        scheme: "http", host: "h.test", port: 80, headers: headers, body: "ABCD".to_slice))
+      head.should contain("Content-Length: 0abc\r\n")
+      head.should_not contain("Content-Length: 4\r\n")
+    end
+
     it "still drops a lone Transfer-Encoding the body does not back" do
       headers = Gori::Import::Builder::Headers.new
       headers << {"Transfer-Encoding", "chunked"}
@@ -1292,6 +1381,40 @@ describe Gori::Import::Builder do
             "POST /clte HTTP/1.1\r\nHost: 127.0.0.1:19802\r\n" \
             "Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n")
           detail.request_body.should eq("5\r\nhello\r\n0\r\n\r\n".to_slice)
+        end
+      ensure
+        File.delete?(har)
+      end
+    end
+
+    it "imports CL.CL and malformed Content-Length HAR entries without rewriting them" do
+      har = File.tempname("gori", ".har")
+      request = ->(path : String, headers : Array({String, String})) do
+        {
+          "startedDateTime" => "2026-07-31T00:00:00.000Z",
+          "request"         => {"method" => "POST", "url" => "http://127.0.0.1:19802#{path}",
+                        "httpVersion" => "HTTP/1.1",
+                        "headers" => headers.map { |(name, value)| {"name" => name, "value" => value} },
+                        "postData" => {"mimeType" => "text/plain", "text" => "ABCD"}},
+          "response" => {"status" => 200, "statusText" => "OK", "httpVersion" => "HTTP/1.1",
+                         "headers" => [] of String,
+                         "content" => {"size" => 0, "mimeType" => ""}},
+        }
+      end
+      begin
+        clcl = [{"Host", "127.0.0.1:19802"}, {"Content-Length", "4"}, {"Content-Length", "5"}]
+        malformed = [{"Host", "127.0.0.1:19802"}, {"Content-Length", "0abc"}]
+        File.write(har, {"log" => {"version" => "1.2", "creator" => {"name" => "hand", "version" => "1"},
+                                   "entries" => [request.call("/clcl", clcl), request.call("/bad", malformed)]}}.to_json)
+        with_store do |store|
+          Gori::Import.import_file(store, :har, har).count.should eq(2) # the injected part name is skipped
+          details = store.recent_flows(2).map { |row| store.get_flow(row.id).not_nil! }
+          clcl_detail = details.find { |detail| detail.row.target == "/clcl" }.not_nil!
+          malformed_detail = details.find { |detail| detail.row.target == "/bad" }.not_nil!
+          String.new(clcl_detail.request_head).should contain(
+            "Content-Length: 4\r\nContent-Length: 5\r\n")
+          String.new(malformed_detail.request_head).should contain("Content-Length: 0abc\r\n")
+          String.new(malformed_detail.request_head).should_not contain("Content-Length: 4\r\n")
         end
       ensure
         File.delete?(har)
@@ -1526,6 +1649,83 @@ describe Gori::Import::Builder do
       ensure
         File.delete?(urls)
       end
+    end
+  end
+end
+
+# #1244 — curl commands into History. Each request is stored BYTE-EXACT through `Raw.flow`:
+# the head `Import::Curl` built is the request, and re-serializing it through `Builder` would
+# re-derive framing the operator stated.
+describe "Gori::Import curl" do
+  it "stores each request as built, stamped import / the surface / the ref" do
+    with_store do |store|
+      result = Gori::Import.import_curl_text(store,
+        "curl 'https://a.test/p?x=1' -X post -H 'Content-Length: 1' -d abc -k ;\ncurl http://b.test:8080/",
+        Gori::FlowSource::Surface::Tui, "curl (pasted)")
+      result.count.should eq(2)
+      result.notes.join.should contain("-k")
+      rows = store.recent_flows(2)
+      post = rows.find! { |r| r.host == "a.test" }
+      post.method.should eq("post")
+      post.target.should eq("/p?x=1")
+      post.source.should eq(Gori::FlowSource::Kind::Import)
+      post.source_surface.should eq(Gori::FlowSource::Surface::Tui)
+      post.source_ref.should eq("curl (pasted)")
+      detail = store.get_flow(post.id).not_nil!
+      # The stated Content-Length stays beside the longer body — nothing reframed it.
+      String.new(detail.request_head).should eq(
+        "post /p?x=1 HTTP/1.1\r\nHost: a.test\r\nContent-Length: 1\r\n" \
+        "Content-Type: application/x-www-form-urlencoded\r\n\r\n")
+      detail.request_body.not_nil!.should eq("abc".to_slice)
+      rows.find! { |r| r.host == "b.test" }.port.should eq(8080)
+    end
+  end
+
+  # `Raw.flow` would re-split and CRLF-normalize the head; a head `Curl` built is stored as
+  # built, so History holds the same bytes the Repeater does for the same paste.
+  it "stores a bare LF inside a -H value byte-exact" do
+    with_store do |store|
+      Gori::Import.import_curl_text(store, %q(curl http://a.test/p -H $'X: a\nY: b' -H $'Z: 1\n\nq'))
+      head = String.new(store.get_flow(store.recent_flows(1).first.id).not_nil!.request_head)
+      head.should eq("GET /p HTTP/1.1\r\nHost: a.test\r\nX: a\nY: b\r\nZ: 1\n\nq\r\n\r\n")
+    end
+  end
+
+  it "reads a file through import_file, naming the file as the ref" do
+    with_store do |store|
+      path = File.tempname("gori-curl", ".sh")
+      File.write(path, "curl https://a.test/f\n")
+      begin
+        Gori::Import.import_file(store, :curl, path, Gori::FlowSource::Surface::Cli).count.should eq(1)
+        store.recent_flows(1).first.source_ref.should eq(File.basename(path))
+      ensure
+        File.delete?(path)
+      end
+    end
+  end
+
+  # `gori run import --urls -` (#1386) spools stdin to a temp file and imports it under
+  # `ref: "stdin"`, so the flows' provenance never names the spool.
+  it "names a ref'd import by its ref, not by the file it was read from" do
+    with_store do |store|
+      path = File.tempname("gori-stdin-import", ".txt")
+      File.write(path, "http://a.test/one\n")
+      begin
+        Gori::Import.import_file(store, :urls, path, Gori::FlowSource::Surface::Cli, ref: "stdin").count.should eq(1)
+        store.recent_flows(1).first.source_ref.should eq("stdin")
+      ensure
+        File.delete?(path)
+      end
+    end
+  end
+
+  it "raises the refusal itself when no request came out, and counts a refused one as skipped" do
+    with_store do |store|
+      expect_raises(Gori::Error, /local file/) do
+        Gori::Import.import_curl_text(store, "curl -d @body.json https://a.test/")
+      end
+      store.count.should eq(0)
+      Gori::Import.import_curl_text(store, "curl https://a.test/ok\ncurl -T f https://a.test/no").skipped.should eq(1)
     end
   end
 end

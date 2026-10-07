@@ -50,7 +50,7 @@ module Gori::Settings
   #               SNI or a `Host` header. For the client that can be pointed at a proxy but not
   #               at an HTTP one — an `ALL_PROXY=socks5://` tool, a runtime whose only proxy
   #               setting is SOCKS. gori already speaks the other end of this protocol
-  #               (`network.upstream_rules`, kind `socks5`); this is the same vocabulary,
+  #               (`upstream_rules`, kind `socks5`); this is the same vocabulary,
   #               inbound. NO-AUTH only, like the `proxy` listener beside it.
   LISTENER_MODES = ["proxy", "transparent", "reverse", "socks5"]
 
@@ -94,14 +94,6 @@ module Gori::Settings
       mode == "socks5"
     end
 
-    # The upstream port for a transparent connection the kernel could not answer for, when the
-    # derived host carries none. `tls` picks the sensible default so a plain `{host, port, mode}`
-    # entry works for both halves of a redirect pair without the operator spelling out 80/443.
-    def effective_target_port(tls : Bool) : Int32
-      return target_port if target_port > 0
-      tls ? 443 : 80
-    end
-
     # `origin` split into {scheme, host, port}, or nil when it is absent or unusable.
     # One parse shared by validation, the Session wiring and the readout, so a string that
     # saves cannot then fail to dial — and so no two of them can disagree about which port
@@ -128,7 +120,7 @@ module Gori::Settings
     return nil if host.empty?
     port = uri.port || (scheme == "https" ? 443 : 80)
     1 <= port <= 65535 ? {scheme, host, port} : nil
-  rescue URI::Error
+  rescue URI::Error | ArgumentError | OverflowError
     nil
   end
 
@@ -274,17 +266,37 @@ module Gori::Settings
   # the transparent/forward cases this loop is one an operator creates by typing, and it is
   # detectable here rather than only once traffic arrives.
   #
-  # Best-effort in exactly the way `same_bind_host?` is (which is what this reuses, so the
-  # wildcard and localhost-alias spellings fold the same way here as they do there): NO name
-  # resolution, so an origin hostname that happens to resolve to the bind escapes this. The
+  # NOT `same_bind_host?`, which answers a different question. That one de-duplicates BINDS, and
+  # for a bind a wildcard does own every address of its family — so asked about a DIAL it called
+  # every origin on a shared port a loop, hostnames included: the stock reverse shape
+  # `0.0.0.0:443 → https://api.example.com` was refused as "points back at gori itself", and so
+  # was any `:8070` origin under a `0.0.0.0:8070` primary. `dials_bind?` is the runtime
+  # backstop's rule (`Upstream.reaches_self?`): the same host, or a loopback/unspecified target
+  # against a loopback/wildcard bind.
+  #
+  # Best-effort: NO name resolution and no interface list, so an origin hostname — or a LAN
+  # literal of this machine's own — that reaches the bind escapes this. The
   # per-connection `Upstream.loops_to_self?` backstop covers the residue for a reverse listener
   # whose origin names ITS OWN port; a cross-port loop through a hostname is not caught by
   # either, and would surface as the 2048-connection wedge described in `upstream.cr:100-119`.
   private def self.self_target?(host : String, port : Int32, own : Listener,
                                 among : Array(Listener)) : Bool
-    return true if port == own.port && same_bind_host?(host, own.host)
-    return true if port == effective_bind_port && same_bind_host?(host, effective_bind_host)
-    among.any? { |l| l.port == port && same_bind_host?(host, l.host) }
+    return true if port == own.port && dials_bind?(host, own.host)
+    return true if port == effective_bind_port && dials_bind?(host, effective_bind_host)
+    among.any? { |l| l.port == port && dials_bind?(host, l.host) }
+  end
+
+  # Would dialing `target` reach a socket bound on `bind` (same port assumed)? See `self_target?`.
+  private def self.dials_bind?(target : String, bind : String) : Bool
+    t = canonical_bind_host(target)
+    b = canonical_bind_host(bind)
+    return true if t == b
+    (local_host?(t) || wildcard_bind?(t)) && (local_host?(b) || wildcard_bind?(b))
+  end
+
+  # A loopback literal (the names are already folded onto theirs by `canonical_bind_host`).
+  private def self.local_host?(h : String) : Bool
+    !!(Socket::IPAddress.new(h, 0).loopback? rescue nil)
   end
 
   # The upstream port a transparent connection should use WHEN THE SOCKET CANNOT SAY: the

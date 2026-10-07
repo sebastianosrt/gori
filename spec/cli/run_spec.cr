@@ -185,7 +185,7 @@ describe Gori::CLI::Output do
   it "serialises a probe group to JSON with the documented fields (incl. remediation)" do
     g = Gori::Probe::Group.new("secret_in_url", "infoleak", "api.test", "Secret in URL",
       Gori::Store::Severity::High, 3, ["https://api.test/a", "https://api.test/b"], "token", 7_i64)
-    parsed = JSON.parse(Gori::CLI::Output.probe_group_json(g))
+    parsed = JSON.parse(JSON.build { |j| Gori::Probe.group_json(j, g) })
     parsed["code"].as_s.should eq("secret_in_url")
     parsed["category"].as_s.should eq("infoleak")
     parsed["severity"].as_s.should eq("high")
@@ -392,12 +392,12 @@ end
 
 # #406: `gori run repeater send/<flow-id>/minimize` ran only the Layer-2 (Sandbox/exclude)
 # gate, so a configured project scope was silently inert and there was no --allow-unscoped
-# waiver — unlike fuzz/mine/sequence/discover and MCP. `repeater_out_of_scope?` is the Layer-1
+# waiver — unlike fuzz/mine/sequence/discover and MCP. `repeater_scope_verdict` is the Layer-1
 # decision `abort_if_out_of_scope!` acts on; a Gate::Configured outbound must refuse an
 # out-of-scope origin and a waived one must not.
 module Gori::CLI::Run
   def self.repeater_out_of_scope_for_spec(ob : Gori::Outbound, plan : Gori::Repeater::Plan) : Bool
-    repeater_out_of_scope?(ob, plan)
+    repeater_scope_verdict(ob, plan).blocked?
   end
 end
 
@@ -423,6 +423,35 @@ describe "gori run repeater — Layer-1 scope gate (#406)" do
     ensure
       store.close
       File.delete?(path); File.delete?("#{path}-wal"); File.delete?("#{path}-shm")
+    end
+  end
+
+  it "judges a $BIND path where it resolves, not as authored" do
+    with_env_syntax(Gori::Env::Syntax::Namespaced) do
+      with_store_env do |store|
+        Gori::Env.layer = SpecBindingLayer.new(["PATH"], {"PATH" => "admin"})
+        scope = Gori::Scope.load(store)
+        scope.add("include", "string", "/$BIND.PATH") # matches the draft, not the wire
+        plan = Gori::Repeater::Plan.build(
+          Gori::Repeater::PlanOptions.new(["GET /$BIND.PATH HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_slice],
+            target: "http://127.0.0.1:9/", expand_request: false), Gori::Outbound.cli(scope, false))
+        Gori::CLI::Run.repeater_out_of_scope_for_spec(Gori::Outbound.cli(scope, false), plan).should be_true
+      end
+    end
+  end
+end
+
+describe "gori run repeater race/timing — Layer-1 scope gate over every member" do
+  it "refuses a group whose later member is out of scope" do
+    with_store do |store|
+      scope = Gori::Scope.load(store)
+      scope.add("include", "string", "in.test/api/")
+      wires = ["GET /api/ok HTTP/1.1\r\nHost: in.test\r\n\r\n", "GET /internal HTTP/1.1\r\nHost: in.test\r\n\r\n"]
+      plan = Gori::Repeater::Plan.build(
+        Gori::Repeater::PlanOptions.new(wires.map(&.to_slice), target: "http://in.test/"),
+        Gori::Outbound.cli(scope, false))
+      Gori::CLI::Run.repeater_out_of_scope_for_spec(Gori::Outbound.cli(scope, false), plan).should be_true
+      Gori::CLI::Run.repeater_out_of_scope_for_spec(Gori::Outbound.cli(scope, true), plan).should be_false
     end
   end
 end
@@ -601,6 +630,127 @@ module Gori::CLI::Run
                                             name : String?, tags : String?)
     apply_repeater_metadata(store, id, name, tags)
   end
+
+  def self.persist_repeater_response_for_spec(id : Int64, head : Bytes, body : Bytes?, error : String?,
+                                              duration_us : Int64, project : Gori::Project,
+                                              request_sha256 : String?) : String?
+    persist_repeater_response(id, head, body, error, duration_us, project, request_sha256)
+  end
+end
+
+# `persist_repeater_response` goes through `open_store`, which installs the project's env layer
+# and settings into process globals exactly as a real `gori run` would. Put them back.
+private def with_cli_env_restored(&)
+  prev_env = Gori::Settings.project_env_vars
+  prev_layer = Gori::Env.layer
+  begin
+    yield
+  ensure
+    Gori::Env.layer = prev_layer
+    Gori::Settings.project_env_vars = prev_env
+    Gori::Env.bump_highlight_rev
+  end
+end
+
+private def with_project_db(&)
+  path = File.tempname("gori-post-send", ".db")
+  begin
+    yield path
+  ensure
+    File.delete?(path)
+    File.delete?("#{path}-wal")
+    File.delete?("#{path}-shm")
+    File.delete?("#{path}.open.lock")
+  end
+end
+
+describe "gori run repeater post-send persistence" do
+  # …and the sentence carries the reason `open_store`'s own abort would have given, not the
+  # generic "busy or unwritable" every open failure used to collapse into: a non-database file
+  # is not busy, and "retry" is the wrong advice for it (and for a read-only file or directory,
+  # which reach here the same way).
+  it "turns an unopenable project into a failed write result that says what was wrong" do
+    path = File.tempname("gori-post-send-invalid", ".db")
+    File.write(path, "not a sqlite database")
+    begin
+      why = Gori::CLI::Run.persist_repeater_response_for_spec(
+        1_i64, Bytes.empty, nil, nil, 0_i64, Gori::Project.new("broken", path), nil).not_nil!
+      why.should start_with("response was NOT saved: gori run: cannot open database #{path}")
+      why.should_not contain("busy")
+    ensure
+      File.delete?(path)
+    end
+  end
+
+  it "composes the open-failure sentence from SQLite's words plus the hint" do
+    project = Gori::Project.new("p", "/tmp/p/gori.db")
+    locked = Gori::CLI::Run.open_failure_message(Exception.new("database is locked"), project)
+    locked.should start_with("gori run: cannot open database /tmp/p/gori.db: database is locked")
+    locked.should contain("read it with a read-only subcommand")
+    Gori::CLI::Run.open_failure_message(Exception.new(nil), project)
+      .should eq("gori run: cannot open database /tmp/p/gori.db: not a valid SQLite database (or unreadable)")
+  end
+end
+
+# `open_store` hydrates the process (env layer, settings, schemas, slots) AFTER `Store.open`
+# returned. A raise in that stretch used to propagate with the Store still alive — open-lock
+# flock held, writer fiber parked — which only looked harmless because every caller then
+# exited; the post-send writes call it with `abort_on_failure: false` and carry on. Every
+# hydration step rescues its own malformed input today, so there is no input that makes this
+# stretch raise on demand; the shape is pinned instead: the hydration is one call, and the
+# rescue around it closes the store before re-raising.
+describe "gori run — a store that could not finish opening is closed" do
+  it "closes the Store when hydration raises, before the open-failure rescue sees it" do
+    src = File.read(File.join(__DIR__, "..", "..", "src", "gori", "cli", "run.cr"))
+    open_store = src[/private def self\.open_store\(.*?\n      end\n/m].not_nil!
+    hydrate = open_store.index("hydrate_cli_store(store, project, busy_ms)").not_nil!
+    close = open_store.index("store.close").not_nil!
+    outer = open_store.index("rescue ex : DB::Error | SQLite3::Exception").not_nil!
+    hydrate.should be < close
+    close.should be < outer
+    # Nothing between `Store.open` and the hydration call: a step that lands there is a step
+    # the close does not cover.
+    open_store[/Store\.open\(.*?\n        begin\n          hydrate_cli_store/m].should_not be_nil
+  end
+end
+
+it "answers nil once the row holds the response" do
+  with_cli_env_restored do
+    with_project_db do |path|
+      store = Gori::Store.open(path)
+      id = store.insert_repeater("https://a.test", "GET / HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
+      store.close
+      Gori::CLI::Run.persist_repeater_response_for_spec(
+        id, "HTTP/1.1 200 OK\r\n\r\n".to_slice, nil, nil, 5_i64, Gori::Project.new("p", path), nil).should be_nil
+      reopened = Gori::Store.open(path)
+      begin
+        String.new(reopened.repeaters.find!(&.id.==(id)).response_head.not_nil!).should start_with("HTTP/1.1 200")
+      ensure
+        reopened.close
+      end
+    end
+  end
+end
+
+describe "gori run repeater post-send persistence — the window between send and write" do
+  # The window: `send` read the row and closed the store, dialled for seconds, and reopens to
+  # write. A peer removed the row meanwhile. The UPDATE matches nothing and used to commit,
+  # answer true, print nothing and exit 0 — the operator believed the response was on a tab
+  # that no longer existed. The sentence has to name THAT, not the project's busy-ness.
+  it "names the session as gone when it was deleted during the send, not the project as busy" do
+    with_cli_env_restored do
+      with_project_db do |path|
+        store = Gori::Store.open(path)
+        id = store.insert_repeater("https://a.test", "GET / HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
+        store.delete_repeater(id).should be_true
+        store.close
+        why = Gori::CLI::Run.persist_repeater_response_for_spec(
+          id, "HTTP/1.1 200 OK\r\n\r\n".to_slice, nil, nil, 5_i64, Gori::Project.new("p", path), nil).not_nil!
+        why.should contain("session ##{id} no longer exists")
+        why.should_not contain("busy")
+      end
+    end
+  end
 end
 
 # #210: both writes it makes are now `exec_task_ok`, and it threw the answer away — so
@@ -644,46 +794,6 @@ describe "gori run repeater create — did the name/tags write commit? (#210)" d
       id = store.insert_repeater("https://a.test", "GET / HTTP/1.1\r\n\r\n".to_slice, false, true, nil, 0)
       store.close
       Gori::CLI::Run.apply_repeater_metadata_for_spec(store, id, nil, nil).should be_true
-    end
-  end
-end
-
-# `intercept_bridge_state` / `intercept_live?` are private CLI glue (mirror MCP's
-# identically-named helpers in src/gori/mcp/tools/intercept.cr) — reopen the module
-# for bare-call wrappers.
-module Gori::CLI::Run
-  def self.intercept_bridge_state_for_spec(store : Gori::Store) : Hash(String, JSON::Any)?
-    intercept_bridge_state(store)
-  end
-
-  def self.intercept_live_for_spec(bridge : Hash(String, JSON::Any)) : Bool
-    intercept_live?(bridge)
-  end
-end
-
-describe "gori run intercept (bridge state)" do
-  it "returns nil when no bridge has ever been published" do
-    with_store do |store|
-      Gori::CLI::Run.intercept_bridge_state_for_spec(store).should be_nil
-    end
-  end
-
-  it "parses a published bridge and reports live for a fresh heartbeat" do
-    with_store do |store|
-      now = Time.utc.to_unix_ms
-      store.set_intercept_bridge(%({"capturing":true,"enabled":true,"direction":"both","filter":"","session_token":"tok","heartbeat_ms":#{now}}))
-      bridge = Gori::CLI::Run.intercept_bridge_state_for_spec(store)
-      bridge.should_not be_nil
-      Gori::CLI::Run.intercept_live_for_spec(bridge.not_nil!).should be_true
-    end
-  end
-
-  it "treats a stale heartbeat as not live" do
-    with_store do |store|
-      stale = Time.utc.to_unix_ms - 60_000
-      store.set_intercept_bridge(%({"capturing":true,"session_token":"tok","heartbeat_ms":#{stale}}))
-      bridge = Gori::CLI::Run.intercept_bridge_state_for_spec(store).not_nil!
-      Gori::CLI::Run.intercept_live_for_spec(bridge).should be_false
     end
   end
 end
@@ -1160,25 +1270,6 @@ end
 # gate and therefore covers every subcommand: an example that ran one command and found its stdout
 # clean would keep passing after somebody added a subcommand that logs, which is exactly how this
 # was missed the first time.
-# `dup(2)` is not in Crystal's LibC bindings; one line binds it for the helper below.
-lib LibC
-  fun dup(fd : Int) : Int
-end
-
-# Run the block with STDOUT pointed at /dev/null — for driving a `gori run` entry point whose
-# normal output is the help page, when the example is about a side effect and not the page.
-private def stdout_silenced(&)
-  STDOUT.flush
-  saved = LibC.dup(STDOUT.fd)
-  File.open(File::NULL, "w") { |null| STDOUT.reopen(null) }
-  yield
-ensure
-  STDOUT.flush
-  if saved
-    STDOUT.reopen(IO::FileDescriptor.new(saved))
-  end
-end
-
 describe "gori run — the root logger" do
   it "writes to STDERR once the dispatch gate has run, whatever the subcommand" do
     # Driven through the real entry point rather than the setup method: `-h` is the cheapest
@@ -1210,9 +1301,24 @@ describe "gori run — the root logger" do
     # store is exactly the one that was polluting stdout.
     dispatch.index("route_logs_to_stderr").not_nil!
       .should be < dispatch.index("dispatch_subcommand(args)").not_nil!
-    # And it must name STDERR — the stream `gori mcp` and `App#run_capture` already use.
+    # And it must be STDERR — the stream `gori mcp` and `App#run_capture` already use — through
+    # `StderrLog`, which survives a closed one.
     setup = body[/^ *private def self\.route_logs_to_stderr.*?\n( *)end\n/m].not_nil!
-    setup.should contain("STDERR")
+    setup.should contain("StderrLog")
     setup.should_not contain("STDOUT")
+  end
+end
+
+# A closed STDERR made the stdlib backend's write raise, which killed the async log fiber and
+# then blocked every later `Log` call (`gori mcp` stopped answering tools).
+describe Gori::CLI::StderrLog do
+  it "drops an entry it cannot write instead of raising" do
+    r, w = IO.pipe
+    r.close
+    backend = Gori::CLI::StderrLog.new
+    backend.io = w
+    entry = Log::Entry.new("spec", Log::Severity::Info, "nobody reads this", Log::Metadata.empty, nil)
+    3.times { backend.write(entry) }
+    w.close rescue nil
   end
 end

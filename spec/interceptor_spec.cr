@@ -240,21 +240,50 @@ describe Gori::Interceptor do
   end
 end
 
+describe "Gori::Interceptor.direction_note" do
+  # A `status:` term never matches at the request gate, so under the requests-only default the
+  # condition holds nothing. Said, never refused: the direction may change next.
+  it "notes a response-only field only while catch holds requests only" do
+    note = Gori::Interceptor.direction_note("status:>=500", Gori::Interceptor::Direction::RequestOnly, "press c").not_nil!
+    note.should contain("`status:` only matches responses")
+    note.should end_with("press c")
+    Gori::Interceptor.direction_note("host:a.test -status:404", Gori::Interceptor::Direction::RequestOnly, "x").should_not be_nil
+    Gori::Interceptor.direction_note("status:>=500", Gori::Interceptor::Direction::Both, "x").should be_nil
+    Gori::Interceptor.direction_note("status:>=500", Gori::Interceptor::Direction::ResponseOnly, "x").should be_nil
+    Gori::Interceptor.direction_note("host:a.test", Gori::Interceptor::Direction::RequestOnly, "x").should be_nil
+    Gori::Interceptor.direction_note("\"status 500\"", Gori::Interceptor::Direction::RequestOnly, "x").should be_nil # free text, not a field
+  end
+end
+
 describe "Gori::Interceptor direction + condition gates" do
-  it "cycle_direction wraps Both → RequestOnly → ResponseOnly → Both" do
+  # Requests only by default: holding both legs made every forwarded request's response wait
+  # for a second decision while the client hung.
+  it "defaults to RequestOnly and cycle_direction wraps RequestOnly → ResponseOnly → Both" do
     with_store do |store|
       ic = Gori::Interceptor.new(Gori::Scope.load(store))
-      ic.direction.should eq(Gori::Interceptor::Direction::Both)
-      ic.cycle_direction.should eq(Gori::Interceptor::Direction::RequestOnly)
+      ic.direction.should eq(Gori::Interceptor::Direction::RequestOnly)
       ic.cycle_direction.should eq(Gori::Interceptor::Direction::ResponseOnly)
       ic.cycle_direction.should eq(Gori::Interceptor::Direction::Both)
+      ic.cycle_direction.should eq(Gori::Interceptor::Direction::RequestOnly)
     end
+  end
+
+  # Every reader publishes `to_s.downcase` (`requestonly`), every writer documents `request`;
+  # both must read back to the same member, and nothing else may fall back to Both (#1433).
+  it "reads a set_direction argument in either spelling, and refuses anything else" do
+    Gori::Interceptor::Direction.each do |d|
+      Gori::Interceptor::Direction.from_arg?(d.to_s.downcase).should eq(d)
+      Gori::Interceptor::Direction.from_arg?(d.arg).should eq(d)
+    end
+    Gori::Interceptor::Direction.from_arg?(" RequestOnly ").should eq(Gori::Interceptor::Direction::RequestOnly)
+    %w[requests out either].each { |s| Gori::Interceptor::Direction.from_arg?(s).should be_nil }
+    Gori::Interceptor::Direction.from_arg?("").should be_nil
   end
 
   it "set_direction sets an explicit value idempotently, bumping revision only on change (#123)" do
     with_store do |store|
       ic = Gori::Interceptor.new(Gori::Scope.load(store))
-      ic.direction.should eq(Gori::Interceptor::Direction::Both)
+      ic.direction.should eq(Gori::Interceptor::Direction::RequestOnly)
       r0 = ic.revision
       ic.set_direction(Gori::Interceptor::Direction::ResponseOnly)
       ic.direction.should eq(Gori::Interceptor::Direction::ResponseOnly)
@@ -268,19 +297,19 @@ describe "Gori::Interceptor direction + condition gates" do
   it "honours the catch direction at the request/response gates" do
     with_store do |store|
       ic = Gori::Interceptor.new(Gori::Scope.load(store))
-      ic.toggle # enable (default Both)
+      ic.toggle # enable (default RequestOnly)
       req_ok = -> { ic.intercepts_request?(method: "GET", host: "acme.test", target: "/x", scheme: "http", port: 80) }
       res_ok = -> { ic.intercepts_response?(method: "GET", host: "acme.test", target: "/x", scheme: "http", port: 80, status: 200) }
 
-      req_ok.call.should be_true
-      res_ok.call.should be_true
-
-      ic.cycle_direction # RequestOnly
       req_ok.call.should be_true
       res_ok.call.should be_false
 
       ic.cycle_direction # ResponseOnly
       req_ok.call.should be_false
+      res_ok.call.should be_true
+
+      ic.cycle_direction # Both
+      req_ok.call.should be_true
       res_ok.call.should be_true
     end
   end
@@ -307,6 +336,7 @@ describe "Gori::Interceptor direction + condition gates" do
     with_store do |store|
       ic = Gori::Interceptor.new(Gori::Scope.load(store))
       ic.toggle
+      ic.set_direction(Gori::Interceptor::Direction::Both)
       ic.set_filter("status:>=500")
       ic.intercepts_response?(method: "GET", host: "acme.test", target: "/x", scheme: "http", port: 80, status: 503).should be_true
       ic.intercepts_response?(method: "GET", host: "acme.test", target: "/x", scheme: "http", port: 80, status: 200).should be_false
@@ -861,6 +891,68 @@ describe "Gori::Interceptor::ToggleResult" do
 
       # Nothing held → nothing claimed, the same answer `forward_all` gives.
       ic.toggle.released.should eq(0)
+    end
+  end
+end
+
+# #1430. The edit-and-forward receipt (CLI `intercept edit`, MCP `intercept_forward_edit`, the
+# TUI's agent note) named the HELD request — `edited: GET 127.0.0.1/bf2` — while the origin
+# received `DELETE /changed?x=1`. `edited_label` reads the method/target off the bytes that
+# actually go out, by the same parse the TUI editor's queue row uses.
+describe "Gori::Interceptor::Item#edited_label (#1430)" do
+  it "names the EDITED method and target of a request, not the held ones" do
+    with_store do |store|
+      ic = Gori::Interceptor.new(Gori::Scope.load(store))
+      ic.toggle
+      req = ic.enqueue_request("GET /bf2 HTTP/1.1\r\n\r\n".to_slice, method: "GET", target: "/bf2",
+        host: "127.0.0.1", port: 19201, scheme: "http").not_nil!
+      edit = "DELETE /changed?x=1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_slice
+      req.edited_label(edit).should eq("DELETE 127.0.0.1/changed?x=1")
+      req.edited_method_target(edit).should eq({"DELETE", "/changed?x=1"})
+      # LF-joined (the TUI editor's text) and absolute-form (a forward-proxy hold) read alike.
+      req.edited_label("PUT http://127.0.0.1:19201/x HTTP/1.1\nHost: h\n\n".to_slice)
+        .should eq("PUT 127.0.0.1/x")
+    end
+  end
+
+  it "names an edited response's status, keeping the request method" do
+    with_store do |store|
+      ic = Gori::Interceptor.new(Gori::Scope.load(store))
+      ic.toggle
+      resp = ic.enqueue_response("HTTP/1.1 200 OK\r\n\r\n".to_slice, flow_id: 1_i64, method: "POST",
+        target: "200 OK", host: "127.0.0.1", port: 19201, scheme: "http").not_nil!
+      resp.edited_label("HTTP/1.1 403 Forbidden\r\nX: y\r\n\r\n".to_slice)
+        .should eq("POST 127.0.0.1 -> 403 Forbidden")
+      resp.edited_label("HTTP/1.1  404 Not Found\r\n\r\n".to_slice).should eq("POST 127.0.0.1 -> 404 Not Found")
+      resp.edited_label("HTTP/1.1\r\n\r\n".to_slice).should eq("POST 127.0.0.1 -> 200 OK")
+    end
+  end
+
+  it "keeps a WebSocket message's handshake label but reports the edited size" do
+    with_store do |store|
+      ic = Gori::Interceptor.new(Gori::Scope.load(store))
+      ic.toggle
+      out = ic.enqueue_ws("hello".to_slice, to_server: true, method: "GET", target: "/ws",
+        host: "acme.test", port: 443, scheme: "https", flow_id: 9_i64, binary: false).not_nil!
+      # A payload whose first "line" looks like a start line must not rename the socket.
+      out.edited_label("DELETE /evil HTTP/1.1".to_slice).should eq("acme.test/ws client->server 21B")
+    end
+  end
+
+  it "keeps the held value for a token the start line does not carry" do
+    with_store do |store|
+      ic = Gori::Interceptor.new(Gori::Scope.load(store))
+      ic.toggle
+      req = ic.enqueue_request("x".to_slice, method: "GET", target: "/held",
+        host: "127.0.0.1", port: 19201, scheme: "http").not_nil!
+      req.edited_label("\r\nHost: h\r\n\r\n".to_slice).should eq("GET 127.0.0.1/held")
+      req.edited_label("POST\r\n\r\n".to_slice).should eq("POST 127.0.0.1/held")
+      req.edited_label(Bytes.empty).should eq("GET 127.0.0.1/held")
+      # A doubled space or a tab between tokens is still a target, not an absent one.
+      req.edited_label("DELETE  /changed HTTP/1.1\r\n\r\n".to_slice).should eq("DELETE 127.0.0.1/changed")
+      req.edited_label("DELETE\t/changed\tHTTP/1.1\r\n\r\n".to_slice).should eq("DELETE 127.0.0.1/changed")
+      # Only the first line is decoded, and a non-UTF-8 octet in it does not raise.
+      req.edited_label(Bytes[0x50, 0x55, 0x54, 0x20, 0x2f, 0xff, 0x0a]).should start_with("PUT 127.0.0.1/")
     end
   end
 end

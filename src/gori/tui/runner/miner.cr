@@ -1,14 +1,17 @@
 # Param Miner — ExecContext verb implementations, reopens Gori::Tui::Runner (see
 # tui/runner.cr for the event loop, Host facade, overlays, and rendering).
 class Gori::Tui::Runner < Gori::Verb::ExecContext
-  # CROSS-TAB: open the config popup for History's selected flow (space → Mine params).
+  # CROSS-TAB: open the config popup for History's selected flow (space → Send flow to… → Miner).
   # Batch-capable (#442): ONE config popup, then a mining session per marked flow. Capped
   # like the other session-spawning verbs. Flows with no mineable location are dropped here
   # rather than starting an empty session.
+  #
+  # Each flow is seeded with the names its host's OTHER endpoints carry (#1231), as the
+  # Params sub-tab's Mine is — scanned while the popup is up (`seed_mine_names`).
   def mine_selected : Nil
     ids = history_target_flow_ids
     return (@toast = "select a flow first") if ids.empty?
-    return open_mine_config(miner_controller.build_seed_from_flow(ids.first)) if ids.size == 1
+    return seed_mine_names(open_mine_config(miner_controller.build_seed_from_flow(ids.first))) if ids.size == 1
     return unless targets = batch_within_cap(ids, "the Miner")
     seeds = targets.compact_map { |id| miner_controller.build_seed_from_flow(id) }.reject(&.applicable.empty?)
     return (@toast = "no mineable locations in the marked flows") if seeds.empty?
@@ -21,7 +24,12 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     best = (0...seeds.size).max_by { |i| seeds[i].applicable.size }
     extra = seeds.dup
     extra.delete_at(best)
-    open_mine_config(seeds[best], extra)
+    seed_mine_names(open_mine_config(seeds[best], extra))
+  end
+
+  # Start the popup's inventory scan (Start cancels it — see `open_mine_config`).
+  private def seed_mine_names(ov : MineConfigOverlay?) : Nil
+    miner_controller.scan_seed_names(ov) if ov
   end
 
   # CROSS-TAB: open the config popup for the current Repeater request.
@@ -31,23 +39,16 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     open_mine_config(miner_controller.build_seed_from_request(v.target, v.request_text, v.http2?, v.sni_override))
   end
 
-  def mine_run : Nil
-    miner_controller.mine_run
-  end
-
-  def mine_stop : Nil
-    miner_controller.mine_stop
-  end
-
-  def mine_filter : Nil
-    miner_controller.mine_filter
-  end
+  forward mine_run : Nil,
+    mine_stop : Nil,
+    mine_filter : Nil,
+    to: miner_controller
 
   def miner_duplicate_subtab : Nil
     miner_controller.miner_duplicate
   end
 
-  # The strip's raw `r` rename / ^W close, promoted to verbs. `Runner#renameable_subtabs?`
+  # The strip's raw `e` rename / ^W close, promoted to verbs. `Runner#renameable_subtabs?`
   # and `#subtab_close` have listed :miner all along; only the VERBS were missing, so the
   # `:subtab` space-menu group here held Duplicate alone and neither key was rebindable.
   def miner_rename_subtab : Nil
@@ -72,11 +73,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   end
 
   # The FINDING pane holds focus — the gate for its read verbs.
-  def miner_detail_readable? : Bool
-    miner_controller.miner_detail_readable?
-  end
+  forward miner_detail_readable? : Bool, to: miner_controller
 
-  def miner_results_readable? : Bool
-    miner_controller.miner_results_readable?
-  end
+  forward miner_results_readable? : Bool, to: miner_controller
 end

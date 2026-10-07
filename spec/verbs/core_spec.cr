@@ -37,6 +37,15 @@ describe "Gori::Verbs.register_core" do
       verb_intents(r, "app.notifications").should eq([:open_notifications])
     end
 
+    it "leaves Tell the agent palette-only, next to the card that names who is listening" do
+      # No chord on purpose (#1090): the gesture opens two cards before anything is sent, so
+      # it is not worth one of the few free Global letters — same call app.agents made.
+      r["app.tell-agent"].chords.should be_empty
+      r["app.tell-agent"].scope.should eq(Gori::Verb::Scope::Global)
+      r["app.tell-agent"].category.should eq(Gori::Verb::Category::Action)
+      verb_intents(r, "app.tell-agent").should eq([:tell_agent])
+    end
+
     it "routes capture / reveal-whitespace / refresh to their own intents" do
       verb_intents(r, "capture.toggle").should eq([:toggle_capture])
       verb_intents(r, "view.reveal-ws").should eq([:toggle_reveal])
@@ -44,11 +53,12 @@ describe "Gori::Verbs.register_core" do
     end
 
     it "keeps the destructive CA verbs palette-only (no chord to fat-finger)" do
-      %w[ca.export ca.regenerate ca.import browser.open].each { |id| r[id].chords.should be_empty }
+      %w[ca.export ca.regenerate ca.import browser.open shell.open].each { |id| r[id].chords.should be_empty }
       verb_intents(r, "ca.export").should eq([:export_ca])
       verb_intents(r, "ca.regenerate").should eq([:regenerate_ca])
       verb_intents(r, "ca.import").should eq([:import_ca])
       verb_intents(r, "browser.open").should eq([:open_browser_picker])
+      verb_intents(r, "shell.open").should eq([:open_shell_picker])
     end
   end
 
@@ -127,15 +137,13 @@ describe "Gori::Verbs.register_core" do
 
   describe "project description copy" do
     # BARE 'y' stays chordless: ProjectController raw-dispatches it in the description pane and
-    # handle_body_key returns true there, so the shared Keymap is never consulted — a bare chord
-    # could only ever be dead weight in the rebind editor. The mnemonic mirrors that real key.
-    #
-    # `^Y` IS registered, because that raw dispatch only covers READ. In INS a bare `y` is a
-    # literal character (and typing it over a ⇧arrow selection REPLACES it), so the ctrl form is
-    # the only way to copy without leaving the mode.
-    it "carries the 'y' menu key with only the ctrl chord, in its own scope, gated on tab AND pane" do
+    # handle_body_key no longer raw-dispatches `y` there (that arm went with the editor-verb
+    # migration — KEY_AUDIT §2e), so the description pane carries the SAME pair every other
+    # Copy verb does: bare `y` for READ, and `^Y` for INS, where a bare `y` is a literal
+    # character that would REPLACE the ⇧arrow selection being copied.
+    it "carries the 'y' menu key on the READ + pinned INS pair, in its own scope, gated on tab AND pane" do
       verb = r["project.copy"]
-      verb.chords.should eq([typed_chord("y", ctrl: true)])
+      verb.chords.should eq([typed_chord("y"), typed_chord("y", ctrl: true)])
       verb.menu_key.should eq('y')
       verb.scope.should eq(Gori::Verb::Scope::ProjectDesc) # NOT Body — see the History list
       ctx = FakeExecContext.new

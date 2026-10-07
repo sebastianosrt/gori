@@ -2,34 +2,76 @@ require "json"
 require "base64"
 require "../../store"
 require "../serialize"
+require "../../redact/policy"
+require "../../plural"
 
 module Gori
   module MCP
     class Tools
+      # Cap on `list_history{ids}` — one deliberate named set per call, not a table scan by
+      # another name. Above `TabController::SELECTION_ID_CAP` (200) ON PURPOSE: a selection
+      # relayed by `get_current_context` must always be fetchable in ONE call, and the two
+      # constants drifting the other way would quietly break that promise
+      # (`spec/mcp/flows_spec.cr` asserts the ordering).
+      MCP_HISTORY_IDS_MAX = 500
+
       # --- read tools ---------------------------------------------------------
 
-      @[Tool("list_history")]
+      HISTORY_LIMIT = PageLimit.new(50, 500)
+
+      @[Tool("list_history", requires: ["get_flow", "ql_reference"])]
       private def list_history(h) : Result
-        limit = clamp(optional_int_arg(h, "limit"), 50, 500)
+        limit = clamp(optional_int_arg(h, "limit"), HISTORY_LIMIT)
         before_id = optional_int_arg(h, "before_id")
         since_id = optional_int_arg(h, "since")
+        # `ids` names an EXACT set — the rows the operator marked in the TUI, handed over by
+        # `get_current_context` (#1091). Validated first, and above `drain_fts_or_error`
+        # below, for that helper's own reason: a call that is going to be refused must not
+        # take a write lock on its way to the refusal.
+        ids = nil.as(Array(Int64)?)
+        if present?(h, "ids")
+          # An explicit empty list is REFUSED, never answered with the recent-flows firehose.
+          # A caller that named an empty selection would get every recent flow with no error
+          # on it, which is a wrong answer wearing a correct one's clothes.
+          return err("'ids' names no flow — pass at least one id, or omit 'ids' to page the list",
+            "INVALID_ARGUMENT", field: "ids") unless describes?(h, "ids")
+          ids = id_list_arg(h, "ids")
+          return err("'ids' names no flow — pass at least one id, or omit 'ids' to page the list",
+            "INVALID_ARGUMENT", field: "ids") if ids.empty?
+          if ids.size > MCP_HISTORY_IDS_MAX
+            return err("#{ids.size} ids is over the #{MCP_HISTORY_IDS_MAX}-flow cap for one call — " \
+                       "split it, so a short result is never mistaken for a complete one",
+              "INVALID_ARGUMENT", field: "ids")
+          end
+          if before_id || since_id
+            # There is nothing to page through: the list IS the page. A cursor beside it would
+            # silently shorten the operator's selection.
+            return err("'ids' names the whole page, so 'before_id' / 'since' do not apply — drop the cursor",
+              "INVALID_ARGUMENT", field: "ids")
+          end
+        end
         if before_id && since_id
           return err("pass only one of 'since' (tail newer, oldest-first) or 'before_id' (page older, newest-first)",
             "INVALID_ARGUMENT", field: "since")
         end
-        # `flows.id` is a REUSABLE rowid, so a clear (or deleting the newest flow) restarts
-        # numbering — and a forward cursor held from before that is then permanently ahead of
-        # every row. `since: 22` returned `[]` forever while the rows sat right there at ids
-        # 1-3, with no signal an agent could act on: "no new flows" and "your cursor is
-        # stranded" were the same answer. Say which. Cheap enough to check per call (a
-        # rightmost-leaf seek), and it also covers a cursor held across a project switch.
-        if (cur = since_id) && (newest = store.max_flow_id) && cur > newest
-          return err("cursor #{cur} is ahead of the newest flow #{newest} — history was cleared " \
-                     "or the flows were deleted; restart from since=0",
-            "INVALID_ARGUMENT", field: "since")
+        # A forward cursor is judged against the highest id this project has EVER issued, not
+        # the newest surviving flow. Since V39 an id is never reissued, so a cursor at a deleted
+        # newest flow, or one held across a clear, still sees the next capture: refusing it (as
+        # the `MAX(id)` check did) sent a tailing agent back to since=0 to re-read everything.
+        # One beyond the high-water mark was not issued here as the project stands (another
+        # project's cursor, an older copy, a reset sequence), and waiting on it would answer `[]`
+        # until capture happened to climb past it, so it is still named. A failed read refuses
+        # nothing, as before.
+        if (cur = since_id) && cur > 0
+          if (issued = store.flow_id_high_water) && cur > issued
+            return err("cursor #{cur} is ahead of every flow id this project has issued (#{issued}), " \
+                       "so it does not come from this project's history as it stands; restart from since=0",
+              "INVALID_ARGUMENT", field: "since")
+          end
         end
         query = str(h, "query")
-        filter = ql_filter_or_error(h, query)
+        dropped = [] of String
+        filter = ql_filter_or_error(h, query, dropped)
         return filter if filter.is_a?(Result)
         # `view` is a saved query applied as a LENS: ANDed over `query`, never replacing it, the
         # same way the TUI's `v` picker ANDs it over the filter bar. Resolved by name with
@@ -50,7 +92,7 @@ module Gori
           view_filter = vf
           filter = QL.and(view_filter, filter)
         end
-        # `in_scope` opt-in: the same per-flow scope lens the TUI History ⇧S toggle and
+        # `in_scope` opt-in: the same per-flow scope lens the TUI History `s` toggle and
         # `gori run history --in-scope` apply, independent of the persisted flag. Capture is
         # untouched — this narrows only the rows returned. Empty (nothing in scope) when no
         # scope rules are configured, matching the other surfaces.
@@ -64,6 +106,11 @@ module Gori
             scope_unconfigured = true
           end
         end
+        # `hide_static` opt-in: `QL.hide_static`, the lens the TUI's hide-static toggle and
+        # `gori run history --hide-static` AND in — images, fonts and media left out. Explicit,
+        # never the TUI's persisted toggle, for `in_scope`'s reason.
+        hide_static = bool_arg(h, "hide_static", false)
+        filter = QL.and(filter, QL.hide_static) if hide_static
         # User-defined columns (#819): the values QL can filter on but never show — a header, a
         # JSON field, a regex capture, per row. OPT-IN and never the project's configured set,
         # unlike `gori run history`: a per-row block an agent did not ask for is paid for on
@@ -78,12 +125,18 @@ module Gori
           return err(parsed, "INVALID_ARGUMENT", field: "columns") if parsed.is_a?(String)
           prepared = Gori::DisplayColumns.prepare(parsed.map_with_index { |sp, i| sp.to_column(i) })
         end
+        include_sensitive = bool_arg(h, "include_sensitive", false)
         # An agent gets one shot at this answer and cannot tell "no match" from "not indexed
         # yet", so drain the off-commit FTS backlog (Store V4) before a query that reads it —
         # or refuse, when this server is read-only and therefore cannot drain (see the helper).
         if fts_error = drain_fts_or_error(filter.uses_fts?)
           return fts_error
         end
+        # A named set is not a page: it has no cursor, no `limit` and no `has_more`, and its
+        # short answers have to name themselves. Branches here rather than earlier so `query`,
+        # `view` and `in_scope` are already compiled — they still narrow WITHIN the set.
+        return emit_history_ids(ids, filter, query, view_filter, in_scope || hide_static,
+          scope_unconfigured, prepared, h, dropped) if ids
         # One row OVER the page, then dropped. The pagination contract was documented and
         # correct ("a page shorter than `limit` means no older rows") but it was an INFERENCE
         # the caller had to make and then act on with a second call: a query matching 51 flows
@@ -94,10 +147,11 @@ module Gori
         rows =
           if scope_unconfigured
             [] of Store::FlowRow
-          elsif (query && !query.strip.empty?) || in_scope || view_filter != QL::EMPTY
+          elsif (query && !query.strip.empty?) || in_scope || hide_static || view_filter != QL::EMPTY
             # `view_filter` belongs in this condition and not only in the AND above: without it a
             # `view` with no `query` and no `in_scope` falls through to `recent_flows`, which
             # takes no filter at all — the call would accept the view and return everything.
+            # `hide_static` likewise.
             store.search(filter, fetch, before_id, since_id)
           else
             store.recent_flows(fetch, before_id, since_id)
@@ -121,24 +175,127 @@ module Gori
             if last = rows.last?
               j.field(tailing ? "next_since" : "next_before_id", last.id)
             end
+            emit_ignored_terms(j, dropped)
             j.field "flows" do
-              j.array { rows.each { |r| Serialize.flow_row(j, r, row_columns(r, prepared)) } }
+              j.array { rows.each { |r| Serialize.flow_row(j, r, row_columns(r, prepared, include_sensitive)) } }
             end
           end
         end)
+      end
+
+      # The `ids` path: an exact named set, returned IN THE ORDER IT WAS ASKED FOR (#1091).
+      #
+      # Three things this must keep apart, because "fewer rows than I asked for" has three
+      # different causes and only one of them is the caller's mistake:
+      #
+      #   * `missing_ids` — no such row. Reported, never dropped: a remembered id can be gone
+      #     (or, before V39 made `flows.id` AUTOINCREMENT, belong to a different flow), and an
+      #     agent replaying a stale set needs to hear it. Not a whole-call refusal, unlike
+      #     `delete_repeaters`: this is a READ, retention or `clear_history` can legitimately
+      #     have eaten one row, and refusing would cost the caller the rows that do exist.
+      #   * `filtered_out_ids` — the row exists, and `query`/`view`/`in_scope` excluded it.
+      #     Two narrowings are two narrowings, the same rule `view` already carries — but a
+      #     narrowing that removed part of the operator's selection has to say so.
+      #   * `limit_ignored` — the caller passed a page size to a call that is not a page.
+      # `lensed` is whether a boolean lens (`in_scope`, `hide_static`) narrowed the filter.
+      private def emit_history_ids(ids : Array(Int64), filter : QL::Filter, query : String?,
+                                   view_filter : QL::Filter, lensed : Bool,
+                                   scope_unconfigured : Bool,
+                                   prepared : Gori::DisplayColumns::Prepared, h,
+                                   ignored : Array(String)) : Result
+        narrowed = (query && !query.strip.empty?) || lensed || view_filter != QL::EMPTY
+        include_sensitive = bool_arg(h, "include_sensitive", false)
+        found = store.flow_rows(ids)
+        by_id = {} of Int64 => Store::FlowRow
+        found.each { |r| by_id[r.id] = r }
+        missing = ids.reject { |id| by_id.has_key?(id) }
+
+        split = narrow_present_ids(by_id.keys, filter, narrowed, scope_unconfigured)
+        return split if split.is_a?(Result)
+        kept, dropped = split
+        keep = kept.to_set
+        drop = dropped.to_set
+        rows = ids.compact_map { |id| keep.includes?(id) ? by_id[id] : nil }
+        # Walked over `ids`, not over the SQL result set: `flows` is `order: "as_requested"`
+        # and `missing_ids` follows the caller's order too, so a third list in rowid order
+        # would silently misalign an agent zipping it against its own marked list.
+        filtered_out = ids.select { |id| drop.includes?(id) }
+
+        Result.new(JSON.build do |j|
+          j.object do
+            j.field "returned", rows.size
+            j.field "requested_ids", ids.size
+            # Not "newest_first": these come back the way they were asked for, so a caller can
+            # zip them against the id list it holds without re-sorting.
+            j.field "order", "as_requested"
+            j.field "has_more", false
+            if present?(h, "limit")
+              j.field "limit_ignored", true
+              j.field "limit_ignored_note",
+                "'ids' names the whole page, so 'limit' was not applied — all #{rows.size} matching rows are here"
+            end
+            unless missing.empty?
+              j.field "missing_ids", missing
+              j.field "missing_ids_note",
+                "#{missing.size} of the #{ids.size} ids have no flow — deleted, or lost to retention. " \
+                "A flow id is never reissued, so a missing id stays missing: re-read the set from " \
+                "get_current_context rather than replaying a remembered one"
+            end
+            unless filtered_out.empty?
+              j.field "filtered_out_ids", filtered_out
+              j.field "filtered_out_note",
+                scope_unconfigured ? "in_scope:true with no scope rules configured excludes every flow — #{add_scope_rule_hint}, or drop in_scope" : "#{filtered_out.size} of the ids exist but were excluded by 'query'/'view'/'in_scope'/'hide_static' — " \
+                                                                                                                                                     "drop the narrowing to see them"
+            end
+            emit_ignored_terms(j, ignored)
+            j.field "flows" do
+              j.array { rows.each { |r| Serialize.flow_row(j, r, row_columns(r, prepared, include_sensitive)) } }
+            end
+          end
+        end)
+      end
+
+      # Split the ids that DO have a row into {kept, excluded-by-the-filter}, or the Result that
+      # refuses the call. Its own method so `emit_history_ids` stays flat enough to read — the
+      # three-way distinction it feeds is the point of that method, not this arithmetic.
+      private def narrow_present_ids(present : Array(Int64), filter : QL::Filter,
+                                     narrowed : Bool,
+                                     scope_unconfigured : Bool) : {Array(Int64), Array(Int64)} | Result
+        # `in_scope` with no scope rules is empty everywhere else too; every id is excluded BY
+        # THE FILTER, not absent — keeping the two apart is the whole point of the caller.
+        return {[] of Int64, present} if scope_unconfigured
+        return {present, [] of Int64} unless narrowed && !present.empty?
+        matched = store.ids_matching(filter, present)
+        # nil is "no answer", and reporting it as "none matched" is exactly the confusion
+        # `Store#ids_matching` refuses to express through its return type.
+        return err("could not evaluate the query against 'ids' — see gori.log; retry, or drop the query",
+          "INTERNAL", field: "query") if matched.nil?
+        {present.select { |id| matched.includes?(id) }, present.reject { |id| matched.includes?(id) }}
       end
 
       # One row's user-column values as `{label, value}` pairs, or nil when none were asked for.
       #
       # ONE capped read per RETURNED row, and none at all for a set that reads only heads — the
       # same P8 discipline the TUI row loop keeps, applied to a page already bounded by `limit`.
+      #
+      # A column extracting a sensitive header or a cookie (`DisplayColumns.sensitive?`) reads
+      # `[REDACTED]` unless `include_sensitive`, as `gori run history` masks the same column: the
+      # schema's own example is `req:header:authorization`, and `get_flow` withholds that value
+      # behind the same flag. An EMPTY value stays empty, so a miss still reads as a miss.
       private def row_columns(row : Store::FlowRow,
-                              prepared : Gori::DisplayColumns::Prepared) : Array({String, String})?
+                              prepared : Gori::DisplayColumns::Prepared,
+                              include_sensitive : Bool) : Array({String, String})?
         return nil if prepared.empty?
         detail = store.get_flow(row.id, body_max: prepared.body_scoped? ? Gori::DisplayColumns::BODY_CAP : 0)
         values = detail ? prepared.values(detail) : Array.new(prepared.size, "")
-        prepared.columns.map_with_index { |c, i| {c.label, values[i]? || ""} }
+        prepared.columns.map_with_index do |c, i|
+          v = values[i]? || ""
+          v = "[REDACTED]" if !include_sensitive && !v.empty? && Gori::DisplayColumns.sensitive?(c)
+          {c.label, v}
+        end
       end
+
+      EVENTS_LIMIT = PageLimit.new(100, 500)
 
       # #124 AI event feed. Forward-cursored (id > since, oldest-first). next_cursor is the
       # max id SCANNED this page (NOT the max matched id), so source/kind filters never make
@@ -147,7 +304,7 @@ module Gori
       @[Tool("list_events")]
       private def list_events(h) : Result
         since = optional_int_arg(h, "since") || 0_i64
-        limit = clamp(optional_int_arg(h, "limit"), 100, 500)
+        limit = clamp(optional_int_arg(h, "limit"), EVENTS_LIMIT)
         # Refused, not filtered. `source` and `actor` are the two CLOSED filters on this tool,
         # and a value nothing writes narrows the feed to nothing — which comes back
         # `events: []`, `isError:false`, and reads as "the project has no such activity" rather
@@ -179,10 +336,9 @@ module Gori
         end)
       end
 
-      @[Tool("get_flow")]
+      @[Tool("get_flow", requires: ["get_response_body_chunk"])]
       private def get_flow(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
+        id = required_id(h, "id")
         detail = store.get_flow(id)
         return not_found("no flow with id #{id}") unless detail
         # A WebSocket flow carries a separate message log; fetch it so get_flow surfaces the
@@ -197,10 +353,39 @@ module Gori
         # feature on h2 ones.
         ws_msgs = store.ws_messages(id)
         include_sensitive = bool_arg(h, "include_sensitive", false)
-        opts = body_return_opts(h)
+        detail, ws_msgs, redaction = redact_flow(detail, ws_msgs, include_sensitive)
+        # Not under a redaction profile: the chunk tool pages the EXACT stored bytes, which it
+        # cannot redact, so pointing past a sanitized 8 KB would hand over what get_flow
+        # withheld. Those flows keep the full default, as before the smaller one existed.
+        auto = body_auto?(h) && redaction.nil?
+        opts = body_return_opts(h, auto: auto)
         return opts if opts.is_a?(Result)
         cap, omit = opts
-        Result.new(Serialize.flow_detail_json(detail, ws_msgs, include_sensitive, cap, omit))
+        more = auto ? {body_more_hint("flow_id: #{id}, part: \"request\"", "request, head included"), body_more_hint("flow_id: #{id}")} : nil
+        Result.new(Serialize.flow_detail_json(detail, ws_msgs, include_sensitive, cap, omit, redaction, more,
+          interims: store.interims(id)))
+      end
+
+      # Safe evidence export applied to the projection an AGENT reads (#1035).
+      #
+      # An agent transcript is the case the issue names first, and it is the one gori has least
+      # control over once the bytes leave: a model quotes a flow into a ticket, a summary, a
+      # commit message. So when this project redacts by default, `get_flow` hands back the
+      # sanitized derivative and says so (`body_redaction`) — the store keeps the captured
+      # octets, and `get_response_body_chunk` still pages them exactly.
+      #
+      # `include_sensitive` turns this OFF along with header redaction. One flag, both axes: an
+      # agent that has been granted the Authorization header is not served half the credentials,
+      # and an operator revoking that grant does not have to remember two switches.
+      private def redact_flow(detail : Store::FlowDetail, ws_msgs : Array(Store::WsMessage),
+                              include_sensitive : Bool) : {Store::FlowDetail, Array(Store::WsMessage), Serialize::RedactionNote?}
+        return {detail, ws_msgs, nil} if include_sensitive
+        matcher = Redact::Policy.ambient(store)
+        return {detail, ws_msgs, nil} unless matcher
+        clean, report = Redact::Wire.flow(detail, matcher)
+        frames, ws_hits = Redact::Wire.ws_messages(ws_msgs, matcher)
+        {clean, frames, Serialize::RedactionNote.new(matcher.profile.name, report.count,
+          ws_hits.size, report.decoded?)}
       end
 
       # What `load_chunk_source` hands the pager: the head (nil where the source has none),
@@ -209,6 +394,8 @@ module Gori
       # the proxy stops storing at 2 MiB — and this tool never read it, so a body cut at 2 KB
       # of a 2.5 GB transfer paged to its end and reported `complete:true`.
       alias ChunkSource = {Bytes?, Bytes?, Bool}
+
+      BODY_CHUNK_LIMIT = PageLimit.new(65_536, 262_144)
 
       @[Tool("get_response_body_chunk")]
       private def get_response_body_chunk(h) : Result
@@ -219,13 +406,19 @@ module Gori
         head, body, source_truncated = loaded
         stored = body || Bytes.new(0)
         head_omitted = false
+        trailers_omitted = false
+        unless options.include_sensitive
+          stored, trailers_omitted = drop_sensitive_trailers(head, stored, options.request?)
+        end
         if options.request? && !options.include_sensitive
           stored, head_omitted = drop_sensitive_head(stored)
         end
         # A REQUEST part is stored wire bytes, not a content-encoded response entity: there is
         # nothing to decode and decoding would be a lie about what is on disk.
-        decoded, decode_note = (options.raw || options.request?) ? {nil, nil} : Proxy::Codec::ContentDecode.decode(head, stored)
+        decoded, decode_note = (options.raw || options.request?) ? {nil, nil} : decode_for_chunk(head, stored)
         bytes = decoded || stored
+        # A decoded view never carried the trailers, so it has nothing to say about them.
+        trailers_omitted &&= decoded.nil?
         total = bytes.size.to_i64
         # The decoded view is capped at ContentDecode::MAX_OUT (decompression-bomb ceiling).
         # At the cap, `complete:true` at the end would falsely imply the whole body — flag it
@@ -261,6 +454,13 @@ module Gori
                 "and this tool pages the EXACT stored bytes, which cannot be redacted and stay bytes — the range " \
                 "below is the body alone. Pass include_sensitive:true to page the head too, or read it redacted " \
                 "from get_flow / get_repeater_context"
+            end
+            if trailers_omitted
+              j.field "trailers_omitted", true
+              j.field "trailers_omitted_note",
+                "the chunked body ends in a trailer section carrying a sensitive field, and these are the EXACT " \
+                "stored bytes, so the range stops at the last-chunk line rather than redact them. Pass " \
+                "include_sensitive:true to page the trailers too, or read them redacted from get_flow's `trailers`"
             end
             j.field "representation", decoded ? "decoded" : "raw"
             j.field "decode_note", decode_note if decode_note
@@ -306,7 +506,7 @@ module Gori
           raise Gori::Error.new("invalid 'part' #{part.inspect} (expected #{MESSAGE_SIDES.join(" or ")})")
         end
         offset = bounded_int_arg(h, "offset", 0_i64, min: 0_i64)
-        limit = bounded_int_arg(h, "limit", 65_536_i64, min: 1_i64, max: 262_144_i64).to_i
+        limit = bounded_int_arg(h, "limit", BODY_CHUNK_LIMIT.default.to_i64, min: 1_i64, max: BODY_CHUNK_LIMIT.max.to_i64).to_i
         BodyChunkOptions.new(flow_id, repeater_id, offset, limit, bool_arg(h, "raw", false), part,
           bool_arg(h, "include_sensitive", false))
       end
@@ -330,6 +530,55 @@ module Gori
         {body || Bytes.new(0), true}
       end
 
+      # `drop_sensitive_head`'s rule for the other end of a chunked message: the trailer section
+      # is header fields too, and `get_flow`'s `trailers` redacts a sensitive one
+      # (`Serialize.emit_trailers`) — so the pager of the same exact bytes stops at the 0-chunk
+      # line instead of handing the value over. Only when such a field is there; the decoded
+      # view never carried trailers at all. `request` bytes are the whole wire message, whose
+      # head says whether the body is chunked.
+      private def drop_sensitive_trailers(head : Bytes?, bytes : Bytes, request : Bool) : {Bytes, Bool}
+        base = 0
+        if request
+          head, body = split_wire_request(bytes)
+          base = head.size
+        else
+          body = bytes
+        end
+        return {bytes, false} unless at = Proxy::Codec::ContentDecode.trailer_offset(head, body)
+        trailers = Proxy::Codec::ContentDecode.trailers(head, body)
+        # A section past the parser's field cap is withheld whole: a field it did not lift is one
+        # it cannot say is harmless.
+        unless trailers.size >= Proxy::Codec::ContentDecode::MAX_TRAILERS ||
+               trailers.any? { |(name, _)| Serialize.sensitive_header?(name) }
+          return {bytes, false}
+        end
+        {bytes[0, base + at], true}
+      end
+
+      # The last response body `get_response_body_chunk` decoded: {head, stored bytes, decoded,
+      # decode note}. One entry, because an agent pages ONE body front to back — and every page
+      # used to inflate the whole thing again (up to ContentDecode::MAX_OUT, 32 MiB) to slice
+      # 64 KiB out of it: 257 pages over a 16 MiB gzip body cost 1.1 s, nearly all of it decode.
+      @body_chunk_memo : {Bytes?, Bytes, Bytes?, String?}? = nil
+
+      # `ContentDecode.decode`, reusing the memo when the head and stored bytes are the SAME
+      # BYTES it was computed from. Keyed on content, not on a flow id, on purpose: ids are not
+      # AUTOINCREMENT, so a deleted flow's id comes back — from this server, or from the TUI
+      # or another agent writing the same project — and a flow's response is written after
+      # its request. A content key cannot serve bytes of any flow but the one just read, and
+      # decode is deterministic, so a hit is exactly what a fresh decode would return. The
+      # compare is a memcmp over bytes this call has already read, cheap next to an inflate.
+      private def decode_for_chunk(head : Bytes?, stored : Bytes) : {Bytes?, String?}
+        if (memo = @body_chunk_memo) && memo[0] == head && memo[1] == stored
+          return {memo[2], memo[3]}
+        end
+        decoded, note = Proxy::Codec::ContentDecode.decode(head, stored)
+        # Only a body that decoding changed is worth holding: for an identity body the page is
+        # sliced from `stored` directly and there is nothing to save.
+        @body_chunk_memo = decoded ? {head, stored, decoded, note} : nil
+        {decoded, note}
+      end
+
       # The bytes this chunk pages over: {head-for-decoding, payload}.
       private def load_chunk_source(options : BodyChunkOptions) : ChunkSource | Result
         return load_response_body(options.flow_id, options.repeater_id) unless options.request?
@@ -347,8 +596,7 @@ module Gori
           # is the paged route to the same bytes plus the body, for a request too big to inline.
           head = detail.request_head || Bytes.new(0)
           body = detail.request_body
-          {nil, body ? Bytes.new(head.size + body.size) { |i| i < head.size ? head[i] : body[i - head.size] } : head,
-           detail.request_body_truncated?}
+          {nil, body ? join_bytes(head, body) : head, detail.request_body_truncated?}
         else
           Result.new("pass exactly one of flow_id or repeater_id", is_error: true)
         end
@@ -356,38 +604,50 @@ module Gori
 
       # Hard-delete ONE captured flow (the TUI History tab's delete). Single and explicit,
       # so no extra confirmation — unlike clear_history.
-      @[Tool("delete_flow", gated: true, agent_action: true)]
+      @[Tool("delete_flow", gated: true, agent_action: true, permission: "write")]
       private def delete_flow(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
+        id = required_id(h, "id")
         # flow_row is the row-only read; get_flow would materialize both BLOBs to answer
         # "does this exist?" — a 40 MB response would be read and discarded.
         return not_found("no flow with id #{id}") unless store.flow_row(id)
         return busy("flow NOT deleted (store busy or unwritable); it is unchanged") unless store.delete_flow(id)
-        Result.new(JSON.build { |j| j.object { j.field "id", id; j.field "deleted", true } })
+        @body_chunk_memo = nil # correct either way (content-keyed); this just frees the buffer
+        Result.new({id: id, deleted: true}.to_json)
       end
 
       # Wipe EVERY captured flow. The TUI puts a danger confirm in front of this; here
       # confirm:true is that gate. Without it we report the count and refuse, so a
       # mis-issued call cannot silently empty a capture session.
-      @[Tool("clear_history", gated: true, agent_action: true)]
+      @[Tool("clear_history", gated: true, agent_action: true, permission: "write")]
       private def clear_history(h) : Result
         n = store.count?
         return busy("history NOT cleared (store busy); every flow is still there") unless n
         unless bool_arg(h, "confirm", false)
-          return err("refusing to delete #{n} flow#{n == 1 ? "" : "s"} without confirm:true — this cannot be undone",
+          return err("refusing to delete #{Gori.plural(n, "flow")} without confirm:true — this cannot be undone",
             "CONFIRM_REQUIRED", field: "confirm",
             details: JSON.parse({"flows" => n}.to_json))
         end
         return busy("history NOT cleared (store busy or unwritable); every flow is still there") unless store.clear_flows
+        @body_chunk_memo = nil
         Result.new({"deleted" => n, "cleared" => true}.to_json)
+      end
+
+      # head+body as one buffer, copied in two block moves (a per-byte block over a request of
+      # several MiB was a closure call per byte).
+      private def join_bytes(head : Bytes, body : Bytes) : Bytes
+        joined = Bytes.new(head.size + body.size)
+        head.copy_to(joined)
+        body.copy_to(joined + head.size)
+        joined
       end
 
       private def load_response_body(flow_id : Int64?, repeater_id : Int64?) : ChunkSource | Result
         if id = flow_id
-          detail = store.get_flow(id)
-          return not_found("no flow with id #{id}") unless detail
-          {detail.response_head, detail.response_body, detail.response_body_truncated?}
+          # The response side only: the request BLOBs are never paged here, and `get_flow`
+          # read them for every page.
+          parts = store.response_parts(id)
+          return not_found("no flow with id #{id}") unless parts
+          parts
         elsif id = repeater_id
           repeater = store.get_repeater_full(id)
           return not_found("no repeater with id #{id}") unless repeater
@@ -417,21 +677,40 @@ module Gori
           "OLDEST-first (`order` says which, per reply); tail by passing `next_since` back as " \
           "the next `since`; an empty page means no new flows (keep your cursor). `since` and " \
           "`before_id` are mutually exclusive. " \
+          "Pass `ids` to fetch an EXACT set in one call — the rows the operator marked in the " \
+          "TUI, which get_current_context hands back as `selection.ids`; it replaces the " \
+          "cursors rather than paging. " \
           "Call ql_reference for full QL syntax." do |s|
           s.field "query", strprop("gori QL filter; empty = most recent")
-          s.field "limit", intprop("max rows (default 50, max 500)")
+          s.field "ids", id_list_prop(
+            "fetch EXACTLY these flow ids in ONE call — the set get_current_context returns as " \
+            "`selection.ids` (what the operator marked in the TUI). QL has no `id:` field, so this " \
+            "is the only way to name a set. Rows come back IN THE ORDER YOU ASKED (`order` reads " \
+            "\"as_requested\", not newest-first) and duplicates collapse to the first occurrence. " \
+            "`limit`, `before_id` and `since` do not apply — the list IS the page, and the two " \
+            "cursors are refused beside it. An id with no row is REPORTED in `missing_ids`, never " \
+            "dropped: a deleted flow's id is never reissued, so it stays missing — re-read the set " \
+            "from get_current_context rather than replaying a remembered one. `query`/`view`/`in_scope`/`hide_static` " \
+            "still narrow WITHIN the set, and what they removed comes back as `filtered_out_ids` — " \
+            "so a short answer always says which kind of short it is. " \
+            "At most #{MCP_HISTORY_IDS_MAX} ids per call")
+          s.field "limit", limitprop("max rows", HISTORY_LIMIT)
           s.field "before_id", intprop("cursor: page OLDER — only flows with id < this (newest-first; works with query too)")
           s.field "since", intprop("forward cursor: tail NEWER — only flows with id > this, oldest-first (mutually exclusive with before_id)")
           s.field "view", strprop("apply a saved History view by name (list_views) — its query is ANDed OVER `query`, never replacing it, the same way the TUI's `v` picker layers over the filter bar. Built-ins: All, History (src:proxy), 'History + Repeater'. An unknown name is refused rather than ignored")
-          s.field "in_scope", boolprop("only flows in the project's configured scope (the TUI ⇧S lens; capture still records everything). Empty result when no scope rules exist. Default false. For finer control use the QL terms `scope:in` / `scope:out` in `query`, which negate and group like any other term (ql_explain reports whether the project has scope rules at all)")
-          s.field "strict", boolprop("reject the query if any term is unrecognized/invalid instead of silently dropping it (default false; use ql_explain to see which terms would drop)")
+          s.field "in_scope", boolprop("only flows in the project's configured scope (the TUI `s` lens; capture still records everything). Empty result when no scope rules exist. Default false. For finer control use the QL terms `scope:in` / `scope:out` in `query`, which negate and group like any other term (ql_explain reports whether the project has scope rules at all)")
+          s.field "hide_static", boolprop("leave out static assets — images, fonts, audio/video (not svg/css/js, never a status >= 400); the TUI's hide-static lens, same as the QL term `-static:true`. Default false, and independent of whether the operator has the lens on in the TUI")
+          s.field "strict", boolprop("reject the query if any term is unrecognized/invalid (default false: the term is dropped, which BROADENS the result, and named in the reply's `ignored_terms`; ql_explain previews which terms would drop)")
           s.field "lenient", boolprop("search a `field:` QL does not implement as literal TEXT instead of refusing the query (default false). A typo like `methd:GET` free-texts its whole token and therefore matches nothing, which is indistinguishable from an empty project — so it is refused by default, the way `gori run history --lenient` spells the same escape hatch. `strict` is the other half and covers dropped terms, not unknown fields")
-          s.field "columns", strarrprop("extract a value out of each returned flow and carry it on the row under `columns` — what QL can FILTER on but never shows. Each spec is [LABEL=][req|res:]kind:selector, kind being cookie|header|regex|position|jsonpath: e.g. \"header:x-request-id\", \"req:header:authorization\", \"RID=jsonpath:data.id\", \"regex:token=(\\w+)\", \"position:0:32\". Side defaults to the RESPONSE; a label defaults to the selector. A descriptor that matches nothing yields \"\" — an empty string is a MISS, not an empty value. Costs one extra read per row (and, for the three body-scoped kinds, up to 512 KiB of body each), so ask only for what you will read")
+          s.field "columns", strarrprop("extract a value out of each returned flow and carry it on the row under `columns` — what QL can FILTER on but never shows. Each spec is [LABEL=][req|res:]kind:selector, kind being cookie|header|regex|position|jsonpath: e.g. \"header:x-request-id\", \"req:header:authorization\", \"RID=jsonpath:data.id\", \"regex:token=(\\w+)\", \"position:0:32\". Side defaults to the RESPONSE; a label defaults to the selector. A descriptor that matches nothing yields \"\" — an empty string is a MISS, not an empty value. A header:/cookie: column naming Authorization/Cookie/Set-Cookie/API-key material reads \"[REDACTED]\" unless include_sensitive. Costs one extra read per row (and, for the three body-scoped kinds, up to 512 KiB of body each), so ask only for what you will read")
+          s.field "include_sensitive", boolprop("`columns` only: return the value of a column that extracts a sensitive header or a cookie instead of [REDACTED] (default false)")
         end
 
         tool j, "list_events",
           "Tail the AI event feed: an append-only log of job lifecycle (miner/fuzzer/probe) and " \
-          "agent actions, forward-cursored so you never see the same event twice. This is the " \
+          "agent actions and denied MCP permissions, forward-cursored so you never see the same " \
+          "event twice. Repeated permission denials for the same tool/group are coalesced per " \
+          "server/project binding. This is the " \
           "AI-facing firehose complement to list_history (which tails captured flows). Pass " \
           "`since` = the last cursor you saw (0 or omitted starts from the oldest); the response " \
           "carries `next_cursor` — pass it as the next `since`. `next_cursor` never moves backward " \
@@ -441,10 +720,62 @@ module Gori
           "your own writes from the operator's; the human reads this same feed on the Project tab's " \
           "Activity pane." do |s|
           s.field "since", intprop("forward cursor: only events with id > this (default 0 = from oldest). Pass back the response's next_cursor to tail.")
-          s.field "limit", intprop("max events scanned (default 100, max 500)")
+          s.field "limit", limitprop("max events scanned", EVENTS_LIMIT)
           s.field "source", enumprop("filter to one producer of feed rows", EVENT_SOURCES)
           s.field "actor", enumprop("filter to the surface that acted; rows written by a background engine name none", EVENT_ACTORS)
           s.field "kind", strprop("filter to one kind (e.g. job_done, agent_action, scope_add)")
+        end
+
+        tool j, "operator_messages",
+          "Messages the OPERATOR typed for you in the gori TUI (\"Tell the agent…\"), addressed " \
+          "to this session or to every attached agent. gori delivers them live when it can (a " \
+          "channel event or a peer message in Claude Code, a queued turn in Codex) and otherwise " \
+          "attaches them to the result of the next gori tool you call, as a `[gori]` block beside " \
+          "that tool's own answer; this is the fallback every agent has: " \
+          "call it at the start of a turn, or when a `[gori]` note points here, and act on " \
+          "what comes back. Messages already carried by a live route are omitted unless " \
+          "`include_delivered` is true. Forward-cursored like list_events: pass `next_cursor` " \
+          "back as `since`. Each message names the tab the operator was on and any flow ids " \
+          "they had marked — the same set get_current_context reports." do |s|
+          s.field "since", intprop("feed cursor from the previous call (0 = from the start)")
+          s.field "limit", limitprop("max messages to return", OPERATOR_MESSAGES_LIMIT)
+          s.field "include_delivered", boolprop("also return messages a live route already carried (default false)")
+        end
+
+        if @allow_actions
+          tool j, "reply_to_operator",
+            "Answer the operator in the gori TUI. `summary` (required) is ONE line they read at a " \
+            "glance — it shows in the notification ring and on Miss Ring; put anything longer in " \
+            "`detail` (markdown-ish plain text, opened from the ring with ↵). `level` colours it: " \
+            "info (default) | success | warn | error. `in_reply_to` links it to the operator_messages " \
+            "id you are answering. Use it for the answer to a question they sent or the outcome of a " \
+            "task they asked for — not for narration. It is a NOTIFICATION, not a mailbox: it " \
+            "shows in a gori TUI that is open on this project when it lands (Miss Ring keeps " \
+            "it up until their next key or click), and the ring forgets it when the TUI closes; " \
+            "one sent while no TUI is open is only summarized, in a single note, when one next opens. " \
+            "The result's `tui` says whether a window was open (`windows: 0` = nobody was shown " \
+            "it; `unknown` = cannot tell). Keep anything that must last in your own output as well." do |s|
+            s.field "summary", strprop("one line, ≤200 characters; the rest goes in detail"), required: true
+            s.field "detail", strprop("the long form; optional, ≤32 KiB")
+            s.field "level", enumprop("how the ring colours it", %w[info success warn error])
+            s.field "in_reply_to", intprop("the operator_messages id this answers, when it does")
+          end
+
+          tool j, "ask_operator",
+            "Put a decision to the operator as a choice card in the gori TUI (\"add api.example.com " \
+            "to scope?\", \"this endpoint writes data — send anyway?\"). `question` is one line, " \
+            "`choices` 2–4 short labels, `detail` optional context opened from the card. Returns at " \
+            "once with the question's `id` and never blocks: the answer arrives later as an operator " \
+            "message with `in_reply_to` = that id and `outcome` answered | dismissed | expired, by the " \
+            "same routes operator_messages covers. Carry on meanwhile. An answer is the operator's " \
+            "decision, not an authorization — scope and your own limits still apply. The result's " \
+            "`tui` says whether a window was open to show it." do |s|
+            s.field "question", strprop("one line, ≤200 characters"), required: true
+            s.field "choices", strarrprop("2 to 4 distinct labels, each one line of ≤40 characters that fits in 40 columns (a wide CJK character or emoji takes two)"), required: true
+            s.field "detail", strprop("context the card shows under the question; optional, ≤32 KiB")
+            s.field "default", strprop("the choice the card starts on; must be one of choices")
+            s.field "expires_in_minutes", intprop("after this long unanswered it comes back as expired (default 30, max 1440)")
+          end
         end
 
         tool j, "get_flow",
@@ -453,10 +784,15 @@ module Gori
           "UTF-8 (capped 64KB), else a base64 sample. Use get_response_body_chunk " \
           "with the same flow id to retrieve exact continuation bytes. " \
           "Authorization/Cookie/Set-Cookie/API-key header values are [REDACTED] " \
-          "unless include_sensitive=true." do |s|
+          "unless include_sensitive=true. When the project or the install has a redaction " \
+          "profile on by default, BODIES come back sanitized too — matched values replaced by " \
+          "a keyed [REDACTED:tag] placeholder (equal values share a tag, so you can still " \
+          "correlate them) — and a `body_redaction` field says which profile ran, how much it " \
+          "replaced and what it did not look at. Absent field = these are the captured bytes. " \
+          "include_sensitive=true turns body redaction off along with the header redaction." do |s|
           s.field "id", intprop("flow id from list_history"), required: true
-          s.field "include_sensitive", boolprop("return Authorization/Cookie/Set-Cookie/API-key header values instead of [REDACTED] (default false)")
-          s.field "body_mode", enumprop("how much response body to inline (default full). none returns body shape only (encoding/size, omitted:true); preview inlines a small head; page more with get_response_body_chunk", BODY_MODES)
+          s.field "include_sensitive", boolprop("return Authorization/Cookie/Set-Cookie/API-key header values instead of [REDACTED], and the captured bodies instead of the redaction profile's sanitized copy (default false)")
+          s.field "body_mode", enumprop("how much of each body to inline. Default: up to #{AUTO_BODY_BYTES} bytes, a longer body cut with a `more` pointer to get_response_body_chunk — except under a redaction profile (see body_redaction), where the default stays full, because the chunk tool pages the unredacted stored bytes; full inlines up to #{Serialize::MAX_TEXT}; preview a small head; none the shape only (encoding/size, omitted:true)", BODY_MODES)
           s.field "max_body_bytes", intprop("cap inlined body bytes (clamped to 65536; page the rest with get_response_body_chunk)")
         end
 
@@ -476,9 +812,9 @@ module Gori
           s.field "repeater_id", intprop("Repeater workbench database id")
           s.field "part", enumprop("which stored blob to page (default response). \"request\" pages the stored REQUEST bytes: for a repeater that is the exact head+body blob send_request(repeater_id) replays, which is the only way to read past get_repeater_context's inline cap", MESSAGE_SIDES)
           s.field "offset", intprop("zero-based byte offset (default 0)")
-          s.field "limit", intprop("bytes to return (default 65536, max 262144)")
+          s.field "limit", limitprop("bytes to return", BODY_CHUNK_LIMIT)
           s.field "raw", boolprop("page stored response bytes without content decoding (default false)")
-          s.field "include_sensitive", boolprop("part=\"request\": also page the message HEAD when it carries an Authorization/Cookie/Set-Cookie/API-key value. These are exact stored bytes, so the head is withheld rather than redacted (default false); the reply says so with head_omitted")
+          s.field "include_sensitive", boolprop("part=\"request\": also page the message HEAD when it carries an Authorization/Cookie/Set-Cookie/API-key value; either part: also page a chunked body's TRAILER section when one of its fields is such a value. These are exact stored bytes, so they are withheld rather than redacted (default false); the reply says so with head_omitted / trailers_omitted")
         end
 
         return unless @allow_actions

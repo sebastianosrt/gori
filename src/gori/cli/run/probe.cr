@@ -38,10 +38,10 @@ module Gori
       end
 
       private def self.cmd_probe_scan(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         query : String? = nil
         min_sev : Store::Severity? = nil
+        fail_on : Store::Severity? = nil
         category : String? = nil
         format = :text
         active = false
@@ -51,9 +51,12 @@ module Gori
         insecure = false
         lenient = false
         in_scope = false
-        positional = [] of String
+        persist = false
+        persist_failed = false
 
-        parser = OptionParser.new do |p|
+        args = normalize_query_flag(args)
+        neg_terms, opt_args = split_ql_negations(args)
+        positional = parse_args(opt_args, "gori run probe") do |p|
           p.banner = "Usage: gori run probe [QL query] [options]\n\n" \
                      "Scan captured History flows AND Repeater responses for issues —\n" \
                      "the headless equivalent of the TUI Probe tab. By default runs passive checks\n" \
@@ -67,12 +70,12 @@ module Gori
                      "Manage which checks run with: probe rules · probe mode.\n" \
                      "Those words are reserved as the first argument — to scan with a QL query\n" \
                      "starting with one, pass it as --query."
-          p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
+          project_options(p, proj, "read")
           p.on("-qQL", "--query=QL", "Only scan flows matching this QL query (host: status:>=500 size: …)") { |v| query = v }
           p.on("--severity=LEVEL", "Only show issues at/above LEVEL (info|low|medium|high|critical)") { |v| min_sev = parse_severity(v) }
+          p.on("--fail-on=LEVEL", "Exit 3 when a REPORTED issue is at/above LEVEL — a CI gate (the --severity/--category/--in-scope filters apply first)") { |v| fail_on = parse_severity(v, "--fail-on") }
           p.on("--category=CAT", "Only show issues in CAT (#{PROBE_CATEGORIES.join("|")})") { |v| category = parse_probe_category(v) }
-          p.on("--in-scope", "Only show issues on hosts in the project's configured scope (the TUI's ⇧S lens; ALL flows are still scanned)") { in_scope = true }
+          p.on("--in-scope", "Only show issues on hosts in the project's configured scope (the TUI's `s` lens; ALL flows are still scanned)") { in_scope = true }
           p.on("-a", "--active", "Include light-touch active checks (sends probe requests)") { active = true }
           p.on("--allow-unscoped", "With --active, probe flows even when outside the project scope (default: only scope-included hosts)") { allow_unscoped = true }
           p.on("--unsafe", "With --active, ALSO probe unsafe methods (POST/PUT/PATCH/DELETE) — re-sends may mutate server data") { unsafe = true }
@@ -83,15 +86,10 @@ module Gori
           # way to say otherwise.
           p.on("-k", "--insecure-upstream", "With --active, do not verify upstream TLS certificates") { insecure = true }
           p.on("--lenient", "Don't refuse a query naming an unknown field — search that token as text (old behaviour)") { lenient = true }
-          p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = before + after }
-          p.invalid_option { |f| abort "gori run probe: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run probe: missing value for #{f}" }
+          p.on("--persist", "Also write the findings into the project's persisted list (what `probe issues` and the TUI Probe tab show), merged as the live scanner merges them") { persist = true }
+          format_flag(p, [:text, :json], "Output: text (default) | json") { |f| format = f }
         end
-        args = normalize_query_flag(args)
-        neg_terms, opt_args = split_ql_negations(args)
-        parser.parse(opt_args)
+        refresh_verify_upstream(!insecure)
         # A positional QL is accepted too ("gori run probe status:>=500" / "-status:200"),
         # mirroring history. `compose_history_query` owns the precedence, and it is shared rather
         # than re-spelled here because the local `query ||= (positional + neg_terms).join` this
@@ -119,6 +117,11 @@ module Gori
           # Both halves, not just invalid-regex: an UNRECOGNIZED field is dropped by QL and
           # broadens the scan, which is the direction that matters here — see Run.warn_query_terms.
           Run.warn_query_terms("probe", q)
+          # `--active` sends probes for every selected flow, so a dropped term that widened the
+          # selection is refused rather than warned about.
+          if active && !(unusable = QL.analyze(q, scope: QL::SCOPE_SHAPE_ONLY).ignored).empty?
+            abort "gori run probe: --active refuses a query with terms QL cannot use (#{unusable.join(", ")}) — they would be dropped and probe more flows than asked"
+          end
           # A query that compiles to NOTHING (e.g. `status:>=foo`) becomes the match-all EMPTY
           # filter — here that would scan every flow, the opposite of what was asked. Refuse it.
           if !q.strip.empty? && parsed == QL::EMPTY
@@ -127,7 +130,9 @@ module Gori
           filter = parsed
         end
 
-        store = open_store(resolve_read_project(project_name, db_path))
+        # `long_running`: a scan walks every selected flow (and `--active` sends probes) before
+        # its findings are written through this same handle.
+        store = open_store(resolve_read_project(proj.name, proj.db), long_running: true)
         scope = Scope.load(store)
         # The one term that could not be compiled before the store opened. Off `scope`, which is
         # loaded here anyway, so a `scope:` query costs no extra read — and only when the query
@@ -165,14 +170,26 @@ module Gori
           # skips have to be reported — otherwise a partial scan prints the same summary as a
           # complete one and reads as "clean".
           scan_errors = [] of String
+          writer = persist ? Probe::Scan::Persist.new : nil
           dets, rn = Probe::Scan.scan_all(store, ids, active: active, scope: scope,
             verify_upstream: !insecure,
             allow_unscoped: allow_unscoped, opts: opts, rules: cfg, progress: probe_progress_meter(meter),
-            on_error: ->(where : String, ex : Exception) { scan_errors << "#{where}: #{ex.message}"; nil })
+            on_error: ->(where : String, ex : Exception) { scan_errors << "#{where}: #{ex.message}"; nil },
+            persist: writer)
           STDERR.print "\r\e[K" if meter # clear the in-place meter before the summary line
+          if w = writer
+            # Every finding is written, before --severity/--category/--in-scope narrow the
+            # report below — the same rule MCP `probe_scan{persist}` keeps.
+            if w.committed?
+              STDERR.puts "gori run probe: persisted #{Gori.plural(w.detections, "detection")} (see `gori run probe issues`)"
+            else
+              persist_failed = true
+              STDERR.puts "gori run probe: the findings were NOT persisted (store busy or unwritable) — the report below is complete; re-run with --persist to write them"
+            end
+          end
           unless scan_errors.empty?
             n = scan_errors.size
-            STDERR.puts "gori run probe: #{n} item#{n == 1 ? "" : "s"} skipped after an error " \
+            STDERR.puts "gori run probe: #{Gori.plural(n, "item")} skipped after an error " \
                         "(results are INCOMPLETE) — first: #{scan_errors.first}"
           end
           {Probe.group(dets), ids.size, rn}
@@ -194,6 +211,27 @@ module Gori
           groups = groups.select { |g| scope.host_in_scope?(g.host) }
         end
         report_probe(groups, flow_n, repeater_n, format, query, min_sev, category, in_scope)
+        # After the report, which is complete either way, and non-zero: a script that asked for
+        # the write must not read exit 0 as "the findings are in the project".
+        exit 1 if persist_failed
+        exit_on_probe_findings(groups, fail_on)
+      end
+
+      # `--fail-on=LEVEL` (#1388): a scan used to exit 0 whatever it found, so it could not gate
+      # a CI job. Exit 3 — fuzz's `--fail-if-no-matches` verdict code — AFTER the report is
+      # written, so the job log still shows what failed it; 1 stays "the scan itself failed".
+      # Judged over the issues the command REPORTED, so `--category`/`--in-scope` narrow the
+      # gate exactly as they narrow the listing.
+      def self.probe_fail_count(groups : Array(Probe::Group), level : Store::Severity) : Int32
+        groups.count { |g| g.severity.value >= level.value }
+      end
+
+      private def self.exit_on_probe_findings(groups : Array(Probe::Group), level : Store::Severity?) : Nil
+        return unless level
+        n = probe_fail_count(groups, level)
+        return if n.zero?
+        STDERR.puts "gori run probe: #{Gori.plural(n, "issue")} at or above #{level.to_s.downcase} (--fail-on)"
+        exit 3
       end
 
       # The sentence an active scan owes an operator whose ENABLED out-of-band rules cannot run,
@@ -215,17 +253,17 @@ module Gori
         return nil if on.empty? || Probe::OutOfBand.available?(store)
         "#{on.join(", ")} #{on.size == 1 ? "is" : "are"} enabled but this project has no OAST " \
         "session — out-of-band probes were NOT sent, so an empty result is not evidence that no " \
-        "blind (out-of-band) vulnerability exists (register a listener in the TUI's OAST tab, " \
-        "then `gori run oast resume ID`)"
+        "blind (out-of-band) vulnerability exists (`gori run oast listen --save`, or register a " \
+        "listener in the TUI's OAST tab, then scan again)"
       end
 
       private def self.report_probe(groups : Array(Probe::Group), flow_n : Int32, repeater_n : Int32,
                                     format : Symbol, query : String?, min_sev : Store::Severity?,
                                     category : String?, in_scope : Bool = false) : Nil
         parts = [] of String
-        parts << "#{flow_n} flow#{flow_n == 1 ? "" : "s"}"
-        parts << "#{repeater_n} repeater#{repeater_n == 1 ? "" : "s"}" if repeater_n > 0 || query.nil?
-        STDERR.puts "scanned #{parts.join(" + ")} · #{groups.size} issue#{groups.size == 1 ? "" : "s"}"
+        parts << Gori.plural(flow_n, "flow")
+        parts << Gori.plural(repeater_n, "repeater") if repeater_n > 0 || query.nil?
+        STDERR.puts "scanned #{parts.join(" + ")} · #{Gori.plural(groups.size, "issue")}"
         if format == :json
           puts CLI::Output.probe_array_json(groups)
         elsif groups.empty?
@@ -241,41 +279,30 @@ module Gori
       # --- triage over PERSISTED findings -------------------------------------------------
 
       private def self.cmd_probe_issues(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         min_sev : Store::Severity? = nil
         category : String? = nil
         host : String? = nil
         include_closed = false
         format = :text
-        leftover = [] of String
 
-        parser = OptionParser.new do |p|
+        leftover = parse_args(args, "gori run probe issues") do |p|
           p.banner = "Usage: gori run probe issues [options]\n\n" \
                      "List the findings the scanner already persisted — the same rows the TUI Probe\n" \
                      "tab shows, each with the id the dismiss/promote/delete subcommands take.\n" \
                      "Shows OPEN findings only by default (the TUI's default lens)."
-          p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
+          project_options(p, proj, "read")
           p.on("-a", "--all", "Also show dismissed/confirmed/resolved findings") { include_closed = true }
           p.on("--severity=LEVEL", "Only show findings at/above LEVEL (info|low|medium|high|critical)") { |v| min_sev = parse_severity(v) }
           p.on("--category=CAT", "Only show findings in CAT (#{PROBE_CATEGORIES.join("|")})") { |v| category = parse_probe_category(v) }
           p.on("--host=HOST", "Only show findings for this exact host") { |v| host = v }
-          p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| leftover = before + after }
-          p.invalid_option { |f| abort "gori run probe issues: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run probe issues: missing value for #{f}" }
+          format_flag(p, [:text, :json], "Output: text (default) | json") { |f| format = f }
         end
-        parser.parse(args)
         refuse_list_leftovers(leftover, "probe issues", "dismiss, promote, delete/rm, list")
 
-        store = open_store(resolve_read_project(project_name, db_path), read_only: true)
-        issues = begin
+        issues = with_store(resolve_read_project(proj.name, proj.db), read_only: true) do |store|
           list = store.probe_issues(category, host.try(&.strip).presence, min_sev)
           include_closed ? list : list.select(&.status.open?)
-        ensure
-          store.close
         end
 
         if format == :json
@@ -283,43 +310,33 @@ module Gori
         elsif issues.empty?
           STDERR.puts include_closed ? "no probe findings" : "no open probe findings (pass --all to include dismissed)"
         else
-          STDERR.puts "#{issues.size} finding#{issues.size == 1 ? "" : "s"}"
+          STDERR.puts Gori.plural(issues.size, "finding")
           issues.each { |i| puts CLI::Output.probe_issue_text(i) }
         end
       end
 
       private def self.cmd_probe_dismiss(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         code : String? = nil
         host : String? = nil
-        positional = [] of String
 
-        parser = OptionParser.new do |p|
+        positional = one_positional_list(args, "gori run probe dismiss", "<id>") do |p|
           p.banner = "Usage: gori run probe dismiss <id> | --code=CODE | --host=HOST\n\n" \
                      "Mute findings. With <id>, TOGGLES that one finding dismissed ⇄ open; with\n" \
                      "--code/--host, bulk-mutes every OPEN finding sharing it. Reversible —\n" \
                      "a dismissed finding still lists under `probe issues --all`."
-          p.on("--project=NAME", "Project to write (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to write") { |v| db_path = v }
+          project_options(p, proj, "write")
           p.on("--code=CODE", "Bulk-dismiss every open finding with this check code") { |v| code = v }
           p.on("--host=HOST", "Bulk-dismiss every open finding on this host") { |v| host = v }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = before + after }
-          p.invalid_option { |f| abort "gori run probe dismiss: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run probe dismiss: missing value for #{f}" }
         end
-        parser.parse(args)
 
-        abort "gori run probe dismiss: too many arguments (expected one <id>, got: #{positional.join(" ")})" if positional.size > 1
         id = parse_probe_issue_id(positional.first?, "gori run probe dismiss")
         selectors = [id, code, host].count { |v| !v.nil? }
         if selectors != 1
           abort "gori run probe dismiss: pass exactly one of <id>, --code=CODE, or --host=HOST"
         end
 
-        store = open_store(resolve_read_project(project_name, db_path))
-        begin
+        with_store(resolve_read_project(proj.name, proj.db)) do |store|
           if c = code
             n = store.open_probe_issue_count(code: c)
             abort "gori run probe dismiss: NOT applied (project busy) — the findings are unchanged" unless store.dismiss_probe_by_code(c)
@@ -331,38 +348,27 @@ module Gori
           elsif iid = id
             issue = store.get_probe_issue(iid) || abort("gori run probe dismiss: no probe finding with id #{iid}")
             landed = Probe::Triage.toggle_dismiss(store, issue)
+            abort "gori run probe dismiss: NOT applied (project busy) — finding ##{iid} is unchanged" if landed == issue.status
             puts "Finding ##{issue.id} is now #{landed.label}."
           end
-        ensure
-          store.close
         end
       end
 
       private def self.cmd_probe_promote(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
-        positional = [] of String
+        proj = ProjectFlags.new
 
-        parser = OptionParser.new do |p|
+        positional = one_positional_list(args, "gori run probe promote", "<id>") do |p|
           p.banner = "Usage: gori run probe promote <id>\n\n" \
                      "Promote a machine finding to a human-confirmed Issue (see `gori run issues`),\n" \
                      "carrying its severity/host/sample evidence over. Marks the source finding\n" \
                      "Confirmed so a repeat call cannot mint a duplicate."
-          p.on("--project=NAME", "Project to write (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to write") { |v| db_path = v }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = before + after }
-          p.invalid_option { |f| abort "gori run probe promote: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run probe promote: missing value for #{f}" }
+          project_options(p, proj, "write")
         end
-        parser.parse(args)
 
-        abort "gori run probe promote: too many arguments (expected one <id>, got: #{positional.join(" ")})" if positional.size > 1
         id = parse_probe_issue_id(positional.first?, "gori run probe promote")
         abort "gori run probe promote: <id> is required (see `gori run probe issues`)" unless id
 
-        store = open_store(resolve_read_project(project_name, db_path))
-        begin
+        with_store(resolve_read_project(proj.name, proj.db)) do |store|
           issue = store.get_probe_issue(id) || abort("gori run probe promote: no probe finding with id #{id}")
           res = Probe::Triage.promote(store, issue)
           case res.outcome
@@ -374,57 +380,43 @@ module Gori
             # Nothing was written — exit non-zero so a script retries rather than moving on.
             abort "gori run probe promote: finding ##{issue.id} NOT promoted (store busy or unwritable); it is unchanged"
           end
-        ensure
-          store.close
         end
       end
 
       private def self.cmd_probe_delete(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         all = false
         yes = false
-        positional = [] of String
 
-        parser = OptionParser.new do |p|
+        positional = one_positional_list(args, "gori run probe delete", "<id>") do |p|
           p.banner = "Usage: gori run probe delete <id> | --all --yes\n\n" \
                      "Delete <id>: also SUPPRESSES that (code, host) pair so the next scan does not\n" \
                      "immediately re-add it — prefer `probe dismiss` when you only want it out of\n" \
                      "the default lens.\n" \
                      "Delete --all: wipes every finding AND every suppression, so a rescan\n" \
                      "re-discovers everything. Needs --yes."
-          p.on("--project=NAME", "Project to write (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to write") { |v| db_path = v }
+          project_options(p, proj, "write")
           p.on("--all", "Delete EVERY probe finding AND every suppression in the project") { all = true }
           p.on("--yes", "Required with --all (there is no interactive prompt here)") { yes = true }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = before + after }
-          p.invalid_option { |f| abort "gori run probe delete: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run probe delete: missing value for #{f}" }
         end
-        parser.parse(args)
 
-        abort "gori run probe delete: too many arguments (expected one <id>, got: #{positional.join(" ")})" if positional.size > 1
         id = parse_probe_issue_id(positional.first?, "gori run probe delete")
         abort "gori run probe delete: pass <id> or --all" if id.nil? && !all
         abort "gori run probe delete: <id> and --all are mutually exclusive" if id && all
 
-        store = open_store(resolve_read_project(project_name, db_path))
-        begin
+        with_store(resolve_read_project(proj.name, proj.db)) do |store|
           if all
             n = store.count_probe_issues
             unless yes
-              abort "gori run probe delete: refusing to delete #{n} finding#{n == 1 ? "" : "s"} (and every suppression) without --yes"
+              abort "gori run probe delete: refusing to delete #{Gori.plural(n, "finding")} (and every suppression) without --yes"
             end
             abort "gori run probe delete: NOT cleared (project busy) — every finding is still there" unless store.clear_probe_issues
-            puts "Deleted #{n} finding#{n == 1 ? "" : "s"} and cleared every suppression."
+            puts "Deleted #{Gori.plural(n, "finding")} and cleared every suppression."
           elsif iid = id
             issue = store.get_probe_issue(iid) || abort("gori run probe delete: no probe finding with id #{iid}")
             abort "gori run probe delete: finding ##{issue.id} NOT deleted (project busy)" unless store.delete_probe_issue(issue.id)
             puts "Deleted finding ##{issue.id}."
           end
-        ensure
-          store.close
         end
       end
 
@@ -449,36 +441,25 @@ module Gori
       end
 
       private def self.cmd_probe_rules_list(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         kind : String? = nil
         format = :text
-        leftover = [] of String
 
-        parser = OptionParser.new do |p|
+        leftover = parse_args(args, "gori run probe rules") do |p|
           p.banner = "Usage: gori run probe rules [list] [options]\n\n" \
                      "List every scan rule — built-in passive, built-in active, and custom match\n" \
                      "rules — with whether it is enabled. A scan on ANY surface (here, the TUI, or\n" \
                      "MCP) honours this config."
-          p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
+          project_options(p, proj, "read")
           p.on("--kind=KIND", "Only list rules of this kind (passive|active|custom)") { |v| kind = parse_rule_kind(v) }
-          p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| leftover = before + after }
-          p.invalid_option { |f| abort "gori run probe rules: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run probe rules: missing value for #{f}" }
+          format_flag(p, [:text, :json], "Output: text (default) | json") { |f| format = f }
         end
-        parser.parse(args)
         refuse_list_leftovers(leftover, "probe rules", "add, enable, disable, delete/rm")
 
-        store = open_store(resolve_read_project(project_name, db_path), read_only: true)
-        entries, mode = begin
+        entries, mode = with_store(resolve_read_project(proj.name, proj.db), read_only: true) do |store|
           list = Probe::RuleCatalog.load(store)
           list = list.select { |e| e.kind == kind } if kind
           {list, store.probe_mode}
-        ensure
-          store.close
         end
 
         if format == :json
@@ -486,32 +467,23 @@ module Gori
           return
         end
         off = entries.count { |e| !e.enabled }
-        STDERR.puts "mode: #{mode.label} · #{entries.size} rule#{entries.size == 1 ? "" : "s"}#{off > 0 ? " (#{off} disabled)" : ""}"
+        STDERR.puts "mode: #{mode.label} · #{Gori.plural(entries.size, "rule")}#{off > 0 ? " (#{off} disabled)" : ""}"
         entries.each { |e| puts CLI::Output.probe_rule_text(e) }
       end
 
       private def self.cmd_probe_rule_enabled(args : Array(String), enabled : Bool) : Nil
         verb = enabled ? "enable" : "disable"
-        db_path : String? = nil
-        project_name : String? = nil
-        positional = [] of String
+        proj = ProjectFlags.new
 
-        parser = OptionParser.new do |p|
+        positional = one_positional_list(args, "gori run probe rules #{verb}", "<rule-id>") do |p|
           p.banner = "Usage: gori run probe rules #{verb} <rule-id>\n\n" \
                      "Turn a scan rule on/off for this project (ids from `probe rules`).\n" \
                      "Disabling a built-in stops NEW detections; findings it already produced stay."
-          p.on("--project=NAME", "Project to write (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to write") { |v| db_path = v }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = one_positional_list(before, after, "gori run probe rules #{verb}", "<rule-id>") }
-          p.invalid_option { |f| abort "gori run probe rules #{verb}: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run probe rules #{verb}: missing value for #{f}" }
+          project_options(p, proj, "write")
         end
-        parser.parse(args)
 
         id = positional.first? || abort("gori run probe rules #{verb}: <rule-id> is required (see `gori run probe rules`)")
-        store = open_store(resolve_read_project(project_name, db_path))
-        begin
+        with_store(resolve_read_project(proj.name, proj.db)) do |store|
           entry = Probe::RuleCatalog.load(store).find { |e| e.id == id } ||
                   abort("gori run probe rules #{verb}: no scan rule with id '#{id}' (see `gori run probe rules`)")
           # Both writers now answer whether the toggle COMMITTED, so this stops claiming a
@@ -533,14 +505,11 @@ module Gori
             end
           abort "gori run probe rules #{verb}: NOT applied (project busy) — rule '#{id}' is unchanged" unless ok
           puts "Rule '#{id}' is now #{enabled ? "enabled" : "disabled"}."
-        ensure
-          store.close
         end
       end
 
       private def self.cmd_probe_rule_add(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         title : String? = nil
         pattern : String? = nil
         description = ""
@@ -548,13 +517,14 @@ module Gori
         region = "body"
         match_kind = "string"
         sev_s = "info"
+        format = :text
 
-        parser = OptionParser.new do |p|
+        parse_no_positionals(args, "gori run probe rules add",
+          "pass the rule as --title TEXT and --pattern P — quote them, a value with spaces is one argument") do |p|
           p.banner = "Usage: gori run probe rules add --title=T --pattern=P [options]\n\n" \
                      "Add a PROJECT custom match rule: a string or regex tested against one region\n" \
                      "of every captured flow, emitting a finding on a hit."
-          p.on("--project=NAME", "Project to write (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to write") { |v| db_path = v }
+          project_options(p, proj, "write")
           p.on("-tTITLE", "--title=TITLE", "Rule name, shown as the finding title (required)") { |v| title = v }
           p.on("-pPATTERN", "--pattern=PATTERN", "String to look for, a regex with --regex, or a command with --exec (required)") { |v| pattern = v }
           p.on("--description=TEXT", "What the rule is for") { |v| description = v }
@@ -564,12 +534,8 @@ module Gori
           p.on("--exec", "Treat --pattern as a COMMAND: the region goes to it on stdin, exit 0 = " \
                          "match, stdout = evidence. Run with no shell and with your own privileges") { match_kind = "exec" }
           p.on("-sSEVERITY", "--severity=SEVERITY", "info|low|medium|high|critical (default info)") { |v| sev_s = v }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.invalid_option { |f| abort "gori run probe rules add: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run probe rules add: missing value for #{f}" }
+          format_flag(p, [:text, :json], "Output: text (default) | json") { |f| format = f }
         end
-        parse_no_positionals(parser, args, "gori run probe rules add",
-          "pass the rule as --title TEXT and --pattern P — quote them, a value with spaces is one argument")
 
         t = title
         abort "gori run probe rules add: --title is required" if t.nil? || t.empty?
@@ -586,54 +552,54 @@ module Gori
         end
         severity = Store::Severity.parse?(sev_s.strip) || abort("gori run probe rules add: invalid --severity '#{sev_s}' (info|low|medium|high|critical)")
 
-        store = open_store(resolve_read_project(project_name, db_path))
-        begin
+        with_store(resolve_read_project(proj.name, proj.db)) do |store|
           id = store.insert_probe_custom_rule(t, description, side, region, match_kind, pat, severity)
           abort "gori run probe rules add: failed to persist the rule (store busy or unwritable)" if id == 0
-          puts "Custom rule 'custom_p_#{id}' created."
-        ensure
-          store.close
+          puts probe_rule_added_output(store, id, format)
         end
       end
 
-      private def self.cmd_probe_rule_delete(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
-        positional = [] of String
+      # What `probe rules add` prints once the insert committed. `--format json` (#1117) is the
+      # rule's `probe rules --format json` entry, through the same `RuleCatalog.entry_json` and
+      # read back through the listing's own `RuleCatalog.load`. So `id` is the rule's CODE
+      # (`custom_p_7`), not the bare row number: that is the id the listing prints and every
+      # sibling verb takes (`probe rules disable custom_p_7`), and the bare number is refused
+      # there. A rule a peer removed in that instant has no entry, and the command refuses
+      # rather than print one the listing never shows.
+      private def self.probe_rule_added_output(store : Store, id : Int64, format : Symbol) : String
+        code = "custom_p_#{id}"
+        return "Custom rule '#{code}' created." unless format == :json
+        entry = Probe::RuleCatalog.load(store).find { |e| e.id == code } ||
+                abort_closing(store, "gori run probe rules add: rule '#{code}' was created, but it was gone before it could be read back")
+        JSON.build { |j| Probe::RuleCatalog.entry_json(j, entry) }
+      end
 
-        parser = OptionParser.new do |p|
+      private def self.cmd_probe_rule_delete(args : Array(String)) : Nil
+        proj = ProjectFlags.new
+
+        positional = one_positional_list(args, "gori run probe rules delete", "<custom-rule-id>") do |p|
           p.banner = "Usage: gori run probe rules delete <custom-rule-id>\n\n" \
                      "Delete a project custom rule. A built-in can only be DISABLED, never deleted."
-          p.on("--project=NAME", "Project to write (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to write") { |v| db_path = v }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = one_positional_list(before, after, "gori run probe rules delete", "<custom-rule-id>") }
-          p.invalid_option { |f| abort "gori run probe rules delete: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run probe rules delete: missing value for #{f}" }
+          project_options(p, proj, "write")
         end
-        parser.parse(args)
 
         id = positional.first? || abort("gori run probe rules delete: <custom-rule-id> is required")
         row_id = probe_custom_row_id(id) ||
                  abort("gori run probe rules delete: '#{id}' is not a project custom rule — a built-in can only be disabled (`probe rules disable #{id}`)")
 
-        store = open_store(resolve_read_project(project_name, db_path))
-        begin
+        with_store(resolve_read_project(proj.name, proj.db)) do |store|
           abort "gori run probe rules delete: no custom rule with id '#{id}'" unless store.probe_custom_rules.any? { |r| r.id == row_id }
           abort "gori run probe rules delete: custom rule '#{id}' NOT deleted (project busy)" unless store.delete_probe_custom_rule(row_id)
           puts "Custom rule '#{id}' deleted."
-        ensure
-          store.close
         end
       end
 
       private def self.cmd_probe_mode(args : Array(String)) : Nil
         db_path : String? = nil
         project_name : String? = nil
-        positional = [] of String
         modes = Probe::Mode.values.map(&.label)
 
-        parser = OptionParser.new do |p|
+        positional = one_positional_list(args, "gori run probe mode", "<mode>") do |p|
           p.banner = "Usage: gori run probe mode [#{modes.join("|")}]\n\n" \
                      "Get (no argument) or set the project's scan mode:\n" \
                      "  off         no analysis at all\n" \
@@ -645,32 +611,21 @@ module Gori
                      "This arms the AUTOMATIC pipeline for live captures, not just one scan."
           p.on("--project=NAME", "Project to read/write (default: most-recently-active)") { |v| project_name = v }
           p.on("--db=PATH", "Explicit SQLite db file") { |v| db_path = v }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = one_positional_list(before, after, "gori run probe mode", "<mode>") }
-          p.invalid_option { |f| abort "gori run probe mode: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run probe mode: missing value for #{f}" }
         end
-        parser.parse(args)
 
         want = positional.first?.try(&.strip.downcase)
         # Mode.from_setting silently falls back to Passive on an unknown label — that would
         # report success for a typo, so validate against the labels first.
         abort "gori run probe mode: invalid mode '#{want}' (#{modes.join("|")})" if want && !modes.includes?(want)
 
-        store = open_store(resolve_read_project(project_name, db_path))
-        begin
+        with_store(resolve_read_project(project_name, db_path)) do |store|
           if w = want
             mode = Probe::Mode.from_setting(w)
-            unless store.set_probe_mode(mode)
-              store.close
-              abort "gori run probe mode: project is busy (write did not commit) — try again"
-            end
+            store.set_probe_mode(mode) || abort_closing(store, "gori run probe mode: project is busy (write did not commit) — try again")
             puts "Scan mode set to #{mode.label}."
           else
             puts store.probe_mode.label
           end
-        ensure
-          store.close
         end
       end
 
@@ -713,8 +668,8 @@ module Gori
         "#{q[0, QUERY_ECHO_LIMIT]}…"
       end
 
-      private def self.parse_severity(v : String) : Store::Severity
-        Store::Severity.parse?(v) || abort "gori run probe: invalid --severity '#{v}' (info|low|medium|high|critical)"
+      private def self.parse_severity(v : String, flag : String = "--severity") : Store::Severity
+        Store::Severity.parse?(v) || abort "gori run probe: invalid #{flag} '#{v}' (info|low|medium|high|critical)"
       end
 
       private def self.parse_probe_category(v : String) : String

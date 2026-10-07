@@ -5,12 +5,16 @@ abstract class Gori::Verb::ExecContext
   # toggles are verbs so they're keymap-driven and rebindable)
   abstract def repeater_selected : Nil                   # load History's selection into Repeater
   abstract def repeater_new : Nil                        # open a blank, hand-authored repeater request
+  abstract def repeater_paste_curl : Nil                 # open the curl paste box; each request becomes a sub-tab
   abstract def repeater_send : Nil                       # resend the (edited) request to the target
   abstract def repeater_send_group : Nil                 # pipeline %%%-split requests on one connection
+  abstract def repeater_send_race : Nil                  # race the marked sub-tabs together (h1 last-byte / h2 single-packet)
+  abstract def repeater_timing_analysis : Nil            # differential timing of the two marked sub-tabs (order + quartiles, #1246)
   abstract def repeater_find_subtab : Nil                # open the sub-tab search picker (filter + jump)
   abstract def repeater_subtab_count : Int32             # open repeater session count (gates the search menu entry)
   abstract def repeater_rename_subtab : Nil              # open the rename prompt for the active sub-tab
   abstract def repeater_tag_subtab : Nil                 # open the tag editor for the active sub-tab (issue #121)
+  abstract def repeater_use_as_refresh : Nil             # append the active sub-tab to a session slot's refresh steps (#1233)
   abstract def repeater_filter_subtabs : Nil             # open the `/` tag-filter bar over the sub-tab strip
   abstract def repeater_close_subtab : Nil               # close the active sub-tab (confirm-gated)
   abstract def repeater_duplicate_subtab : Nil           # clone the active sub-tab's content into a new sibling
@@ -25,16 +29,21 @@ abstract class Gori::Verb::ExecContext
   abstract def repeater_toggle_grpc_fields : Nil         # gRPC: edit the request message by field through the loaded .proto
   abstract def repeater_toggle_resp_diff : Nil           # switch the response pane between raw and diff-vs-previous
   abstract def repeater_toggle_resp_hex : Nil            # toggle a raw hex dump of the response bytes
+  abstract def repeater_toggle_unicode_escapes : Nil     # decode JSON Unicode escapes in the response display
   abstract def repeater_pretty_request : Nil
+  # Rewrite the request as a POST of the (legacy) GraphQL introspection query.
+  abstract def repeater_graphql_introspection(legacy : Bool) : Nil
   abstract def repeater_minimize : Nil      # squash the request (strip cosmetic headers/cookies/params) in the background
   abstract def repeater_auto_mark : Nil     # wrap every request param value in §…§
   abstract def repeater_mark_word : Nil     # toggle a marker around the token at the cursor
   abstract def repeater_insert_marker : Nil # drop a single § at the cursor (bracket by hand)
   abstract def repeater_clear_marks : Nil   # strip all markers (and their chains)
   abstract def repeater_attach_chain : Nil  # open the chain-edit prompt for the marker at the cursor
-  abstract def repeater_copy : Nil          # copy selection or current line (READ panes)
-  abstract def repeater_copy_all : Nil      # copy the whole focused pane text
   abstract def repeater_read_mode? : Bool   # focused pane is READ (y/copy verbs gate on this)
+  # The Repeater is in front and its tab splits the request into envelope and decoded payload
+  # (a SAML/GraphQL decode or a WebSocket handshake), so ^T flips a view rather than dropping
+  # a marker.
+  abstract def repeater_split_request? : Bool
 
   # Open the ACTIVE sub-tab's last response in the desktop's viewer — History's
   # `open_response_external` for a response that is not a stored flow but the result of the

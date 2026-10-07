@@ -33,17 +33,27 @@ module Gori
         ctx.current_tab == :miner && !ctx.link_miner_id.nil?
       }
 
+      # ONE verb, and it keeps the bytes (#1038). There used to be a "Link & freeze…" sibling
+      # on `Z`; it asked the operator to understand that a link is a mutable pointer — that
+      # retention and the next send can hollow it out — at the moment of FILING, when the
+      # answer was almost always "keep the bytes". So ↵ on an issue links AND freezes the
+      # ref's current exchange in one transaction whenever there is one, and says so when
+      # there is not. A note still takes the pointer alone: a note owns no evidence.
       r.register Verb::Definition.new(
-        "link.history.attach", "Link…", "Attach the selected/marked flows to an issue or note — or create one",
-        Verb::Scope::Body, available: flow_targets, mnemonic: 'k') { |ctx| ctx.link_attach; nil }
+        "link.history.attach", "Link…",
+        "Attach the selected/marked flows to an issue (freezing their exchanges as evidence) or a note — or create one",
+        Verb::Scope::Body, available: flow_targets, intent: :link) { |ctx| ctx.link_attach; nil }
 
       r.register Verb::Definition.new(
-        "link.history-detail.attach", "Link…", "Attach this flow to an issue or note — or create one",
-        Verb::Scope::HistoryDetail, available: flow_available, mnemonic: 'k') { |ctx| ctx.link_attach; nil }
+        "link.history-detail.attach", "Link…",
+        "Attach this flow to an issue (freezing its exchange as evidence) or a note — or create one",
+        Verb::Scope::HistoryDetail, available: flow_available, intent: :link) { |ctx| ctx.link_attach; nil }
 
+      # No freeze half here, and none possible: a mining session is a template plus a run,
+      # not one exchange (`Evidence.freezable?`), so the picker's hint says "link".
       r.register Verb::Definition.new(
         "link.miner.attach", "Link…", "Attach this miner session to an issue or note — or create one",
-        Verb::Scope::Miner, available: miner_linkable, mnemonic: 'k') { |ctx| ctx.link_attach; nil }
+        Verb::Scope::Miner, available: miner_linkable, intent: :link) { |ctx| ctx.link_attach; nil }
     end
   end
 end

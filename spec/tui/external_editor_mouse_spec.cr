@@ -38,6 +38,14 @@ private class TermSpy
     yield
     @log << :suspend_out
   end
+
+  # Stands in for `Termisu#with_mode`: the shell's handoff, which needs the terminal's own
+  # output/input flags rather than `suspend`'s cooked subset.
+  def with_mode(mode : Termisu::Terminal::Mode, preserve_screen : Bool, &) : Nil
+    @log << (mode == Termisu::Terminal::Mode.full_cooked && !preserve_screen ? :full_cooked_in : :other_mode_in)
+    yield
+    @log << :mode_out
+  end
 end
 
 describe "Runner.suspend_without_mouse" do
@@ -61,5 +69,146 @@ describe "Runner.suspend_without_mouse" do
       Runner.suspend_without_mouse(spy, mouse: true, io: IO::Memory.new) { raise "no such editor" }
     end
     spy.log.should eq([:disable, :suspend_in, :enable]) # the ensure ran; :suspend_out never did
+  end
+
+  # A shell hands its termios to every command it runs, so `suspend`'s cooked mode (OPOST and
+  # ICRNL off) staircased their output (#1238). The mode is the caller's; the ordering is not.
+  it "hands the tty over in the mode asked for, bracketed the same way" do
+    spy = TermSpy.new
+    Runner.suspend_without_mouse(spy, mouse: true, io: IO::Memory.new,
+      mode: Termisu::Terminal::Mode.full_cooked) { spy.log << :shell }
+    spy.log.should eq([:disable, :full_cooked_in, :shell, :mode_out, :enable])
+  end
+end
+
+# Open shell's toast (#1238). A shell exits with its last command's status, so non-zero after real
+# use is ordinary; gone at once and non-zero means it never started, and whatever it printed was
+# repainted over — the toast is the only place left to say so.
+describe "Runner.shell_exit_toast" do
+  it "counts what was captured after an ordinary session, whatever the exit status" do
+    Runner.shell_exit_toast(Process::Status[0], 30.seconds, 3).should eq("shell exited · 3 flows captured meanwhile")
+    Runner.shell_exit_toast(Process::Status[1], 30.seconds, 1).should eq("shell exited · 1 flow captured meanwhile")
+  end
+
+  it "says the shell never started when it failed at once" do
+    Runner.shell_exit_toast(Process::Status[127], 100.milliseconds, 0).should contain("exited at once (exit 127)")
+    Runner.shell_exit_toast(Process::Status[0], 100.milliseconds, 0).should contain("0 flows captured")
+  end
+end
+
+# The count is ids issued since the shell opened. It was a `MAX(id)` difference, which since V39
+# counted every deleted newest flow (or a whole cleared History) as captured by the shell.
+describe "Runner.flows_issued_since" do
+  it "counts only the captures after the baseline, past a delete of the newest flows" do
+    with_store do |store|
+      req = ->(target : String) {
+        Gori::Store::CapturedRequest.new(
+          created_at: 0_i64, scheme: "https", host: "shell.test", port: 443, method: "GET",
+          target: target, http_version: "HTTP/1.1", head: "GET #{target} HTTP/1.1\r\n\r\n".to_slice,
+          source: Gori::FlowSource::Kind::Proxy)
+      }
+      ids = Array.new(5) { |i| store.insert_flow(req.call("/#{i}")) }
+      store.delete_flows(ids[1..]).should be_true
+      before = Runner.flow_mark(store)
+      store.insert_flow(req.call("/from-the-shell"))
+      Runner.flows_issued_since(store, before).should eq(1)
+    end
+  end
+
+  it "counts none when the baseline could not be read" do
+    with_store do |store|
+      store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 0_i64, scheme: "https", host: "shell.test", port: 443, method: "GET",
+        target: "/", http_version: "HTTP/1.1", head: "GET / HTTP/1.1\r\n\r\n".to_slice,
+        source: Gori::FlowSource::Kind::Proxy))
+      Runner.flows_issued_since(store, nil).should eq(0)
+    end
+  end
+
+  it "is what the shell's toast is built from" do
+    body = File.read("#{__DIR__}/../../src/gori/tui/runner.cr").split("private def open_shell_here", 2)[1].split("\n    end\n", 2)[0]
+    body.should contain("before = Runner.flow_mark(@session.store)")
+    body.should contain("Runner.flows_issued_since(@session.store, before)")
+    body.should_not contain("max_flow_id")
+  end
+end
+
+describe "Runner.copy_shell_command" do
+  it "uses the absolute path of the running gori binary and quotes arguments" do
+    posix_only!("a POSIX absolute CA path, quoted the POSIX way")
+    cmd_posix = Runner.copy_shell_command("127.0.0.1:8070", "/path/with space/ca",
+      Gori::ShellEnv::Syntax::Posix, executable: "/opt/custom bin/gori")
+    cmd_posix.should eq(%(eval "$('/opt/custom bin/gori' run shell --print --proxy 127.0.0.1:8070 --ca-dir '/path/with space/ca')"))
+
+    cmd_fish = Runner.copy_shell_command("127.0.0.1:8070", "/path/to/ca",
+      Gori::ShellEnv::Syntax::Fish, executable: "/usr/local/bin/gori")
+    cmd_fish.should eq("'/usr/local/bin/gori' run shell --print --shell fish --proxy '127.0.0.1:8070' --ca-dir '/path/to/ca' | source")
+  end
+
+  it "quotes arguments for Fish using ShellEnv.fish_quote" do
+    nasty_ca = "/path/with'quote/and\\ca\\"
+    cmd_fish = Runner.copy_shell_command("127.0.0.1:8070", nasty_ca,
+      Gori::ShellEnv::Syntax::Fish, executable: "/usr/local/bin/gori")
+    cmd_fish.should contain(Gori::ShellEnv.fish_quote(File.expand_path(nasty_ca)))
+    cmd_fish.should_not contain(Process.quote_posix(File.expand_path(nasty_ca)))
+  end
+
+  it "runs the quoted path with `&` and pipes into Invoke-Expression for PowerShell" do
+    cmd = Runner.copy_shell_command("127.0.0.1:8070", "/path/it's/ca",
+      Gori::ShellEnv::Syntax::Powershell, executable: "/opt/custom bin/gori")
+    ca = File.expand_path("/path/it's/ca").gsub("'", "''")
+    cmd.should eq("& '/opt/custom bin/gori' run shell --print --shell powershell --proxy '127.0.0.1:8070' " \
+                  "--ca-dir '#{ca}' | Out-String | Invoke-Expression")
+  end
+
+  it "falls back to 'gori' when executable is nil" do
+    posix_only!("a POSIX absolute CA path, quoted the POSIX way")
+    cmd = Runner.copy_shell_command("127.0.0.1:8070", "/ca",
+      Gori::ShellEnv::Syntax::Posix, executable: nil)
+    cmd.should eq(%(eval "$(gori run shell --print --proxy 127.0.0.1:8070 --ca-dir /ca)"))
+  end
+
+  # `gori --ca-dir ./ca` stores a relative CA path; the copied command runs in ANOTHER pane's
+  # cwd, where `./ca` names nothing.
+  it "makes a relative CA directory absolute against gori's cwd" do
+    cmd = Runner.copy_shell_command("127.0.0.1:8070", "./ca",
+      Gori::ShellEnv::Syntax::Posix, executable: "gori")
+    cmd.should eq(%(eval "$(gori run shell --print --proxy 127.0.0.1:8070 --ca-dir #{Process.quote_posix(File.join(Dir.current, "ca"))})"))
+    cmd.should_not contain("./ca")
+  end
+end
+
+describe "Runner.reclaim_foreground_pgrp" do
+  it "runs cleanly without raising and resets Signal::TTOU" do
+    Runner.reclaim_foreground_pgrp
+  end
+end
+
+# A ^C typed at an editor that leaves ISIG on (`code --wait`) reaches gori too — the child shares
+# its process group. While the child owns the tty that signal must not tear gori down, and
+# whatever handled it before (SignalGuard's restore-and-die) must be back afterwards.
+describe "Runner.shield_tty_signals" do
+  it "swallows INT while the child runs and restores the previous handler" do
+    posix_only!("Process.signal")
+    hits = Channel(Nil).new(1)
+    int = Runner::TTY_SIGNALS.first # INT, trapped the way SignalGuard arms it
+    int.trap { hits.send(nil) }
+    begin
+      Runner.shield_tty_signals do
+        Process.signal(Signal::INT, Process.pid)
+        sleep 50.milliseconds
+      end
+      select
+      when hits.receive then fail "the guard ran while the child owned the tty"
+      else
+      end
+      Process.signal(Signal::INT, Process.pid)
+      select
+      when hits.receive
+      when timeout(2.seconds) then fail "the previous INT handler was not restored"
+      end
+    ensure
+      int.reset
+    end
   end
 end

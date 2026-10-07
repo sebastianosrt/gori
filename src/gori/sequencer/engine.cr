@@ -3,6 +3,7 @@ require "./extract"
 require "../fuzz/engine"
 require "../fuzz/matcher"
 require "../pacing"
+require "wait_group"
 
 module Gori::Sequencer
   # Collects tokens into an Event stream. LIVE REPLAY sends the ONE fixed @request
@@ -17,16 +18,10 @@ module Gori::Sequencer
   # Single-threaded fiber scheduler (no -Dpreview_mt): plain ivar increments never yield
   # mid-op, so the shared counters across dispatcher/worker fibers need no locks.
   class Engine
-    # Outbound rate limiting (rps / throttle_ms / jitter_ms) over `@last_dispatch`.
+    # Outbound rate limiting (rps / throttle_ms) over `@last_dispatch`.
     include Gori::Pacing
 
     MAX_CONCURRENCY = 50
-
-    enum State : UInt8
-      Running
-      Paused
-      Stopped
-    end
 
     getter events : Channel(Event)
 
@@ -35,8 +30,7 @@ module Gori::Sequencer
     # combination (live replay without a backend), which is what makes this nil safe.
     @backend : Fuzz::CappedBackend?
     @concurrency : Int32
-    @state : State
-    @wake : Channel(Nil)
+    @stopped = false
     @collected : Int32
     @sent : Int32
     @errors : Int32
@@ -69,8 +63,6 @@ module Gori::Sequencer
       # of the operator's budget, and only the tighter of the two may reach the wire.
       @backend = backend.try { |b| Fuzz::CappedBackend.new(b, @config.wire_cap) }
       @concurrency = @config.concurrency.clamp(1, MAX_CONCURRENCY)
-      @state = State::Running
-      @wake = Channel(Nil).new(1)
       @settled = Channel(Nil).new(1)
       @events = Channel(Event).new(256)
       @collected = 0
@@ -99,26 +91,16 @@ module Gori::Sequencer
       end
     end
 
-    def stop : Nil
-      @state = State::Stopped
-      poke(@wake)
-      # The dispatcher may be HOLDING for an in-flight sample to settle rather than parked on
-      # `@wake` (see `await_outstanding`); without this second nudge a stop taken during that
-      # hold waits out the sample before it is noticed.
-      poke(@settled)
-    end
-
-    def pause : Nil
-      @state = State::Paused
-    end
-
-    def resume : Nil
-      @state = State::Running
-      poke(@wake)
-    end
-
     def stopped? : Bool
-      @state == State::Stopped
+      @stopped
+    end
+
+    def stop : Nil
+      @stopped = true
+      # The dispatcher may be HOLDING for an in-flight sample to settle (see
+      # `await_outstanding`); without this nudge a stop taken during that hold waits out the
+      # sample before it is noticed.
+      poke(@settled)
     end
 
     # ── orchestration ───────────────────────────────────────────────────────────────
@@ -128,10 +110,10 @@ module Gori::Sequencer
       in Mode::Manual     then run_manual
       in Mode::LiveReplay then run_live
       end
-      @events.send(DoneEvent.new(@collected, @sent, @state.stopped?, wire_requests))
+      @events.send(DoneEvent.new(@collected, @sent, @stopped, wire_requests))
     rescue ex
       @events.send(ErrorEvent.new(ex.message || "sequencer error"))
-      @events.send(DoneEvent.new(@collected, @sent, @state.stopped?, wire_requests))
+      @events.send(DoneEvent.new(@collected, @sent, @stopped, wire_requests))
     ensure
       # Release the keep-alive pool's parked sockets (see `Plan.build`). In the `ensure` so a
       # stopped or raising run leaks no fd — the same standard `Fuzz::Engine` and
@@ -146,7 +128,7 @@ module Gori::Sequencer
 
     private def run_manual : Nil
       @config.manual_tokens.each do |tok|
-        break if @state.stopped?
+        break if @stopped
         next if tok.empty?
         @idx += 1
         @collected += 1
@@ -184,21 +166,19 @@ module Gori::Sequencer
       # from shutdown. Any Int32 (even 0) is truthy, so `while jobs.receive?` ends only
       # on close.
       jobs = Channel(Int32).new(@concurrency)
-      finished = Channel(Nil).new(@concurrency)
+      finished = WaitGroup.new(@concurrency)
 
       spawn(name: "sequencer-dispatch") do
         loop do
-          break if @state.stopped?
-          park_if_paused
-          break if @state.stopped?
+          break if @stopped
           # Hold — do not break — while enough samples are already IN FLIGHT to reach the
           # goal; see `await_outstanding` for what the old break cost.
           await_outstanding
-          break if @state.stopped?
+          break if @stopped
           break if @collected >= @config.goal
           break if @dispatched >= @config.max_sends
           break if backend.cap_reached?
-          pace(interval)
+          break unless pace(interval)
           # BEFORE the send: `jobs.send` yields when the buffer is full, and during that
           # yield a worker can take this very job and settle it — decrementing a slot the
           # dispatcher had not opened yet.
@@ -216,11 +196,11 @@ module Gori::Sequencer
             run_job(backend)
           end
         ensure
-          finished.send(nil)
+          finished.done
         end
       end
 
-      @concurrency.times { finished.receive }
+      finished.wait
     end
 
     # Hold the dispatch loop while enough samples are already IN FLIGHT to reach the goal.
@@ -238,10 +218,10 @@ module Gori::Sequencer
     # Holding re-decides when a sample settles instead, so the run tops up a late miss and
     # still lands EXACTLY on the goal — the no-overshoot property the break was there for.
     # `max_sends` (below) is what bounds a descriptor that never matches; this wait cannot
-    # outlive the `finished.receive` join that already waits on the same jobs, so it adds no
+    # outlive the `finished.wait` join that already waits on the same jobs, so it adds no
     # way to hang that the run did not already have.
     private def await_outstanding : Nil
-      while !@state.stopped? && @collected < @config.goal &&
+      while !@stopped && @collected < @config.goal &&
             @collected + @outstanding >= @config.goal && @outstanding > 0
         @settled.receive
       end
@@ -249,7 +229,7 @@ module Gori::Sequencer
 
     # One sample, with the worker fiber's survival and its dispatch slot both guaranteed.
     #
-    # Without the rescue, a raise out of `process_one` kills the worker. `finished` still
+    # Without the rescue, a raise out of `process_one` kills the worker. `finished.done` still
     # fires from the loop's `ensure`, so the join completes and the run reports Done — but
     # the DISPATCHER is left parked on `jobs.send` (buffered to @concurrency) with no
     # receiver, never reaches its own `ensure jobs.close`, and leaks forever holding the
@@ -257,7 +237,7 @@ module Gori::Sequencer
     # comment above `run_live` names this exact leak and guards only the invalid-regex
     # case; this covers the rest. Count the sample as an error and keep sampling.
     private def run_job(backend : Fuzz::CappedBackend) : Nil
-      process_one(backend) unless @state.stopped?
+      process_one(backend) unless @stopped
     rescue ex
       @errors += 1
       @first_error ||= ex.message || ex.class.name
@@ -294,7 +274,7 @@ module Gori::Sequencer
       # without this a live-replay collection against a target rejecting every call (an
       # expired session cookie, say) read as healthy on every sample. nil/nil (and free, past
       # the allocation-free needle scan) for a non-gRPC response.
-      grpc_status, grpc_message = Fuzz::GrpcVerdict.response(raw.head, raw.body)
+      grpc_status, grpc_message = Fuzz::GrpcVerdict.response_wire(raw.head, raw.body)
       @events.send(SampleEvent.new(Sample.new(idx, token, status, len, raw.duration_us, err,
         grpc_status, grpc_message)))
       emit_progress
@@ -302,9 +282,15 @@ module Gori::Sequencer
 
     private def send_with_retries(backend : Fuzz::CappedBackend, bytes : Bytes) : Repeater::Result
       attempts = 0
+      failed = nil.as(Repeater::Result?)
       loop do
         raw = backend.send(bytes)
+        # A retry the budget refused put nothing on the wire: the answer is the failure it was
+        # retrying, not "the budget ran out" — every caller reads the cap as a budget, so the
+        # connect error vanished and a dead origin read as a run with nothing wrong.
+        return failed if failed && raw.error == Fuzz::CappedBackend::CAP_ERROR
         return raw if raw.error.nil? || permanent_refusal?(raw.error) || attempts >= @config.retries
+        failed = raw
         attempts += 1
         # A STOP ends the retry chain. It was honoured everywhere else in the run — the
         # dispatcher breaks, a worker skips its next job — and invisible only here, where a
@@ -313,9 +299,9 @@ module Gori::Sequencer
         # `retry_pause` 500ms by default) scale that to 1000 requests and ~8 minutes PER
         # WORKER after `sequence_stop` returned. Checked on BOTH sides of the pause so
         # neither a stop that arrived during the send nor one during the pause costs another.
-        return raw if @state.stopped?
+        return raw if @stopped
         sleep @config.retry_pause
-        return raw if @state.stopped?
+        return raw if @stopped
       end
     end
 
@@ -333,32 +319,29 @@ module Gori::Sequencer
 
     # Requests actually put on the wire, retries included — see `ProgressEvent#requests`.
     # 0 on an analyse-only plan, which has no backend and opens no socket.
+    #
+    # `+ extra_requests`, as `Fuzz::Engine` reports it: `CappedBackend#sent` counts CALLS, and
+    # a `ConnPool` stale re-send is a whole request that left the machine INSIDE one call
+    # (`Fuzz::Backend#extra_requests`). The Sequencer is the run most exposed to it — every
+    # sample is the same request re-sent down a reused connection, which is exactly what
+    # `keep_alive` buys — so against an origin that reaps idle sockets this number was short
+    # by one re-send per reap while claiming to be "the load the run put on the target".
+    #
+    # The BUDGET is untouched: `max_requests` is enforced against `CappedBackend#sent` alone,
+    # deliberately, and this is the reported figure only — same split Fuzz makes.
     private def wire_requests : Int64
-      @backend.try(&.sent) || 0_i64
+      @backend.try { |b| b.sent + b.extra_requests } || 0_i64
     end
 
     private def emit_progress : Nil
-      ev = ProgressEvent.new(@collected, @sent, total, @errors, wire_requests)
-      select
-      when @events.send(ev)
-      else
-      end
-    end
-
-    private def park_if_paused : Nil
-      while @state == State::Paused
-        @wake.receive
-      end
+      offer(@events, ProgressEvent.new(@collected, @sent, total, @errors, wire_requests))
     end
 
     # A non-blocking nudge. Dropping it when the buffer is already full costs nothing: the
-    # receiver re-reads `@state` and the counters and decides for itself, so a token that
+    # receiver re-reads `@stopped` and the counters and decides for itself, so a token that
     # never lands only means the decision it would have triggered has already been made.
     private def poke(ch : Channel(Nil)) : Nil
-      select
-      when ch.send(nil)
-      else
-      end
+      offer(ch, nil)
     end
   end
 end

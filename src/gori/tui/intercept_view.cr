@@ -8,16 +8,19 @@ require "./traffic_empty_state"
 require "../settings"
 require "./highlight"
 require "./text_area"
+require "./text_read_state"
 require "./hex_edit"
 # The class body continues in `intercept_view/` — a class-reopen slice, the same shape
 # `repeater_view/` uses. This file keeps the state (ivars + `initialize`) the slice reads.
 require "./intercept_view/hex"
 require "./read_pane"
-require "./url"
+require "./project_marks"
+require "../url"
 require "../interceptor"
 require "../store"
 require "../fuzz/content_length"
 require "../env"
+require "../hotkeys"
 require "./viewport"
 
 module Gori::Tui
@@ -28,7 +31,7 @@ module Gori::Tui
   # Pure view: it reads the shared Interceptor snapshot; the Runner performs the
   # actual forward/drop. No diff (that's Repeater's job).
   class InterceptView
-    include QueryBarEdit # ⌃/⌥←→ word motion, Home/End, Delete, ⌥⌫ on the `/` bar
+    include QueryBarPopup # the `/` bar: edits, ⌃/⌥←→ word motion, Home/End, Delete, ⌥⌫, `↓` dropdown
     # Height of the top filter bar (catch direction + condition), reserved above the
     # queue|detail split — the Intercept tab's analogue of History's QL bar. While the
     # condition is being edited a second row carries Tab suggestions (see bar_h).
@@ -42,13 +45,16 @@ module Gori::Tui
     # a fact no generator over a field list could know.
     QUERY_HINT = QuerySuggest.cold_hint(InterceptFilter::HINT_FIELDS,
       note: "proto:ws opts WS messages IN", help_key: true)
-    # The idle bar, before `/` opens the condition. Same generator as History's and Sitemap's, so
-    # the three stop disagreeing about which operators exist.
-    IDLE_HINT = QuerySuggest.idle_hint("/ condition", InterceptFilter::HINT_FIELDS)
     # The highlighter's field vocabulary. This backend's `FIELDS` really is the whole of what it
     # accepts (the comment there requires it to stay in lockstep with `field_symbol`), so unlike
     # History there is no wider accepted set to reach for.
     GATE_KNOWN = ->(f : String, op : Char) { InterceptFilter.known_field?(f, regex: op == '~') }
+    # …and the predicate the TYPO row asks, which is a different question: the row above it
+    # already answers for every field QL has and this gate refuses (`UNSUPPORTED_FIELDS`), so
+    # what is left for a typo is "QL does not have this name either". Asking GATE_KNOWN here
+    # instead filed `scope:` — a refusal with a sentence of its own — as a misspelling, and
+    # said it was searched as text when it compiles to a never-match.
+    QL_NAME_KNOWN = ->(f : String, op : Char) { QL.known_field?(f, regex: op == '~') }
     # The editing bar's label — a constant because `render_query_popup` lines the dropdown up
     # under the token, which means knowing how far the condition text is indented.
     QUERY_PREFIX = "catch › "
@@ -62,6 +68,7 @@ module Gori::Tui
     getter? editing : Bool
     getter? querying : Bool
     getter query : String
+    property menu_registry : Verb::Registry? = nil
 
     def initialize
       @items = [] of Interceptor::Item
@@ -76,11 +83,17 @@ module Gori::Tui
       # without having read it.
       @editor.wrap = true
       @editing = false
+      # The TEXT editor opens in READ, as the Repeater's and the Fuzzer's do: a bare letter is a
+      # command there, and `i`/`↵` (or the queue's `↵`/`e`) enter INS. Meaningless while the hex
+      # editor is up — it has no READ mode.
+      @insert = false
+      @read = TextReadState.new
       # Filter bar: the catch direction + on/off mirror the Interceptor (captured on
       # reload, rendered as chips); the condition query is a local edit buffer pushed
       # to the Interceptor on every keystroke (live, like History's filter).
       @enabled = false
-      @direction = Interceptor::Direction::Both
+      @direction = Interceptor::Direction::RequestOnly
+      @body_focused = true
       @querying = false
       @query = ""
       @qcx = 0
@@ -113,6 +126,13 @@ module Gori::Tui
       # `toggle_content_length_sync`. Session-wide rather than per-item: it is a property of
       # how the operator is working, and an intercept queue is transient anyway.
       @sync_content_length = true
+      # ONE generation per held item, shared by `pending_edit` and the Content-Length the
+      # editor DISPLAYS. A forward is one message, and a context per call minted a different
+      # `$GEN.RANDOM` for each: the pane then showed a Content-Length the socket never got —
+      # the display lie `reflect_content_length_in_editor` exists to end. Replaced when a
+      # different item loads, so the next forward still mints its own values.
+      # A dial-less placeholder until the first held item loads and replaces it (`load_text`).
+      @edit_generation = Env::Generation.new
       # Cached highlight of the selected held item's bytes (read-only detail pane).
       # Held bytes are immutable, so the item id + theme is the base cache key —
       # recomputed only when the selection/theme changes, not every render. The loaded
@@ -140,11 +160,7 @@ module Gori::Tui
       # index-keyed set would silently retarget on the next revision tick. Unlike History there
       # is no hidden-mark case — `pending` returns exactly what the queue renders — so reload
       # prunes ids that have left the queue and marks stay a subset of what's on screen.
-      @marks = Set(Int64).new
-      @mark_anchor = nil.as(Int64?) # id-keyed range anchor for the ⇧arrow extend
-      # Ids THIS ⇧arrow gesture added (vs a deliberate `t`/⇧T mark) — the set a plain arrow
-      # hands back, and the set a shrinking range gives up. Cleared whenever the anchor resets.
-      @mark_extent = Set(Int64).new
+      @marks = Marks(Int64).new
     end
 
     # Fresh snapshot (called on enter AND every frame via the 50ms loop). Gated on the
@@ -231,9 +247,7 @@ module Gori::Tui
       return if @marks.empty?
       live = @items.map(&.id).to_set
       return if @marks.all? { |id| live.includes?(id) }
-      @marks &= live
-      @mark_extent &= live
-      @mark_anchor = nil unless @mark_anchor.try { |a| live.includes?(a) }
+      @marks.keep(live)
     end
 
     def selected_item : Interceptor::Item?
@@ -249,6 +263,11 @@ module Gori::Tui
       @selected
     end
 
+    # Held messages currently in the queue (mirrors HistoryView#row_count / IssuesView's).
+    def row_count : Int32
+      @items.size
+    end
+
     def empty? : Bool
       @items.empty?
     end
@@ -256,7 +275,7 @@ module Gori::Tui
     def move(delta : Int32) : Nil
       return if @items.empty? || @editing
       @selected = (@selected + delta).clamp(0, @items.size - 1)
-      reset_mark_anchor # a plain move re-seeds the range anchor, like a GUI list
+      @marks.reset_anchor # a plain move re-seeds the range anchor, like a GUI list
     end
 
     # At the first (top) queue item (and not editing) — lets the Runner pop focus
@@ -268,7 +287,7 @@ module Gori::Tui
     # --- marks (multi-select over the hold queue) -----------------------------
 
     def marked?(id : Int64) : Bool
-      @marks.includes?(id)
+      @marks.marked?(id)
     end
 
     def mark_count : Int32
@@ -298,41 +317,26 @@ module Gori::Tui
     # a mark-only variant would leave the bottom hold with no way to un-mark it by key at all.
     def toggle_mark : Nil
       return unless id = selected_id
-      @marks.includes?(id) ? @marks.delete(id) : @marks.add(id)
+      @marks.toggle(id)
       step_cursor(1)
-      @mark_anchor = id
-      @mark_extent.clear
     end
 
     # ⇧T — mark every held message currently queued (the queue's Ctrl+A).
     def mark_all : Nil
-      @items.each { |it| @marks.add(it.id) }
-      @mark_anchor = selected_id
-      @mark_extent.clear
+      @marks.mark_all(@items.map(&.id), selected_id)
     end
 
     def clear_marks : Nil
       @marks.clear
-      reset_mark_anchor
-    end
-
-    # Forget where a range gesture started (and what it had added), so the next ⇧arrow
-    # anchors at the cursor instead of sweeping back to a stale point.
-    private def reset_mark_anchor : Nil
-      @mark_anchor = nil
-      @mark_extent.clear
     end
 
     # End a ⇧arrow range gesture AND hand back everything it marked — what letting go of ⇧
     # and pressing a plain arrow does in a GUI list, where the highlight collapses instead of
-    # being left behind (#442/#457). Only the gesture's own ids go (@mark_extent): `t`/⇧T
-    # marks are deliberate tags, and dropping those too would put a discontiguous set out of
-    # reach. Returns how many marks it gave back, so the caller can say so.
+    # being left behind (#442/#457). Only the gesture's own ids go: `t`/⇧T marks are
+    # deliberate tags, and dropping those too would put a discontiguous set out of reach.
+    # Returns how many marks it gave back, so the caller can say so.
     def end_mark_gesture : Int32
-      before = @marks.size
-      @mark_extent.each { |id| @marks.delete(id) }
-      reset_mark_anchor
-      before - @marks.size
+      @marks.end_gesture
     end
 
     # ⇧↑/⇧↓ — extend a contiguous range from the anchor, the keyboard form of a GUI
@@ -340,23 +344,10 @@ module Gori::Tui
     # move/click clears it), so the first ⇧arrow always starts from where you are.
     def extend_marks(delta : Int32) : Nil
       return if @items.empty?
-      anchor_idx = @mark_anchor.try { |a| @items.index { |it| it.id == a } }
-      unless anchor_idx
-        @mark_anchor = selected_id
-        anchor_idx = @selected
-        @mark_extent.clear
-      end
+      anchor_idx = @marks.anchor.try { |a| @items.index { |it| it.id == a } }
+      from = @selected
       step_cursor(delta)
-      lo, hi = {anchor_idx, @selected}.minmax
-      wanted = Set(Int64).new
-      (lo..hi).each { |i| @items[i]?.try { |it| wanted.add(it.id) } }
-      # Give back what THIS gesture added but the new range no longer covers, so ⇧↑ after
-      # ⇧↓⇧↓ leaves two rows marked rather than three. A mark made earlier by `t`/⇧T survives
-      # a range sweeping over it and back off, since it was never in @mark_extent.
-      (@mark_extent - wanted).each { |id| @marks.delete(id) }
-      added = wanted - @marks
-      @marks.concat(added)
-      @mark_extent = (@mark_extent & wanted) | added
+      @marks.extend_range(anchor_idx, from, @selected) { |i| @items[i]?.try(&.id) }
     end
 
     # Cursor step used by the mark gestures. Deliberately NOT `move` — that no-ops while
@@ -374,87 +365,24 @@ module Gori::Tui
     end
 
     # --- catch-condition filter bar (a text sub-mode; mirrors History's QL bar) ---
-    # `store` (optional) backs `host:` Tab-completion; without it every other field
-    # still completes from its static pool.
+    # `store` backs `host:` Tab-completion; without it every other field still completes from
+    # its static pool. A bare call (no store) drops the previous one: `super()` is
+    # `QueryBarEdit`'s, so the default cannot recurse into this method.
     def start_query(store : Store? = nil) : Nil
-      @querying = true
-      @qcx = @query.size
+      super()
       @suggest_store = store
       @host_suggest_prefix = nil # invalidate: peers may have captured new hosts since
     end
 
-    def stop_query : Nil # Enter: keep the condition, leave edit mode
-      @querying = false
-      @popup.close
-    end
-
-    def cancel_query : Nil # Esc: clear the condition, leave edit mode
-      @querying = false
-      @query = ""
-      @qcx = 0
-      @preedit = ""
-      @popup.close
-    end
-
-    def query_insert(ch : Char) : Nil
-      @query = "#{@query[0, @qcx]}#{ch}#{@query[@qcx..]}"
-      @qcx += 1
+    # `QueryBarEdit`'s hook. The condition itself is pushed to the interceptor by the
+    # controller, after the edit.
+    def query_edited : Nil
       sync_popup
     end
 
-    def query_backspace : Nil
-      return if @qcx == 0
-      @query = "#{@query[0, @qcx - 1]}#{@query[@qcx..]}"
-      @qcx -= 1
-      sync_popup
-    end
-
-    def query_move(d : Int32) : Nil
-      @qcx = (@qcx + d).clamp(0, @query.size)
-      sync_popup
-    end
-
-    # --- the opt-in completion dropdown (`\u2193`) ---------------------------------
-    # Same component and contract as History's and Sitemap's; see `SuggestPopup`.
-
-    def popup_open? : Bool
-      @popup.open?
-    end
-
-    # `↓`: open the dropdown, or move down inside it. Nil rather than Bool — the key is claimed
-    # either way, and an earlier Bool "so the key falls through" was a contract no controller
-    # honoured, which is worse than not offering one.
-    def popup_down : Nil
-      return @popup.move(1) if @popup.open?
-      @popup.set(query_suggestions)
-      @popup.open!
-    end
-
-    def popup_up : Nil
-      @popup.move(-1)
-    end
-
-    def popup_close : Nil
-      @popup.close
-    end
-
-    private def sync_popup : Nil
-      @popup.set(query_suggestions) if @popup.open?
-    end
-
-    # Splice the SELECTED candidate (dropdown open) or the first (closed) over the token under
-    # the caret. False when there is nothing to complete, so the caller can leave the query
-    # untouched. `close` is ↵'s — see HistoryView#query_complete for why ↵ must shut the popup or
-    # the bar cannot be left with Enter.
-    def query_complete(close : Bool = false) : Bool
-      sugg = query_suggestions
-      pick = @popup.choice(sugg)
-      return false unless pick
-      cur = FilterAst.token_at(@query, @qcx)
-      @query = "#{@query[0, cur.start]}#{pick}#{@query[cur.stop..]}"
-      @qcx = cur.start + pick.size
-      close ? @popup.close : (@popup.set(query_suggestions) if @popup.open?)
-      true
+    # `QueryBarEdit`'s hook. A `LineEdit` action leaves the dropdown as it was; only a typed
+    # character re-syncs it.
+    def query_line_edited(action : Symbol) : Nil
     end
 
     def query_suggestions : Array(String)
@@ -495,7 +423,10 @@ module Gori::Tui
     # it to flip. The hex editor is the answer the Repeater's `^X` already was — nibble
     # overtype and byte insert/delete over an `Array(UInt8)` that never becomes a String — so
     # the refusal is gone and the lossy path is still never taken.
-    def toggle_edit : Nil
+    #
+    # `insert` picks the text editor's mode: ↵/`e` on the queue ask to edit and land in INS,
+    # Tab into the pane lands in READ, where a typed `i` is the way in rather than a byte.
+    def toggle_edit(insert : Bool = true) : Nil
       if @editing
         @editing = false
       elsif it = selected_item
@@ -503,7 +434,47 @@ module Gori::Tui
         @loaded_id = it.id
         @loaded_ws = it.kind.ws?
         @editing = true
+        @insert = insert
       end
+    end
+
+    def text_insert? : Bool
+      text_editing? && @insert
+    end
+
+    def text_read? : Bool
+      text_editing? && !@insert
+    end
+
+    def enter_insert! : Nil
+      @insert = true if text_editing?
+    end
+
+    # Back to READ, carrying an INS ⇧arrow selection over (see TextReadState#adopt_editor_selection).
+    def exit_insert! : Nil
+      return unless text_insert?
+      @insert = false
+      @read.adopt_editor_selection(@editor)
+    end
+
+    # The buffer READ-mode edits run against (`TabController#editor_text_buffer`).
+    def read_edit_buffer : {TextArea, TextReadState}?
+      text_editing? ? {@editor, @read} : nil
+    end
+
+    # READ navigation: the caret and selection are `@read`'s, never a buffer change.
+    def read_move(dr : Int32, dc : Int32, selecting : Bool = false) : Nil
+      @read.move(@editor, dr, dc, selecting: selecting) if text_read?
+    end
+
+    def read_page(dir : Int32, selecting : Bool = false) : Nil
+      read_move(dir * @editor.page_rows, 0, selecting)
+    end
+
+    def read_line_edge(dir : Int32, selecting : Bool = false) : Nil
+      return unless text_read?
+      dir < 0 ? @editor.home(selecting) : @editor.end_of_line(selecting)
+      @read.sync_to(@editor, selecting: selecting)
     end
 
     # Only reload from pristine bytes when switching to a DIFFERENT held item; re-entering
@@ -511,34 +482,67 @@ module Gori::Tui
     # mirroring detail_window_for's @detail_win_id guard.
     private def load_text(it : Interceptor::Item) : Nil
       if @loaded_id != it.id
-        @editor.set_text(String.new(it.raw))
+        seed = String.new(it.raw)
+        @editor.set_text(seed)
+        # The PROVENANCE baseline for `$` tokens (#1416): a name the held message arrived with is
+        # the client's byte, a name typed afterwards is a reference. The editor keeps the seed
+        # BYTES and re-derives the set when the grammar flips mid-hold, and `edited_wire` reads
+        # that same set — so the pane paints as literal exactly what a forward sends literally.
+        @editor.env_literal_source = seed
         @editor_dirty = false # freshly loaded — not yet modified
+        # Named by the held item's destination: the proxy's upstream dial applies the
+        # destination's TLS rule, and a `$GEN.USER_AGENT` typed here should agree with it (#1153).
+        @edit_generation = Env::Generation.for_dial(it.host, it.scheme)
       end
       @hex = nil # a text item never has one; clearing here is what keeps `text_editing?` honest
+    end
+
+    # The edited buffer as wire bytes, with the operator's `$ENV`/`$GEN` references resolved —
+    # and nothing else. The ONE expansion both the forward (`pending_edit`) and the visible
+    # Content-Length (`reflect_content_length_in_editor`) read, so the pane measures the bytes
+    # the socket gets.
+    #
+    # The buffer is EVIDENCE: it was seeded from bytes a client (or an origin) sent, and an edit
+    # to one header does not make the rest of it the operator's (P7, #1416). This used to expand
+    # the whole buffer, so appending a byte to the request line substituted a project secret into
+    # a captured `a=$ENV.FOO`, minted a value for a captured `$GEN.UUID`, consumed every `$$`, and
+    # resynced Content-Length to match — none of it typed, all of it forwarded. CLI `intercept
+    # edit` and MCP `intercept_forward_edit` forward verbatim; this surface keeps one thing more,
+    # a name the operator TYPED, which is the per-name rule the Repeater's evidence tabs use
+    # (`RepeaterView#operator_env_vars`):
+    #
+    #   * `literal: @editor.env_literal_names` — a name the held message carried stays literal,
+    #     whoever typed the occurrence. gori cannot tell a typed `$ENV.FOO` from the captured one
+    #     beside it, and evidence wins when it cannot. Per name and not per edited span: two
+    #     separated edits leave captured bytes BETWEEN them, so a span derived from a prefix /
+    #     suffix diff would hand those back to the expansion, and a full diff per keystroke over
+    #     a held body is a P6 cost.
+    #   * `unescape: Owns::None` — a `$$` in captured bytes is two bytes the client sent. The cost
+    #     is that an operator's own `$$ENV.X` is forwarded as typed, as on every evidence path.
+    #
+    # `Env.expand_wire` (byte-level, head-only CRLF) rather than `split('\n').join("\r\n")`: a
+    # `$KEY` value carrying a CRLF would otherwise double into `\r\r\n`. Nothing resolves BIND
+    # after this — a forward goes straight to the origin — so `$BIND.X` stays literal.
+    private def edited_wire : Bytes
+      Env.expand_wire(@editor.wire_text, resolve: Env::Owns::Env | Env::Owns::Gen,
+        unescape: Env::Owns::None, generation: @edit_generation, literal: @editor.env_literal_names)
     end
 
     def stop_edit : Nil
       @editing = false
     end
 
-    # The forward payload. An UNEDITED forward (editor never opened, or opened to view
-    # only) returns the original raw bytes BYTE-EXACT (P7) — so merely inspecting a
-    # held message can't mutate it, and a deliberately CL-mismatched smuggling probe
-    # forwards untouched. Only an ACTUAL edit returns the editor's bytes, with
-    # Content-Length recomputed to match the edited body (Burp's "update
-    # Content-Length", default on; add_when_missing: true so adding a body to a GET
-    # that had none still gets framed). The proxy itself stays byte-exact — the
-    # update-CL decision lives here, in the human's editor, not the wire path. An edit now
-    # keeps every line's ORIGINAL terminator (TextArea#wire_text), so editing the head leaves
-    # the body byte-identical; only the head is normalized to CRLF, which is where CRLF is
-    # required. The one thing an edit still changes on its own is Content-Length, deliberately.
-    def forward_bytes(it : Interceptor::Item) : Bytes
-      edit = pending_edit
-      (edit && edit[0] == it.id) ? edit[1] : it.raw
-    end
-
     # The {id, edited-bytes} of the currently-loaded held item IFF it has an unsaved edit,
-    # else nil. Keyed by @loaded_id (the item the editor holds) rather than the queue
+    # else nil — and nil is what makes an UNEDITED forward (editor never opened, or opened to
+    # view only) send the original raw bytes BYTE-EXACT (P7), so merely inspecting a held
+    # message can't mutate it, and a deliberately CL-mismatched smuggling probe forwards
+    # untouched. Only an ACTUAL edit returns the editor's bytes, with Content-Length recomputed
+    # to match the edited body (Burp's "update Content-Length", default on; add_when_missing:
+    # true so adding a body to a GET that had none still gets framed). The proxy itself stays
+    # byte-exact — the update-CL decision lives here, in the human's editor, not the wire path.
+    # An edit keeps every line's ORIGINAL terminator (TextArea#wire_text), so editing the head
+    # leaves the body byte-identical; only the head is normalized to CRLF, which is where CRLF
+    # is required. The one thing an edit still changes on its own is Content-Length. Keyed by @loaded_id (the item the editor holds) rather than the queue
     # selection, so "forward all" can pick up an in-progress edit for whichever item is
     # loaded even when the cursor has since moved to a different row.
     # A WebSocket message payload is taken VERBATIM, and the kind gate comes before anything
@@ -567,21 +571,17 @@ module Gori::Tui
       # so it has to come back exactly as it was loaded. (`to_bytes` would be worse still: it
       # joins with CRLF because it exists for wire HEADS.)
       return {id, @editor.wire_bytes} if @loaded_ws
-      # `wire_text` again, for the same reason the Repeater's send path reads it: `text` is the
-      # LF projection, so an edit to a HEADER used to rewrite the BODY — every CR deleted and
-      # Content-Length silently resynced down to match. That is the "I only changed one header"
-      # case, which is most intercept edits, and it shipped different bytes to a live target.
-      # `Env.expand_wire` (gsub `/\r?\n/`) not `split('\n').join("\r\n")`: a `$KEY` value
-      # carrying a CRLF would otherwise double into `\r\r\n` and corrupt the forwarded bytes.
-      #
-      # `Escape::Consume`: a forward goes STRAIGHT to the origin — there is no send-seam
-      # `expand_bindings` after this the way there is on every Repeater/Fuzzer path — so this
-      # pass is the last one and therefore the one that owes the operator `$$` → `$`.
-      raw = Env.expand_wire(@editor.wire_text, escape: Env::Escape::Consume)
+      # `wire_text` again (inside `edited_wire`), for the same reason the Repeater's send path
+      # reads it: `text` is the LF projection, so an edit to a HEADER used to rewrite the BODY —
+      # every CR deleted and Content-Length silently resynced down to match. That is the "I only
+      # changed one header" case, which is most intercept edits, and it shipped different bytes
+      # to a live target. The same case is why only the operator's own `$` references resolve
+      # there (#1416) — see `edited_wire`.
+      raw = edited_wire
       # `@sync_content_length` (^L) — see its toggle. When it is OFF the operator's declared
       # value goes out as written. When it is on the rewrite has ALREADY been reflected into
       # the visible buffer by `reflect_content_length_in_editor`, so the call below is
-      # normally a no-op that only catches a `$KEY` whose expansion changed the body length.
+      # normally a no-op that only catches a typed `$KEY` whose expansion changed the body length.
       return {id, raw} unless @sync_content_length
       {id, Fuzz::ContentLength.sync(raw, add_when_missing: true)}
     end
@@ -666,18 +666,24 @@ module Gori::Tui
     #
     # The other half of the defect above: even with the rewrite left default-on, a pane that
     # keeps showing the operator's `5` while the wire carries gori's `16` is a display lie
-    # about a live request. So the rewrite is applied where the operator can see it and undo
-    # it, exactly as the Repeater's auto-CL does — after which `pending_edit`'s own sync has
-    # nothing left to change and display and wire agree by construction.
+    # about a live request. So the rewrite is applied where the operator can see it, exactly
+    # as the Repeater's auto-CL does — after which `pending_edit`'s own sync has nothing left
+    # to change and display and wire agree by construction.
     #
     # `replace_line` (not `set_text`) keeps the caret and the undo stack, so this can run on
-    # every keystroke. The CL line is located in the RAW editor head BY CONTENT rather than
-    # by transplanting the expanded-space index: a multi-line `$KEY` expansion earlier in the
-    # head shifts the line count, and the index would then overwrite an unrelated header.
+    # every keystroke. It FOLDS into the edit's own undo step: as a step of its own, ⌃Z on the
+    # restored state re-applied it and pushed another, so undo was dead after any edit that
+    # changed the body length (#1417). Folded, an undo pops a pre-keystroke state, this
+    # re-derives its Content-Length and pushes nothing, and the next ⌃Z goes further back.
+    #
+    # The CL line is located in the RAW editor head BY CONTENT rather than by transplanting
+    # the expanded-space index: a multi-line `$KEY` expansion earlier in the head shifts the
+    # line count, and the index would then overwrite an unrelated header.
     private def reflect_content_length_in_editor : Nil
       return unless @editing && @editor_dirty && @sync_content_length
-      return if @loaded_ws                                                   # no head to update — see pending_edit
-      raw = Env.expand_wire(@editor.wire_text, escape: Env::Escape::Consume) # see pending_edit
+      return if @loaded_ws # no head to update — see pending_edit
+      # The forward's own bytes, so the pane measures what the socket gets — see `edited_wire`.
+      raw = edited_wire
       synced = Fuzz::ContentLength.sync(raw, add_when_missing: true)
       return if synced == raw # already agrees (or chunked / no boundary — sync no-ops)
       synced_head = String.new(synced).split("\r\n\r\n", limit: 2).first
@@ -685,7 +691,7 @@ module Gori::Tui
       lines = @editor.lines_snapshot
       head_end = lines.index(&.empty?) || lines.size
       if idx = (0...head_end).find { |i| content_length_line?(lines[i]) }
-        @editor.replace_line(idx, new_line) unless lines[idx] == new_line
+        @editor.replace_line(idx, new_line, fold: true) unless lines[idx] == new_line
       end
       # A head with NO Content-Length line got one spliced in by `add_when_missing`. Leave
       # the buffer alone rather than inserting a line under the caret mid-keystroke; the
@@ -699,36 +705,16 @@ module Gori::Tui
     # The method + target to DISPLAY for a held item — the EDITED values when this is
     # the item loaded in the editor and modified (so a GET→PUT method change or a
     # 200→201 status edit shows in the queue row + forward/drop toast, not the stale
-    # hold-time metadata), else the immutable Item's own fields. For a response,
-    # `target` is the "status reason" the response Item carries.
-    #
-    # A WebSocket message re-reads NOTHING from the editor: its first line is JSON or
-    # protobuf, not an HTTP start line, so parsing it would rewrite the row's own label from
-    # the first three space-separated tokens of a payload. Its method/target are the
-    # handshake's and are immutable, which is exactly why the row stays identifiable while
-    # its payload is being edited.
+    # hold-time metadata), else the immutable Item's own fields. The parse is
+    # `Interceptor::Item#edited_method_target`'s, shared with the agent bridge's receipt.
     def effective_method_target(it : Interceptor::Item) : {String, String}
       return {it.method, it.target} unless @loaded_id == it.id && @editor_dirty
-      case it.kind
-      in .ws_out?, .ws_in? then {it.method, it.target}
-      in .request?
-        first = editor_first_line
-        parts = first.split(' ', 3)
-        {parts[0]?.presence || it.method, parts[1]?.presence || it.target}
-      in .response?
-        first = editor_first_line
-        parts = first.split(' ', 2) # "HTTP/1.1 201 CREATED" → the "201 CREATED" target
-        {it.method, parts[1]?.presence || it.target}
-      end
-    end
-
-    private def editor_first_line : String
-      (String.new(@editor.to_bytes).split('\n', 2).first? || "").rstrip('\r')
+      it.edited_method_target(@editor.to_bytes)
     end
 
     # backspace/delete/undo are no-ops at buffer start / end-of-buffer / empty undo
     # stack (TextArea returns early without bumping @edits). A no-op here must NOT set
-    # @editor_dirty: once dirty, forward_bytes recomputes Content-Length and normalizes
+    # @editor_dirty: once dirty, pending_edit recomputes Content-Length and normalizes
     # line endings, so a held message the user only *looked* at would forward as
     # different bytes — breaking the byte-exact hold contract (P7). Gate on a real edit.
     def edit_undo : Nil
@@ -783,7 +769,7 @@ module Gori::Tui
     # one where a mistyped header could not be selected and replaced.
     #
     # `mark_editor_edit` only on a real buffer change (⌥⌫), and for the reason spelled out at
-    # `edit_undo`: once dirty, `forward_bytes` recomputes Content-Length and normalizes line
+    # `edit_undo`: once dirty, `pending_edit` recomputes Content-Length and normalizes line
     # endings, so a held message the operator only NAVIGATED must not be marked edited or it
     # forwards as different bytes (P7).
     def edit_motion_key(ev : Termisu::Event::Key) : Bool
@@ -802,12 +788,14 @@ module Gori::Tui
     def editor_drag_to_cursor(rect : Rect, mx : Int32, my : Int32) : Nil
       return unless text_editing?
       _, right = split_panes(body_rect(rect))
+      return @read.click(@editor, right.inset(1, 1), mx, my, selecting: true) unless @insert
       @editor.click_to_cursor(right.inset(1, 1), mx, my, selecting: true)
     end
 
     def editor_select_word(rect : Rect, mx : Int32, my : Int32) : Bool
       return false unless text_editing?
       _, right = split_panes(body_rect(rect))
+      return @read.select_word(@editor, right.inset(1, 1), mx, my) unless @insert
       @editor.select_word_at(right.inset(1, 1), mx, my)
     end
 
@@ -875,7 +863,7 @@ module Gori::Tui
     end
 
     # Replace the held item's editable bytes (e.g. from the external editor); only
-    # while editing — forward_bytes then sends the edited text.
+    # while editing — pending_edit then sends the edited text.
     #
     # `set_text` is the exact inverse of the `wire_text` above (`TextArea#split_wire`
     # round-trips every terminator, including a lone CR), so ^E is a byte-exact round trip
@@ -888,21 +876,21 @@ module Gori::Tui
 
     # --- focus ring (driven by the Runner's Tab/Shift-Tab) ---
     # Two panes: queue (editing off) ▸ detail editor (editing on). Entering the
-    # detail pane starts editing the selected item; pane_advance returns false at
+    # detail pane opens the selected item's editor in READ; pane_advance returns false at
     # an end so the Runner wraps focus back to the tab bar.
     def focus_first : Nil
       @editing = false
     end
 
     def focus_last : Nil
-      toggle_edit unless @editing
+      toggle_edit(insert: false) unless @editing
     end
 
     def pane_advance(dir : Int32) : Bool
       if dir > 0
         return false if @editing # detail → off the end (to the tab bar)
         return false unless selected_item
-        toggle_edit # queue → detail (start editing)
+        toggle_edit(insert: false) # queue → detail, in READ
         true
       else
         return false unless @editing # queue → off the end (to the tab bar)
@@ -937,13 +925,13 @@ module Gori::Tui
 
     # Filter-bar click zones, matching render_filter_bar left-to-right:
     #   " i:CATCH " chip → :catch
-    #   direction label (c:ALL / c:REQ / c:RES) → :direction
+    #   direction label (c:REQ / c:RES / c:ALL) → :direction
     #   rest of the bar → :condition (start query edit)
     # Nil while the bar is an input line (@querying) or off the bar row.
     def bar_zone_at(rect : Rect, mx : Int32, my : Int32) : Symbol?
       return nil if @querying || my != rect.y
       return nil if mx < rect.x || mx >= rect.right
-      catch_label = " i:CATCH "
+      catch_label = catch_chip_label
       x = rect.x + 1
       return :catch if mx >= x && mx < x + catch_label.size
       x += catch_label.size + 1 # render: Frame.chip(...) + 1
@@ -988,7 +976,7 @@ module Gori::Tui
     def select_index(idx : Int32) : Nil
       return if @items.empty?
       @selected = idx.clamp(0, @items.size - 1)
-      reset_mark_anchor # same as the keyboard `move`: a plain click re-seeds the anchor
+      @marks.reset_anchor # same as the keyboard `move`: a plain click re-seeds the anchor
     end
 
     # Click the queue list → focus the list (stop editing the detail editor).
@@ -1002,6 +990,7 @@ module Gori::Tui
     def editor_click_to_cursor(rect : Rect, mx : Int32, my : Int32) : Nil
       return unless text_editing?
       _, right = split_panes(body_rect(rect))
+      return @read.click(@editor, right.inset(1, 1), mx, my) unless @insert
       @editor.click_to_cursor(right.inset(1, 1), mx, my)
     end
 
@@ -1019,6 +1008,7 @@ module Gori::Tui
                listen : {String, Int32}? = nil, capturing : Bool = true,
                holding : Bool = true) : Nil
       return if rect.empty?
+      @body_focused = focused
       render_panes(screen, rect, focused, listen: listen, capturing: capturing, holding: holding)
       render_query_popup(screen, rect)
     end
@@ -1045,7 +1035,8 @@ module Gori::Tui
 
       if @items.empty?
         TrafficEmptyState.render(screen, body, variant: :intercept, listen: listen,
-          capturing: capturing, catch_on: @enabled)
+          capturing: capturing, catch_on: @enabled, body_focused: focused,
+          catch_direction: direction_label)
         return
       end
 
@@ -1065,14 +1056,14 @@ module Gori::Tui
         base = rect.x + 1 + QUERY_PREFIX.size
         screen.input_line(base, rect.y, @query, @qcx, @preedit, Theme.text_bright,
           width: {rect.w - QUERY_PREFIX.size - 2, 0}.max,
-          colors: Highlight.filter_query(@query, Theme.text_bright, known: GATE_KNOWN))
+          colors: Highlight.filter_query(@query, Theme.text_bright, known: GATE_KNOWN, shaped: InterceptFilter::FIELD_SHAPED))
         return
       end
 
       # Left cluster: the master CATCH toggle (lit while holding) then the direction
       # sub-mode — each carries its chord (i toggles, c cycles) so both are discoverable
       # in the chrome, not just the empty-state prose.
-      x = Frame.chip(screen, rect.x + 1, rect.y, " i:CATCH ", @enabled) + 1
+      x = Frame.chip(screen, rect.x + 1, rect.y, catch_chip_label, @enabled) + 1
       label, color = direction_chip
       x = screen.text(x, rect.y, label, color, Theme.bg, Attribute::Bold) + 2
 
@@ -1093,12 +1084,12 @@ module Gori::Tui
         return
       end
       if @query.blank?
-        screen.text(x, rect.y, IDLE_HINT, Theme.muted, width: left_w)
+        screen.text(x, rect.y, QuerySuggest.idle_hint("/ condition", InterceptFilter::HINT_FIELDS, left_w), Theme.muted, width: left_w)
       else
         # The committed condition stays highlighted — this readout is what you scan to
         # check WHY something is (or isn't) being held.
         x = screen.text(x, rect.y, ": ", Theme.muted, width: left_w)
-        screen.styled_text(x, rect.y, @query, Highlight.filter_query(@query, Theme.text, known: GATE_KNOWN),
+        screen.styled_text(x, rect.y, @query, Highlight.filter_query(@query, Theme.text, known: GATE_KNOWN, shaped: InterceptFilter::FIELD_SHAPED),
           Theme.text, width: {rect.right - 1 - x, 0}.max)
       end
     end
@@ -1139,20 +1130,61 @@ module Gori::Tui
           Theme.orange, width: {rect.w - 2, 0}.max)
         return
       end
+      # A name QL does not have EITHER is a typo, and on a hold gate it is the worst of the
+      # three: an unknown field free-texts the whole token, so the condition holds nothing and
+      # the only symptom is a queue that never fills. Said on the same row and in the same
+      # sentence the lists use, below the refusal above (which is about a field that EXISTS).
+      # Judged against QL's vocabulary, the same one `InterceptFilter::FIELD_SHAPED` paints
+      # from. Narrowing this to the gate's own nine names made the two rows disagree about one
+      # token: `sizee:8080` was painted muted by the bar and passed over in silence here (QL is
+      # one edit from `size`, the gate's pool is nowhere near it). A suggestion this gate then
+      # refuses is not a dead end — the branch above answers it, in a sentence that teaches
+      # where the field DOES live.
+      if u = FilterAst.unknown_field(@query, FilterAst::SEPS_FIELD_REGEX, QL_NAME_KNOWN,
+           QL::SIDE_PREFIXES, QL::CANDIDATE_FIELDS)
+        screen.text(rect.x + 1, y, FilterAst.unknown_field_note(u), Theme.orange,
+          width: {rect.w - 2, 0}.max)
+        return
+      end
+      if note = direction_note
+        screen.text(rect.x + 1, y, note, Theme.orange, width: {rect.w - 2, 0}.max)
+        return
+      end
       return unless QuerySuggest.hint_slot?(FilterAst.token_at(@query, @qcx).core)
       screen.text(rect.x + 1, y, QUERY_HINT, Theme.muted, width: {rect.w - 2, 0}.max)
+    end
+
+    # The condition names `status:` while catch holds requests only — see `Interceptor.direction_note`.
+    def direction_note : String?
+      Interceptor.direction_note(@query, @direction, "#{key_label("intercept.direction", "c")} for RES or ALL")
     end
 
     # The catch-direction chip: `c`-chord + which direction, coloured by enabled state.
     # Dim when intercept is OFF (nothing is held yet, so the chip advertises what WILL be
     # caught once toggled on).
     private def direction_chip : {String, Color}
-      label = case @direction
-              when .request_only?  then "c:REQ"
-              when .response_only? then "c:RES"
-              else                      "c:ALL"
-              end
+      label = @body_focused ? "#{key_label("intercept.direction", "c")}:#{direction_label}" : "DIR:#{direction_label}"
       {label, @enabled ? Theme.accent : Theme.muted}
+    end
+
+    private def catch_chip_label : String
+      if @body_focused
+        " #{key_label("intercept.toggle", "i")}:CATCH "
+      else
+        " CATCH:#{@enabled ? "ON" : "OFF"} "
+      end
+    end
+
+    private def key_label(id : String, fallback : String) : String
+      @menu_registry.try { |r| Hotkeys.binding_label(r, id, fallback) } || fallback
+    end
+
+    def direction_label : String
+      case @direction
+      when .request_only?  then "REQ"
+      when .response_only? then "RES"
+      else                      "ALL"
+      end
     end
 
     # --- what a queue row IS ---------------------------------------------------
@@ -1231,7 +1263,7 @@ module Gori::Tui
         it = @items[idx]
         y = inner.y + i
         selected = idx == @selected
-        marked = @marks.includes?(it.id)
+        marked = @marks.marked?(it.id)
         bg = row_band(screen, inner, y, selected: selected, marked: marked, focused: focused)
         badge, bcolor = kind_badge(it.kind)
         screen.text(inner.x + 1, y, badge, bcolor, bg, Attribute::Bold)
@@ -1319,11 +1351,17 @@ module Gori::Tui
       if @editing && @loaded_id == it.id && (h = @hex)
         @hex_scroll = h.render(screen, inner, focused, @hex_scroll)
       elsif @editing && @loaded_id == it.id
-        @editor.render(screen, inner, cursor: focused, highlight: mode, gauge: true, gauge_focused: focused)
+        render_text_editor(screen, inner, focused, mode)
       else
         sync_preview(it)
         @preview.render(screen, inner, focused, styled_at: preview_styled_at(it))
       end
+    end
+
+    # The INS caret, or READ's caret and band painted over the frame the editor drew.
+    private def render_text_editor(screen : Screen, inner : Rect, focused : Bool, mode : Symbol?) : Nil
+      @editor.render(screen, inner, cursor: focused && @insert, highlight: mode, gauge: true, gauge_focused: focused)
+      @read.paint_chrome(screen, inner, @editor, focused && !@insert)
     end
 
     # The item's styled window, and the plain projection of it the caret/selection/copy use.
@@ -1336,7 +1374,7 @@ module Gori::Tui
 
     private def sync_preview(it : Interceptor::Item) : Nil
       win = detail_window_for(it)
-      @preview.source(win.total, ->(i : Int32) { Highlight.plain(win.line_at(i)) })
+      @preview.source(win.total, ->(i : Int32) { win.plain_at(i) })
     end
 
     # Scroll the read-only preview so a held body taller than the pane is fully readable WITHOUT
@@ -1356,24 +1394,13 @@ module Gori::Tui
       yield
     end
 
-    # ↑/↓ and ⇧↑/↓ over the preview: the caret moves, ⇧ grows the selection. The pane had a
-    # scroll gauge and no caret at all — readable, and not selectable or copyable by any route.
-    def preview_move(dr : Int32, dc : Int32, selecting : Bool = false) : Nil
-      with_preview { @preview.move(dr, dc, selecting: selecting) }
-    end
-
-    def preview_motion_key(ev : Termisu::Event::Key) : Bool
-      return false if @editing
-      it = selected_item || return false
-      sync_preview(it)
-      @preview.motion_key(ev)
-    end
-
     def preview_select_line : Nil
+      return @read.select_line(@editor) if text_read?
       with_preview { @preview.select_line }
     end
 
     def preview_clear_selection : Nil
+      @read.clear_selection
       @preview.clear_selection
     end
 
@@ -1385,6 +1412,7 @@ module Gori::Tui
     # RepeaterView#pane_selection? / #request_copy_text; all three change together.
     def preview_selection? : Bool
       return false if hex_editing? # the byte editor has a cursor, not a selection
+      return @read.selection?(@editor) if text_read?
       @editing ? @editor.selection? : @preview.selection?
     end
 
@@ -1395,6 +1423,7 @@ module Gori::Tui
       if (h = @hex) && @editing # `hex_editing?`, spelled out so the buffer is bound
         return String.new(h.to_bytes).scrub
       end
+      return @read.copy_text(@editor) if text_read?
       return @editor.selection_text || @editor.text if @editing
       it = selected_item || return ""
       sync_preview(it)
@@ -1449,18 +1478,13 @@ module Gori::Tui
       @editing ? @editor.scroll_view(delta) : vscroll_detail(delta)
     end
 
-    # At the top of the read-only preview — ↑ there pops focus back to the queue.
-    def preview_at_top? : Bool
-      @preview.at_top?
-    end
-
     # Windowed view of the held item's raw bytes, cached by item id (held bytes
     # never change; ids never repeat). The head is styled eagerly, the body kept RAW
     # and styled per visible line — a multi-MiB held body no longer freezes the UI
     # fiber on selection (mirrors the History/Repeater windowing).
     private def detail_window_for(it : Interceptor::Item) : Highlight::Windowed
       # When this is the item loaded in the editor AND it was modified, preview the EDITED
-      # bytes (mirrors forward_bytes / effective_method_target) rather than the pristine
+      # bytes (mirrors pending_edit / effective_method_target) rather than the pristine
       # held bytes — so leaving the editor for the QUEUE doesn't snap the body back to the
       # original. edit_rev keys the cache on the editor's change counter for that case.
       edited = @loaded_id == it.id && @editor_dirty

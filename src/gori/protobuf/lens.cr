@@ -1,5 +1,6 @@
 require "base64"
 require "./schema"
+require "../plural"
 
 module Gori::Protobuf
   # Reads ONE wire field through ONE `.proto` declaration — the whole schema-aware half of
@@ -98,7 +99,8 @@ module Gori::Protobuf
     end
 
     private def read_enum(schema : Schema, d : Schema::FieldDef, u : UInt64) : Reading
-      n = u.to_i64!
+      # An enum is an int32 on the wire: sign-extended when negative, low 32 bits the value.
+      n = u.to_u32!.to_i32!.to_i64
       e = d.type_name.try { |tn| schema.enum?(tn) }
       name = e.try(&.name?(n))
       note = if e.nil?
@@ -188,7 +190,7 @@ module Gori::Protobuf
           more += 1
         end
       end
-      note = left == 0 ? nil : "the packed run ends mid-element — #{left} byte#{left == 1 ? "" : "s"} left over"
+      note = left == 0 ? nil : "the packed run ends mid-element — #{Gori.plural(left, "byte")} left over"
       Reading.new(d, packed: values, packed_more: more, note: note)
     end
 
@@ -214,7 +216,7 @@ module Gori::Protobuf
             end
         {v, pos + 8, true}
       else
-        u, pos, ok = read_varint(data, pos)
+        u, pos, ok = Protobuf.read_varint(data, pos)
         return {nil, pos, false} unless ok
         v = case d.type
             when .int32?   then u.to_u32!.to_i32!.to_i64.as(Scalar)
@@ -223,27 +225,11 @@ module Gori::Protobuf
             when .s_int32? then zigzag(u).to_i32!.to_i64.as(Scalar)
             when .s_int64? then zigzag(u).as(Scalar)
             when .bool?    then (u != 0).as(Scalar)
-            else                u.as(Scalar) # uint64, and enum (rendered by number)
+            when .enum?    then u.to_u32!.to_i32!.to_i64.as(Scalar) # an int32, like read_enum
+            else                u.as(Scalar)                        # uint64
             end
         {v, pos, true}
       end
-    end
-
-    # A varint out of a packed run. `Protobuf`'s own reader is private to the decoder and
-    # returns a decoder-shaped tuple; this is the same 10-byte rule, kept local so the
-    # decoder's contract stays about MESSAGES.
-    private def read_varint(data : Bytes, pos : Int32) : {UInt64, Int32, Bool}
-      value = 0_u64
-      shift = 0
-      10.times do
-        return {0_u64, pos, false} if pos >= data.size
-        b = data[pos]
-        pos += 1
-        value |= (b.to_u64 & 0x7f_u64) << shift
-        return {value, pos, true} if (b & 0x80) == 0
-        shift += 7
-      end
-      {0_u64, pos, false}
     end
 
     # --- JSON projection ----------------------------------------------------

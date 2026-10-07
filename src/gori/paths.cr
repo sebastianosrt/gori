@@ -30,6 +30,12 @@ module Gori
       File.join(home_dir, "ca")
     end
 
+    # Where `gori run shell` writes the CA bundles it points a terminal's tools at: the system
+    # roots plus gori's, content-addressed (see ShellEnv.bundle). Public certificates only.
+    def self.shell_dir : String
+      File.join(home_dir, "shell")
+    end
+
     # Convention dir for fuzzer wordlists: bare (slash-less) names typed into the
     # Fuzzer's wordlist field auto-complete from here (and the current dir). Users
     # drop `*.txt` lists in here for discovery without typing a full path.
@@ -86,6 +92,16 @@ module Gori
       path
     end
 
+    # Whether *path* is *dir* itself or anything beneath it. Both sides are compared as given,
+    # so canonicalize them first (`canonical_file`) when they may be spelled differently.
+    # Either separator counts: `File::SEPARATOR` is `/` on every platform, while Windows joins
+    # and resolves paths with `\`.
+    def self.within?(path : String, dir : String) : Bool
+      return true if path == dir
+      base = dir.rstrip(Path::SEPARATORS.join)
+      path.starts_with?(base) && Path::SEPARATORS.includes?(path[base.size]?)
+    end
+
     def self.ensure_dirs : Nil
       ensure_dir(home_dir)
       ensure_dir(projects_dir) # lock the projects ROOT too (registry only mkdir's leaves)
@@ -126,6 +142,21 @@ module Gori
       rescue File::AlreadyExistsError
         # created concurrently by another instance — it exists now, at DIR_MODE already
         ours = false
+      rescue ex : File::Error
+        # Every OTHER way mkdir can fail is one the operator can act on: a $GORI_HOME that is
+        # unwritable or on a read-only mount, a full disk, a stale NFS handle. Gori::Error is
+        # this project's EXPECTED-error type, and `CLI.run` rescues exactly that to print one
+        # actionable line; anything else reaches the top of the process as a Crystal
+        # backtrace. `Paths.ensure_dirs` is the FIRST thing `gori tutorial` and `gori wizard`
+        # do, so a read-only home met an operator with eleven frames of Dir#mkdir_p before
+        # either command had drawn anything.
+        #
+        # Same reasoning as the `path exists and is not a directory` raise below, and the same
+        # place to apply it — while the path is still in hand, rather than however far
+        # downstream the first write happens to be. Every ensure_dirs caller inherits it: the
+        # eight in cli.cr, App#initialize, and Settings.save (whose blanket rescue already
+        # swallows this, unchanged).
+        raise Gori::Error.new(ex.message.presence || "cannot create directory: #{path}")
       end
       # mkdir_p raises AlreadyExists for BOTH "another instance won the race" and "a plain
       # FILE occupies this path", and only the first is benign. Say which, here, while the

@@ -1,5 +1,5 @@
 +++
-title = "AI 설정"
+title = "gori MCP와 AI 에이전트 설정"
 description = "MCP로 AI 에이전트를 gori에 연결합니다: 클라이언트에 서버 설치, 프로젝트 고정, 그리고 첫 요청 구동."
 weight = 30
 +++
@@ -21,16 +21,20 @@ gori mcp --install-codex         # OpenAI Codex
 gori mcp --install-agy           # Antigravity CLI
 gori mcp --install-grok          # Grok
 gori mcp --install-hermes        # Hermes
+gori mcp --install-pi            # Pi
 ```
 
 | 플래그 | 클라이언트 | 작성되는 설정 |
 |------|--------|----------------|
 | `--install-claude` | Claude Desktop | 플랫폼별 앱 설정 디렉터리의 `claude_desktop_config.json` (아래 참고) |
 | `--install-claude-code` | Claude Code | `~/.claude.json` (`mcpServers.gori`) |
-| `--install-codex` | OpenAI Codex | `~/.codex/config.toml` (`[mcp_servers.gori]`) |
+| `--install-codex` | OpenAI Codex | `~/.codex/config.toml` (`[mcp_servers.gori]`), 또는 `$CODEX_HOME` |
 | `--install-agy` | Antigravity CLI | `~/.gemini/antigravity-cli/mcp_config.json` |
 | `--install-grok` | Grok | `~/.grok/config.toml` (`[mcp_servers.gori]`) |
 | `--install-hermes` | Hermes | `~/.hermes/config.yaml` (`mcp_servers.gori`), 또는 `$HERMES_HOME` |
+| `--install-pi` | Pi | `~/.pi/agent/mcp.json` (`mcpServers.gori`), 또는 `$PI_CODING_AGENT_DIR` |
+
+Pi는 [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) 같은 MCP 어댑터가 필요합니다. `pi install npm:pi-mcp-adapter`로 어댑터를 설치한 다음 Pi를 다시 시작하세요. `--install-pi`는 MCP 서버 설정을 기록합니다.
 
 각 명령은 작성한 파일과 기록한 정확한 실행 명령을 출력합니다. Codex와 Grok은 TOML `[mcp_servers.gori]` 테이블을, Hermes는 YAML `mcp_servers:` 항목을 사용합니다(JSON이 아닙니다). 설치 후에는 클라이언트를 재시작하거나 세션을 다시 열어 MCP 서버를 다시 로드하세요.
 
@@ -40,7 +44,7 @@ gori mcp --install-hermes        # Hermes
 
 **체크포인트.** 클라이언트가 gori의 도구들(`list_history`, `send_request`, `project_info` 등)을 나열합니다. 나타나지 않으면 클라이언트를 재시작했는지, 그리고 `gori`가 클라이언트가 사용하는 `PATH`에 있는지 확인하세요.
 
-## 2. 프로젝트 바인딩 (또는 에이전트가 고르게) {#2-pin-the-right-project}
+## 2. 프로젝트 바인딩 (또는 에이전트가 고르게) {#2-bind-a-project-or-let-the-agent-pick-one}
 
 각 gori 프로젝트는 별도의 데이터베이스입니다. 설치 후 `gori mcp`는 항상 연결됩니다.
 
@@ -50,7 +54,7 @@ gori mcp --install-hermes        # Hermes
 | Git 밖 (Desktop / 전역 에이전트에서 흔함) | **unbound**로 시작. 핸드셰이크 성공; 에이전트가 트래픽 도구 전에 `list_projects` / `create_project` / `switch_project` 호출 |
 | `--project` / `--db`로 설치 | 첫 도구 호출부터 그 프로젝트 제공 |
 
-에이전트가 먼저 `project_info`를 호출하게 하세요. `bound`가 false이면 프로젝트를 나열·생성(unbound일 때 create는 자동 바인딩)하거나 switch 한 뒤, bound일 때 이름·DB 경로·선택 출처를 확인한 다음 데이터를 건드리게 합니다.
+에이전트가 먼저 `project_info`를 호출하게 하세요. `bound`가 false이면 프로젝트를 나열하거나 생성한 뒤(unbound일 때 create는 자동 바인딩), 필요하면 switch 합니다. bound이면 데이터를 변경하기 전에 이름·데이터베이스 경로·선택 출처를 확인합니다.
 
 설치 시점에 고정 engagement를 박아 두려면:
 

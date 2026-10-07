@@ -36,10 +36,6 @@ module Gori
         nil
       end
 
-      def self.replayable?(detail : Store::FlowDetail, identities : Array(Identity)) : Bool
-        skip_reason(detail, identities).nil?
-      end
-
       # `skip_reason` plus the one rung only an UNATTENDED replay adds: a request gori itself
       # sent. Every explicit path — the TUI's manual queue, `gori run authorize 42`, MCP
       # `authorize_start{flow_ids}` — deliberately does NOT ask this, because there a person
@@ -114,24 +110,28 @@ module Gori
         return false if identities.size < 2
         head = detail.request_head
         base_id = identities.find(&.baseline?) || identities.first
-        base = Authorize.overlay_head(head, Authorize.resolve_without_report(base_id))
+        # A context per identity, dial-less: nothing here goes on a wire, and a `$GEN` value
+        # differing between two identities is not what this predicate asks about.
+        base = SessionSlot.overlay_head(head, Authorize.resolve_without_report(base_id, Env::Generation.new))
         identities.any? do |id|
           next false if id.same?(base_id)
-          Authorize.overlay_head(head, Authorize.resolve_without_report(id)) != base
+          SessionSlot.overlay_head(head, Authorize.resolve_without_report(id, Env::Generation.new)) != base
         end
       end
 
-      # A human sentence for a skip reason, for the readout the tab carries.
+      # A human sentence for a skip reason, for the readout the tab carries. `:pseudo_header_head`
+      # comes only from `CacheDeception.skip_reason`; it is worded here, the one home for these.
       def self.reason_label(reason : Symbol) : String
         case reason
-        when :no_effect       then "no identity changes them"
-        when :unsafe_method   then "not a safe method to repeat"
-        when :incomplete      then "never completed"
-        when :short_circuited then "answered by gori"
-        when :gori_originated then "sent by gori, not the browser"
-        when :out_of_scope    then "outside project scope"
-        when :duplicate       then "already queued"
-        else                       reason.to_s
+        when :no_effect          then "no identity changes them"
+        when :unsafe_method      then "not a safe method to repeat"
+        when :incomplete         then "never completed"
+        when :short_circuited    then "answered by gori"
+        when :gori_originated    then "sent by gori, not the browser"
+        when :out_of_scope       then "outside project scope"
+        when :duplicate          then "already queued"
+        when :pseudo_header_head then "stored as an HTTP/2 field list, not a replayable request line"
+        else                          reason.to_s
         end
       end
 

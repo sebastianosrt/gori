@@ -1,5 +1,6 @@
 require "../spec_helper"
 require "../support/memory_backend"
+require "compress/gzip"
 
 include Gori::Tui
 
@@ -107,7 +108,7 @@ describe "RepeaterView gRPC framing failure" do
   # the READ over-paint reached this branch — a visible NORMAL block caret), so it carries the
   # READ/INS chip like every other non-hex request card. Draw and hit-test share
   # `Frame.right_badge_edge` over one badge list; this pins them together, because a chip that
-  # is drawn but not hit-testable (or the reverse) is the exact defect `␣K:KEY` had.
+  # is drawn but not hit-testable (or the reverse) is the exact defect `␣Pw:KEY` had.
   it "draws a clickable READ/INS mode chip on the request head" do
     grpc_tmp_store do |store|
       view = def_view.call(store)
@@ -178,8 +179,8 @@ describe "RepeaterView gRPC reframe toggle" do
   # the append slot, then four nibbles.
   grown = ->(view : RepeaterView) do
     view.toggle_request_hex.should be_true
-    2.times { view.hex_move(0, 1) } # nib 0 → 2, the append slot past the single byte
-    "4243".each_char { |c| view.hex_set_nibble(c) }
+    2.times { view.hex_key(hex_ev(Termisu::Input::Key::Right)) } # nib 0 → 2, the append slot past the single byte
+    "4243".each_char { |c| view.hex_key(hex_ev(c)) }
     view
   end
 
@@ -251,29 +252,38 @@ describe "RepeaterView gRPC reframe toggle" do
     end
   end
 
-  # Drawn AND hit-testable, in both halves of the gRPC branch — the defect `␣K:KEY` had, and
+  # Drawn AND hit-testable, in both halves of the gRPC branch — the defect `␣Pw:KEY` had, and
   # the state matters most exactly while the payload is being hex-edited.
-  it "draws a clickable ␣F:FRAME badge in both the MSG and HEX states" do
-    grpc_tmp_store do |store|
-      view = unary.call(store)
-      view.focus_pane(:request)
-      rect = Rect.new(0, 0, 160, 24)
-      border_y = rect.y + 3
+  # The badge's menu path is the registry's (`Hotkeys.menu_chip`, #1295): `␣` plus the keys
+  # that reach Protocol…'s reframe row, and a bare `␣` in a view nobody gave a registry.
+  it "draws a clickable FRAME badge in both the MSG and HEX states" do
+    reg = Gori::Verbs.registry
+    chip = "#{Gori::Hotkeys.menu_chip(reg, "repeater.toggle-grpc-reframe")}:FRAME"
+    chip.should eq("␣#{reg.menu_keys("repeater.toggle-grpc-reframe").not_nil!.join}:FRAME")
+    {reg, nil}.each do |registry|
+      label = registry ? chip : "␣:FRAME"
+      grpc_tmp_store do |store|
+        view = unary.call(store)
+        view.menu_registry = registry
+        view.focus_pane(:request)
+        rect = Rect.new(0, 0, 160, 24)
+        border_y = rect.y + 3
 
-      b = MemoryBackend.new(160, 24)
-      view.render(Screen.new(b), rect)
-      row = b.row(border_y)
-      row.should contain("␣F:FRAME")
-      col = row.index("␣F:FRAME").not_nil!
-      view.chrome_hit(rect, col + 1, border_y).should eq(:grpc_reframe)
+        b = MemoryBackend.new(160, 24)
+        view.render(Screen.new(b), rect)
+        row = b.row(border_y)
+        row.should contain(label)
+        col = row.index(label).not_nil!
+        view.chrome_hit(rect, col + 1, border_y).should eq(:grpc_reframe)
 
-      view.toggle_request_hex.should be_true
-      b2 = MemoryBackend.new(160, 24)
-      view.render(Screen.new(b2), rect)
-      row2 = b2.row(border_y)
-      row2.should contain("␣F:FRAME")
-      col2 = row2.index("␣F:FRAME").not_nil!
-      view.chrome_hit(rect, col2 + 1, border_y).should eq(:grpc_reframe)
+        view.toggle_request_hex.should be_true
+        b2 = MemoryBackend.new(160, 24)
+        view.render(Screen.new(b2), rect)
+        row2 = b2.row(border_y)
+        row2.should contain(label)
+        col2 = row2.index(label).not_nil!
+        view.chrome_hit(rect, col2 + 1, border_y).should eq(:grpc_reframe)
+      end
     end
   end
 
@@ -353,6 +363,27 @@ describe "RepeaterView gRPC over HTTP/1.1 (grpc-web)" do
     end
   end
 
+  # An UNEDITED grpc-web-text tab sends the captured text, whatever its spelling: re-encoding
+  # the frames normalised separately padded chunks (the shape `decode_web_text` exists for),
+  # a trailing CRLF and the URL-safe alphabet into one strict-base64 string — with `␣Pr:FRAME`
+  # off as much as on — while `gori run repeater send` and MCP sent the capture verbatim (P7).
+  it "sends an unedited grpc-web-text body verbatim, in either reframe state" do
+    grpc_tmp_store do |store|
+      frame = Bytes[0x00, 0x00, 0x00, 0x00, 0x01, 0x41]
+      [Base64.strict_encode(frame[0, 4]) + Base64.strict_encode(frame[4, 2]),
+       Base64.strict_encode(frame) + "\r\n",
+       Base64.urlsafe_encode(Bytes[0x00, 0x00, 0x00, 0x00, 0x02, 0xfb, 0xff])].each do |captured|
+        [true, false].each do |reframe|
+          view = def_web.call(store, "application/grpc-web-text", captured.to_slice)
+          view.grpc_reframable?.should be_true
+          view.toggle_grpc_reframe unless reframe
+          sent = String.new(view.request_bytes)
+          sent[(sent.index("\r\n\r\n").not_nil! + 4)..].should eq(captured)
+        end
+      end
+    end
+  end
+
   # The transcript used to read the call's outcome off the response HEAD only. grpc-web has no
   # HTTP trailers — the status is a FRAME in the body, which the rows right above already draw
   # — so the pane printed `⚠ no grpc-status trailer` directly beneath the trailer it was
@@ -371,6 +402,24 @@ describe "RepeaterView gRPC over HTTP/1.1 (grpc-web)" do
       # The STATUS row (not the trailer row above it, which always drew the raw headers).
       backend.contains?("✗ grpc-status: 7 PERMISSION_DENIED · denied").should be_true
       backend.contains?("no grpc-status trailer").should be_false
+    end
+  end
+
+  # The result body is WIRE bytes: under `Content-Encoding: gzip` the trailer frame is one
+  # decode down, and reading the coded octets printed `⚠ no grpc-status trailer` for a denial.
+  it "reads the status out of a gzipped grpc-web response" do
+    grpc_tmp_store do |store|
+      view = def_web.call(store, "application/grpc-web+proto", Bytes[0x00, 0x00, 0x00, 0x00, 0x01, 0x41])
+      io = IO::Memory.new
+      Compress::Gzip::Writer.open(io) do |gz|
+        gz.write(Gori::Proxy::H2::Grpc.frame(false, "grpc-status: 7\r\ngrpc-message: denied\r\n".to_slice, trailer: true))
+      end
+      resp_head = "HTTP/1.1 200 OK\r\nContent-Type: application/grpc-web+proto\r\nContent-Encoding: gzip\r\n\r\n"
+      resp = Gori::Proxy::Codec::Http1.parse_response_head(resp_head.to_slice)
+      view.apply(Gori::Repeater::Result.new(resp_head.to_slice, io.to_slice, resp, 5000_i64))
+      backend = MemoryBackend.new(160, 24)
+      view.render(Screen.new(backend), Rect.new(0, 0, 160, 24))
+      backend.contains?("✗ grpc-status: 7 PERMISSION_DENIED · denied").should be_true
     end
   end
 

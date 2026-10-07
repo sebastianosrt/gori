@@ -53,6 +53,18 @@ module Gori
         end
       end
 
+      # A raise that came from the CALLER's block, not from the file. `each_flow` yields from
+      # inside the walk, so without this marker the clauses that name the file would also
+      # catch a store write or a progress callback failing and report it as a corrupt HAR.
+      # Unwrapped and re-raised as itself at the top of `each_flow`.
+      private class ConsumerRaise < Exception
+        getter inner : Exception
+
+        def initialize(@inner : Exception)
+          super(@inner.message)
+        end
+      end
+
       def self.each_flow(path : String, prov : Provenance = Provenance.none,
                          cancelled : (-> Bool)? = nil, &block : Builder::FlowPair ->) : Int32
         File.open(path) do |file|
@@ -70,9 +82,35 @@ module Gori
           pull.read_end_object
           skipped || raise Gori::Error.new("HAR file missing log object")
         end
+      rescue ex : ConsumerRaise
+        # First on purpose: the two clauses that name the FILE must never get to speak for a
+        # failure that was the caller's. Re-raised as itself — whatever the block was doing,
+        # its own error is the true one.
+        raise ex.inner
       rescue ex : Stopped
         ex.skipped
       rescue ex : JSON::ParseException
+        raise Gori::Error.new("HAR file is not valid JSON: #{ex.message}")
+      rescue ex : InvalidByteSequenceError
+        # A HAR carrying one byte that is not valid UTF-8 — a browser writing a response body
+        # verbatim is the ordinary way to get one — never reaches the clause above. The pull
+        # parser reads the file through `IO#read_char`, which raises `InvalidByteSequenceError`
+        # and not a `JSON::ParseException`, so the raise ran all the way out: `import_file`
+        # rescues `File::Error` only, `CLI.run` `Gori::Error` only, and the operator got a
+        # backtrace. The whole-file parse this walk replaced built the String up front and so
+        # never met the byte here — the hole arrived with the streaming rewrite. Reported as a
+        # bad FILE, which is what it is; nothing in the HAR can be trusted past that byte.
+        raise Gori::Error.new("HAR file is not valid UTF-8: #{ex.message}")
+      rescue ex : Gori::Error
+        raise ex
+      rescue ex : IO::Error
+        # The file's own read failing (EIO, a dropped mount), not its JSON — which the clause
+        # below would mislabel. Still a `Gori::Error`: every surface rescues only that.
+        raise Gori::Error.new("cannot read HAR file: #{ex.message}")
+      rescue ex
+        # `JSON::Any.new(pull)` raises a bare `Exception` ("Unknown pull kind: EndObject") on
+        # some malformed input instead of a `JSON::ParseException`. A consumer's own raise is
+        # already out through `ConsumerRaise` above, so what lands here is the file's.
         raise Gori::Error.new("HAR file is not valid JSON: #{ex.message}")
       end
 
@@ -116,7 +154,23 @@ module Gori
           rescue
             nil
           end
-          flow ? block.call(flow) : (skipped += 1)
+          if flow
+            # The CONSUMER's raise, kept apart from the parser's. This block is the caller's —
+            # `import_har_stream` writes a chunk to SQLite and calls the progress callback in
+            # here — and `each_flow`'s rescues name the FILE. Without this, a store or UI
+            # failure carrying one of those classes came back to the operator as "HAR file is
+            # not valid UTF-8", with `import_file` then appending how many flows were written
+            # before it: a wrong diagnosis, cemented by a true-sounding detail.
+            begin
+              block.call(flow)
+            rescue ex : Stopped
+              raise ex
+            rescue ex
+              raise ConsumerRaise.new(ex)
+            end
+          else
+            skipped += 1
+          end
           if Time.instant - last_pause >= PACE_SLICE
             Fiber.yield
             last_pause = Time.instant
@@ -138,6 +192,7 @@ module Gori
 
         req_headers = headers_list(req["headers"]?)
         req_body, req_frame = post_body(req["postData"]?)
+        raw_request_head = req["_goriRawRequestHead"]?.try(&.as_s?).try { |s| Base64.decode(s) }
         # HAR's `bodySize` is the size the body had ON THE WIRE, which is not necessarily the
         # size of the text the file carries: `Export::Har` writes the true size beside a body
         # that was capped at capture time. Passing it through keeps that flow truncated
@@ -149,8 +204,10 @@ module Gori
         unless resp
           return Builder.pending_request(created_at, url, method, req_headers, req_body,
             http_version, req_declared, frame_body: req_frame,
-            source_surface: prov.surface, source_ref: prov.ref)
+            source_surface: prov.surface, source_ref: prov.ref,
+            request_head_override: raw_request_head)
         end
+        raw_response_head = resp["_goriRawResponseHead"]?.try(&.as_s?).try { |s| Base64.decode(s) }
 
         # `number_i64`, not `as_i`: a fractional `"status": 200.5` raises `TypeCastError`
         # out of `as_i`, which the per-entry rescue turned into a dropped request.
@@ -175,7 +232,7 @@ module Gori
                  elsif resp_version.starts_with?("HTTP/2")
                    ""
                  else
-                   status_reason(status)
+                   HTTP::Status.new(status).description.to_s
                  end
         resp_headers = headers_list(resp["headers"]?)
         resp_body, mime_type, resp_declared = response_body(resp)
@@ -193,7 +250,9 @@ module Gori
           status, reason, resp_headers, resp_body, content_type, duration_us,
           req_declared, resp_declared, connect_protocol(req_headers),
           resp_http_version: resp_version, frame_body: req_frame,
-          source_surface: prov.surface, source_ref: prov.ref)
+          source_surface: prov.surface, source_ref: prov.ref,
+          request_head_override: raw_request_head,
+          response_head_override: raw_response_head)
         msgs = ws_messages(entry, created_at)
         msgs.empty? ? pair : Builder::FlowPair.new(pair.request, pair.response, msgs)
       end
@@ -283,7 +342,7 @@ module Gori
         s = node.try(&.as_f?)
         return nil unless s && s.finite? && s > 0
         ms = (s * 1_000).round
-        return nil unless ms <= Int64::MAX.to_f64 / 1_000
+        return nil unless ms < Int64::MAX.to_f64 / 1_000 # strict — see `number_i64`
         ms.to_i64 * 1_000
       end
 
@@ -310,7 +369,10 @@ module Gori
         end
         f = node.as_f?
         return nil unless f && f.finite?
-        return nil unless f >= Int64::MIN.to_f64 && f <= Int64::MAX.to_f64
+        # STRICT at the top: `Int64::MAX.to_f64` rounds UP to 2^63, one more than Int64 holds,
+        # so `<=` admits exactly the value `to_i64` then overflows on. `Int64::MIN` is a power
+        # of two and converts exactly, so its bound stays inclusive.
+        return nil unless f >= Int64::MIN.to_f64 && f < Int64::MAX.to_f64
         f.to_i64
       end
 
@@ -329,7 +391,7 @@ module Gori
         # the entire entry rather than just its duration.
         return nil unless ms && ms.finite? && ms >= 0
         us = (ms * 1_000).round
-        return nil unless us <= Int64::MAX.to_f64
+        return nil unless us < Int64::MAX.to_f64 # strict — see `number_i64`
         us.to_i64
       end
 
@@ -351,6 +413,7 @@ module Gori
         arr = node.try(&.as_a?)
         return list unless arr
         arr.each do |item|
+          next unless item.as_h? # a `null` row would raise out of `[]?` and drop the entry
           name = item["name"]?.to_s
           value = item["value"]?.to_s
           next if name.empty? || name.starts_with?(':')
@@ -371,25 +434,52 @@ module Gori
       # the same head it left, or the export→import fixed point breaks and a replay carries a
       # header the capture did not (see `Builder.synthesized_length`). A `params` body IS ours to
       # frame, since we composed it.
+      #
+      # `postData: null` (a GET some exporters write) is no body, not a reason to drop the entry:
+      # `[]?` raises on a JSON null, which the per-entry rescue turned into a lost request.
       private def self.post_body(node : JSON::Any?) : {Bytes?, Bool}
-        return {nil, false} unless node
+        return {nil, false} unless node && node.as_h?
         if body = encoded_body(node["text"]?.to_s, node["encoding"]?.to_s)
           return {body, false}
         end
-        if params = node["params"]?.try(&.as_a?)
-          pairs = params.compact_map do |p|
-            name = p["name"]?.to_s
-            next if name.empty?
-            "#{URI.encode_www_form(name)}=#{URI.encode_www_form(p["value"]?.to_s)}"
-          end
-          return {pairs.join('&').to_slice, true} unless pairs.empty?
+        params = node["params"]?.try(&.as_a?).try(&.select(&.as_h?)) || return {nil, false}
+        params.reject!(&.["name"]?.to_s.empty?)
+        return {nil, false} if params.empty?
+        mime = node["mimeType"]?.to_s
+        if mime.downcase.starts_with?("multipart/form-data")
+          # The parts go out under the request's own multipart Content-Type, so they are framed
+          # with ITS boundary; without one there is no body to rebuild that it would accept.
+          m = mime.scrub.match(/boundary=(?:"([^"]+)"|([^";\s]+))/i) || return {nil, false}
+          boundary = m[1]? || m[2]
+          return {multipart_body(params, boundary), true}
         end
-        {nil, false}
+        {URI::Params.build { |f| params.each { |p| f.add(p["name"]?.to_s, p["value"]?.to_s) } }.to_slice, true}
+      end
+
+      # The part headers are gori's own framing, so a name, filename or type that could forge a
+      # header line is refused (the entry is skipped) and quotes are escaped, as OAS's does.
+      private def self.multipart_body(params : Array(JSON::Any), boundary : String) : Bytes
+        quoted = ->(s : String) { s.gsub("\\", "\\\\").gsub("\"", "\\\"") }
+        String.build do |b|
+          params.each do |p|
+            name, file, type = p["name"]?.to_s, p["fileName"]?.try(&.as_s?), p["contentType"]?.try(&.as_s?).presence
+            if {name, file, type}.any? { |v| v && Builder.inject_bytes?(v) }
+              raise Gori::Error.new("multipart param #{name.inspect} carries a control character")
+            end
+            b << "--" << boundary << "\r\n"
+            b << %(Content-Disposition: form-data; name="#{quoted.call(name)}")
+            file.try { |f| b << %(; filename="#{quoted.call(f)}") }
+            b << "\r\n"
+            type.try { |ct| b << "Content-Type: " << ct << "\r\n" }
+            b << "\r\n" << p["value"]?.to_s << "\r\n"
+          end
+          b << "--" << boundary << "--\r\n"
+        end.to_slice
       end
 
       private def self.response_body(resp : JSON::Any) : {Bytes?, String?, Int64?}
         content = resp["content"]?
-        return {nil, nil, nil} unless content
+        return {nil, nil, nil} unless content && content.as_h?
         mime = content["mimeType"]?.to_s.presence
         body = encoded_body(content["text"]?.to_s, content["encoding"]?.to_s)
         {body, mime, declared_size(content["size"]?)}
@@ -437,33 +527,21 @@ module Gori
       # of flows captured inside one second all collapsed onto the same timestamp.
       private def self.parse_started(s : String) : Int64
         return Time.utc.to_unix_ms * 1_000 unless s.presence
+        # `ArgumentError` beside `Time::Format::Error`: a well-formed stamp naming an impossible
+        # date (`2024-02-31`, hour 25) raises it, and the entry's own rescue then dropped the
+        # whole request.
         time =
           begin
             Time.parse_rfc3339(s)
-          rescue Time::Format::Error
+          rescue Time::Format::Error | ArgumentError
             begin
               Time.parse(s.gsub(/\.\d+/, ""), "%FT%T", Time::Location::UTC)
-            rescue Time::Format::Error
+            rescue Time::Format::Error | ArgumentError
               Time.utc
             end
           end
+        time = Time.utc unless Builder.representable?(time)
         time.to_unix_ms * 1_000
-      end
-
-      private def self.status_reason(status : Int32) : String
-        case status
-        when 200 then "OK"
-        when 201 then "Created"
-        when 204 then "No Content"
-        when 301 then "Moved Permanently"
-        when 302 then "Found"
-        when 400 then "Bad Request"
-        when 401 then "Unauthorized"
-        when 403 then "Forbidden"
-        when 404 then "Not Found"
-        when 500 then "Internal Server Error"
-        else          ""
-        end
       end
     end
   end

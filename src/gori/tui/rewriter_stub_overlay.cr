@@ -17,6 +17,8 @@ module Gori::Tui
   # still inside the rule form — so esc and click-away both commit, and the injected closure
   # writes the buffer back onto the form and re-opens it.
   class RewriterStubOverlay < Overlay
+    include EditorCard
+
     def initialize(text : String)
       @editor = TextArea.new(text)
     end
@@ -58,26 +60,6 @@ module Gori::Tui
       :stay
     end
 
-    # --- pointer selection (see Overlay#supports_drag?) ---
-    def supports_drag? : Bool
-      true
-    end
-
-    def handle_drag(area : Rect, mx : Int32, my : Int32) : Nil
-      return unless box = overlay_box(area)
-      @editor.click_to_cursor(editor_rect(box), mx, my, selecting: true)
-    end
-
-    def handle_double_click(area : Rect, mx : Int32, my : Int32) : Symbol
-      return :pass unless box = overlay_box(area)
-      @editor.select_word_at(editor_rect(box), mx, my) ? :stay : :pass
-    end
-
-    # Which pasted keystrokes reach this card (see `Overlay#takes_pasted?`): the whole card is the editor, so a line break is a newline.
-    def takes_pasted?(ev : Termisu::Event::Key) : Bool
-      true
-    end
-
     def handle_key(ev : Termisu::Event::Key) : Symbol
       key = ev.key
       case
@@ -93,30 +75,11 @@ module Gori::Tui
     # Home/End and passed no `selecting:` anywhere, so a multi-line HTTP response was a buffer
     # with no way to select a header line and replace it.
     private def edit(ev : Termisu::Event::Key) : Nil
-      key = ev.key
-      case
-      when key.enter?               then @editor.insert_newline
-      when ev.ctrl? && key.lower_z? then @editor.undo # the undo chord every body editor binds
-      # Before plain ⌫, which would swallow the modified form as a one-character delete.
-      when @editor.word_delete_key?(ev)  then @editor.handle_motion_key(ev)
-      when key.backspace?                then @editor.backspace
-      when key.delete?                   then @editor.delete
-      when @editor.handle_motion_key(ev) then nil
-      else
-        ch = ev.char || key.to_char
-        @editor.insert(ch) if ch && !ev.ctrl? && !ev.alt?
-      end
-    end
-
-    def set_preedit(text : String) : Nil
-      @editor.set_preedit(text)
+      @editor.handle_edit_key(ev)
     end
 
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 72}.min
-      h = {area.h - 2, 20}.min
-      return nil if w < 40 || h < 10
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      area.card?(72, 20, 40, 10)
     end
 
     # The buffer's rect inside a drawn card. Shared by `render` and the three pointer

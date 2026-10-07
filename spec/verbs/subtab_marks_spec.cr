@@ -70,11 +70,18 @@ describe "sub-tab mark verbs" do
     end
   end
 
-  it "keeps the Repeater strip's tag entry where it was" do
-    # Tagging left the strip's bare `t` (that key marks now) but NOT the menu: `space ▸ t` on
-    # the strip still opens the prompt, and with marks set it tags every marked sub-tab.
+  it "gives the menu's `t` to Mark sub-tab, the strip's own `t`, and moves Tag to `g`" do
+    # `t` on the strip MARKS a chip (this file's whole subject), and the menu's `t` tagged it:
+    # one letter, two meanings a keystroke apart. With the Sub-tabs… card (#1274 Decision 8)
+    # the menu gained the strip's mark as a row on all nine tabs, on the strip's letter, and
+    # Tag took `g`, which no strip key answers. With marks set it still tags every marked one.
     tag = r["repeater.tag-subtab"]
     tag.section.should eq(:subtab)
-    tag.menu_key.should eq('t')
+    tag.menu_key.should eq('g')
+    %w[repeater fuzz mine sequence decoder jwt cookie comparer notes].each do |prefix|
+      mark = r["#{prefix}.subtab-mark"]
+      mark.menu_key.should eq('t')
+      mark.section.should eq(:subtab)
+    end
   end
 end

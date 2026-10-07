@@ -57,10 +57,6 @@ module Gori::Tui
       @status == :paused
     end
 
-    def same?(other : DiscoverRun) : Bool
-      object_id == other.object_id
-    end
-
     # Record a finding and the slot its flow id will land in. One method, so the two arrays
     # cannot drift: an unaligned `flow_ids` would open the request/response of the WRONG
     # endpoint, which is worse than opening none.
@@ -96,10 +92,6 @@ module Gori::Tui
     def request_stop : Nil
       @stop_requested = true
       @engine.try(&.stop)
-    end
-
-    def stop_requested? : Bool
-      @stop_requested
     end
 
     def pause : Nil
@@ -154,6 +146,21 @@ module Gori::Tui
 
     getter focus : Symbol
 
+    # The empty card's pointer to where a run starts: Sitemap/History's space menu, read from
+    # the registry so the two keys (`space → > D`) follow the menu (`#set_registry`).
+    @start_hint = DiscoverView.start_hint(nil)
+
+    # "Discover here" from Sitemap/History — the one place the tab spells the menu path.
+    def self.start_hint(registry : Verb::Registry?) : String
+      Hotkeys.expand_menu_paths(registry, "start from Sitemap/History ({space:sitemap.discover} Discover here)")
+    end
+
+    getter start_hint : String
+
+    def set_registry(registry : Verb::Registry) : Nil
+      @start_hint = DiscoverView.start_hint(registry)
+    end
+
     def initialize
       @runs = [] of DiscoverRun
       @sel = 0
@@ -163,23 +170,22 @@ module Gori::Tui
       @focus = :runs
       @filter = RowFilter.new # the FINDINGS `/` filter
       @vis = [] of Int32      # visible finding indices, memoised over {run, rev, query}
-      @vis_key = {0_u64, 0, ""}
+      # The run itself, not its object_id: an id outlives a dismissed run, and a new run allocated
+      # at the same address would otherwise inherit its verdicts. Holding it also pins the address.
+      @vis_run = nil.as(DiscoverRun?)
+      @vis_rev = 0
+      @vis_q = ""
+      @vis_n = 0 # findings.size when @vis was computed — the tail `visible` resumes from
     end
 
     # --- the FINDINGS `/` filter -------------------------------------------------------------
     # A lens over the selected run's findings: `visible(r)` is the list the cursor, the draw
     # loop and every hit-test walk; the run's own array is untouched.
+    getter filter : RowFilter
+
     def filter_start : Nil
       focus_pane(:findings)
       @filter.start
-    end
-
-    def filter_editing? : Bool
-      @filter.editing?
-    end
-
-    def filter_hint : String
-      @filter.hint
     end
 
     # A key while editing. The cursor is re-anchored to the SOURCE row it was on, so a
@@ -193,15 +199,30 @@ module Gori::Tui
       true
     end
 
-    def set_filter_preedit(text : String) : Bool
-      @filter.set_preedit(text)
-    end
-
+    # Recomputed on every `rev` bump — i.e. per finding while a crawl runs — so it must not
+    # rebuild and downcase a haystack for every finding each time: 10k findings cost that per
+    # frame. The empty query (the resting state) keeps every row and builds no haystack; a
+    # live query only filters the findings appended since the last call. Appending is the
+    # only change a run makes besides `begin_run`'s clear, and both bump `rev` by exactly one,
+    # so "rev moved by as much as the list grew" is exactly "nothing but appends happened".
     private def visible(r : DiscoverRun) : Array(Int32)
-      key = {r.object_id, r.rev, @filter.query}
-      return @vis if key == @vis_key
-      @vis = (0...r.findings.size).select { |i| @filter.matches?(finding_haystack(r.findings[i])) }
-      @vis_key = key
+      q = @filter.query
+      same_run = @vis_run.same?(r)
+      return @vis if same_run && @vis_rev == r.rev && @vis_q == q
+      n = r.findings.size
+      from = 0
+      if same_run && @vis_q == q && n - @vis_n == r.rev - @vis_rev && n >= @vis_n
+        from = @vis_n # appends only: keep the verdicts already made
+      else
+        @vis = [] of Int32
+      end
+      (from...n).each do |i|
+        @vis << i if q.empty? || finding_haystack(r.findings[i]).downcase.includes?(q)
+      end
+      @vis_run = r
+      @vis_rev = r.rev
+      @vis_q = q
+      @vis_n = n
       @vis
     end
 
@@ -427,7 +448,7 @@ module Gori::Tui
       r = current
       unless r
         screen.text(inner.x + 1, inner.y,
-          "no runs — from Sitemap/History press space → \"Discover here\"", Theme.muted, Theme.bg, width: inner.w - 1)
+          "no runs — #{@start_hint}", Theme.muted, Theme.bg, width: inner.w - 1)
         return
       end
       # The badge tracks the SELECTED row, which is what ^R/^X act on — so a stopped run

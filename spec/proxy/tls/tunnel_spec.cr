@@ -493,7 +493,7 @@ describe Gori::Proxy::Tls::Tunnel do
       rules = Gori::Rules.load(store.not_nil!)
       rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
         "/stubbed", "200 OK\n\nFROM-RULE", op: Gori::Store::RuleOp::ShortCircuit)
-      rules.short_circuits?.should be_true
+      rules.short_circuits_for_host?("localhost").should be_true
       # It is NOT a body rule — the pre-#511 gate would have let this reach the h2 relay.
       rules.rewrites_request_body?.should be_false
       rules.rewrites_response_body?.should be_false
@@ -531,6 +531,71 @@ describe Gori::Proxy::Tls::Tunnel do
       File.delete?(dbpath)
       File.delete?("#{dbpath}-wal")
       File.delete?("#{dbpath}-shm")
+    end
+  end
+
+  # A short-circuit FAULT inside a MITM'd TLS tunnel (#1237). `reset` has to close the RAW
+  # socket with SO_LINGER 0: closing the TLS socket first would put a close_notify on the wire
+  # ahead of the RST, and `close` keeps the ordinary write-only close_notify + FIN.
+  {"reset", "close"}.each do |kind|
+    it "injects a #{kind} fault on a TLS connection" do
+      dir = File.tempname("gori-ca-fault")
+      dbpath = File.tempname("gori-fault", ".db")
+      seen = Channel(String).new(1)
+      done = Channel(Nil).new(1)
+      store = Gori::Store.open(dbpath)
+      raised = run_capturing do # not an `ensure`: see `with_store`
+        origin_port = start_tls_origin("FROM-ORIGIN", seen)
+        ca = CertAuthority.load_or_create(dir)
+        rules = Gori::Rules.load(store)
+        rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+          "/pay", "", op: Gori::Store::RuleOp::ShortCircuit,
+          respond: Gori::Store::RespondKind::Fault, respond_args: %({"fault":"#{kind}"}))
+
+        sink = RecordingSink.new(done)
+        proxy = Server.new("127.0.0.1", 0, sink, tls: Tunnel.new(ca, verify_upstream: false, rewriter: rules))
+        proxy.start
+
+        raw = TCPSocket.new("127.0.0.1", proxy.port)
+        raw << "CONNECT localhost:#{origin_port} HTTP/1.1\r\nHost: localhost:#{origin_port}\r\n\r\n"
+        raw.flush
+        Codec::Http1.read_head(raw).not_nil!
+
+        client_ctx = OpenSSL::SSL::Context::Client.new
+        ca_cert = Cert.read_pem(File.join(dir, "root.crt.pem"))
+        st = LibSSL.ssl_ctx_get_cert_store(client_ctx.to_unsafe)
+        LibCrypto.x509_store_add_cert(st, ca_cert.handle)
+
+        tls = OpenSSL::SSL::Socket::Client.new(raw, context: client_ctx, sync_close: true, hostname: "localhost")
+        tls << "GET /pay HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        tls.flush
+        done.receive
+        raw.read_timeout = 5.seconds
+        outcome = begin
+          tls.gets_to_end.empty? ? "eof" : "bytes"
+        rescue ex : IO::Error | OpenSSL::SSL::Error
+          # Windows words a reset as "An existing connection was forcibly closed by the remote host".
+          msg = ex.message.to_s.downcase
+          msg.includes?("reset") || msg.includes?("forcibly closed") ? "reset" : "error: #{ex.message}"
+        end
+        tls.close rescue nil
+        proxy.stop
+
+        # Crystal's Windows sockets read a reset as EOF (`connreset_is_error: false`); the
+        # recorded error below still tells the two apart there.
+        outcome.should eq(kind == "reset" && !{{ flag?(:win32) }} ? "reset" : "eof")
+        sink.requests.first.short_circuited?.should be_true
+        sink.responses.first.error.not_nil!.should start_with("injected #{kind} by project rule #")
+        select
+        when seen.receive
+          fail "gori reached the origin for a faulted request"
+        else
+        end
+      end
+      store.close
+      FileUtils.rm_rf(dir) if Dir.exists?(dir)
+      delete_db_files(dbpath)
+      raise raised if raised
     end
   end
 

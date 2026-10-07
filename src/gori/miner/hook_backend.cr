@@ -1,4 +1,5 @@
 require "../env"
+require "../session_refresh/hook"
 require "../process_hook"
 require "../fuzz/engine"
 require "./inject"
@@ -53,7 +54,7 @@ module Gori::Miner
   # fork+exec+wait to every one of those RTTs, on the worker fiber that owns the send. That is
   # the arithmetic change #818 disclosed for Probe's `exec` running per flow on the analyzer
   # fiber, and it is the same trade here.
-  class HookBackend < Fuzz::Backend
+  class HookBackend < Fuzz::WrapperBackend
     # Prefix on a hook-failure error string so `Miner.permanent_refusal?` can keep a broken
     # command from being RE-forked on every retry — a spawn failure will not fix itself in a
     # `retry_pause`, and a timeout re-run only multiplies the cost. The rest of the string is
@@ -64,43 +65,22 @@ module Gori::Miner
                    @env : Hash(String, String)? = nil)
     end
 
-    def origin : Fuzz::Origin
-      @inner.origin
-    end
-
-    # Delegated (not defaulted) like every other wrapper backend: this is what the Engine holds
-    # through `CappedBackend`, so a `false`/`0`/nil stopping here would misreport every gated
-    # or pooled run underneath it. See `Fuzz::Backend#evidence?`.
-    def blocked : Int64
-      @inner.blocked
-    end
-
-    def blocked_reason : String?
-      @inner.blocked_reason
-    end
-
-    def extra_requests : Int64
-      @inner.extra_requests
-    end
-
-    def evidence? : Bool
-      @inner.evidence?
-    end
-
-    def close : Nil
-      @inner.close
-    end
-
-    def send(bytes : Bytes) : Repeater::Result
-      send(bytes, nil)
-    end
-
     def send(bytes : Bytes, verbatim : Array({Int32, Int32})?) : Repeater::Result
       spans = @inner.evidence? ? Fuzz::Backend.all_verbatim(bytes) : verbatim
-      prepared = Gori::Env.expand_bindings(bytes, spans)
+      # ONE context across both passes, as `Fuzz::Sender#send` holds it, naming the dial so a
+      # `$GEN.USER_AGENT` agrees with the TLS preset the inner sender will present (#1153).
+      # The active slot's before-send refresh (#1233): this backend runs the binding pass and the
+      # overlay ITSELF (the inner sender's overlay is off), so it asks here, before both.
+      Gori::SessionRefresh.before_send(Gori::Env.active_slot_name)
+      origin = @inner.origin
+      gen = Gori::Env::Generation.for_dial(origin.host, origin.scheme, @inner.as?(Fuzz::Sender).try(&.tls_preset))
+      prepared = Gori::Env.expand_bindings(bytes, spans, generation: gen)
       # The active slot's identity headers, BEFORE the hook signs them (the inner sender's own
       # overlay is off — see the class comment). A no-op when no slot is active.
-      prepared = Gori::Env.overlay_slot(prepared)
+      prepared = Gori::Env.overlay_slot(prepared, gen)
+      # ...and the `chrome` preset's client hints (#1174), also before the hook, so a signature
+      # over the headers covers them. The inner sender's own pass then finds them and adds none.
+      prepared = Gori::Env.client_hints(prepared, gen)
       sent, reason = Inject.hook(prepared, @argv, @timeout, @env)
       if sent.nil?
         # A hook that could not run is a SKIP with a reported reason, never a clean negative:

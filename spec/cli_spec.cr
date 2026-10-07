@@ -5,7 +5,7 @@ require "file_utils"
 # here — CLI.run itself starts a TUI / server or calls `exit`, so it is not spec-callable.
 #
 # `global_version_flag?` is private; expose it the way the other CLI specs expose theirs
-# (spec/cli/run/links_spec.cr does the same for resolve_link_ends / parse_link_id).
+# (spec/cli/run/links_spec.cr does the same for resolve_link_ends / parse_id).
 module Gori::CLI
   # Mirrors what CLI.run does: split off the top-level subcommand, then ask about the tail. Kept
   # at full-argv granularity so these cases read as real command lines.
@@ -202,7 +202,7 @@ end
 # The `--` separator used to switch every guard above back off. OptionParser strips the run
 # after it and hands it over as a SECOND list, which `gori settings` discarded — so two
 # characters turned each of these back into the silent-no-op-at-exit-0 the guards exist to
-# stop. `gori wizard` / `gori tutorial` already handled it (reject_extra_args); settings did not.
+# stop. `gori wizard` / `gori tutorial` already handled it (now `refuse_leftovers`); settings did not.
 describe "gori settings — arguments after a `--` separator" do
   it "sees a flag pushed past `--` as the stray argument it is" do
     # `gori settings -- --edit` printed the settings path and exited 0, editor never opened.
@@ -257,6 +257,7 @@ end
 # DELETES `env` (token values) and `decoder` in place, says "wrote <path>", and exits 0.
 describe "gori settings export — same-file detection for -o" do
   it "matches the same file through `..`, a relative path and a symlink" do
+    posix_only!("File.symlink needs Developer Mode")
     dir = File.tempname("gori-cli-samefile")
     Dir.mkdir_p(File.join(dir, "home"))
     settings = File.join(dir, "home", "settings.json")
@@ -367,7 +368,7 @@ describe "gori run — the `--` half of unknown_args" do
   it "is bound by every subcommand parser" do
     dir = File.join(__DIR__, "..", "src", "gori", "cli", "run")
     offenders = [] of String
-    Dir.glob(File.join(dir, "**", "*.cr")).sort.each do |path|
+    glob_files(dir, "**", "*.cr").sort.each do |path|
       File.read_lines(path).each_with_index do |line, i|
         next unless line.includes?("unknown_args")
         # The second block parameter discarded as `_` — the whole defect, in one token.

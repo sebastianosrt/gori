@@ -65,7 +65,7 @@ module Gori
           control = results[plan.params.size]?
           # No usable control ⇒ no attribution. Refuse rather than fall back to the captured status:
           # that fallback IS the false positive this leg exists to remove.
-          return [] of Detection unless control && control.ok?
+          return [] of Detection unless control && Evidence.complete?(control)
           # The canonical path serves 2xx now too ⇒ the gate is simply open (a transient/rate-limited
           # 403 that cleared), and every variant "flip" below is that same clearing, not a bypass.
           return [] of Detection if (200..299).includes?(probe_status(control))
@@ -73,7 +73,7 @@ module Gori
           hits = [] of String
           plan.params.each_with_index do |param, i|
             r = results[i]?
-            next unless r && r.ok?
+            next unless r && Evidence.complete?(r)
             next unless (200..299).includes?(probe_status(r))
             hits << param.name
           end
@@ -110,7 +110,7 @@ module Gori
         # or the ACTIVE↔AGGRESSIVE backfill re-arm would skip an already-seen surface and never send the
         # extra variant. Stays byte-identical to plan's key for the SAME opts (equivalence invariant).
         private def key_string(detail : Store::FlowDetail, method_upcase : String, path : String, opts : Options) : String
-          "path_normalization_bypass|#{detail.row.host}:#{detail.row.port}|#{method_upcase}|#{path}#{opts.aggressive ? "|aggr" : ""}"
+          endpoint_key(detail, method_upcase, path, tag: opts.aggressive ? "aggr" : nil)
         end
 
         # Deterministic normalization variants of `path` (each {short label, rewritten path}). Every
@@ -127,42 +127,6 @@ module Gori
           ]
           base << {"semicolon", "#{path};"} if aggressive # /admin; -> /admin (empty path param)
           base
-        end
-
-        private def path_only(origin_target : String) : String
-          qi = origin_target.index('?')
-          qi ? origin_target[0...qi] : origin_target
-        end
-
-        private def probe_status(result : Repeater::Result) : Int32
-          if r = result.response
-            return r.status
-          end
-          Proxy::Codec::Http1.parse_response_head(result.head).status
-        rescue
-          0
-        end
-
-        # Rebuild the request with a new request-line target; headers/body untouched (no CL change).
-        private def rebuild_target(head : Bytes, body : Bytes?, new_target : String) : Bytes
-          combined = if body && !body.empty?
-                       io = IO::Memory.new(head.size + body.size)
-                       io.write(head)
-                       io.write(body)
-                       io.to_slice
-                     else
-                       head
-                     end
-          hbytes, bbytes, eol = Miner::Inject.split(combined)
-          lines = String.new(hbytes).split(eol)
-          unless lines.empty?
-            parts = lines[0].split(' ')
-            lines[0] = "#{parts[0]} #{new_target} #{parts[2]}" if parts.size == 3
-          end
-          io = IO::Memory.new
-          io << lines.join(eol) << eol << eol
-          io.write(bbytes) unless bbytes.empty?
-          io.to_slice
         end
       end
     end

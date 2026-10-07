@@ -1,4 +1,5 @@
 require "./screen"
+require "./line_edit"
 require "./theme"
 require "./frame"
 require "./highlight"
@@ -86,11 +87,12 @@ module Gori::Tui
       @styled_kind = nil.as(Symbol?)
       @styled_rev = Theme.revision
       @styled_env_rev = Env.highlight_rev
-      @gutter = false          # left line-number gutter (on for the Repeater request body)
-      @search_hl = ""          # active ^F query → matches highlighted in render
-      @reveal = false          # show whitespace (space ·, tab →) instead of syntax colours
-      @edits = 0               # monotonic content-change counter — cheap cache key for owners
-      @lc_lines = [] of String # downcased lines for ^F search, memoized on @edits
+      @gutter = false                     # left line-number gutter (on for the Repeater request body)
+      @search_hl = ""                     # active ^F query → matches highlighted in render
+      @search_memo = Wrap::SearchMemo.new # that query's whole-line scans, kept across frames
+      @reveal = false                     # show whitespace (space ·, tab →) instead of syntax colours
+      @edits = 0                          # monotonic content-change counter — cheap cache key for owners
+      @lc_lines = [] of String            # downcased lines for ^F search, memoized on @edits
       @lc_lines_rev = -1
       # Opt-in background tints: [start, end) FULL-buffer char offsets + colour, painted
       # UNDER the text (over syntax/plain, beneath search + cursor). Empty for every editor
@@ -132,6 +134,13 @@ module Gori::Tui
       # wire will carry literally is not painted — or tooltipped — as a resolved variable.
       # Fed by the Repeater's evidence baseline; see `RepeaterView#operator_env_vars`.
       @env_literal_names = Set(String).new
+      # The bytes that set was derived FROM and the grammar revision it was derived UNDER (see
+      # `env_literal_source=`): nil source ⇒ the set is whatever an owner assigned.
+      @env_literal_source = nil.as(String?)
+      @env_literal_rev = Env.highlight_rev
+      # The namespaces this editor's send path actually resolves — all of them unless an owner
+      # narrows it (`env_complete_namespaces=`).
+      @env_complete_namespaces = Env::Namespace.values
       @env_complete = nil.as(EnvComplete?)
       # Opt-in `$ENV` value peek (nil = disabled). Paired with @env_complete — the same
       # request editors get it. Shows the resolved value of a COMPLETE `$KEY` token under
@@ -152,13 +161,27 @@ module Gori::Tui
     end
 
     setter gutter : Bool
-    setter search_hl : String
-    setter reveal : Bool
+
+    # An empty query frees the memo's whole-line scans now, not at this pane's next render: a
+    # pane that is not drawn again (the Repeater's hidden decoded/editor twin) would keep them.
+    def search_hl=(q : String) : Nil
+      @search_hl = q
+      @search_memo.clear if q.empty?
+    end
+
     setter bg_regions : Array({Int32, Int32, Color})
     # Enable horizontal cursor-following (the Decoder/JWT inputs); off everywhere
     # else, so those editors keep @xscroll == 0 and their hot render path unchanged.
     # Ignored while wrap is on — a wrapped line has nothing off to the side.
     setter follow_x : Bool
+
+    def reveal=(on : Bool) : Nil
+      return if @reveal == on
+      @reveal = on
+      @wrap_cache.clear
+      @wrap_rev = -1
+      @xscroll = 0
+    end
 
     # …and ON, unasked, for an editor that opted into wrap while the Display preference has
     # wrap switched off. Every one of those panes REPLACED a `follow_x` pan when it started
@@ -280,10 +303,6 @@ module Gori::Tui
       @preedit = text
     end
 
-    def preedit : String
-      @preedit
-    end
-
     # Split `text` into the CR-free line projection + the exact terminator that followed each
     # line. `lines[i] + eols[i]` concatenated is `text`, byte for byte, always — including the
     # pathological `"a\r\r\n"` (line `"a"`, eol `"\r\r\n"`), which the old rstrip silently
@@ -361,6 +380,12 @@ module Gori::Tui
 
     def lines_snapshot : Array(String)
       @lines.map(&.itself)
+    end
+
+    # The buffer's lines, lazily and without a copy — for a caller that reads a PREFIX of the
+    # document (a title, a label) and must not pay `text`'s whole-buffer join to get it.
+    def each_line : Iterator(String)
+      @lines.each
     end
 
     # First line with non-whitespace content — used to derive a label/preview
@@ -529,6 +554,19 @@ module Gori::Tui
       set_text(with_wire_eols(lf_text))
     end
 
+    # A decoded request edit can change the BODY's line count while the request HEAD still needs
+    # its captured terminators. Keep the exact head eols when the transform crossed that boundary;
+    # new body lines use LF because their old counterparts no longer have a reliable one-to-one
+    # mapping. Same-line transforms continue through `set_text_keeping_eols` above, preserving
+    # the body's mixed endings too.
+    def set_text_keeping_head_eols(lf_text : String) : Nil
+      wire = with_wire_eols(lf_text)
+      if wire == lf_text && @eols.any? { |e| e != "\n" && !e.empty? }
+        wire = with_wire_head_eols(lf_text)
+      end
+      set_text(wire)
+    end
+
     # ditto, for the transforms that must stay ONE undoable edit (marker strip).
     def replace_all_keeping_eols(lf_text : String, caret : Int32) : Nil
       replace_all(with_wire_eols(lf_text), caret)
@@ -542,6 +580,25 @@ module Gori::Tui
         parts.each_with_index do |p, i|
           io << p
           io << @eols[i]
+        end
+      end
+    end
+
+    private def with_wire_head_eols(lf_text : String) : String
+      parts = lf_text.split('\n')
+      old_blank = @lines.index(&.empty?) || return lf_text
+      new_blank = parts.index(&.empty?) || return lf_text
+      return lf_text unless old_blank == new_blank
+      return lf_text unless @eols[old_blank]? && !@eols[old_blank].empty?
+
+      String.build do |io|
+        parts.each_with_index do |part, i|
+          io << part
+          if i <= new_blank
+            io << @eols[i]
+          elsif i < parts.size - 1
+            io << '\n'
+          end
         end
       end
     end
@@ -1027,7 +1084,7 @@ module Gori::Tui
       # visible window, which is @xscroll columns into the full line (always 0 under wrap).
       target = mx - (rect.x + gw) + @xscroll
       line = @lines[@cy]
-      cr = @conceal_spans.empty? ? nil : line_conceal(line_start_offset(@cy), line.size)
+      cr = @reveal || @conceal_spans.empty? ? nil : line_conceal(line_start_offset(@cy), line.size)
       # `Wrap.row_index` is the exact inverse of `Wrap.row_col`, which is what the caret,
       # the selection tint and the search overdraw all measure with — so a click lands on
       # the cell the caret would paint, on a continuation row as much as on a first row. It
@@ -1035,7 +1092,7 @@ module Gori::Tui
       # start and never an unseen `¦chain` char; it clamps to the row's own end, so a click
       # past the text of a wrapped row stops at the break instead of running into the next
       # row's characters.
-      @cx = Wrap.row_index(line, cr, vr.a, vr.b, target, nearest: true)
+      @cx = Wrap.row_index(line, cr, vr.a, vr.b, target, nearest: true, reveal: @reveal)
       snap_cx_out_of_conceal(0) # a click on the closing-§ column resolves to it; nudge to a legal rest
       break_run                 # a caret move ends the typing run — see push_undo
       env_complete_close
@@ -1063,26 +1120,8 @@ module Gori::Tui
       return false if @lines.empty?
       @cy = @cy.clamp(0, @lines.size - 1)
       line = @lines[@cy]
-      cx = @cx.clamp(0, line.size)
-      # `Screen.column_for_click` rounds a POINTER to the NEAREST cluster boundary, so a
-      # double-click on the RIGHT half of a WIDE glyph — a Hangul syllable, a CJK ideograph:
-      # half of every pointer position over such text — resolves to the position AFTER it,
-      # where the word may have already ended and there is no token to take. Step back over
-      # that one glyph, and ONLY when it is wide: a 1-column cluster cannot be rounded past,
-      # so every ASCII gesture is bit-for-bit what it was (including "a double-click on a
-      # space takes nothing", which is this method's stated contract).
-      cx = Screen.step_back_over_wide(line, cx)
-      return false if cx >= line.size || line[cx].whitespace?
-      word = word_char?(line[cx])
-      a = cx
-      while a > 0 && !line[a - 1].whitespace? && word_char?(line[a - 1]) == word
-        a -= 1
-      end
-      b = cx
-      while b < line.size && !line[b].whitespace? && word_char?(line[b]) == word
-        b += 1
-      end
-      return false if a == b
+      return false unless span = LineEdit.word_span(line, @cx)
+      a, b = span
       @sel_anchor = {@cy, a}
       @cx = b
       snap_cx_to_cluster(1)
@@ -1175,6 +1214,16 @@ module Gori::Tui
       env_complete_close
     end
 
+    # Select {y0, x0}…{y1, x1} as an INSERT-mode selection, caret at the far end. The way a
+    # READ-mode edit hands its span to the editor's own ⌫ (`ReadEdit.delete_selection`), so the
+    # cut runs through the same path a typed ⌫ over a ⇧arrow selection takes. Pure navigation:
+    # no undo, no `edits` bump.
+    def select_span(y0 : Int32, x0 : Int32, y1 : Int32, x1 : Int32) : Nil
+      place_cursor(y1, x1)
+      ay = y0.clamp(0, @lines.size - 1)
+      @sel_anchor = {ay, x0.clamp(0, @lines[ay].size)}
+    end
+
     def line_count : Int32
       @lines.size
     end
@@ -1217,14 +1266,32 @@ module Gori::Tui
       true
     end
 
-    # A modified ⌫. The `char` half is load-bearing: a terminal sends ⌥⌫ as ESC + 0x7F, and
-    # termisu's Alt-prefix branch maps the payload through `Key.from_char`, which has no name
-    # for DEL — so it arrives as `Key::Unknown` + Alt carrying that char, not as Backspace.
+    # A modified ⌫ — `LineEdit.word_delete_key?`, which says why the `char` half matters.
     def word_delete_key?(ev : Termisu::Event::Key) : Bool
-      return false unless ev.ctrl? || ev.alt?
-      return true if ev.key.backspace?
-      c = ev.char
-      !!c && (c == '\u{7F}' || c == '\b')
+      LineEdit.word_delete_key?(ev)
+    end
+
+    # The whole keymap of an editor that IS its card's surface (the Rewriter stub, the Discover
+    # headers, …): ↵ a newline (an owner that gives ↵ another meaning answers it first), ^Z
+    # undo, then `handle_motion_key`, ⌫/Del and a printable. ↑/↓ have no pane to cross into,
+    # so they are the motion keymap's too. `TextField#handle_edit_key`'s multi-line
+    # counterpart; true when consumed.
+    def handle_edit_key(ev : Termisu::Event::Key) : Bool
+      key = ev.key
+      case
+      when key.enter?               then insert_newline
+      when ev.ctrl? && key.lower_z? then undo # the undo chord every body editor binds
+      # Before plain ⌫, which would swallow the modified form as a one-character delete.
+      when word_delete_key?(ev)  then handle_motion_key(ev)
+      when key.backspace?        then backspace
+      when key.delete?           then delete
+      when handle_motion_key(ev) then nil
+      else
+        ch = ev.char || key.to_char
+        return false unless ch && !ev.ctrl? && !ev.alt?
+        insert(ch)
+      end
+      true
     end
 
     # One screenful for `page`, taken from the LAST RENDERED viewport height so the step
@@ -1237,14 +1304,22 @@ module Gori::Tui
 
     # Replace one line in-place (cursor clamped when on that row). Used by Repeater to
     # resync a lone Content-Length header without resetting the whole buffer.
-    def replace_line(idx : Int32, content : String) : Nil
+    #
+    # `fold: true` takes no undo snapshot: the rewrite joins the step of the edit that caused
+    # it. Only for a line DERIVED from the rest of the buffer (the auto Content-Length), which
+    # the owner re-derives after an undo too. As a step of its own it left a snapshot taken
+    # between a keystroke and its reflection, so ⌃Z landed on a Content-Length that matched
+    # neither body (#1417), and the forced push ended every typing run. A line the operator
+    # could want back on its own must not fold: nothing else would ever restore it.
+    def replace_line(idx : Int32, content : String, fold : Bool = false) : Nil
       return if idx < 0 || idx >= @lines.size
       return if @lines[idx] == content
-      push_undo
+      push_undo unless fold
       @lines[idx] = content
       if @cy == idx
         @cx = @cx.clamp(0, content.size)
         snap_cx_to_cluster(0) # the replacement line re-clusters under the old index
+        break_run             # the run's {cy, cx} named a line that is now different
       end
       @styled = nil
       @edits += 1
@@ -1363,7 +1438,12 @@ module Gori::Tui
     # the hairline); `gauge_focused` brightens the thumb when this pane holds focus.
     def render(screen : Screen, rect : Rect, cursor : Bool, highlight : Symbol? = nil, peek : Bool = false,
                gauge : Bool = false, gauge_focused : Bool = false) : Nil
-      return if rect.empty?
+      # Nothing drawn means no drawn rows: kept, the last frame's rows let READ chrome paint a
+      # caret from a taller layout onto the borders after the pane shrank to nothing (#1433).
+      if rect.empty?
+        @last_rows = [] of VRow
+        return
+      end
       @last_h = rect.h                                           # remembered for scroll_view (wheel) clamping
       gw = @gutter ? {Gutter.width(@lines.size), rect.w}.min : 0 # never exceed the pane
       cx0 = rect.x + gw                                          # content start x (after the optional gutter)
@@ -1386,6 +1466,7 @@ module Gori::Tui
         ensure_visible_x(cw) # slide @xscroll so the caret stays on screen (no-op unless follow_x?)
       end
       styled = highlight ? highlighted(highlight) : nil
+      @search_memo.clear if @search_hl.empty?
       rows = visible_rows(cw, rect.h)
       @last_rows = rows
       # The visual row the caret lives on, decided ONCE by Wrap::Layout#row_of — the same
@@ -1486,7 +1567,7 @@ module Gori::Tui
           # constant (the two editors with conceal both wrapped); the Display preference can
           # now send them down this path.
           Wrap.mark_search(screen, cx0, rect.y + i, line, a, b, @search_hl, cx0 + cw, cr,
-            xoff: @xscroll)
+            xoff: @xscroll, memo: @search_memo, reveal: @reveal)
         end
         # The INS selection tint, over the text and the search marks, under the caret —
         # the same stacking (and the same `Theme.accent_bg`) the READ-mode over-painter
@@ -1505,7 +1586,7 @@ module Gori::Tui
         # exactly: `@cx` rests only on cluster boundaries (snap_cx_to_cluster), so this is
         # single-valued and Wrap.row_index inverts it. Measured from the ROW's first char,
         # which is char 0 of the line whenever nothing wrapped.
-        prefix_w = Wrap.row_col(line, cr, a, ci)
+        prefix_w = Wrap.row_col(line, cr, a, ci, reveal: @reveal)
         # Unwrapped editors draw the preedit AFTER the buffer text without it being part of
         # `line`, so its width is added here; under wrap `drawn_line` already spliced it in.
         preedit_w = wrapping? ? 0 : Screen.draw_width(@preedit)
@@ -1600,11 +1681,11 @@ module Gori::Tui
     # `Wrap::Layout` stores no per-row table for an ASCII line — but together they make the
     # common case (a big ASCII body, scrolled) O(1) per row with no allocation at all.
     private def layout_of(li : Int32, cw : Int32) : Wrap::Layout
-      cr = @conceal_spans.empty? ? nil : line_conceal(line_start_offset(li), @lines[li].size)
+      cr = @reveal || @conceal_spans.empty? ? nil : line_conceal(line_start_offset(li), @lines[li].size)
       # The caret line while an IME is composing changes with every jamo WITHOUT bumping
       # @edits, so it must never enter the memo — a stale layout there desyncs the caret
       # from the row it is drawn on.
-      return Wrap.layout(drawn_line(li), cw, cr) if li == @cy && !@preedit.empty?
+      return Wrap.layout(drawn_line(li), cw, cr, reveal: @reveal) if li == @cy && !@preedit.empty?
       if @wrap_rev != @edits || @wrap_w != cw
         @wrap_cache.clear
         @wrap_rev = @edits
@@ -1614,7 +1695,7 @@ module Gori::Tui
         return hit
       end
       @wrap_cache.clear if @wrap_cache.size >= WRAP_CACHE_CAP
-      @wrap_cache[li] = Wrap.layout(@lines[li], cw, cr)
+      @wrap_cache[li] = Wrap.layout(@lines[li], cw, cr, reveal: @reveal)
     end
 
     # A `Wrap` layout provider bound to this buffer at content width `cw`.
@@ -1647,11 +1728,6 @@ module Gori::Tui
       @scroll = @scroll.clamp(0, @lines.size - 1)
       csub = layout_of(@cy, cw).row_of(caret_index(@cy))
       @scroll, @scroll_sub = Wrap.ensure_visible(@scroll, @scroll_sub, @cy, csub, h, layout_fn(cw))
-    end
-
-    # Place the anchor `back` visual rows above (li, sub).
-    private def anchor_back_from(li : Int32, sub : Int32, back : Int32, cw : Int32) : Nil
-      @scroll, @scroll_sub = Wrap.step_back(li, sub, back, layout_fn(cw))
     end
 
     # Move the anchor `step` visual rows (negative = up), stopping at the buffer's ends.
@@ -1687,10 +1763,11 @@ module Gori::Tui
                    else
                      ->(i : Int32) : Array({Int32, Int32})? { line_conceal(line_start_offset(i), @lines[i].size) }
                    end
+      conceal_at = nil if @reveal
       Wrap.step_caret(@cy, @cx, dr, @lines.size,
         ->(i : Int32) { @lines[i] },
         ->(i : Int32) { layout_of(i, cw) },
-        conceal_at)
+        conceal_at, reveal: @reveal)
     end
 
     # The composing caret line as spans: buffer text, the preedit underlined, buffer text —
@@ -1731,7 +1808,7 @@ module Gori::Tui
       # a cursor move mid-token) must not hide the peek.
       dropdown_visible = cursor && ec && ec.open?
       if (cursor || peek) && (cc = caret_cell) && !dropdown_visible && (tok = env_token_at_cursor)
-        ep.set(tok[0], tok[1], Settings.env_prefix)
+        ep.set(tok[0], tok[1])
         ep.render(screen, cc[0], cc[1], rect)
       else
         ep.close
@@ -1825,10 +1902,12 @@ module Gori::Tui
     def read_caret_cell(li : Int32, cx : Int32, row_start : Int32 = 0) : {Int32, Char | String}
       line = @lines[li]? || ""
       cr = conceal_of(li)
-      col = Wrap.row_col(line, cr, row_start, cx)
+      col = Wrap.row_col(line, cr, row_start, cx, reveal: @reveal)
       r = cx
       cr.each { |(ra, rb)| r = rb if r >= ra && r < rb } if cr
-      {col, Screen.caret_glyph(line, r)}
+      glyph = Screen.caret_glyph(line, r)
+      shown = @reveal ? (Reveal.visible_grapheme(glyph.to_s) || glyph) : glyph
+      {col, shown}
     end
 
     # Paint `[x0, x1)` of line `li` on the selection background, clipped to the drawn row
@@ -1878,15 +1957,16 @@ module Gori::Tui
                                 cr : Array({Int32, Int32})?, row_start : Int32,
                                 s : Int32, e : Int32, cw : Int32) : Nil
       return if s >= e
-      from = Wrap.row_col(line, cr, row_start, s) - @xscroll
-      to = {Wrap.row_col(line, cr, row_start, e) - @xscroll, cw}.min
+      from = Wrap.row_col(line, cr, row_start, s, reveal: @reveal) - @xscroll
+      to = {Wrap.row_col(line, cr, row_start, e, reveal: @reveal) - @xscroll, cw}.min
       seg = line[s...e]
       if from < 0 # h-scrolled off the left edge (unwrapped follow_x editors only)
-        seg = Highlight.slice_left_text(seg, -from)
+        seg = @reveal ? Reveal.slice_left_text(seg, -from) : Highlight.slice_left_text(seg, -from)
         from = 0
       end
       return if from >= to || seg.empty?
-      screen.text(cx0 + from, y, seg, Theme.text, Theme.accent_bg, width: to - from)
+      shown = @reveal ? Reveal.rendered_text(seg) : seg
+      screen.text(cx0 + from, y, shown, Theme.text, Theme.accent_bg, width: to - from)
     end
 
     # Overlay the bg_regions intersecting THIS line. `off0` is the line's start offset
@@ -1914,12 +1994,12 @@ module Gori::Tui
         la = (a - off0).clamp(rs, re)
         lb = (b - off0).clamp(rs, re)
         next if la >= lb
-        start_col = Wrap.row_col(line, nil, rs, la) - @xscroll
-        end_col = Wrap.row_col(line, nil, rs, lb) - @xscroll
+        start_col = Wrap.row_col(line, nil, rs, la, reveal: @reveal) - @xscroll
+        end_col = Wrap.row_col(line, nil, rs, lb, reveal: @reveal) - @xscroll
         draw_from = {start_col, 0}.max
         draw_to = {end_col, cw}.min
         next if draw_from >= draw_to
-        seg = Highlight.slice_left_text(line[la, lb - la], draw_from - start_col)
+        seg = @reveal ? Reveal.slice_left_text(line[la, lb - la], draw_from - start_col) : Highlight.slice_left_text(line[la, lb - la], draw_from - start_col)
         screen.text(cx0 + draw_from, y, seg, Theme.marker_fg, color, width: draw_to - draw_from)
       end
     end
@@ -1939,7 +2019,7 @@ module Gori::Tui
         la = (a - off0).clamp(rs, re)
         lb = (b - off0).clamp(rs, re)
         next if la >= lb
-        col = Wrap.row_col(line, cr, rs, la) # display columns before the first drawn char, within this row
+        col = Wrap.row_col(line, cr, rs, la, reveal: @reveal) # display columns before the first drawn char, within this row
         i = la
         while i < lb
           hit = cr.find { |(ra, rb)| i >= ra && i < rb }
@@ -1947,7 +2027,7 @@ module Gori::Tui
             i = hit[1] # skip the hidden run in one hop
             next
           end
-          w = Screen.grapheme_cols(line[i].to_s)
+          w = @reveal ? Reveal.grapheme_cols(line[i].to_s) : Screen.grapheme_cols(line[i].to_s)
           sx = cx0 + col - @xscroll
           if sx >= cx0 && sx < cx0 + cw
             accent = cr.any? { |(_, rb)| rb == i } # char immediately after a concealed run = closing §
@@ -2046,7 +2126,7 @@ module Gori::Tui
     # safe direction — it can only increase, staying clear of the `(a, b]` no-rest zone,
     # whereas rounding down would land on `b` itself, the one index this exists to avoid.
     private def snap_cx_out_of_conceal(dir : Int32) : Nil
-      return if @conceal_spans.empty?
+      return if @reveal || @conceal_spans.empty?
       line = @lines[@cy]
       line_conceal(line_start_offset(@cy), line.size).each do |(a, b)|
         next unless @cx > a && @cx <= b
@@ -2093,6 +2173,10 @@ module Gori::Tui
     # above the viewport changes how the visible ones read), so styling a window of it in
     # isolation would be wrong rather than merely slower.
     private def highlighted(kind : Symbol) : Highlight::Windowed
+      # Read the literal set FIRST: it re-derives itself when the grammar moved (and drops the
+      # styled cache when the answer changed), and doing that inside the assignment below would
+      # have it invalidating the very buffer being built.
+      literal = env_literal_names
       cached = @styled
       env_rev = Env.highlight_rev
       return cached if cached && @styled_kind == kind && @styled_rev == Theme.revision && @styled_env_rev == env_rev
@@ -2107,7 +2191,7 @@ module Gori::Tui
         else
           request = kind == :request
           Highlight.from_lines_windowed(@lines, request,
-            env_tokens: request, literal: @env_literal_names)
+            env_tokens: request, literal: literal)
         end
     end
 
@@ -2139,7 +2223,7 @@ module Gori::Tui
       pw = Screen.draw_width(@preedit)
       # On a concealed line, measure in CONCEALED columns — the hidden ¦chain doesn't take
       # cells, so the caret window must be sized/positioned against what's actually drawn.
-      cr = @conceal_spans.empty? ? nil : line_conceal(line_start_offset(@cy), line.size)
+      cr = @reveal || @conceal_spans.empty? ? nil : line_conceal(line_start_offset(@cy), line.size)
       concealed = cr && !cr.empty?
       # draw_width (not display_width) to match the actual draw: a raw control char
       # occupies one drawn cell, so measuring it as width 0 here would let the caret render
@@ -2153,13 +2237,13 @@ module Gori::Tui
       # (snap_cx_to_cluster) and every measure here, in `cxs`/`prefix_w`, and in
       # Highlight.slice_left is draw_width, so the window, the slice and the caret finally
       # agree — that reconciliation was the caret-model change this comment used to defer.
-      full = concealed ? Wrap.row_col(line, cr, 0, line.size) : Screen.draw_width(line)
+      full = concealed ? Wrap.row_col(line, cr, 0, line.size, reveal: @reveal) : Wrap.draw_width(line, @reveal)
       if full + pw <= cw
         @xscroll = 0
         return
       end
       cx = @cx.clamp(0, line.size)
-      curx = (concealed ? Wrap.row_col(line, cr, 0, cx) : Screen.draw_width(line[0, cx])) + pw
+      curx = (concealed ? Wrap.row_col(line, cr, 0, cx, reveal: @reveal) : Wrap.draw_width(line[0, cx], @reveal)) + pw
       @xscroll = curx if curx < @xscroll                # caret left of the window → snap left
       @xscroll = curx - cw + 1 if curx >= @xscroll + cw # caret past the right edge → snap right
       @xscroll = 0 if @xscroll < 0
@@ -2256,6 +2340,21 @@ module Gori::Tui
       @coalesce = nil
     end
 
+    # Drop the undo history WITHOUT touching the text — for an owner that has decided this
+    # buffer now holds a DIFFERENT document whose bytes happen to match the one it was already
+    # holding (two issues with the same writeup, two empty ones most of all).
+    #
+    # `set_text` clears the stack as part of replacing the buffer, and for a long time that was
+    # the only way a buffer changed hands, so no owner needed this. A skip-if-unchanged guard
+    # in front of `set_text` (IssuesView#seed_notes) breaks that pairing on purpose — it keeps
+    # the caret and the scroll — and it keeps the STACK with them. A stack left over from the
+    # previous document then undoes edits that were never made to this one: undo on issue B
+    # hands back issue A's text, now dirty against B and one save away from overwriting it.
+    def clear_undo : Nil
+      @undo_stack.clear
+      break_run # whatever run was open belonged to the document being handed over
+    end
+
     def undo : Nil
       return if @undo_stack.empty?
       state = @undo_stack.pop
@@ -2287,13 +2386,71 @@ module Gori::Tui
       @env_peek = on ? (@env_peek || EnvPeek.new) : nil # the value peek rides the same opt-in
     end
 
+    # Which namespaces this editor's bytes are actually RESOLVED against, defaulting to all of
+    # them. Narrow it where a send path runs only one of the passes: an Authorize slot's overlay
+    # headers go through `Env.expand_bindings_as` and nothing else, so an accepted `$ENV.UA`
+    # there ships as seven literal bytes with no report, on every replay. The dropdown is what
+    # offered it, so the dropdown is where the namespace is withheld — and the peek follows,
+    # because a value shown under a token this path will not resolve is the same promise.
+    #
+    # Namespaced only: the bare grammar has ONE merged table (`Env.display_vars`) and no
+    # namespace in its bytes, so there is nothing to filter there without moving the bare
+    # contract.
+    def env_complete_namespaces=(list : Array(Env::Namespace)) : Nil
+      @env_complete_namespaces = list
+      env_complete_close # the open list was built from the wider set
+    end
+
     # The `$NAME`s that will NOT be substituted on send — see the ivar. Drops the styled
     # cache: the overlay it holds was built against the old answer, and nothing else in the
     # cache key (@edits, theme, Env.highlight_rev) moves when an owner re-seeds this.
+    #
+    # A hand-set list has no bytes behind it, so it also drops any EVIDENCE source: the set is
+    # then exactly what the caller said, under whatever grammar is in force.
     def env_literal_names=(names : Set(String)) : Nil
+      @env_literal_source = nil
+      set_env_literal_names(names)
+    end
+
+    # The EVIDENCE BYTES the literal set is derived from (nil for a buffer with no provenance),
+    # rather than a set computed once at seed time.
+    #
+    # `Env.literal_keys` reads the CURRENT grammar, so a set computed at seed time is only
+    # correct until the operator flips `env.syntax` (Project tab `s`, Settings env card `s`).
+    # After a namespaced→bare flip a captured `$id`'s literal key was the qualified `ENV.id`
+    # while the painter asks about the bare `id`, so the token started painting — and
+    # tooltipping — as a variable this buffer ships verbatim. Keeping the bytes and re-deriving
+    # on `Env.highlight_rev` is what makes the answer follow the grammar; the bytes are the
+    # SEED's, never the current buffer's, so a token the operator types afterwards is still
+    # theirs.
+    def env_literal_source=(wire : String?) : Nil
+      @env_literal_source = wire
+      @env_literal_rev = Env.highlight_rev
+      set_env_literal_names(wire ? Env.literal_keys(wire) : Set(String).new)
+    end
+
+    private def set_env_literal_names(names : Set(String)) : Nil
       return if names == @env_literal_names
       @env_literal_names = names
       @styled = nil
+    end
+
+    # The literal set, re-derived from the evidence bytes when the grammar moved under it. Every
+    # reader (the painter, both completers, the peek) goes through here — the staleness was one
+    # `Settings.env_syntax=` away from any of them.
+    #
+    # Public for an owner whose SEND reads the same set (`InterceptView#edited_wire`): the tokens
+    # the pane greys out as literal are then the ones the wire gets literally, by construction
+    # rather than by two caches agreeing.
+    def env_literal_names : Set(String)
+      src = @env_literal_source
+      return @env_literal_names unless src
+      rev = Env.highlight_rev
+      if @env_literal_rev != rev
+        @env_literal_rev = rev
+        set_env_literal_names(Env.literal_keys(src))
+      end
+      @env_literal_names
     end
 
     # Enable the chain tooltip (paired with @conceal_spans on the request editors).
@@ -2335,66 +2492,311 @@ module Gori::Tui
       when key.up?, key.back_tab? then ec.move(-1)
       when key.down?              then ec.move(1)
       when key.escape?            then ec.close
-      else                             return false
+      else
+        # Every other key falls through to the editor, which re-derives the rows from the text
+        # after the edit — except the `.` that finishes a namespace row.
+        return false unless env_dot_accepts?(ec, ev)
+        env_accept(ec)
       end
       true
+    end
+
+    # Does a typed `.` mean "take the selected row"? Only over a NAMESPACE row — it is the
+    # character that row's own label ends with, so typing it says "that one" exactly as ↹ does,
+    # while over a token row a dot is literal text the editor must receive.
+    #
+    # And only once the operator has typed part of the namespace. On a bare `$` the popup opens
+    # on the first opener, so `$.` — a dollar and a full stop in ordinary text (a price, a shell
+    # `$.`) — came out as `$ENV.`: a token nobody asked for, in bytes about to be sent, from two
+    # characters that mean nothing together. `$E.` still completes.
+    private def env_dot_accepts?(ec : EnvComplete, ev : Termisu::Event::Key) : Bool
+      return false unless ec.selected_kind == :ns
+      return false if ev.ctrl? || ev.alt?
+      return false unless (ev.char || ev.key.to_char) == '.'
+      env_ns_partial_typed?
+    end
+
+    # Has the operator typed any of the namespace themselves (`$E|`), or is the caret still on a
+    # bare sigil (`$|`) with the popup merely showing what could follow? Re-derives the token
+    # through the SAME walk the rows came from, so the two cannot disagree about the partial.
+    private def env_ns_partial_typed? : Bool
+      prefix = Settings.env_prefix
+      return false if prefix.empty?
+      line = @lines[@cy]? || return false
+      tok = env_caret_token(line, @cx.clamp(0, line.size), Settings.env_syntax, prefix)
+      return false unless tok
+      !tok.partial.empty?
     end
 
     private def env_accept(ec : EnvComplete) : Nil
       push_undo
       line = @lines[@cy]
-      newline, ncx = ec.accept(line, @cx.clamp(0, line.size))
+      newline, ncx, reopen = ec.accept(line, @cx.clamp(0, line.size))
       @lines[@cy] = newline
       @cx = ncx.clamp(0, newline.size)
       snap_cx_to_cluster(1) # the expansion's tail can merge with the text it was spliced into
-      ec.close
       @styled = nil
       @edits += 1
+      # A NAMESPACE row is half a reference: refresh onto its names rather than closing, so
+      # `$E` ↹ ↹ reaches `$ENV.HOST` without the operator having to reopen the popup by hand.
+      # `refresh` closes it itself when the namespace has nothing left to offer.
+      reopen ? refresh_env_complete : ec.close
     end
 
-    # Recompute the match set for the `$partial` token the caret sits in — the run of
-    # env-key chars immediately left of the caret, which must be preceded by the prefix
-    # sigil. Closes when there's no token, no registered vars, or the sole match is already
-    # fully typed. Called after every insert-mode edit; a cheap no-op when disabled.
-    private def refresh_env_complete : Nil
-      ec = @env_complete
-      return unless ec
-      prefix = Settings.env_prefix
-      return ec.close if prefix.empty?
-      # `display_vars`, so a bound `$SESSION` completes beside the env vars — one syntax,
-      # one dropdown. `declared` is read ONCE here, not per candidate row: it takes the
-      # binding table's mutex.
-      vars = Env.display_vars
-      declared = Env.declared_bindings
-      return ec.close if vars.empty?
-      line = @lines[@cy]
-      cx = @cx.clamp(0, line.size)
+    # One token under the caret, as the dropdown AND the peek both read it — there used to be
+    # two near-identical walks here and they disagreed the moment the grammar grew a second
+    # stage.
+    #
+    #   * `sigil`      — char offset of the prefix sigil (the left edge a completion replaces)
+    #   * `ns`         — the namespace ALREADY in the bytes (`$ENV.HO|ST`), else nil
+    #   * `partial`    — what is typed left of the caret in the current segment
+    #   * `full_name`  — that whole segment, caret to either edge (what a peek resolves)
+    #   * `run_end`    — end of the identifier run the caret is in
+    #   * `token_end`  — end of the whole reference, `.NAME` tail included
+    #   * `dot_follows` — a structural `.` sits at `run_end` (a namespace row must eat it)
+    record EnvCaret, sigil : Int32, ns : Env::Namespace?, partial : String, full_name : String,
+      run_end : Int32, token_end : Int32, dot_follows : Bool
+
+    # The env token the caret sits in, or nil when it sits in none.
+    #
+    # `.` is deliberately NOT a key character (`env_key_tail?` is untouched): it is STRUCTURE
+    # in `$ENV.HOST`, not part of either half, so it is crossed here explicitly. Folding it
+    # into the key run would make `a.b` and a dotted URL path look like token material and
+    # would let a name swallow the namespace in front of it.
+    private def env_caret_token(line : String, cx : Int32, syntax : Env::Syntax,
+                                prefix : String) : EnvCaret?
+      return nil if prefix.empty?
       plen = prefix.size
       ks = cx
       while ks > 0 && env_key_tail?(line[ks - 1])
         ks -= 1
       end
-      # A prefix sigil must sit immediately before the key run (else it isn't an env token).
-      return ec.close unless ks - plen >= 0 && line[(ks - plen)...ks] == prefix
-      partial = line[ks...cx]
-      # A non-empty partial must start with a valid key head — `$1` etc. never expand.
-      return ec.close if !partial.empty? && !env_key_head?(partial[0])
-      # Extend right over the rest of the key run so accepting replaces the whole identifier.
-      ke = cx
-      while ke < line.size && env_key_tail?(line[ke])
-        ke += 1
+      # STAGE B — the caret is in the NAME half of a `$NS.NAME`: the char before the run is
+      # the dot, the uppercase run before THAT parses as a namespace, and the sigil sits in
+      # front of it. Only then; `$X.TO` and `$BIND.A.B`'s `.B` fall through and complete
+      # nothing, which is what an operator typing an ordinary dotted value expects.
+      if syntax.namespaced? && ks > 0 && line[ks - 1] == '.'
+        ns_end = ks - 1
+        ns_start = ns_end
+        while ns_start > 0 && env_ns_char?(line[ns_start - 1])
+          ns_start -= 1
+        end
+        if ns_start < ns_end && (ns = Env::Namespace.parse?(line[ns_start...ns_end])) &&
+           ns_start - plen >= 0 && line[(ns_start - plen)...ns_start] == prefix &&
+           live_sigil?(line, ns_start - plen, plen, prefix, syntax)
+          ke = cx
+          while ke < line.size && env_key_tail?(line[ke])
+            ke += 1
+          end
+          return EnvCaret.new(ns_start - plen, ns, line[ks...cx], line[ks...ke], ke, ke,
+            ke < line.size && line[ke] == '.')
+        end
       end
-      pl = partial.downcase
-      matches = vars.keys
-        .select { |k| !@env_literal_names.includes?(k) } # offering one would promise a substitution this buffer won't make
+      # STAGE A — a bare run behind the sigil: `$TO`, `$E`, a fully-typed `$SESSION`, or the
+      # NAMESPACE run of a `$ENV.HOST` whose name the caret has not reached yet.
+      return nil unless ks - plen >= 0 && line[(ks - plen)...ks] == prefix &&
+                        live_sigil?(line, ks - plen, plen, prefix, syntax)
+      run_end = cx
+      while run_end < line.size && env_key_tail?(line[run_end])
+        run_end += 1
+      end
+      dot = run_end < line.size && line[run_end] == '.'
+      # A token row offered from inside the namespace run replaces the `.NAME` tail too —
+      # otherwise accepting `$ENV.HOST` over `$EN|V.TOKEN` would leave `.TOKEN` behind it.
+      token_end = run_end
+      if syntax.namespaced? && dot && Env::Namespace.parse?(line[ks...run_end])
+        token_end = run_end + 1
+        while token_end < line.size && env_key_tail?(line[token_end])
+          token_end += 1
+        end
+      end
+      EnvCaret.new(ks - plen, nil, line[ks...cx], line[ks...run_end], run_end, token_end, dot)
+    end
+
+    # Is the sigil at `sigil` the one a PASS would read as opening a reference — or is it half
+    # of an escape?
+    #
+    # Both stages above find a sigil by looking ONE character back, and `$` is a character that
+    # can precede itself: for `Host: $$ENV.HOST` the second sigil satisfied that test, so the
+    # peek printed the value and the dropdown opened while `Env.regions` painted the whole span
+    # as a non-token and the wire carried the literal `$ENV.HOST`. Display promising a
+    # substitution the send path does not make is the one thing this editor must never do.
+    #
+    # A single "is the previous character a sigil?" test is not enough, because the answer is
+    # decided by the RUN of sigils in front of the candidate and the two grammars consume that
+    # run differently (`Env.read_token_at`'s decision table, cross-checked against `Env.regions`
+    # in the spec):
+    #
+    #   * NAMESPACED — the escape is the whole `$$ENV.NAME`, so the sigil directly in front of a
+    #     namespace run always swallows it: `$$ENV.X` and `$$$ENV.X` both reach the wire as
+    #     literal text and neither carries a reference. Any preceding sigil ⇒ not live.
+    #   * BARE — the escape is the PAIR `$$`, consumed as a unit with nothing behind it read, so
+    #     an EVEN run leaves the candidate live (`$$$HOST` really does expand, and the painter
+    #     paints it) and an odd one makes it the escape's second half (`$$HOST` — the
+    #     pre-existing hole this closes).
+    private def live_sigil?(line : String, sigil : Int32, plen : Int32, prefix : String,
+                            syntax : Env::Syntax) : Bool
+      run = 0
+      at = sigil - plen
+      while at >= 0 && line[at...(at + plen)] == prefix
+        run += 1
+        at -= plen
+      end
+      syntax.namespaced? ? run.zero? : run.even?
+    end
+
+    # Recompute the row set for the token the caret sits in. Closes when there's no token, no
+    # rows to offer, or the sole row is already fully typed. Called after every insert-mode
+    # edit; a cheap no-op when disabled.
+    private def refresh_env_complete : Nil
+      ec = @env_complete
+      return unless ec
+      prefix = Settings.env_prefix
+      return ec.close if prefix.empty?
+      syntax = Settings.env_syntax
+      line = @lines[@cy]
+      cx = @cx.clamp(0, line.size)
+      tok = env_caret_token(line, cx, syntax, prefix)
+      return ec.close unless tok
+      # A non-empty partial must start with a valid key head — `$1` etc. never expand.
+      return ec.close if !tok.partial.empty? && !env_key_head?(tok.partial[0])
+      matches = syntax.bare? ? bare_env_matches(tok, prefix) : namespaced_env_matches(tok, prefix)
+      # Auto-close on the SOLE row that is already written out in full. Compared against the
+      # typed token text rather than the partial, because a row's `insert` is a whole spelling
+      # (`$BIND.SESSION`) and a partial is only the tail of one: comparing the two would keep
+      # the popup up forever on a token that is finished, and in bare mode would never match.
+      if matches.empty? || (matches.size == 1 && matches[0].label == line[tok.sigil...cx])
+        ec.close
+      else
+        ec.set(matches, tok.sigil)
+      end
+    end
+
+    # BARE mode: one flat list of names out of the single display table — what shipped.
+    private def bare_env_matches(tok : EnvCaret, prefix : String) : Array(EnvComplete::Match)
+      rows_out = [] of EnvComplete::Match
+      # `declared` is read ONCE here, not per candidate row: it takes the binding table's mutex.
+      declared = Env.declared_bindings
+      vars = bare_env_candidates(declared)
+      return rows_out if vars.empty?
+      bind_only = !@env_complete_namespaces.includes?(Env::Namespace::Env)
+      pl = tok.partial.downcase
+      vars.keys
+        .select { |k| !env_literal_names.includes?(k) } # offering one would promise a substitution this buffer won't make
         .select { |k| pl.empty? || k.downcase.starts_with?(pl) }
         .sort!
         .first(40)
-        .map { |k| {k, env_value_preview(vars[k], declared.includes?(k))} }
-      if matches.empty? || (matches.size == 1 && matches[0][0] == partial)
-        ec.close # nothing to offer, or already fully typed
-      else
-        ec.set(matches, ks - plen, ke, prefix)
+        .each do |k|
+          spelled = Env.spell(k, Env::Namespace::Env, Env::Syntax::Bare, prefix)
+          rows_out << EnvComplete::Match.new(:token, spelled,
+            env_value_preview(vars[k], bind_only || declared.includes?(k)), tok.token_end)
+        end
+      rows_out
+    end
+
+    # What a BARE-mode `$NAME` may complete to, and what a bare-mode peek may answer for.
+    #
+    # `display_vars` normally — a bound `$SESSION` completes beside the env vars, one syntax and
+    # one dropdown. But an editor whose send path runs only ONE of the passes
+    # (`env_complete_namespaces=`) must not be offered the other's names in either grammar: an
+    # Authorize identity's overlay headers are resolved by `Env.expand_bindings_as` and by
+    # nothing else, so a `$UA` taken from the env layer goes out as four literal bytes on every
+    # replay, silently. Namespaced mode withholds the namespace; bare mode has no namespace in
+    # the bytes to withhold, so it withholds the NAMES.
+    #
+    # Bind-only is the binding names: bound, plus DECLARED-but-not-yet-bound — an identity is
+    # usually written before the first replay has filled the table, and `$SESSION` has to be
+    # typeable there (a declared name carries no value, so it gets no preview, which is the same
+    # answer the painter gives).
+    private def bare_env_candidates(declared : Array(String)) : Hash(String, String)
+      ns = @env_complete_namespaces
+      # The default (every namespace) keeps the merged table it always had, byte for byte.
+      return Env.display_vars if ns.size == Env::Namespace.values.size
+      out = {} of String => String
+      Env.vars_for(Env::Namespace::Env).each { |name, value| out[name] = value } if ns.includes?(Env::Namespace::Env)
+      if ns.includes?(Env::Namespace::Bind)
+        declared.each { |name| out[name] = out[name]? || "" }
+        Env.vars_for(Env::Namespace::Bind).each { |name, value| out[name] = value }
+      end
+      out
+    end
+
+    # NAMESPACED mode, two stages in one refresh.
+    #
+    # With the namespace already in the bytes (`$ENV.TO`) only that namespace's names are
+    # offered — the operator has said which table they mean. Otherwise the namespace OPENERS
+    # come first (in enum order, so the list does not reshuffle as vars are added) and then
+    # every name flattened, so `$TO` stays exactly the keystrokes bare mode needed: no
+    # namespace label starts with `TO`, so the two token rows are the whole list.
+    private def namespaced_env_matches(tok : EnvCaret, prefix : String) : Array(EnvComplete::Match)
+      rows_out = [] of EnvComplete::Match
+      syntax = Env::Syntax::Namespaced
+      pl = tok.partial.downcase
+      # Each namespace's table read ONCE per refresh: `vars_for(Bind)` takes the binding
+      # layer's mutex, and reading it per candidate row put the dropdown in contention with
+      # the send path on every keystroke.
+      #
+      # A namespace this editor's send path does NOT resolve is absent from the map entirely, so
+      # neither stage can offer it: no opener, no flattened name, and nothing for an already
+      # typed `$ENV.` to filter (see `env_complete_namespaces=`).
+      tables = {} of Env::Namespace => Hash(String, String)
+      Env::Namespace.each do |ns|
+        next unless @env_complete_namespaces.includes?(ns)
+        # GEN has no stable value table: these strings are send-time format hints, which makes
+        # the popup useful without minting a nonce merely because the operator typed `$G`.
+        tables[ns] = ns.gen? ? Env::GENERATOR_HINTS : Env.vars_for(ns)
+      end
+      if fixed = tok.ns
+        if table = tables[fixed]?
+          append_env_token_rows(rows_out, {fixed => table}, pl, tok.token_end, prefix, syntax)
+        end
+        return rows_out
+      end
+      # A namespace opener. An EMPTY namespace gets no row: it would insert a prefix the
+      # second stage then has nothing to offer for, which reads as a broken dropdown rather
+      # than as "nothing is bound yet".
+      Env::Namespace.each do |ns|
+        table = tables[ns]?
+        next if table.nil? || table.empty?
+        next unless pl.empty? || ns.label.downcase.starts_with?(pl)
+        spelled = Env.input_hint(ns, syntax, prefix)
+        rows_out << EnvComplete::Match.new(:ns, spelled,
+          "#{ns.description} · #{table.size}", tok.run_end + (tok.dot_follows ? 1 : 0))
+      end
+      # The fixed generators would otherwise fill the eight-row viewport on a bare `$` and
+      # push the operator's own ENV/BIND names below the fold. Their `$GEN.` opener is enough
+      # at that stage; typing any name prefix (`$U`) still searches them directly.
+      append_env_token_rows(rows_out, tables, pl, tok.token_end, prefix, syntax,
+        include_generators: !pl.empty?)
+      rows_out
+    end
+
+    # The token rows for `tables`, filtered by `pl`, sorted by {name, namespace} so the same
+    # name in two namespaces lands adjacent, and capped — the cap is on TOKEN rows only, so a
+    # long var list can never push the namespace openers off the list.
+    private def append_env_token_rows(rows_out : Array(EnvComplete::Match),
+                                      tables : Hash(Env::Namespace, Hash(String, String)),
+                                      pl : String, replace_end : Int32, prefix : String,
+                                      syntax : Env::Syntax,
+                                      include_generators : Bool = true) : Nil
+      rows = [] of {String, Env::Namespace}
+      tables.each do |ns, table|
+        next if ns.gen? && !include_generators
+        table.each_key do |name|
+          # The QUALIFIED key: a `$id` the capture arrived with is literal in THIS buffer, and
+          # a set keyed by bare name alone would also withhold the other namespace's `id`.
+          next if env_literal_names.includes?(Env.qualify(ns, name))
+          next unless pl.empty? || name.downcase.starts_with?(pl)
+          rows << {name, ns}
+        end
+      end
+      rows.sort_by! { |row| {row[0], row[1].label} }
+      rows.first(40).each do |row|
+        name, ns = row
+        spelled = Env.spell(name, ns, syntax, prefix)
+        hint = ns.gen? ? tables[ns][name] : env_value_preview(tables[ns][name]? || "", ns.secret?)
+        rows_out << EnvComplete::Match.new(:token, spelled,
+          hint, replace_end)
       end
     end
 
@@ -2404,6 +2806,12 @@ module Gori::Tui
 
     private def env_key_tail?(c : Char) : Bool
       c.ascii_alphanumeric? || c == '_'
+    end
+
+    # The namespace run's alphabet. UPPERCASE only, so `$env.x` is not a token and the
+    # spelling an operator reads is the spelling gori resolves (see `Env::Namespace`).
+    private def env_ns_char?(c : Char) : Bool
+      'A' <= c <= 'Z'
     end
 
     # A one-line, whitespace-collapsed, length-capped value hint for the dropdown row.
@@ -2429,43 +2837,62 @@ module Gori::Tui
       s.size > 20 ? "#{s[0, 19]}…" : s
     end
 
-    # The COMPLETE, REGISTERED `$KEY` env token the caret currently sits inside (or
-    # immediately after), as {key, value-preview} — for the value peek. Scans the key run
-    # around @cx, requires the prefix sigil right before it, and looks the key up in the
-    # effective env vars. nil when the caret isn't on a token OR the key isn't registered —
-    # an unknown `$word` (e.g. a literal `$` typed during testing) is just text, no peek.
+    # The COMPLETE, REGISTERED env token the caret currently sits inside (or immediately
+    # after), as {spelled label, value-preview} — for the value peek. Shares `env_caret_token`
+    # with the dropdown, so the two can never disagree about where a token starts. nil when
+    # the caret isn't on a token OR the name isn't registered — an unknown `$word` (e.g. a
+    # literal `$` typed during testing) is just text, no peek.
     private def env_token_at_cursor : {String, String}?
       prefix = Settings.env_prefix
       return nil if prefix.empty?
       line = @lines[@cy]?
       return nil unless line
+      syntax = Settings.env_syntax
       cx = @cx.clamp(0, line.size)
-      plen = prefix.size
-      ks = cx
-      while ks > 0 && env_key_tail?(line[ks - 1]) # walk left to the key run's start
-        ks -= 1
-      end
-      # The prefix sigil must sit immediately before the key run (else it isn't an env token).
-      return nil unless ks - plen >= 0 && line[(ks - plen)...ks] == prefix
-      ke = cx
-      while ke < line.size && env_key_tail?(line[ke]) # extend right over the rest of the key
-        ke += 1
-      end
-      key = line[ks...ke]
+      tok = env_caret_token(line, cx, syntax, prefix) || return nil
+      name = tok.full_name
       # A valid identifier: non-empty and starting with a key head (`$1` never expands).
-      return nil if key.empty? || !env_key_head?(key[0])
-      # `display_vars`: the peek is the operator's answer to "is my `$SESSION` bound, and to
-      # what?" in the editor where they are writing the token — Repeater, Fuzzer, Intercept —
-      # with no new surface at all. A declared-but-UNBOUND name has no value and so gets no
-      # peek, which is the same answer `token_regions` paints (it stays `env_unknown`).
-      # A name the OWNER will ship literally gets no peek, for the same reason an unregistered
-      # one doesn't: on this buffer it is not a variable reference. An evidence tab used to
-      # tooltip the resolved secret under a `$TOKEN` the send path then wrote to the socket
-      # as six literal bytes.
-      return nil if @env_literal_names.includes?(key)
-      val = Env.display_vars[key]?
-      return nil unless val # unregistered → just a literal string, not an env reference
-      {key, env_value_preview(val, Env.declared_bindings.includes?(key))}
+      return nil if name.empty? || !env_key_head?(name[0])
+      if syntax.bare?
+        # A name the OWNER will ship literally gets no peek, for the same reason an
+        # unregistered one doesn't: on this buffer it is not a variable reference. An evidence
+        # tab used to tooltip the resolved secret under a `$TOKEN` the send path then wrote to
+        # the socket as six literal bytes.
+        return nil if env_literal_names.includes?(name)
+        # `display_vars`: the peek is the operator's answer to "is my `$SESSION` bound, and to
+        # what?" in the editor where they are writing the token — Repeater, Fuzzer, Intercept —
+        # with no new surface at all. A declared-but-UNBOUND name has no value and so gets no
+        # peek, which is the same answer the painter gives (it stays `env_unknown`).
+        #
+        # The table is the one the DROPDOWN offers from (`bare_env_candidates`), narrowed for an
+        # editor whose send path runs only one pass: a value shown under a token this path will
+        # not resolve is the same false promise the offer was.
+        declared = Env.declared_bindings
+        val = bare_env_candidates(declared)[name]?
+        return nil unless val # unregistered → just a literal string, not an env reference
+        # A DECLARED-but-unbound name is padded into that table with no value, so the dropdown
+        # can offer it before the first replay; "no value" is what the painter says about it too.
+        return nil if val.empty? && declared.includes?(name)
+        return {Env.spell(name, Env::Namespace::Env, syntax, prefix),
+                env_value_preview(val, declared.includes?(name))}
+      end
+      # NAMESPACED: the namespace has to be in the BYTES. A caret in the `ENV` run of
+      # `$ENV.HOST` is not on a reference yet, and answering from one table or the other there
+      # would be guessing at which of two secrets the operator is pointing at.
+      ns = tok.ns || return nil
+      # A namespace this editor's send path does not run is not a reference HERE, whatever the
+      # table holds — the same answer the dropdown gives (`env_complete_namespaces=`).
+      return nil unless @env_complete_namespaces.includes?(ns)
+      return nil if env_literal_names.includes?(Env.qualify(ns, name))
+      if ns.gen?
+        hint = Env.generator_hint?(name) || return nil
+        return {Env.spell(name, ns, syntax, prefix), hint}
+      end
+      val = Env.vars_for(ns)[name]?
+      return nil unless val
+      # Masked per NAMESPACE rather than per name: a BIND value came off the wire, whatever
+      # its rule's current state (see `Env::Namespace#secret?`).
+      {Env.spell(name, ns, syntax, prefix), env_value_preview(val, ns.secret?)}
     end
   end
 end

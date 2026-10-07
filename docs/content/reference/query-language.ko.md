@@ -1,10 +1,10 @@
 +++
-title = "쿼리 언어"
+title = "gori 쿼리 언어"
 description = "History, Sitemap, Probe, Issues, Intercept, MCP 도구 전반에서 쓰는 필터 문법."
 weight = 30
 +++
 
-gori에는 플로우를 걸러내는 작은 쿼리 언어(QL)가 있습니다. 같은 문법이 TUI 필터 바, `gori run`(`-q`/`--query` 또는 위치 인자), 그리고 MCP 도구에서 동일하게 동작합니다. 내장 레퍼런스는 `gori run history --help`와 `ql_reference` MCP 도구로도 볼 수 있습니다.
+gori에는 플로우를 걸러내는 작은 쿼리 언어(QL)가 있습니다. 같은 문법이 TUI 필터 바, `gori run`(`-q`/`--query` 또는 위치 인자), 그리고 MCP 도구에서 동일하게 동작합니다. 내장 레퍼런스는 TUI Help의 **Query** 페이지와 `ql_reference` MCP 도구로도 볼 수 있습니다.
 
 ## 필드 {#fields}
 
@@ -13,7 +13,7 @@ gori에는 플로우를 걸러내는 작은 쿼리 언어(QL)가 있습니다. �
 | Field | Matches |
 |-------|---------|
 | `host` | 요청 호스트 |
-| `path` | 요청 경로 |
+| `path` | 요청 경로와 **쿼리 문자열**. 그래서 `-path:x`는 `?q=x`도 걸러 냅니다 |
 | `url` | 전체 URL |
 | `method` | HTTP 메서드 |
 | `scheme` | `http` / `https` |
@@ -26,7 +26,9 @@ gori에는 플로우를 걸러내는 작은 쿼리 언어(QL)가 있습니다. �
 | `header` | 헤드(요청 + 응답 헤더) 부분 문자열 |
 | `body` | 본문 전문 검색(trigram FTS 인덱스) |
 | `stub` | `true` / `false`. 원본에 닿지 않고 [short-circuit 규칙](/ko/guide/proxy/#short-circuit)이 gori 자신이 답한 플로우 |
+| `static` | `true` / `false`. 이미지, 폰트, 오디오·비디오. 응답 Content-Type으로 판단하고, 없으면 경로 확장자를 봅니다. SVG·CSS·JS와 이미지 프록시(`?url=`)는 제외하고, 성공한 응답(2xx 또는 304)만 해당합니다. `-static:true`가 [정적 에셋 숨기기 렌즈](/ko/guide/proxy/#hide-static)입니다 |
 | `scope` | `in` / `out`. 프로젝트 스코프 규칙([아래](#scope-in-scope-out)) |
+| `cache` | `hit` / `miss` / `dynamic` / `none`: 응답의 캐시 헤더(`Age`, `X-Cache`, `CF-Cache-Status`, `Cache-Status` 등)에서 읽은 캐시 판정. `none`도 실제 값입니다(판정 없음, 대기 중인 플로우 포함). `cache:` 쿼리를 쓰면 History에 CACHE 열이 붙습니다 |
 
 ```text
 host:example.com
@@ -34,7 +36,7 @@ method:POST
 status:404
 ```
 
-### 한쪽 방향만 보기: `req.` / `resp.`
+### 한쪽 방향만 보기: `req.` / `resp.` {#one-side-only-req-resp}
 
 `header:`와 `body:`는 **요청과 응답을 모두** 뒤집니다. 한쪽만 보려면 `req.` 또는 `resp.`를 앞에 붙입니다.
 
@@ -65,6 +67,9 @@ NOT (req.body:token OR resp.body:token)
 | `repeater` | Repeater 전송(TUI, `gori run repeater send --record-history`, MCP `send_request`) |
 | `fuzzer` | `--record-history` / `record_history`로 기록된 퍼즈 결과 |
 | `discover` | 크롤러가 가져온 것(Discover는 기본으로 저장합니다) |
+| `retest` | Issue 리테스트의 한 단계(`gori run retest run`, MCP `run_retest`, TUI의 RETEST 카드). `repeater`가 아니라 별도 값입니다 — 사람이 직접 보낸 요청과 gori가 실행한 검사의 한 단계는 같은 바이트에 대한 다른 사실이기 때문입니다 |
+| `refresh` | 세션 슬롯 [갱신](/ko/guide/authorize/#refreshing-a-slot)의 한 단계. 수동이든 전송 직전 자동이든 같습니다(`source_ref`에 `slot NAME step N`). `RFRSH`로 표시됩니다 |
+| `macro` | Fuzzer나 Miner 실행의 [요청 시점 매크로](/ko/guide/repeater-and-fuzzer/#rotating-tokens-with-a-macro)가 후보 앞에서 실행한 한 단계(`source_ref`에 `macro step N`). `MACRO`로 표시됩니다 |
 | `miner`, `sequencer`, `authorize`, `probe` | 예약됨. 아직 플로우를 기록하지 않는 도구들 |
 | `import` | HAR, Burp export, `--urls`, OpenAPI 문서에서 읽어 들인 것 |
 | `gori` | gori가 **보낸** 모든 출처. 가운데 행들의 합집합이며 `import`는 **포함하지 않습니다** |
@@ -114,7 +119,8 @@ scope:out -host:cdn                   스코프 밖으로 새어 나간 트래�
 
 - **`s` 렌즈가 켜졌는지와 무관합니다.** 필터 항목은 모드가 아니라 질문이므로 `scope:in`은 어느
   쪽이든 같은 뜻입니다. (렌즈가 켜져 있으면 렌즈가 이미 같은 조건을 AND로 걸기 때문에
-  `scope:in`은 중복이 되고, `scope:out`은 아무것도 매치하지 않습니다.)
+  `scope:in`은 중복이 되고, `scope:out`은 아무것도 매치하지 않습니다. 렌즈가 스코프 밖의 행을
+  이미 모두 걸러냈기 때문입니다.)
 - **스코프 규칙이 하나도 없으면 두 표기 모두 아무것도 매치하지 않습니다.** 스코프 안에 든 것이
   없으니 질문에 답이 없고, 그래서 묻지 않습니다. 특히 그 상태에서 `scope:out`은 "전체"를 뜻하지
   **않습니다**. 같은 이유로, never-match를 부정한 `-scope:in`은 그 상태에서 `scope:out`과 같지
@@ -145,6 +151,8 @@ status:>=500        서버 오류
 size:>100000        큰 교환
 dur:>500            500ms보다 느림
 dur:<2s             2s보다 빠름 (s / ms 접미사 허용)
+size:>100k          바이트 필드는 k/kb, m/mb, g/gb 접미사 허용
+status:>=4xx        클래스 약어에도 비교 연산자를 붙일 수 있음
 ```
 
 ## 정규 표현식 {#regular-expressions}
@@ -167,7 +175,7 @@ method~^P(OST|UT|ATCH)$                쓰기 메서드 전부를 한 항목으�
 - `OR`는 둘 중 하나를 매칭합니다. `NOT`과 `-` 접두사는 모두 부정입니다.
 - 괄호로 묶을 수 있습니다. 우선순위는 `NOT`, `AND`, `OR` 순입니다.
 - `field:`가 없는 단순 단어는 method, host, target을 대상으로 하는 자유 텍스트 검색입니다.
-- 존재하지 않는 `field:` 이름은 의도한 자유 텍스트가 아닙니다. `gori run history`, `gori run sitemap`, `gori run probe`는 이를 **거절**하고 가장 가까운 실제 필드를 알려준 뒤 0이 아닌 코드로 종료합니다. `--lenient`를 주면 그 토큰을 텍스트로 검색합니다(예전에 모든 표면이 조용히 하던 동작으로, `methd:GET`은 아무것도 매칭하지 않아 프로젝트가 비어 보였습니다). TUI 필터 바는 타이핑 중인 이름을 그대로 받습니다.
+- 존재하지 않는 `field:` 이름은 의도한 자유 텍스트가 아닙니다. `gori run history`, `gori run sitemap`(과 그 `params`, `js`, `export` 동사), `gori run probe`는 이를 **거절**하고 가장 가까운 실제 필드를 알려준 뒤 0이 아닌 코드로 종료합니다. `--lenient`를 주면 그 토큰을 텍스트로 검색합니다(예전에 모든 표면이 조용히 하던 동작으로, `methd:GET`은 아무것도 매칭하지 않아 프로젝트가 비어 보였습니다). TUI 필터 바는 타이핑 중인 이름을 그대로 받습니다.
 
 ```text
 host:example.com status:5xx           둘 다 매칭되어야 함
@@ -201,15 +209,19 @@ host:"my host"                        공백까지 포함한 하나의 host 값
 | 화면 | 필드 |
 |------|------|
 | History, `gori run history`, MCP | 위 표 전체 |
-| Sitemap | 위와 동일, 여기에 노드별 경로 메모용 `tag:` 추가 |
+| Sitemap, `gori run sitemap`, MCP `list_sitemap` | 위와 동일, 여기에 노드별 경로 메모용 `tag:` 추가: 대소문자 구분 없이 메모의 일부와 비교하고, 태그가 붙은 경로와 그 아래 전부, 그리고 거기로 이어지는 경로가 매칭됩니다. `-tag:`는 그 하위 트리를 빼고, 모든 `tag:` 항목은 쿼리의 나머지와 AND로 묶입니다 |
 | 컬러 규칙(Colormarker) | 위와 동일. History 필터 바에 쓰는 그 쿼리를 그대로 받습니다 |
-| Intercept 캐치 조건, Extract 규칙 조건 | `host`, `path`, `url`, `method`, `scheme`, `status`, `proto`, `header`, `body`. **`scope:` 없음** |
+| Intercept 캐치 조건, Extract 규칙 조건 | `host`, `path`, `url`, `method`, `scheme`, `status`, `proto`, `header`, `body`. **나머지 필드는 모두 거부**(아래 참고) |
 | Probe | `severity`(`sev`), `status`(`st`), `category`(`cat`), `host`, `code` |
 | Issues | `severity`(`sev`), `status`(`st`), `host`, `title`, `cvss` |
 
-`scope:`는 홀드 게이트와 Extract 규칙 조건이 답하지 않고 거부하는 유일한 필드입니다. 두 곳은
-흐르는 중인 메시지를 평가하는데, 프로젝트의 스코프 규칙은 메시지의 일부가 아닙니다. 입력하는
-자리에서 그렇게 알려주고, `scope:`를 담은 Extract 규칙은 저장되지 않습니다.
+홀드 게이트와 Extract 규칙 조건은 캡처되기 전의 흐르는 메시지 하나를 평가하므로, 그 메시지가
+답할 수 없는 History 필드는 추측하지 않고 거부합니다. `scope:`(프로젝트의 스코프 규칙은 메시지의
+일부가 아님), `size:`·`reqsize:`·`respsize:`·`dur:`(교환이 아직 끝나지 않음), `stub:`·`static:`·
+`src:`·`cache:`, 그리고 한쪽 방향만 보는 `req.`/`resp.` 표기가 그렇습니다. 거부된 필드를 대신
+자유 텍스트로 검색하는 일도 없습니다. 입력하는 자리에서 그렇게 알려주고, 그런 필드를
+담은 Extract 규칙은 저장되지 않으며, MCP `intercept_set_filter`와 `gori run intercept filter`는
+그 조건을 거부합니다.
 
 Probe와 Issues는 심각도 이름(`info`, `low`, `medium`/`med`, `high`, `critical`/`crit`)과 트리아지 상태(`open`, `confirmed`/`conf`, `false-positive`/`fp`, `resolved`/`done`, 그리고 open이 아닌 모든 상태를 뜻하는 `closed`)를 받습니다. 심각도는 비교를 지원하므로 `sev:>=high`도 동작합니다. Issues는 수치 비교 연산자(`cvss:>=7.0`, `cvss:<4.0`), 일치 점수(`cvss:7.5`), 벡터 부분일치(`cvss:3.1`)를 지원하는 `cvss:`도 받습니다.
 
@@ -223,12 +235,12 @@ body:secret AND -host:cdn             컬러 규칙: 유출은 칠하고 CDN은 
 
 Intercept 바와 컬러 규칙 바 모두 입력하는 동안 필드 이름과 알려진 값을 Tab으로 자동 완성합니다.
 
-### 요청·응답 본문 문자열 매칭 {#matching-content}
+### 요청·응답 본문 문자열 매칭 {#matching-request-and-response-content}
 
 `header:`와 `body:`는 메시지의 바이트를 뒤집니다. 따라서 어디서 동작하는지는 필터를 물어보는 그 시점에 **어떤 바이트가 존재하는가**로 정해집니다.
 
 - **History, Sitemap, 컬러 규칙**은 이미 캡처된 플로를 봅니다. 그래서 두 필드 모두 요청·응답 양쪽에서 항상 동작합니다.
-- **Intercept와 Extract 규칙 조건**은 흐르는 중인 메시지를 봅니다. `header:`는 모든 게이트에서 동작합니다. `body:`는 페이로드가 손에 있는 경우(홀드된 **WebSocket 메시지**와 **Extract 규칙** 조건)에서 동작하고, HTTP 홀드 게이트에서는 동작하지 않습니다. 그 게이트가 바로 본문을 버퍼링할지 말지를 결정하는 지점이기 때문입니다.
+- **Intercept와 Extract 규칙 조건**은 흐르는 중인 메시지를 봅니다. `header:`는 HTTP 요청·응답 게이트와 Extract 규칙 조건에서 동작하고, 홀드된 WebSocket 메시지에서는 동작하지 않습니다. WebSocket 메시지에는 자기 헤드가 없기 때문입니다. `body:`는 페이로드가 손에 있는 경우(홀드된 **WebSocket 메시지**와 **Extract 규칙** 조건)에서 동작하고, HTTP 홀드 게이트에서는 동작하지 않습니다. 그 게이트가 바로 본문을 버퍼링할지 말지를 결정하는 지점이기 때문입니다.
 
 규칙을 쓰기 전에 알아둘, 의도된 차이가 하나 있습니다.
 
@@ -236,6 +248,15 @@ Intercept 바와 컬러 규칙 바 모두 입력하는 동안 필드 이름과 �
 - **컬러 규칙**에서 `body:`는 항상 훑고, 각 방향 첫 64 KiB를 읽습니다. 인덱싱은 캡처 이후에 일어나는데 규칙은 방금 도착한 행을 칠해야 하니 훑는 것 말고는 정답이 없고, 64 KiB 한계는 큰 본문 한 화면이 목록을 멈춰 세우지 않게 하는 장치입니다. 그래서 컬러 규칙은 똑같은 쿼리가 목록에 못 띄우는 행도 칠하지만, 64 KiB를 넘어가는 매치는 칠하지 않습니다.
 
 모든 화면의 `body:`는 **와이어에 흐른 그대로의 바이트**를 읽습니다. 그래서 어느 것도 gzip 본문 안의 문자열은 찾지 못합니다. Extract 규칙 조건도 마찬가지입니다. 조건은 응답을 디코드하기 *전에* 평가되고, 압축 해제된 텍스트를 보는 것은 그 뒤에 이어지는 추출뿐입니다. 압축된 내용을 걸러야 한다면 그 바깥을 거세요: 헤더, 경로, 또는 응답 크기.
+
+## 주의할 점 {#caveats}
+
+쿼리가 실제로는 제대로 보지 않았는데도 깨끗해 보이는 경우가 몇 가지 있습니다.
+
+- **대기 중인 플로우**에는 상태, 지속 시간, 응답 크기가 없어 `status:`와 `-status:` 양쪽에서 모두 빠집니다(`dur`, `respsize`도 같습니다).
+- **버려진 항목은 쿼리를 넓힙니다.** gori가 읽을 수 없는 값(`status:>=foo`)은 거부되지 않고 무시되지만, 무시된 사실은 알려 줍니다. `gori run`은 경고를 출력하고, MCP 쿼리 도구는 응답의 `ignored_terms`에 그 항목을 적습니다(`strict:true`를 주면 쿼리를 거절합니다). 무엇이 남았는지는 `ql_explain`으로 확인하세요.
+- **잘못된 정규식은 오류입니다.** 조용히 버려지지 않고 `body~[`는 쿼리 전체를 실패시킵니다.
+- **큰 본문에 `-body:`**를 쓰면 8 KiB 인덱스 한도 너머의 일치를 인덱스가 보지 못해 그대로 남깁니다.
 
 ## 예제 {#examples}
 

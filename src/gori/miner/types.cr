@@ -1,3 +1,5 @@
+require "../request_macro/lane" # RequestMacro::Spec / Tally — a run's macro and what it reports
+
 module Gori
   # The parameter-mining engine ("Param Miner"): discovers hidden/unlinked
   # parameters a server accepts but that aren't in the captured request. It stuffs a
@@ -139,7 +141,11 @@ module Gori
       names_done : Int64,
       sent : Int64,
       found : Int32,
-      errors : Int64
+      errors : Int64,
+      # The run's request-time macro (#1350): how often its steps ran, how many failed, and how
+      # many probes that cost. nil for a run with no macro. `sent` already includes the steps'
+      # requests — they are charged to the same budget — so this is the breakdown, not an addend.
+      request_macro : Gori::RequestMacro::Tally? = nil
 
     # Engine → consumer events. A union of records (matches Fuzz's pattern so a
     # Channel(Event) carries them without boxing). Progress is droppable (latest wins);
@@ -164,6 +170,51 @@ module Gori
 
       def self.fresh : String
         "gq#{Random::Secure.hex(4)}"
+      end
+
+      # ── recognising a canary in captured bytes ──────────────────────────────────────
+      # The token SHAPE is a correctness-linked invariant, not a cosmetic one: `Fingerprint`
+      # decides reflection by whether a canary appears in the response, and `Inject` locates the
+      # JSON spans a send seam must protect by the same tokens. If those two ever disagreed about
+      # what a canary looks like, one would mint what the other cannot find. So the shape lives
+      # HERE, beside `fresh` that mints it, and both scanners call it — no second definition to
+      # drift from this one.
+
+      # The 8 bytes at `from` are all lower-hex (0-9 a-f) — a `gq`+8-hex canary's tail. `from`+8
+      # must be in bounds; every caller holds `i <= size - LEN`.
+      def self.hex_tail?(bytes : Bytes, from : Int32) : Bool
+        i = 0
+        while i < LEN - 2
+          b = bytes.unsafe_fetch(from + i)
+          return false unless (b >= 0x30_u8 && b <= 0x39_u8) || (b >= 0x61_u8 && b <= 0x66_u8)
+          i += 1
+        end
+        true
+      end
+
+      # Is `s` exactly a canary — `gq` + 8 lower-hex, `LEN` bytes and no more?
+      def self.shaped?(s : String) : Bool
+        return false unless s.bytesize == LEN
+        b = s.to_slice
+        b.unsafe_fetch(0) == 0x67_u8 && b.unsafe_fetch(1) == 0x71_u8 && hex_tail?(b, 2)
+      end
+
+      # Yield the start offset of every `gq`+8-hex canary token in `bytes`. `Slice(UInt8)#index`
+      # is memchr, so the bytes BETWEEN candidate `g`s are skipped by libc a word at a time
+      # rather than one Crystal comparison each — a `g` is ~2% of ordinary text, so the walk that
+      # matters is the memchr, not this loop. No canary is a substring of another (fixed length)
+      # and no lower-hex byte is `g`, so tokens never overlap and each start is yielded once.
+      def self.each_token(bytes : Bytes, & : Int32 ->) : Nil
+        return if bytes.size < LEN
+        last = bytes.size - LEN
+        i = 0
+        while i <= last
+          break unless found = bytes.index(0x67_u8, i)
+          break if found > last
+          i = found
+          yield i if bytes.unsafe_fetch(i + 1) == 0x71_u8 && hex_tail?(bytes, i + 2)
+          i += 1
+        end
       end
 
       # `n` canaries from ONE CSPRNG draw. `fresh` costs a `getrandom` syscall per call, and
@@ -227,15 +278,18 @@ module Gori
       property concurrency : Int32
       property rps : Float64?
       property throttle_ms : Int32?
-      property jitter_ms : Int32
       property timeout : Time::Span?
       property retries : Int32
       property retry_pause : Time::Span
       property stability_rounds : Int32 # baseline resends to learn tolerance
       property confirm_rounds : Int32   # isolate re-tests before Confirmed
       property max_requests : Int64?    # hard cap on total sends
-      property? add_content_length_when_missing : Bool
       property user_wordlist : String?
+      # Names to test FIRST, ahead of the built-in list and the user file — the parameter
+      # inventory's neighbour names (#1231: seen on this host's other endpoints, absent from
+      # this one). First so a `max_requests`-capped run spends its budget on the likeliest
+      # guesses. Merged and de-duplicated by `Plan.build`, like the user file.
+      property seed_names = [] of String
       # The operator's per-request transform HOOK (#818/#846): an argv command that receives
       # the assembled request on stdin and returns the request to actually send on stdout. nil
       # = no hook, the default. This is the miner's answer to a signed API — an app that
@@ -246,6 +300,12 @@ module Gori
       # `Plan.build` so a bad argv is a `PlanError` before the run starts, not a per-worker
       # surprise. See `Miner::HookBackend` for the timeout unit and where the cost lands.
       property hook : String?
+      # The run's request-time macro (#1350): Repeater sessions replayed before a probe so a
+      # per-request CSRF token or nonce is fresh when the probe resolves its `$BIND.NAME`. The
+      # native answer to the rotating-token target the hook above reaches by forking a command.
+      # nil is every run that came before. See `Miner::MacroBackend` for what a "request" is
+      # here, and `Fuzz::Config#request_macro` — this is the same spec on the same terms.
+      property request_macro : Gori::RequestMacro::Spec?
       property notify : NotifyMode
       # Reuse one connection across the run's sends instead of dialing a fresh one per probe —
       # `Repeater::ConnPool` on HTTP/1.1, `Repeater::H2Pool` on h2, both wired in `Plan.build`. ON by default, as it is for the
@@ -275,12 +335,13 @@ module Gori
 
       def initialize(@locations = [Location::Query],
                      @bucket_size = DEFAULT_BUCKETS.dup,
-                     @concurrency = 10, @rps = nil, @throttle_ms = nil, @jitter_ms = 0,
+                     @concurrency = 10, @rps = nil, @throttle_ms = nil,
                      @timeout = nil, @retries = 1, @retry_pause = 500.milliseconds,
                      @stability_rounds = 4, @confirm_rounds = 2, @max_requests = nil,
-                     @add_content_length_when_missing = false, @user_wordlist = nil,
+                     @user_wordlist = nil,
                      @hook = nil,
-                     @notify = NotifyMode::WhenFound, @keep_alive = true)
+                     @notify = NotifyMode::WhenFound, @keep_alive = true,
+                     @request_macro = nil)
       end
 
       def bucket_for(loc : Location) : Int32

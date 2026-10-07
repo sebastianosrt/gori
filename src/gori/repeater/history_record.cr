@@ -45,8 +45,14 @@ module Gori
       # `surface` is required for the same reason `wire` is: every caller of this recorder lives
       # inside one surface's own file and knows the answer, and a defaulted one would let a
       # fourth surface record under a third's name.
+      # `kind` is WHICH TOOL put the request on the wire. It defaults to `Repeater` because
+      # that is what this recorder was written for and what three of its four callers still
+      # are; an issue retest (#1036) passes `Retest`, because a step of a check gori ran and
+      # a request an operator drove by hand are different facts about the same bytes and the
+      # History SRC column exists to tell producers apart.
       def record(store : Store, plan : Plan, result : Result, created_at : Int64,
                  wire : Bytes, *, surface : FlowSource::Surface,
+                 kind : FlowSource::Kind = FlowSource::Kind::Repeater,
                  source_ref : String? = nil) : Int64
         head, body, method, target, version = request_projection(plan, wire)
         captured = Store::CapturedRequest.new(
@@ -60,7 +66,7 @@ module Gori
           head: head,
           body: body,
           body_size: body.try(&.size.to_i64),
-          source: FlowSource::Kind::Repeater,
+          source: kind,
           source_surface: surface,
           source_ref: source_ref,
         )
@@ -98,19 +104,13 @@ module Gori
           target = H2Engine.pseudo_field(fields, ":path") || "/"
           {head, plan.h2_body, method, target, "HTTP/2"}
         else
-          head, body = split_head_body(wire)
-          # `authored_start_line`, not the strict parser: the bytes are the operator's and under
-          # `--verbatim` a bare-LF terminator is the payload — the same call MCP's recorder makes.
-          method, target, version = Proxy::Codec::Http1.authored_start_line(head)
+          head, body = Env.split_head_body(wire)
+          # Not the strict parser: the bytes are the operator's and under `--verbatim` a bare-LF
+          # terminator is the payload, and a line it cannot frame is filed the way the proxy
+          # files it (#1423) — the same call MCP's recorder makes.
+          method, target, version = FlowMapper.authored_request(head, http2: plan.http2?)
           {head, body, method, target, version}
         end
-      end
-
-      private def split_head_body(bytes : Bytes) : {Bytes, Bytes?}
-        boundary = Env.head_body_boundary(bytes)
-        head = bytes[0, boundary]
-        body_size = bytes.size - boundary
-        {head, body_size > 0 ? bytes[boundary, body_size] : nil}
       end
     end
   end

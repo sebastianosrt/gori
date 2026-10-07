@@ -103,7 +103,7 @@ end
 # spec starts here, because a 2xx is what opens the socket (RFC 8441 §5.1).
 private def open_socket(sink : WsSink, protocol : String = "websocket",
                         status : String = "200") : Gori::Proxy::H2::Assembler
-  assembler = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443, 1_i64)
+  assembler = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443)
   assembler.feed("out", headers_frame(1_u32, Frame::END_HEADERS, connect_block(protocol)))
   assembler.feed("in", headers_frame(1_u32, Frame::END_HEADERS, status_block(status)))
   assembler
@@ -151,6 +151,21 @@ describe Gori::Proxy::H2::WsCapture do
       ws_in(WS::OP_TEXT, "one"), ws_in(WS::OP_TEXT, "two"), ws_in(WS::OP_TEXT, "three"))))
 
     sink.frames.map(&.text).should eq(["one", "two", "three"])
+  end
+
+  # A single-frame message is handed to the sink without a copy through the reassembly
+  # buffer, so its row must not alias the DATA frame it arrived in: the h2 reader is free to
+  # reuse that buffer, and a later frame must not rewrite a row already captured.
+  it "keeps a single-frame row intact after its DATA buffer is reused" do
+    sink = WsSink.new
+    a = open_socket(sink)
+    wire = ws_in(WS::OP_TEXT, "first message")
+    a.feed("in", data_frame(1_u32, 0_u8, wire))
+    wire.fill(0_u8)
+    a.feed("out", data_frame(1_u32, 0_u8, ws_out(WS::OP_TEXT, "masked message")))
+    a.feed("in", data_frame(1_u32, 0_u8, ws_in(WS::OP_TEXT, "second message")))
+
+    sink.frames.map(&.text).should eq(["first message", "masked message", "second message"])
   end
 
   # A fragmented message is ONE row, and the row says it was fragmented — the same fact the h1
@@ -307,7 +322,7 @@ describe Gori::Proxy::H2::WsCapture do
   # capture quietly being absent.
   it "bounds concurrent transcripts per connection and names the stream that missed out" do
     sink = WsSink.new
-    a = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443, 1_i64)
+    a = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443)
     max = Gori::Proxy::H2::WsCapture::MAX_STREAMS
     ids = (0..max).map { |i| (i * 2 + 1).to_u32 }
     ids.each do |id|
@@ -330,7 +345,7 @@ describe Gori::Proxy::H2::WsCapture do
   # closes sockets in sequence would run itself out of them.
   it "releases a capture slot when the socket ends" do
     sink = WsSink.new
-    a = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443, 1_i64)
+    a = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443)
     max = Gori::Proxy::H2::WsCapture::MAX_STREAMS
     (0...(max * 3)).each do |i|
       id = (i * 2 + 1).to_u32
@@ -367,7 +382,7 @@ describe Gori::Proxy::H2::WsCapture do
 
   it "leaves an ordinary stream's column NULL" do
     sink = WsSink.new
-    a = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443, 1_i64)
+    a = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443)
     a.feed("out", headers_frame(1_u32, Frame::END_HEADERS | Frame::END_STREAM,
       hpack([{":method", "GET"}, {":scheme", "https"}, {":path", "/"},
              {":authority", "ws.example.com"}])))
@@ -376,7 +391,7 @@ describe Gori::Proxy::H2::WsCapture do
 
   it "leaves an ordinary stream's DATA as a body" do
     sink = WsSink.new
-    a = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443, 1_i64)
+    a = Gori::Proxy::H2::Assembler.new(sink, "ws.example.com", 443)
     a.feed("out", headers_frame(1_u32, Frame::END_HEADERS,
       hpack([{":method", "POST"}, {":scheme", "https"}, {":path", "/"},
              {":authority", "ws.example.com"}])))

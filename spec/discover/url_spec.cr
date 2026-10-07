@@ -501,4 +501,101 @@ describe Gori::Discover::Url do
       pr.parts.should eq(U.parse("#{dir_url}my%20file.pdf").not_nil!)
     end
   end
+  # The predicate `Engine#consider_link` asks BEFORE a link becomes a request, so the
+  # extension is all it has: the content type only arrives with the body it exists to avoid
+  # downloading.
+  describe ".binary_asset?" do
+    it "answers true for images, fonts, tracks and archives" do
+      %w[/a/photo.jpg /x.PNG /f/icon.ico /f/inter.woff2 /m/clip.mp4 /d/backup.zip /d/app.tar.gz]
+        .each { |path| U.binary_asset?(path).should be_true }
+    end
+
+    # Everything that can NAME another url stays crawlable, which is the whole care this
+    # predicate needs — `.svg` is XML and carries hrefs, `.css` carries `url(…)`, a `.map`
+    # names a bundle's sources, and an exposed `.pdf` is itself the point of a sweep.
+    it "answers false for anything whose body can be read" do
+      %w[/logo.svg /app.css /app.js.map /report.pdf /data.json /page.html /api/v2/orders /]
+        .each { |path| U.binary_asset?(path).should be_false }
+    end
+
+    it "does not read a dot in a DIRECTORY as the file's extension" do
+      U.binary_asset?("/v1.2/report").should be_false
+      U.binary_asset?("/assets.png/index").should be_false
+    end
+
+    # A dotfile has no extension (`.env` is the name), and a trailing dot names nothing.
+    it "answers false for a dotfile and a bare trailing dot" do
+      U.binary_asset?("/.env").should be_false
+      U.binary_asset?("/a/.gitignore").should be_false
+      U.binary_asset?("/a/thing.").should be_false
+    end
+  end
+
+  # `template_key` writes the folded path straight into one builder, `canonical_query` stops
+  # re-joining a pair it already holds, and `resolve` lowers an href only when lowering it
+  # would change something. All three are allocation shapes; none may move a byte of the keys
+  # `@seen`/`@templates` dedupe on, so these pin the edges each one touches.
+  describe "key building (allocation-shape rewrites)" do
+    it "folds a path with empty, trailing and mixed-case segments the same way" do
+      {"/a/1/b"            => "http://h/a/{n}/b",
+       "/"                 => "http://h/",
+       "/a/"               => "http://h/a/",
+       "/API/Users/42"     => "http://h/api/users/{n}",
+       "/a/2026-07-19/b"   => "http://h/a/{date}/b",
+       "/a/deadbeefcafe/b" => "http://h/a/{hex}/b"}.each do |path, want|
+        U.template_key(U.parse("http://h#{path}").not_nil!).should eq(want)
+      end
+      # `parse_path` collapses `//`, so only a hand-built Parts reaches the empty-segment
+      # branch — the one the old `split.map.join` spelled as `seg.empty? ? seg : fold(seg)`.
+      U.template_key(U::Parts.new("http", "h", 80, "//a//1", nil)).should eq("http://h//a//{n}")
+    end
+
+    it "keeps the non-default port in every key it belonged in" do
+      p = U.parse("https://h:8443/a/1?b=2&a=1").not_nil!
+      U.visit_key(p).should eq("https://h:8443/a/1?a=1&b=2")
+      U.template_key(p).should eq("https://h:8443/a/{n}?a&b")
+      # `gate_url` is the scope question, not a key: it carries the query VERBATIM (order and
+      # all) and drops the port, which is the INCLUDE spelling every allowlist consumer sees (#407).
+      U.gate_url(p).should eq("https://h/a/1?b=2&a=1")
+    end
+
+    it "normalizes a VALUELESS query key to `k=` in visit_key, as it always has" do
+      U.visit_key(U.parse("http://h/s?flag&b=2").not_nil!).should eq("http://h/s?b=2&flag=")
+      U.visit_key(U.parse("http://h/s?a=").not_nil!).should eq("http://h/s?a=")
+      U.template_key(U.parse("http://h/s?flag&b=2").not_nil!).should eq("http://h/s?b&flag")
+      # An `=` inside the VALUE belongs to the value, not a second pair.
+      U.visit_key(U.parse("http://h/s?a=1=2").not_nil!).should eq("http://h/s?a=1=2")
+      U.template_key(U.parse("http://h/s?a=1=2").not_nil!).should eq("http://h/s?a")
+    end
+
+    it "resolve answers identically whatever case the scheme or the href arrives in" do
+      base = U.parse("https://app.test/shop/catalog/index.html").not_nil!
+      {"MAILTO:a@b"           => nil,
+       "JavaScript:alert(1)"  => nil,
+       "Data:text/html,x"     => nil,
+       "FTP://other.test/x"   => nil,
+       "HTTPS://Other.test/X" => "HTTPS://Other.test/X",
+       "//Other.test/X"       => "https://Other.test/X",
+       "Product/1234"         => "https://app.test/shop/catalog/Product/1234",
+       "/Account/Orders"      => "https://app.test/Account/Orders"}.each do |href, want|
+        U.resolve(base, href).should eq(want)
+      end
+    end
+
+    it "case-folds a segment whose capitals are outside ASCII, like every other one" do
+      # `parse_path` percent-encodes nothing here, so a crawl reaches both spellings as
+      # themselves — and they are one route, hence one template.
+      lower = U.template_key(U.parse("http://h/äöü/1").not_nil!)
+      U.template_key(U.parse("http://h/ÄÖÜ/1").not_nil!).should eq(lower)
+      lower.should eq("http://h/äöü/{n}")
+      U.fold_segment("ÄÖÜ").should eq("äöü")
+      U.fold_segment("Straße").should eq("straße")
+    end
+
+    it "resolve still refuses a non-ASCII scheme-looking href without raising" do
+      base = U.parse("https://app.test/a/b").not_nil!
+      U.resolve(base, "caf\xE9/x").should eq("https://app.test/a/caf\xE9/x")
+      U.resolve(base, "wss://other.test/x").should be_nil
+    end
+  end
 end

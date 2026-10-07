@@ -140,8 +140,8 @@ module Gori::Repeater
 
     # Has the peer sent FIN on this parked connection?
     #
-    # ONE question, and — unlike `ConnPool.checkout_state`, which also has to hunt for residue
-    # and may consume a byte doing it — never consuming one. That difference is load-bearing:
+    # ONE question, and — unlike ConnPool's `SocketResidue.state` checkout, which also has to
+    # hunt for residue and may consume a byte doing it — never consuming one. That difference is load-bearing:
     # bytes waiting on an idle h2 connection are ordinary protocol frames, so a probe that ate
     # one would corrupt the frame stream it was trying to protect. Anything already buffered
     # therefore answers "not closed" outright, and only a connection with nothing waiting
@@ -164,11 +164,10 @@ module Gori::Repeater
       false
     end
 
-    # `MSG_PEEK` on a socket fd: read-without-consume, non-blocking because Crystal's sockets
-    # are evented. 0 means the peer sent FIN; anything else (a byte, or EAGAIN) does not.
+    # A read-without-consume peek: 0 means the peer sent FIN; anything else (a byte, nothing
+    # waiting, an error) does not.
     private def self.fin?(sock : TCPSocket) : Bool
-      buf = uninitialized UInt8[1]
-      LibC.recv(sock.fd, buf.to_unsafe.as(Void*), LibC::SizeT.new(1), ConnPool::MSG_PEEK) == 0
+      Proxy::SocketResidue.peek(sock) == 0
     end
 
     # A REUSED connection that failed before any response byte arrived — the h2 twin of
@@ -176,17 +175,18 @@ module Gori::Repeater
     # nothing back, NOT that the origin never saw the request. The method gate above covers
     # that gap.
     #
-    # Plus one clause the h1 version does not need. `error && response.nil? && !delivered?` IS
-    # a dead socket on HTTP/1.1, where the only way to fail before a response byte is for the
-    # transport to break. On h2 it is also what a live connection produces when the peer
+    # The h1 reader carries an explicit zero-byte EOF/reset retry decision. On h2,
+    # `error && response.nil? && !delivered?` can also describe a live connection when the peer
     # REFUSES the stream — a WAF answering RST_STREAM(ENHANCE_YOUR_CALM) before any HEADERS, a
     # GOAWAY, or gori's own flow-control stall — and reading those as "stale parked
     # connection" re-sent a payload the origin had already refused (GET) or replaced the
     # peer's own stated reason with a fabricated "the connection was closed by the origin"
     # (POST, via `unsafe_stale_result`), while also disabling pooling for the rest of the run.
-    # `Conn#explained?` is exactly the difference: somebody OBSERVED how this ended.
+    # A read timeout is also not a stale close. `Conn#explained?` and `timed_out?` preserve
+    # those distinctions.
     private def stale?(result : Repeater::Result, conn : H2Engine::Conn) : Bool
-      !result.error.nil? && result.response.nil? && !result.delivered? && !conn.explained?
+      !result.error.nil? && result.response.nil? && !result.delivered? &&
+        !result.timed_out? && !conn.explained?
     end
 
     private def unsafe_stale_result(result : Repeater::Result, method : String) : Repeater::Result

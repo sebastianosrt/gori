@@ -1,5 +1,5 @@
 +++
-title = "Authorize"
+title = "Authorization Testing"
 description = "Replay a captured request under several identities and diff the verdicts to find broken access control."
 weight = 75
 
@@ -9,7 +9,7 @@ group = "Workbenches"
 
 Most access-control bugs are invisible from one session. You are logged in as an admin, `/admin/users` returns the list, and everything looks correct, because you never asked what the *anonymous* client gets, or the read-only user, or the tenant next door. **Authorize** asks: it takes a request you already captured, replays it under several identities, and compares each response against a baseline. An identity that is served what the baseline was served is a likely authorization bypass. It is gori's counterpart to Burp's Autorize / Auth Analyzer and to AuthMatrix.
 
-The **Authorize** tab is hidden by default. Reveal it from the tab-bar `⋯` menu, the command palette (`Ctrl-P` → **Go to Authorize**), or Preferences (`Ctrl-,`) → **Network & Tabs** → **Tabs**.
+The **Authorize** tab is off the bar by default. Press **`0`** and type "auth", use the command palette (`Ctrl-P` → **Go to Authorize**), or give it one of the nine slots in Preferences (`Ctrl-,`) → **Network & Tabs** → **Tabs**.
 
 ## What an Identity Is
 
@@ -33,7 +33,7 @@ Press `i` on the tab to open the identities card. A fresh project starts with tw
 | `b` | Make this one the baseline |
 | `esc` | Close |
 
-The add / edit form has three fields: a **name** (unique, because two rows under one label would make the results table unreadable, and all three surfaces refuse a duplicate; names are compared case-insensitively), the headers to **set**, one `Name: value` per line, and the headers to **remove**, comma-separated. `⇥` moves between fields, `↵` saves. A header line whose name is not a valid token, or whose value carries a CR or LF, is refused with the offending line named rather than silently dropped.
+The add / edit form has four fields: a **name** (unique, because two rows under one label would make the results table unreadable, and all three surfaces refuse a duplicate; names are compared case-insensitively), the headers to **remove** (`drop headers:`), comma-separated, the headers to **set**, one `Name: value` per line, and **refresh before** (`off`, `jwt-exp` or `ttl=10m`; see [Refreshing a slot](#refreshing-a-slot)); the slot's refresh steps are listed read-only on the line above it. `⇥` moves between fields, `↵` saves (inside the set-headers editor it inserts a newline). A header line whose name is not a valid token, or whose value carries a CR or LF, is refused with the offending line named rather than silently dropped.
 
 Identities are saved with the project, so `gori run authorize` and the MCP tools default to the same set you configured here. The list shows header *names* only. A session cookie is a credential, and a list that paints it on screen leaks it to anyone glancing at your terminal. The form shows values, because that is what editing means.
 
@@ -48,21 +48,35 @@ Picking the active one is a separate action from editing the list, because it is
 | Surface | Pick the active slot | Edit the list |
 |---------|----------------------|---------------|
 | TUI | `Ctrl-P` → **Session slot**, or click the `session:NAME` chip | `i` on this tab |
-| `gori run` | `--slot NAME` on the sending command | `gori run session list \| show \| add \| edit \| rm \| baseline` |
+| `gori run` | `--slot NAME` on the sending command | `gori run session list \| show \| add \| from-flow \| from-request \| edit \| rm \| baseline \| refresh` |
 | MCP | `set_active_session_slot` | `list_session_slots`, `create_session_slot`, `update_session_slot`, `delete_session_slot` |
 
 What the active slot changes, on `send_request`, a Repeater or Fuzzer send, and an intercept forward:
 
-- its **header overlay** is applied to the final wire bytes, after `$NAME` substitution, header lines only, so `Content-Length` never moves and the body is byte-exact;
-- `$NAME` resolves against **its** binding table. An extract rule a slot claims writes that slot's table; a rule no slot claims keeps writing the one global table it always did. So `Authorization: Bearer $SESSION` means admin's token on the `admin` slot and the low-priv user's on `low-priv`, off one saved string.
+- its **header overlay** is applied to the final wire bytes, after `$BIND.NAME` substitution, header lines only, so `Content-Length` never moves and the body is byte-exact;
+- `$BIND.NAME` resolves against **its** binding table. An extract rule a slot claims writes that slot's table; a rule no slot claims keeps writing the one global table it always did. So `Authorization: Bearer $BIND.SESSION` means admin's token on the `admin` slot and the low-priv user's on `low-priv`, off one saved string.
 
 Three things the active slot deliberately does **not** do:
 
-- **It does not apply to an Authorize run.** This tab supplies the identity itself, once per send, and comparing them *is* the measurement, so a run reads the list across and wears none of it, whichever slot is active. Left to apply, the active slot would write its `Cookie` over the top of every identity, including the one whose whole job is to remove it: every response would match the baseline by construction and every queued row would report a bypass that does not exist. What *does* still apply is the second half above: each identity's own `$NAME` resolves out of **that identity's** binding table as its overlay goes on, so `Cookie: session=$SESSION` on both `admin` and `low-priv` is two different sessions on the wire, which is the whole point of running them side by side.
-- **It is never persisted.** Reopening a project, or a new `gori mcp` connection, starts as-captured. A slot's *values* are memory-only by design, so restoring "admin is active" into an empty admin table would hand the next send an overlay whose `$SESSION` is literal: a `401` with no visible cause. Activation is one keystroke; a stale one is a support ticket.
+- **It does not apply to an Authorize run.** This tab supplies the identity itself, once per send, and comparing them *is* the measurement, so a run reads the list across and wears none of it, whichever slot is active. Left to apply, the active slot would write its `Cookie` over the top of every identity, including the one whose whole job is to remove it: every response would match the baseline by construction and every queued row would report a bypass that does not exist. What *does* still apply is the second half above: each identity's own `$BIND.NAME` resolves out of **that identity's** binding table as its overlay goes on, so `Cookie: session=$BIND.SESSION` on both `admin` and `low-priv` is two different sessions on the wire, which is the whole point of running them side by side.
+- **It is never persisted.** Reopening a project, or a new `gori mcp` connection, starts as-captured. A slot's *values* are memory-only by design, so restoring "admin is active" into an empty admin table would hand the next send an overlay whose `$BIND.SESSION` is literal: a `401` with no visible cause. Activation is one keystroke; a stale one is a support ticket.
 - **`as-captured` is the baseline in both senses.** With no slot active nothing changes a byte, which is what makes every project and every playbook written before slots existed behave exactly as it did.
 
-There is no cookie jar and no auto-login macro here. A slot carries the headers you wrote and the values gori observed; `--bind-from` replays one flow *you* named to fill them.
+There is no cookie jar here. A slot carries the headers you wrote and the values gori observed; `--bind-from` replays one flow *you* named to fill them, and a slot's refresh steps replay the Repeater sessions *you* put in its list.
+
+## Refreshing a Slot
+
+A slot is a snapshot, so a long run can outlive its token. Give the slot **refresh steps**, the Repeater sessions that log in, in order (for example `csrf-fetch → login`), and the slot re-authenticates itself: each step's response goes through the slot's own extract rules, which rebind it. A step resolves the slot's own `$BIND.NAME` values and carries no slot header overlay, so the login never sends the stale credential it is replacing.
+
+| Surface | Add a step | Refresh now | Policy |
+|---------|------------|-------------|--------|
+| TUI | In the Repeater, `Ctrl-P` → **Use as refresh for slot…** on the login sub-tab | `Ctrl-R` on the row in the session slot picker | the **refresh before** field of the identity form (`i` on this tab) |
+| `gori run` | `session edit NAME --refresh 12,14` | `session refresh NAME` | `--refresh-before` |
+| MCP | `update_session_slot{refresh}` | `refresh_session_slot` | `refresh_before` |
+
+A **refresh before** policy runs the refresh on its own, before a send that goes out as the slot: `jwt-exp` when a JWT bound in the slot is within 30 s of its `exp`, or `ttl=10m` when that long has passed since the last successful refresh (or, before one, since the slot's oldest binding). A refresh that leaves the JWT still about to expire counts as a failure. It applies to every identity an Authorize run sends as, not only to the active slot. It acts **before** a send and never reads a response: a `401` in this tab is still the verdict, never a reason to log in again and retry.
+
+Refresh traffic is visible: each step lands in History with source `refresh` (`src:refresh`, SRC `RFRSH`), each refresh writes one event, and the `session:NAME` chip shows `⟳` while one runs and `!` after one failed. A failure also raises a notification and leaves the send going out with the value it had; a failed automatic refresh waits 30 s before it tries again, and after 3 failures in a row it switches itself off until a manual refresh succeeds. A step whose Repeater session was deleted stays in the list as `(deleted)` and refuses to run. Values stay per process: a refresh in the TUI does not update a running `gori mcp`.
 
 ## The Baseline
 
@@ -72,7 +86,7 @@ A run needs at least one identity besides the baseline, and all three surfaces r
 
 ## The Loop
 
-1. In **History**, select the flows worth testing and `Space` → **Send to Authorize**. From **Sitemap**, the same verb queues the selected endpoint's captured flow.
+1. In **History**, select the flows worth testing and `Space` `>` `a` (**Send flow to…** → **Send to Authorize**). From **Sitemap**, the same verb queues the selected endpoint's captured flow.
 2. On the **Authorize** tab, press `i` and set up the identities you want to compare.
 3. `Ctrl-R` replays every queued request that has no result yet; `⇧R` re-runs everything; `t` runs just the request under the cursor.
 4. Read the table. The top pane is one row per request with an aggregate verdict; `⇥` drills into the selected request's identities in the bottom pane.
@@ -88,14 +102,14 @@ Each identity's response is reduced to three facts (status, decoded body size, a
 | Verdict | Means |
 |---------|-------|
 | `baseline` | This row *is* the baseline |
-| `different` | A different status **class** (2xx vs 4xx vs 3xx), the clearest sign access control engaged. Or two redirects that point somewhere else |
+| `different` | A different status **class** (2xx vs 4xx vs 3xx) where this identity did not gain a 2xx, the clearest sign access control engaged. Or two redirects to a different destination |
 | `same` | Same status class, and the body matches: within a SimHash distance of 3 **and** within 10% in size. Or two redirects to the same place |
-| `review` | Same status class, divergent body. Or the baseline itself errored, so there was nothing to anchor against |
+| `review` | Same status class, divergent body. Or this identity got a 2xx the baseline did not (`403 → 200`, `304 → 200`); two redirects to the same path that differ only in query or fragment; a `HEAD` or `304` pair with no `ETag` or `Content-Length` to compare; or the baseline itself errored or was denied (4xx/5xx), so there was nothing to anchor against |
 | `error` | This identity's send failed (TLS, DNS, timeout, refused); nothing was compared |
 
-Two redirects are judged on their **`Location`**, before the body is looked at. A redirect's body is empty, so on the three facts above every `3xx` matched every other `3xx`, and an authenticated `302 → /dashboard` against an anonymous `302 → /login`, which is the clearest *enforcement* there is, came back `same`. Where the origin steers each identity is the only thing a redirect says, so that is what gets compared: an exact string match, because `/login` and `/login/` are a difference worth showing you rather than one worth deciding for you.
+Two redirects are judged on their **`Location`**, before the body is looked at. A redirect's body is empty, so on the three facts above every `3xx` matched every other `3xx`, and an authenticated `302 → /dashboard` against an anonymous `302 → /login`, which is the clearest *enforcement* there is, came back `same`. Where the origin steers each identity is the only thing a redirect says, so that is what gets compared, when both responses carry one: an exact match is `same`, the same scheme, host, port and path with only the query or fragment differing is `review` (both identities still reached the resource), and anything else is `different`. Paths are compared as written, because `/login` and `/login/` are a difference worth showing you rather than one worth deciding for you.
 
-The per-request row aggregates them: **BYPASS** when any non-baseline identity came back `same`, **enforced** when every one clearly differed, **error** when every one of their sends *failed*, **review** otherwise.
+The per-request row aggregates them: **BYPASS** (the TUI row reads `⚠ N same`) when any non-baseline identity came back `same`, **enforced** when every one clearly differed, **error** when every one of their sends *failed*, **review** otherwise.
 
 That fourth word is not a formality. A request nothing answered has no `same` verdict and no `different` one either, so an aggregate built from those two alone calls it **enforced**: a clean bill of health for a host gori could not reach. "The server held" and "we never got a reply" are opposite findings, and every surface reports them apart: the tab paints the row `error`, `gori run authorize` prints `[x] error` for it, and the MCP verdict is `error` with an `unanswered_count` beside it. When *nothing* in the run was compared (every request either refused by the gate or unanswered), the CLI says so on its summary line and exits non-zero, so a script that gates on the exit code cannot read a dead host as an endpoint that held.
 
@@ -115,6 +129,7 @@ A selection can reach flows that cannot be replayed meaningfully. gori names eve
 | **answered by gori** | gori short-circuited this request itself; there is no origin behind it | — |
 | **outside project scope** | The outbound gate refused the target before the socket | `--allow-unscoped` (CLI), `allow_unscoped:true` (MCP), or add a scope include rule |
 | **already queued** | The same flow was named twice | — |
+| **sent by gori, not the browser** | Passive replay only: the flow is gori's own traffic (a Repeater send, a fuzz row, an agent's request), not something you browsed | — |
 
 The first row is the one worth internalizing. The skip is not a "does this request carry a `Cookie`?" test; that question missed APIs authenticating through `X-Api-Key`, and on a site you were not logged into it skipped everything while saying nothing. gori asks the exact question instead: *would any identity change these bytes?* If not, there is nothing to compare, and it says so.
 
@@ -139,12 +154,14 @@ The tab keeps a live readout of what passive has actually done (`N seen · M que
 | `i` | Identities: edit the set every request is replayed under |
 | `p` | Toggle passive replay |
 | `d` | Remove the selected request from the queue |
+| `/` | Filter the queue by method / host / path / verdict |
+| `y` | Copy the selected request as `METHOD host/path` |
 | `↑` / `↓` | Move between requests |
 | `⇥` | Move between the selected request's identities |
 | `PgUp` / `PgDn` | Scroll the detail pane |
 | `⇧X` | Clear: empty the queue and every identity's results (asks first). `Space` → `X` does the same; `⇧X` is the clear-all key in History, Probe, Issues and the Project ACTIVITY feed too |
 
-From **History** or **Sitemap**, `Space` → **Send to Authorize** queues a request here.
+From **History** or **Sitemap**, `Space` `>` `a` (**Send flow to…** → **Send to Authorize**) queues a request here.
 
 ## Headless
 
@@ -195,7 +212,7 @@ gori run session baseline as-captured
 gori run session rm low-priv
 ```
 
-There is no `gori run session activate`: a `gori run` process sends and exits, so the active pointer has nothing to span. Name the identity on the send instead: `--slot NAME` works on `repeater`, `fuzz`, `mine`, `sequence` and `discover`, and applies before `--bind-from` replays its seed, so the seed fills the slot the run then sends as.
+There is no `gori run session activate`: a `gori run` process sends and exits, so the active pointer has nothing to span. Name the identity on the send instead: `--slot NAME` works on `send`, `repeater`, `repeater send`, `repeater race`, `repeater timing`, `repeater minimize`, `fuzz`, `mine`, `sequence`, `discover` and `retest run`, and applies before `--bind-from` replays its seed, so the seed fills the slot the run then sends as.
 
 `--format jsonl` streams one object per request as it lands; `--format json` buffers and emits a single array at the end. Both carry the decoded body size the verdict actually compared alongside the wire size, which a gzipped response makes disagree by an order of magnitude. Full flags are in the [CLI Reference](/reference/cli/#run-authorize).
 
@@ -205,15 +222,15 @@ Four MCP tools drive the same engine as a background job: `authorize_start` (ret
 
 `authorize_results` puts the answer first. `access_control` names the outcome in one token (`BYPASS`, `enforced`, `review`, `error`, or `nothing_sent`; the last two both mean nothing was compared), `summary` says it in a sentence, and `bypasses` lists every request where a non-baseline identity was served the baseline's response, flat and never paged. An agent that reads nothing else still gets the finding.
 
-Five more manage the slots themselves: `list_session_slots` (with the active one named, header values `[REDACTED]` unless you ask), `create_session_slot`, `update_session_slot`, `delete_session_slot`, and `set_active_session_slot`, which picks the identity every *other* tool's sends go out as, for the life of that server process.
+Six more manage the slots themselves: `list_session_slots` (with the active one named, header values `[REDACTED]` unless you ask), `create_session_slot`, `update_session_slot`, `delete_session_slot`, `set_active_session_slot`, which picks the identity every *other* tool's sends go out as, for the life of that server process, and `refresh_session_slot`, which runs a slot's refresh steps now.
 
-A run is capped at 2,000 sends, and the cap counts `flows × identities`: a 500-row query under four identities is refused up front, naming both factors, rather than truncated into a run that would report "enforced" for flows it never sent. Layer-1 scope is strict here: an out-of-scope target needs an explicit `allow_unscoped:true`, because nobody eyeballed it.
+A run is capped at 2,000 sends, and the cap counts `flows × identities`: a 500-row query under five identities (2,500 sends) is refused up front, naming both factors, rather than truncated into a run that would report "enforced" for flows it never sent. Layer-1 scope is strict here: an out-of-scope target needs an explicit `allow_unscoped:true`, because nobody eyeballed it.
 
 ## A Run That Sent Nothing Is Not Evidence
 
 This is the property the code goes out of its way to enforce, on every surface.
 
-If the sandbox or an exclude rule refused every send before the socket, if every selected flow was skipped, or if you stopped the run part-way, gori does **not** report "no identity matched the baseline". It says nothing was sent. A clean bill of health for traffic that never left the machine is the worst way an access-control test can fail, worse than a false positive, because you would close the ticket.
+If the sandbox or an exclude rule refused every send before the socket, or if every selected flow was skipped, gori does **not** report "no identity matched the baseline". It says nothing was sent. A run you stop part-way says it was stopped and counts only the requests that finished. A clean bill of health for traffic that never left the machine is the worst way an access-control test can fail, worse than a false positive, because you would close the ticket.
 
 The same caution applies to a genuine `enforced`: it means access control held *for the identities you tested, on the requests you replayed*. A different endpoint, a different privilege boundary, or an identity you did not model is untested, not safe.
 

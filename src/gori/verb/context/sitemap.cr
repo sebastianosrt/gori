@@ -10,11 +10,15 @@ abstract class Gori::Verb::ExecContext
   abstract def sitemap_tag : Nil               # tag the selected path — or every marked path — with a memo
   abstract def sitemap_toggle_grouping : Nil   # fold/unfold numeric path-param sequences
   abstract def sitemap_toggle_query_fold : Nil # fold/unfold query-string variants of one path
+  abstract def sitemap_toggle_js_refs : Nil    # show/hide the paths captured JavaScript references (#1243)
+  abstract def sitemap_js_scan : Nil           # scan captured JavaScript for referenced endpoints (sends nothing)
   abstract def sitemap_repeater : Nil          # send the selected/marked endpoints to Repeater
   abstract def sitemap_open_flow : Nil         # open the selected endpoint's captured flow in History
   abstract def sitemap_scope_add : Nil         # seed the scope-rule popup from the cursor row (host, or host+path)
+  abstract def sitemap_export : Nil            # the marked/cursor endpoints as an OpenAPI document (asks for the path)
   # multi-select marks: the batch verbs above act on the marks if any are set, else the cursor row
   abstract def sitemap_mark_toggle : Nil                # flip the cursor row's mark, then step down
+  abstract def sitemap_mark_all : Nil                   # ⇧T: mark every endpoint the tree shows
   abstract def sitemap_mark_clear : Nil                 # drop every mark
   abstract def sitemap_mark_extend(delta : Int32) : Nil # ⇧↑/⇧↓: extend a range from the anchor
   abstract def sitemap_marked_count : Int32             # how many nodes are marked (menu gate/titles)

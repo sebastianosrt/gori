@@ -4,16 +4,21 @@ require "../support/fake_host"
 
 # `y` with NOTHING selected copies the WHOLE focused pane. That is the rule `Runner#read_copy`
 # states for every read pane in the tree ("selection if active, else the whole focused pane"),
-# and the two panes here are the ones where the operator's `y` never reached it: both are
-# raw-dispatched by their controller AHEAD of the keymap, and both fell back to the caret's own
-# LINE instead. So the pane's two copy keys disagreed — `^Y` (project.copy / issue.copy → the
-# verb → read_copy) copied the whole description/notes, `y` copied one line of it.
+# and the two panes here are the ones where the operator's `y` never reached it: each
+# controller raw-dispatched the letter AHEAD of the keymap and fell back to the caret's own
+# LINE, so the pane's two copy keys disagreed — `^Y` (project.copy / issue.copy → the verb →
+# read_copy) copied the whole description/notes, `y` copied one line of it.
 #
-# The assertions are on WHICH branch ran, read off the toast, because the two branches word
-# their status differently ("copied Nb to clipboard" for a selection, "copied description/notes
-# to clipboard (Nb)" for the whole pane). `Settings.clipboard_osc52` is off for the duration:
-# `Clipboard.copy` then returns 0 without touching the tty, which is what keeps a spec run from
-# writing OSC 52 at the developer's terminal and taking their clipboard with it.
+# BOTH raw-dispatch arms are gone (the editor-verb migration — KEY_AUDIT §2e). The pane now
+# DEFERS `y` and the verb's own bare chord carries it, which is what makes the disagreement
+# structurally impossible rather than fixed in two places: there is one path left. So the
+# assertions come in two halves — the key defers, and the branch `read_copy` reaches from
+# there produces the right payload. The branch is read off the toast, because the two word
+# their status differently ("copied Nb to clipboard" for a selection, "copied
+# description/notes to clipboard (Nb)" for the whole pane). `Settings.clipboard_osc52` is off
+# for the duration: `Clipboard.copy` then returns 0 without touching the tty, which is what
+# keeps a spec run from writing OSC 52 at the developer's terminal and taking their clipboard
+# with it.
 
 # The CA is the slow part of standing a Session up and nothing here asserts about it.
 private READ_COPY_CA = File.tempname("gori-read-copy-ca")
@@ -64,9 +69,9 @@ private def interaction : Gori::Oast::Interaction
     at: Time.unix(1_700_000_000_i64))
 end
 
-describe "bare `y` in a raw-dispatched read pane" do
+describe "bare `y` in a read pane that used to raw-dispatch it" do
   describe "the Project description" do
-    it "copies the WHOLE description when nothing is selected" do
+    it "defers the key, and copies the WHOLE description when nothing is selected" do
       with_session do |host, _session|
         ctl = Gori::Tui::ProjectController.new(host)
         ctl.view.replace_desc(TEXT)
@@ -77,7 +82,12 @@ describe "bare `y` in a raw-dispatched read pane" do
         ctl.view.desc_copy_text.should eq("alpha")
         ctl.view.desc_copy_all.should eq(TEXT)
 
-        ctl.handle_body_key(Y.call).should be_true
+        # The pane no longer claims the letter: `project.copy` carries a real bare `y` again
+        # and the shell resolves it (verbs/core.cr).
+        ctl.handle_body_key(Y.call).should be_false
+        Gori::Verbs.registry["project.copy"].chords.should contain(Gori::Verb::Chord.new("y"))
+
+        ctl.project_copy_all # the branch Runner#read_copy takes with no selection
         host.statuses.last.should start_with("copied description to clipboard")
       end
     end
@@ -89,7 +99,8 @@ describe "bare `y` in a raw-dispatched read pane" do
         ctl.view.desc_select_line
         ctl.view.desc_selection?.should be_true
 
-        ctl.handle_body_key(Y.call).should be_true
+        ctl.handle_body_key(Y.call).should be_false
+        ctl.project_copy                                               # the branch Runner#read_copy takes with a live selection
         host.statuses.last.should start_with("copied 0b to clipboard") # 0b: the clipboard is off
       end
     end
@@ -111,7 +122,10 @@ describe "bare `y` in a raw-dispatched read pane" do
         ctl.view.notes_copy_text.should eq("alpha")
         ctl.view.notes_copy_all.should eq(TEXT)
 
-        ctl.handle_detail_key(Y.call).should be_true
+        # The notes pane defers `y` like the description above: `issue.copy` carries both `y`
+        # and `^Y`, and under the vim keyset a bare `y` here is `yy` (spec/tui/editor_scope_spec.cr).
+        ctl.handle_detail_key(Y.call).should be_false
+        ctl.issues_copy_all # the branch Runner#read_copy takes with nothing selected
         host.statuses.last.should start_with("copied notes to clipboard")
       end
     end
@@ -127,7 +141,8 @@ describe "bare `y` in a raw-dispatched read pane" do
         ctl.view.notes_select_line
         ctl.view.notes_selection?.should be_true
 
-        ctl.handle_detail_key(Y.call).should be_true
+        ctl.handle_detail_key(Y.call).should be_false
+        ctl.issues_copy # the branch Runner#read_copy takes with a live selection
         host.statuses.last.should start_with("copied 0b to clipboard")
       end
     end
@@ -137,8 +152,10 @@ end
 # Not a fallback bug like the two above but the same key in the same kind of pane: OAST's
 # callback detail swallowed EVERY key it did not itself handle, so the `y copy · x line` its
 # footer names were both dead — `y` reached no copy at all and `x` never got out to its chord.
+# Both are plain chords now (`oast.copy-callback`, `oast.select-line`), so the pane's job here
+# is to hand BOTH letters back rather than to copy anything itself.
 describe "bare `y` in the OAST callback detail" do
-  it "copies the callback, and leaves `x` to the keymap" do
+  it "leaves `y` and `x` to the keymap, and `oast.copy-callback` is what `y` reaches" do
     with_session do |host, session|
       store = session.store
       sid = store.insert_oast_session(nil, "interactsh", "https://oast.test",
@@ -151,11 +168,23 @@ describe "bare `y` in the OAST callback detail" do
       ctl.handle_body_key(key(Termisu::Input::Key::Enter)).should be_true # ↵ opens the detail
       ctl.oast_detail_readable?.should be_true
 
-      ctl.handle_body_key(Y.call).should be_true
-      host.statuses.last.should start_with("copied all (")
-
-      # `x` is oast.select-line, a plain chord: the pane must hand it back, not eat it.
+      # Neither letter is claimed here any more: the keymap owns both, which is what makes
+      # them visible to (and movable from) the Hotkeys editor.
+      ctl.handle_body_key(Y.call).should be_false
       ctl.handle_body_key(key(Termisu::Input::Key::LowerX, :none, 'x')).should be_false
+
+      # …and the verb the fall-through lands on still copies the whole callback.
+      ctl.oast_detail_copy
+      host.statuses.last.should start_with("copied all (")
     end
+  end
+
+  it "binds `y` in Scope::OastCallbacks to the DETAIL copy, the one the scope can carry" do
+    reg = Gori::Verbs.registry
+    reg["oast.copy-callback"].chords.should eq([typed_chord("y")])
+    # `validate_chords!` allows one `y` per scope and the keymap has no focus dimension, so
+    # the LIST's payload-URL copy keeps its menu letter and its controller arm.
+    reg["oast.copy"].chords.should be_empty
+    reg["oast.copy"].menu_key.should eq('y')
   end
 end

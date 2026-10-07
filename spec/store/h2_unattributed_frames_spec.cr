@@ -119,4 +119,23 @@ describe "the unattributed-frame reap and retention" do
       store.count.should eq(2_i64)
     end
   end
+
+  # A clear used to drop every connection row, so the next connection reused id 1 and shared
+  # its frame log with a still-open one. The rows now stay, as they do on an explicit delete.
+  it "keeps connection rows through a clear, so a new connection gets a fresh id" do
+    h2_store(retention: 1000, prune_interval: 1) do |store|
+      real = store.insert_h2_connection("acme.test", 443, "h2")
+      store.insert_flow(h2_request("/first", real))
+      store.flush
+      store.clear_flows.should be_true
+      # The connection is still open and keeps logging under its own id.
+      3.times { |i| store.insert_h2_frame(real, "out", 1_u8, 0_u8, (i + 1).to_u32, "late#{i}".to_slice) }
+      fresh = store.insert_h2_connection("acme.test", 443, "h2")
+      fresh.should be > real
+      store.insert_flow(h2_request("/next", fresh))
+      store.flush
+      store.h2_frames(real).size.should eq(3)
+      store.h2_frames(fresh).size.should eq(0)
+    end
+  end
 end

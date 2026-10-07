@@ -2,6 +2,7 @@ require "./screen"
 require "./theme"
 require "./frame"
 require "./overlay"
+require "./note_detail_overlay"
 
 module Gori::Tui
   # A centered yes/no confirmation modal for destructive actions — deleting a
@@ -31,7 +32,7 @@ module Gori::Tui
     # …and the fewest it can be drawn in at all: the top border (which carries the heading),
     # the button row at `bottom - 3`, and the bottom border. Under this there is nowhere to put
     # the buttons that is not a border, so `render` declines and `handle_key` refuses to
-    # commit — see `drawn?`.
+    # commit — see `@drawn`.
     MIN_H = 4
 
     # The card's heading (`DELETE ISSUE`), NOT the shell's focus badge — that is `title`
@@ -48,21 +49,18 @@ module Gori::Tui
       # `open`/`run`/`save` on the button and answered ↵ with "no", so the hand that had
       # learnt ↵ = go had to learn `y` for these alone.
       @selected = @danger ? :cancel : :confirm
+      # Did the last frame actually put this card on screen? A terminal too short for even
+      # `MIN_H` gets no card at all, and the only cue left is the shell's `CONFIRM` focus badge
+      # — which names no action, no target and no consequence. ProjectPicker already refuses
+      # to ARM a delete it cannot draw ("a delete you cannot read is a delete you cannot have
+      # confirmed"); this is the same rule one step later, where a RESIZE after arming can also
+      # reach it, and it covers every confirm the Runner raises rather than that one open site.
+      #
       # "The last frame did not REFUSE to draw me" — not "a frame has run". The shell draws
       # before it reads a key, so this is never stale there; starting it false instead would
       # make every non-rendering driver (the spec harness, ProjectPicker's own ladder) unable
       # to answer a card that is in fact on screen.
       @drawn = true
-    end
-
-    # Did the last frame actually put this card on screen? A terminal too short for even
-    # `MIN_H` gets no card at all, and the only cue left is the shell's `CONFIRM` focus badge —
-    # which names no action, no target and no consequence. ProjectPicker already refuses to ARM
-    # a delete it cannot draw ("a delete you cannot read is a delete you cannot have
-    # confirmed"); this is the same rule one step later, where a RESIZE after arming can also
-    # reach it, and it covers every confirm the Runner raises rather than that one open site.
-    def drawn? : Bool
-      @drawn
     end
 
     # --- Overlay contract (see overlay.cr) ---
@@ -78,7 +76,7 @@ module Gori::Tui
     # names the verb it stands for rather than a generic "confirm" the button never says.
     def hint : String
       lit = @selected == :confirm ? @confirm_label : @cancel_label
-      "←/→ choose · ↵ #{lit} · y #{@confirm_label} · n/esc #{@cancel_label}"
+      "←/→ choose · ↵ #{lit} · #{CONFIRM_KEY} #{@confirm_label} · #{CANCEL_KEY}/esc #{@cancel_label}"
     end
 
     # ←/→ or Tab move between the buttons; `y` confirms, `n`/esc cancels, ↵ acts on the
@@ -153,16 +151,18 @@ module Gori::Tui
       @selected = @selected == :confirm ? :cancel : :confirm
     end
 
-    def select_confirm : Nil
-      @selected = :confirm
-    end
-
-    def select_cancel : Nil
-      @selected = :cancel
-    end
-
     def confirm_selected? : Bool
       @selected == :confirm
+    end
+
+    # Whether every wrapped message line can be read in `area` without the compact-card
+    # fallback folding the tail into an ellipsized row. A few decisions (project archives,
+    # for example) must show their full disclosure before the operator can continue.
+    def message_fits?(area : Rect) : Bool
+      box = overlay_box(area)
+      return false if box.empty?
+      room = {box.h - (CHROME_H - 1), 0}.max
+      display_lines(area).size <= room
     end
 
     # Centered card over `area` (the body rect). The card sizes to the widest of
@@ -207,9 +207,7 @@ module Gori::Tui
       # project's whole History. It degrades instead; `fitted_lines` spends the shortfall.
       h = {lines.size + CHROME_H, area.h}.min
       w = (content + TEXT_INSET).clamp(16, {area.w - 2, MAX_WIDTH}.min)
-      x = area.x + (area.w - w) // 2
-      y = area.y + (area.h - h) // 2
-      Rect.new(x, y, w, h)
+      area.center(w, h)
     end
 
     # The message as it will actually be DRAWN: split on '\n', then WRAPPED to the widest
@@ -221,77 +219,42 @@ module Gori::Tui
     # #897's two-line messages ran past it, and each lost exactly the clause that said what
     # would happen: `CLOSE FUZZER` drew "Its template/config, private temporary spool, and
     # eve…" and dropped "ry saved run are deleted." — the only warning an operator gets that
-    # `^W` destroys every run ⇧S promoted into the project.
+    # `^W` destroys every run ⇧E promoted into the project.
     #
     # Wrapping HERE and not at each call site is the point: a hand-wrapped sentence is correct
     # until someone edits it, and this is the third message to acquire the same bug. `render`
     # and `overlay_box` share this one definition, so the card's height still matches what is
     # drawn into it — the invariant `overlay_box`'s doc already claims.
     private def display_lines(area : Rect) : Array(String)
-      width = {area.w - 2, MAX_WIDTH}.min - TEXT_INSET
-      lines = [] of String
-      @message.split('\n') { |line| wrap_line(line, width, lines) }
-      lines
-    end
-
-    # Greedy word wrap measured in terminal COLUMNS, not characters, so a CJK message wraps
-    # where it is drawn rather than where its character count happens to land.
-    private def wrap_line(line : String, width : Int32, into : Array(String)) : Nil
-      if width <= 0 || Screen.display_width(line) <= width
-        into << line
-        return
-      end
-      current = [] of String
-      current_w = 0
-      line.split(' ') do |word|
-        parts = hard_split(word, width)
-        parts.each_with_index do |part, i|
-          pw = Screen.display_width(part)
-          if current.empty?
-            current << part
-            current_w = pw
-          elsif current_w + 1 + pw <= width
-            current << part
-            current_w += 1 + pw
-          else
-            into << current.join(' ')
-            current = [part]
-            current_w = pw
-          end
-          # A hard-split chunk fills the line by construction; its remainder starts the next.
-          next if i == parts.size - 1
-          into << current.join(' ')
-          current = [] of String
-          current_w = 0
-        end
-      end
-      into << current.join(' ') unless current.empty?
-    end
-
-    # One word wider than the whole line, cut at grapheme-cluster starts. Cut rather than
-    # clipped: an over-long token is usually a URL, a project name or a payload, and its tail
-    # is the half that identifies it. `Screen.column_for` floors to a cluster start, so a wide
-    # glyph is never split down the middle; the `{cut, 1}.max` keeps a single glyph wider than
-    # the budget from looping forever.
-    private def hard_split(word : String, width : Int32) : Array(String)
-      return [word] if Screen.display_width(word) <= width
-      parts = [] of String
-      rest = word
-      while Screen.display_width(rest) > width
-        cut = {Screen.column_for(rest, width), 1}.max
-        parts << rest[0, cut]
-        rest = rest[cut..]
-      end
-      parts << rest unless rest.empty?
-      parts
+      NoteDetailOverlay.wrap_text(@message, {area.w - 2, MAX_WIDTH}.min - TEXT_INSET)
     end
 
     private def longest(lines : Array(String)) : Int32
       lines.max_of { |l| Screen.display_width(l) }
     end
 
+    # The keys that press the buttons — the same two `handle_key` answers to and `hint` names.
+    CONFIRM_KEY = 'y'
+    CANCEL_KEY  = 'n'
+
+    # A button wears its accelerator: `[y] open`, `[n] stay`. The two words alone were not the
+    # keys that press them — an operator reading `open` / `stay` reaches for `o` and `s`, and
+    # both do nothing — and on the one card raised UNDER a fresh toast (ISSUE CREATED) the hint
+    # line that would have said so was not on screen for the frame the decision is made on.
+    def self.button_text(label : String, key : Char) : String
+      "[#{key}] #{label}"
+    end
+
     private def button_row_width : Int32
-      btn_width(@confirm_label) + 4 + btn_width(@cancel_label)
+      btn_width(confirm_text) + 4 + btn_width(cancel_text)
+    end
+
+    private def confirm_text : String
+      ConfirmDialog.button_text(@confirm_label, CONFIRM_KEY)
+    end
+
+    private def cancel_text : String
+      ConfirmDialog.button_text(@cancel_label, CANCEL_KEY)
     end
 
     private def btn_width(label : String) : Int32
@@ -300,8 +263,8 @@ module Gori::Tui
 
     private def render_buttons(screen : Screen, box : Rect) : Nil
       confirm_rect, cancel_rect = button_rects(box)
-      render_button(screen, confirm_rect.x, confirm_rect.y, @confirm_label, @selected == :confirm, @danger)
-      render_button(screen, cancel_rect.x, cancel_rect.y, @cancel_label, @selected == :cancel, false)
+      render_button(screen, confirm_rect.x, confirm_rect.y, confirm_text, @selected == :confirm, @danger)
+      render_button(screen, cancel_rect.x, cancel_rect.y, cancel_text, @selected == :cancel, false)
     end
 
     # Inverts render_buttons' x/y placement: the {confirm, cancel} button rects
@@ -310,8 +273,8 @@ module Gori::Tui
     def button_rects(box : Rect) : {Rect, Rect}
       x = box.x + (box.w - button_row_width) // 2
       y = box.bottom - 3
-      confirm = Rect.new(x, y, btn_width(@confirm_label), 1)
-      cancel = Rect.new(confirm.right + 4, y, btn_width(@cancel_label), 1)
+      confirm = Rect.new(x, y, btn_width(confirm_text), 1)
+      cancel = Rect.new(confirm.right + 4, y, btn_width(cancel_text), 1)
       {confirm, cancel}
     end
 

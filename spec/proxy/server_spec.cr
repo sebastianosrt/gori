@@ -54,6 +54,14 @@ private class BodyRewriter < Gori::Proxy::HeadRewriter
     true
   end
 
+  def rewrites_request_body_for_host?(host : String) : Bool
+    true
+  end
+
+  def rewrites_response_body_for_host?(host : String) : Bool
+    true
+  end
+
   def rewrites_response_body? : Bool
     true
   end
@@ -182,7 +190,8 @@ end
 # An origin that reads the request BODY (per its framing) and reports it on `seen_body`,
 # then replies with `resp_body`. `chunked` frames the reply as Transfer-Encoding: chunked
 # (one chunk) so the response-body M&R path exercises de-chunk → re-frame.
-private def start_body_origin(resp_body : String, seen_body : Channel(String), chunked : Bool = false) : Int32
+private def start_body_origin(resp_body : String, seen_body : Channel(String), chunked : Bool = false,
+                              content_type : String? = nil) : Int32
   origin = TCPServer.new("127.0.0.1", 0)
   port = origin.local_address.port
   spawn do
@@ -197,10 +206,14 @@ private def start_body_origin(resp_body : String, seen_body : Channel(String), c
         seen_body.send("")
       end
       if chunked
-        conn << "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        conn << "HTTP/1.1 200 OK\r\n"
+        conn << "Content-Type: #{content_type}\r\n" if content_type
+        conn << "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
         conn << resp_body.bytesize.to_s(16) << "\r\n" << resp_body << "\r\n0\r\n\r\n"
       else
-        conn << "HTTP/1.1 200 OK\r\nContent-Length: #{resp_body.bytesize}\r\nConnection: close\r\n\r\n" << resp_body
+        conn << "HTTP/1.1 200 OK\r\n"
+        conn << "Content-Type: #{content_type}\r\n" if content_type
+        conn << "Content-Length: #{resp_body.bytesize}\r\nConnection: close\r\n\r\n" << resp_body
       end
       conn.flush
       conn.close
@@ -289,8 +302,20 @@ private class HostScopedBodyRewriter < Gori::Proxy::HeadRewriter
     head
   end
 
+  def rewrites_request_body? : Bool
+    true
+  end
+
   def rewrites_response_body? : Bool
     true
+  end
+
+  def rewrites_request_body_for_host?(host : String) : Bool
+    @host_match
+  end
+
+  def rewrites_response_body_for_host?(host : String) : Bool
+    @host_match
   end
 
   def rewrites_body_for_host?(host : String) : Bool
@@ -527,7 +552,7 @@ describe Gori::Proxy::Server do
 
     response.should contain("Rebound!")
     # old port is no longer listening (skip the rare OS ephemeral-port reuse case)
-    expect_raises(Exception) { TCPSocket.new("127.0.0.1", old_port) } if new_port != old_port
+    tcp_port_accepts?("127.0.0.1", old_port).should be_false if new_port != old_port
   end
 
   it "releases its connection slot after each connection (bounded concurrency)" do
@@ -678,9 +703,9 @@ describe Gori::Proxy::Server do
     String.new(resp.body.not_nil!).should contain("data: two") # streamed body captured
   end
 
-  # The streaming decision is `Sse.sse?` — a media-type test — and not a substring scan of the
-  # whole field value. A `Content-Type` that merely CARRIES the token in a parameter is an
-  # ordinary Length-framed response to `Proto`, to `QL`'s `proto:sse`, and to History's EVENTS
+  # The streaming decision is `Sse.sse?` — an exact media-type test — and not a substring or
+  # prefix scan of the whole field value. A `Content-Type` that merely carries the token in a
+  # parameter is an ordinary Length-framed response to `Proto`, `proto:sse`, and History's EVENTS
   # pane; the proxy used to be the one reader that disagreed, and it is the reader with side
   # effects — such a response took the streaming path, which skips the intercept response hold,
   # no-ops a Match&Replace body rule, and closes the client connection instead of keeping it
@@ -781,6 +806,167 @@ describe Gori::Proxy::Server do
     sink.responses.map { |r| String.new(r.body.not_nil!) }.sort.should eq(["RESP-1", "RESP-2"])
   end
 
+  # The relay above was always right; the RECORD kept only the final head, so no surface could
+  # tell a 103 had been sent. The interims now ride the response DTO, octet for octet, while
+  # the client still receives exactly what the origin wrote.
+  it "records each interim 1xx head with the flow, byte-exact, and forwards them unchanged" do
+    done = Channel(Nil).new(1)
+    hint = "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n"
+    hint2 = "HTTP/1.1 103 Early Hints\r\nLink: </app.js>; rel=preload\r\n\r\n"
+    final = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nDONE"
+    origin = TCPServer.new("127.0.0.1", 0)
+    origin_port = origin.local_address.port
+    spawn do
+      if conn = origin.accept?
+        if Gori::Proxy::Codec::Http1.read_head(conn)
+          conn << hint << hint2 << final
+          conn.flush
+        end
+        conn.close
+      end
+    rescue
+    end
+
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
+    proxy.start
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client.read_timeout = 3.seconds
+    client << "GET http://127.0.0.1:#{origin_port}/page HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n"
+    client.flush
+    got = read_until(client, "DONE")
+    client.close
+    done.receive
+    proxy.stop
+
+    got.should eq(hint + hint2 + final) # forwarding untouched (P7)
+    resp = sink.responses.first
+    resp.status.should eq(200)
+    String.new(resp.head).should start_with("HTTP/1.1 200 OK") # the final head stays ONE response
+    interims = resp.interims.not_nil!
+    interims.heads.map(&.status).should eq([103, 103])
+    interims.heads.map { |h| String.new(h.head) }.should eq([hint, hint2])
+    interims.omitted.should eq(0)
+  end
+
+  # RFC 9110 §15.2: a 1.0 client is never sent a 1xx. The record still keeps what the origin
+  # said, but must not claim the client received it.
+  it "records an interim a 1.0 client was not sent as not relayed" do
+    done = Channel(Nil).new(1)
+    hint = "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n"
+    final = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nDONE"
+    origin = TCPServer.new("127.0.0.1", 0)
+    origin_port = origin.local_address.port
+    spawn do
+      if conn = origin.accept?
+        if Gori::Proxy::Codec::Http1.read_head(conn)
+          conn << hint << final
+          conn.flush
+        end
+        conn.close
+      end
+    rescue
+    end
+
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
+    proxy.start
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client.read_timeout = 3.seconds
+    client << "GET http://127.0.0.1:#{origin_port}/page HTTP/1.0\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n"
+    client.flush
+    got = read_until(client, "DONE")
+    client.close
+    done.receive
+    proxy.stop
+
+    got.should eq(final) # no 1xx for a 1.0 client (unchanged)
+    interims = sink.responses.first.interims.not_nil!
+    interims.heads.map { |h| {String.new(h.head), h.relayed?} }.should eq([{hint, false}])
+    interims.relayed_wire.should be_empty
+  end
+
+  # A 101 is the upgrade itself, not an interim (`interim_response?`): a 103 before it is kept
+  # as the interim and the 101 stays the flow's response, with the tunnel behind it untouched.
+  it "keeps a 103 before a 101 upgrade as the interim, and the 101 as the response" do
+    done = Channel(Nil).new(1)
+    hint = "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n"
+    upgrade = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: tcp\r\nConnection: Upgrade\r\n\r\n"
+    origin = TCPServer.new("127.0.0.1", 0)
+    origin_port = origin.local_address.port
+    spawn do
+      if conn = origin.accept?
+        if Gori::Proxy::Codec::Http1.read_head(conn)
+          conn << hint << upgrade << "TUNNEL-DATA"
+          conn.flush
+        end
+        conn.close
+      end
+    rescue
+    end
+
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
+    proxy.start
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client.read_timeout = 3.seconds
+    client << "GET http://127.0.0.1:#{origin_port}/attach HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n" \
+              "Upgrade: tcp\r\nConnection: Upgrade\r\n\r\n"
+    client.flush
+    got = read_until(client, "TUNNEL-DATA")
+    client.close
+    done.receive
+    proxy.stop
+
+    got.should eq(hint + upgrade + "TUNNEL-DATA")
+    resp = sink.responses.first
+    resp.status.should eq(101)
+    String.new(resp.head).should eq(upgrade)
+    resp.interims.not_nil!.heads.map(&.status).should eq([103])
+  end
+
+  # The Expect settlement's client-gone exit records the flow without a response of its own;
+  # the 1xx the origin had already answered with belong on it all the same, the last one
+  # marked as never having reached the client.
+  it "keeps the interims when the client vanishes during the Expect settlement" do
+    done = Channel(Nil).new(1)
+    origin = TCPServer.new("127.0.0.1", 0)
+    origin_port = origin.local_address.port
+    spawn do
+      if conn = origin.accept?
+        if Gori::Proxy::Codec::Http1.read_head(conn)
+          # The client is already gone: the first write lands in the kernel and draws the RST,
+          # the later ones fail — that failure is the client-gone exit.
+          5.times do
+            conn << "HTTP/1.1 103 Early Hints\r\n\r\n"
+            conn.flush
+            sleep 100.milliseconds
+          end
+        end
+        conn.close
+      end
+    rescue
+    end
+
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
+    proxy.start
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client << "POST http://127.0.0.1:#{origin_port}/up HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n" \
+              "Content-Length: 9\r\nExpect: 100-continue\r\n\r\n"
+    client.flush
+    sleep 50.milliseconds
+    client.close
+    receive_within(done)
+    proxy.stop
+
+    resp = sink.responses.first
+    resp.error.should eq("connection closed while answering Expect: 100-continue")
+    interims = resp.interims.not_nil!
+    interims.heads.all?(&.status.==(103)).should be_true
+    interims.heads.last.relayed?.should be_false
+  end
+
   # #728. The spec above proves the interim is relayed when the origin VOLUNTEERS one on a
   # bodyless GET — which never made the proxy wait for anything. The three below drive the
   # case that deadlocked: the CLIENT sends `Expect: 100-continue` with a Content-Length and
@@ -838,6 +1024,9 @@ describe Gori::Proxy::Server do
     rest.should contain("200 OK")
     sink.responses.first.status.should eq(200)
     String.new(sink.requests.first.body.not_nil!).should eq(payload)
+    # The origin's 100 is on the record too, as it arrived.
+    sink.responses.first.interims.not_nil!.heads.map { |h| String.new(h.head) }
+      .should eq(["HTTP/1.1 100 Continue\r\nX-Origin-Interim: yes\r\n\r\n"])
   end
 
   it "relays a 103 Early Hints and keeps waiting for the real 100 Continue (#728)" do
@@ -900,6 +1089,14 @@ describe Gori::Proxy::Server do
     seen_body.receive.should eq(payload) # the withheld body did flow, after the 100
     rest.should contain("200 OK")
     sink.responses.first.status.should eq(200)
+    # Both interims the settlement relayed are on the record, in wire order and byte-exact,
+    # and the client got them unchanged ahead of the final response.
+    hint = "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n"
+    cont = "HTTP/1.1 100 Continue\r\nX-Origin-Interim: yes\r\n\r\n"
+    (interim + rest).should eq(hint + cont + "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nSTORED")
+    interims = sink.responses.first.interims.not_nil!
+    interims.heads.map(&.status).should eq([103, 100])
+    interims.heads.map { |h| String.new(h.head) }.should eq([hint, cont])
   end
 
   it "bounds the whole expectation, not each 1xx, against a 103 drip (#728)" do
@@ -1159,7 +1356,9 @@ describe Gori::Proxy::Server do
       n = client.read(Bytes.new(64))
       n == 0 ? "closed" : "answered #{n} bytes"
     rescue ex
-      "#{ex.class} after #{(Time.instant - t0).total_milliseconds.round.to_i}ms"
+      # Windows resets, rather than closes, a socket shut with the follow-up request unread.
+      reset = {{ flag?(:win32) }} && ex.is_a?(IO::Error) && !ex.is_a?(IO::TimeoutError)
+      reset ? "closed" : "#{ex.class} after #{(Time.instant - t0).total_milliseconds.round.to_i}ms"
     end
     client.close
 
@@ -1205,6 +1404,7 @@ describe Gori::Proxy::Server do
 
     seen_body.receive.should eq(payload)
     rest.should contain("200 OK")
+    sink.responses.first.interims.should be_nil # gori's own 100 is not something the origin sent
   end
 
   it "answers 100 Continue itself on the buffering request-body rewrite path (#728)" do
@@ -1360,6 +1560,84 @@ describe Gori::Proxy::Server do
     sink.responses.first.error.should_not be_nil
   end
 
+  it "records a truncated upstream CONNECT reply without starting a tunnel (#1211)" do
+    upstream = TCPServer.new("127.0.0.1", 0)
+    upstream_port = upstream.local_address.port
+    tunnel_data = Channel(Bytes?).new(1)
+    spawn do
+      conn = upstream.accept
+      Gori::Proxy::Codec::Http1.read_head(conn)
+      conn << "HTTP/1.1 200 Connection Established\r\nX-Test: truncated\r\n"
+      conn.flush
+      conn.close_write
+      data = Bytes.new(64)
+      count = conn.read(data)
+      tunnel_data.send(count > 0 ? data[0, count].dup : nil)
+      conn.close rescue nil
+    rescue
+      tunnel_data.send(nil)
+    end
+
+    previous_proxy = Gori::Settings.upstream_proxy
+    previous_passthrough = Gori::Settings.tls_passthrough
+    Gori::Settings.upstream_proxy = "127.0.0.1:#{upstream_port}"
+    Gori::Settings.tls_passthrough = ["example.test"]
+    done = Channel(Nil).new(1)
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
+    proxy.start
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client.read_timeout = 5.seconds
+    begin
+      request = IO::Memory.new
+      request << "CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n"
+      request.write(Bytes[0x16_u8, 0x03_u8, 0x01_u8, 0x00_u8])
+      client.write(request.to_slice)
+      client.flush
+
+      response = Gori::Proxy::Codec::Http1.parse_response_head(
+        Gori::Proxy::Codec::Http1.read_head(client).not_nil!)
+      response.status.should eq(502)
+      done.receive
+      tunnel_data.receive.should be_nil
+      sink.responses.first.state.should eq(Gori::Store::FlowState::Error)
+      sink.responses.first.error.not_nil!.should contain("incomplete CONNECT reply")
+      sink.responses.first.error.not_nil!.should contain("200 Connection Established")
+    ensure
+      client.close rescue nil
+      proxy.stop
+      upstream.close rescue nil
+      Gori::Settings.upstream_proxy = previous_proxy
+      Gori::Settings.tls_passthrough = previous_passthrough
+    end
+  end
+
+  it "rejects a CONNECT authority with a nonnumeric port and records the reason" do
+    done = Channel(Nil).new(1)
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink)
+    proxy.start
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client.read_timeout = 5.seconds
+    begin
+      client.write("CONNECT example.test:notaport HTTP/1.1\r\nHost: example.test:notaport\r\n\r\n".to_slice)
+      client.flush
+      response_head = Gori::Proxy::Codec::Http1.read_head(client).not_nil!
+      response = Gori::Proxy::Codec::Http1.parse_response_head(response_head)
+      body = Bytes.new(response.headers.get?("Content-Length").not_nil!.to_i)
+      client.read_fully(body)
+      done.receive
+
+      response.status.should eq(400)
+      String.new(body).should contain("CONNECT port must be a decimal number")
+      sink.requests.first.port.should eq(0)
+      sink.responses.first.state.should eq(Gori::Store::FlowState::Error)
+      sink.responses.first.error.not_nil!.should contain("CONNECT port must be a decimal number")
+    ensure
+      client.close rescue nil
+      proxy.stop
+    end
+  end
   it "records an error when the client truncates the request body" do
     seen = Channel(String).new(1)
     done = Channel(Nil).new(1)
@@ -1743,6 +2021,27 @@ describe Gori::Proxy::Server do
     String.new(sink.responses.first.body.not_nil!).should eq("a [HIDDEN] here")
   end
 
+  it "rewrites a text/event-stream prefix media type as an ordinary response body" do
+    seen_body = Channel(String).new(1)
+    done = Channel(Nil).new(1)
+    origin_port = start_body_origin("the SECRET value", seen_body, content_type: "text/event-streaming")
+
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: BodyRewriter.new)
+    proxy.start
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client << "GET /events HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\nConnection: close\r\n\r\n"
+    client.flush
+    response = client.gets_to_end
+    client.close
+    done.receive
+    proxy.stop
+
+    response.should contain("Content-Type: text/event-streaming")
+    response.should contain("the [HIDDEN] value")
+    response.should_not contain("SECRET")
+  end
+
   # #740: the Match&Replace body gate read Content-Encoding ONLY, so a body compressed by a
   # TRANSFER coding (`Transfer-Encoding: gzip, chunked` — no Content-Encoding anywhere) went
   # straight to the rule engine as a raw DEFLATE stream. Either the rule silently never fired,
@@ -1853,6 +2152,96 @@ describe Gori::Proxy::Server do
     proxy.stop
 
     sink.responses.first.advisory.should be_nil
+  end
+
+  it "streams an unrelated request body while a host-scoped body rule is live" do
+    seen_head = Channel(String).new(1)
+    seen_body = Channel(String).new(1)
+    done = Channel(Nil).new(1)
+    origin = TCPServer.new("127.0.0.1", 0)
+    origin_port = origin.local_address.port
+    spawn do
+      conn = origin.accept
+      head = Gori::Proxy::Codec::Http1.read_head(conn)
+      seen_head.send(head ? String.new(head) : "")
+      body = Bytes.new(5)
+      conn.read_fully(body)
+      seen_body.send(String.new(body))
+      conn << "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+      conn.flush
+      conn.close
+    end
+
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink,
+      rewriter: HostScopedBodyRewriter.new(host_match: false))
+    proxy.start
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client << "POST /upload HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\nContent-Length: 5\r\n\r\nA"
+    client.flush
+
+    saw_head_before_body = false
+    select
+    when head = seen_head.receive
+      head.should contain("POST /upload")
+      saw_head_before_body = true
+    when timeout(1.second)
+    end
+
+    client << "BCDE"
+    client.flush
+    client.gets_to_end
+    client.close
+    receive_within(done, what: "the captured response")
+    proxy.stop
+    origin.close
+
+    saw_head_before_body.should be_true
+    receive_within(seen_body, what: "the complete streamed request body").should eq("ABCDE")
+  end
+
+  it "streams an unrelated response body while a host-scoped body rule is live" do
+    response_head = Channel(String).new(1)
+    release_body = Channel(Nil).new(1)
+    origin = TCPServer.new("127.0.0.1", 0)
+    origin_port = origin.local_address.port
+    spawn do
+      conn = origin.accept
+      Gori::Proxy::Codec::Http1.read_head(conn)
+      conn << "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nA"
+      conn.flush
+      release_body.receive
+      conn << "BCDE"
+      conn.flush
+      conn.close
+    end
+
+    sink = RecordingSink.new(Channel(Nil).new(1))
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink,
+      rewriter: HostScopedBodyRewriter.new(host_match: false))
+    proxy.start
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client << "GET /download HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\nConnection: close\r\n\r\n"
+    client.flush
+    spawn do
+      head = Gori::Proxy::Codec::Http1.read_head(client)
+      response_head.send(head ? String.new(head) : "")
+    end
+
+    saw_head_before_body = false
+    select
+    when head = response_head.receive
+      head.should contain("200 OK")
+      saw_head_before_body = true
+    when timeout(1.second)
+    end
+    release_body.send(nil)
+    client.gets_to_end
+    client.close
+    proxy.stop
+    origin.close
+
+    saw_head_before_body.should be_true
   end
 
   # The two rates, in one example (#745 point 1). EVERY affected flow is annotated — "did my
@@ -1993,11 +2382,52 @@ describe Gori::Proxy::Server do
 
     seen.receive.should eq("GET /held HTTP/1.1") # upstream saw the edited request
     sink.requests.first.target.should eq("/held")
+    # …and History keeps what the CLIENT sent, byte for byte (#1378).
+    sink.requests.first.intercept_original.should eq(
+      "GET /hello HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n".to_slice)
+  end
+
+  it "keeps no original when a held request is forwarded unchanged" do
+    seen = Channel(String).new(1)
+    done = Channel(Nil).new(1)
+    origin_port = start_origin("ok", seen)
+
+    store_path = File.tempname("gori-icu", ".db")
+    store = Gori::Store.open(store_path)
+    interceptor = Gori::Interceptor.new(Gori::Scope.load(store))
+    interceptor.toggle
+
+    sink = RecordingSink.new(done)
+    proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, interceptor: interceptor)
+    proxy.start
+
+    spawn do
+      loop do
+        interceptor.pending.each { |it| interceptor.forward(it.id) }
+        sleep 0.01.seconds
+      end
+    end
+
+    client = TCPSocket.new("127.0.0.1", proxy.port)
+    client << "GET /same HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\n\r\n"
+    client.flush
+    client.gets_to_end
+    client.close
+
+    done.receive
+    proxy.stop
+    store.close
+    File.delete?(store_path)
+    File.delete?("#{store_path}-wal")
+    File.delete?("#{store_path}-shm")
+
+    seen.receive.should eq("GET /same HTTP/1.1")
+    sink.requests.first.intercept_original.should be_nil
   end
 
   it "forwards held bytes byte-exact, preserving a deliberately mismatched Content-Length (P7)" do
     # The proxy must NOT rewrite the bytes the human chose to send — Content-Length
-    # sync is the editor's job (InterceptView#forward_bytes). A forwarded smuggling
+    # sync is the editor's job (InterceptView#pending_edit). A forwarded smuggling
     # probe (CL: 3 but a 7-byte body) reaches the origin verbatim.
     done = Channel(Nil).new(1)
     got = Channel(String).new(1)
@@ -2311,8 +2741,7 @@ describe Gori::Proxy::Server do
     store = Gori::Store.open(store_path)
     interceptor = Gori::Interceptor.new(Gori::Scope.load(store))
     interceptor.toggle
-    interceptor.cycle_direction # Both → RequestOnly
-    interceptor.cycle_direction # → ResponseOnly (stream the request, hold only the response)
+    interceptor.set_direction(Gori::Interceptor::Direction::ResponseOnly) # stream the request, hold only the response
     interceptor.set_filter("path:/hi")
 
     sink = RecordingSink.new(done)
@@ -2386,5 +2815,7 @@ describe Gori::Proxy::Server do
     response.should contain("502")
     response.should contain("X-Gori-Intercept: dropped")
     sink.responses.first.state.should eq(Gori::Store::FlowState::Aborted)
+    # The operator's own outcome, which the surfaces tell apart from an upstream error (#1378).
+    Gori::Interceptor.dropped?(sink.responses.first.error).should be_true
   end
 end

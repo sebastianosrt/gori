@@ -13,7 +13,7 @@ require "../spec_helper"
 #      gone. That is the bug report `^Y` exists to answer, and the footer is where it lands.
 #
 #   B. A strip that starts with `type ` and still offers `space cmds`. JWT's HEADER, PAYLOAD
-#      and SECRET are always-typing panes (`JwtController#edit_json` / `#edit_secret` insert
+#      and SECRET are always-typing panes (`JwtController#edit_lens_editor` / `#edit_secret` insert
 #      the character; `#handle_body_key` only defers ctrl/alt chords), so that space typed a
 #      space. It cost the one token with room to say which key copies — on the three panes
 #      where `^Y` is not the convenient copy but the ONLY one.
@@ -34,7 +34,7 @@ describe "editor key-hint strips" do
   # and every one of them has at least two segments.
   hint = ->(text : String) { text.includes?(" · ") }
 
-  hint_sources = Dir.glob(File.join(__DIR__, "..", "..", "src", "gori", "tui", "**", "*.cr")).sort
+  hint_sources = glob_files(__DIR__, "..", "..", "src", "gori", "tui", "**", "*.cr").sort
 
   it "name a copy key whenever they advertise a selection" do
     offenders = [] of String
@@ -74,7 +74,7 @@ describe "editor key-hint strips" do
   # so the tab that registers one owes its operator a strip that says so, somewhere.
   it "every tab whose Copy verb carries ^Y names it somewhere in its own footers" do
     ids = [] of String
-    Dir.glob(File.join(__DIR__, "..", "..", "src", "gori", "verbs", "*.cr")).sort.each do |path|
+    glob_files(__DIR__, "..", "..", "src", "gori", "verbs", "*.cr").sort.each do |path|
       lines = File.read(path).lines
       lines.each_with_index do |line, i|
         next unless m = line.match(/"([a-z]+)\.copy", "Copy"/)

@@ -3,6 +3,7 @@ require "../../support/demo_descriptor"
 require "base64"
 require "file_utils"
 require "json"
+require "compress/gzip"
 
 # `gori run history` / `gori run show` — the QL gate on the listing, the flow-row text and
 # JSON contract in CLI::Output, and the `show --format json` document. Split out of the
@@ -50,12 +51,21 @@ end
 # only an explicit-receiver call from outside is not).
 module Gori::CLI::Run
   def self.show_json_for_spec(detail : Store::FlowDetail, req : Bool, resp : Bool,
-                              ws_msgs : Array(Store::WsMessage) = [] of Store::WsMessage) : String
-    show_json(detail, req, resp, ws_msgs)
+                              ws_msgs : Array(Store::WsMessage) = [] of Store::WsMessage,
+                              interims : Store::Interims? = nil) : String
+    show_json(detail, req, resp, ws_msgs, interims: interims)
   end
 
-  def self.raw_truncation_notes_for_spec(detail : Store::FlowDetail, req : Bool, resp : Bool) : Array(String)
-    raw_truncation_notes(detail, req, resp)
+  def self.raw_truncation_notes_for_spec(detail : Store::FlowDetail, req : Bool, resp : Bool,
+                                         interims : Store::Interims? = nil) : Array(String)
+    raw_truncation_notes(detail, req, resp, interims)
+  end
+
+  def self.write_raw_for_spec(detail : Store::FlowDetail, req : Bool, resp : Bool,
+                              interims : Store::Interims?) : String
+    io = IO::Memory.new
+    write_raw(io, detail, req, resp, interims)
+    io.to_s
   end
 end
 
@@ -151,7 +161,9 @@ describe "gori run history — CLI::Output rows" do
     txt.should_not contain('\e') # no ESC
     txt.should_not contain('\r') # no CR
     txt.should_not contain('\a') # no BEL
-    txt.should contain("·")      # control bytes replaced with a visible marker
+    txt.should contain("⟨ESC⟩")
+    txt.should contain("⟨CR⟩")
+    txt.should contain("⟨BEL⟩")
   end
 
   it "scrubs the METHOD and SCHEME columns too, not just the target" do
@@ -162,7 +174,7 @@ describe "gori run history — CLI::Output rows" do
       target: "/", status: 200, size: 0_i64, state: Gori::Store::FlowState::Complete)
     txt = Gori::CLI::Output.flow_row_text(row)
     txt.should_not contain('\e')
-    txt.should contain("G·ET")
+    txt.should contain("G⟨ESC⟩ET")
   end
 
   # `ljust(7)` guarantees a separator only while the method is SHORTER than 7 — so the two
@@ -197,9 +209,11 @@ describe "gori run history — CLI::Output rows" do
     Gori::CLI::Output.flow_row_text(row).should contain("GET    https")
   end
 
-  it "term_safe leaves ordinary UTF-8 untouched but replaces control bytes" do
+  it "term_safe leaves ordinary UTF-8 untouched and names hidden characters" do
     Gori::CLI::Output.term_safe("api.test/π/데이터").should eq("api.test/π/데이터")
-    Gori::CLI::Output.term_safe("a\tb\nc").should eq("a·b·c")
+    Gori::CLI::Output.term_safe("a\tb\nc").should eq("a⟨TAB⟩b⟨LF⟩c")
+    Gori::CLI::Output.term_safe("a\u{200b}b").should eq("a⟨ZWSP⟩b")
+    Gori::CLI::Output.term_safe("👨‍👩‍👧‍👦").should eq("👨‍👩‍👧‍👦")
   end
 
   it "term_safe also scrubs invalid UTF-8 (not just control bytes) so JSON output stays valid" do
@@ -214,16 +228,35 @@ describe "gori run history — CLI::Output rows" do
     out.should eq("hi�hi")
   end
 
-  it "term_safe_multiline keeps newlines and tabs while still killing ANSI/OSC" do
+  it "term_safe_multiline keeps newlines and names tabs and ANSI/OSC controls" do
     # This is the `show`/`repeater` TEXT view's scrubber: a captured head/body must keep
     # its layout (a head flattened to one line is unreadable) while escapes still die.
-    src = "HTTP/1.1 200 OK\r\nX-A:\t1\n\e[31mred\e]0;title\a"
+    src = "HTTP/1.1 200 OK\r\nX-A:\t1\nbare\rcr\n\e[31mred\e]0;title\a"
     out = Gori::CLI::Output.term_safe_multiline(src)
     out.should contain("\n") # line breaks survive
-    out.should contain("\t") # tabs survive
+    out.should contain("⟨TAB⟩")
+    out.should_not contain('\t')
     out.should_not contain('\e')
     out.should_not contain('\a')
-    out.should contain('·') # the CR of the CRLF and the escapes are neutralized
+    out.should_not contain('\r')
+    out.should contain("bare⟨CR⟩cr") # a LONE CR is still named
+    out.should contain("⟨ESC⟩")
+    out.should contain("⟨BEL⟩")
+  end
+
+  # "\r\n" is ONE grapheme cluster, so a walk that only let "\n" through badged every CRLF as
+  # `⟨CR⟩⟨LF⟩` and printed a whole HTTP head on one line. The fixture above passed anyway
+  # because it also carries a bare "\n"; this one has CRLF endings and nothing else.
+  it "term_safe_multiline keeps a CRLF-only head on separate lines" do
+    out = Gori::CLI::Output.term_safe_multiline("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    out.should eq("GET / HTTP/1.1\nHost: x\n\n")
+    out.should_not contain("⟨CR⟩")
+    out.should_not contain("⟨LF⟩")
+  end
+
+  it "term_safe_multiline still names hidden characters on a CRLF line" do
+    out = Gori::CLI::Output.term_safe_multiline("X-A: 1\e[31m\r\nX-B:\u{200b}2\r\n")
+    out.should eq("X-A: 1⟨ESC⟩[31m\nX-B:⟨ZWSP⟩2\n")
   end
 
   it "emits a valid JSON object with the expected keys" do
@@ -255,9 +288,7 @@ describe "gori run history — CLI::Output rows" do
     cli.should contain("created_at_iso") # …alongside the machine-readable one MCP names
   end
 
-  # The half the key-set pin cannot see. `Output.iso_time_utc` is a reimplementation of
-  # `Serialize.unix_micros_iso` (CLI::Output deliberately takes no dependency on MCP::), so
-  # nothing but this assertion stops the two from drifting.
+  # The half the key-set pin cannot see: the two surfaces spell the same instant the same way.
   it "renders created_at_iso byte-for-byte the same as the MCP serializer" do
     row = Gori::Store::FlowRow.new(
       id: 1_i64, created_at: 1_700_000_000_123_456_i64, scheme: "https", method: "GET",
@@ -268,8 +299,42 @@ describe "gori run history — CLI::Output rows" do
     cli["created_at_iso"].as_s.should eq(mcp["created_at_iso"].as_s)
     # UTC, milliseconds, Z — and the sub-second micros `time` drops are kept here.
     cli["created_at_iso"].as_s.should eq("2023-11-14T22:13:20.123Z")
-    Gori::CLI::Output.iso_time_utc(1_700_000_000_123_456_i64)
-      .should eq(Gori::MCP::Serialize.unix_micros_iso(1_700_000_000_123_456_i64))
+  end
+
+  # Two renderings of ONE instant must not disagree about whether that instant exists. `time`
+  # is local and `created_at_iso` is UTC, and `to_local` raises `ArgumentError` when a stored
+  # instant near `Time::MAX` plus a POSITIVE offset lands past it — so the same row printed
+  # under `TZ=Asia/Seoul` died where `TZ=UTC` printed it, after `[` and some rows had already
+  # gone out. Reachable from ordinary data (a HAR entry dated `9999-12-31T23:59:59.999Z`
+  # imports without complaint) and PERSISTENT, because the row is then stored.
+  it "prints a far-future row in every timezone, falling back to UTC where local cannot hold it" do
+    far = 253_402_300_799_999_000_i64 # 9999-12-31T23:59:59.999Z
+    ["Asia/Seoul", "Europe/Berlin", "UTC", "America/New_York"].each do |tz|
+      Time::Location.local = Time::Location.load(tz)
+      row = Gori::Store::FlowRow.new(
+        id: 1_i64, created_at: far, scheme: "https", method: "GET",
+        host: "h", port: 443, target: "/a", status: 200, size: 0_i64,
+        state: Gori::Store::FlowState::Complete)
+      json = JSON.parse(Gori::CLI::Output.flow_row_json(row))
+      json["time"].as_s.should contain("9999-12-31")
+      json["created_at_iso"].as_s.should eq("9999-12-31T23:59:59.999Z")
+    end
+  ensure
+    Time::Location.local = Time::Location.load_local
+  end
+
+  # The UTC field sits one line after the local one in the same object, and staying in UTC only
+  # avoids the OFFSET half of the problem: the Span addition still raises past year 9999. A
+  # column that far out is hand-edited or foreign rather than imported, but hardening only the
+  # local rendering would leave `--format json` writing the same truncated document.
+  it "prints a created_at past the end of Time in both renderings" do
+    row = Gori::Store::FlowRow.new(
+      id: 1_i64, created_at: Int64::MAX, scheme: "https", method: "GET",
+      host: "h", port: 443, target: "/a", status: 200, size: 0_i64,
+      state: Gori::Store::FlowState::Complete)
+    json = JSON.parse(Gori::CLI::Output.flow_row_json(row))
+    json["time"].as_s.should eq("—")
+    json["created_at_iso"].as_s.should eq("—")
   end
 
   # The class this round closed: `JSON::Builder#string` escapes JSON metacharacters but writes
@@ -415,6 +480,16 @@ describe "gori run show --format json" do
     sse["events"].as_a.size.should eq(n)
   end
 
+  it "carries a non-UTF-8 head byte-exact beside the scrubbed text, as get_flow does" do
+    head = String.new("HTTP/1.1 200 OK\r\nX-Hi: \xE9t\xE9\r\n\r\n".to_slice)
+    detail = flow_detail("http", "x", 80, "GET / HTTP/1.1\r\nHost: x\r\n\r\n", response_head: head)
+    json = JSON.parse(Gori::CLI::Run.show_json_for_spec(detail, true, true))
+    resp = json["response"]
+    resp["head_lossy"].as_bool.should be_true
+    Base64.decode(resp["head_base64"].as_s).should eq(head.to_slice)
+    json["request"].as_h.has_key?("head_lossy").should be_false
+  end
+
   it "emits ws_messages with base64 for a binary frame and text for a text frame" do
     detail = flow_detail("https", "ws.test", 443, "GET /ws HTTP/1.1\r\nHost: ws.test\r\n\r\n",
       response_head: "HTTP/1.1 101 Switching Protocols\r\n\r\n")
@@ -512,6 +587,27 @@ describe "gori run show --format json" do
       msgs = JSON.parse(Gori::CLI::Run.show_json_for_spec(detail, true, true))["response"]["grpc_messages"]
       msgs.as_h.has_key?("schema_method").should be_false
       msgs["messages"].as_a[0].as_h.has_key?("schema").should be_false
+    end
+
+    # A stored body is WIRE bytes: scanned raw, a gzipped grpc-web response reported its
+    # frames as residual garbage and lost the trailer frame carrying the call's outcome.
+    it "deframes a response body under a Content-Encoding" do
+      io = IO::Memory.new
+      Compress::Gzip::Writer.open(io) do |gz|
+        gz.write(grpc_frame_for_spec("hi".to_slice))
+        gz.write(Gori::Proxy::H2::Grpc.frame(false, "grpc-status: 7\r\n".to_slice, trailer: true))
+      end
+      resp_head = "HTTP/1.1 200 OK\r\ncontent-type: application/grpc-web\r\ncontent-encoding: gzip\r\n\r\n"
+      row = Gori::Store::FlowRow.new(
+        id: 9_i64, created_at: 0_i64, scheme: "https", method: "POST", host: "api.test", port: 443,
+        target: "/S/M", status: 200, size: 0_i64, state: Gori::Store::FlowState::Complete,
+        content_type: "application/grpc-web")
+      req_head = "POST /S/M HTTP/1.1\r\nHost: api.test\r\n\r\n"
+      detail = Gori::Store::FlowDetail.new(row, "HTTP/1.1", req_head.to_slice, nil, resp_head.to_slice, io.to_slice)
+      msgs = JSON.parse(Gori::CLI::Run.show_json_for_spec(detail, true, true))["response"]["grpc_messages"]
+      msgs["count"].as_i.should eq(2)
+      msgs.as_h.has_key?("framing_error").should be_false
+      msgs["grpc_status"].as_i.should eq(7)
     end
 
     it "does not feed a compressed gRPC payload to the protobuf decoder" do
@@ -693,7 +789,10 @@ describe "gori run history --format json — the listing's url and headers" do
       id: 1_i64, created_at: 0_i64, scheme: "https", method: "POST", host: "accounts.test",
       port: 443, target: "/login", status: 200, size: 0_i64,
       state: Gori::Store::FlowState::Complete)
-    json = JSON.parse(Gori::CLI::Output.flow_row_json(row, head))
+    # `include_sensitive`, because `Cookie` is the fixture's repeated name and the default is
+    # now redaction — the fold is a property of the OBJECT, so it has to be pinned on the
+    # values the caller asked for. The redacted counterpart is pinned below.
+    json = JSON.parse(Gori::CLI::Output.flow_row_json(row, head, include_sensitive: true))
     json["headers"]["Cookie"].as_a.map(&.as_s).should eq(["a=1", "b=2"])
   end
 
@@ -722,6 +821,149 @@ describe "gori run history --format json — the listing's url and headers" do
     keys = JSON.parse(Gori::CLI::Output.flow_row_json(row)).as_h.keys
     keys.should_not contain("url")
     keys.should_not contain("headers")
+  end
+end
+
+# #1002: the `headers` block rides along on an INVENTORY row, so `gori run history
+# --format json` — a command run to answer "what did I capture?" — was putting live session
+# material into whatever terminal log or agent transcript read the listing. The MCP surface
+# has redacted by default since it shipped (`get_flow`, `compare_flows`, `intercept_get`);
+# on the CLI only `gori run intercept list/get` did, and this is the listing brought level
+# with it, `--include-sensitive` spelled the same way.
+describe "gori run history --format json — sensitive header values" do
+  private_head = ("POST /login HTTP/1.1\r\nHost: accounts.test\r\n" \
+                  "Authorization: Bearer supersecret\r\nCookie: sid=AAAA\r\nCOOKIE: csrf=BBBB\r\n" \
+                  "X-Api-Key: key-9999\r\nSet-Cookie: echoed=1\r\nProxy-Authorization: Basic Zm9v\r\n" \
+                  "X-Auth-Token: tok\r\nApi-Key: k\r\nAccept: application/json\r\n\r\n").to_slice
+
+  row = Gori::Store::FlowRow.new(
+    id: 1_i64, created_at: 0_i64, scheme: "https", method: "POST", host: "accounts.test",
+    port: 443, target: "/login", status: 200, size: 0_i64,
+    state: Gori::Store::FlowState::Complete)
+
+  it "redacts every sensitive header value by default and leaves the rest alone" do
+    headers = JSON.parse(Gori::CLI::Output.flow_row_json(row, private_head))["headers"]
+    headers["Authorization"].as_s.should eq("[REDACTED]")
+    headers["X-Api-Key"].as_s.should eq("[REDACTED]")
+    headers["Set-Cookie"].as_s.should eq("[REDACTED]")
+    headers["Proxy-Authorization"].as_s.should eq("[REDACTED]")
+    headers["X-Auth-Token"].as_s.should eq("[REDACTED]")
+    headers["Api-Key"].as_s.should eq("[REDACTED]")
+    # NAMES, wire order and the non-sensitive values are untouched: the row still answers
+    # "what request was this?", which is the whole reason the block exists.
+    headers["Host"].as_s.should eq("accounts.test")
+    headers["Accept"].as_s.should eq("application/json")
+  end
+
+  # The fold emits the FIRST spelling seen as the key, so a redaction keyed off the emitted
+  # key rather than the downcased name would let `COOKIE: csrf=BBBB` through whenever it
+  # arrived first. Both occurrences stay in the array — the count is the shape of the
+  # message (a split `Cookie`), not the secret.
+  it "redacts a case-varying repeat of a sensitive name, keeping one entry per occurrence" do
+    headers = JSON.parse(Gori::CLI::Output.flow_row_json(row, private_head))["headers"]
+    headers["Cookie"].as_a.map(&.as_s).should eq(["[REDACTED]", "[REDACTED]"])
+  end
+
+  it "returns the exact bytes with include_sensitive" do
+    headers = JSON.parse(Gori::CLI::Output.flow_row_json(row, private_head, include_sensitive: true))["headers"]
+    headers["Authorization"].as_s.should eq("Bearer supersecret")
+    headers["Cookie"].as_a.map(&.as_s).should eq(["sid=AAAA", "csrf=BBBB"])
+    headers["X-Api-Key"].as_s.should eq("key-9999")
+  end
+
+  # Presence, not a boolean on every row: the same discipline `advisory`/`headers`/`columns`
+  # keep, and on a JSON-Lines feed a `false` per row is a per-row cost for a fact about the
+  # invocation.
+  it "marks the row only when a value actually was redacted" do
+    JSON.parse(Gori::CLI::Output.flow_row_json(row, private_head))["sensitive_headers_redacted"]
+      .as_bool.should be_true
+
+    plain = "GET /a HTTP/1.1\r\nHost: h\r\nAccept: */*\r\n\r\n".to_slice
+    JSON.parse(Gori::CLI::Output.flow_row_json(row, plain)).as_h
+      .has_key?("sensitive_headers_redacted").should be_false
+    JSON.parse(Gori::CLI::Output.flow_row_json(row, private_head, include_sensitive: true)).as_h
+      .has_key?("sensitive_headers_redacted").should be_false
+    JSON.parse(Gori::CLI::Output.flow_row_json(row)).as_h
+      .has_key?("sensitive_headers_redacted").should be_false
+  end
+
+  # `flow_row_fields` is the seam a NEW emitter reaches for (`show_json` already does, with no
+  # head), and its own default has to be the fail-closed one — a caller that never heard of
+  # the flag must redact. Pinned directly, because every example above goes through
+  # `flow_row_json`, which passes the flag explicitly and so hides what the inner default is.
+  it "fails closed at the flow_row_fields seam too, not only at flow_row_json" do
+    doc = JSON.parse(JSON.build { |j| Gori::CLI::Output.flow_row_fields(j, row, private_head) })
+    doc["headers"]["Authorization"].as_s.should eq("[REDACTED]")
+    doc["sensitive_headers_redacted"].as_bool.should be_true
+  end
+
+  # An obs-fold continuation is part of the field it continues (RFC 9110 §5.2), but
+  # `Codec::Http1.parse_headers` has no fold handling: it splits every colon-bearing line at
+  # its own first colon, so a folded `Cookie` carrying a URL arrived as a SECOND header named
+  # `" redirect=https"` whose value printed in the clear beside `Cookie: [REDACTED]`. Redacting
+  # only the value would not have closed it either — the split put `redirect=https` in the KEY.
+  it "does not leak an obs-fold continuation of a sensitive header, in the key or the value" do
+    folded = ("GET /a HTTP/1.1\r\nHost: h\r\n" \
+              "Cookie: sid=X;\r\n redirect=https://evil/?tok=SECRET\r\n\r\n").to_slice
+    doc = Gori::CLI::Output.flow_row_json(row, folded)
+    doc.should_not contain("SECRET")
+    doc.should_not contain("evil")
+    doc.should_not contain("redirect")
+    headers = JSON.parse(doc)["headers"]
+    # ONE `Cookie`, redacted — not a Cookie plus an invented sibling.
+    headers.as_h.keys.should eq(["Host", "Cookie"])
+    headers["Cookie"].as_s.should eq("[REDACTED]")
+  end
+
+  # The same unfold, without redaction in the way: the continuation joins the field it
+  # continues (one SP, RFC 7230 §3.2.4) instead of becoming a header of its own. Correct
+  # independent of #1002 — this projection used to invent a field the wire never carried.
+  it "joins an obs-fold continuation into the field it continues" do
+    folded = ("GET /a HTTP/1.1\r\nHost: h\r\n" \
+              "X-Trace: a=1;\r\n b=https://x/?q=2\r\n\r\n").to_slice
+    headers = JSON.parse(Gori::CLI::Output.flow_row_json(row, folded))["headers"]
+    headers.as_h.keys.should eq(["Host", "X-Trace"])
+    headers["X-Trace"].as_s.should eq("a=1; b=https://x/?q=2")
+  end
+
+  # A continuation with nothing to continue is malformed. Dropped, not hung on an invented
+  # field — and it must not crash the emitter, which is the whole listing for that run.
+  it "drops a continuation that has no field before it" do
+    orphan = "GET /a HTTP/1.1\r\n oops=https://x/?t=1\r\nHost: h\r\n\r\n".to_slice
+    headers = JSON.parse(Gori::CLI::Output.flow_row_json(row, orphan))["headers"]
+    headers.as_h.keys.should eq(["Host"])
+  end
+
+  # The emitter fails closed, so the dangerous direction is safe whatever the call site does.
+  # The other direction is not: a `--include-sensitive` that silently changes nothing is a
+  # shape this CLI has already shipped twice (`gori run` flag-before-verb, the `--` guards).
+  # `cmd_history_list` opens a store and writes to STDOUT, so there is no in-process harness
+  # for it — asserted over the SOURCE, the way `unknown_args_sweep_spec` asserts its guard,
+  # and DERIVED rather than listed so a second `--format json` emit site is covered too.
+  it "forwards the flag from every listing emit site in history.cr" do
+    src = File.read(File.join(__DIR__, "..", "..", "..", "src", "gori", "cli", "run", "history.cr"))
+    src.should contain("p.on(\"--include-sensitive\"")
+    # Three things this guard got wrong the first time, each of which made it green on the
+    # drift it exists to catch:
+    #
+    # 1. It matched `CLI::Output.flow_row_json(`. history.cr is `module Gori::CLI::Run`, so the
+    #    bare `Output.flow_row_json(...)` spelling resolves and compiles — this file already
+    #    writes bare `Output.term_safe(...)` elsewhere. A site written that way scored zero
+    #    matches while the existing qualified call kept the population floor satisfied.
+    # 2. It asserted `include_sensitive: include_sensitive`, pinning a LOCAL's name rather than
+    #    the argument being passed — a future site correctly passing `include_sensitive: true`
+    #    would have failed.
+    # 3. It was line-anchored, and the json branch's call now wraps across lines. Each site's
+    #    window is therefore the call line plus the three after it. Loose on purpose: a drift
+    #    guard that under-matches is worthless, and one that over-matches only ever costs a
+    #    reader looking one line further.
+    lines = src.lines
+    sites = [] of String
+    lines.each_with_index do |l, i|
+      sites << lines[i, 4].join('\n') if l.includes?("Output.flow_row_json(")
+    end
+    sites.empty?.should be_false
+    sites.each(&.should(contain("include_sensitive:")))
   end
 end
 
@@ -1086,6 +1328,74 @@ describe "gori run show --format raw" do
     notes.size.should eq(1)
     notes.first.should contain("response body was truncated at the capture cap")
     notes.first.should contain("stored prefix")
+  end
+
+  # The note used to point at `--format json` for "the true size", and that document's body
+  # `size` is the STORED prefix. `source_size` is the wire size the cap cut, as on MCP.
+  it "points at a JSON field that holds the whole body's size" do
+    req_head = "POST /big HTTP/1.1\r\nContent-Length: 9000\r\n\r\n"
+    resp_head = "HTTP/1.1 200 OK\r\nContent-Length: 7000\r\n\r\n"
+    row = Gori::Store::FlowRow.new(
+      id: 15_i64, created_at: 0_i64, scheme: "http", method: "POST", host: "example.test",
+      port: 80, target: "/big", status: 200, state: Gori::Store::FlowState::Complete,
+      size: (req_head.bytesize + 9000 + resp_head.bytesize + 7000).to_i64,
+      response_size: (resp_head.bytesize + 7000).to_i64)
+    detail = Gori::Store::FlowDetail.new(row, "HTTP/1.1", req_head.to_slice, "short".to_slice,
+      resp_head.to_slice, "short".to_slice, request_body_truncated: true, response_body_truncated: true)
+    Gori::CLI::Run.raw_truncation_notes_for_spec(detail, true, true).first.should contain("as source_size")
+    doc = JSON.parse(Gori::CLI::Run.show_json_for_spec(detail, true, true))
+    doc["request"]["body"]["size"].should eq(5)
+    doc["request"]["body"]["source_size"].should eq(9000)
+    doc["response"]["body"]["source_size"].should eq(7000)
+    whole = capped_detail(request_capped: false, response_capped: false)
+    JSON.parse(Gori::CLI::Run.show_json_for_spec(whole, true, true))["request"]["body"]["source_size"]?.should be_nil
+  end
+
+  # The interim 1xx heads went to the client before the final response, so the exact-bytes view
+  # prints them there — and only on the side it prints.
+  it "writes the interim 1xx heads ahead of the final response, in wire order" do
+    hint = "HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n"
+    interims = Gori::Store::Interims.new
+    interims.add(103, hint.to_slice)
+    detail = flow_detail("http", "example.test", 80, "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n",
+      response_head: "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", response_body: "ok")
+    Gori::CLI::Run.write_raw_for_spec(detail, true, true, interims).should eq(
+      "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n" + hint + "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+    Gori::CLI::Run.write_raw_for_spec(detail, true, false, interims).should_not contain("103")
+
+    doc = JSON.parse(Gori::CLI::Run.show_json_for_spec(detail, true, true, interims: interims))
+    doc["response"]["interim"].as_a.map { |e| {e["status"].as_i, e["head"].as_s} }.should eq([{103, hint}])
+    doc["response"]["interim_omitted"]?.should be_nil
+    doc["response"]["head"].as_s.should start_with("HTTP/1.1 200 OK")
+    JSON.parse(Gori::CLI::Run.show_json_for_spec(detail, true, true))["response"]["interim"]?.should be_nil
+  end
+
+  # A head the client never received (an HTTP/1.0 client) is not part of the exchange's bytes:
+  # raw leaves it out and says so, JSON keeps it with `relayed: false`.
+  it "leaves an unrelayed interim out of the raw bytes and marks it in JSON" do
+    hint = "HTTP/1.1 103 Early Hints\r\n\r\n"
+    interims = Gori::Store::Interims.new
+    interims.add(103, hint.to_slice, relayed: false)
+    detail = flow_detail("http", "example.test", 80, "GET / HTTP/1.0\r\n\r\n",
+      response_head: "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", response_body: "ok")
+    Gori::CLI::Run.write_raw_for_spec(detail, false, true, interims).should eq("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+    notes = Gori::CLI::Run.raw_truncation_notes_for_spec(detail, false, true, interims)
+    notes.size.should eq(1)
+    notes.first.should contain("not relayed to the client")
+    entry = JSON.parse(Gori::CLI::Run.show_json_for_spec(detail, true, true, interims: interims))["response"]["interim"][0]
+    entry["relayed"].as_bool.should be_false
+    entry["head"].as_s.should eq(hint)
+  end
+
+  it "names the interims the cap left out, on the response side only" do
+    interims = Gori::Store::Interims.new
+    (Gori::Store::Interims::MAX_KEPT + 1).times { interims.add(103, "HTTP/1.1 103 Early Hints\r\n\r\n".to_slice) }
+    detail = capped_detail(request_capped: false, response_capped: false)
+    notes = Gori::CLI::Run.raw_truncation_notes_for_spec(detail, true, true, interims)
+    notes.size.should eq(1)
+    notes.first.should contain("did not record the other 1")
+    Gori::CLI::Run.raw_truncation_notes_for_spec(detail, true, false, interims).should be_empty
+    JSON.parse(Gori::CLI::Run.show_json_for_spec(detail, true, true, interims: interims))["response"]["interim_omitted"].as_i.should eq(1)
   end
 
   it "stays silent for a flow whose bodies are whole" do

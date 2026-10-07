@@ -100,6 +100,16 @@ describe F::Template do
     F::Template.parse(marked).position_count.should eq(4) # name, admin, age, gone
   end
 
+  it "auto-marks the whole JSON number token, exponent included (#1205)" do
+    body = "POST / HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"n\":1e5,\"m\":-2.5E-3,\"p\":10.0e+2,\"k\":12}"
+    marked = F::Template.auto_mark(body)
+    t = F::Template.parse(marked)
+    t.position_count.should eq(4)
+    String.new(t.render(["ZZ"] * 4)).ends_with?("{\"n\":ZZ,\"m\":ZZ,\"p\":ZZ,\"k\":ZZ}").should be_true
+    # A token that runs on into a non-number is left unmarked rather than split.
+    F::Template.auto_mark_payload("{\"h\":0x1F,\"v\":1.2.3}").includes?('§').should be_false
+  end
+
   it "toggles a marker around the word at the cursor" do
     # cursor inside "admin"
     F::Template.mark_word("user=admin", 7).should eq("user=§admin§")
@@ -352,11 +362,20 @@ describe F::PayloadSet do
     # count walked `len` steps per length — ~max²/2 of yield-free integer arithmetic. At
     # max 1e8 that is weeks, on the single-threaded scheduler, before any send: this example
     # simply does not RETURN without the short-circuit (MCP `brute a:1-100000000`).
-    F::BruteForce.new("a", 1, 100_000_000).size.should eq(100_000_000_i64)
+    # (The length is now clamped to MAX_LEN at construction as well — see the next example.)
+    F::BruteForce.new("a", 1, 100_000_000).size.should eq(F::BruteForce::MAX_LEN.to_i64)
     F::BruteForce.new("a", 3, 5).size.should eq(3) # "aaa", "aaaa", "aaaaa"
     vals = [] of String
     F::BruteForce.new("a", 1, 3).each { |v| vals << v }
     vals.should eq(["a", "aa", "aaa"])
+  end
+
+  # The iterator allocates MIN slots up front: an unclamped `ab:2000000000` from any surface
+  # (the TUI Fuzzer's brute row had no limit) was an ~8 GB allocation before the first send.
+  it "clamps both lengths to MAX_LEN, whatever surface built it" do
+    first = nil.as(String?)
+    F::BruteForce.new("ab", 2_000_000_000, 2_000_000_000).each { |v| first = v; break }
+    first.not_nil!.size.should eq(F::BruteForce::MAX_LEN)
   end
 end
 
@@ -396,6 +415,44 @@ describe F::Generator do
     seen = 0
     g.each { seen += 1 }
     seen.should eq(9)
+  end
+
+  it "walks cluster bomb combinations in order, position 0 outermost" do
+    tmpl = F::Template.parse("GET /?a=§1§&b=§2§&c=§3§ HTTP/1.1\r\nHost: h\r\n\r\n")
+    sets = [F::PayloadSet.new(F::InlineList.new(["x", "y"])),
+            F::PayloadSet.new(F::InlineList.new(["p", "q", "r"])),
+            F::PayloadSet.new(F::InlineList.new(["1", "2"]))]
+    seen = [] of Array(String)
+    F::Generator.new(tmpl, sets, F::Config.new(mode: F::Mode::ClusterBomb)).each { |j| seen << j.payloads }
+    expected = [] of Array(String)
+    %w[x y].each { |a| %w[p q r].each { |b| %w[1 2].each { |c| expected << [a, b, c] } } }
+    seen.should eq(expected)
+    empty = sets.dup
+    empty[1] = F::PayloadSet.new(F::InlineList.new([] of String))
+    count = 0
+    F::Generator.new(tmpl, empty, F::Config.new(mode: F::Mode::ClusterBomb)).each { count += 1 }
+    count.should eq(0)
+  end
+
+  # One stack frame per position overflowed the Engine fiber's stack at ~40k positions: a
+  # SIGSEGV, so without the fix this example takes the spec binary down rather than failing.
+  # `auto_mark` reaches it from a captured form body of that many pairs.
+  it "walks a cluster bomb over 60k positions on a fiber without overflowing its stack" do
+    body = (0...60_000).map { |i| "k#{i}=1" }.join('&')
+    raw = F::Template.auto_mark("POST /api HTTP/1.1\r\nHost: t.test\r\n" \
+                                "Content-Type: application/x-www-form-urlencoded\r\n" \
+                                "Content-Length: #{body.bytesize}\r\n\r\n#{body}")
+    tmpl = F::Template.parse(raw)
+    tmpl.position_count.should be >= 60_000
+    g = F::Generator.new(tmpl, [F::PayloadSet.new(F::InlineList.new(["x"]))],
+      F::Config.new(mode: F::Mode::ClusterBomb))
+    done = Channel(Int32).new
+    spawn do
+      n = 0
+      g.each { n += 1 }
+      done.send(n)
+    end
+    done.receive.should eq(1)
   end
 
   it "applies a position's inline Decoder chain to the payload on the wire" do
@@ -602,6 +659,20 @@ describe F::Engine do
     d.progress.sent.should eq(2_i64)     # payloads
     d.progress.requests.should eq(6_i64) # 1 attempt + 2 retries each
     backend.sent.should eq(6)            # …and that is what the origin really received
+  end
+
+  # A retry the request budget refuses sent nothing: the row is the failure it was retrying.
+  # Recording the cap marker read a dead origin as a budget stop.
+  it "keeps the network failure when the budget refuses its retry" do
+    set = F::PayloadSet.new(F::InlineList.new(["a"]))
+    cfg = F::Config.new(mode: F::Mode::Sniper, concurrency: 1, retries: 1,
+      retry_pause: Time::Span.zero)
+    gen = F::Generator.new(base, [set], cfg)
+    dead = FakeBackend.new(F::Origin.new("http", "h", 80)) do |_b|
+      Gori::Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, "connect failed")
+    end
+    results, _ = drain(F::Engine.new(gen, F::Matcher.new, F::CappedBackend.new(dead, 1_i64), cfg))
+    results.first.error.should eq("connect failed")
   end
 
   it "auto-calibration end-to-end: calibrate_baseline's synthetic sends capture EVERY shape " \
@@ -858,6 +929,21 @@ describe Gori::CLI::Output do
     txt.should contain("403")
   end
 
+  it "names a matched row, and carries the History flow --record-history wrote" do
+    hit = F::Result.new(3_i64, ["admin"], 0, 403, 21_i64, 3, 1, 1500_i64, nil, true, false, nil)
+    miss = F::Result.new(4_i64, ["guest"], 0, 200, 21_i64, 3, 1, 1500_i64, nil, false, false, nil)
+    Gori::CLI::Output.fuzz_row_text(hit).should contain("matched")
+    Gori::CLI::Output.fuzz_row_text(miss).should_not contain("matched")
+    Gori::CLI::Output.fuzz_row_text(hit, 9_i64).should contain("flow #9")
+    JSON.parse(Gori::CLI::Output.fuzz_row_json(hit, 9_i64))["flow_id"].should eq(9)
+    JSON.parse(Gori::CLI::Output.fuzz_row_json(hit)).as_h.has_key?("flow_id").should be_false
+    io = IO::Memory.new
+    stream = Gori::CLI::Output::FuzzArrayStream.new(io)
+    stream.append(F::Result.new(0_i64, ["a"], 0, 200, 1_i64, 1, 1, 1_i64, nil, true, false, nil), 7_i64)
+    stream.close
+    JSON.parse(io.to_s)[0]["flow_id"].should eq(7)
+  end
+
   # #567/H3 Finding 2: a byte-faithful payload (a wordlist may hold invalid UTF-8, e.g. a
   # raw \xff\xfe bad-strings entry) put raw bytes inside a JSON string, so one payload made
   # the WHOLE document unparseable (poisoning every row). The MCP twin already scrubs; the CLI
@@ -865,8 +951,8 @@ describe Gori::CLI::Output do
   it "emits valid JSON for a non-UTF-8 payload (row and array)" do
     binary = String.new(Bytes[0xff_u8, 0xfe_u8])
     r = F::Result.new(1_i64, [binary], nil, 200, 3_i64, 1, 1, 10_i64, nil, true, false, nil)
-    row = Gori::CLI::Output.fuzz_row_json(r)     # jsonl path
-    arr = Gori::CLI::Output.fuzz_array_json([r]) # json path
+    row = Gori::CLI::Output.fuzz_row_json(r)                                    # jsonl path
+    arr = JSON.build { |j| j.array { Gori::MCP::Serialize.fuzz_result(j, r) } } # json path
     # `valid_encoding?`, not `JSON.parse`: Crystal's parser tolerates its own invalid-UTF-8
     # output, but jq / python's json / every other consumer rejects a document with a raw
     # \xff in a string — which is exactly what the finding reproduced. The emitted bytes must

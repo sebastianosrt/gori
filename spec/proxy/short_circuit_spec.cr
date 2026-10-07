@@ -1,5 +1,6 @@
 require "../spec_helper"
 require "socket"
+require "file_utils"
 
 # The proxy half of the short-circuit rule op (#511): gori answers the request itself and
 # `Upstream.dial` is never reached. What is pinned here is everything the engine cannot check
@@ -33,19 +34,33 @@ end
 private def with_rules(&)
   path = File.tempname("gori-sc-proxy", ".db")
   store = Gori::Store.open(path)
-  begin
-    yield Gori::Rules.load(store)
-  ensure
-    store.close
-    File.delete?(path)
-    File.delete?("#{path}-wal")
-    File.delete?("#{path}-shm")
-  end
+  raised = run_capturing { yield Gori::Rules.load(store) } # not an `ensure`: see `with_store`
+  store.close
+  delete_db_files(path)
+  raise raised if raised
 end
 
 private def add_stub(rules : Gori::Rules, pattern : String, response : String, body_file : String = "")
   rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
     pattern, response, op: Gori::Store::RuleOp::ShortCircuit, body_file: body_file)
+end
+
+# The process-wide held-connection count, set directly so the cap can be reached without
+# holding 256 real connections.
+class Gori::Proxy::ClientConn
+  def self.held_for_spec : Int32
+    @@held.get
+  end
+
+  def self.held_for_spec=(n : Int32) : Nil
+    @@held.set(n)
+  end
+end
+
+private def add_fault(rules : Gori::Rules, pattern : String, args : String)
+  rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+    pattern, "", op: Gori::Store::RuleOp::ShortCircuit,
+    respond: Gori::Store::RespondKind::Fault, respond_args: args)
 end
 
 # A port that nothing is listening on: bind, read the port, close. Dialing it fails, which is
@@ -65,6 +80,7 @@ private def start_counting_origin(accepts : Channel(Nil)) : Int32
   spawn do
     while conn = origin.accept?
       accepts.send(nil)
+      drain_request_head(conn)
       conn << "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nORIGIN"
       conn.flush
       conn.close
@@ -91,6 +107,37 @@ private def read_bounded(client : TCPSocket, seconds : Int32 = 5) : String?
   when timeout(seconds.seconds)
     nil
   end
+end
+
+# Send a chunked POST whose body is `mib` MiB through a proxy that short-circuits it, and
+# return {bytes gori allocated meanwhile, the recorded request, the response bytes}. The body
+# is never forwarded, so what it may cost is a capture's worth, not its own size: a path that
+# buffers it whole allocates at least `mib` MiB (more, through IO::Memory's doubling). Counted
+# with `total_bytes`, which only goes up, so free heap left by earlier examples cannot hide it.
+private def drain_big_chunked_post(rules : Gori::Rules, mib : Int32) : {Int64, Gori::Store::CapturedRequest, String?}
+  done = Channel(Nil).new(1)
+  sink = RecordingSink.new(done)
+  proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: rules)
+  proxy.start
+  chunk = Bytes.new(1024 * 1024, 'a'.ord.to_u8)
+  client = TCPSocket.new("127.0.0.1", proxy.port)
+  GC.collect
+  before = GC.stats.total_bytes
+  client << "POST /upload HTTP/1.1\r\nHost: 127.0.0.1:#{dead_port}\r\nConnection: close\r\n" \
+            "Transfer-Encoding: chunked\r\n\r\n"
+  mib.times do
+    client << chunk.size.to_s(16) << "\r\n"
+    client.write(chunk)
+    client << "\r\n"
+  end
+  client << "0\r\n\r\n"
+  client.flush
+  response = read_bounded(client)
+  client.close rescue nil
+  done.receive
+  allocated = (GC.stats.total_bytes - before).to_i64
+  proxy.stop
+  {allocated, sink.requests.first, response}
 end
 
 describe "proxy — short-circuit rule" do
@@ -208,6 +255,18 @@ describe "proxy — short-circuit rule" do
       # what the client tried to send.
       String.new(sink.requests.first.body.not_nil!).should eq("hello=world")
       sink.requests.all?(&.short_circuited?).should be_true
+    end
+  end
+
+  it "drains a large chunked request body without buffering it" do
+    with_rules do |rules|
+      add_stub(rules, "/upload", "201 Created\n\nok")
+      allocated, req, response = drain_big_chunked_post(rules, 48)
+      response.not_nil!.should start_with("HTTP/1.1 201 Created")
+      allocated.should be < 24_i64 * 1024 * 1024
+      req.short_circuited?.should be_true
+      req.body_truncated?.should be_true
+      req.body.not_nil!.size.should eq(Gori::Settings.capture_max)
     end
   end
 
@@ -346,6 +405,312 @@ describe "proxy — short-circuit rule" do
       fail "gori kept reading HTTP on a connection its own stub declared upgraded" if response.nil?
       response.should contain("101 Switching Protocols")
       sink.responses.first.state.aborted?.should be_true
+    end
+  end
+  # Map-local (#1237): the directory answers, the flow says which rule and file did, a missing
+  # file falls through only when the rule opted in, and a refused path never reaches anything.
+  describe "map-local (respond: dir)" do
+    it "serves a file from the mapped directory and records which rule answered" do
+      root = File.join(File.realpath(Dir.tempdir), "gori-sc-proxy-dir-#{Random.new.hex(6)}")
+      Dir.mkdir_p(root)
+      File.write(File.join(root, "app.js"), "tampered()")
+      begin
+        with_rules do |rules|
+          rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+            "GET /static/", "", op: Gori::Store::RuleOp::ShortCircuit, body_file: root,
+            respond: Gori::Store::RespondKind::Dir, respond_args: %({"strip_prefix":"/static/"}))
+          id = rules.rules.first.id
+          done = Channel(Nil).new(1)
+          sink = RecordingSink.new(done)
+          proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: rules)
+          proxy.start
+
+          client = TCPSocket.new("127.0.0.1", proxy.port)
+          client << "GET /static/app.js HTTP/1.1\r\nHost: 127.0.0.1:#{dead_port}\r\nConnection: close\r\n\r\n"
+          client.flush
+          response = client.gets_to_end
+          client.close
+          done.receive
+          proxy.stop
+
+          response.should contain("HTTP/1.1 200 OK")
+          response.should contain("Content-Type: text/javascript; charset=utf-8")
+          response.should end_with("tampered()")
+          req = sink.requests.first
+          req.short_circuited?.should be_true
+          req.source_ref.should eq("project rule ##{id} · dir app.js")
+        end
+      ensure
+        FileUtils.rm_rf(root)
+      end
+    end
+
+    it "falls through to the origin for a missing file only when the rule opted in" do
+      root = File.join(File.realpath(Dir.tempdir), "gori-sc-proxy-dir-#{Random.new.hex(6)}")
+      Dir.mkdir_p(root)
+      begin
+        with_rules do |rules|
+          rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+            "GET /static/", "", op: Gori::Store::RuleOp::ShortCircuit, body_file: root,
+            respond: Gori::Store::RespondKind::Dir,
+            respond_args: %({"strip_prefix":"/static/","fallthrough":true}))
+          accepts = Channel(Nil).new(4)
+          origin_port = start_counting_origin(accepts)
+          done = Channel(Nil).new(2)
+          sink = RecordingSink.new(done)
+          proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: rules)
+          proxy.start
+
+          client = TCPSocket.new("127.0.0.1", proxy.port)
+          client << "GET /static/missing.js HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\nConnection: close\r\n\r\n"
+          client.flush
+          response = client.gets_to_end
+          client.close
+          done.receive
+          proxy.stop
+
+          response.should contain("ORIGIN")
+          accepts.receive
+          sink.requests.first.short_circuited?.should be_false
+          sink.requests.first.source_ref.should be_nil
+        end
+      ensure
+        FileUtils.rm_rf(root)
+      end
+    end
+
+    it "answers a traversal 404 itself, records it, and never dials the origin" do
+      root = File.join(File.realpath(Dir.tempdir), "gori-sc-proxy-dir-#{Random.new.hex(6)}")
+      Dir.mkdir_p(root)
+      begin
+        with_rules do |rules|
+          rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+            "GET /", "", op: Gori::Store::RuleOp::ShortCircuit, body_file: root,
+            respond: Gori::Store::RespondKind::Dir, respond_args: %({"fallthrough":true}))
+          accepts = Channel(Nil).new(4)
+          origin_port = start_counting_origin(accepts)
+          done = Channel(Nil).new(1)
+          sink = RecordingSink.new(done)
+          proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: rules)
+          proxy.start
+
+          client = TCPSocket.new("127.0.0.1", proxy.port)
+          client << "GET /..%2f..%2fetc/passwd HTTP/1.1\r\nHost: 127.0.0.1:#{origin_port}\r\nConnection: close\r\n\r\n"
+          client.flush
+          response = client.gets_to_end
+          client.close
+          done.receive
+          proxy.stop
+
+          response.should contain("HTTP/1.1 404 Not Found")
+          response.should contain("X-Gori-Short-Circuit: error")
+          response.should_not contain("root:")
+          sink.requests.first.short_circuited?.should be_true
+          sink.responses.first.error.not_nil!.should contain("refused")
+          select
+          when accepts.receive
+            fail "gori dialed the origin for a refused map-local path"
+          else
+          end
+        end
+      ensure
+        FileUtils.rm_rf(root)
+      end
+    end
+  end
+  # Faults (#1237): no response bytes at all. The flow is recorded short-circuited and Aborted,
+  # naming the fault and the rule, and the origin is never dialed.
+  describe "fault injection (respond: fault)" do
+    it "closes with no response bytes after draining the body" do
+      with_rules do |rules|
+        add_fault(rules, "/pay", %({"fault":"close"}))
+        done = Channel(Nil).new(1)
+        sink = RecordingSink.new(done)
+        proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: rules)
+        proxy.start
+
+        client = TCPSocket.new("127.0.0.1", proxy.port)
+        client << "POST /pay HTTP/1.1\r\nHost: 127.0.0.1:#{dead_port}\r\nContent-Length: 5\r\n\r\nhello"
+        client.flush
+        response = read_bounded(client)
+        client.close rescue nil
+        done.receive
+        proxy.stop
+
+        response.should eq("")
+        req = sink.requests.first
+        req.short_circuited?.should be_true
+        String.new(req.body.not_nil!).should eq("hello")
+        resp = sink.responses.first
+        resp.state.aborted?.should be_true
+        resp.error.not_nil!.should start_with("injected close by project rule #")
+      end
+    end
+
+    # A fault only has to get past the body, and nothing bounds a chunked one: buffering it
+    # whole let a client grow the heap by whatever it sent to a `fault: close` endpoint.
+    it "drains a large chunked body without buffering it, still recording the capped capture" do
+      with_rules do |rules|
+        add_fault(rules, "/upload", %({"fault":"close"}))
+        allocated, req, response = drain_big_chunked_post(rules, 48)
+        response.should eq("")
+        allocated.should be < 24_i64 * 1024 * 1024
+        req.body_truncated?.should be_true
+        req.body.not_nil!.size.should eq(Gori::Settings.capture_max)
+        req.body_size.not_nil!.should be > 48_i64 * 1024 * 1024 # the wire size, chunk lines too
+      end
+    end
+
+    it "resets the connection" do
+      with_rules do |rules|
+        add_fault(rules, "/pay", %({"fault":"reset"}))
+        done = Channel(Nil).new(1)
+        sink = RecordingSink.new(done)
+        proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: rules)
+        proxy.start
+
+        client = TCPSocket.new("127.0.0.1", proxy.port)
+        client << "GET /pay HTTP/1.1\r\nHost: 127.0.0.1:#{dead_port}\r\n\r\n"
+        client.flush
+        done.receive
+        reset = begin
+          client.read_timeout = 5.seconds
+          # Crystal's Windows sockets read a reset as EOF (`connreset_is_error: false`), so
+          # there an empty read is all a client can see of it.
+          client.gets_to_end.empty? && {{ flag?(:win32) }}
+        rescue ex : IO::Error
+          # Windows words a reset as "An existing connection was forcibly closed by the remote host".
+          msg = ex.message.to_s.downcase
+          msg.includes?("reset") || msg.includes?("forcibly closed")
+        end
+        client.close rescue nil
+        proxy.stop
+
+        reset.should be_true
+        sink.responses.first.error.not_nil!.should start_with("injected reset by project rule #")
+      end
+    end
+
+    it "holds without answering until its bound, then closes" do
+      with_rules do |rules|
+        add_fault(rules, "/pay", %({"fault":"hang","hang_ms":300}))
+        done = Channel(Nil).new(1)
+        sink = RecordingSink.new(done)
+        proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: rules)
+        proxy.start
+
+        client = TCPSocket.new("127.0.0.1", proxy.port)
+        started = Time.instant
+        client << "GET /pay HTTP/1.1\r\nHost: 127.0.0.1:#{dead_port}\r\n\r\n"
+        client.flush
+        response = read_bounded(client)
+        elapsed = Time.instant - started
+        client.close rescue nil
+        done.receive
+        proxy.stop
+
+        response.should eq("")
+        elapsed.should be >= 250.milliseconds
+        sink.responses.first.error.not_nil!.should start_with("injected hang (released after")
+      end
+    end
+
+    it "notices a client that gives up on a hang before its bound" do
+      with_rules do |rules|
+        add_fault(rules, "/pay", %({"fault":"hang","hang_ms":20000}))
+        done = Channel(Nil).new(1)
+        sink = RecordingSink.new(done)
+        proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: rules)
+        proxy.start
+
+        client = TCPSocket.new("127.0.0.1", proxy.port)
+        client << "GET /pay HTTP/1.1\r\nHost: 127.0.0.1:#{dead_port}\r\n\r\n"
+        client.flush
+        sleep 100.milliseconds
+        client.close
+        got = select
+        when done.receive then true
+        when timeout(5.seconds) then false
+        end
+        proxy.stop
+
+        got.should be_true
+        sink.responses.first.error.not_nil!.should start_with("injected hang (client closed after")
+      end
+    end
+
+    it "closes a hang at once, and says so, when the held-connection cap is reached" do
+      with_rules do |rules|
+        add_fault(rules, "/pay", %({"fault":"hang","hang_ms":20000}))
+        done = Channel(Nil).new(1)
+        sink = RecordingSink.new(done)
+        proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: rules)
+        proxy.start
+        held = Gori::Proxy::ClientConn.held_for_spec
+        Gori::Proxy::ClientConn.held_for_spec = Gori::Proxy::ClientConn::MAX_HELD_CONNECTIONS
+        begin
+          client = TCPSocket.new("127.0.0.1", proxy.port)
+          client << "GET /pay HTTP/1.1\r\nHost: 127.0.0.1:#{dead_port}\r\n\r\n"
+          client.flush
+          read_bounded(client, 3).should eq("") # not held for 20 s
+          client.close rescue nil
+          done.receive
+        ensure
+          # Restored, not zeroed: a hang from an earlier example may still be releasing its hold.
+          Gori::Proxy::ClientConn.held_for_spec = held
+          proxy.stop
+        end
+        sink.responses.first.error.not_nil!.should contain("hang skipped")
+      end
+    end
+
+    it "sends no 100 Continue for a withheld body, and still faults" do
+      with_rules do |rules|
+        add_fault(rules, "/upload", %({"fault":"close"}))
+        done = Channel(Nil).new(1)
+        sink = RecordingSink.new(done)
+        proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: rules)
+        proxy.start
+
+        client = TCPSocket.new("127.0.0.1", proxy.port)
+        client << "PUT /upload HTTP/1.1\r\nHost: 127.0.0.1:#{dead_port}\r\nContent-Length: 4\r\nExpect: 100-continue\r\n\r\n"
+        client.flush
+        response = read_bounded(client)
+        client.close rescue nil
+        done.receive
+        proxy.stop
+
+        response.should eq("")
+        sink.requests.first.body.should be_nil
+        sink.responses.first.state.aborted?.should be_true
+      end
+    end
+
+    it "waits a rule's delay before an ordinary stub answers" do
+      with_rules do |rules|
+        rules.add(Gori::Store::RuleTarget::Request, Gori::Store::RulePart::Head,
+          "/slow", "200 OK\n\nslow", op: Gori::Store::RuleOp::ShortCircuit, respond_args: %({"delay_ms":300}))
+        done = Channel(Nil).new(1)
+        sink = RecordingSink.new(done)
+        proxy = Gori::Proxy::Server.new("127.0.0.1", 0, sink, rewriter: rules)
+        proxy.start
+
+        client = TCPSocket.new("127.0.0.1", proxy.port)
+        started = Time.instant
+        client << "GET /slow HTTP/1.1\r\nHost: 127.0.0.1:#{dead_port}\r\nConnection: close\r\n\r\n"
+        client.flush
+        response = client.gets_to_end
+        elapsed = Time.instant - started
+        client.close
+        done.receive
+        proxy.stop
+
+        response.should end_with("slow")
+        elapsed.should be >= 250.milliseconds
+        sink.requests.first.source_ref.not_nil!.should end_with("· inline +300ms")
+        sink.responses.first.state.complete?.should be_true
+        sink.responses.first.ttfb_us.should be_nil
+      end
     end
   end
 end

@@ -19,8 +19,10 @@ require "./controllers/intercept_controller"
 require "./controllers/notes_controller"
 require "./controllers/history_controller"
 require "./controllers/issues_controller"
+require "./controllers/evidence_controller"
 require "./controllers/probe_controller"
 require "./controllers/project_controller"
+require "./timing_report_overlay"
 require "./controllers/repeater_controller"
 require "./controllers/fuzzer_controller"
 require "./controllers/miner_controller"
@@ -51,26 +53,34 @@ require "./extract_rule_overlay"
 require "./columns_overlay"
 require "./column_overlay"
 require "./rewriter_stub_overlay"
+require "./rewriter_respond_overlay"
 require "./confirm_dialog"
 require "./browser_picker"
 require "./choice_picker"
 require "./issue_form"
 require "./cvss_calculator_overlay"
-require "./more_menu"
 require "./copy_picker"
 require "./send_picker"
 require "./flow_picker"
+require "./tab_goto_picker"
 require "./subtab_picker"
 require "./library_picker"
 require "./name_prompt_overlay"
 require "./links_overlay"
+require "./retest_overlay"
+require "./retest_assert_overlay"
 require "./link_picker"
+require "./evidence_viewer"
+require "./evidence_view"
 require "../links"
 require "../notes"
 require "./settings_view"
 require "./tabs_overlay"
 require "./hosts_overlay"
+require "./keyset_playground_overlay"
 require "./env_overlay"
+require "./user_agents_overlay"
+require "./env_syntax_seam"
 require "./hotkeys_overlay"
 require "./palette"
 require "./space_menu"
@@ -78,6 +88,7 @@ require "./jobs"
 require "./notifications"
 require "./companion"
 require "./notifications_overlay"
+require "./note_detail_overlay"
 require "./passthrough_overlay"
 require "./listeners_overlay"
 require "./agents_overlay"
@@ -96,21 +107,42 @@ require "./oast_provider_overlay"
 require "./oast_provider_picker"
 require "./ca_import_overlay"
 require "./import_overlay"
+require "./curl_paste_overlay"
 require "./export_overlay"
 require "../paths"
 require "../browser"
+require "../shell_env"
 require "../external_editor"
 require "./clipboard"
+require "./read_edit"
 require "./keybind"
 require "../scope"
 require "../rules"
 require "../import"
+
+# Declared ahead of the class-reopen slices below, which use it.
+class Gori::Tui::Runner < Gori::Verb::ExecContext
+  # `forward a : Nil, b? : Bool, to: x_controller` emits `def a : Nil; x_controller.a; end`
+  # per name: the ExecContext verbs that only hand off to a same-named controller method.
+  # Stdlib `delegate` emits untyped defs, which do not satisfy ExecContext's typed abstracts.
+  private macro forward(*defs, to)
+    {% for d in defs %}
+      def {{ d.var }} : {{ d.type }}
+        {{ to }}.{{ d.var }}
+      end
+    {% end %}
+  end
+end
+
+require "./runner/agent_message"
+require "./runner/agent_question"
 require "./runner/agent_presence"
 require "./runner/authorize"
 require "./runner/colormarker"
 require "./runner/comparer"
 require "./runner/decoder"
 require "./runner/diff"
+require "./runner/params"
 require "./runner/discover"
 require "./runner/activity"
 require "./runner/env"
@@ -124,6 +156,8 @@ require "./runner/issues"
 require "./runner/jwt"
 require "./runner/cookie"
 require "./runner/links"
+require "./runner/evidence"
+require "./runner/retest"
 require "./runner/miner"
 require "./runner/mouse"
 require "./runner/notes"
@@ -141,6 +175,14 @@ require "./runner/sitemap"
 require "./runner/subtabs"
 require "./runner/views"
 require "./runner/columns"
+require "../plural"
+
+{% unless flag?(:win32) %}
+  lib LibC
+    fun tcsetpgrp(fd : Int32, pgrp : PidT) : Int32
+    fun getpgrp : PidT
+  end
+{% end %}
 
 module Gori::Tui
   # The shell controller for ONE open project: owns view state, implements the
@@ -159,10 +201,16 @@ module Gori::Tui
       @scope = @session.scope
       @palette = PaletteState.new(@session.registry)
       @space_menu = SpaceMenu.new(@session.registry)
-      # Land on the home tab, but never on a hidden one (settings:tabs may hide Project;
-      # Miner is hidden by default). Settings is loaded (cli.cr) before Runner.new.
-      vis = Chrome.visible_tabs(Settings.tab_prefs).map(&.first)
-      @active_tab = vis.includes?(:project) ? :project : vis.first
+      # Land on History — where traffic arrives and where the first-run steps live — but never
+      # on a hidden tab (settings:tabs may hide it). Settings is loaded (cli.cr) before Runner.new.
+      @evidence_available = @session.store.count_evidence > 0
+      # A layout saved before the nine slots may name more visible tabs than the bar holds.
+      # Settle that ONCE, here, before anything reads the prefs — it rewrites them, so the
+      # notice is raised on this launch and never again. Assigned to @toast further down
+      # (it is not initialised yet at this point in the ladder).
+      fold_notice = Runner.settle_tab_slots
+      vis = available_tabs(Chrome.visible_tabs(Settings.tab_prefs)).map(&.first)
+      @active_tab = Runner.landing_tab(vis)
       # Custom Colormarker colours are absolute hexes (unlike the theme-relative built-ins), so
       # the render-side resolver keeps its own name→hue map. Prime it from settings now, and
       # re-sync it whenever the colour set changes (the data-version poll below, keyed on the
@@ -176,6 +224,9 @@ module Gori::Tui
       # to @overlay so it floats over WHATEVER is underneath (the History list, an
       # open detail …) without disturbing that state; the scope is captured at open.
       @space_menu_open = false
+      # The "what can I do here" the open menu was built from — what a sticky family re-opens
+      # against. Nil while the menu is closed.
+      @space_menu_here = nil.as(ActionContext?)
       # The ^G "go to line" prompt — also orthogonal to @overlay (floats over an
       # editor or the detail view). @goto_target is the view captured at ^G time.
       @goto_open = false
@@ -216,6 +267,8 @@ module Gori::Tui
       @import_job = nil.as(Int32?)
       @import_cancel = false
       @import_events = Channel(ImportEvent).new(16)
+      # The session-slot refresh runner's rev as last painted (#1233) — see the tick.
+      @session_refresh_rev = 0_u64
       @tag_preedit = ""
       @tag_views = [] of RepeaterView # the sub-tabs the prompt will tag (marks, else the active one)
       # Whitespace reveal (·→␍␊) toggle for the req/res views — global view pref,
@@ -224,10 +277,9 @@ module Gori::Tui
       # Pretty-print bodies (JSON/XML/form/…) toggle — global view pref like reveal,
       # seeded from the persisted default, propagated to History/Repeater each frame.
       @pretty = Settings.pretty_bodies_default
-      # The tab-bar "more" dropdown (the ⋯ affordance → ↵/↓): lists the settings-hidden
-      # tabs (Miner by default). @overlay is :tabs_more while it's open; built fresh each
-      # time from the current hidden set.
-      @more_menu = nil.as(MoreMenu?)
+      # The persisted default `@pretty` was last seeded from, so a settings save re-applies it
+      # only when it changed (`apply_pretty_default`).
+      @pretty_default = @pretty
       # The "copy as X" format picker (Repeater/History detail → space Y). ORTHOGONAL to
       # @overlay (like @space_menu_open) so it floats over whatever's underneath — the
       # Repeater body (@overlay :none) OR the History detail drill-in (@overlay :detail) —
@@ -250,10 +302,20 @@ module Gori::Tui
       # entering a project would bury the notification center under standing state the
       # `bypass:N` chip is already reporting.
       @passthrough_announced = Settings.passthrough_count
+      # Whether an untrusted-CA handshake has already raised its one toast (see
+      # drain_untrusted_handshakes).
+      @untrusted_toasted = false
       # #123: high-water-mark of intercept_commands drained + applied to the live interceptor
       # (agent forward/drop/edit/toggle). Seeded to the current max at run start so a fresh
       # session never replays a prior command; advances monotonically as commands are consumed.
       @intercept_cmd_watermark = 0_i64
+      # #1090: same "seed at now" rule one line up, for the operator→agent channel's replies.
+      # A project keeps every delivery row a courier ever wrote; opening it must not replay them
+      # into the notification ring as things that just happened. Replies are the one kind the
+      # operator was owed: those written while no window was open are summarized ONCE, in a
+      # single note, by `announce_missed_replies` against the project's watermark (#1322).
+      @agent_delivery_cursor = @session.store.last_agent_delivery_id
+      @agent_reply_cursor = @agent_delivery_cursor
       # #123 safety net: auto-forward a held item nobody is watching after this many ms, so a
       # dead MCP client (hold() has no timeout) can't wedge a connection forever. 0 disables it.
       @intercept_max_hold_ms = 30_000_i64
@@ -262,9 +324,13 @@ module Gori::Tui
       # base P4 contract — a held item waits INDEFINITELY for the human decision, never
       # auto-forwarded just because the operator glanced at another tab.
       @intercept_agent_seen = false
+      # The reaper's last tick with the Intercept tab up (nil = never this session), monotonic.
+      # The operator watching the queue restarts every hold's window, so leaving the tab gives
+      # each one the full `@intercept_max_hold_ms` from there (#1418).
+      @intercept_operator_watched_at = nil.as(Time::Instant?)
       # Optional bottom statusline: runs a user script on an interval and shows its
       # ANSI-coloured stdout. Disabled by default (no fiber, no reserved row until on).
-      @statusline = StatuslineController.new(@session)
+      @statusline = StatuslineController.new(@session, @jobs)
       # Far-right status-bar readout of gori's own CPU/RSS (settings:display → Resource meter).
       # Samples nothing while disabled; see ResourceMeter for the idle-repaint discipline.
       @resource = ResourceMeter.new
@@ -285,7 +351,7 @@ module Gori::Tui
       @active_overlay = nil.as(Overlay?)
       @theme_restore = nil.as(String?) # theme to revert to if the theme settings are cancelled (live preview)
       @focus = :menu                   # default focus on the tab bar (TABS) on project entry; :body for content
-      @menu_more = false               # tab-bar focus is on the far-right ⋯ "more" affordance (only meaningful when @focus == :menu)
+      @menu_more = false               # tab-bar focus is on the far-right `0:Tabs` stop (only meaningful when @focus == :menu)
       # Sub-tab strip focus is on the left-edge ⌕ affordance rather than a chip. A HINT
       # only — `subtab_find_focused?` is the truth, and it re-derives the answer from the
       # live frame. That matters: `@focus` is assigned raw at twenty-odd sites across
@@ -293,7 +359,7 @@ module Gori::Tui
       # at all), so a flag that had to be cleared everywhere would rot on the next one added.
       # Deriving instead makes "the pill is focused but not on screen" unrepresentable.
       @subtab_find_focus = false
-      @toast = nil.as(String?) # transient action feedback; nil → show key hints
+      @toast = fold_notice.as(String?) # transient action feedback; nil → show key hints
       # When the toast was set. The status row has ONE text slot and Miss Ring's bar
       # placement also writes to it, so the two are resolved by recency rather than by a
       # fixed precedence — see #companion_notice for why a fixed one is wrong.
@@ -337,6 +403,7 @@ module Gori::Tui
         NotesController.new(self),
         HistoryController.new(self),
         IssuesController.new(self),
+        EvidenceController.new(self),
         ProbeController.new(self),
         ProjectController.new(self),
         RepeaterController.new(self),
@@ -359,13 +426,11 @@ module Gori::Tui
     # actions, the shell's ExecContext delegates) is downcast here, ONCE per tab, so
     # call sites stay cast-free. The key is always present after initialize, so `.as`
     # never raises in practice (a missing key would be a registry-wiring bug).
-    private def help_controller : HelpController
-      @tabs[:help].as(HelpController)
-    end
-
-    private def target_controller : TargetController
-      @tabs[:target].as(TargetController)
-    end
+    {% for tab in %w(help target intercept notes history issues evidence probe project repeater fuzzer miner oast sequencer comparer authorize decoder jwt cookie rewriter colormarker) %}
+      private def {{ tab.id }}_controller : {{ tab.camelcase.id }}Controller
+        @tabs[:{{ tab.id }}].as({{ tab.camelcase.id }}Controller)
+      end
+    {% end %}
 
     # Sitemap + Discover are sub-tabs composed under the Target parent, so their controllers
     # are reached through it (they aren't registered in @tabs directly).
@@ -377,89 +442,44 @@ module Gori::Tui
       target_controller.discover
     end
 
-    private def diff_controller : DiffController
-      target_controller.diff
-    end
+    # The flow to open this session on, set by the caller before `run`: the project picker's
+    # cross-project search (#1229) hands over the hit the operator pressed ↵ on, and the session
+    # opens on History with that flow's detail already showing.
+    property focus_flow_on_start : Int64?
 
-    private def intercept_controller : InterceptController
-      @tabs[:intercept].as(InterceptController)
-    end
-
-    private def notes_controller : NotesController
-      @tabs[:notes].as(NotesController)
-    end
-
-    private def history_controller : HistoryController
-      @tabs[:history].as(HistoryController)
-    end
-
-    private def issues_controller : IssuesController
-      @tabs[:issues].as(IssuesController)
-    end
-
-    private def probe_controller : ProbeController
-      @tabs[:probe].as(ProbeController)
-    end
-
-    private def project_controller : ProjectController
-      @tabs[:project].as(ProjectController)
-    end
-
-    private def repeater_controller : RepeaterController
-      @tabs[:repeater].as(RepeaterController)
-    end
-
-    private def fuzzer_controller : FuzzerController
-      @tabs[:fuzzer].as(FuzzerController)
-    end
-
-    private def miner_controller : MinerController
-      @tabs[:miner].as(MinerController)
-    end
-
-    private def oast_controller : OastController
-      @tabs[:oast].as(OastController)
-    end
-
-    private def sequencer_controller : SequencerController
-      @tabs[:sequencer].as(SequencerController)
-    end
-
-    private def comparer_controller : ComparerController
-      @tabs[:comparer].as(ComparerController)
-    end
-
-    private def authorize_controller : AuthorizeController
-      @tabs[:authorize].as(AuthorizeController)
-    end
-
-    private def decoder_controller : DecoderController
-      @tabs[:decoder].as(DecoderController)
-    end
-
-    private def jwt_controller : JwtController
-      @tabs[:jwt].as(JwtController)
-    end
-
-    private def cookie_controller : CookieController
-      @tabs[:cookie].as(CookieController)
-    end
-
-    private def rewriter_controller : RewriterController
-      @tabs[:rewriter].as(RewriterController)
-    end
-
-    private def colormarker_controller : ColormarkerController
-      @tabs[:colormarker].as(ColormarkerController)
+    # The drill-in hop `sitemap_open_flow` makes, taken once at startup. A flow can be gone by
+    # the time the session opens — pruned by retention or deleted by a peer between the search
+    # reading it and this — and then the project opens on its usual tab and SAYS so, since a
+    # silent landing would read as the search having pointed nowhere. The same two surfaces
+    # `announce_env_syntax_migration` uses: the ring always, the toast unless a bind failure
+    # already holds it.
+    private def open_focus_flow : Nil
+      return unless id = @focus_flow_on_start
+      @focus_flow_on_start = nil
+      if history_controller.view.open_detail_id(id, @session.store)
+        @active_tab = :history
+        @focus = :body
+        @overlay = OverlayKind::Detail
+      else
+        line = "flow ##{id} is no longer in this project — deleted or pruned since the search found it"
+        @notifications.push(:warn, line)
+        @toast ||= line
+      end
     end
 
     def run : Symbol
+      # The fiber that runs the event loop: a session slot's before-send refresh asked from it
+      # runs in the background instead of blocking the loop on a login (#1233).
+      Gori::SessionRefresh.ui_fiber = Fiber.current
       # Record the opened project's db path globally for explicitly opted-in headless
       # integrations (`gori mcp --use-active-project`). Workspace-aware MCP launches use
       # their path binding instead, preventing a different repository from inheriting this.
       Paths.write_active_project(@session.project.db_path)
-      history_controller.view.reload(@session.store)
-      notes_controller.view.reload(@session.store) # load persisted notes up front so the tab is ready before it's ever focused
+      # Every stored-data read and the first paint before the loop go through `startup_step`:
+      # the loop's rescue cannot reach them, and one hostile row read here (a `created_at` past
+      # year 9999 in the Project tab's reload) ended the process before the operator saw a frame.
+      startup_step(:input) { history_controller.view.reload(@session.store) }
+      startup_step(:input) { notes_controller.view.reload(@session.store) } # load persisted notes up front so the tab is ready before it's ever focused
       # Surface the bind outcome on entry: capture-off if nothing could bind, or a
       # port-fallback note if the configured port was taken and we picked another.
       requested = @session.config.port
@@ -491,8 +511,20 @@ module Gori::Tui
       # every surface that answers "where am I listening": the top-bar chip
       # (#listen_chip_label), the status line, the listeners overlay, the traffic empty states
       # — all of which read `@session.proxy.port` directly — plus the toast above.
-      project_controller.reload
-      render # initial paint (the loop below only re-renders when something changed)
+      startup_step(:input) { announce_env_syntax_migration }
+      # Landing on History is entering it: `on_enter` is where a saved view that has gone
+      # missing gets said (HistoryController holds it until then). Not over a bind or env-migration
+      # toast, which matter more; the note then waits for the next entry, as it did when Project was home.
+      startup_step(:input) { history_controller.on_enter if @active_tab == :history && @toast.nil? }
+      startup_step(:input) { project_controller.reload }
+      startup_step(:input) { open_focus_flow }
+      # Replies an agent sent while no window was open (#1322): one note, before the first
+      # paint so Miss Ring has it to say. After `Runner#initialize` seeded the reply cursor,
+      # which is what bounds "while you were away".
+      startup_step(:input) { announce_missed_replies }
+      startup_step(:render) do
+        render # initial paint (the loop below only re-renders when something changed)
+      end
       # The render loop polls input on a 50ms cadence (so async channels are still
       # checked ≤50ms), but RENDER only runs when the frame would actually change —
       # input handled, flow events / repeater results drained, the interceptor queue
@@ -502,17 +534,22 @@ module Gori::Tui
       last_wf = @session.store.write_failures
       last_dv = @session.store.data_version # SQLite change counter for cross-process refresh
       last_dv_poll = Time.instant
-      last_probe_gen = @session.store.probe_generation # committed probe_issues mutations
-      last_spin = Time.instant                         # advances the background-job spinner frame
-      last_clock = clock_minute                        # status-row wall clock; re-render only when the minute rolls over
-      last_hold_tick = Time.instant                    # advances the Intercept queue's waiting-age column
-      last_ui_ident = nil.as(UiIdentity?)              # last-written ui-state identity (see UI_STATE_THROTTLE)
+      last_spin = Time.instant            # advances the background-job spinner frame
+      last_clock = clock_minute           # status-row wall clock; re-render only when the minute rolls over
+      last_hold_tick = Time.instant       # advances the Intercept queue's waiting-age column
+      last_ui_ident = nil.as(UiIdentity?) # last-written ui-state identity (see UI_STATE_THROTTLE)
       last_ui_write = Time.instant
       last_pub_rev = -1                                                     # #123: last interceptor revision mirrored to the store (-1 = publish on first tick)
       last_pub_edit_id = nil.as(Int64?)                                     # #123: held item the mirrored snapshot last reported an operator edit on
       last_bridge_pub = Time.instant                                        # #123: last bridge-heartbeat write (throttled so idle never churns the WAL)
       @intercept_cmd_watermark = @session.store.latest_intercept_command_id # tail agent commands from now
       begin
+        # "A gori TUI window is attached to this project" (#1091), for `get_current_context`
+        # to read cross-process. INSIDE this begin, not beside the setup above, so the same
+        # `ensure` that stops the statusline is what drops it — a marker released only because
+        # a raise happened to end the process is an invariant held by accident. Best effort:
+        # a failure is a missing marker, never a session that will not start.
+        announce_tui_presence
         loop do
           # Absorb a raise from THIS tick instead of letting it end the process. The loop
           # below is session-scoped: it holds unsaved Repeater/Fuzzer buffers and an
@@ -529,8 +566,17 @@ module Gori::Tui
             ev = @term.poll_event(50)
             dirty = false
             if ev
-              handle(ev)
-              dirty = true
+              # Was she on screen BEFORE this input? A held reply is released only by input
+              # the operator gave while it was showing; a key typed into the body editor, a
+              # menu or an overlay that hides her says nothing about a bubble they never saw.
+              shown = companion_on_screen?
+              @operator_input = false
+              # Only input that could have changed the frame dirties it. A key a paste in
+              # progress absorbed (into the bulk buffer, or dropped) changes nothing on screen
+              # until the paste closes, and a 1 MB paste is ~32k such ticks: marking each one
+              # rendered the unchanged frame 32k times, 63% of the main thread (P6). The close
+              # itself — the marker or the watchdog — dirties the frame it lands on.
+              dirty = handle(ev)
               # Drain any input already queued behind `ev` in the SAME tick, then
               # render once. A fast scroll arrives as a burst — held ↑/↓/j/k key
               # repeat, or (under the terminal's alternate-scroll mode) a mouse wheel
@@ -539,8 +585,12 @@ module Gori::Tui
               # the user stopped. Draining applies the whole burst before the frame, so
               # scrolling tracks the input. Bounded so an infinitely-held key can't
               # starve the render / async-channel drains below.
-              keys_drained = drain_burst
-              @companion.wake_on_input # any key/click re-arms Miss Ring's idle clock
+              keys_drained, burst_changed = drain_burst
+              dirty ||= burst_changed
+              # Any event re-arms Miss Ring's idle clock; only a key or click (anywhere in the
+              # burst, set by #handle) that she was on screen for releases a held reply. A
+              # resize or a terminal mode change is the terminal moving, not the operator.
+              @companion.wake_on_input(@operator_input && shown)
               # Tell the stall guard how DENSE this tick was: only a burst means the paste is
               # still streaming. Key events only — see `PasteStall#saw`.
               @paste_stall.saw(Time.instant, keys_drained)
@@ -555,12 +605,23 @@ module Gori::Tui
               search_recompute # a ^F over a now-updated response keeps fresh hits
               dirty = true
             end
+            # A finished differential-timing run (#1246) opens its verdict card — but not over a
+            # modal the operator raised meanwhile (the palette and a History detail are overlays
+            # `active_overlay` does not return, and the space menu, pickers and bottom prompts are
+            # none); the report stays pending until the seam is clear.
+            if @overlay.none? && !@space_menu_open && !copy_as_shown? && !send_to_shown? &&
+               !@goto_open && !@search_open && !@rename_open && !@tag_edit_open &&
+               (rpt = repeater_controller.take_timing_report)
+              open_overlay(TimingReportOverlay.new(rpt[0], rpt[1]))
+              dirty = true
+            end
             dirty = true if fuzzer_controller.drain_events
             dirty = true if miner_controller.drain_events
             dirty = true if oast_controller.drain_events
             dirty = true if sequencer_controller.drain_events
             dirty = true if discover_controller.drain_events
             dirty = true if authorize_controller.drain_events
+            dirty = true if drain_retest_run
             # A finished gRPC reflection fetch (#827): applied on THIS fiber because
             # `Schemas.adopt` writes to the store, which the send fiber must never wait on.
             dirty = true if history_controller.drain_reflection
@@ -573,26 +634,28 @@ module Gori::Tui
               dirty = true
             end
             # Probe list live refresh: Store#probe_generation increments after every
-            # committed probe_issues write (upsert/delete/status). Poll every tick —
+            # committed probe_issues write (upsert/delete/status). Polled every tick —
             # do NOT rely on the droppable analyzer event channel or PRAGMA data_version.
             # Reload the (full-table SELECT + filter) list ONLY when Probe is the active tab:
             # nothing in the always-visible chrome reads it (toasts arrive via drain_events),
             # and on_enter reloads on tab switch, so an off-tab bump is caught up on return.
-            # `last_probe_gen` still advances so returning to Probe doesn't reload redundantly.
-            # When Probe is visible, force a full terminal sync (not just cell-diff) so a
-            # new/removed row cannot stick as a stale paint.
-            if (pgen = @session.store.probe_generation) != last_probe_gen
-              last_probe_gen = pgen
-              if @active_tab == :probe
-                # Force a FULL terminal sync only when the row COUNT moved. That is the case
-                # the cell diff cannot cover — a removed row leaves a stale tail. A row whose
-                # contents merely changed is exactly what the diff is for, and during an
-                # active scan `probe_generation` bumps on every committed write, so the
-                # unconditional version was repainting the whole screen up to 20 times a
-                # second and bypassing both diff layers to do it.
-                @resized = true if probe_controller.refresh_from_store
-                dirty = true
-              end
+            #
+            # EVERY tick, not only on a generation change: `refresh_if_moved` spaces reloads
+            # RELOAD_SPACING apart while a scan keeps the generation moving, and a change it
+            # deferred is landed by a later tick's call here — the trailing edge. The check is
+            # an int compare until there is something to read (the view remembers the
+            # generation it last loaded, so `drain_events` above reloading for the same commit
+            # makes this a no-op).
+            if @active_tab == :probe
+              reloaded, rows_moved = probe_controller.refresh_if_moved
+              # Force a FULL terminal sync only when the row COUNT moved. That is the case
+              # the cell diff cannot cover — a removed row leaves a stale tail. A row whose
+              # contents merely changed is exactly what the diff is for, and during an
+              # active scan `probe_generation` bumps on every committed write, so the
+              # unconditional version was repainting the whole screen up to 20 times a
+              # second and bypassing both diff layers to do it.
+              @resized = true if rows_moved
+              dirty = true if reloaded
             end
             # Live store refresh: PRAGMA data_version bumps when the writer fiber (or a
             # second gori process) commits. Own captures/saves bump it too — soft-sync
@@ -612,6 +675,23 @@ module Gori::Tui
               # chip too. Reports dirty only when the rendered chip string actually changed, so an
               # idle project with a steady agent list does not repaint on the timer.
               dirty = true if refresh_agent_presence
+              # Courier replies to the lines `app.tell-agent` posted (#1090). Beside the presence
+              # scan and OUTSIDE the data_version branch for a different reason than it: the
+              # cursor is what makes this idempotent, so the DB-version gate buys nothing, and it
+              # costs the one case it gets wrong — a courier's commit coalescing with our own
+              # write's bump, after which the note waits for an unrelated commit that may never
+              # come. Reports dirty only when a note was actually pushed.
+              dirty = true if drain_agent_deliveries
+              dirty = true if drain_agent_replies
+              # Questions an agent put with `ask_operator` (#1324): after the presence scan
+              # above, because a question is offered only while the agent that asked is
+              # attached. Outside the data_version branch for the same reason as the two
+              # drains beside it, and for one of its own: a question expires on the clock.
+              dirty = true if drain_agent_questions
+              # Our own marker's capture bit, on the same tick and for the same reason it is
+              # not in the data_version branch (#1091). Writes only when `c` actually moved
+              # the lock, and never reports dirty — nothing on screen reads it.
+              refresh_tui_presence
               # Peer-change announcements (#772). OUTSIDE the data_version branch for the same
               # class of reason as agent presence, but the opposite way round: the CHANGE is
               # spotted inside the branch (only a commit can move a peer's rules or probe mode),
@@ -680,6 +760,16 @@ module Gori::Tui
             dirty = true if drain_passthrough_notices
             # …and what intercept could not hold. Same placement, same reason.
             dirty = true if drain_intercept_notices
+            # …and a client that refused gori's certificate. Same placement, same reason.
+            dirty = true if drain_untrusted_handshakes
+            # Session-slot refreshes (#1233): a finished one raises its toast, and a start or
+            # finish moves the `session:` chip (`⟳` / `!`), so repaint on the runner's rev
+            # rather than on a timer.
+            dirty = true if drain_session_refreshes
+            if (rrev = @session.refresher.rev) != @session_refresh_rev
+              @session_refresh_rev = rrev
+              dirty = true
+            end
             # Miss Ring: advance the animation beat and pick up new notifications. Like the
             # resource meter above she reports dirty ONLY when the drawn sprite/bubble
             # changes, and stops reporting at all once she dozes off (Companion::SLEEP_AFTER).
@@ -704,6 +794,10 @@ module Gori::Tui
             dirty = true if history_controller.flush_query_reload_if_due(now)
             dirty = true if sitemap_controller.flush_query_reload_if_due(now)
             dirty = true if sitemap_controller.drain_search
+            dirty = true if sitemap_controller.drain_export
+            dirty = true if sitemap_controller.drain_js_scan
+            dirty = true if target_controller.params.drain_build
+            dirty = true if miner_controller.drain_seed_names
             dirty = true if drain_import_events
             # Tick the top-bar clock: dirty only when the displayed minute changes, so the
             # idle loop wakes once a minute to repaint rather than every second.
@@ -769,6 +863,17 @@ module Gori::Tui
         #
         # Wind down the statusline worker fiber so it doesn't outlive this project's Runner.
         @statusline.stop
+        # Drop this window's presence marker (#1091). The flock would release it on exit
+        # anyway, but a project the operator LEFT for the picker keeps the process alive, and
+        # an agent must not be told a window is up for a project nobody is looking at.
+        release_tui_presence
+        # Every reply this window announced has been in front of the operator (#1322); the
+        # next window to open summarizes only what lands after this.
+        begin
+          mark_agent_replies_seen
+        rescue ex
+          Log.warn(exception: ex) { "tui: could not record the agent-reply watermark" }
+        end
         @import_cancel = true
         history_controller.cancel_searches
         # Drop the per-tab window title back to a neutral "𝓰𝓸𝓻𝓲" on leave — the shared term
@@ -874,6 +979,24 @@ module Gori::Tui
       true
     end
 
+    # One step of `run`'s setup, which the loop's rescue cannot reach. A failed paint goes the
+    # way a failed render does (`absorb_tick_error`: the reduced frame, no strike). A failed
+    # read is logged and reported, and leaves that tab empty until its next reload — but is NOT
+    # a strike: the breaker's window is the loop's, and a store that fails three reads here
+    # would otherwise trip it before the first frame, which is what this exists to prevent.
+    private def startup_step(phase : Symbol, &) : Nil
+      yield
+    rescue ex : Gori::Error
+      raise ex
+    rescue ex
+      if phase == :render
+        raise ex unless absorb_tick_error(ex, phase)
+      else
+        ::Log.error(exception: ex) { "TUI startup step raised" }
+        status("part of this project failed to load — details in gori.log (#{ex.class}: #{ex.message})", :error)
+      end
+    end
+
     # A plain printable char (a paste/typed character), as opposed to a nav/control
     # key. Coalesced generously in the input drain so a paste doesn't force a
     # full-screen render every 256 characters.
@@ -889,19 +1012,21 @@ module Gori::Tui
     # frame.
     #
     # Returns how many KEY events were drained behind the tick's first one — the density
-    # `PasteStall` reads to tell a paste still streaming from a person typing.
+    # `PasteStall` reads to tell a paste still streaming from a person typing — and whether any
+    # of them could have changed the frame (`handle`).
     #
     # Keys only, deliberately. The budgets below still count every event (a wheel burst must be
     # bounded like any other), but mouse reports must not feed the paste-stall clock: gori
     # enables xterm mode 1002, so a press-and-drag reports pointer motion continuously and would
     # clear the burst threshold by itself — handing the wedge back to the operator most likely to
     # be dragging, the one whose keyboard just went dead.
-    private def drain_burst : Int32
+    private def drain_burst : {Int32, Bool}
       chars = 0
       nav = 0
       keys = 0
+      changed = false
       while more = @term.poll_event(0)
-        handle(more)
+        changed = true if handle(more)
         keys += 1 if more.is_a?(Termisu::Event::Key)
         if coalesceable_char?(more)
           chars += 1
@@ -911,7 +1036,7 @@ module Gori::Tui
           break if nav >= 256
         end
       end
-      keys
+      {keys, changed}
     end
 
     # Braille spinner frames (U+2800–U+28FF: EAW-Neutral width 1, no emoji/VS16).
@@ -929,10 +1054,32 @@ module Gori::Tui
     # is constant per session, so it's not part of the identity. A tuple, not an interpolated
     # string: this is read on every 50 ms tick, and the string was built (and thrown away)
     # even when nothing had moved and nothing would be written.
-    alias UiIdentity = {Symbol, Symbol, Int64?, Int32}
+    alias UiIdentity = {Symbol, Symbol, Int64?, Int32, SelectionIdent, Int32}
 
     private def ui_state_identity : UiIdentity
-      {@active_tab, @focus, current_selected_flow_id, current_subtab_index}
+      {@active_tab, @focus, current_selected_flow_id, current_subtab_index,
+       current_selection_ident, total_mark_count}
+    end
+
+    # The active tab's selection identity (#1091). Without this component the tuple above
+    # moves for none of the mark gestures — `t`, `⇧T`, mark-clear and `⇧arrow` all leave
+    # `active_tab`, `focus`, `selected_flow_id` and `subtab` exactly where they were — so
+    # marking four rows published NOTHING and `get_current_context` told an agent the
+    # operator had selected nothing while four rows sat banded on screen.
+    #
+    # A tab with neither marks nor a list answers the all-zero default, which is what every
+    # non-participating tab compares as — so the gate behaves for Help/Project/Settings
+    # exactly as it did before.
+    private def current_selection_ident : SelectionIdent
+      @tabs[@active_tab]?.try(&.selection_ident) || SelectionIdent.new
+    end
+
+    # Marks across EVERY tab, not just the active one, so that switching away from a marked
+    # History and marking something else republishes the `marks_elsewhere` roll-up. O(1) per
+    # tab (`TabController#mcp_mark_count` is a `size`), 21 tabs, on the same tick — far
+    # cheaper than the string this tuple replaced.
+    private def total_mark_count : Int32
+      @tabs.each_value.sum(&.mcp_mark_count)
     end
 
     # May THIS window write the project's single `ui_state` row?
@@ -1001,10 +1148,60 @@ module Gori::Tui
             j.field "selected_flow_id", fid
           end
           j.field "subtab", current_subtab_index
+          # What the operator has MARKED, or has the cursor on (#1091). One block, written by
+          # the ACTIVE tab through the base-class hook, so the four list tabs and the nine
+          # sub-tab strips all reach an agent through one shape. Gated so a tab with nothing
+          # to say writes no key at all rather than an empty object every throttle window.
+          if (tab = @tabs[@active_tab]?) && tab.mcp_selection?
+            j.field "selection" { tab.write_mcp_selection(j) }
+          end
+          # Marks the operator left on ANOTHER tab. Without it, marking four flows and then
+          # stepping over to Repeater to look at something makes "do X with the four I
+          # selected" read the Repeater's selection and answer confidently about the wrong
+          # thing — the active tab alone cannot say "your marks are over there".
+          write_marks_elsewhere(j)
           if @active_tab == :repeater
             j.field "repeater" { repeater_controller.write_mcp_context(j) }
           end
           j.field "recorded_at", Time.utc.to_unix_ms
+        end
+      end
+    end
+
+    # The marked-but-not-here roll-up: every tab whose marks the `selection` block above did
+    # NOT carry, as the tab it is on plus how many. Counts only, never ids — the ids of a tab
+    # the operator is not looking at are a `switch_tab` away, and carrying them would put four
+    # selections in one row where the whole design has exactly one.
+    #
+    # The skip is "this tab already published its marks", not "this tab is active": Target is
+    # ONE registry tab over three children, and with Discover or Diff in front the parent
+    # publishes no selection at all — so a plain active-tab skip made four marked sitemap
+    # nodes vanish from both halves of the row, which is precisely the silence this feature
+    # exists to remove.
+    #
+    # `tab` always, `kind` only when the marks HAVE one. The kinds are a closed set
+    # (flow|issue|sitemap_node|intercept_item) and a sub-tab strip's marks are in none of
+    # them; inventing "repeater" as a kind would put a value in that field no reader can
+    # branch on. `mcp_mark_kind` rather than `selection_kind` because Target's marks can sit
+    # on a different child than the one on screen.
+    private def write_marks_elsewhere(j : JSON::Builder) : Nil
+      rows = [] of {Symbol, String?, Int32}
+      @tabs.each do |tab, ctl|
+        next if tab == @active_tab && ctl.mcp_selection?
+        n = ctl.mcp_marked_count
+        next if n.zero?
+        rows << {tab, ctl.mcp_mark_kind, n}
+      end
+      return if rows.empty?
+      j.field "marks_elsewhere" do
+        j.array do
+          rows.each do |(tab, kind, n)|
+            j.object do
+              j.field "tab", tab.to_s
+              j.field "kind", kind if kind
+              j.field "marked_count", n
+            end
+          end
         end
       end
     end
@@ -1044,6 +1241,7 @@ module Gori::Tui
     # store-backed views. Active-tab reloads use id/path soft-anchors; Repeater/Notes
     # soft-merge and skip dirty buffers so session UI is not clobbered.
     private def apply_external_change : Nil
+      refresh_evidence_availability
       # Scope has no dirty-edit-buffer concept to protect (add/remove/toggle write straight
       # through to the store), so it's always safe to refresh in place here — unlike a
       # controller with an open, unsaved editor. This is what keeps the Sitemap's in-scope
@@ -1164,15 +1362,14 @@ module Gori::Tui
       search_recompute # a ^F prompt open over the reloaded view keeps fresh hits
     end
 
+    # Never blocks: nil when no event is waiting, and (`receive?`) when the channel is closed.
     private def nonblocking_event : Store::FlowEvent?
       select
-      when e = @session.flow_events.receive
+      when e = @session.flow_events.receive?
         e
       else
         nil
       end
-    rescue Channel::ClosedError
-      nil
     end
 
     # Collapses a pasted CRLF into one newline — see `PasteNewline`. Filtered here, at the
@@ -1187,12 +1384,24 @@ module Gori::Tui
     # Bounds a paste whose end marker never comes — the decision lives there, not here.
     @paste_stall = PasteStall.new
 
-    private def handle(ev : Termisu::Event::Any) : Nil
+    #
+    # Returns false only for an event a paste IN PROGRESS absorbed without touching anything on
+    # screen — a key buffered for the bulk insert or dropped by a refused paste, the LF half of
+    # a pasted CRLF, a click swallowed mid-paste — so the run loop does not re-render an
+    # unchanged frame per pasted key. Every paste transition, and everything outside a paste,
+    # answers true as before.
+    private def handle(ev : Termisu::Event::Any) : Bool
       # A key retires the reduced frame (see `absorb_tick_error`): the next render is the
       # real one, and if it fails again the reduced frame simply comes back. Keys only —
       # xterm mode 1002 reports pointer motion continuously, and a drag would otherwise retry
       # (and log) the broken render at the mouse's rate.
       @safe_frame = nil if ev.is_a?(Termisu::Event::Key)
+      # The operator did something (see the run loop's `wake_on_input`). Set per event, so a
+      # key drained behind a resize in the same burst still counts.
+      @operator_input = true if ev.is_a?(Termisu::Event::Key) || ev.is_a?(Termisu::Event::Mouse)
+      # A click between the two presses of `dd` / `yy` may have moved the caret or the focus;
+      # the second press must not act on a line the first one never saw.
+      @editor_op = nil if ev.is_a?(Termisu::Event::Mouse)
       # A PasteStart arriving while a paste is ALREADY open means the previous one was abandoned
       # (its marker lost) and a new one is beginning. Close the old one first, or there is no
       # start transition for the new one and it silently inherits the abandoned paste's
@@ -1211,6 +1420,9 @@ module Gori::Tui
         # minutes old — the ordinary way to paste is to go copy something and come back, and a
         # clock left at that keypress declared the paste stalled on its own opening tick.
         @paste_stall.opened(Time.instant)
+        # An editor pane in READ is OPENED rather than refused — see `arm_editor_for_paste`,
+        # which runs first precisely so both questions below see the mode it just set.
+        arm_editor_for_paste
         if begin_bulk_paste?
           @paste_buf = String::Builder.new
         elsif paste_runs_as_commands?
@@ -1220,11 +1432,11 @@ module Gori::Tui
       elsif was_pasting && !@paste_newline.pasting?
         close_paste
       end
-      return if swallowed
+      return !(was_pasting && @paste_newline.pasting?) if swallowed
       case ev
       when Termisu::Event::Key
-        return if @paste_dropped
-        return if buffer_bulk_paste(ev)
+        return false if @paste_dropped
+        return false if buffer_bulk_paste(ev)
         handle_key(ev)
       when Termisu::Event::Mouse
         # A click is not part of a paste, and acting on one mid-paste moves the target out from
@@ -1233,7 +1445,7 @@ module Gori::Tui
         # thing to `replay_paste`, i.e. N keystrokes through the keymap — commands, and the
         # per-character edit cycle this bulk path exists to avoid. Swallowed until the paste
         # resolves, which the stall guard bounds.
-        return if @paste_newline.pasting?
+        return false if @paste_newline.pasting?
         handle_mouse(ev)
       when Termisu::Event::Resize
         # termisu already resized its cell buffer to these dims (prepare_event). Re-fit the
@@ -1244,6 +1456,7 @@ module Gori::Tui
       when Termisu::Event::Preedit
         apply_preedit(ev.text)
       end
+      true
     end
 
     # The surfaces with no text field that own the keys while up — the IME's composing text
@@ -1300,6 +1513,11 @@ module Gori::Tui
 
     private def handle_key(ev : Termisu::Event::Key) : Nil
       @detail_pin = nil # see history_target_flow_id — the pin lives for one event only
+      # An armed `d` / `y` is spent by THIS key, whatever takes it: the quit arm, `^G`/`^F`/`^B`
+      # or a prompt that returns before the check below must not leave it armed, or a later
+      # single `d` would delete a line.
+      pending_op = @editor_op
+      @editor_op = nil
       # Deliberate quit: ^D (or ^C) must be pressed twice in a row — the first press
       # arms and hints in the status bar; any other key disarms. (Q no longer quits;
       # `q` still returns to the project picker.) Handled before everything else so
@@ -1375,11 +1593,47 @@ module Gori::Tui
         return
       end
       return handle_palette_key(ev) if @overlay.palette?
-      return handle_more_menu_key(ev) if @overlay.tabs_more?
       # Migrated modals (Overlay base) dispatch generically — no per-modal handle_*_key.
       if ov = active_overlay
         dispatch_overlay_key(ov, ev)
         return
+      end
+      # The second press of vim's `dd` / `yy` (see `editor_delete_line`). Ahead of the digit
+      # family and every pane's own keys: between the two presses the operator owns the next
+      # key, as vim's operator-pending state does, so a `d2` cannot jump to tab 2.
+      if op = pending_op
+        return if finish_editor_op(op, ev)
+      end
+      # esc cancels a differential-timing run in flight (#1246) — the run is bounded but can be
+      # seconds at a large N. Only on the Repeater tab and outside text entry, and only once every
+      # modal, prompt, picker and the space menu above has had the key: this arm used to sit
+      # before them, so esc could not close a space menu (or the palette) anywhere while a run
+      # was in flight.
+      if ev.key.escape? && @active_tab == :repeater && @overlay.none? && !text_input_active? &&
+         repeater_controller.timing_running?
+        repeater_controller.cancel_timing
+        return
+      end
+      # THE DIGIT FAMILY, claimed here and nowhere else.
+      #
+      # The tab bar is nine numbered slots and the numbers are how you move: `1`-`9` jump to
+      # a slot, `0` opens the Go-to picker, `⇧1`-`⇧9` jump to a sub-tab and `⇧0` finds one.
+      # A number painted on the bar has to mean the same thing wherever the hand is, and it
+      # did not: a dozen handlers below return BEFORE the keymap — the sub-tab strip swallows
+      # everything it does not recognise, the drill-in details and every controller's
+      # `handle_body_key` claim their own bare keys — so the digits worked on the tab bar and
+      # in about half the panes underneath it.
+      #
+      # Hoisted above all of them, and gated by exactly one question: is this keystroke TEXT?
+      # `text_input_active?` answers it the way `space` already does — an editor in insert
+      # mode, a query or filter bar, a field taking a value — and a modal answers it by owning
+      # the keys outright (the arm above returns first; the CVSS calculator's digits, the
+      # pickers' filters and the hotkey editor's capture are all behind it).
+      #
+      # Routed through the keymap rather than calling `focus_visible_tab` directly, so the
+      # family stays rebindable and a scoped digit binding would still win.
+      if tab_digit_family?(ev) && !text_input_active?
+        return if dispatch_chord(ev)
       end
       # Text-entry modes own Tab (complete) + Esc within themselves — let them run
       # before the global focus ring claims Tab.
@@ -1421,6 +1675,13 @@ module Gori::Tui
       if @active_tab == :project && @overlay.none? && @focus == :body && project_controller.activity_querying?
         return if project_controller.handle_activity_query_key(ev)
       end
+      # The BODY's own `/` bar on the five rule lists (Colormarker, Rewriter, Probe RULES,
+      # Host overrides, Env). One generic arm rather than five named ones: they all carry the
+      # same `RowFilter`, so the claim is `TabController#list_filter_editing?` and the tab
+      # answers for whichever pane is showing.
+      if @overlay.none? && @focus == :body && (lf = @tabs[@active_tab]?) && lf.list_filter_editing?
+        return if lf.handle_list_filter_key(ev)
+      end
       # Sub-tab filter (issue #121): the `/` bar captures keys until Enter/Esc. Opened
       # from the strip (not the body), so it's not gated on @focus. Generic across the
       # workbench tabs — only the active tab's controller can be in filter-edit mode.
@@ -1428,7 +1689,20 @@ module Gori::Tui
         ctl.handle_subtab_filter_key(ev)
         return
       end
+      # Esc over a READ selection clears it and goes no further — vim's Esc out of `V`. Ahead
+      # of every pane's own Esc (an open issue's included), which would leave the pane with
+      # the selection still armed for the next `d`.
+      if ev.key.escape? && !ev.ctrl? && !ev.alt? && editor_read_mode? &&
+         @tabs[@active_tab]?.try(&.editor_drop_read_selection)
+        return
+      end
       if @active_tab == :issues && @overlay.none? && @focus == :body && issues_controller.view.detail_open?
+        # esc on an issue just filed by hand goes back where the form was opened (#F19),
+        # BEFORE the detail's own esc, which would close it into the Issues list. One shot:
+        # `return_to_filing_origin` spends the origin, so the next esc is the ordinary one.
+        if ev.key.escape? && !ev.ctrl? && !ev.alt?
+          return if return_to_filing_origin
+        end
         return if issues_controller.handle_detail_key(ev)
       end
       # History detail drill-in: shift+arrows select, space opens the action menu.
@@ -1484,23 +1758,21 @@ module Gori::Tui
         return
       end
 
-      # ^N opens a new blank repeater whenever the Repeater tab is active — body OR
-      # tab-bar focus — so the advertised empty-state shortcut is never a dead key.
-      if @active_tab == :repeater && @overlay.none? && ev.ctrl? && ev.key.lower_n?
-        repeater_controller.repeater_new
+      # ^N / ^W create and close a sub-tab from ANY focus level, on every tab that has a
+      # strip — the same `subtab_new` / `subtab_close` contract `handle_subtabs_key` runs
+      # (which is claimed above, so the strip keeps its own copy). They were per-tab guards
+      # before: ^N answered on Repeater/Fuzzer/Notes only, and ^W only from the strip or
+      # from the six controllers that had grown their own arm, so Fuzzer/Miner/Sequencer
+      # bodies had no close at all. The space menu now SHOWS both chords beside their rows,
+      # so a dead key here would be an advertised one.
+      if @overlay.none? && ev.ctrl? && ev.key.lower_n? && subtab_new_supported?
+        subtab_new
         return
       end
 
-      # ^N opens a new fuzz session from the Fuzzer tab (body OR tab-bar focus).
-      if @active_tab == :fuzzer && @overlay.none? && ev.ctrl? && ev.key.lower_n?
-        fuzzer_controller.fuzz_new
-        return
-      end
-
-      # ^N opens a new note from the Notes tab (body OR tab-bar focus), mirroring
-      # Repeater's new-request shortcut so it's never a dead key.
-      if @active_tab == :notes && @overlay.none? && ev.ctrl? && ev.key.lower_n?
-        notes_controller.notes_new
+      if @overlay.none? && ev.ctrl? && ev.key.lower_w? && subtab_close_supported?
+        subtab_close
+        resolve_subtab_focus # a close that empties the strip must not strand focus on it
         return
       end
 
@@ -1555,26 +1827,31 @@ module Gori::Tui
         return
       end
       # Resolve through the keymap, honouring available? so a scoped binding that is
-      # gated off (e.g. Repeater copy only in READ) does not swallow the chord — and so
-      # Global breath keys (c/i/s) still fire when a scoped verb is unavailable.
-      if id = resolve_verb_id(chord, current_scope)
-        @toast = @session.registry[id].call(self) || @toast
-        return
-      end
+      # gated off (e.g. Repeater copy only in READ) does not swallow the chord.
+      return if dispatch_chord(ev, chord)
       # A bare printable nothing binds HERE. Say so: typed text that missed its field used to
-      # vanish letter by letter — except the letters that were Global breath keys, which
-      # fired (`s` flipped the scope lens, `c` stopped capture) with nothing on screen tying
-      # the flip to the typing. The named keys (arrows, ↵, esc, ↹) and every modified chord
+      # vanish letter by letter — except the Global breath keys, which fired (`s` flipped the
+      # scope lens, `c` stopped capture and `i` held all traffic) with nothing on screen tying
+      # the action to the typing. The named keys (arrows, ↵, esc, ↹) and every modified chord
       # stay silent: those are navigation, legitimately unbound in some scopes (`space` is a
       # named key too, so the leader below is never named here).
-      if hint = Runner.unbound_key_hint(chord)
+      # A bare printable or Ctrl chord the TAB BAR does not bind but the tab's body does: name
+      # the `↵` that gets there, rather than "nothing bound here" one row above a header
+      # advertising the very key that was pressed (F10), or silence for a `^R`.
+      if @focus == :menu && (below = Runner.body_scope_verb(chord, @tabs[@active_tab]?.try(&.command_scope) || Verb::Scope::Body, @keymap, @session.registry))
+        lands = @tabs[@active_tab]?.try(&.command_section) || :common
+        status(Runner.enter_first_hint(chord, below.title, strip: subtabs_shown?, pane: Runner.gated_pane(below, lands)))
+        return
+      end
+      if hint = Runner.unbound_key_hint(chord, read_mode: editor_read_mode?)
         status(Hotkeys.expand(@session.registry, hint))
         return
       end
 
       # "space" opens the focused area's action menu (helix leader). Placed AFTER the
-      # scoped keymap so any area that already binds space wins — Sitemap's space
-      # toggles a tree node (sitemap.toggle). The Project SCOPE pane instead DEFERS
+      # scoped keymap so any area that already binds space wins — none does today:
+      # Sitemap's expand/collapse (sitemap.toggle) is `enter` alone, which is what leaves
+      # its space free for the menu. The Project SCOPE pane instead DEFERS
       # space to here (its lens toggle is the menu-only scope.lens-toggle verb). Only
       # reached in NAVIGABLE contexts: text editors (Repeater request/target, Notes,
       # Project desc, the QL "/" bar, Issues notes, Intercept edit) swallow keys
@@ -1584,24 +1861,93 @@ module Gori::Tui
       open_space_menu if ev.key.space? && !ev.ctrl? && !ev.alt?
     end
 
-    # Keymap id for `chord` in `scope` (then Global) whose verb is currently available.
-    # A scoped hit that fails available? does not block the Global fallback — so e.g.
-    # Repeater's READ-only `y` does not shadow a future Global on the same letter when
-    # the user is in INS, and gated response tools never swallow breath keys.
+    # Resolve `ev` through the keymap and run what it finds; true when a verb fired. Shared
+    # by the tail of `handle_key` and the digit family it hoists above the per-focus handlers,
+    # so the two cannot resolve or report differently.
+    private def dispatch_chord(ev : Termisu::Event::Key, chord : Verb::Chord? = nil) : Bool
+      chord ||= Keybind.from_event(ev)
+      return false unless chord
+      return false unless id = resolve_verb_id(chord, current_scope)
+      verb = @session.registry[id]
+      from_read = Runner.read_mode_global?(verb, chord, editor_read_mode?)
+      before = @toast
+      @toast = verb.call(self) || @toast
+      tag_read_mode_toast(before) if from_read
+      true
+    end
+
+    # A Global breath letter (`c` capture, `s` scope lens) that fired from a text editor in
+    # READ: the hand most likely thought it was typing. The key keeps its meaning (#1375); the
+    # toast says where it came from and how to type, or the flip goes unnoticed.
+    def self.read_mode_global?(verb : Verb::Definition, chord : Verb::Chord, read_mode : Bool) : Bool
+      read_mode && verb.scope.global? && !chord.ctrl && !chord.alt &&
+        chord.key.size == 1 && chord.key[0].letter?
+    end
+
+    def self.read_mode_note(toast : String) : String
+      # Terse: the status row clips the hint, and the key is the half worth keeping.
+      "#{toast} · READ: #{EditorPane::INSERT_KEYS} to type"
+    end
+
+    private def tag_read_mode_toast(before : String?) : Nil
+      return unless (toast = @toast) && toast != before
+      tagged = Hotkeys.expand(@session.registry, Runner.read_mode_note(toast))
+      kinded = @toast_kinded
+      @toast_kinded = {tagged, kinded[1]} if kinded && kinded[0] == toast
+      @toast = tagged
+    end
+
+    # The sub-tab strip owns its raw navigation keys. Its unhandled keys may reach Global
+    # shortcuts, but never the active tab or Editor scope — that would type through the strip.
+    private def dispatch_global_chord(ev : Termisu::Event::Key) : Bool
+      return false unless chord = Keybind.from_event(ev)
+      return false unless id = @keymap.resolve_global(chord, @session.registry, self)
+      @toast = @session.registry[id].call(self) || @toast
+      true
+    end
+
+    # `0`-`9`, bare or with shift and nothing else — the tab / sub-tab navigation family.
+    # Shift is folded onto the digit by `Keybind::SHIFTED_DIGITS`, so a terminal that sends
+    # `!` and one that sends shift+`1` both land here.
+    private def tab_digit_family?(ev : Termisu::Event::Key) : Bool
+      return false if ev.ctrl? || ev.alt?
+      return false unless c = ev.char || ev.key.to_char
+      ('0' <= c <= '9') || Keybind::SHIFTED_DIGITS.has_key?(c)
+    end
+
+    # Is a bare printable key TEXT right now? The digit family stands down in exactly the
+    # states that already swallow `space` as a literal: an editor in insert mode, a query or
+    # filter bar, a line-edit prompt, a numeric field.
+    #
+    # The bottom prompts (^G go-to-line, ^F find, the rename and tag bars) and every modal
+    # return above the digit arm, so they need no entry here. What is left is the active tab's
+    # own body, which is the one thing the shell cannot answer for itself — each controller
+    # owns its panes and its modes, so each answers `body_takes_text?` (TabController).
+    # The `/` sub-tab filter is asked without the focus gate, exactly as `handle_key` asks it
+    # below: the bar is opened from the STRIP, so it takes keys while `@focus` is `:subtabs`.
+    private def text_input_active? : Bool
+      return true if (ctl = @tabs[@active_tab]?) && ctl.subtab_filter_editing?
+      @focus == :body && (@tabs[@active_tab]?.try(&.body_takes_text?) || false)
+    end
+
+    # Keymap id for `chord` down the SCOPE CHAIN — Editor (only while a text editor pane
+    # holds focus), then `scope`, then Global — taking the first link whose verb is currently
+    # available. A hit that fails available? does not block the links behind it, so e.g.
+    # Repeater's READ-only `y` does not shadow a future Global on the same letter when the
+    # user is in INS, and gated response tools never swallow breath keys.
+    #
+    # `Scope::Editor` at the head is the FOCUS DIMENSION the keymap did not have (KEY_AUDIT
+    # §2d): eleven editor panes hand-rolled `i`/`↵`/`x` in `handle_body_key` because one
+    # `Scope` per tab could not say "here, in this pane". Putting it AHEAD of the tab scope
+    # rather than instead of it is what keeps the tab's own vocabulary alive in its editor —
+    # `{repeater.send-and-…}`, the Notes sub-tab keys, the Global breath keys all still
+    # resolve behind it.
+    #
+    # A link also stands down when its verb's chord is not live in the focused section
+    # (`Definition#chord_sections`) — the Repeater's bare `p` in the request pane. The walk
+    # itself is `Keymap#resolve`, pure, so the pane gate is spec'd without a terminal.
     private def resolve_verb_id(chord : Verb::Chord, scope : Verb::Scope) : String?
-      if id = @keymap.lookup(chord, scope)
-        verb = @session.registry[id]
-        return id if verb.available?(self)
-        # lookup already fell back to Global when the scope had no binding; when the
-        # scope HAD a binding that is gated off, try Global explicitly.
-        if verb.scope != Verb::Scope::Global && scope != Verb::Scope::Global
-          if gid = @keymap.lookup(chord, Verb::Scope::Global)
-            return gid if @session.registry[gid].available?(self)
-          end
-        end
-        return nil
-      end
-      nil
+      @keymap.resolve(chord, scope, @session.registry, self)
     end
 
     # --- Overlay seam (see overlay.cr) — generic dispatch for the ONE @active_overlay,
@@ -1610,8 +1956,25 @@ module Gori::Tui
     # Open a migrated modal: it becomes @active_overlay and syncs @overlay to its key
     # (so modal_overlay? + residual `@overlay ==` checks keep working during migration).
     private def open_overlay(ov : Overlay) : Nil
+      ov.over_detail = detail_shown?
       @active_overlay = ov
       @overlay = ov.key
+    end
+
+    # Is the History drill-in on screen: up itself, or under the card that sits on it? The
+    # drill-in and every modal share the one `@overlay` slot, so a card opened over a flow
+    # used to draw the bare list behind it and, for a card with no restore of its own (the
+    # issue form, the mock-rule form, active scan), close onto that list too (#1282 fixed the
+    # palette's close, not its backdrop). History renders the detail on this answer, and
+    # `open_overlay` stamps it on each card so a nested one inherits it.
+    def detail_shown? : Bool
+      Runner.detail_beneath?(@overlay, @palette_return, active_overlay)
+    end
+
+    def self.detail_beneath?(overlay : OverlayKind, palette_return : OverlayKind, modal : Overlay?) : Bool
+      return true if overlay.detail?
+      return palette_return.detail? if overlay.palette?
+      modal.try(&.over_detail?) || false
     end
 
     # Close `ov` and run its on_close — the nested-modal seam (overlay.cr). A modal opened
@@ -1638,9 +2001,14 @@ module Gori::Tui
     # Drop the active modal WITHOUT running its on_close. For an exit that goes somewhere
     # else entirely — the ^P jump to the command palette — where a nested modal's pop-back
     # would otherwise re-open on top of the destination.
+    #
+    # A card opened over the History drill-in drops back INTO it (`Overlay#over_detail?`), on
+    # the History tab only: a commit that moved the operator to another tab has already said
+    # where they go. The ^P jump takes it along, so the palette closes onto the same flow.
     private def leave_overlay : Nil
+      back = active_overlay.try(&.over_detail?) && @active_tab == :history
       @active_overlay = nil
-      @overlay = OverlayKind::None
+      @overlay = back ? OverlayKind::Detail : OverlayKind::None
     end
 
     # The active migrated modal, but ONLY while @overlay still names it. @overlay is the
@@ -1711,8 +2079,8 @@ module Gori::Tui
     # keep your hands off @overlay". The missing-path branch returns false for the ordinary
     # reason: keep the form up so it can be corrected.
     private def submit_ca_import(ov : CAImportOverlay) : Bool
-      cert = ov.cert_path
-      key = ov.key_path
+      cert = ov.resolved_cert_path
+      key = ov.resolved_key_path
       if cert.empty? || key.empty?
         @toast = "CA import: both certificate and key paths are required"
         return false
@@ -1823,6 +2191,9 @@ module Gori::Tui
       # captured @overlay back rather than dropping to the bare body (#413). Before this, declining
       # the quit confirm over the palette silently closed it.
       return (@overlay = displaced) if kind.none? && MODAL_OVERLAYS.includes?(displaced)
+      # A :none confirm over the History drill-in (the opt-in quit confirm) leaves the flow up:
+      # `leave_overlay` has already put the drill-in back, and :none asked for no change.
+      return if kind.none? && @overlay.detail?
       # No object to restore — either nothing was displaced (a :none confirm over the bare
       # body or the History Detail drill-in), or `return_to:` names a state the shell routes
       # BY STATE. Setting @overlay alone is right for None / Detail / an unmigrated
@@ -1861,7 +2232,7 @@ module Gori::Tui
         return
       end
       issues_controller.view.resync(store)
-      @toast = "#{plural(ids.size, "issue")} updated" if ids.size > 1
+      @toast = "#{Gori.plural(ids.size, "issue")} updated" if ids.size > 1
     end
 
     # Score the target issues, straight from the Space menu. The same calculator the create
@@ -1886,7 +2257,7 @@ module Gori::Tui
       # Only a BATCH needs saying — a single issue's chip and severity badge both change under
       # the operator's eyes, and echoing a 44-character vector into the status strip just
       # truncates it. Same rule apply_issue_choice follows.
-      @toast = "#{raw.empty? ? "cvss cleared" : "cvss set"} · #{plural(ids.size, "issue")}" if ids.size > 1
+      @toast = "#{raw.empty? ? "cvss cleared" : "cvss set"} · #{Gori.plural(ids.size, "issue")}" if ids.size > 1
       true
     end
 
@@ -1955,6 +2326,8 @@ module Gori::Tui
         # it now offers the target set's formats — one flow's single-message list, or the
         # set-shaped urls/hosts/curl/raw for a mark set (#442).
         @overlay.detail? ? history_controller.detail_copy_as_menu : history_controller.list_copy_as_menu(history_target_flow_ids)
+      when :evidence
+        evidence_copy_as_menu
       else
         {"COPY AS", [] of CopyMenu::Option}
       end
@@ -1994,15 +2367,21 @@ module Gori::Tui
       !@send_picker.nil?
     end
 
-    # "Send selection to X" (space → S): capture the focused pane's current selection
-    # and open a centered picker of string-handling destinations (Decoder for now).
-    # Gated upstream by read_selection_active?, so a selection is normally present; if
-    # it came back empty the verb just no-ops with a toast rather than opening an empty
-    # send.
+    # "Send selection to X" (space → S): capture the focused pane's current selection — or,
+    # with nothing selected, the line under the cursor, which is the same fallback `y` takes
+    # (`read_selection_text` → each pane's `*_copy_text`) — and open a centered picker of
+    # string-handling destinations.
+    #
+    # The verb is listed in the menu either way (#F17): gated on a live selection it was
+    # invisible until one existed, and nothing on screen named the `x` that makes one, so the
+    # only route from a response to the Decoder / JWT / Cookie / Sequencer was one you had to
+    # already know. An empty payload — an empty pane — still no-ops with a toast.
     def send_to_open : Nil
       payload = read_selection_text
       if payload.empty?
-        @toast = "nothing selected to send"
+        # With no selection this verb sends the line under the cursor (#F17), so an empty
+        # payload now means an empty PANE, not an empty selection.
+        @toast = "nothing under the cursor to send"
         return
       end
       sp = SendPicker.new("Send selection to", payload, SendMenu.destinations)
@@ -2013,8 +2392,8 @@ module Gori::Tui
         if dest = sp.selected_destination
           case dest.tab
           when :decoder   then decoder_controller.decoder_from_text(sp.payload)
-          when :jwt       then jwt_controller.jwt_from_text(sp.payload)
-          when :cookie    then cookie_controller.cookie_from_text(sp.payload)
+          when :jwt       then jwt_controller.session_from_text(sp.payload)
+          when :cookie    then cookie_controller.session_from_text(sp.payload)
           when :sequencer then sequencer_controller.sequence_from_text(sp.payload)
           end
         end
@@ -2080,9 +2459,12 @@ module Gori::Tui
     # Comparing against the reconciled default (rather than trusting the caller to say "this
     # was a reset") also covers the operator who dragged the bar back to its default by hand.
     private def tab_prefs_of(ov : TabsOverlay) : Array({String, Bool})
-      prefs = ov.to_prefs
-      defaults = Chrome.reconcile([] of {String, Bool}).map { |(sym, _, vis)| {sym.to_s, vis} }
-      prefs == defaults ? [] of {String, Bool} : prefs
+      # Partitioned, like the editor's own list: `to_prefs` writes the bar first and everything
+      # off it after, so the comparison has to be against the defaults in THAT shape or an
+      # untouched open-and-save would look like a customised layout and pin today's defaults.
+      # And without Evidence when the archive is empty, since the editor drops that row — see
+      # `Chrome.prefs_to_save`, which also puts the operator's own Evidence entry back.
+      Chrome.prefs_to_save(ov.to_prefs, @evidence_available, Settings.tab_prefs)
     end
 
     # Snap off a now-hidden active tab, after anything that changed Settings.tab_prefs (the
@@ -2090,14 +2472,17 @@ module Gori::Tui
     # therefore hide the tab you are standing on). Use the GENUINE visibility (no force:) for
     # this decision — effective_tabs force-includes the active tab, which would mask the hide.
     private def settle_hidden_active_tab : Nil
-      vis = Chrome.visible_tabs(Settings.tab_prefs)
+      vis = available_tabs(Chrome.visible_tabs(Settings.tab_prefs))
       return if vis.any? { |(s, _)| s == @active_tab }
       # Persist the outgoing tab's dirty buffer before snapping off — @active_tab still
       # names the tab being hidden here. flush_active_tab_edits covers all hideable tabs
       # (Notes/Fuzzer/Issues/Miner included), unlike the old project/repeater/decoder-only
       # flush which silently dropped the others at hide-time.
       flush_active_tab_edits
-      @active_tab = vis.first[0]
+      # `vis` can be empty here: an Evidence-only layout reused in a project whose archive is
+      # empty. Project is the last resort here and `effective_bar` falls back to it for the same
+      # reason, so the two agree on where a stranded operator lands.
+      @active_tab = vis.first?.try(&.[0]) || :project
       on_enter_tab
       @focus = :menu
     end
@@ -2112,6 +2497,13 @@ module Gori::Tui
     end
 
     private def save_env(ov : EnvOverlay) : Bool
+      # The env section is written WHOLE by the merge, grammar included, and this card saves on
+      # every keystroke — so a var edit used to carry the overlay's opening snapshot of the
+      # grammar back over a `gori settings env-syntax` run in another terminal. No TUI surface
+      # switches the grammar any more, so a save here never has an opinion about it: follow
+      # whatever the file says first — which RE-SPELLS this project's stored tokens and says so,
+      # not just flips the reading. See `EnvSyntaxSeam`.
+      follow_env_syntax
       prefix, vars = ov.to_config
       Settings.env_prefix = prefix
       Settings.env_vars = vars.dup
@@ -2124,12 +2516,90 @@ module Gori::Tui
     # keymap so dispatch reflects them immediately, close.
     private def save_hotkeys(ov : HotkeysOverlay) : Bool
       working, profile = ov.to_working
-      Hotkeys.apply(working, profile)
+      Hotkeys.apply(working, profile, @session.registry)
       ok = Settings.save
       @keymap = Hotkeys.build_keymap(@session.registry)
       # Help is built from the registry at open; reload so rebound labels stay honest.
       help_controller.reload_help(@session.registry)
       @toast = ok ? "hotkeys saved" : "hotkeys applied — could not save to #{Settings.path}"
+      true
+    end
+
+    # Where an issue was filed FROM, so the detail it opens into has a way back (#F19).
+    #
+    # An issue filed by hand is read next in ~every case, so the create no longer ASKS —
+    # it opens the issue and says how to return. The question that used to be here (an
+    # open/stay confirm) was one modal per filing, answered "open" nearly every time, on a
+    # card whose buttons and keys were different letters.
+    #
+    # `drill_in` is History's shell-held drill-in (`@overlay == :detail`), which is the one
+    # piece of the origin that does not live in a controller: the list's cursor, the open
+    # flow and the Repeater's sub-tab index all survive on their own, so restoring is a
+    # matter of pointing focus back at them.
+    record FilingOrigin, issue_id : Int64, tab : Symbol, focus : Symbol, drill_in : Bool, label : String
+
+    @filing_origin : FilingOrigin? = nil
+
+    # Did the events handled this tick include a key or click? Reset by the run loop before
+    # each burst and read after it, to decide whether Miss Ring may release a held reply.
+    @operator_input : Bool = false
+
+    # The tab's own name, as the bar spells it — the word the toast promises esc will take you
+    # back to, so it has to be the one on screen.
+    def self.filing_origin_label(tab : Symbol) : String
+      Chrome::TABS.find { |(sym, _)| sym == tab }.try(&.[1]) || tab.to_s
+    end
+
+    # What the create's toast ends with, and the state `esc` puts back. Both pure, because
+    # `Runner.new` owns a terminal: these are the halves of #F19 a spec can read.
+    def self.filing_return_hint(label : String) : String
+      " · esc returns to #{label}"
+    end
+
+    def self.filing_return_state(origin : FilingOrigin) : {Symbol, Symbol, OverlayKind}
+      {origin.tab, origin.focus, origin.drill_in ? OverlayKind::Detail : OverlayKind::None}
+    end
+
+    # The tab a project opens on, from the visible ones in bar order. Pure because `Runner.new`
+    # owns a terminal. Tab ORDER is untouched: Project keeps slot 1, focus just starts on History.
+    def self.landing_tab(visible : Array(Symbol)) : Symbol
+      visible.includes?(:history) ? :history : (visible.first? || :project)
+    end
+
+    # Snapshot the origin and open the new issue in the Issues detail. Returns the clause the
+    # create's toast ends with — the way back, named — or "" when the issue could not be
+    # opened (a store that lost it), in which case nothing is recorded and nothing is claimed.
+    private def open_filed_issue(id : Int64) : String
+      origin_tab = @active_tab
+      origin_focus = @focus
+      drill_in = origin_tab == :history && !history_controller.view.detail_flow_id.nil?
+      label = Runner.filing_origin_label(origin_tab)
+      history_controller.cancel_searches if origin_tab == :history
+      @active_tab = :issues
+      @focus = :body
+      @overlay = OverlayKind::None
+      unless issues_controller.view.open_by_id(@session.store, id)
+        issues_controller.view.reload(@session.store)
+        return ""
+      end
+      # Filed FROM the Issues tab (its own `n`): there is nowhere to send esc back to, so the
+      # detail closes into the list the ordinary way and the toast promises nothing.
+      return "" if origin_tab == :issues
+      @filing_origin = FilingOrigin.new(id, origin_tab, origin_focus, drill_in, label)
+      Runner.filing_return_hint(label)
+    end
+
+    # `esc` on the detail of an issue that was just filed: back to exactly where the form was
+    # opened from. One shot — the origin is spent here, so a second esc closes the detail the
+    # ordinary way.
+    private def return_to_filing_origin : Bool
+      origin = @filing_origin
+      return false unless origin
+      return false unless issues_controller.view.detail_issue.try(&.id) == origin.issue_id
+      @filing_origin = nil
+      issues_controller.view.close_detail
+      @active_tab, @focus, @overlay = Runner.filing_return_state(origin)
+      @toast = "back to #{origin.label}"
       true
     end
 
@@ -2152,7 +2622,8 @@ module Gori::Tui
         issues_controller.view.resync(@session.store)
         @toast = "issue updated"
       else
-        new_id = @session.store.insert_issue(title, form.severity, form.host, form.flow_id, cvss: cvss_val)
+        new_id = @session.store.insert_issue(title, form.severity, form.host, form.flow_id, cvss: cvss_val,
+          notes: form.notes)
         # `insert_issue` returns 0 — NOT nil — when the write never committed, and 0 is TRUTHY
         # in Crystal: the same trap `Probe::Triage.promote` and `sequencer_promote` both name.
         # Everything below takes `new_id` as an owner id, so swallowing it filed entity_links
@@ -2163,12 +2634,11 @@ module Gori::Tui
           @toast = "could not file the issue (store busy) — nothing was written, ↵ to retry"
           return false
         end
-        # `insert_issue` writes notes '' — it has no notes parameter, and giving it one would
-        # touch every caller. A second write is fine here: this is a one-off create, not the
-        # data path, and it is skipped entirely unless the open-site supplied evidence.
-        # The issue itself is already filed, so a failure here is a HALF landing, not a
-        # rollback — name which half, like `sequencer_promote` does, rather than claim both.
-        notes_lost = !form.notes.empty? && !@session.store.update_issue(new_id, notes: form.notes)
+        # The form's notes ride the INSERT (#1019), so there is no half landing to name: the
+        # issue and its body commit together, or `new_id == 0` above kept the form with the
+        # only copy of both. This used to be a second `update_issue`, whose failure filed a
+        # titled issue with an empty body and a toast saying so.
+        #
         # History's marked set beyond the primary evidence flow (#442) — one issue, N flows.
         # insert_issue already linked form.flow_id, so exclude it and never re-link. A flow the
         # store can't resolve (a stale mark) is dropped rather than filing an orphan link row, and
@@ -2190,29 +2660,28 @@ module Gori::Tui
           # which is exactly where a marked set arrives, so reporting only the picker's own ref
           # would leave the N flows just attached unmentioned.
           msg = attached > 1 ? "issue ##{new_id} created and linked · #{attached} flows attached" : "issue ##{new_id} created and linked"
-          @toast = notes_lost ? "#{msg} — but its notes did not save (store busy)" : msg
-          # Ask open-vs-stay (default stay). FALSE, not true: offer_open_created has just
-          # put a confirm up, and "close the overlay" would be asking the shell to close a
-          # form it is no longer holding. close_active_overlay's identity check would make
-          # that inert anyway; saying false states the intent rather than relying on it.
-          offer_open_created(:issue, new_id)
-          return false
+          news = msg + write_form_snapshots(new_id, form)
+          # Open it (#F19) rather than asking. TRUE, so the shell drops the form: the issue
+          # is on screen behind it and there is no second modal to hand the overlay to.
+          @toast = news + open_filed_issue(new_id)
+          return true
         elsif form.stay_on_create?
           # Filed from a list the operator is still reading (the retest Diff): the create
           # must not move them off it, so the Issues list is refreshed IN PLACE and the
-          # toast names the id and whether evidence went with it. `offer_open_created`'s
-          # confirm is deliberately not raised here either — a retest sweep files row after
-          # row, and one modal per row is one modal too many.
+          # toast names the id and whether evidence went with it. It does NOT open the issue
+          # the way the two hand-filing paths above do (#F19) — a retest sweep files row
+          # after row, and being moved off the list between two of them is the interruption
+          # the old open/stay modal was, minus the question.
           issues_controller.view.reload(@session.store)
           msg = attached > 0 ? "issue ##{new_id} filed with its capture attached" : "issue ##{new_id} filed"
-          @toast = notes_lost ? "#{msg} — but its notes did not save (store busy)" : msg
+          @toast = msg + write_form_snapshots(new_id, form)
         else
-          history_controller.cancel_searches if @active_tab == :history
-          @active_tab = :issues
-          @focus = :body
-          issues_controller.view.reload(@session.store)
-          msg = attached > 1 ? "issue created with #{attached} flows attached" : "issue created"
-          @toast = notes_lost ? "#{msg} — but its notes did not save (store busy)" : msg
+          # The other hand-filed path (History's Add issue, and every form with no ref to
+          # link). It already landed on the Issues tab; now it lands on the ISSUE, with the
+          # way back named — the same act as the link path above, so the same ending.
+          msg = attached > 1 ? "issue ##{new_id} created with #{attached} flows attached" : "issue ##{new_id} created"
+          news = msg + write_form_snapshots(new_id, form)
+          @toast = news + open_filed_issue(new_id)
         end
       end
       true
@@ -2225,13 +2694,12 @@ module Gori::Tui
         close_overlay
       elsif key.enter?
         if verb = @palette.selected_verb
-          close_overlay
-          @toast = verb.call(self) || @toast
+          run_palette_verb(verb)
         end
       elsif @palette.edit(ev, self) # ↑/↓, ⌃/⌥←→, Home/End, Delete, ⌥⌫, ←/→ — before ⌫ and the printables
       elsif key.backspace?
         @palette.backspace(self)
-      elsif c && !ev.ctrl? && !ev.alt?
+      elsif c && !c.control? && !ev.ctrl? && !ev.alt? # termisu reads Tab as '\t'
         @palette.append(c, self)
         @palette.set_preedit("") if @palette.responds_to?(:set_preedit)
       end
@@ -2239,12 +2707,13 @@ module Gori::Tui
 
     # Keys for the space action menu — mnemonic-first (helix leader): a printable key
     # matching an entry's menu_key runs it; ↑/↓ (+ Tab) navigate and ↵ runs the
-    # highlighted one; esc or any unmapped key dismisses. The chosen verb runs scoped
-    # to where space was pressed (P1).
+    # highlighted one; any unmapped key dismisses (at level 2 too: the whole menu). A family
+    # row's key descends, and esc/⌫ come back up one level — closing from level 1. The
+    # chosen verb runs scoped to where space was pressed (P1).
     private def handle_space_menu_key(ev : Termisu::Event::Key) : Nil
       key = ev.key
-      if key.escape?
-        close_space_menu
+      if key.escape? || key.backspace?
+        close_space_menu unless @space_menu.back
       elsif key.up? || key.back_tab?
         @space_menu.move(-1)
       elsif key.down? || key.tab?
@@ -2254,14 +2723,14 @@ module Gori::Tui
       elsif key.right?
         space_menu_move_column(1)
       elsif key.enter?
-        run_space_verb(@space_menu.selected_verb)
+        activate_space_entry(@space_menu.selected_entry)
       elsif (c = ev.char) && !ev.ctrl? && !ev.alt?
-        # A bound mnemonic always wins (helix leader). Only when j/k/h/l are NOT a live
-        # mnemonic in this menu do they fall back to vim-style nav — so the reflex
-        # keystroke moves the selection instead of dismissing the menu, while scopes
-        # that bind 'k' (link-to-issue) or 'h' (add-host, dismiss-host) keep theirs.
-        if verb = @space_menu.verb_for(c)
-          run_space_verb(verb)
+        # A bound mnemonic always wins (helix leader). No row is ever lettered j/k/h/l
+        # (`Registry#validate_intents!`, `Verb::Family#validate!`), so those four always
+        # fall back to vim-style nav — the reflex keystroke moves the selection instead of
+        # dismissing the menu or running a row, at either level (#1274).
+        if entry = @space_menu.entry_for(c)
+          activate_space_entry(entry)
         elsif c == 'j'
           @space_menu.move(1)
         elsif c == 'k'
@@ -2288,10 +2757,73 @@ module Gori::Tui
       @space_menu.move_column(delta, Layout.compute(w, h, statusline_active?).body)
     end
 
-    # Close the menu, then run the verb (if any) and surface its status toast.
+    # ↵, a click or a row's key: a family row descends, a verb row runs, and the inert
+    # "nothing here right now" row does nothing — the card stays up for esc.
+    private def activate_space_entry(entry : SpaceMenu::Entry?) : Nil
+      if verb = @space_menu.activate(entry)
+        run_space_verb(verb)
+      end
+    end
+
+    # Close the menu, then run the verb (if any) and surface its status toast. From a STICKY
+    # family's card (`Verb::Family#sticky?`) the card comes back at the same row afterwards —
+    # unless the verb opened something of its own (an overlay, a picker, a prompt) or moved
+    # focus somewhere the card no longer describes; then it stays closed.
     private def run_space_verb(verb : Verb::Definition?) : Nil
+      point = @space_menu.sticky_point
+      was = @space_menu_here
       close_space_menu
-      @toast = verb.call(self) || @toast if verb
+      return unless verb
+      before = space_menu_blockers
+      @toast = verb.call(self) || @toast
+      return unless point && was
+      here = action_context
+      reopen_sticky_family(point, here) if SpaceMenu.resume_sticky?(before, space_menu_blockers, was, here)
+    end
+
+    # Every surface a verb could have opened that the space menu must not cover — including
+    # a pane that took the keys (Protocol…'s SNI field, the gRPC field list, a hex editor).
+    private def space_menu_blockers
+      {@overlay, @active_overlay.try(&.object_id), copy_as_shown?, send_to_shown?,
+       @goto_open, @search_open, @rename_open, @tag_edit_open, @focus, @active_tab,
+       @tabs[@active_tab]?.try(&.pane_captures_keys?)}
+    end
+
+    private def reopen_sticky_family(point : {Verb::Family, Int32}, here : ActionContext) : Nil
+      w, h = @backend.size
+      return unless Layout.usable?(w, h) && Layout.compute(w, h, statusline_active?).body.h >= 3
+      @space_menu.open(here.scope, here.section, self, banner: here.banner, subtabs: here.subtabs)
+      return unless @space_menu.resume(point)
+      @space_menu_here = here
+      @space_menu_open = true
+    end
+
+    # The verb `chord` would fire if the body had focus, or nil. Deliberately NOT gated on
+    # `available?`: this answers "is there something here one level down", and a verb that is
+    # momentarily unavailable (an empty list, nothing selected) is still the reason the key is
+    # not the tab bar's. A single-character key, bare or Ctrl: the bar is app-level focus
+    # (DESIGN.md §7, 2026-09-26), so a body chord like History's `^R` does not run from it —
+    # but the row it is pressed beside looks selected and the tour names that very chord, so
+    # silence read as a broken key. Alt stays out: on the bar it is a terminal's Meta prefix.
+    # Class-level and pure so the rule is spec-able (`Runner.new` owns a terminal).
+    def self.body_scope_verb(chord : Verb::Chord, scope : Verb::Scope, keymap : Verb::Keymap,
+                             registry : Verb::Registry) : Verb::Definition?
+      return nil if chord.alt || chord.key.size != 1
+      return nil if scope == Verb::Scope::Sidebar
+      id = keymap.lookup(chord, scope)
+      return nil if id.nil?
+      verb = registry[id]?
+      # A Global binding is not "one level down" — it fires from the bar too, so it would
+      # already have run above.
+      return nil if verb.nil? || verb.scope == Verb::Scope::Global
+      verb
+    end
+
+    # The pane `verb`'s chord is live in, when ↵ from the tab bar resumes into `lands`, where
+    # it is not (`Definition#chord_sections`); nil when the key works where ↵ lands.
+    def self.gated_pane(verb : Verb::Definition, lands : Symbol) : Symbol?
+      return nil unless secs = verb.chord_sections
+      secs.includes?(lands) ? nil : secs.first?
     end
 
     private def current_scope : Verb::Scope
@@ -2306,28 +2838,27 @@ module Gori::Tui
       end
     end
 
-    # The (scope, section) the space menu renders for, captured at the space
-    # keystroke. Deliberately DISTINCT from current_scope (the keymap's resolver,
-    # unchanged above) — the tab bar keeps Sidebar for keybindings (so Repeater's
-    # chords don't fire while navigating tabs) but the space menu on the tab bar
-    # should show that TAB's own top actions instead. By the time this is read,
-    # @overlay is always :none or :detail — every other overlay handles its own
-    # keys earlier in handle_key and returns before space is ever checked.
-    private def space_menu_context : {Verb::Scope, Symbol}
-      if @overlay.detail?
-        {Verb::Scope::HistoryDetail, :common}
-      else
-        scope = @tabs[@active_tab]?.try(&.command_scope) || Verb::Scope::Body
-        case @focus
-        when :menu
-          section = @session.registry.has_section?(scope, :tab) ? :tab : :common
-          {scope, section}
-        when :subtabs
-          {scope, :subtab}
-        else
-          {scope, @tabs[@active_tab]?.try(&.command_section) || :common}
-        end
-      end
+    # "What can I do here" at this keystroke — the one context both `Space` and `Ctrl-P` list
+    # the focused tab's actions from (#1282), so the two can never disagree. The rule itself
+    # is `ActionContext.capture`. Must be read BEFORE either surface opens: by then @overlay
+    # is always :none or :detail — every other overlay handles its own keys earlier in
+    # handle_key and returns before space or ^P is ever checked — and the palette is about to
+    # replace it.
+    private def action_context : ActionContext
+      ctl = @tabs[@active_tab]?
+      ActionContext.capture(@session.registry, detail: @overlay.detail?, focus: @focus,
+        scope: ctl.try(&.command_scope) || Verb::Scope::Body,
+        pane_section: ctl.try(&.command_section) || :common, banner: space_menu_banner)
+    end
+
+    # The section that holds focus: what a verb's `chord_sections` is checked against. The
+    # same rule `Space` and `Ctrl-P` list actions from (`ActionContext.capture`), so a pane
+    # gate and the menu can never disagree about which pane is focused.
+    def focused_section : Symbol
+      ctl = @tabs[@active_tab]?
+      ActionContext.capture(@session.registry, detail: @overlay.detail?, focus: @focus,
+        scope: ctl.try(&.command_scope) || Verb::Scope::Body,
+        pane_section: ctl.try(&.command_section) || :common, banner: nil).section
     end
 
     # The status strip's glyph — spinner / ✓ / ✗ — comes from the KIND the producer passed to
@@ -2346,9 +2877,35 @@ module Gori::Tui
     # Global) binds. Only for a BARE character: a modified chord is deliberate, and the named
     # keys are navigation that some scopes legitimately leave unbound. `{tab.help}` resolves
     # through `Hotkeys.expand` at the call site so a rebound `?` is what the line names.
-    def self.unbound_key_hint(chord : Verb::Chord) : String?
+    # `read_mode`: the focused pane is a text editor in READ, so the operator was most likely
+    # typing — the way to type is the answer, not "nothing bound".
+    def self.unbound_key_hint(chord : Verb::Chord, read_mode : Bool = false) : String?
       return nil if chord.ctrl || chord.alt || chord.key.size != 1
-      "‹#{Hotkeys.display_label(chord)}› — nothing bound here · space menu · {tab.help} help"
+      key = "‹#{Hotkeys.display_label(chord)}›"
+      return "#{key} — READ mode: #{EditorPane::INSERT_KEYS} to type · space menu" if read_mode
+      "#{key} — nothing bound here · space menu · {tab.help} help"
+    end
+
+    # …and the same line for a key that IS bound — one level down. On the tab bar `/` answered
+    # "nothing bound here" from one row above a list header that reads `/ filter`: true about
+    # the SIDEBAR scope and useless, because the key the operator wanted was `↵` and nothing
+    # said so. The letter deliberately does not fall through (that is the tab bar's own
+    # decision, see the `1-9/0 tabs` hint); it is ANSWERED instead.
+    #
+    # `verb` names what the key does down there, so the line teaches the pair rather than just
+    # refusing: `‹/› — press ↵ to enter the list, then / filter`.
+    # `where` is what one `↵` from the bar actually reaches — the list itself, or the sub-tab
+    # strip above it on the workbench tabs, where the body is one more ↵ down. Naming the
+    # wrong one would repeat the defect this fixes in miniature.
+    # `pane` names the pane the key is live in when ↵ lands somewhere else: a chord gated by
+    # `chord_sections` (the Repeater's `p` pretty, response only) is dead in the request pane
+    # ↵ resumes into, so "then p" alone would promise a key that does nothing there.
+    def self.enter_first_hint(chord : Verb::Chord, verb : String, strip : Bool = false,
+                              pane : Symbol? = nil) : String
+      key = Hotkeys.display_label(chord)
+      where = strip ? "↵↵ to enter the body" : "↵ to enter the list"
+      line = "‹#{key}› — press #{where}, then #{key} #{verb.downcase}"
+      pane ? "#{line} in the #{pane.to_s.upcase} pane" : line
     end
 
     # The strip line for `message`: led by `spinner` / ✓ / ✗ when `kinded` names this same
@@ -2433,24 +2990,12 @@ module Gori::Tui
         render_safe_frame(screen, layout, failed)
         return
       end
-      Chrome.render_top_bar(screen, layout.topbar, project: @session.project.name,
-        listen: listen_chip_label,
-        scope: scope_label, probe: probe_label, rules: rules_label, intercept: intercept_label,
-        sandbox: sandbox_label,
-        unread: @notifications.unread, capturing: @session.capturing?,
-        write_failures: @session.store.write_failures, bypass: Settings.passthrough_count,
-        listeners: listener_chip_count, listener_errors: @session.listener_errors.size,
-        authorize: authorize_chip_label, session: session_slot_chip, agents: agent_chip)
-      Chrome.render_rule(screen, layout.rule)
-      # One reconcile per frame: the menu strip AND the ⋯ hidden count both derive from the
-      # same tab reconcile — split_tabs computes both in a single pass (was two per frame).
-      vis_tabs, hid_tabs = Chrome.split_tabs(Settings.tab_prefs, force: @active_tab)
-      Chrome.render_menu(screen, layout.menu, active_tab: @active_tab,
-        focused: @focus == :menu && !@menu_more,
-        tabs: vis_tabs, intercept_count: @session.interceptor.pending_count,
-        hidden_count: hid_tabs.size, more_focused: @focus == :menu && @menu_more,
-        numbered: Settings.tab_numbers?)
+      render_chrome(screen, layout)
+      # Text the companion will cover is ellipsized at her edge, not left as a stump that reads
+      # like a real value (see Screen#occlusion). Body only: nothing else shares her rows.
+      screen.occlusion = companion_occlusion(layout.body)
       render_body(screen, layout.body)
+      screen.occlusion = nil
       render_companion(screen, layout.body)
       # One retag for the whole status row: key_hints already funnels the Runner's own
       # hint literals, every overlay/prompt hint AND every controller body_hint, and the
@@ -2459,9 +3004,10 @@ module Gori::Tui
         hints: Hotkeys.retag(status_line || key_hints),
         activity: activity_chip, resource: @resource.label, time: clock_label,
         companion: companion_bar_frame)
-      Chrome.render_statusline(screen, layout.statusline, @statusline.segments) unless layout.statusline.empty?
+      unless layout.statusline.empty?
+        Chrome.render_statusline(screen, layout.statusline, @statusline.segments, failed: @statusline.failed?)
+      end
       @palette.render(screen, layout.body) if @overlay.palette?
-      @more_menu.try(&.render(screen, more_anchor_rect(layout), layout.body)) if @overlay.tabs_more?
       active_overlay.try(&.render(screen, layout.body)) # migrated modals (Overlay seam; gated on @overlay)
       # The space menu + bottom prompts float over everything else (drawn last).
       render_prompts(screen, layout)
@@ -2483,13 +3029,8 @@ module Gori::Tui
       flush_screen
     end
 
-    # The frame drawn while a full render is failing (see `absorb_tick_error`): the top bar,
-    # the tab menu and the status row exactly as `render` draws them, and the error where the
-    # body would be. Nothing pane-owned is asked to draw — the body, the companion, overlays,
-    # the prompts and the controllers' hint strips are all suspects — so this frame can only
-    # fail if the chrome itself is broken. The tab menu is kept LIVE (focus, active tab) so
-    # 1-9 / ←→ still read as what they do: the way out of a tab that cannot draw.
-    private def render_safe_frame(screen : Screen, layout : Layout, ex : Exception) : Nil
+    # The top bar, rule and tab menu — shared by `render` and `render_safe_frame`.
+    private def render_chrome(screen : Screen, layout : Layout) : Nil
       Chrome.render_top_bar(screen, layout.topbar, project: @session.project.name,
         listen: listen_chip_label,
         scope: scope_label, probe: probe_label, rules: rules_label, intercept: intercept_label,
@@ -2497,14 +3038,27 @@ module Gori::Tui
         unread: @notifications.unread, capturing: @session.capturing?,
         write_failures: @session.store.write_failures, bypass: Settings.passthrough_count,
         listeners: listener_chip_count, listener_errors: @session.listener_errors.size,
-        authorize: authorize_chip_label, session: session_slot_chip, agents: agent_chip)
+        authorize: authorize_chip_label, session: session_slot_chip, agents: agent_chip,
+        asks: answerable_questions.size)
       Chrome.render_rule(screen, layout.rule)
-      vis_tabs, hid_tabs = Chrome.split_tabs(Settings.tab_prefs, force: @active_tab)
+      # One reconcile per frame: the menu strip, the off-bar count AND the slot numbers all
+      # derive from the same tab reconcile — split_tabs computes them in a single pass.
+      vis_tabs, _, slots = effective_bar
       Chrome.render_menu(screen, layout.menu, active_tab: @active_tab,
         focused: @focus == :menu && !@menu_more,
         tabs: vis_tabs, intercept_count: @session.interceptor.pending_count,
-        hidden_count: hid_tabs.size, more_focused: @focus == :menu && @menu_more,
-        numbered: Settings.tab_numbers?)
+        more_focused: @focus == :menu && @menu_more,
+        numbered: Settings.tab_numbers?, slots: slots)
+    end
+
+    # The frame drawn while a full render is failing (see `absorb_tick_error`): the top bar,
+    # the tab menu and the status row exactly as `render` draws them, and the error where the
+    # body would be. Nothing pane-owned is asked to draw — the body, the companion, overlays,
+    # the prompts and the controllers' hint strips are all suspects — so this frame can only
+    # fail if the chrome itself is broken. The tab menu is kept LIVE (focus, active tab) so
+    # 1-9 / ←→ still read as what they do: the way out of a tab that cannot draw.
+    private def render_safe_frame(screen : Screen, layout : Layout, ex : Exception) : Nil
+      render_chrome(screen, layout)
       body = layout.body
       # A message may carry wire bytes or newlines (an IndexError's does not, a parser's may):
       # one line, valid UTF-8, or the frame meant to report the crash would be the next one.
@@ -2563,7 +3117,15 @@ module Gori::Tui
     end
 
     private def scope_label : String
-      @scope.active? ? "scope:#{@scope.size}" : "scope:off"
+      Runner.scope_chip(@scope.active?, @scope.size)
+    end
+
+    # `scope:N` while the lens filters. Off, a bare `scope:off` read as "the rules did nothing"
+    # right after adding one, so rules waiting on the lens show as `scope:off(N)` — the
+    # `intercept:on(N)` shape, and still `:off`-muted (see `Chrome.top_bar_chips`).
+    def self.scope_chip(active : Bool, rules : Int32) : String
+      return "scope:#{rules}" if active
+      rules > 0 ? "scope:off(#{rules})" : "scope:off"
     end
 
     # The address on the top-bar listen chip. TERSE: the bar is a dense right-aligned chip
@@ -2657,7 +3219,19 @@ module Gori::Tui
         case @focus
         when :menu    then "TABS"
         when :subtabs then "SUBTABS"
-        else               body_editor? ? "EDITOR" : "BODY"
+        else
+          # The controller names its own body state (TabController#body_badge) — the same
+          # answer `body_editor?` reads, asked one level wider so a view-owned drill-in can
+          # say DETAIL too. History's arrives above, off `@overlay`.
+          badge = case @tabs[@active_tab]?.try(&.body_badge)
+                  when :editor then "EDITOR"
+                  when :detail then "DETAIL"
+                  else              "BODY"
+                  end
+          # …and, on a tab whose body is several panes, WHICH pane (TabController#
+          # body_pane_label). The badge is the only always-drawn slot that can answer it.
+          pane = @tabs[@active_tab]?.try(&.body_pane_label)
+          pane ? "#{badge} · #{pane}" : badge
         end
       end
     end
@@ -2683,7 +3257,10 @@ module Gori::Tui
     # the active tab, and any open overlay (so the user always sees what the keys
     # under their fingers do right now).
     private def key_hints : String
-      return "press a key · ↑/↓ select · ←/→ column · ↵ run · esc close" if @space_menu_open
+      if @space_menu_open
+        return "press a key · ↑/↓ select · ↵ run · esc back" if @space_menu.level
+        return "press a key · ↑/↓ select · ←/→ column · ↵ run · esc close"
+      end
       if pt = prompt_picker # prompt-tier Overlays carry their own hint too
         return pt.hint
       end
@@ -2691,12 +3268,11 @@ module Gori::Tui
         return ov.hint
       end
       case @overlay
-      when .palette?   then "↑/↓ select · ↵ run · ⌫ · esc close · type to filter"
-      when .tabs_more? then "↑/↓ select · ↵ open tab · ←/esc close"
-      when .detail?    then history_controller.body_hint(:body)
+      when .palette? then "↑/↓ select · ↵ run · ⌫ · esc close · type to filter"
+      when .detail?  then history_controller.body_hint(:body)
       else
-        # Focus on the far-right ⋯ "more" affordance: ↵/↓ expands the hidden-tabs list.
-        return "↵/↓ show hidden tabs · ← back · ^P cmds · q projects" if @focus == :menu && @menu_more
+        # Focus on the far-right `0:Tabs` stop: ↵/↓ opens the Go-to picker, same as the key.
+        return "↵/↓ go to tab… · ← back · ^P cmds · q projects" if @focus == :menu && @menu_more
         # Focus on the tab bar: ←/→ pick the tab, Tab/↵ drop into the body.
         #
         # `c` and `i` earn their place here even though they are Global verbs reachable from
@@ -2704,7 +3280,9 @@ module Gori::Tui
         # keypress lands on one of them — and both change what the PROXY does, from a tab that
         # shows neither: `i` starts holding every request, `c` stops recording entirely. They
         # were the only unadvertised keys at this focus with an effect outside the current tab.
-        return Hotkeys.expand(@session.registry, "←/→ switch tab · ↹/↵ enter · 1-9 jump · {capture.toggle} capture · {intercept.toggle} intercept · ^P cmds · q projects · ^D quit") if @focus == :menu
+        # `{tab.help}` sits in the escape-hatch tail with `^P cmds`, which Chrome.fit_hints keeps
+        # when the row is narrow: it drops the head's extras first.
+        return Hotkeys.expand(@session.registry, "←/→ switch tab · ↹/↵ enter · 1-9/0 tabs · {capture.toggle} capture · {intercept.toggle} intercept · ^P cmds · {tab.help} help · q projects · ^D quit") if @focus == :menu
         if @focus == :subtabs
           # On the ⌕ affordance the strip's own keys are the wrong story — ↵ lists every
           # sub-tab here instead of entering one. Only ever reached when the pill is really
@@ -2713,25 +3291,26 @@ module Gori::Tui
           # A fixed strip (Help) has no create/close and a read-only body — don't
           # advertise ^N/^W/edit as live keys there.
           if @tabs[@active_tab]?.try(&.subtabs_fixed?)
-            return "←/→ switch sub-tab · ↓/↵ enter · ^1-9 jump · ↑/esc tabs"
+            return "←/→ switch sub-tab · ↓/↵ enter · ⇧1-9 jump · ↑/esc tabs"
           end
-          rn = renameable_subtabs? ? " · r rename" : ""
+          rn = renameable_subtabs? ? " · e rename" : ""
           mk = subtab_marks_shown? ? " · t mark" : ""
           # With marks set, esc no longer leaves the strip — it drops the selection first, and
           # the row has to say so rather than keep advertising the gesture it used to be.
           marked = subtab_marked_count
           tail = marked > 0 ? "#{marked} marked · esc unmark · ↑ tabs" : "↑/esc tabs"
-          # `f find` takes the column `^1-9 jump` used to hold. Both keys still work; only one
-          # of them works EVERYWHERE. Ctrl+digit has no control character, so on many terminals
-          # the jump never arrives (docs/content/guide/hotkeys.md says so in as many words),
-          # and it runs out at nine on the strips that pile up past nine.
+          # `⇧1-9 jump` is the strip's own digit row and `f find` the way past nine chips. The
+          # `^1-9` alias still works and is deliberately NOT advertised here: Ctrl+digit has no
+          # control character, so on many terminals the jump never arrives
+          # (docs/content/guide/hotkeys.md says so in as many words) — a hint must not name the
+          # key that might not land when a key that does is sitting beside it.
           #
           # Miner sessions are background-seeded (^N is a no-op) and its body is a read-only
           # table (↵ ENTERS, doesn't edit) — drop the ^N/edit tokens that fit editor strips.
           unless subtab_new_supported?
-            return "←/→ switch sub-tab · ↓/↵ enter · f find#{mk} · ^W close · space cmds#{rn} · #{tail}"
+            return "←/→ switch sub-tab · ↓/↵ enter · ⇧1-9 jump · f find#{mk} · ^W close · space cmds#{rn} · #{tail}"
           end
-          return "←/→ switch sub-tab · ↓/↵ edit · f find#{mk} · ^N new · ^W close · space cmds#{rn} · #{tail}"
+          return "←/→ switch sub-tab · ↓/↵ edit · ⇧1-9 jump · f find#{mk} · ^N new · ^W close · space cmds#{rn} · #{tail}"
         end
         body_hints
       end
@@ -2760,10 +3339,10 @@ module Gori::Tui
       @body_h = rect.h # remembered for PageUp/PageDown's screenful step (see page_nav_delta)
       # Onboarding empty-state cards are drawn by the body but a modal lands on top of
       # them a few lines later, so a dialog shorter than the card leaves its tail poking
-      # out (see TrafficEmptyState.suppressed?). Every overlay but the ⋯ dropdown centres
-      # itself in this same rect; tabs_more is anchored to its tab-bar chip and doesn't
-      # cover the card, so it keeps it.
-      TrafficEmptyState.suppressed = !@overlay.none? && !@overlay.tabs_more?
+      # out (see TrafficEmptyState.suppressed?). Every overlay centres itself in this same
+      # rect — including the Go-to picker, which took the ⋯ dropdown's place and is a card
+      # rather than something anchored to a tab-bar chip — so every one of them suppresses.
+      TrafficEmptyState.suppressed = !@overlay.none?
       # Every catalog tab has a controller that owns its body render; the `?` guard is
       # defensive (a blank body beats a crash if the active tab ever lacks one).
       @tabs[@active_tab]?.try(&.render_body(screen, rect, @focus))
@@ -2771,7 +3350,7 @@ module Gori::Tui
 
     # Miss Ring rides the BODY rect (bottom-right), so she has to paint over the tab body
     # — hence immediately after render_body. But every float drawn AFTER this point (the
-    # palette, the ⋯ menu, migrated modals, the space menu, the pickers, the bottom
+    # palette, migrated modals, the space menu, the pickers, the bottom
     # prompts) would clip her box and leave an orphaned corner poking out — exactly the
     # failure TrafficEmptyState.suppressed exists to prevent. So the gate hides her
     # outright rather than relying on z-order.
@@ -2780,6 +3359,15 @@ module Gori::Tui
       return unless frame = @companion.frame
       return unless companion_visible?
       Companion.draw(screen, body, frame)
+    end
+
+    # Where she will be painted over the body this frame — the same gates as
+    # #render_companion — or nil when she will not be.
+    private def companion_occlusion(body : Rect) : Rect?
+      return nil if Settings.companion_in_bar?
+      return nil unless @companion.frame
+      return nil unless companion_visible?
+      Companion.hit_rect(body)
     end
 
     # The status-bar placement. Nil unless she is both enabled and set to `bar`, which is
@@ -2807,10 +3395,22 @@ module Gori::Tui
     # the whole few seconds it is alive. Recency is the only rule that also gets the
     # opposite case right — fresh action feedback while an older notice is still up.
     private def status_line : String?
+      # A confirm card is a QUESTION, and its keys are letters nothing else on screen names —
+      # so the card's own hint takes this slot rather than a toast. The case that made it
+      # matter was NOTE CREATED (and ISSUE CREATED, before #F19 stopped asking that one): the
+      # card goes up in the same frame as its own creation toast, so the first ↵ was pressed
+      # blind and the line that explains it appeared only after some other key had cleared the
+      # toast. The news is not lost — `offer_open_created` puts the standing toast in the card,
+      # where it is read with the question.
+      return nil if @overlay.confirm?
       toast = @toast
       notice = Settings.companion_in_bar? ? @companion.frame.try(&.bubble) : nil
       return format_status_message(toast) unless notice
       return notice unless toast && (at = @toast_at)
+      # A HELD reply keeps the slot against a newer toast, as it keeps her bubble against a
+      # newer note: the toast a job result raises must not hide what an agent said. The
+      # operator's own next key releases the hold, so the feedback for THAT key still shows.
+      return notice if @companion.holding?
       @companion.bubble_at.try { |b| b > at } ? notice : format_status_message(toast)
     end
 
@@ -2828,7 +3428,7 @@ module Gori::Tui
     end
 
     private def companion_visible? : Bool
-      return false unless @overlay.none? # palette / detail / tabs_more / every modal
+      return false unless @overlay.none? # palette / detail / every modal
       return false if @space_menu_open || copy_as_shown? || send_to_shown?
       return false if @goto_open || @search_open || @rename_open || @tag_edit_open
       return false if body_editor? # she steps aside while you're typing
@@ -2946,6 +3546,10 @@ module Gori::Tui
       repeater_controller.stop_all
       oast_controller.stop_all
       authorize_controller.stop_all
+      sitemap_controller.stop_all
+      # A retest run is the Issues tab's one background sender (#1036). Cooperative like the
+      # rest: the fiber owns its sockets and checks the flag between steps.
+      issues_controller.halt_retest
     end
 
     private def quit_message : String
@@ -3040,7 +3644,7 @@ module Gori::Tui
     end
 
     private def self.job_count(count : Int32) : String
-      "#{count} job#{count == 1 ? "" : "s"}"
+      Gori.plural(count, "job")
     end
 
     # What an operator-initiated quit request does right now.
@@ -3070,6 +3674,51 @@ module Gori::Tui
     # Pure + class-level for the same reason the exit prompts above are: the Runner needs a
     # live tty. `@overlay.confirm?` deliberately stays at the chord's call site — "don't stack a
     # second modal on the one already asking this question" is dispatch, not policy.
+    # The one-time migration onto the nine-slot bar, run at boot before anything reads
+    # `Settings.tab_prefs`. Returns the notice to show, or nil when there is nothing to say.
+    #
+    # Three cases, and the middle one is why this is not just "let reconcile truncate":
+    #
+    #   • no saved prefs, or a bar that already fits → nothing happens; a fresh install simply
+    #     gets DEFAULT_HIDDEN's nine.
+    #   • prefs that are EXACTLY the pre-slots factory default → the owner never chose those
+    #     fifteen tabs, so truncating by position would hand them Project…JWT: neither the bar
+    #     they had nor the one we now ship. They get the new default instead, silently, which
+    #     is what "I never touched this" should mean.
+    #   • anything else → CUSTOMISED. Their first nine stay, in their own order, because that
+    #     order is what their fingers learned; the rest fold behind `0` and are NAMED in a
+    #     toast, because a tab vanishing off the bar with no explanation is the failure this
+    #     whole migration has to avoid.
+    #
+    # The truncated list is persisted either way, so the check fails next launch and the
+    # notice fires exactly once. A save that fails is not fatal — the notice would simply
+    # repeat, which beats refusing to start.
+    #
+    # A class method, not an instance one, for the same reason `quit_decision` is: it is a
+    # policy over Settings with no terminal behind it, and `Runner.new` owns a terminal.
+    # `prefs` is the layout to settle, defaulting to the persisted one; it is a parameter only
+    # so a spec can hand one in without writing the singleton first.
+    def self.settle_tab_slots(prefs : Array({String, Bool}) = Settings.tab_prefs) : String?
+      return nil unless Settings.tab_slots?
+      return nil if prefs.empty? # fresh install → the factory nine, nothing moved
+      uncapped = Chrome.reconcile(prefs, capped: false)
+      visible = uncapped.select { |(_, _, v)| v }
+      return nil if visible.size <= Chrome::MAX_SLOTS
+      if Chrome.legacy_default?(uncapped)
+        # Never customised: drop the saved copy entirely rather than writing today's defaults
+        # out, so the NEXT tab gori adds lands by DEFAULT_HIDDEN instead of being pinned
+        # visible by a config this migration froze.
+        Settings.tab_prefs = [] of {String, Bool}
+        Settings.save
+        return nil
+      end
+      folded = visible[Chrome::MAX_SLOTS..].map { |(_, label, _)| label }
+      Settings.tab_prefs = Chrome.reconcile(prefs).map { |(sym, _, vis)| {sym.to_s, vis} }
+      Settings.save
+      "#{folded.size} #{folded.size == 1 ? "tab" : "tabs"} moved behind 0 " \
+      "(#{folded.join(", ")}) — settings:tabs picks your nine"
+    end
+
     def self.quit_decision(confirm_setting : Bool, *, chord : Bool, armed : Bool,
                            notes_conflict : Bool = false) : QuitAction
       return QuitAction::Confirm if confirm_setting
@@ -3102,7 +3751,7 @@ module Gori::Tui
     # modal by this. The invariant is worth keeping true: an overlay added later that swallows
     # esc would, for the first time, be able to hold the quit chord hostage.
     #
-    # SCOPE — deliberately the `active_overlay` seam and nothing else. The Palette, the ⋯
+    # SCOPE — deliberately the `active_overlay` seam and nothing else. The Palette, the
     # dropdown (MODAL_OVERLAYS, no Overlay object) and the prompt-tier strips (space menu,
     # copy-as, send-to, ^G goto, ^F find, rename, tag-edit) keep the old behaviour: none of
     # them has anything that could answer for the chord, so yielding there would only make ^D
@@ -3145,13 +3794,44 @@ module Gori::Tui
       @notifications.push(:error, message, source: "toast") if kind == :error
     end
 
+    # The palette lists the focused tab's actions from the context captured HERE, before it
+    # takes @overlay (#1282): availability lambdas read state the palette's own overlay would
+    # change — an open History detail answers `@overlay.detail?` only while nothing sits on top
+    # of it — so they are evaluated once, against the tab as it was when ^P was pressed.
     def open_palette : Nil
+      @palette.capture(action_context, self)
+      @palette_return = Runner.palette_return(@overlay)
       @overlay = OverlayKind::Palette
       @palette.reset(self)
     end
 
+    # The overlay the open palette replaced, put back when it closes.
+    @palette_return = OverlayKind::None
+
+    # Where closing the palette lands, given the overlay it was opened over. An open History
+    # detail comes back: esc from ^P returns to the flow you were reading, and a verb chosen
+    # there runs against that flow — the same state its chord would have run in (P1). Before
+    # #1282 every close dropped to the bare list, which only Global verbs could survive.
+    # Anything else lands on the bare body, as before.
+    def self.palette_return(displaced : OverlayKind) : OverlayKind
+      displaced.detail? ? OverlayKind::Detail : OverlayKind::None
+    end
+
     def close_overlay : Nil
-      @overlay = OverlayKind::None
+      @overlay = @overlay.palette? ? @palette_return : OverlayKind::None
+      @palette_return = OverlayKind::None
+    end
+
+    # Close the palette, then run its pick with the state restored. A tab row was listed
+    # against the state ^P was pressed in, so it is re-checked here, in the state it will run
+    # in, rather than trusted; a Global row keeps its own listing (same as before #1282).
+    private def run_palette_verb(verb : Verb::Definition) : Nil
+      close_overlay
+      if @palette.tab_verb?(verb) && !verb.available?(self)
+        @toast = "#{verb.title}: not available here any more"
+        return
+      end
+      @toast = verb.call(self) || @toast
     end
 
     # Emergency full repaint (palette-only). `@resized` routes the next flush through the
@@ -3167,7 +3847,8 @@ module Gori::Tui
     def toggle_companion : Nil
       Settings.companion = !Settings.companion?
       saved = Settings.save
-      @companion.wake_on_input
+      # `false`: a settings write is not the operator reading a held reply (see #apply_companion).
+      @companion.wake_on_input(false)
       # The toggle has ALREADY applied in memory either way, so a failed save must still
       # report the new state — "could not save" alone reads as though nothing happened.
       # Same shape as the tabs/hotkeys/env/hosts toasts.
@@ -3206,6 +3887,7 @@ module Gori::Tui
     # view_focus_first (which would reload/reset). For ^R/^N-style "open this and land
     # in it" jumps that manage their own view state.
     def goto_tab(tab : Symbol) : Nil
+      return unavailable_evidence_tab if tab == :evidence && !@evidence_available
       flush_active_tab_edits # cross-tab "open this and land in it" jumps must persist the outgoing edit too
       @active_tab = tab
       @focus = :body
@@ -3284,12 +3966,48 @@ module Gori::Tui
     # Open the notification center (the app.notifications verb + the clickable top-bar
     # badge). Marks everything read, clearing the unread badge.
     def open_notifications : Nil
+      open_notifications_at(nil)
+    end
+
+    # `anchor` is the id of the note the centre puts its cursor on, instead of the newest.
+    # Only the detail card passes one: it hands the operator back to the row they opened it
+    # from, which a fresh overlay would otherwise miss whenever a drain landed while the card
+    # was up. The verb, the badge and the chip want the newest, so they pass nil.
+    private def open_notifications_at(anchor : Int32?) : Nil
       ov = NotificationsOverlay.new(@notifications)
+      ov.anchor_to(anchor) if anchor
+      # ↵ on a row means "open this one", and what that opens depends on what the note
+      # carries. A note with a `detail` (#1090) has a long form the 60-column row could only
+      # clip, so it raises the detail card; a note with only a `goto` still jumps.
+      #
+      # The card is raised from on_close, not from here — Runner#confirm's rule. The shell
+      # runs `commit` BEFORE it drops this modal, so a card opened here would be overwritten
+      # by the close that follows it. So the commit only RECORDS which note to open, and
+      # on_close — which runs after the drop — is what raises it.
+      detail_note = nil.as(Notifications::Note?)
+      # …and an agent's open question (#1324) raises its answer card the same way, from
+      # on_close, carrying the row's id so the card hands the operator back to it.
+      question = nil.as({Gori::AgentQuestion, Int32}?)
       # The jump itself lands on the target tab, and focus_tab already clears @overlay —
       # so the shell's close-on-commit is a no-op after it, not a second dismissal.
       ov.on_commit = -> {
-        run_goto(ov.selected_note.try(&.goto))
+        note = ov.selected_note
+        if note && (q = answerable_question_for(note))
+          question = {q, note.id}
+        elsif note && note.detail
+          detail_note = note
+        else
+          run_goto(note.try(&.goto))
+        end
         true
+      }
+      ov.on_close = -> {
+        if asked = question
+          open_question_card(asked[0], from_ring: asked[1])
+        elsif note = detail_note
+          open_note_detail(note, from_ring: true)
+        end
+        nil
       }
       # Close BEFORE raising the palette: the reverse order would drop @active_overlay on
       # top of the modal we just opened.
@@ -3299,6 +4017,21 @@ module Gori::Tui
       ov.on_palette = -> { leave_overlay; open_palette }
       open_overlay(ov)
       @notifications.mark_all_read
+      mark_agent_replies_seen
+    end
+
+    # One notification's long form (#1090), opened with ↵ on a ring row that carries a
+    # `detail`. Read-only, so there is no on_commit.
+    #
+    # `from_ring` is what decides whether esc lands back in the notification center: the
+    # card pops back only when the ring is where it came from, so a later open-site (a
+    # toast's "read it", the Activity pane) does not conjure a modal the operator never
+    # opened. Raising it from `on_close` is the same ordering rule the open-site above
+    # states — the shell has dropped the previous modal by the time this runs.
+    private def open_note_detail(note : Notifications::Note, *, from_ring : Bool = false) : Nil
+      ov = NoteDetailOverlay.new(note)
+      ov.on_close = -> { open_notifications_at(note.id) } if from_ring
+      open_overlay(ov)
     end
 
     # Open the TLS-passthrough list (the `bypass:N` top-bar chip + the app.passthrough verb).
@@ -3344,7 +4077,7 @@ module Gori::Tui
       borrowed = !Settings.mouse
       @term.enable_mouse if borrowed
       begin
-        Tutorial.new(@term).run
+        Tutorial.new(@term, Tutorial::Handoff::Session, @session.registry).run
       ensure
         @term.disable_mouse if borrowed
       end
@@ -3381,7 +4114,20 @@ module Gori::Tui
         # QL plus this surface's own `tag:`, which never reaches the parser (FilterAst.partition
         # pulls it out first) and so cannot come from QL's table.
         HelpPopupOverlay.query_reference("SITEMAP FILTER",
-          HelpView.query_rows(["tag"] + QL::FIELDS, SitemapView::QL_HELP))
+          HelpView.query_rows(["tag"] + QL::FIELDS, SitemapView.ql_help(@session.registry)))
+      when :issues
+        # Five fields, none of them QL's. Without this arm `?` fell through to the generic
+        # reference below — the full QL vocabulary, of which `Issues::Filter` implements two
+        # names and reads one of those (`status:`) as something else entirely.
+        HelpPopupOverlay.query_reference("ISSUES FILTER",
+          HelpView.query_rows(Issues::Filter::HINT_FIELDS, Issues::Filter::FIELD_HELP_PROC,
+            Issues::Filter::ALSO_ACCEPTED, Issues::Filter::SYNTAX_HELP,
+            Issues::Filter::CAVEATS, regex: false))
+      when :probe
+        HelpPopupOverlay.query_reference("PROBE FILTER",
+          HelpView.query_rows(Probe::Filter::HINT_FIELDS, Probe::Filter::FIELD_HELP_PROC,
+            Probe::Filter::ALSO_ACCEPTED, Probe::Filter::SYNTAX_HELP,
+            Probe::Filter::CAVEATS, regex: false))
       else
         HelpPopupOverlay.query_reference
       end
@@ -3430,6 +4176,26 @@ module Gori::Tui
       @session.listener_rows.size
     end
 
+    # What the open-time token-grammar reconcile did to this project, on the channel the operator is
+    # actually watching (#env.syntax).
+    #
+    # The SAME three surfaces a peer notice uses, for the same reason: the ring always (this is the
+    # answer to "why do my drafts read `$ENV.KEY` now?", asked a minute later), the bottom-bar toast
+    # so it is seen at all, and the ACTIVITY feed — which the migration itself wrote through
+    # `ConfigLog`, because the feed's question is "what happened to this project" and this is the
+    # largest single edit gori ever makes to one unasked.
+    #
+    # `:warn`, deliberately: the bytes in this operator's Repeater tabs changed, and `:info` takes
+    # neither the bell nor the toast (`Notifications#push`). The toast yields to a bind failure
+    # already on screen — capture being off is the more urgent of the two — but the ring keeps both.
+    private def announce_env_syntax_migration : Nil
+      lines = @session.env_syntax_migration.try(&.notices) || [] of String
+      Settings.take_env_syntax_global_migration.try { |g| lines << g.line }
+      return if lines.empty?
+      lines.each { |line| @notifications.push(:warn, line, goto: Jobs::Goto.new(:project)) }
+      @toast ||= lines.first
+    end
+
     # Peer-change announcements (#772). The policy — which peer change is worth a line, at what
     # level, and in what words — lives in `Gori::PeerNotices` so the headless capture loop can say
     # the same thing; this end only queues and emits.
@@ -3446,8 +4212,32 @@ module Gori::Tui
     #
     # `:info` notes take neither the toast nor the bell (Notifications#push rings only above
     # `:info`): a peer STOPPING active probing is worth a line in the centre and nothing louder.
+    # A peer's token-grammar switch, adopted + re-spelled + announced on this session's own
+    # channels. One call site per seam that could notice it: the peer tick below, and the two
+    # env-section writes (`save_env`, the Project ENV pane's prefix commit) whose SAVE would
+    # otherwise carry a stale grammar back over the switch.
+    #
+    # Answers whether anything was said, so the tick can mark the frame dirty.
+    private def follow_env_syntax : Bool
+      lines = EnvSyntaxSeam.follow(@session)
+      return false if lines.empty?
+      @toast ||= EnvSyntaxSeam.announce(lines, @notifications)
+      true
+    end
+
     private def drain_peer_notices : Bool
       now = Time.instant
+      # A peer's GRAMMAR switch is a peer change like any other, and the loudest one available: it
+      # rewrites stored bytes in this project. Taken on the same cadence, ahead of the rule/binding
+      # deltas, so the editors and the database agree before anything else in this pass reads them.
+      dirty = follow_env_syntax
+      # Then the global `$ENV.KEY` table and `$GEN.USER_AGENT` corpus, which every send here
+      # expands and which settings.json is the only home of — so a token a peer rotated or deleted
+      # (`gori settings import`, a second TUI) stops going out without a restart (#1217, #1218).
+      # After the grammar, which `reload_env_from_disk` leaves to `follow_env_syntax`. A `stat`
+      # when the file has not moved; the Env card edits its own working copy, not these.
+      Settings.reload_env_from_disk
+      Settings.reload_user_agents_from_disk
       # The rule sets hold their own peer delta rather than returning it, so a re-read cannot eat
       # it — the Rewriter tab's `on_enter` and its `r` key both reload, and a peer's change picked
       # up by one of those is still owed a line. Taking here, on the bare cadence, is what makes
@@ -3462,7 +4252,7 @@ module Gori::Tui
       if note = @peer_notices.flush(now)
         @peer_notices_pending.unshift(note)
       end
-      return false if @peer_notices_pending.empty?
+      return dirty if @peer_notices_pending.empty?
       @peer_notices_pending.each do |note|
         goto = note.tab.try { |tab| Jobs::Goto.new(tab) }
         @notifications.push(note.level, note.message, goto: goto, source: note.source)
@@ -3506,6 +4296,27 @@ module Gori::Tui
       true
     end
 
+    # Say on screen that a client refused gori's certificate. Otherwise the only trace is
+    # `Tunnel#notice_handshake_failure`'s `::Log.warn`, which under `gori tui` lands in
+    # `~/.gori/gori.log`: a beginner who just pointed a browser at gori saw an empty History and
+    # no reason. Once per `host:port` (the tunnel's own dedup), with the remedy.
+    private def drain_untrusted_handshakes : Bool
+      hosts = @session.tunnel.drain_untrusted_handshakes
+      return false if hosts.empty?
+      remedy = "Install it from http://gori.proxy/ (or #{Tutorial.reach(@session.registry, "ca.export")})"
+      hosts.each do |hp|
+        msg = "HTTPS to #{hp} failed — the client doesn't trust gori's CA. #{remedy}"
+        @notifications.push(:warn, msg, source: "app")
+        # A toast for the FIRST one only: as the system proxy, every cert-pinning OS service
+        # fails here too, and a toast per host would own the status line. The badge counts the rest.
+        next if @untrusted_toasted || !Settings.notify_toast?
+        @untrusted_toasted = true
+        # Short enough for an 80-column status line to keep the remedy; the notification has the rest.
+        status("HTTPS failed: trust gori's CA from http://gori.proxy/ (#{hp})")
+      end
+      true
+    end
+
     private def run_goto(g : Jobs::Goto?) : Nil
       return unless g
       switch_tab(g.tab)
@@ -3514,14 +4325,17 @@ module Gori::Tui
       end
     end
 
-    # Open the space action menu scoped to the CURRENT focus area. current_scope is
-    # read BEFORE flipping @space_menu_open (which is orthogonal to @overlay) so the
-    # scope reflects where space was pressed — the History list → Body, an open
-    # detail → HistoryDetail, the Repeater response → Repeater, the tab bar → Sidebar.
+    # Open the space action menu for the CURRENT focus area. `action_context` is read BEFORE
+    # flipping @space_menu_open (which is orthogonal to @overlay), so it reflects where space
+    # was pressed — the History list → Body, an open detail → HistoryDetail, the Repeater
+    # response → Repeater. On the tab bar it is the TAB's scope (COMMON or its `:tab` rows),
+    # while the bar's own bare keys still resolve Sidebar → Global (`current_scope`), so a
+    # dropped space there reaches Global, not the row (the R1 guard's tab-bar sweep).
     def open_space_menu : Nil
-      scope, section = space_menu_context
+      here = action_context
+      @space_menu_here = here # what a sticky family re-opens against (#run_space_verb)
       # captures the scope+section + populates entries
-      @space_menu.open(scope, section, self, banner: space_menu_banner)
+      @space_menu.open(here.scope, here.section, self, banner: here.banner, subtabs: here.subtabs)
       # Don't open an empty popup: some focus areas (the tab bar, an open detail)
       # have only hidden nav verbs, so the entry list is empty. Opening there would
       # trap input behind an empty box — keep space a no-op (with a hint) instead.
@@ -3540,8 +4354,19 @@ module Gori::Tui
       @space_menu_open = true
     end
 
+    # A family's card straight from the tab (`Verb::Family#chord`, the bare `>` of Send flow
+    # to…, #1295): the menu opened exactly as `space` opens it, then descended as the family
+    # row's key descends — so the bare key and `space >` are one path and one card. Where the
+    # view draws no row for the family, level 1 stays up rather than nothing happening.
+    def open_space_family(family : Symbol) : Nil
+      return unless f = @session.registry.family(family)
+      open_space_menu
+      @space_menu.descend(f) if @space_menu_open
+    end
+
     private def close_space_menu : Nil
       @space_menu_open = false
+      @space_menu_here = nil
     end
 
     private def open_goto(target : Symbol) : Nil
@@ -3581,10 +4406,12 @@ module Gori::Tui
       end
     end
 
-    # `r` (no modifiers) on a renameable sub-tab strip opens the rename prompt. Factored
-    # out of handle_subtabs_key's case so its conditions don't inflate that method.
+    # `e` (no modifiers) on a renameable sub-tab strip opens the rename prompt: the menu's
+    # Rename letter on all nine strips, so `e` renames whichever way it is reached (#1295).
+    # It was `r`, which the menu spends on Send/Run in four of those tabs. Factored out of
+    # handle_subtabs_key's case so its conditions don't inflate that method.
     private def rename_chord?(ev : Termisu::Event::Key) : Bool
-      renameable_subtabs? && ev.key.lower_r? && !ev.ctrl? && !ev.alt?
+      renameable_subtabs? && ev.key.lower_e? && !ev.ctrl? && !ev.alt?
     end
 
     # The tabs whose sub-tab chips carry a custom name (Repeater + Fuzzer + Decoder + Miner + Comparer).
@@ -3699,9 +4526,9 @@ module Gori::Tui
       tagged = @tag_views.count { |v| repeater_controller.apply_tags(v, raw) }
       return unless @tag_views.size > 1
       @toast = if tagged == @tag_views.size
-                 "tagged #{plural(tagged, "sub-tab")}"
+                 "tagged #{Gori.plural(tagged, "sub-tab")}"
                else
-                 "tagged #{tagged} of #{plural(@tag_views.size, "sub-tab")} (the rest were closed meanwhile)"
+                 "tagged #{tagged} of #{Gori.plural(@tag_views.size, "sub-tab")} (the rest were closed meanwhile)"
                end
     end
 
@@ -3721,10 +4548,69 @@ module Gori::Tui
 
     # --- Import path popup (palette → import.har/urls/oas/postman/insomnia/burp/wsdl) ---
 
-    private def open_import(kind : Symbol) : Nil
+    def open_import(kind : Symbol) : Nil
       ov = ImportOverlay.new(kind)
       ov.on_commit = -> { submit_import(ov) }
       open_overlay(ov)
+    end
+
+    # --- curl paste box (Repeater → Paste cURL, palette → Import: cURL), #1244 ---
+
+    private def open_curl_paste(mode : Symbol) : Nil
+      ov = CurlPasteOverlay.new(mode)
+      ov.pasting = -> { @paste_newline.pasting? }
+      ov.on_commit = -> { mode == :history ? import_curl_paste(ov.text) : open_curl_paste_tabs(ov.text) }
+      open_overlay(ov)
+    end
+
+    # One Repeater sub-tab per request, capped like every batch open. Any refusal keeps the
+    # card up with the text intact (false), so a fix is an edit rather than a re-paste.
+    private def open_curl_paste_tabs(text : String) : Bool
+      parsed = begin
+        Import::Curl.parse(text)
+      rescue ex : Gori::Error
+        return curl_paste_refused(ex.message)
+      end
+      return curl_paste_refused(parsed.skipped.first) unless parsed.skipped.empty?
+      reqs = parsed.requests
+      return curl_paste_refused("the curl command names no URL") if reqs.empty?
+      if reqs.size > BATCH_SUBTAB_CAP
+        return curl_paste_refused("#{reqs.size} requests is over the #{BATCH_SUBTAB_CAP}-tab cap — use Import: cURL to put them in History")
+      end
+      reqs.each { |req| repeater_controller.repeater_from_request(req.origin, req.text, req.http2?, nil) }
+      notes = (parsed.notes + reqs.flat_map(&.notes)).uniq
+      opened = reqs.size == 1 ? "#{reqs.first.method} #{reqs.first.url}" : "#{reqs.size} sub-tabs"
+      status("repeater: opened #{opened} from curl#{curl_notes_tail(notes)} · ^R send", :done)
+      true
+    end
+
+    # Straight into History: a paste is a handful of requests, so it is written in place
+    # rather than through the file importer's background job.
+    private def import_curl_paste(text : String) : Bool
+      result = begin
+        Import.import_curl_text(@session.store, text, Gori::FlowSource::Surface::Tui, "curl (pasted)")
+      rescue ex : Gori::Error
+        return curl_paste_refused(ex.message)
+      end
+      sitemap_controller.reload
+      count = result.count
+      msg = "imported #{Gori.plural(count, "flow")} from cURL"
+      msg += " (#{result.skipped} refused)" if result.skipped > 0
+      result.shortfall_note.try { |note| msg += " — #{note}" }
+      status("#{msg}#{curl_notes_tail(result.notes)}", :done)
+      true
+    end
+
+    private def curl_paste_refused(why : String?) : Bool
+      status("curl: #{why || "not a usable curl command"}", :error)
+      false
+    end
+
+    # The first note in full (usually the ignored transport flags), and how many more.
+    private def curl_notes_tail(notes : Array(String)) : String
+      first = notes.first? || return ""
+      more = notes.size > 1 ? " (+#{notes.size - 1} more)" : ""
+      " — #{first}#{more}"
     end
 
     # The ImportOverlay commit closure. Returns true so the SHELL closes the card — no
@@ -3813,14 +4699,16 @@ module Gori::Tui
       sitemap_controller.reload
       count = result.count
       msg = if @import_cancel
-              "import cancelled — #{count} flow#{count == 1 ? "" : "s"} from #{ev.label} were written before the stop"
+              "import cancelled — #{Gori.plural(count, "flow")} from #{ev.label} were written before the stop"
             else
-              "imported #{count} flow#{count == 1 ? "" : "s"} from #{ev.label} · #{ev.path}"
+              "imported #{Gori.plural(count, "flow")} from #{ev.label} · #{ev.path}"
             end
       msg += " (#{result.skipped} entries skipped)" if result.skipped > 0
       # The import is chunked, so a partial write is possible — say so rather than letting a
       # short count read as a successful import of a smaller file (see Import::Result).
       result.shortfall_note.try { |note| msg += " — #{note}" } unless @import_cancel
+      # What the import could not carry, or that it duplicated an earlier one (`Import::Result`).
+      msg += curl_notes_tail(result.notes)
       @jobs.finish(ev.job, @import_cancel ? :stopped : :done, "#{count} flows")
       status(msg, :done)
     end
@@ -3917,7 +4805,7 @@ module Gori::Tui
       decoder_controller.commit if @active_tab == :decoder && @focus == :body && pane != :body
       notes_controller.save_notes if @active_tab == :notes && @focus == :body && pane != :body
       @focus = pane
-      @menu_more = false # any focus change lands on a real tab, not the ⋯ affordance
+      @menu_more = false # any focus change lands on a real tab, not the `0:Tabs` stop
       # Unconditional, INCLUDING pane == :subtabs. This is what keeps entering a tab landing
       # on chip 1: `enter_content` descends through here, so the strip is always entered at
       # a session, never at the ⌕ affordance. Reaching the affordance is always a deliberate
@@ -3928,13 +4816,13 @@ module Gori::Tui
     end
 
     # Descend from the tab menu (↓/↵/j on the tab bar). When focus is on the far-right
-    # ⋯ "more" affordance, ↓/↵ EXPANDS the hidden-tabs dropdown instead. Otherwise: tabs
+    # far-right `0:Tabs` stop, ↓/↵ opens the Go-to picker instead. Otherwise: tabs
     # with a navigable sub-tab strip (Repeater/Notes/Decoder) land on the STRIP first so
     # ←/→ can switch sub-tabs; ↓/↵ again drops into the editor. Other tabs go straight to
     # the body. (`focus_pane`'s guard would otherwise route an absent strip to the menu,
     # so the active tab is checked here.)
     def enter_content : Nil
-      return open_more_menu if @menu_more
+      return open_tab_goto if @menu_more
       focus_pane(subtabs_shown? ? :subtabs : :body)
     end
 
@@ -3958,6 +4846,7 @@ module Gori::Tui
     end
 
     def focus_tab(tab : Symbol, focus : Symbol = :body) : Nil
+      return unavailable_evidence_tab if tab == :evidence && !@evidence_available
       flush_active_tab_edits
       @active_tab = tab
       @focus = focus
@@ -3968,19 +4857,47 @@ module Gori::Tui
       view_focus_resume
     end
 
-    # The effective tab strip — the configured order/visibility (settings:tabs), with the
-    # active tab force-included even if hidden (so a cross-tab jump to a hidden tab still
-    # renders + highlights). The single source the menu render, click hit-test, and nav read.
-    private def effective_tabs : Array({Symbol, String})
-      Chrome.visible_tabs(Settings.tab_prefs, force: @active_tab)
+    # The effective tab bar for this frame: {visible strip, off-bar list, slot count}.
+    #
+    # The strip is the configured order/visibility (settings:tabs, capped at
+    # `Chrome::MAX_SLOTS`) with the active tab force-included even if hidden — so a cross-tab
+    # jump to a hidden tab still renders + highlights. That force-shown tab is APPENDED past
+    # the slots, which is why the count is returned rather than inferred from the strip's
+    # length: it is a temporary tenth tab, drawn without a number, and no digit points at it.
+    #
+    # Evidence is off the bar until the archive holds a snapshot; dropping it here CLOSES the
+    # gap in the numbering rather than leaving a hole, so the digits stay 1..N.
+    #
+    # The single source the menu render, the click hit-test and nav all read.
+    private def effective_bar : {Array({Symbol, String}), Array({Symbol, String}), Int32}
+      vis, hid, slots = Chrome.split_tabs(Settings.tab_prefs, force: @active_tab)
+      return {vis, hid, slots} if @evidence_available
+      hid = hid.reject { |(s, _)| s == :evidence }
+      if i = vis.index { |(s, _)| s == :evidence }
+        vis = vis.dup
+        vis.delete_at(i)
+        slots -= 1 if i < slots
+      end
+      # A saved layout can make Evidence its only visible tab in a populated project, then be
+      # reused in a new/emptied project where Evidence is unavailable. Keep the shell's
+      # visible/navigation ring non-empty in that transition; the tab editor will persist the
+      # correction only if the operator chooses to save it.
+      vis.empty? ? {[{:project, Chrome.tab_label(:project)}], hid, 1} : {vis, hid, slots}
     end
 
-    # Positional number-key target: focus the Nth (1-based) VISIBLE tab — the order shown
-    # on the bar. Out-of-range n (fewer tabs visible than the digit) is a no-op.
+    private def effective_tabs : Array({Symbol, String})
+      effective_bar[0]
+    end
+
+    # Positional number-key target: focus the Nth (1-based) SLOT on the bar. Out-of-range n
+    # (fewer slots filled than the digit) is a no-op, and so is a digit that would land on the
+    # force-shown tab past the ninth slot — the bar paints no number there, so none answers.
     # Lands on the tab bar (TABS level), like a tab-bar click: a number jump selects the
     # tab, it does not drill into the body.
     def focus_visible_tab(n : Int32) : Nil
-      if t = effective_tabs[n - 1]?
+      tabs, _, slots = effective_bar
+      return if n < 1 || n > Chrome.numbered_slots(slots)
+      if t = tabs[n - 1]?
         focus_tab(t[0], focus: :menu)
       end
     end
@@ -4000,13 +4917,21 @@ module Gori::Tui
       view_focus_resume if @focus == :body
     end
 
-    # ←/→ on the tab bar. → past the last visible tab lands on the far-right ⋯ "more"
-    # affordance (when tabs are hidden) rather than wrapping; ← steps back off it onto
+    # ←/→ on the tab bar. → past the last visible tab lands on the far-right `0:Tabs`
+    # affordance rather than wrapping; ← steps back off it onto
     # the last tab. Everywhere else these are plain cycle_tab(±1). (`[`/`]` keep the
-    # from-anywhere wrap via cycle_tab — the ⋯ stop is menu-bar-only.)
+    # from-anywhere wrap via cycle_tab — the `0:Tabs` stop is menu-bar-only.)
     def menu_right : Nil
       return if @menu_more
-      if last_visible_tab? && hidden_tab_count > 0
+      # No `&& hidden_tab_count > 0` guard: the pill is drawn whatever the layout (`0` opens
+      # the whole catalog, not a drawer of leftovers), and a stop you can see but cannot walk
+      # to is worse than no stop.
+      #
+      # The converse — walking to a stop that was NOT drawn — is ruled out by the frame, not
+      # by a check here: `menu_layout` drops the pill only when the menu row is under nine
+      # columns, and `Layout.usable?` has already refused to draw anything under 40×8, which
+      # leaves that row 36. A check would need this key handler to re-derive the row's rect.
+      if last_visible_tab?
         @menu_more = true
       else
         cycle_tab(1)
@@ -4014,7 +4939,7 @@ module Gori::Tui
     end
 
     def menu_left : Nil
-      # ← off the ⋯ affordance steps back onto the bar; otherwise cycle left. The
+      # ← off the `0:Tabs` stop steps back onto the bar; otherwise cycle left. The
       # LEFTMOST tab is a hard stop — no wrap to the far end (mirrors menu_right's
       # no-wrap at the right edge). A stray ← on Project used to jump to the last tab,
       # which was almost always accidental, so the left edge is now inert.
@@ -4025,14 +4950,24 @@ module Gori::Tui
       end
     end
 
-    # The tabs hidden from the bar right now — the ⋯ dropdown's contents. The active tab
-    # is force-shown on the bar, so it's never listed here.
-    private def hidden_tabs_now : Array({Symbol, String})
-      Chrome.hidden_tabs(Settings.tab_prefs, force: @active_tab)
+    private def available_tabs(tabs : Array({Symbol, String})) : Array({Symbol, String})
+      return tabs if @evidence_available
+      tabs.reject { |(sym, _)| sym == :evidence }
     end
 
-    private def hidden_tab_count : Int32
-      hidden_tabs_now.size
+    private def unavailable_evidence_tab : Nil
+      @toast = "freeze evidence on an Issue before opening the Evidence tab"
+    end
+
+    private def refresh_evidence_availability : Nil
+      @evidence_available = @session.store.count_evidence > 0
+      if !@evidence_available && @active_tab == :evidence
+        @active_tab = :issues
+        @focus = :body
+        @overlay = OverlayKind::None
+        on_enter_tab
+        @toast = "Evidence is empty — freeze an Issue link to restore the archive tab"
+      end
     end
 
     private def last_visible_tab? : Bool
@@ -4043,73 +4978,49 @@ module Gori::Tui
       effective_tabs.first?.try(&.first) == @active_tab
     end
 
-    # The anchor the dropdown drops down from — the ⋯ button's cell rect, or (defensively,
-    # on a terminal too narrow to draw the button) a zero-width rect flush with the menu's
-    # right edge, so the dropdown never becomes an invisible-but-input-capturing modal.
-    private def more_anchor_rect(layout : Layout) : Rect
-      Chrome.more_button_rect(layout.menu, hidden_tab_count) ||
-        Rect.new(layout.menu.right, layout.menu.y, 0, 1)
-    end
-
-    # Open the hidden-tabs dropdown from the ⋯ affordance (↵/↓ on it, or a click).
-    # No-op when nothing is hidden. Keeps @menu_more set so a dismiss returns to the ⋯.
-    def open_more_menu : Nil
-      items = hidden_tabs_now
-      return if items.empty?
-      @focus = :menu
-      @menu_more = true
-      @more_menu = MoreMenu.new(items)
-      @overlay = OverlayKind::TabsMore
-    end
-
-    # Dismiss the dropdown back to the ⋯ affordance (esc / ← / click-outside). Focus
-    # stays on the bar with @menu_more set, so ←/→ keep navigating from there.
-    private def close_more_menu : Nil
-      @overlay = OverlayKind::None
-      @more_menu = nil
-    end
-
-    # ↑/↓ (or j/k) move · ↵ switch to the hidden tab (force-shown on the bar, like a
-    # palette "Go to …") · esc/← dismiss back to the ⋯ affordance.
+    # The `0` key: a type-to-filter picker over the WHOLE tab catalog — the nine numbered
+    # slots and everything settings:tabs keeps off the bar. It is also what the `0:Tabs` pill's
+    # click and the bar's far-right stop (↵/↓) open, so the key, the pill and the stop are one
+    # gesture rather than three.
     #
-    # ↑ ON THE FIRST ROW dismisses too, in the same spirit as ←: the dropdown drops DOWN
-    # out of the tab bar, so "up past the top" is a walk back onto the bar. Clamping there
-    # instead (the old behaviour) left ↑ looking dead at the one spot a user is most likely
-    # to press it — the list opens with row 0 already selected.
-    private def handle_more_menu_key(ev : Termisu::Event::Key) : Nil
-      key = ev.key
-      mm = @more_menu
-      return close_more_menu unless mm
-      case
-      when key.escape?, key.left? then close_more_menu
-      when key.up?, key.lower_k?
-        mm.selected == 0 ? close_more_menu : mm.move(-1)
-      when key.down?, key.lower_j? then mm.move(1)
-      when key.enter?, key.space?  then apply_more_menu
+    # This replaced the ⋯ dropdown (`MoreMenu`). Nine slots against a twenty-one tab catalog
+    # means the off-bar list is a DOZEN entries, which is a list you type at: the dropdown had
+    # no filter, could not reach a tab that WAS on the bar, and carried a key table of its own.
+    # One component fewer is part of the point.
+    def open_tab_goto : Nil
+      tabs, off_bar, slots = effective_bar
+      numbered = Chrome.numbered_slots(slots)
+      # Rows come from the BAR, not from the catalog: the strip in its own order (so the digits
+      # read 1, 2, 3 down the card even after ⇧K/⇧J rearranged them) and then everything off
+      # it. The two lists are disjoint and together are the whole catalog, so every tab appears
+      # exactly once — and `effective_bar`'s filtering comes along, which is how Evidence stops
+      # being offered here while the project has no snapshot to open.
+      rows = tabs.map_with_index do |(sym, label), i|
+        TabGotoPicker::Row.new(sym, label, i < numbered ? i + 1 : nil, Chrome.tab_summary(sym))
       end
-    end
-
-    # Switch to the selected hidden tab and drill into its content (like "Go to …").
-    private def apply_more_menu : Nil
-      mm = @more_menu
-      return close_more_menu unless mm
-      if sym = mm.selected_sym
-        close_more_menu
-        focus_tab(sym) # :body — the deliberate pick drills in; force-shows the tab on the bar
-      else
-        close_more_menu
+      # Disjoint in every ordinary layout, but not in ONE: `effective_bar` substitutes a bare
+      # Project strip when an Evidence-only layout lands in a project with no archive, and
+      # Project is in the off-bar list at that moment. A tab listed twice is a tab whose second
+      # row does nothing — cheap to rule out over twenty-one entries.
+      on_bar = tabs.map(&.first)
+      off_bar.each do |(sym, label)|
+        next if on_bar.includes?(sym)
+        rows << TabGotoPicker::Row.new(sym, label, nil, Chrome.tab_summary(sym))
       end
-    end
-
-    private def click_more_menu(layout : Layout, mx : Int32, my : Int32) : Nil
-      mm = @more_menu
-      return close_more_menu unless mm
-      if idx = mm.row_at(more_anchor_rect(layout), layout.body, mx, my)
-        mm.set_selected(idx)
-        apply_more_menu
-      else
-        close_more_menu # click outside the list → dismiss (back to the ⋯ affordance)
+      picker = TabGotoPicker.new(rows)
+      # Opens on the ACTIVE tab, like the sub-tab picker on the active chip: ↵ with no query
+      # stays put, and ↑/↓ walk out from where the operator is standing.
+      if cur = rows.index { |r| r.sym == @active_tab }
+        picker.set_selected(cur)
       end
+      picker.on_commit = -> {
+        if sym = picker.selected_sym
+          focus_tab(sym) # :body — the deliberate pick drills in; force-shows a hidden tab
+        end
+        true
+      }
+      @menu_more = false # the pick lands on a real tab, never back on the pill
+      open_overlay(picker)
     end
 
     # --- unified focus ring (tab-bar ◂▸ body panes) --------------------------
@@ -4117,7 +5028,7 @@ module Gori::Tui
     # Tab (+1) / Shift-Tab (-1) move focus one step around the ring: from the tab
     # bar into the body's first/last pane, between panes, then back to the bar.
     private def focus_advance(dir : Int32) : Nil
-      @menu_more = false # the ring lands on a tab / body pane, never the ⋯ affordance
+      @menu_more = false # the ring lands on a tab / body pane, never the `0:Tabs` stop
       if @focus == :menu
         @focus = :body
         dir > 0 ? view_focus_first : view_focus_last
@@ -4174,8 +5085,8 @@ module Gori::Tui
     end
 
     # The flow a detail.* jump verb was READING when it closed the overlay, held for the rest
-    # of the event that closed it. Those verbs (`detail.repeater`, `.issue`, `.fuzz`, `.mine`,
-    # `.sequence`, `.probe-active`) run `close_detail` first so the overlay does not float over
+    # of the event that closed it. Those verbs (`detail.repeater`, `.fuzz`, `.mine`,
+    # `.sequence`) run `close_detail` first so the overlay does not float over
     # the destination tab — and with `@overlay` already `:none` the two resolvers above and
     # below fell back to the marks (or to a cursor follow mode had moved to the newest capture),
     # sending flows the operator never had on screen. `Runner#close_detail` sets it and
@@ -4200,6 +5111,20 @@ module Gori::Tui
       history_controller.target_flow_ids
     end
 
+    # `Host#detail_pinned_flow_id` — the flow an OPEN History detail pins, for the selection
+    # `HistoryController` publishes (#1091). The ui-state row has to name the flow the keys on
+    # screen would act on, not the marks they would ignore.
+    #
+    # `@overlay.detail?` ALONE, deliberately unlike `history_target_flow_ids` above, which also
+    # honours `@detail_pin`. That pin is an INTRA-EVENT carrier: `close_detail` sets it so the
+    # jump verbs that close first still resolve to the flow they were reading, and `handle_key`
+    # drops it when the NEXT event arrives — which may be minutes later, or never. Reading it
+    # here left the row saying `target_source:"detail"` with one id after the operator pressed
+    # esc and was looking at their four marks again.
+    def detail_pinned_flow_id : Int64?
+      @overlay.detail? ? history_controller.view.detail_flow_id : nil
+    end
+
     # Hard ceiling on batch verbs that spawn a sub-tab or a session per flow (Repeater,
     # Fuzzer, Miner). ⇧T over a filtered list can mark up to HistoryView::PAGE (1000) rows,
     # and "open 1000 sub-tabs?" is a question with no good answer — so refuse above this
@@ -4218,7 +5143,7 @@ module Gori::Tui
     # Shared summary for a continue-and-report batch: "opened 5 · 1 gone" (#442 Q4 — a
     # partial failure reports, it never aborts the rest).
     private def batch_summary(verb : String, done : Int32, total : Int32) : String
-      msg = "#{verb} #{plural(done, "flow")}"
+      msg = "#{verb} #{Gori.plural(done, "flow")}"
       msg += " · #{total - done} no longer available" if done < total
       msg
     end
@@ -4242,13 +5167,33 @@ module Gori::Tui
     #
     # Batch-capable from the History list (#442): the picker is shown ONCE and every marked
     # flow is attached to whatever it lands on. refs is 1-element everywhere else.
+    #
+    # ↵ on an issue also FREEZES each ref's current exchange, in the same transaction as the
+    # link (#1038) — there is no second verb to choose, because choosing was the operator
+    # being asked about an implementation detail at the moment of filing. See
+    # runner/evidence.cr for where the pick lands.
     def link_attach : Nil
       refs = current_link_refs
       return (@toast = "nothing to link") if refs.empty?
       # Persist the notes buffer before listing it: the rows are read off the store, so an
       # unsaved in-progress note would otherwise be missing or stale in the card.
       notes_controller.save_notes
-      lp = LinkPicker.new(link_picker_rows)
+      # The copies are taken NOW, before the card opens: an exchange that changes while the
+      # operator is picking an issue or typing a title is exactly the race a freeze exists to
+      # close. A ref with no exchange comes back carrying its REFUSAL rather than being
+      # dropped — it is still linked, and the toast names why its bytes were not kept.
+      snaps = evidence_snapshots(refs)
+      # `freeze_refusal` is the FIRST refusal the snapshots carry, and it is shown only because
+      # nothing froze: the card's ↵ token degrades from `link & freeze` to `link` on its own,
+      # and that degradation used to be silent — the row landed LIVE and no word on screen said
+      # why. A ref that was never a freeze candidate (fuzz/miner) carries no refusal, so those
+      # keep the plain token they always had.
+      #
+      # `linked:` opens the cursor on `+ New issue…` when nothing has been filed against these
+      # refs yet. Computed HERE because the picker holds no store: it is a flag, not a query.
+      lp = LinkPicker.new(link_picker_rows, freezable: snaps.any?(&.snapshot),
+        freeze_refusal: snaps.any?(&.snapshot) ? nil : snaps.compact_map(&.refusal).first?,
+        linked: refs.any? { |kind, id| @session.store.ref_linked?(kind, id) })
       # Put the History drill-in back on the way out. `open_overlay` overwrites @overlay and
       # closing clears it to None, which would tear down the flow detail the operator is
       # linking FROM — the same restore `confirm(return_to: :detail)` performs for the delete
@@ -4258,7 +5203,7 @@ module Gori::Tui
       if @overlay.detail?
         lp.on_close = -> { @overlay = OverlayKind::Detail }
       end
-      lp.on_commit = -> { link_picked(lp, refs) }
+      lp.on_commit = -> { link_picked(lp, refs, snaps) }
       open_overlay(lp)
     end
 
@@ -4512,13 +5457,10 @@ module Gori::Tui
       @tabs[@active_tab]?.try(&.start_subtab_filter)
     end
 
-    def close_repeater_tab : Nil
-      repeater_controller.close_repeater_tab
-    end
-
     # --- Miner ExecContext / cross-tab mediators ---
 
-    private def open_mine_config(seed : MineSeed?, extra : Array(MineSeed) = [] of MineSeed) : Nil
+    # The popup it opened, or nil when it refused (the toast says why).
+    private def open_mine_config(seed : MineSeed?, extra : Array(MineSeed) = [] of MineSeed) : MineConfigOverlay?
       unless seed
         @toast = "can't mine this request"
         return
@@ -4527,13 +5469,17 @@ module Gori::Tui
         @toast = "no mineable locations for this request"
         return
       end
-      ov = MineConfigOverlay.new(seed, extra)
+      ov = MineConfigOverlay.new(seed, extra, macro_session_choices)
       # Start commits: require ≥1 location (keep the form up otherwise), then kick off the
       # BACKGROUND mine and stay where we are. This popup IS the gate for the batch case —
       # its header names the flow count, so N sessions are never a surprise (P4).
       ov.on_commit = -> {
         if ov.any_checked?
-          status("mine prefs applied — could not save to #{Settings.path}", :error) unless ov.save_prefs
+          saved = ov.save_prefs
+          # Start does not wait on the inventory scan: it ends here, and the run tests the
+          # wordlist alone. Said below, so an unseeded run is not taken for a seeded one.
+          unseeded = ov.seeding?
+          miner_controller.cancel_seed_scan
           miner_controller.start_session(ov.seed, ov.build_config)
           started = 1
           ov.extra_seeds.each do |s|
@@ -4542,11 +5488,20 @@ module Gori::Tui
             # on a marked GET. build_config returns a fresh Config each call.
             cfg = ov.build_config
             cfg.locations = cfg.locations & s.applicable
+            cfg.seed_names = s.names # its own endpoint's neighbours, not the first seed's
             next if cfg.locations.empty?
             miner_controller.start_session(s, cfg)
             started += 1
           end
-          @toast = "mining #{started} flows in the background" unless ov.extra_seeds.empty?
+          # One message, most important first: a failed save is an error the operator must
+          # see, so neither of the others may replace it.
+          if !saved
+            status("mine prefs applied — could not save to #{Settings.path}", :error)
+          elsif !ov.extra_seeds.empty?
+            @toast = "mining #{started} flows in the background#{unseeded ? " — inventory scan unfinished, no names seeded" : ""}"
+          elsif unseeded
+            @toast = "inventory scan unfinished — mining without its names"
+          end
           true
         else
           @toast = "select at least one location to mine"
@@ -4554,6 +5509,18 @@ module Gori::Tui
         end
       }
       open_overlay(ov)
+      ov
+    end
+
+    # The project's saved Repeater sessions as `{id, label}`, for the Miner overlay's macro step
+    # cycler (#1350). The label is the tab's name, or `METHOD path` — the same words the
+    # refresh steps and every macro message use (`SessionRefresh.step_label`). One small read of
+    # request-side rows when the popup opens; a store that cannot answer leaves the row saying
+    # there is nothing to pick.
+    private def macro_session_choices : Array({Int64, String})
+      @session.store.repeaters_mcp.map { |r| {r.id, SessionRefresh.step_label(r)} }
+    rescue
+      [] of {Int64, String}
     end
 
     # --- Sequencer ExecContext / cross-tab mediators ---
@@ -4562,6 +5529,9 @@ module Gori::Tui
     # the same overlay; Start applies to the OPEN session — that "apply to current" is the
     # injected commit, so no shell flag distinguishes it from a new-session open.
     def reconfigure_sequence : Nil
+      if why = sequencer_controller.reconfigure_blocked_reason
+        return (@toast = why)
+      end
       seed = sequencer_controller.build_seed_from_current
       return (@toast = "manual sessions have no token descriptor to configure") unless seed
       ov = SequenceConfigOverlay.new(seed)
@@ -4711,10 +5681,16 @@ module Gori::Tui
     # The form asks for its live match preview through on_preview (it decides WHEN — only
     # when a match-relevant field actually changed).
     def open_rewriter_rule_editor(rule : Store::MatchRule?) : Nil
-      ov = rule ? RewriterRuleOverlay.editing(rule) : RewriterRuleOverlay.adding
+      open_rewriter_rule_form(rule ? RewriterRuleOverlay.editing(rule) : RewriterRuleOverlay.adding)
+    end
+
+    # The wiring every Rewriter rule form gets, whoever opened it — the tab's add/edit, or
+    # History's "Mock this response" with a prefilled draft (#1237).
+    def open_rewriter_rule_form(ov : RewriterRuleOverlay) : Nil
       ov.on_preview = ->rewriter_preview_text(Store::MatchRule)
       ov.on_commit = -> { rewriter_controller.apply_rewriter_rule(ov) }
       ov.on_edit_stub = -> { open_rewriter_stub_editor(ov) }
+      ov.on_edit_options = -> { open_rewriter_respond_editor(ov) }
       open_overlay(ov)
     end
 
@@ -4765,11 +5741,10 @@ module Gori::Tui
     # Bounded so a keystroke stays responsive; nothing is written.
     private def colormarker_preview_text(candidate : Store::ColorRule) : String
       engine = @session.colormarker
-      # Only the rules AHEAD of this one can claim a row from it. For a new rule that is every
-      # enabled rule; for an edit it is the ones above it in precedence order.
-      rules = engine.rules
-      idx = rules.index { |r| r.id == candidate.id && r.scope == candidate.scope }
-      ahead = idx ? rules[0, idx] : rules
+      # Only the rules AHEAD of this one can claim a row from it: for an edit, the ones above
+      # it in precedence order; for a rule that does not exist yet, the ones that would be —
+      # which is NOT the whole list when the scope row says global. See `Colormarker.rules_ahead`.
+      ahead = Colormarker.rules_ahead(engine.rules, candidate.id, candidate.scope)
       pv = Colormarker.preview(@session.store, candidate.match_filter, ahead, 200)
       more = pv.total > pv.scanned ? " (of #{pv.total})" : ""
       claimed = pv.matched - pv.painted
@@ -4804,6 +5779,18 @@ module Gori::Tui
         false
       }
       open_overlay(sov)
+    end
+
+    # --- short-circuit answer options (opened from the rule form's `options:` row, #1237) ---
+    # The same sub-editor seam as the stub editor above.
+    private def open_rewriter_respond_editor(form : RewriterRuleOverlay) : Nil
+      rov = RewriterRespondOverlay.new(form.respond, form.fault_kind, form.options)
+      rov.on_commit = -> {
+        form.options = rov.args
+        open_overlay(form)
+        false
+      }
+      open_overlay(rov)
     end
 
     # The "N of M recent flows" line under the Rewriter form. Bounded so a keystroke stays
@@ -4889,6 +5876,19 @@ module Gori::Tui
       open_overlay(ov)
     end
 
+    # --- shell (a terminal proxied through gori, trusting its CA — #1238) ---
+
+    # The two ways to get one: this terminal, handed over until the shell exits, or the export
+    # lines on the clipboard for a pane beside gori (the tmux workflow, and the only one that
+    # keeps the TUI on screen).
+    def open_shell_picker : Nil
+      cp = ChoicePicker.new("OPEN SHELL", [
+        ChoicePicker::Choice.new("OPEN SHELL HERE — gori resumes when it exits", 'o', Theme.accent, 0),
+        ChoicePicker::Choice.new("COPY ENV — export lines for another pane", 'c', Theme.text, 1),
+      ], -1, :shell)
+      open_choice_picker(cp) { |p| p.selected_value == 0 ? open_shell_here : copy_shell_env }
+    end
+
     # --- comparer (diff two arbitrary flows) ---
 
     # The unified Copy verbs whose base title is now plain "Copy" (selection if active,
@@ -4900,8 +5900,35 @@ module Gori::Tui
       notes.copy repeater.copy decoder.copy issue.copy project.copy fuzzer.copy detail.copy
     ]
 
+    # The `S` verbs, which are listed whether or not anything is selected (#F17) and send the
+    # line under the cursor when nothing is. Their registered title names the selection case,
+    # so the MENU says which one this press would be.
+    READ_SEND_VERBS = %w[
+      notes.send-to repeater.send-to decoder.send-to fuzzer.send-to jwt.send-to cookie.send-to
+      issue.send-to project.send-to rewriter.send-to comparer.send-to intercept.send-to
+      oast.send-to probe.send-to sequence.send-to mine.send-to detail.send-to
+    ]
+
+    # The ●/○ (or value) a toggle-family row draws (#1274 WP9). Pretty and whitespace are the
+    # shell's own flags, shared by the History detail and the Repeater, and the hide-static lens
+    # is one project setting for History and the Sitemap; every other toggle belongs to the tab
+    # in front, which answers through `TabController#menu_state`.
+    def menu_state(verb_id : String) : String?
+      case verb_id
+      when "detail.toggle-pretty", "repeater.toggle-pretty"
+        SpaceMenu.on_off(@pretty)
+      when "detail.toggle-ws"
+        SpaceMenu.on_off(@reveal)
+      when "history.toggle-static", "sitemap.toggle-static"
+        SpaceMenu.on_off(history_controller.view.hide_static?)
+      else
+        @tabs[@active_tab]?.try(&.menu_state(verb_id))
+      end
+    end
+
     def space_menu_title(verb_id : String) : String?
       return "Copy selection" if READ_COPY_VERBS.includes?(verb_id) && read_selection_active?
+      return "Send line to…" if READ_SEND_VERBS.includes?(verb_id) && !read_selection_active?
       history_mark_menu_title(verb_id) || intercept_mark_menu_title(verb_id) ||
         sitemap_mark_menu_title(verb_id) || issues_mark_menu_title(verb_id) ||
         subtab_mark_menu_title(verb_id)
@@ -4928,10 +5955,10 @@ module Gori::Tui
     end
 
     # The sub-tab-level verbs that act on every marked chip, on any of the nine strips —
-    # one flat table, because the ids already carry their scope. Two of the nine strips put
-    # their close in `:subtab`, seven in COMMON, and this table does not care which: the
-    # strip's menu shows COMMON ∪ `:subtab`, so both sections are on screen together, which
-    # is exactly why `subtab_mark_menu_count` must gate on the strip having focus.
+    # one flat table, because the ids already carry their scope. All nine now file their close
+    # under `:subtab` (#1055), and the SUB-TABS bucket is on screen from the body panes too —
+    # which is exactly why `subtab_mark_menu_count` must gate on the strip having focus: the
+    # same rows are reachable where every target is the CURSOR's sub-tab, not the marks.
     # "%s" takes the count phrase ("3 sub-tabs").
     SUBTAB_BATCH_TITLES = {
       "repeater.close-subtab"     => "Close %s",
@@ -4974,10 +6001,10 @@ module Gori::Tui
       n = subtab_mark_menu_count
       return nil if n == 0
       if fmt = SUBTAB_BATCH_TITLES[verb_id]?
-        return fmt % plural(n, "sub-tab")
+        return fmt % Gori.plural(n, "sub-tab")
       end
       return "#{@session.registry[verb_id].title} (cursor)" if SUBTAB_CURSOR_ONLY.includes?(verb_id)
-      verb_id.ends_with?(".subtab-mark-clear") ? "Clear #{plural(n, "mark")}" : nil
+      verb_id.ends_with?(".subtab-mark-clear") ? "Clear #{Gori.plural(n, "mark")}" : nil
     end
 
     # How many marks the History LIST menu should speak for; 0 whenever mark titles don't
@@ -5023,12 +6050,12 @@ module Gori::Tui
       n = history_mark_menu_count
       return nil if n == 0
       if fmt = HISTORY_BATCH_TITLES[verb_id]?
-        return fmt % plural(n, "flow")
+        return fmt % Gori.plural(n, "flow")
       end
       return "#{@session.registry[verb_id].title} (cursor)" if HISTORY_CURSOR_ONLY.includes?(verb_id)
       case verb_id
-      when "history.copy"       then "Copy #{plural(n, "URL")}"
-      when "history.mark-clear" then "Clear #{plural(n, "mark")}"
+      when "history.copy"       then "Copy #{Gori.plural(n, "URL")}"
+      when "history.mark-clear" then "Clear #{Gori.plural(n, "mark")}"
         # Only meaningful at exactly 2 — otherwise leave the registered title, which IS what
         # comparer_add_selected falls back to (the next-slot ring on the cursor row).
       when "history.compare" then n == 2 ? "Compare the 2 marked flows" : nil
@@ -5055,9 +6082,9 @@ module Gori::Tui
       n = intercept_mark_menu_count
       return nil if n == 0
       if fmt = INTERCEPT_BATCH_TITLES[verb_id]?
-        return fmt % plural(n, "held message")
+        return fmt % Gori.plural(n, "held message")
       end
-      "Clear #{plural(n, "mark")}" if verb_id == "intercept.mark-clear"
+      "Clear #{Gori.plural(n, "mark")}" if verb_id == "intercept.mark-clear"
     end
 
     # How many marks the SITEMAP menu should speak for; 0 whenever mark titles don't apply
@@ -5073,15 +6100,16 @@ module Gori::Tui
     SITEMAP_BATCH_TITLES = {
       "sitemap.tag"      => "Tag %s",
       "sitemap.repeater" => "Send %s to Repeater",
+      "sitemap.export"   => "Export %s as OpenAPI…",
     }
 
     # Sitemap verbs that stay SINGLE-target even with marks set, and say so in their menu
     # hint. Discover is single by design (one config popup scans one start target under one
     # host — see the multi-host refusal in runner/discover.cr), the Sequencer collects one
-    # endpoint's token, a detail overlay shows one flow, and the scope form edits one
-    # pattern; the rest (query / fold / scope-lens) are selection-independent, so a cursor
-    # note there would be noise.
-    SITEMAP_CURSOR_ONLY = {"sitemap.discover", "sitemap.sequence", "sitemap.open-flow", "sitemap.scope-add"}
+    # endpoint's token, a detail overlay shows one flow, the scope form edits one pattern,
+    # and Params narrows to one row's subtree; the rest (query / fold / scope-lens) are
+    # selection-independent, so a cursor note there would be noise.
+    SITEMAP_CURSOR_ONLY = {"sitemap.discover", "sitemap.sequence", "sitemap.open-flow", "sitemap.scope-add", "sitemap.params"}
 
     # Retitle the Sitemap's menu entries while marks are set, so the menu says what will
     # actually happen — "Tag 3 paths". MUST return nil when nothing is marked, so every
@@ -5090,10 +6118,10 @@ module Gori::Tui
       n = sitemap_mark_menu_count
       return nil if n == 0
       if fmt = SITEMAP_BATCH_TITLES[verb_id]?
-        return fmt % plural(n, "path")
+        return fmt % Gori.plural(n, "path")
       end
       return "#{@session.registry[verb_id].title} (cursor)" if SITEMAP_CURSOR_ONLY.includes?(verb_id)
-      verb_id == "sitemap.mark-clear" ? "Clear #{plural(n, "mark")}" : nil
+      verb_id == "sitemap.mark-clear" ? "Clear #{Gori.plural(n, "mark")}" : nil
     end
 
     # The Issues half of the same rule. Its own table and count, like every other surface's:
@@ -5121,112 +6149,39 @@ module Gori::Tui
       n = issues_mark_menu_count
       return nil if n == 0
       if fmt = ISSUES_BATCH_TITLES[verb_id]?
-        return fmt % plural(n, "issue")
+        return fmt % Gori.plural(n, "issue")
       end
       if note = ISSUES_CURSOR_ONLY[verb_id]?
         return "#{@session.registry[verb_id].title} #{note}"
       end
-      "Clear #{plural(n, "mark")}" if verb_id == "issues.mark-clear"
+      "Clear #{Gori.plural(n, "mark")}" if verb_id == "issues.mark-clear"
     end
 
-    private def plural(n : Int32, noun : String) : String
-      "#{n} #{noun}#{n == 1 ? "" : "s"}"
+    # The tab whose READ-mode selection hooks (`TabController#selection_active?` and friends)
+    # the `read_*` verbs reach. History's selection lives in its detail overlay, so that tab
+    # only counts while the overlay is open.
+    private def read_tab : TabController?
+      return nil if @active_tab == :history && !@overlay.detail?
+      @tabs[@active_tab]?
     end
 
     def read_selection_active? : Bool
-      case @active_tab
-      when :notes     then notes_controller.view.selection?
-      when :repeater  then repeater_controller.repeater_selection_active?
-      when :fuzzer    then fuzzer_controller.fuzzer_selection_active?
-      when :decoder   then decoder_controller.decoder_selection_active?
-      when :jwt       then jwt_controller.jwt_selection_active?
-      when :cookie    then cookie_controller.cookie_selection_active?
-      when :issues    then issues_controller.issues_notes_selection_active?
-      when :project   then project_controller.project_desc_selection_active?
-      when :rewriter  then rewriter_controller.rewriter_selection_active?
-      when :comparer  then comparer_controller.comparer_selection_active?
-      when :intercept then intercept_controller.intercept_preview_selection_active?
-      when :oast      then oast_controller.oast_detail_selection_active?
-      when :probe     then probe_controller.probe_detail_selection_active?
-      when :sequencer then sequencer_controller.sequencer_selection_active?
-      when :miner     then miner_controller.miner_selection_active?
-      when :history
-        @overlay.detail? && history_controller.detail_selection_active?
-      else
-        false
-      end
+      read_tab.try(&.selection_active?) || false
     end
 
     # The focused pane's current selection (or current line) as a string, without the
-    # clipboard write — the payload for "Send selection to". Mirrors
-    # read_selection_active?'s per-@active_tab dispatch, reusing each controller's
-    # *_selection_text getter. "" when the active tab has no selection surface.
+    # clipboard write — the payload for "Send selection to". "" when the active tab has no
+    # selection surface.
     def read_selection_text : String
-      case @active_tab
-      when :notes     then notes_controller.notes_selection_text
-      when :repeater  then repeater_controller.repeater_selection_text
-      when :fuzzer    then fuzzer_controller.fuzzer_selection_text
-      when :decoder   then decoder_controller.decoder_selection_text
-      when :jwt       then jwt_controller.jwt_selection_text
-      when :cookie    then cookie_controller.cookie_selection_text
-      when :issues    then issues_controller.issues_notes_selection_text
-      when :project   then project_controller.project_desc_selection_text
-      when :rewriter  then rewriter_controller.rewriter_selection_text
-      when :comparer  then comparer_controller.comparer_selection_text
-      when :intercept then intercept_controller.intercept_preview_selection_text
-      when :oast      then oast_controller.oast_detail_selection_text
-      when :probe     then probe_controller.probe_detail_selection_text
-      when :sequencer then sequencer_controller.sequencer_selection_text
-      when :miner     then miner_controller.miner_selection_text
-      when :history
-        @overlay.detail? ? history_controller.detail_selection_text : ""
-      else
-        ""
-      end
+      read_tab.try(&.selection_text) || ""
     end
 
     def read_select_line : Nil
-      case @active_tab
-      when :notes     then notes_controller.view.select_line
-      when :repeater  then repeater_controller.repeater_select_line
-      when :fuzzer    then fuzzer_controller.fuzzer_select_line
-      when :decoder   then decoder_controller.decoder_select_line
-      when :jwt       then jwt_controller.jwt_select_line
-      when :cookie    then cookie_controller.cookie_select_line
-      when :issues    then issues_controller.issues_notes_select_line
-      when :project   then project_controller.project_desc_select_line
-      when :rewriter  then rewriter_controller.rewriter_select_line
-      when :comparer  then comparer_controller.comparer_select_line
-      when :intercept then intercept_controller.intercept_preview_select_line
-      when :oast      then oast_controller.oast_detail_select_line
-      when :probe     then probe_controller.probe_detail_select_line
-      when :sequencer then sequencer_controller.sequencer_select_line
-      when :miner     then miner_controller.miner_select_line
-      when :history
-        history_controller.detail_select_line if @overlay.detail?
-      end
+      read_tab.try(&.select_line)
     end
 
     def read_clear_selection : Nil
-      case @active_tab
-      when :notes     then notes_controller.view.clear_selection
-      when :repeater  then repeater_controller.repeater_clear_selection
-      when :fuzzer    then fuzzer_controller.fuzzer_clear_selection
-      when :decoder   then decoder_controller.decoder_clear_selection
-      when :jwt       then jwt_controller.jwt_clear_selection
-      when :cookie    then cookie_controller.cookie_clear_selection
-      when :issues    then issues_controller.issues_notes_clear_selection
-      when :project   then project_controller.project_desc_clear_selection
-      when :rewriter  then rewriter_controller.rewriter_clear_selection
-      when :comparer  then comparer_controller.comparer_clear_selection
-      when :intercept then intercept_controller.intercept_preview_clear_selection
-      when :oast      then oast_controller.oast_detail_clear_selection
-      when :probe     then probe_controller.probe_detail_clear_selection
-      when :sequencer then sequencer_controller.sequencer_clear_selection
-      when :miner     then miner_controller.miner_clear_selection
-      when :history
-        history_controller.detail_clear_selection if @overlay.detail?
-      end
+      read_tab.try(&.clear_selection)
     end
 
     # The unified "Copy" fallback: selection if one is active, else the whole
@@ -5234,10 +6189,20 @@ module Gori::Tui
     # reuses the existing copy delegators — no new copy logic. Wired to each tab's
     # `*.copy` verb (verbs/*.cr) — the *.copy-all verbs are gone.
     def read_copy : Nil
+      # A whole-line selection in an editor copies as LINES for `p` (see `Register`). Asked
+      # before the copy, which may drop the selection; applied only when the copy really
+      # stored something, so a refused copy cannot re-flag an older register.
+      line_copy = (tab = read_edit_tab) && ReadEdit.line_selection?(tab)
+      held = Register.text
+      read_copy_dispatch
+      Register.linewise! if line_copy && !Register.text.same?(held)
+    end
+
+    private def read_copy_dispatch : Nil
       case @active_tab
       when :notes    then read_selection_active? ? notes_copy : notes_copy_all
-      when :repeater then read_selection_active? ? repeater_copy : repeater_copy_all
-      when :fuzzer   then read_selection_active? ? fuzzer_copy : fuzzer_copy_all
+      when :repeater then read_selection_active? ? repeater_controller.copy : repeater_controller.copy_all
+      when :fuzzer   then read_selection_active? ? fuzzer_controller.copy : fuzzer_controller.copy_all
       when :decoder  then read_selection_active? ? decoder_copy_selection : decoder_copy_all
       when :jwt      then jwt_copy
       when :cookie   then cookie_copy
@@ -5263,6 +6228,148 @@ module Gori::Tui
         # selection-vs-whole-pane choice itself (it also words its own toast).
         detail_copy if @overlay.detail?
       end
+    end
+
+    # --- the EDITOR pane seam (Verb::Scope::Editor) ------------------------------
+    # Everything below routes to WHICHEVER controller currently holds an editor pane, the way
+    # read_select_line / read_copy already route the READ-mode half. The shell does not know
+    # which tab that is and does not need to — `TabController#editor_pane?` answers, and the
+    # defaults in tab_controller.cr make every non-editing tab a no-op.
+
+    # Is a text editor pane focused right now? Also the gate that puts `Scope::Editor` at the
+    # head of `resolve_verb_id`'s chain. An open overlay or focus on the tab bar / sub-tab
+    # strip means no: the editor is on screen but the keys are not going to it.
+    def editor_pane? : Bool
+      return false unless @overlay.none? && @focus == :body
+      @tabs[@active_tab]?.try(&.editor_pane?) || false
+    end
+
+    def editor_read_mode? : Bool
+      return false unless @overlay.none? && @focus == :body
+      @tabs[@active_tab]?.try(&.editor_read_mode?) || false
+    end
+
+    def editor_enter_insert : Nil
+      @tabs[@active_tab]?.try(&.editor_enter_insert)
+    end
+
+    def editor_append_insert : Nil
+      @tabs[@active_tab]?.try(&.editor_append_insert)
+    end
+
+    def editor_exit_insert : Nil
+      @tabs[@active_tab]?.try(&.editor_exit_insert)
+    end
+
+    # Says so when the pane has no undo rather than eating the key: READ-mode undo is new
+    # (the nine `^Z` guards are all INS-side), so "u did nothing" would otherwise read as a
+    # broken keyset rather than an empty stack.
+    def editor_undo : Nil
+      status("nothing to undo in this pane") unless @tabs[@active_tab]?.try(&.editor_undo)
+    end
+
+    def editor_to_top : Nil
+      @tabs[@active_tab]?.try(&.editor_to_top)
+    end
+
+    def editor_to_bottom : Nil
+      @tabs[@active_tab]?.try(&.editor_to_bottom)
+    end
+
+    # A one-line field (a TARGET) has no buffer to step words in; say so rather than eat it.
+    def editor_word_move(dir : Int32) : Nil
+      return if @tabs[@active_tab]?.try(&.editor_word_move(dir))
+      status("no word steps in a one-line field — ←/→ and Home/End move here")
+    end
+
+    def editor_line_insert(dir : Int32) : Nil
+      @tabs[@active_tab]?.try(&.editor_line_insert(dir))
+    end
+
+    # --- READ-mode edits (verbs/editor.cr, the engine is `ReadEdit`) ---
+    # The verb armed by the first press of `dd` / `yy`, waiting for its second. Only ever set
+    # in an editor pane's READ mode, and spent by the very next key (`finish_editor_op`).
+    @editor_op : String? = nil
+
+    def editor_delete_selection : Nil
+      return unless tab = read_edit_tab
+      read_edit_status(ReadEdit.delete_selection(tab, read_edit_key_in))
+    end
+
+    def editor_paste : Nil
+      return unless tab = read_edit_tab
+      read_edit_status(ReadEdit.paste(tab, read_edit_key_in))
+    end
+
+    # vim `d`: over a selection it deletes at once (`⇧V` then `d`), otherwise it arms `dd`. A
+    # field with no line buffer (a single-line TARGET) says so on the first press, rather than
+    # arming an operator whose second press could only refuse.
+    def editor_delete_line : Nil
+      return unless tab = read_edit_tab
+      return read_edit_status(ReadEdit::NO_BUFFER) unless tab.editor_text_buffer
+      return read_edit_status(ReadEdit.delete_selection(tab, read_edit_key_in)) if ReadEdit.selection?(tab)
+      arm_editor_op("editor.delete-line", "deletes the line")
+    end
+
+    # vim `y`: over a selection it is the pane's ordinary copy (whole lines stay linewise for
+    # `p`), otherwise it arms `yy`. With no selection there is no copy-all on `y` here; `^Y`
+    # still copies the whole pane. A field with no line buffer has no line to yank, so `y`
+    # there stays the pane's own copy, which is what it was before the keyset took the letter.
+    def editor_yank_line : Nil
+      return unless tab = read_edit_tab
+      return read_copy if tab.editor_text_buffer.nil? || ReadEdit.selection?(tab)
+      arm_editor_op("editor.yank-line", "copies the line")
+    end
+
+    private def arm_editor_op(id : String, does : String) : Nil
+      @editor_op = id
+      read_edit_status("{#{id}}… — {#{id}} again #{does} · esc cancels")
+    end
+
+    # The key after an armed `d` / `y`. True when it was spent here: the same verb again runs
+    # the line operator, esc cancels quietly, and any other key cancels with a word, since
+    # `dw` or `dj` would be a motion this grammar does not have. False only when the focus
+    # left the editor's READ mode in between, so the key is not this operator's to take.
+    private def finish_editor_op(id : String, ev : Termisu::Event::Key) : Bool
+      return false unless tab = read_edit_tab
+      chord = Keybind.from_event(ev)
+      if chord && resolve_verb_id(chord, current_scope) == id
+        msg = id == "editor.delete-line" ? ReadEdit.delete_line(tab, read_edit_key_in) : ReadEdit.yank_line(tab)
+        read_edit_status(msg)
+        return true
+      end
+      read_edit_status("{#{id}} cancelled — only {#{id}}{#{id}} (the whole line) is supported") unless ev.key.escape?
+      true
+    end
+
+    # The editor tab a READ-mode edit runs in, or nil outside an editor's READ mode. The verbs
+    # are gated on that already; this is the same question asked again at run time, because
+    # `finish_editor_op` runs a key later, after the focus may have moved.
+    private def read_edit_tab : TabController?
+      return nil unless editor_read_mode?
+      @tabs[@active_tab]?
+    end
+
+    # The edit is replayed through the WHOLE key path, the way a refused bulk paste is
+    # (`replay_paste`), so every guard the shell applies ahead of a pane's own ladder applies.
+    private def read_edit_key_in : ReadEdit::KeyIn
+      ->(ev : Termisu::Event::Key) { handle_key(ev); nil }
+    end
+
+    # Nil is the engine saying the pane already put its own reason up (`ReadEdit.leave`).
+    private def read_edit_status(message : String?) : Nil
+      status(Hotkeys.expand(@session.registry, message)) if message
+    end
+
+    # The two bottom prompts, reached through the keymap instead of through the hardcoded
+    # ^G/^F guards in handle_key. Same target resolution (`goto_target`), so a keyset's bare
+    # spelling and the Ctrl form open the same prompt over the same pane.
+    def editor_goto_line : Nil
+      (tgt = goto_target) ? open_goto(tgt) : status("no line-addressable pane is focused")
+    end
+
+    def editor_find : Nil
+      (tgt = goto_target) ? open_search(tgt) : status("no searchable pane is focused")
     end
 
     def detail_navigable? : Bool
@@ -5408,32 +6515,6 @@ module Gori::Tui
       persisted ? line : "#{line} — but NOT saved (project busy); it reverts when you reopen this project"
     end
 
-    # Open the settings editor for `section` (palette → settings:network/editor/theme/
-    # tabs/hotkeys). All sections are implemented; an unknown one toasts a TODO.
-    def import_har : Nil
-      open_import(:har)
-    end
-
-    def import_urls : Nil
-      open_import(:urls)
-    end
-
-    def import_oas : Nil
-      open_import(:oas)
-    end
-
-    def import_postman : Nil
-      open_import(:postman)
-    end
-
-    def import_insomnia : Nil
-      open_import(:insomnia)
-    end
-
-    def import_burp : Nil
-      open_import(:burp)
-    end
-
     def import_running? : Bool
       !@import_job.nil?
     end
@@ -5444,8 +6525,8 @@ module Gori::Tui
       status("cancelling the import after its current chunk…", :busy)
     end
 
-    def import_wsdl : Nil
-      open_import(:wsdl)
+    def import_curl : Nil
+      open_curl_paste(:history)
     end
 
     # Palette / verb entry (`settings.*`): nothing to return to, so an editor opened here
@@ -5460,13 +6541,15 @@ module Gori::Tui
     # to the modal) would behave differently.
     private def open_settings_section(section : Symbol, back : PreferencesOverlay?) : Nil
       case section
-      when :network, :editor, :mouse, :keys, :layout, :statusline, :display, :companion, :notifications, :general
-        open_preferences(section)                       # the unified grouped modal, positioned at this section
-      when :theme   then open_overlay(theme_card(back)) # theme keeps its dedicated swatch-list card
-      when :tabs    then open_overlay(tabs_editor(back))
-      when :hosts   then open_overlay(hosts_editor(back))
-      when :env     then open_overlay(env_editor(back))
-      when :hotkeys then open_overlay(hotkeys_editor(back))
+      when :network, :editor, :mouse, :keys, :layout, :statusline, :display, :companion, :notifications, :general, :mcp, :mcp_permissions
+        open_preferences(section)                                 # the unified grouped modal, positioned at this section
+      when :theme             then open_overlay(theme_card(back)) # theme keeps its dedicated swatch-list card
+      when :tabs              then open_overlay(tabs_editor(back))
+      when :hosts             then open_overlay(hosts_editor(back))
+      when :env               then open_overlay(env_editor(back))
+      when :user_agents       then open_overlay(user_agents_editor(back))
+      when :hotkeys           then open_overlay(hotkeys_editor(back))
+      when :keyset_playground then open_overlay(keyset_playground(back))
       when :reset_all
         # The palette's "Settings: Reset" entry. Same verb the modal's Reset row runs, so it
         # goes through the same confirm rather than a second copy of the wording. `back` is
@@ -5528,12 +6611,21 @@ module Gori::Tui
     end
 
     private def tabs_editor(back : PreferencesOverlay?) : TabsOverlay
-      ov = TabsOverlay.new
+      ov = TabsOverlay.new(@evidence_available)
       ov.on_close = -> { resume_preferences(back) }
       ov.on_palette = -> { jump_to_palette }
       ov.on_toast = ->(msg : String) { @toast = msg; nil }
       ov.on_reset = -> { confirm_tabs_reset(ov) }
       ov.on_commit = -> { save_tabs(ov) }
+      ov
+    end
+
+    # Try-only: the keyset is set on the Keys row the card was opened from. The pad's practice
+    # copies leave the paste register on the way out.
+    private def keyset_playground(back : PreferencesOverlay?) : KeysetPlaygroundOverlay
+      ov = KeysetPlaygroundOverlay.new
+      ov.on_close = -> { ov.restore_register; resume_preferences(back) }
+      ov.on_palette = -> { ov.restore_register; jump_to_palette }
       ov
     end
 
@@ -5552,6 +6644,28 @@ module Gori::Tui
       ov.on_palette = -> { jump_to_palette }
       ov.on_toast = ->(msg : String) { @toast = msg; nil }
       ov.on_save = -> { save_env(ov) }
+      ov
+    end
+
+    # Saves on close, not per keystroke: a half-typed line is not a User-Agent. A list that did
+    # not parse (only reachable when the card could not be drawn to refuse it) is not written.
+    private def user_agents_editor(back : PreferencesOverlay?) : UserAgentsOverlay
+      ov = UserAgentsOverlay.new
+      ov.on_close = -> { resume_preferences(back) }
+      ov.on_commit = -> {
+        list = ov.edited_list
+        if list && list != Settings.user_agents
+          Settings.user_agents = list
+          @toast = if !Settings.save
+                     "User-Agents applied — could not save to #{Settings.path}"
+                   elsif list.empty?
+                     "User-Agents: back to the built-in list"
+                   else
+                     "User-Agents: #{list.size} saved"
+                   end
+        end
+        true
+      }
       ov
     end
 
@@ -5592,11 +6706,14 @@ module Gori::Tui
     # save_hotkeys. So "reset from the modal" and "reset inside the editor" cannot drift into
     # meaning two different things.
     #
-    # `prefs` is the modal the confirm is raised from and restored into. Every arm re-pulls it
-    # afterwards: it built one working copy per form section when it OPENED, those copies are
-    # now older than settings.json, and a ↵ on any of them would write the pre-reset values
-    # back — and `apply_settings_saved` would push them at the live proxy. (`dirty?` compares
-    # the working copy to its own equally-stale baseline, so esc would not warn either.)
+    # `prefs` is the modal the confirm is raised from and restored into. Only the FACTORY reset
+    # re-pulls every form: it moves values the forms hold, so their working copies are now older
+    # than settings.json, and a ↵ on any of them would write the pre-reset values back — and
+    # `apply_settings_saved` would push them at the live proxy. (`dirty?` compares the working
+    # copy to its own equally-stale baseline, so esc would not warn either.) The three opener
+    # resets touch no value a form holds, so they use the polite `refresh`: an unsaved edit the
+    # operator typed into Network before pressing ^R on the Tabs row is theirs, not stale, and
+    # the unconditional reload threw it away without a word.
     private def confirm_preferences_reset(section : Symbol, prefs : PreferencesOverlay) : Nil
       case section
       when :reset_all then confirm_factory_reset(prefs)
@@ -5605,10 +6722,10 @@ module Gori::Tui
           "Reset the tab bar to its default order and\n" \
           "visibility? This is saved immediately.",
           confirm_label: "reset", danger: true, return_to: :preferences) do
-          ov = TabsOverlay.new # reconciled from the persisted prefs, then reverted
+          ov = TabsOverlay.new(@evidence_available) # reconciled from the persisted prefs, then reverted
           ov.reset_to_defaults
           save_tabs(ov)
-          prefs.reload_from_settings
+          prefs.refresh(section)
         end
       when :theme
         confirm("RESET THEME",
@@ -5619,7 +6736,7 @@ module Gori::Tui
           v.reload(:theme)
           v.reset_to_defaults
           @toast = apply_settings_saved(:theme, v.save)
-          prefs.reload_from_settings
+          prefs.refresh(section)
         end
       when :hotkeys
         confirm("RESET HOTKEYS",
@@ -5629,23 +6746,27 @@ module Gori::Tui
           ov = HotkeysOverlay.new(@session.registry)
           ov.reset_all     # the rebindings…
           ov.reset_profile # …and the OS pin, which reset_all deliberately leaves alone
+          # …and the entries the editor never shows (another build's ids, raw labels), which
+          # `Hotkeys.apply` keeps on an ordinary save: this prompt says EVERY rebinding.
+          Settings.keymap_overrides = {} of String => Array(String)
           save_hotkeys(ov)
-          prefs.reload_from_settings
+          prefs.refresh(section)
         end
       end
     end
 
     # The whole settings file back to a fresh install's state — the palette's
     # "Settings: Reset" and the modal's Reset row. Named in the body, not summarised: this is
-    # the one reset that also drops operator DATA (env VALUES, the hostname map, OAST tokens,
+    # the one reset that also drops operator DATA (env VALUES, the User-Agent list, the hostname map, OAST tokens,
     # saved decoder chains, global rewriter/colormarker rules), and an operator who reads
     # "every setting" alone would not expect their tokens to go with it.
     private def confirm_factory_reset(prefs : PreferencesOverlay? = nil) : Nil
       confirm("FACTORY RESET",
         "Restore every setting to its factory default?\n" \
-        "This also drops your global env values, hostname\n" \
-        "overrides, OAST tokens, saved decoder chains and\n" \
-        "global rewriter/colormarker rules. Projects are kept.",
+        "This also drops your global env values, User-Agent\n" \
+        "list, hostname overrides, OAST tokens, saved decoder\n" \
+        "chains and global rewriter/colormarker rules.\n" \
+        "Projects are kept.",
         confirm_label: "reset", danger: true, return_to: :preferences) do
         # `Refused` means NOTHING was touched — not the file, not memory — so it must not run
         # the live re-apply (which would rebind the proxy and reconcile listeners off the back
@@ -5683,7 +6804,7 @@ module Gori::Tui
       @keymap = Hotkeys.build_keymap(@session.registry)
       help_controller.reload_help(@session.registry) # Help rows name the chords that just moved
       reconcile_mouse
-      @pretty = Settings.pretty_bodies_default
+      @pretty = @pretty_default = Settings.pretty_bodies_default
       @session.set_verify_upstream(Settings.verify_upstream?)
       @session.set_serve_landing(Settings.serve_landing?)
       # The rewrite/colour snapshots, before anything renders against them. No settings re-read
@@ -5724,7 +6845,7 @@ module Gori::Tui
       history_controller.view.reload(@session.store)
       history_controller.refresh_preview
       sitemap_controller.view.reload(@session.store) if sitemap_controller.view.loaded?
-      @companion.wake_on_input
+      @companion.wake_on_input(false) # not an acknowledgement — see #apply_companion
       project_controller.refresh_network
       settle_hidden_active_tab # tab_prefs is empty now — the default hidden set applies again
       @resized = true          # theme + tab strip changed behind the modal
@@ -5764,8 +6885,17 @@ module Gori::Tui
               end
       @theme_restore = Settings.theme if section == :theme # saved → don't revert this on esc
       reconcile_mouse                                      # the MOUSE section holds the on/off toggle — apply it live
-      @pretty = Settings.pretty_bodies_default             # …and the Pretty-print-bodies toggle — apply it live too
+      apply_pretty_default
       toast
+    end
+
+    # The Pretty-print-bodies DEFAULT, applied live only when it actually MOVED. `@pretty` is
+    # also the session's own `p` toggle, and re-reading the default after every section's save
+    # flipped that back on a retention or network edit.
+    private def apply_pretty_default : Nil
+      return if Settings.pretty_bodies_default == @pretty_default
+      @pretty_default = Settings.pretty_bodies_default
+      @pretty = @pretty_default
     end
 
     # The KEYS section carries the command modifier, which changes what every surface
@@ -5774,6 +6904,10 @@ module Gori::Tui
     # modifier. Also warn when the ⌥ alias has just shadowed a user's own alt binding: the
     # guard fires before the keymap, so that override silently reverts to its default.
     private def apply_keys(save_msg : String) : String
+      # The editor keyset is baked into the keymap when it is BUILT, so without a rebuild the
+      # hints (which re-expand off `keymap_revision`) advertised the new keyset's chords while
+      # dispatch kept answering the old one until a restart or a Hotkeys save.
+      @keymap = Hotkeys.build_keymap(@session.registry)
       help_controller.reload_help(@session.registry)
       @resized = true # chords are baked into rendered hint text — force a full repaint
       shadowed = Hotkeys.alias_conflicts(@session.registry)
@@ -5800,8 +6934,14 @@ module Gori::Tui
 
     # Enable/disable and the motion change land on the SAME frame as the save rather than
     # up to one BEAT later; Companion#tick self-gates on Settings.companion? for the rest.
+    #
+    # `false`: this wakes her, it does not release a held reply. The save is made from
+    # Preferences, which hides her, and the key that made it already went through the run
+    # loop's own release gate — so a reply that landed while the modal was up would otherwise
+    # be let go by a motion change the operator made without ever seeing it. Switching
+    # `replies` to `timed` releases a held one in Companion#tick.
     private def apply_companion(save_msg : String) : String
-      @companion.wake_on_input
+      @companion.wake_on_input(false)
       save_msg
     end
 
@@ -5856,11 +6996,26 @@ module Gori::Tui
     # `io` is where the mode-1002 sequences go — the TUI's tty in the app (`TtyOut`, NOT
     # STDOUT), an IO::Memory in the spec that pins this ordering (a spec must not write
     # escape codes to the test runner's tty).
-    def self.suspend_without_mouse(term, *, mouse : Bool, io : IO = TtyOut.io, &)
+    #
+    # `mode` replaces `suspend`'s plain cooked mode for a child that does not set its own
+    # termios. termisu's cooked keeps OPOST and ICRNL off (the Mode table says `-` for both),
+    # which an editor never notices because it switches to raw itself — but a shell hands that
+    # state to every command it runs, and measured in one: `printf 'a\nb\n'` staircased (no
+    # NL→CRNL) and `stty -a` read `-opost -icrnl -ixon`. `full_cooked` restores the terminal's
+    # ORIGINAL output and input flags instead (termios.cr, the canonical branch).
+    def self.suspend_without_mouse(term, *, mouse : Bool, io : IO = TtyOut.io,
+                                   mode : Termisu::Terminal::Mode? = nil, &)
       MouseDrag.disable(io) # our mode 1002 rides along: the child would get motion reports too
       term.disable_mouse
       begin
-        term.suspend { yield }
+        # Shield outside the mode switch: the tty is cooked (ISIG on) from the moment it flips.
+        shield_tty_signals do
+          if m = mode
+            term.with_mode(m, preserve_screen: false) { yield }
+          else
+            term.suspend { yield }
+          end
+        end
       ensure
         if mouse
           term.enable_mouse
@@ -5869,6 +7024,27 @@ module Gori::Tui
           MouseDrag.forget
           MouseDrag.enable(io)
         end
+      end
+    end
+
+    # The child shares gori's process group (Crystal's `Process` has no `setpgid`) and the
+    # cooked tty has ISIG on, so a ^C or ^\ meant for an editor that leaves ISIG alone
+    # (`code --wait`) reached gori as well: SignalGuard tore the session down, and an untrapped
+    # QUIT killed it with the screen still wrecked. A no-op trap keeps gori alive, and the
+    # child still gets the default disposition — Crystal resets trapped signals before exec.
+    {% if flag?(:win32) %}
+      TTY_SIGNALS = [Signal::INT] # Windows has no QUIT
+    {% else %}
+      TTY_SIGNALS = [Signal::INT, Signal::QUIT]
+    {% end %}
+
+    def self.shield_tty_signals(&)
+      saved = TTY_SIGNALS.map(&.trap_handler?)
+      TTY_SIGNALS.each(&.trap { })
+      begin
+        yield
+      ensure
+        TTY_SIGNALS.zip(saved) { |sig, handler| handler ? sig.trap(&handler) : sig.reset }
       end
     end
 
@@ -5889,16 +7065,7 @@ module Gori::Tui
         end
         status
       end
-      @resized = true # alt-screen re-entered → force a full repaint via the resize path
-      # The child editor may have set its own OS window title. termisu memoizes the last
-      # title it wrote (still "𝓰𝓸𝓻𝓲 - <project> - <tab>"), so a plain re-emit is suppressed
-      # — bust its memo with a throwaway write, then invalidate gori's memo so the next
-      # render re-emits our title over whatever the editor left. Skipped when we own no
-      # title (pref "off"): there's nothing of ours to restore, so leave the editor's be.
-      if @title_written && Settings.terminal_title != "off"
-        @term.title = ""
-        @title_text = nil
-      end
+      reclaim_terminal
       case result.outcome
       in ExternalEditor::Outcome::Changed
         yield result.text.not_nil!
@@ -5907,6 +7074,170 @@ module Gori::Tui
         @toast = "no changes"
       in ExternalEditor::Outcome::Failed
         @toast = result.error || "external editor failed"
+      end
+    end
+
+    # Hand the terminal to `$SHELL` with the env applied, like `run_external_editor` hands it to
+    # `$EDITOR`. Only this fiber waits: `Process.run` parks it on the child's exit, so the proxy
+    # keeps accepting and the Store keeps writing while the screen is suspended.
+    #
+    # The child is `gori run shell`, not `$SHELL` itself. Crystal's runtime ignores SIGPIPE,
+    # an ignored signal survives exec, and nothing in `Process.run` resets it — spawned
+    # directly, the shell and every pipeline in it would inherit it (`yes | head` then prints
+    # "Broken pipe"). The CLI resets it just before its own exec, so reusing it gets that, and
+    # the same env and banner, for free. What would make it refuse is checked here first, so
+    # the refusal is a toast rather than a line the repaint scrolls away.
+    private def open_shell_here : Nil
+      unless @session.capturing?
+        return @toast = "capture is off — start it (c) first; a shell pointed at a closed listener captures nothing"
+      end
+      # Held requests are forwarded from the Intercept tab, which is not on screen while the shell
+      # is: every request the shell made would hang with nothing visible to release it.
+      if @session.interceptor.enabled?
+        return @toast = "intercept is on — the shell's requests would be held with no way to forward " \
+                        "them; turn it off (i) first, or use Copy env for another pane"
+      end
+      if problem = ShellEnv.ca_problem(@session.ca.ca_cert_path)
+        return @toast = "shell: #{problem}"
+      end
+      authority = ShellEnv.dial_authority(@session.proxy.host, @session.proxy.port)
+      # The highest id ever issued, not `MAX(id)`: after a clear or a delete of the newest flows
+      # the next capture lands above every id handed out before (V39), and the gap would count.
+      before = Runner.flow_mark(@session.store)
+      args = ["run", "shell", "--proxy", authority, "--ca-dir", File.dirname(@session.ca.ca_cert_path)]
+      started = Time.instant
+      status = nil.as(Process::Status?)
+      begin
+        Runner.suspend_without_mouse(@term, mouse: Settings.mouse,
+          mode: Termisu::Terminal::Mode.full_cooked) do
+          status = Process.run(Process.executable_path || "gori", args,
+            input: Process::Redirect::Inherit,
+            output: Process::Redirect::Inherit,
+            error: Process::Redirect::Inherit)
+        ensure
+          Runner.reclaim_foreground_pgrp
+        end
+      rescue ex
+        reclaim_terminal
+        return @toast = "shell failed: #{ex.message}"
+      end
+      reclaim_terminal
+      @toast = Runner.shell_exit_toast(status, Time.instant - started, Runner.flows_issued_since(@session.store, before))
+    end
+
+    # The highest flow id ever issued (`Store#flow_id_high_water`), nil on a failed read.
+    def self.flow_mark(store : Store) : Int64?
+      store.flow_id_high_water
+    end
+
+    # How many flow ids were issued since the `flow_mark` `before`. A failed read, either one,
+    # counts none: a baseline of 0 would count the whole History as the shell's.
+    def self.flows_issued_since(store : Store, before : Int64?) : Int64
+      return 0_i64 unless before
+      (store.flow_id_high_water || before) - before
+    end
+
+    # Reclaim the terminal's foreground process group after a child process exits (#1250).
+    # An interactive shell with job control takes the foreground pgrp; if it is
+    # SIGKILLed or crashes without handing it back, restoring termios (tcsetattr)
+    # runs from a background pgrp, delivering SIGTTOU (stopping gori) or returning EIO.
+    # SIGTTOU is ignored around tcsetpgrp so the kernel does not stop gori while it
+    # reclaims the terminal.
+    def self.reclaim_foreground_pgrp : Nil
+      # Windows has no process groups or job control: nothing can take the console away.
+      {% unless flag?(:win32) %}
+        Signal::TTOU.ignore
+        begin
+          pgrp = LibC.getpgrp
+          if tty = (File.open("/dev/tty", "r") rescue nil)
+            begin
+              LibC.tcsetpgrp(tty.fd, pgrp)
+            ensure
+              tty.close
+            end
+          elsif LibC.isatty(0) == 1
+            LibC.tcsetpgrp(0, pgrp)
+          end
+        rescue
+          # Headless or test environments without a controlling terminal
+        ensure
+          Signal::TTOU.reset
+        end
+      {% end %}
+    end
+
+    # How long a shell has to have lived for its exit status to be the SHELL's. A shell exits
+    # with its last command's status, so a non-zero exit after real use is ordinary; one that is
+    # gone at once never started, and whatever it printed was repainted over.
+    SHELL_START_GRACE = 2.seconds
+
+    def self.shell_exit_toast(status : Process::Status?, lived : Time::Span, captured : Int64) : String
+      if status && !status.success? && lived < SHELL_START_GRACE
+        how = status.exit_code?.try { |c| "exit #{c}" } || status.exit_reason.to_s.downcase
+        return "shell exited at once (#{how}) — run `gori run shell` in a terminal to see why"
+      end
+      n = captured.clamp(0_i64, Int32::MAX.to_i64)
+      "shell exited · #{Gori.plural(n, "flow")} captured meanwhile"
+    end
+
+    # The command copied to the clipboard for another pane to evaluate in its own env (#1250).
+    # `ca_dir` is made absolute here: `gori --ca-dir ./ca` leaves it relative to gori's cwd,
+    # and the pasted command runs in another pane's.
+    def self.copy_shell_command(authority : String, ca_dir : String, syntax : ShellEnv::Syntax,
+                                executable : String? = Process.executable_path) : String
+      quote = ->(s : String) do
+        case syntax
+        in .fish?       then ShellEnv.fish_quote(s)
+        in .powershell? then ShellEnv.powershell_quote(s)
+        in .posix?      then Process.quote_posix(s)
+        end
+      end
+      bin_arg = quote.call(executable || "gori")
+      proxy_arg = quote.call(authority)
+      ca_arg = quote.call(File.expand_path(ca_dir))
+      case syntax
+      in ShellEnv::Syntax::Posix
+        %(eval "$(#{bin_arg} run shell --print --proxy #{proxy_arg} --ca-dir #{ca_arg})")
+      in ShellEnv::Syntax::Fish
+        "#{bin_arg} run shell --print --shell fish --proxy #{proxy_arg} --ca-dir #{ca_arg} | source"
+      in ShellEnv::Syntax::Powershell
+        # `&` runs a quoted path; PowerShell would otherwise read it as a string.
+        "& #{bin_arg} run shell --print --shell powershell --proxy #{proxy_arg} --ca-dir #{ca_arg} | Out-String | Invoke-Expression"
+      end
+    end
+
+    # A single-line command that evaluates `gori run shell --print` inside the target pane, so
+    # the target pane evaluates its own environment (its own GODEBUG, NODE_EXTRA_CA_CERTS, and
+    # tool CA variables) rather than inheriting gori's (#1250).
+    private def copy_shell_env : Nil
+      if problem = ShellEnv.ca_problem(@session.ca.ca_cert_path)
+        return @toast = "shell: #{problem}"
+      end
+      authority = ShellEnv.dial_authority(@session.proxy.host, @session.proxy.port)
+      ca_dir = File.dirname(@session.ca.ca_cert_path)
+      syntax = ShellEnv::Syntax.for_shell(ENV["SHELL"]?)
+      text = Runner.copy_shell_command(authority, ca_dir, syntax)
+      copied = Clipboard.copy(text)
+      @toast =
+        if copied == 0
+          "clipboard is off (Settings) — run `gori run shell --print` in the other pane instead"
+        else
+          off = @session.capturing? ? "" : " (capture is off — start it with c)"
+          "copied #{syntax.posix? ? "sh" : syntax.to_s.downcase} env for proxy http://#{authority} — paste it into another pane#{off}"
+        end
+    end
+
+    # After a child that owned the terminal (`$EDITOR`, a shell) returns it.
+    private def reclaim_terminal : Nil
+      @resized = true # alt-screen re-entered → force a full repaint via the resize path
+      # The child may have set its own OS window title. termisu memoizes the last title it
+      # wrote (still "𝓰𝓸𝓻𝓲 - <project> - <tab>"), so a plain re-emit is suppressed — bust its
+      # memo with a throwaway write, then invalidate gori's memo so the next render re-emits
+      # our title over whatever the child left. Skipped when we own no title (pref "off"):
+      # there's nothing of ours to restore, so leave the child's be.
+      if @title_written && Settings.terminal_title != "off"
+        @term.title = ""
+        @title_text = nil
       end
     end
 

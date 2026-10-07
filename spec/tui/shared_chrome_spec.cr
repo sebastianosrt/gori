@@ -20,7 +20,7 @@ describe "shared card chrome" do
     # their count at different widths. None of the numbers was derived from the title they
     # were protecting; `Frame.border_meta` derives it.
     offenders = [] of String
-    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+    glob_files(root, "**", "*.cr").sort.each do |path|
       next if File.basename(path) == "frame.cr"
       File.read(path).lines.each_with_index do |line, i|
         next unless line.includes?("screen.text")
@@ -47,7 +47,7 @@ describe "shared card chrome" do
     # hue swatch, which no generic renderer can place. It is required to spell the cue the
     # same way, which is what this check enforces for it.
     offenders = [] of String
-    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+    glob_files(root, "**", "*.cr").sort.each do |path|
       next if File.basename(path) == "frame.cr"
       File.read(path).lines.each_with_index do |line, i|
         next unless line.includes?("‹/›")
@@ -72,7 +72,7 @@ describe "shared card chrome" do
     # sized to its own text, a "terminal too small" degraded card, and a row-count fit — and
     # holding those to a card's margin would be meaningless.
     offenders = [] of String
-    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+    glob_files(root, "**", "*.cr").sort.each do |path|
       src = File.read(path)
       next unless body = src[/def overlay_box.*?\n    end/m]?
       # ConfirmDialog is the one modal that sizes to its CONTENT (`content + 6`) rather than
@@ -96,14 +96,19 @@ describe "shared card chrome" do
       extract_rule_overlay scope_rule_overlay oast_provider_overlay
     ]
     offenders = [] of String
-    forms.each do |name|
-      src = File.read(File.join(root, "#{name}.cr"))
-      body = src[/def overlay_box.*?\n    end/m]? || ""
+    # A form with no `overlay_box` of its own takes `FormOverlay`'s, held to the same rule below.
+    base = File.read(File.join(root, "overlay.cr"))[/class FormOverlay\b.*?def overlay_box.*?\n    end/m]
+    sources = forms.map { |name| {name, File.read(File.join(root, "#{name}.cr"))} }
+    sources << {"FormOverlay", base}
+    sources.each do |name, src|
+      body = src[/def overlay_box.*?\n    end/m]?
+      next if body.nil? && src.matches?(/< (Extract)?FormOverlay\b/)
+      body ||= ""
       # Not "does it use the right constants" — the whole computation belongs to
       # `Overlay.rule_form_box`, so the form should state only its ROW COUNT and whether it
       # carries a preview band. A form that spells any of the arithmetic here has started its
       # own copy, which is where the six drifted apart the first time.
-      unless body.matches?(/Overlay\.rule_form_box\(area, (ROW_COUNT|row_count)(, preview: true)?\)/)
+      unless body.matches?(/Overlay\.rule_form_box\(area, (ROW_COUNT|row_count)(, preview: (true|preview\?))?\)/)
         offenders << "#{name}: overlay_box does not delegate to Overlay.rule_form_box"
       end
       offenders << "#{name}: re-derives card arithmetic" if body.includes?("area.w -") || body.includes?("area.h -")
@@ -116,7 +121,7 @@ describe "shared card chrome" do
     # `(no vars — a to add)` in parentheses with a bare key, the tab views wrote
     # `no rules — press a to add` without them. Same list, same absence, same instruction.
     offenders = [] of String
-    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+    glob_files(root, "**", "*.cr").sort.each do |path|
       File.read(path).lines.each_with_index do |line, i|
         # Keyed on the `a` KEY specifically: a settings opener row saying `↵ to add` is a
         # different affordance, and "no flows left to add" is a toast, not an empty state.
@@ -133,7 +138,7 @@ describe "shared card chrome" do
     # affordance no other list in gori had, which said "there is more" without saying how
     # much, and cost a column the swatch wanted. The gauge answers both on the hairline.
     offenders = [] of String
-    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+    glob_files(root, "**", "*.cr").sort.each do |path|
       File.read(path).lines.each_with_index do |line, i|
         next unless line.includes?("screen.cell")
         next unless line.includes?("'▲'") || line.includes?("'▼'") || line.includes?("'↕'")
@@ -255,7 +260,7 @@ describe "fixed sub-tab strip labels" do
   it "are Title Case everywhere" do
     root = File.join(__DIR__, "..", "..", "src", "gori")
     offenders = [] of String
-    Dir.glob(File.join(root, "tui", "**", "*.cr")).sort.each do |path|
+    glob_files(root, "tui", "**", "*.cr").sort.each do |path|
       File.read(path).lines.each_with_index do |line, i|
         next unless line.matches?(/^\s+(SUBTABS|SUB_LABELS|PANE_LABELS|PAGE_LABELS|SUBS)\s*=\s*\[/)
         line.scan(/"([^"]+)"/) do |m|
@@ -278,13 +283,13 @@ describe "the last hand-rolled chrome" do
   root = File.join(__DIR__, "..", "..", "src", "gori", "tui")
 
   it "leaves the filter bar's right cluster to Frame.right_text_chain" do
-    # Four views wrote this out — History (`count · ⇧S scope · f:follow · N marked`), Sitemap
+    # Four views wrote this out — History (`count · s scope · f:follow · N marked`), Sitemap
     # (`… g:fold …`), and the bare pair in Issues and Probe. The tell is the hand-rolled
     # right-to-left cursor: `rx = rect.right - 1` followed by `rx -= …`. They had already
     # drifted on the gap, stepping TWO columns after the count and ONE between the chips in
     # the same method.
     offenders = [] of String
-    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+    glob_files(root, "**", "*.cr").sort.each do |path|
       src = File.read(path)
       # Filter BARS only. `probe_view` runs the same right-to-left cursor INSIDE a list row
       # to right-align `status · host · ×N` — a per-row column layout, not a bar cluster, and
@@ -303,7 +308,7 @@ describe "the last hand-rolled chrome" do
     # badge's `min_x` from exactly that width — so the chrome shifted as the number gained a
     # digit. `Frame.border_meta` is the slot, right-aligned and independent of the title.
     offenders = [] of String
-    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+    glob_files(root, "**", "*.cr").sort.each do |path|
       File.read(path).lines.each_with_index do |line, i|
         # A COUNT, specifically — `"FINDINGS (#{n})"`, `"ATTACKS · #{n}"`. A title that
         # interpolates WHAT the card is showing is not the same thing and stays: `RESULT #3`,
@@ -326,7 +331,7 @@ describe "the last hand-rolled chrome" do
     # Every list in gori writes `▎` in the row's marker column. History's preview titles were
     # the one place it followed its label instead.
     offenders = [] of String
-    Dir.glob(File.join(root, "**", "*.cr")).sort.each do |path|
+    glob_files(root, "**", "*.cr").sort.each do |path|
       File.read(path).lines.each_with_index do |line, i|
         next unless line.matches?(/"[^"]*\S\s*▎"/)
         offenders << "#{File.basename(path)}:#{i + 1} — #{line.strip}"

@@ -5,12 +5,13 @@ require "./viewport"
 require "./row_filter"
 require "./theme"
 require "./fmt"
-require "./url"
+require "../url"
 require "./traffic_empty_state"
 require "../authorize/engine"
 require "../authorize/passive"
 require "../repeater/message_lines"
 require "../store/models"
+require "../plural"
 
 module Gori::Tui
   # The Authorize tab body. A LIST of captured requests, each replayed under the same set of
@@ -60,8 +61,14 @@ module Gori::Tui
         @detail.row.method
       end
 
-      def host_path : String
+      # Built once: `detail` never changes, and the list measures every entry's width each
+      # frame to size its HOST / PATH column.
+      getter host_path : String do
         "#{@detail.row.host}#{Url.origin_path(@detail.row.target)}"
+      end
+
+      getter host_path_width : Int32 do
+        Screen.draw_width(host_path)
       end
 
       # The one-word verdict for the master row: the state while it is not done, else the
@@ -119,12 +126,17 @@ module Gori::Tui
     end
 
     def initialize
+      # {head, body, error, lines} — see `response_lines`.
+      @resp_lines_memo = nil.as({Bytes?, Bytes?, String?, Array(String)}?)
       @entries = [] of Entry
       @identities = AuthorizeView.default_identities
       @identity_rev = 0
       @passive_note = nil.as(String?)
       @next_id = 0
-      @sel = 0  # master (request) cursor
+      @sel = 0 # master (request) cursor
+      # The entry the operator put the cursor on. A run re-labels rows under a `/` lens on the
+      # verdict word, so the visible list reshuffles with no keypress; `visible` re-finds this.
+      @sel_id = nil.as(Int32?)
       @tsel = 0 # identity sub-cursor within the selected request
       # Window offsets for the three scrolling regions. Each is DERIVED on the draw path from
       # its cursor and the rows the pane turned out to have (`Viewport`), never set by a
@@ -159,6 +171,7 @@ module Gori::Tui
       touch
       # Land on the new seed — unless the lens hides it, in which case the cursor stays.
       @sel = visible.index(@entries.size - 1) || @sel.clamp(0, {visible.size - 1, 0}.max)
+      anchor_sel
       @tsel = 0
       @trial_scroll = 0
       @detail_scroll = 0
@@ -226,6 +239,7 @@ module Gori::Tui
       @entries.delete(e)
       touch
       @sel = @sel.clamp(0, {visible.size - 1, 0}.max)
+      anchor_sel
       @tsel = 0
       @trial_scroll = 0
       @detail_scroll = 0
@@ -263,13 +277,9 @@ module Gori::Tui
       end
     end
 
-    # How many entries hold a result — the honest denominator for a run summary. After a stop,
-    # "no identity matched across N requests" would be a claim about requests that never ran.
-    def completed_count : Int32
-      @entries.count { |e| !e.target.nil? }
-    end
-
-    # The same two counts restricted to ONE batch. A run summary says what THIS run did, so it
+    # How many entries of ONE batch hold a result — the honest denominator for a run summary.
+    # After a stop, "no identity matched across N requests" would be a claim about requests
+    # that never ran. A run summary says what THIS run did, so it
     # cannot use the queue-wide totals: after a partial run, "ran 6" over a queue of six when
     # the batch was three describes work done by earlier runs.
     def completed_in(ids : Set(Int32)) : Int32
@@ -390,15 +400,12 @@ module Gori::Tui
       nil
     end
 
-    def bypass_total : Int32
-      @entries.sum { |e| (t = e.target) ? t.same_count : 0 }
-    end
-
     # Empty the queue. Deliberately does NOT reset `@next_id` — see `add`.
     def clear : Nil
       touch
       @entries.clear
       @sel = 0
+      @sel_id = nil
       @tsel = 0
       @list_scroll = 0
       @trial_scroll = 0
@@ -417,6 +424,7 @@ module Gori::Tui
       n = visible.size
       return if n == 0
       @sel = (@sel + delta).clamp(0, n - 1)
+      anchor_sel
       @tsel = 0
       @trial_scroll = 0
       @detail_scroll = 0
@@ -455,32 +463,23 @@ module Gori::Tui
     # A lens over `@entries`: `visible` is what the cursor, the list and `selected_entry` walk.
     # It is never a run scope — `pending_entries`, `mark_running`, `runnable` keep reading
     # `@entries`, so a hidden row still runs.
-    def filter_start : Nil
-      @filter.start
-    end
-
-    def filter_editing? : Bool
-      @filter.editing?
-    end
-
-    def filter_hint : String
-      @filter.hint
-    end
+    getter filter : RowFilter
 
     # Re-anchored by entry ID, since removals shift the source indices.
     def handle_filter_key(ev : Termisu::Event::Key) : Bool
       prev = selected_entry.try(&.id)
       @filter.handle_key(ev)
       @sel = (prev && visible.index { |i| @entries[i].id == prev }) || @sel.clamp(0, {visible.size - 1, 0}.max)
+      anchor_sel
       true
-    end
-
-    def set_filter_preedit(text : String) : Bool
-      @filter.set_preedit(text)
     end
 
     private def touch : Nil
       @rev += 1
+    end
+
+    private def anchor_sel : Nil
+      @sel_id = selected_entry.try(&.id)
     end
 
     private def visible : Array(Int32)
@@ -488,6 +487,11 @@ module Gori::Tui
       return @vis if key == @vis_key
       @vis = (0...@entries.size).select { |i| @filter.matches?(entry_haystack(@entries[i])) }
       @vis_key = key
+      if (want = @sel_id) && (j = @vis.index { |i| @entries[i].id == want })
+        @sel = j
+      else
+        @sel = @sel.clamp(0, {@vis.size - 1, 0}.max) # the anchor is filtered out: stay on a row
+      end
       @vis
     end
 
@@ -561,17 +565,13 @@ module Gori::Tui
       !r.empty? && r.contains?(mx, my)
     end
 
-    def detail_contains?(mx : Int32, my : Int32) : Bool
-      r = @detail_rect
-      !r.empty? && r.contains?(mx, my)
-    end
-
     # Put the cursor on visible row `i` — a click. Same resets as `move_row`: the identity
     # sub-cursor and the detail scroll belong to the request they were made on.
     def select_row(i : Int32) : Nil
       n = visible.size
       return if n == 0
       @sel = i.clamp(0, n - 1)
+      anchor_sel
       @tsel = 0
       @trial_scroll = 0
       @detail_scroll = 0
@@ -589,7 +589,7 @@ module Gori::Tui
     private def render_header(screen : Screen, rect : Rect, y : Int32) : Int32
       ids = @identities.map(&.name).join(", ")
       pending = pending_count
-      count = "#{@entries.size} request#{@entries.size == 1 ? "" : "s"}"
+      count = Gori.plural(@entries.size, "request")
       count += " (#{pending} pending)" if pending > 0
       count += " · #{visible.size} match" if @filter.active?
       screen.text(rect.x, y, "#{count} · identities: #{ids}", Theme.muted, Theme.bg, width: rect.w)
@@ -606,7 +606,8 @@ module Gori::Tui
     # which request was selected or that there were any more.
     private def render_list(screen : Screen, rect : Rect, y : Int32, bottom : Int32, focused : Bool) : Nil
       return if y >= bottom # a pane with no room even for the column header
-      hdr = sprintf("  %-3s %-6s %-38s %s", "#", "METHOD", "HOST / PATH", "VERDICT")
+      hw = list_host_width(rect.w, @entries.max_of?(&.host_path_width) || 0)
+      hdr = "  #{fit("#", 3)} #{fit("METHOD", 6)} #{fit("HOST / PATH", hw)} VERDICT"
       screen.text(rect.x, y, hdr, Theme.muted, Theme.bg, Attribute::Bold, width: rect.w)
       y += 1
       rows = {bottom - y, 0}.max
@@ -622,8 +623,8 @@ module Gori::Tui
         screen.fill(Rect.new(rect.x, y, rect.w, 1), bg) if selected && focused
         screen.text(rect.x, y, selected ? "▎" : " ", Theme.focus_gold, bg)
         # The `#` column is the SOURCE ordinal — stable under a filter, and what an operator quotes.
-        cols = " #{fit((src + 1).to_s, 3)} #{fit(e.method, 6)} #{fit(e.host_path, 38)} "
-        screen.text(rect.x + 1, y, cols, Theme.text, bg)
+        cols = " #{fit((src + 1).to_s, 3)} #{fit(e.method, 6)} #{fit(e.host_path, hw)} "
+        screen.text(rect.x + 1, y, cols, Theme.text, bg, width: rect.right - (rect.x + 1))
         vx = rect.x + 1 + Screen.draw_width(cols)
         v = e.verdict
         screen.text(vx, y, master_verdict_label(e), master_verdict_color(v), bg,
@@ -682,7 +683,8 @@ module Gori::Tui
     private def render_trials(screen : Screen, x : Int32, y : Int32, right : Int32, bottom : Int32,
                               t : Authorize::Target, focused : Bool) : Int32
       return y if y >= bottom
-      hdr = sprintf("  %-14s %-7s %-9s %-22s %s", "IDENTITY", "STATUS", "SIZE", "Δ VS BASELINE", "VERDICT")
+      dw = trial_delta_width(right - x, t.trials.max_of? { |tr| Screen.draw_width(tr.delta || "—") } || 0)
+      hdr = "  #{fit("IDENTITY", 14)} #{fit("STATUS", 7)} #{fit("SIZE", 9)} #{fit("Δ VS BASELINE", dw)} VERDICT"
       screen.text(x, y, hdr, Theme.muted, Theme.bg, Attribute::Bold, width: right - x)
       y += 1
       rows = {bottom - y, 0}.max
@@ -697,8 +699,8 @@ module Gori::Tui
         screen.text(x, y, sub ? "▎" : " ", Theme.focus_gold, bg)
         size = trial.meta.size.try { |s| Repeater::ExchangeMeta::Format.bytes(s) } || "—"
         cols = " #{fit(trial.identity, 14)} #{fit(trial.meta.status_text, 7)} " \
-               "#{fit(size, 9)} #{fit(trial.delta || "—", 22)} "
-        screen.text(x + 1, y, cols, Theme.text, bg)
+               "#{fit(size, 9)} #{fit(trial.delta || "—", dw)} "
+        screen.text(x + 1, y, cols, Theme.text, bg, width: right - (x + 1))
         vx = x + 1 + Screen.draw_width(cols)
         screen.text(vx, y, trial_verdict_label(trial.verdict), trial_verdict_color(trial.verdict), bg,
           Attribute::Bold, width: right - vx)
@@ -722,8 +724,7 @@ module Gori::Tui
       screen.text(x, y, head, Theme.text_bright, Theme.bg, Attribute::Bold, width: right - x)
       y += 1
       top = y
-      lines = Repeater::MessageLines.of(trial.response_head, trial.response_body,
-        decode: true, error: summary.error)
+      lines = response_lines(trial, summary.error)
       # CLAMPED to the last page, here rather than at the keypress — `scroll_detail` is called
       # from ⇟ and the wheel, neither of which knows how many lines this response has or how
       # tall the pane is. Unclamped, a couple of page-downs put the offset past the end and the
@@ -738,6 +739,28 @@ module Gori::Tui
       end
       Frame.scroll_gauge(screen, Rect.new(x, top, right - x, rows), lines.size,
         @detail_scroll, false)
+    end
+
+    # The selected trial's response lines, memoized on the bytes they came from: this runs every
+    # frame, and the projection decodes the body and digests a binary one (#1162).
+    #
+    # Matched by IDENTITY (same buffer, same length), not content, which would cost what the memo
+    # saves. The memo holds the slices themselves, so a buffer it matched cannot be freed and its
+    # address reused by different bytes.
+    private def response_lines(trial : Authorize::Trial, error : String?) : Array(String)
+      head = trial.response_head
+      body = trial.response_body
+      if (memo = @resp_lines_memo) && same_bytes?(memo[0], head) && same_bytes?(memo[1], body) && memo[2] == error
+        return memo[3]
+      end
+      lines = Repeater::MessageLines.of(head, body, decode: true, error: error)
+      @resp_lines_memo = {head, body, error, lines}
+      lines
+    end
+
+    private def same_bytes?(a : Bytes?, b : Bytes?) : Bool
+      return a.nil? && b.nil? unless a && b
+      a.to_unsafe == b.to_unsafe && a.size == b.size
     end
 
     # ── labels / colours ────────────────────────────────────────────────────────
@@ -799,6 +822,29 @@ module Gori::Tui
       in .error?     then Theme.muted
       in .baseline?  then Theme.focus_gold
       end
+    end
+
+    # The columns a row keeps for its VERDICT: the widest label either table draws
+    # (`⚠ 12 same`, `different`) plus a cell of air. VERDICT is the answer this tab exists
+    # for, so the elastic column — HOST / PATH, Δ VS BASELINE — gives way first: a fixed
+    # 38/22 pushed the verdict off the card under ~62 columns, and cut every delta to its
+    # status half even on a 140-column terminal (#1433).
+    VERDICT_W = 11
+
+    # HOST / PATH is as wide as the widest one (over EVERY entry, so the column holds still
+    # while the list scrolls), within what the `▎ ### METHOD ` prefix (14 cells) and VERDICT
+    # leave, and floored so a narrow pane still names the host.
+    private def list_host_width(w : Int32, widest : Int32) : Int32
+      elastic_width(w - 14 - VERDICT_W, widest, "HOST / PATH")
+    end
+
+    # Δ VS BASELINE the same way, after the cursor, IDENTITY, STATUS and SIZE (36 cells).
+    private def trial_delta_width(w : Int32, widest : Int32) : Int32
+      elastic_width(w - 36 - VERDICT_W, widest, "Δ VS BASELINE")
+    end
+
+    private def elastic_width(room : Int32, widest : Int32, header : String) : Int32
+      { {widest, Screen.draw_width(header)}.max, {room, 8}.max }.min
     end
 
     # One column, cut and padded to `w` DISPLAY COLUMNS — never characters. The rows here are

@@ -27,6 +27,19 @@ describe Gori::Cvss do
     sev.should eq(Gori::Store::Severity::High)
   end
 
+  # NVD's v2 calculator renders its vector wrapped in parentheses, so that is the form an
+  # operator copying a score out of a CVE record has on the clipboard. gori refused it until
+  # cvss.cr 0.3.0; the parentheses are notation, not part of the vector, and the canonical
+  # form gori stores drops them.
+  it "resolves a parenthesised CVSS v2.0 vector into the bare canonical vector" do
+    res = Gori::Cvss.resolve("(AV:N/AC:L/Au:N/C:P/I:P/A:P)")
+    res.should_not be_nil
+    score, sev, canonical = res.not_nil!
+    score.should eq(7.5)
+    sev.should eq(Gori::Store::Severity::High)
+    canonical.should eq("AV:N/AC:L/Au:N/C:P/I:P/A:P")
+  end
+
   it "resolves numeric scores across severity bands" do
     Gori::Cvss.severity_for("0.0").should eq(Gori::Store::Severity::Info)
     Gori::Cvss.severity_for("0").should eq(Gori::Store::Severity::Info)
@@ -85,5 +98,14 @@ describe Gori::Cvss do
     Gori::Cvss.resolve("NaN").should be_nil
     Gori::Cvss.resolve("Infinity").should be_nil
     Gori::Cvss.resolve("-Infinity").should be_nil
+  end
+end
+
+# The vector grammar is PCRE, which raises on invalid UTF-8; a stored one broke every list.
+describe "Gori::Cvss on invalid UTF-8" do
+  it "reads it as no vector instead of raising" do
+    bad = String.new(Bytes[0x43, 0x56, 0x53, 0x53, 0x3a, 0x33, 0x2e, 0x31, 0x2f, 0xff])
+    Gori::Cvss.parse(bad).should be_nil
+    Gori::Cvss.read(bad).should be_nil
   end
 end

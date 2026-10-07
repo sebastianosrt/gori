@@ -1,6 +1,7 @@
 require "json"
 require "../../env"
 require "../../store"
+require "../../plural"
 
 module Gori
   module MCP
@@ -97,8 +98,14 @@ module Gori
         return [] of String if raw == masked
         prefix = Settings.env_prefix
         return [] of String if prefix.empty?
-        Env.masking_vars.keys
-          .select { |n| masked.includes?("#{prefix}#{n}") && !raw.includes?("#{prefix}#{n}") }
+        # `masking_table`, not a name list: a name can exist in BOTH namespaces and the two are
+        # different secrets with different spellings, so the test has to be the spelling
+        # `mask_secrets` would have written.
+        Env.masking_table
+          .map { |(ref, _)| {ref, Env.spell(ref)} }
+          .select { |(_, spelled)| masked.includes?(spelled) && !raw.includes?(spelled) }
+          .map { |(ref, _)| Env.report_name(ref) }
+          .uniq!
           .sort!
       end
 
@@ -112,9 +119,8 @@ module Gori
       # acting on the wrong tab is how an audit trail gets polluted.
       #
       # It is a RANK, not an address, and no tool here accepts it as a selector. It shifts on
-      # every create, delete and move; `repeaters.id` is itself REUSED after a top-of-space
-      # delete (`Store#delete_repeater` documents why that matters), so a caller acting on a
-      # remembered number could reach a session it never read. `id` stays the only address.
+      # every create, delete and move, so a caller acting on a remembered number could reach
+      # a session it never read. `id` stays the only address (never reused since V40).
       #
       # Unsaved and ephemeral sub-tabs (a gRPC or split-decode duplicate, `db_id == nil`) have
       # no row at all; `reconcile` sorts them after every saved one, so they never shift these.
@@ -218,7 +224,26 @@ module Gori
         FlowSeed.new(target, request, built.http2, built.rewrote_request_line)
       end
 
-      @[Tool("create_repeater", gated: true, agent_action: true)]
+      # The unterminated-head marker (#1075), on every MCP payload that reports a repeater
+      # request — the two writes (`create_repeater`, `update_repeater`), the session emitter
+      # `get_repeater_context` lists through, and `send_request`'s result.
+      #
+      # One emitter so the FIELD NAMES cannot drift across four payloads: an agent that learns
+      # to read `head_unterminated` on a create must find the same key on the listing it polls
+      # afterwards, or the marker is only as good as the surface it was first seen on. The
+      # predicate is the caller's, because "is this row malformed" (`CLI::Run.unterminated_head?`,
+      # which owns the WebSocket exemption) and "are these wire bytes malformed" are two
+      # different questions and the answer must come from whichever one the caller holds.
+      #
+      # Absent — not `false` — when the head is fine, so an untouched workbench serialises
+      # exactly the payload it always did.
+      private def emit_head_unterminated(j : JSON::Builder, unterminated : Bool) : Nil
+        return unless unterminated
+        j.field "head_unterminated", true
+        j.field "head_unterminated_note", CLI::Run.unterminated_head_note
+      end
+
+      @[Tool("create_repeater", gated: true, agent_action: true, permission: "write")]
       private def create_repeater(h) : Result
         issue_id = int(h, "issue_id")
         return Result.new(id_error(h, "issue_id"), is_error: true) if issue_id.nil? && present?(h, "issue_id")
@@ -231,11 +256,32 @@ module Gori
         # traversal payload, or a binary body. A JSON string reaches the store as its UTF-8
         # encoding, so those bytes could previously only arrive via a Burp XML file on disk.
         request = base64_str(h, "request_base64") || str(h, "request")
+        # `curl` is the third way to hand a request in (#1244): a copied curl command, parsed by
+        # the importer every surface shares, which also answers `target` (the URL's origin) and
+        # `http2` (curl's --http2) unless those are given. A second request source beside it
+        # would have to lose silently, so it is refused like the CLI's pair of sources is.
+        curl_req = nil.as(Import::Curl::Request?)
+        if curl_text = str(h, "curl")
+          if request
+            return Result.new("pass 'curl' or 'request'/'request_base64', not both — each one is the whole request",
+              is_error: true)
+          end
+          curl_req = Import::Curl.parse_one(curl_text)
+          request = curl_req.text
+          target = curl_req.origin if target.nil? || target.empty?
+        end
 
         if issue_id
           issue = store.get_issue(issue_id)
           return not_found("no issue with id #{issue_id}") unless issue
           if fid = issue.flow_id
+            # Two sources for one seed are refused, as `curl` beside `request` is above: taking
+            # the issue's flow over the caller's silently changed which capture the session holds
+            # and links as evidence.
+            if flow_id && flow_id != fid
+              return err("issue #{issue_id} is linked to flow #{fid}, not flow #{flow_id} — pass " \
+                         "'issue_id' or 'flow_id', not two different seeds", "INVALID_ARGUMENT", field: "flow_id")
+            end
             flow_id = fid
           elsif target.nil? || target.empty? || request.nil? || request.empty?
             return Result.new("issue #{issue_id} has no associated flow_id", is_error: true)
@@ -273,8 +319,22 @@ module Gori
           ws_messages_override = seed.ws_messages
           notice_rows_dropped = seed.notice_rows_dropped
         end
-        return Result.new("missing required 'target'", is_error: true) if target.nil? || target.empty?
-        return Result.new("missing required 'request'", is_error: true) if request.nil? || request.empty?
+        http2 = curl_req.http2? if curl_req && http2_val.nil?
+        # Neither is required ON ITS OWN — four sources answer them (a flow, an issue's flow, a
+        # curl command, or the pair spelled out) — so the refusal names all four rather than
+        # sending an agent that called with nothing to add a `target` and fail on `request`.
+        if (target.nil? || target.empty?) && (request.nil? || request.empty?)
+          return err("nothing to seed the repeater from: pass flow_id, issue_id, curl, or target + request",
+            "INVALID_ARGUMENT", field: "flow_id")
+        end
+        if target.nil? || target.empty?
+          return err("missing 'target' (the origin to send to, e.g. https://host) beside 'request' — " \
+                     "or seed from flow_id, issue_id or curl instead", "INVALID_ARGUMENT", field: "target")
+        end
+        if request.nil? || request.empty?
+          return err("missing 'request' (the raw HTTP request) beside 'target' — " \
+                     "or seed from flow_id, issue_id or curl instead", "INVALID_ARGUMENT", field: "request")
+        end
 
         sni = str(h, "sni")
 
@@ -394,10 +454,20 @@ module Gori
             # session no longer carries the absolute-form line, so this is the only record
             # that it was ever there.
             j.field "request_line_rewritten", true if rewrote_request_line
+            # Over `request` — the bytes just stored — and not a re-read of the row: the
+            # report describes this write. `ws_http_only` is read off the same argument the
+            # insert above used, so the exemption and the row agree.
+            emit_head_unterminated(j, CLI::Run.unterminated_head?(request.to_slice,
+              ws_http_only: bool_arg(h, "ws_http_only", false), http2: http2))
             emit_secrets_masked(j, request, masked_request, target, masked_target)
             # How many frames were actually stored, so an agent authoring a multi-frame
             # sequence can assert on it rather than take the count on trust.
             j.field "ws_out_message_count", ws_count if ws_count
+            # What the curl command said that the session does not carry (its transport flags,
+            # a path curl would have collapsed), masked like every other echoed string here.
+            if (c = curl_req) && !c.notes.empty?
+              j.field "curl_notes", c.notes.map { |n| Env.mask_secrets(n) }
+            end
             # Only when it FIRED. The seed holds fewer frames than the capture, and a count
             # an agent asserts on has to come with the reason it is short.
             if notice_rows_dropped > 0
@@ -560,7 +630,7 @@ module Gori
         Settings.tls_preset_normalize(raw)
       end
 
-      @[Tool("update_repeater", gated: true, agent_action: true)]
+      @[Tool("update_repeater", gated: true, agent_action: true, permission: "write")]
       private def update_repeater(h) : Result
         id = int(h, "id")
         return Result.new("missing or invalid required 'id'", is_error: true) unless id
@@ -662,6 +732,11 @@ module Gori
             j.field "position", existing.position
             repeater_tui_index(id).try { |n| j.field "tui_index", n }
             j.field "ws_out_message_count", ws_count if ws_count
+            # The write door `create_repeater`'s notice would otherwise leave open: this tool
+            # replaces the stored request wholesale, so a session created well-formed can
+            # become unterminated here and nothing else on this reply would say so.
+            emit_head_unterminated(j, CLI::Run.unterminated_head?(request.to_slice,
+              ws_http_only: ws_http_only, http2: http2))
             emit_secrets_masked(j, request, masked_request, target, masked_target)
             # `flow_id` is unchanged by this write, and it is not a label: the TUI turns it
             # into `RepeaterView#evidence?`, which suppresses `$NAME` expansion because a
@@ -675,7 +750,7 @@ module Gori
               j.field "derived_from_flow_note",
                 "repeater #{id} is still linked to flow #{fid}, but its request no longer holds that " \
                 "flow's bytes — the TUI reads that link as \"these bytes are a capture\" and sends " \
-                "$NAME literally there"
+                "#{Env.spell("NAME", Env::Namespace::Bind)} literally there"
             end
           end
         })
@@ -683,7 +758,7 @@ module Gori
         Result.new(ex.message || "invalid repeater arguments", is_error: true)
       end
 
-      @[Tool("delete_repeater", gated: true, agent_action: true)]
+      @[Tool("delete_repeater", gated: true, agent_action: true, permission: "write")]
       private def delete_repeater(h) : Result
         id = int(h, "id")
         return Result.new("missing or invalid required 'id'", is_error: true) unless id
@@ -737,11 +812,7 @@ module Gori
         j.field("order") do
           j.array do
             rows.each_with_index do |r, i|
-              j.object do
-                j.field "id", r.id
-                j.field "tui_index", i + 1
-                j.field "name", r.name || ""
-              end
+              {id: r.id, tui_index: i + 1, name: r.name || ""}.to_json(j)
             end
           end
         end
@@ -791,7 +862,7 @@ module Gori
         missing = ids.reject { |i| by_id.has_key?(i) }
         unless missing.empty?
           return err("no repeater with id #{missing.join(", ")} — NOTHING was changed. " \
-                     "Ids are per-project and are REUSED after a session is deleted, so re-read them " \
+                     "Ids are per-project and a deleted session's id is never reissued, so re-read them " \
                      "from get_repeater_context rather than replaying a remembered list",
             "NOT_FOUND", field: key,
             details: JSON.parse({"missing" => missing}.to_json))
@@ -806,10 +877,9 @@ module Gori
       # narrow: it is a DESTINATION, not a selector. A stale `to_index` puts the tab somewhere
       # else; a stale index in `id`'s place would act on a different session entirely, which is
       # why `id` stays a database id everywhere (see `repeater_tui_index`).
-      @[Tool("move_repeater", gated: true, agent_action: true)]
+      @[Tool("move_repeater", gated: true, agent_action: true, permission: "write")]
       private def move_repeater(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
+        id = required_id(h, "id")
 
         rows = store.repeaters_mcp
         from = repeater_tui_index(id, rows)
@@ -826,8 +896,7 @@ module Gori
 
         target =
           if has_to
-            to = int(h, "to_index")
-            return Result.new(id_error(h, "to_index"), is_error: true) unless to
+            to = required_id(h, "to_index")
             # REFUSED, not clamped. A clamp would move the tab somewhere other than where the
             # call named, report success, and leave the caller's model of the strip wrong.
             unless 1 <= to <= rows.size
@@ -889,7 +958,7 @@ module Gori
       # Every flow is checked to EXIST before the first insert (`flow_row`, the row-only probe
       # — `get_flow` materialises both BLOBs and is read one flow at a time inside the loop, so
       # a long list never holds every response in memory at once).
-      @[Tool("create_repeaters", gated: true, agent_action: true)]
+      @[Tool("create_repeaters", gated: true, agent_action: true, permission: "write")]
       private def create_repeaters(h) : Result
         flow_ids = id_list_arg(h, "flow_ids")
         if flow_ids.empty?
@@ -914,7 +983,7 @@ module Gori
         name_prefix = str(h, "name_prefix").try { |v| Env.mask_secrets(v) }
         tags = present?(h, "tags") ? repeater_tags_arg(h) : nil
 
-        created = [] of {Int64, Int64, String?, Bool, Int32}
+        created = [] of {Int64, Int64, String?, Bool, Int32, Array(String)}
         failed = [] of {Int64, String}
         pos = store.next_repeater_position
 
@@ -943,14 +1012,22 @@ module Gori
           # Named off the bytes just stored, not off a re-read of the row: the round trip
           # would answer the same thing and cost a query, and it would have to assert the row
           # it just inserted is there.
+          #
+          # Each write answers whether it committed, and one that did not is NAMED on the row
+          # (`unsaved`) rather than reported as saved — `create_repeater` and the CLI check the
+          # same three. The session itself did commit, so it stays under `created`.
           name = name_prefix.try { |pre| "#{pre}#{Repeater::SubtabFilter::Subject.summary_of(seed.request)}" }
-          store.set_repeater_name(id, name) if name
-          store.set_repeater_tags(id, tags) if tags
-          if (msgs = seed.ws_messages) && !msgs.empty?
-            store.update_repeater_ws_messages(id, msgs)
+          unsaved = [] of String
+          if name && !store.set_repeater_name(id, name)
+            unsaved << "name"
+            name = nil
+          end
+          unsaved << "tags" if tags && !store.set_repeater_tags(id, tags)
+          if (msgs = seed.ws_messages) && !msgs.empty? && !store.update_repeater_ws_messages(id, msgs)
+            unsaved << "ws_messages"
           end
           created << {fid, id, name, seed.rewrote_request_line,
-                      seed.notice_rows_dropped}
+                      seed.notice_rows_dropped, unsaved}
         end
 
         rows = store.repeaters_mcp
@@ -959,7 +1036,7 @@ module Gori
             j.field "created_count", created.size
             j.field("created") do
               j.array do
-                created.each do |(fid, id, name, rewrote, dropped)|
+                created.each do |(fid, id, name, rewrote, dropped, unsaved)|
                   j.object do
                     j.field "flow_id", fid
                     j.field "id", id
@@ -967,6 +1044,11 @@ module Gori
                     repeater_tui_index(id, rows).try { |n| j.field "tui_index", n }
                     j.field "request_line_rewritten", true if rewrote
                     j.field "ws_notice_rows_dropped", dropped if dropped > 0
+                    unless unsaved.empty?
+                      j.field "unsaved", unsaved
+                      j.field "unsaved_note", "the session committed but these did not (store busy or unwritable) — " \
+                                              "set them with update_repeater"
+                    end
                   end
                 end
               end
@@ -994,7 +1076,7 @@ module Gori
       # the workbench holds now, and a session created since the listing would be deleted
       # without ever having been read. Narrow the listing (`get_repeater_context{filter}`),
       # then pass the ids it returned.
-      @[Tool("delete_repeaters", gated: true, agent_action: true)]
+      @[Tool("delete_repeaters", gated: true, agent_action: true, permission: "write")]
       private def delete_repeaters(h) : Result
         sel = repeater_bulk_selection(h, "ids")
         return sel if sel.is_a?(Result)
@@ -1043,7 +1125,7 @@ module Gori
             end
             unless failed.empty?
               j.field "failed" { j.array { failed.each { |id| j.number id } } }
-              j.field "note", "#{failed.size} session#{failed.size == 1 ? "" : "s"} could NOT be deleted " \
+              j.field "note", "#{Gori.plural(failed.size, "session")} could NOT be deleted " \
                               "(store busy or unwritable) and #{failed.size == 1 ? "is" : "are"} unchanged; " \
                               "the ones under deleted are gone — retry only the failed ids"
             end
@@ -1061,7 +1143,7 @@ module Gori
       # transport flags and WebSocket frames — a bulk tool that could reach those would let one
       # call change what many sessions PUT ON THE WIRE, and no per-id report makes that
       # reviewable. Everything this writes is a caption the strip paints.
-      @[Tool("update_repeaters", gated: true, agent_action: true)]
+      @[Tool("update_repeaters", gated: true, agent_action: true, permission: "write")]
       private def update_repeaters(h) : Result
         sel = repeater_bulk_selection(h, "ids")
         return sel if sel.is_a?(Result)
@@ -1133,7 +1215,7 @@ module Gori
             end
             if (mats = updated.count { |(_, _, _, m)| m }) > 0
               j.field "name_materialised_note",
-                "#{mats} session#{mats == 1 ? "" : "s"} had no stored name, so the affix was applied to the " \
+                "#{Gori.plural(mats, "session")} had no stored name, so the affix was applied to the " \
                 "label gori derives from the request line and that label is now STORED — it no longer " \
                 "follows the request if you edit it"
             end
@@ -1164,9 +1246,11 @@ module Gori
           "OR ('flow_id') OR ('issue_id'). The reply carries both 'id' (the durable database id, " \
           "which every tool here takes) and 'tui_index' (the 1-based number the TUI paints on the " \
           "sub-tab chip, which is what the operator says out loud). To seed many tabs from one " \
-          "import, use create_repeaters." do |s|
+          "import, use create_repeaters. A copied curl command can stand in for 'target' and " \
+          "'request': pass it as 'curl'." do |s|
           s.field "target", strprop("absolute target URL (scheme+host+optional port), e.g. https://api.example.com")
-          s.field "request", strprop("verbatim raw HTTP request bytes/text")
+          s.field "curl", strprop("a curl command to build the request from (curl's own flag meanings: -b is a cookie, -d a body). Supplies 'target' (the URL's origin) and 'http2' (curl's --http2) unless given; transport flags (-k, -x, -L…) are ignored and listed in curl_notes. Exclusive with 'request'/'request_base64'")
+          s.field "request", strprop(%(verbatim raw HTTP request bytes/text — stored byte-for-byte and never repaired or refused, because a malformed request is a legitimate thing to send. A head with no blank-line terminator is therefore kept (and is what shell $(...) leaves behind, since it strips trailing newlines); the reply, get_repeater_context and send_request all carry head_unterminated:true for such a session))
           s.field "request_base64", strprop("the raw HTTP request as base64 — the byte-exact form; use it when the request carries an octet a JSON string cannot (0x00, 0x80-0xFF, invalid UTF-8, a binary body). Overrides 'request'")
           s.field "http2", boolprop("use HTTP/2 (default false)")
           s.field "auto_content_length", boolprop("auto-calculate Content-Length header (default true)")
@@ -1187,9 +1271,9 @@ module Gori
           "Update an existing repeater tab's properties by database id — including the request " \
           "bytes, target and transport flags. To re-label several tabs at once (tags and name " \
           "affixes only) use update_repeaters." do |s|
-          s.field "id", intprop("repeater DATABASE id — not the number on the TUI sub-tab chip. get_repeater_context returns both, as 'db_id' and 'tui_index'"), required: true
+          s.field "id", intprop("repeater DATABASE id — not the number on the TUI sub-tab chip. get_repeater_context returns both, as 'id' and 'tui_index'"), required: true
           s.field "target", strprop("absolute target URL")
-          s.field "request", strprop("verbatim raw HTTP request")
+          s.field "request", strprop(%(verbatim raw HTTP request bytes/text — stored byte-for-byte and never repaired or refused, because a malformed request is a legitimate thing to send. A head with no blank-line terminator is therefore kept (and is what shell $(...) leaves behind, since it strips trailing newlines); the reply, get_repeater_context and send_request all carry head_unterminated:true for such a session))
           s.field "request_base64", strprop("the raw HTTP request as base64 — the byte-exact form (see create_repeater). Overrides 'request'")
           s.field "http2", boolprop("use HTTP/2")
           s.field "auto_content_length", boolprop("auto-calculate Content-Length")
@@ -1239,7 +1323,7 @@ module Gori
           "never a filter: narrow the listing with get_repeater_context{filter} first and pass " \
           "the ids it returned, so the set you read and the set destroyed are the same set. If " \
           "any id is unknown the whole call is refused and nothing is deleted. Cannot be undone." do |s|
-          s.field "ids", id_list_prop("repeater DATABASE ids to delete (get_repeater_context returns them as 'db_id'). An array of integers, a single integer, or a comma list. At most #{MCP_REPEATER_BULK_MAX} per call"), required: true
+          s.field "ids", id_list_prop("repeater DATABASE ids to delete (get_repeater_context returns them as 'id'). An array of integers, a single integer, or a comma list. At most #{MCP_REPEATER_BULK_MAX} per call"), required: true
           s.field "confirm", boolprop("must be true to actually delete; anything else refuses and reports the count"), required: true
         end
 

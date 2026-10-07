@@ -130,36 +130,58 @@ describe "ProjectView DESCRIPTION scrolling" do
       view.desc_scroll(100) # wheel to the bottom
       b2 = MemoryBackend.new(120, 30)
       view.render(Screen.new(b2), rect, focused: true)
-      b2.contains?("desc40").should be_true      # the tail scrolled into view
-      b2.contains?("desc01").should be_false     # the head scrolled off
-      b2.contains?("DESCRIPTION").should be_true # the card frame is intact (content stayed bounded)
+      b2.contains?("desc40").should be_true       # the tail scrolled into view
+      b2.contains?("desc01").should be_false      # the head scrolled off
+      b2.contains?("╭").should be_true            # the card frame is intact (content stayed bounded)
+      b2.contains?("DESCRIPTION").should be_false # the chip strip names the pane; the card does not
     end
   end
 end
 
 describe "ProjectView DESCRIPTION insert mode" do
-  # Arriving at the DESCRIPTION sub-tab must land in READ mode, where the arrows navigate;
-  # only a click INSIDE the card opens the editor. That is the regression the sub-tab
-  # promotion fixed — selecting the chip used to route through desc_click_to_cursor and drop
-  # straight into INS, where ←/→ became caret movement with no way back out to the strip.
-  it "only enters INS from a click inside its own card" do
+  # Arriving at the DESCRIPTION sub-tab must land in READ mode, where the arrows navigate.
+  # That is the regression the sub-tab promotion fixed — selecting the chip used to route
+  # through desc_click_to_cursor and drop straight into INS, where ←/→ became caret movement
+  # with no way back out to the strip.
+  #
+  # #1124 finished the job: NO pointer gesture enters INS any more. A click aims the caret in
+  # whichever mode the card is already in — arming the editor here meant the next bare letter
+  # was typed rather than run, so a `y` meant as copy put a `y` in the description, over
+  # whatever was selected. `i` / ↵ and the NOR/INS chip are the ways in.
+  it "aims the caret from a click inside its own card, and never enters INS" do
     with_store do |store|
       view = ProjectView.new(Gori::Scope.load(store), Gori::HostOverrides.load(store))
-      view.replace_desc("one\ntwo")
+      view.replace_desc("one\ntwo\nthree")
       rect = Rect.new(0, 0, 120, 30)
       view.render(Screen.new(MemoryBackend.new(120, 30)), rect, focused: true)
       view.pane.should eq(:desc)
       view.desc_insert_mode?.should be_false # the tab opens on DESCRIPTION, in READ
+      inner = view.desc_card_rect(rect).not_nil!.inset(1, 1)
 
       view.focus_pane(:scope) # another sub-tab is showing…
       view.render(Screen.new(MemoryBackend.new(120, 30)), rect, focused: true)
-      view.desc_click_to_cursor(rect, rect.x + 2, rect.y + 14)
-      view.desc_insert_mode?.should be_false # …so a click in the body can't reach the editor
+      view.desc_click_to_cursor(rect, inner.x, inner.y + 1)
+      # …so a click on those cells can't reach the editor at all: the caret has not moved.
+      view.desc_copy_text.should eq("one")
 
       view.focus_pane(:desc)
       view.render(Screen.new(MemoryBackend.new(120, 30)), rect, focused: true)
-      view.desc_click_to_cursor(rect, rect.x + 2, rect.y + 14)
+      view.desc_click_to_cursor(rect, inner.x, inner.y + 1)
+      view.desc_insert_mode?.should be_false
+      view.desc_copy_text.should eq("two") # READ's `y` with no band: the caret LINE
+
+      # A double-click takes the word IN READ, which is exactly what `y` then copies.
+      view.desc_select_word(rect, inner.x + 1, inner.y + 2).should be_true
+      view.desc_insert_mode?.should be_false
+      view.desc_selection?.should be_true
+      view.desc_copy_text.should eq("three")
+
+      # And once INS is on, the same gestures drive the editor's own caret and selection.
+      view.enter_desc_insert!
+      view.desc_click_to_cursor(rect, inner.x, inner.y + 1)
       view.desc_insert_mode?.should be_true
+      view.desc_select_word(rect, inner.x + 1, inner.y + 1).should be_true
+      view.desc_copy_text.should eq("two")
     end
   end
 end
@@ -186,6 +208,41 @@ describe "ProjectView created time" do
       File.delete?(path)
       File.delete?("#{path}-wal")
       File.delete?("#{path}-shm")
+    end
+  end
+end
+
+describe "ProjectView created time out of range" do
+  # An imported HAR dated `9999-12-31T23:59:59-23:59` stored an instant past year 9999, and
+  # `reload` — which the Runner calls before its tick loop can absorb a raise — read it back
+  # through `Time.unix`: the project could not be opened at all.
+  it "opens a project whose earliest flow is outside the years Time can hold" do
+    {253_402_387_139_000_000_i64, -62_135_683_140_000_000_i64}.each do |us|
+      with_store do |store|
+        store.insert_flow(Gori::Store::CapturedRequest.new(
+          created_at: us, scheme: "http", host: "h.test", port: 80,
+          method: "GET", target: "/", http_version: "HTTP/1.1",
+          head: "GET / HTTP/1.1\r\nHost: h.test\r\n\r\n".to_slice, body: nil, source: Gori::FlowSource::Kind::Proxy))
+        project = Gori::Project.new("t", File.tempname("gori-projview-range"))
+        view = ProjectView.new(Gori::Scope.load(store), Gori::HostOverrides.load(store))
+        view.reload(project, store)
+        b = MemoryBackend.new(120, 30)
+        view.render(Screen.new(b), Rect.new(0, 0, 120, 30), focused: false)
+      end
+    end
+  end
+end
+
+describe "ProjectView first-run signpost" do
+  # The line used to name three steps and clipped at 80 columns. It now carries the one step
+  # that needs no setup and points at History's card for the rest, whole at 80.
+  it "fits whole on an 80-column terminal" do
+    with_store do |store|
+      view = ProjectView.new(Gori::Scope.load(store), Gori::HostOverrides.load(store))
+      view.reload(Gori::Project.new("t", File.tempname("gori-first-run")), store)
+      b = MemoryBackend.new(76, 20) # the tab body an 80x24 terminal gives the view
+      view.render(Screen.new(b), Rect.new(0, 0, 76, 20), focused: false)
+      b.contains?("▸ first run — ^P → Open browser, or see History").should be_true
     end
   end
 end
@@ -353,10 +410,11 @@ describe "ProjectView PROJECT SETTINGS pane" do
       view.focus_pane(:settings) # the body shows one card at a time now
       b = MemoryBackend.new(120, 30)
       view.render(Screen.new(b), Rect.new(0, 0, 120, 30), focused: true)
-      # The card title follows the chip, not the first thing that was ever put in the card:
-      # it holds the scope lens, the sandbox, the network fields and (#823) the project's
+      # The card carries NO border title — the chip strip one row above already names the pane,
+      # and repeating it shouted the same word twice in two rows. What identifies this pane is
+      # its content: the scope lens, the sandbox, the network fields and (#823) the project's
       # `.proto` schema path.
-      b.contains?("PROJECT SETTINGS").should be_true
+      b.contains?("PROJECT SETTINGS").should be_false
       # The chip strip still names every sub-tab. Title Case since the strips were unified:
       # four of the six in gori already read `Findings`/`Callbacks`/`Sitemap`, and this one
       # shouted while the Rewriter's whispered — the renderer draws labels verbatim.
@@ -495,7 +553,7 @@ describe "ProjectView PROJECT SETTINGS pane" do
       view.settings_dirty?.should be_false                             # fresh, inherited pane
 
       view.select_setting(3) # Bind Port (row 0 lens, 1 sandbox, 2 bind IP, 3 bind port)
-      view.settings_scope_row?.should be_false
+      view.@set_sel.should_not eq(Gori::Tui::ProjectView::SETTINGS_SCOPE_ROW)
       view.settings_sandbox_row?.should be_false
       view.settings_text_row?.should be_true
       view.set_input('9')
@@ -685,6 +743,77 @@ describe "ProjectView SCOPE pane" do
 
       view.commit_scope_rule("exclude", "host", "b2.test", id).should eq(:ok)
       view.selected_rule.try(&.pattern).should eq("b2.test")
+    end
+  end
+end
+
+# The DESCRIPTION's READ selection is an anchor into the text it was made in. `replace_desc`
+# (`^E`) and `reload` on a project switch replace that text in place, and the band used to
+# survive both — painted over the new description, with `y` copying characters the operator
+# never selected. The drop is `TextReadState#bind`'s; the `@desc_dirty` guard on `reload`
+# is untouched, so an unsaved buffer keeps its text AND its band.
+private def with_desc_project(&)
+  dir = File.tempname("gori-desc-read")
+  Dir.mkdir_p(dir)
+  path = File.join(dir, "gori.db")
+  store = Gori::Store.open(path)
+  begin
+    yield store, Gori::Project.new("p", path)
+  ensure
+    store.close rescue nil
+    FileUtils.rm_rf(dir)
+  end
+end
+
+describe "ProjectView DESCRIPTION READ selection across a document hand-over" do
+  # A view on the DESCRIPTION card with "beta" selected in READ — a band that does not start
+  # at the origin, so a re-seeded caret landing on (0, 0) cannot collapse it by accident.
+  seeded = ->(store : Gori::Store, project : Gori::Project) do
+    store.set_setting(ProjectView::DESC_KEY, "alpha beta gamma")
+    view = ProjectView.new(Gori::Scope.load(store), Gori::HostOverrides.load(store))
+    view.reload(project, store)
+    view.focus_pane(:desc)
+    view.desc_read_move(0, 6)
+    view.desc_read_move(0, 4, selecting: true)
+    view.desc_selection?.should be_true
+    view.desc_copy_text.should eq("beta")
+    view
+  end
+
+  it "drops the band when ^E hands a different text back" do
+    with_desc_project do |store, project|
+      view = seeded.call(store, project)
+      view.replace_desc("zzzzzzzzzzzzzzzzzzzz")
+      view.desc_selection?.should be_false
+      view.desc_copy_text.should eq("zzzzzzzzzzzzzzzzzzzz")
+    end
+  end
+
+  it "drops the band when a reload seeds a different stored description" do
+    with_desc_project do |store, project|
+      view = seeded.call(store, project)
+      store.set_setting(ProjectView::DESC_KEY, "zzzzzzzzzzzzzzzzzzzz")
+      view.reload(project, store)
+      view.desc_text.should eq("zzzzzzzzzzzzzzzzzzzz")
+      view.desc_selection?.should be_false
+      view.desc_copy_text.should eq("zzzzzzzzzzzzzzzzzzzz")
+    end
+  end
+
+  it "keeps an unsaved buffer, and its band, across a reload" do
+    with_desc_project do |store, project|
+      view = seeded.call(store, project)
+      view.enter_desc_insert!
+      view.insert('!') # dirty; typed at the caret, which the band left at column 10
+      view.exit_desc_insert!
+      view.desc_read_move(0, -99)
+      view.desc_read_move(0, 6)
+      view.desc_read_move(0, 4, selecting: true)
+      store.set_setting(ProjectView::DESC_KEY, "zzzzzzzzzzzzzzzzzzzz")
+      view.reload(project, store)
+      view.desc_text.should eq("alpha beta! gamma")
+      view.desc_selection?.should be_true
+      view.desc_copy_text.should eq("beta")
     end
   end
 end

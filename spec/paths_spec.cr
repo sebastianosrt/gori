@@ -22,6 +22,7 @@ end
 describe Gori::Paths do
   describe ".ensure_dir" do
     it "creates a missing directory at 0700" do
+      posix_only!("POSIX mode bits")
       with_tmp_dir do |dir|
         fresh = File.join(dir, "made", "by", "gori")
         Gori::Paths.ensure_dir(fresh)
@@ -30,6 +31,7 @@ describe Gori::Paths do
     end
 
     it "tightens a pre-existing loose directory by default" do
+      posix_only!("POSIX mode bits")
       with_tmp_dir do |dir|
         # An 0755 tree from an install that predates DIR_MODE.
         File.chmod(dir, 0o755)
@@ -42,6 +44,7 @@ describe Gori::Paths do
     # ~/dotfiles to 0700, and a relative `--config gori.json` did it to the working
     # directory.
     it "leaves a pre-existing directory's mode alone with tighten: false" do
+      posix_only!("POSIX mode bits")
       with_tmp_dir do |dir|
         File.chmod(dir, 0o755)
         Gori::Paths.ensure_dir(dir, tighten: false)
@@ -52,6 +55,7 @@ describe Gori::Paths do
     # Not owning a directory it FINDS does not mean not owning one it MAKES: an intermediate
     # gori has to create for the config file is still gori's, so it is created locked.
     it "still creates a missing directory at 0700 with tighten: false" do
+      posix_only!("POSIX mode bits")
       with_tmp_dir do |dir|
         File.chmod(dir, 0o755)
         nested = File.join(dir, "profiles")
@@ -88,6 +92,69 @@ describe Gori::Paths do
           Gori::Paths.ensure_dir(occupied, tighten: false)
         end
       end
+    end
+  end
+end
+
+# `Gori::Error` is the project's EXPECTED-error type, and `CLI.run` rescues exactly that to
+# print one actionable line — anything else reaches the top of the process as a Crystal
+# backtrace. `Paths.ensure_dirs` is the FIRST thing `gori tutorial` and `gori wizard` do, so a
+# $GORI_HOME that cannot be created met the operator with eleven frames of Dir#mkdir_p before
+# either command had drawn anything.
+describe Gori::Paths do
+  describe ".ensure_dir failure reporting" do
+    it "reports an unwritable parent as a Gori::Error, not a File::Error" do
+      posix_only!("a read-only directory (Windows has no directory write bit)")
+      with_tmp_dir do |dir|
+        locked = File.join(dir, "locked")
+        Dir.mkdir(locked, 0o500) # readable + traversable, NOT writable
+        begin
+          ex = expect_raises(Gori::Error) do
+            Gori::Paths.ensure_dir(File.join(locked, "gori"))
+          end
+          # …and it still names the path, which is the whole point of raising it here rather
+          # than letting the first write downstream report it.
+          ex.message.to_s.should contain("gori")
+        ensure
+          File.chmod(locked, 0o700) # so the tmp dir can be torn down
+        end
+      end
+    end
+
+    # The pre-existing conversion, unchanged by the one above: File::AlreadyExistsError covers
+    # BOTH "another instance won the race" and "a plain FILE occupies this path", and only the
+    # second is an error — so it must not be swallowed by the new File::Error arm.
+    it "still reports a file in the directory's place" do
+      with_tmp_dir do |dir|
+        occupied = File.join(dir, "notes.txt")
+        File.write(occupied, "")
+        ex = expect_raises(Gori::Error) { Gori::Paths.ensure_dir(occupied) }
+        ex.message.to_s.should contain("not a directory")
+      end
+    end
+
+    # And the benign race still is one: a directory that already exists is a no-op, not a raise.
+    it "does not raise when the directory is already there" do
+      with_tmp_dir do |dir|
+        Gori::Paths.ensure_dir(dir)
+        Gori::Paths.ensure_dir(dir)
+      end
+    end
+  end
+end
+
+describe Gori::Paths do
+  # `File::SEPARATOR` is `/` everywhere, but a joined or resolved Windows path separates with `\`:
+  # the archive's protected-destination check and map-local's confinement both ask this.
+  describe ".within?" do
+    it "takes either separator, and never a sibling that merely shares the prefix" do
+      dir = File.join(Dir.tempdir, "gori-within")
+      Gori::Paths.within?(dir, dir).should be_true
+      Gori::Paths.within?(File.join(dir, "a", "b.db"), dir).should be_true
+      Gori::Paths.within?("#{dir}/a", dir).should be_true
+      Gori::Paths.within?(File.join(dir, "a"), "#{dir}/").should be_true
+      Gori::Paths.within?("#{dir}-other", dir).should be_false
+      Gori::Paths.within?(File.join("#{dir}-other", "a"), dir).should be_false
     end
   end
 end

@@ -26,16 +26,17 @@ build:
 nix-build:
     nix build .#gori
 
-# Regenerate nix/shards.nix from shard.lock (run it alongside any dependency change).
-# crystal2nix takes no path arguments: it reads ./shard.lock and writes ./shards.nix,
-# so the file is moved into nix/ afterwards — that is where flake.nix reads it from.
+# Regenerate packaging/nix/shards.nix from shard.lock (run it alongside any dependency
+# change). crystal2nix takes no path arguments: it reads ./shard.lock and writes
+# ./shards.nix, so the file is moved into packaging/nix/ afterwards — that is where
+# flake.nix reads it from.
 [group('build')]
 nix-shards:
     nix run nixpkgs#crystal2nix
-    mv shards.nix nix/shards.nix
+    mv shards.nix packaging/nix/shards.nix
 
-# Verify nix/shards.nix still pins what shard.lock does — the check that makes the
-# recipe above mandatory rather than customary. Forgetting it is silent: the flake
+# Verify packaging/nix/shards.nix still pins what shard.lock does — the check that makes
+# the recipe above mandatory rather than customary. Forgetting it is silent: the flake
 # keeps building the OLD revisions and `nix build` stays green. Reads the two files
 # directly, so unlike `nix-build` it needs neither Nix nor the network, which is why
 # CI can afford to run it on every PR.
@@ -45,17 +46,17 @@ nix-shards-check:
 
 # Nothing builds the image on a PR any more — ci.yml dropped its `build-docker`
 # job, and publish-ghcr.yml only runs on a push to `main` — so this recipe is the
-# pre-merge check that docker/Dockerfile still compiles.
+# pre-merge check that packaging/docker/Dockerfile still compiles.
 #
 # BuildKit is pinned because the ignore list lives at
-# `docker/Dockerfile.dockerignore`: only BuildKit reads a Dockerfile-adjacent
+# `packaging/docker/Dockerfile.dockerignore`: only BuildKit reads a Dockerfile-adjacent
 # one. The classic builder looks for `.dockerignore` in the context root, finds
 # none, and ships `bin/`, `lib/` and `.git/` into the build context instead.
 
 # Build the container image locally (host arch only).
 [group('docker')]
 docker-build tag="gori:dev":
-    DOCKER_BUILDKIT=1 docker build -f docker/Dockerfile -t {{tag}} .
+    DOCKER_BUILDKIT=1 docker build -f packaging/docker/Dockerfile -t {{tag}} .
 
 # Bare, it starts the TUI, which needs the TTY `-it` gives it; state lives in the
 # `gori` volume so the CA survives a run. Trailing args pick a headless
@@ -66,7 +67,30 @@ docker-build tag="gori:dev":
 docker-run tag="gori:dev" *args:
     docker run --rm -it -v gori:/data {{tag}} {{args}}
 
-# Run all tests. `--no-debug` because the suite is one 7,000-unit binary whose compile the
+# Apple's `container` (macOS 26+, Apple Silicon) reads the same Dockerfile and takes
+# the same flags as the two recipes above, so these mirror them rather than reshaping
+# anything: `-v gori:/data` auto-creates the named volume, and `-it` gives the TUI its
+# terminal. Its ignore-file rule is the STRICTER half of the note above — it looks for
+# `packaging/docker/Dockerfile.dockerignore` and nothing else, never falling back to a
+# context-root `.dockerignore` the way BuildKit does.
+#
+# Two more differences worth knowing. The builder runs in its own VM, which does not
+# inherit the host's HTTP_PROXY and defaults to 2 CPUs / 2048 MB, where a `--release`
+# build of gori runs well over an hour — `container builder stop && container builder
+# start --cpus 8 --memory 8g` before the first one is worth the detour. And every container gets its own vmnet IP, so publishing a
+# port is optional — `container ls` prints the address to point a client at instead.
+
+# Build the container image with Apple's `container` (macOS 26+).
+[group('docker')]
+container-build tag="gori:dev":
+    container build -f packaging/docker/Dockerfile -t {{tag}} .
+
+# Run the image `container-build` produced.
+[group('docker')]
+container-run tag="gori:dev" *args:
+    container run --rm -it -v gori:/data {{tag}} {{args}}
+
+# Run all tests. `--no-debug` because the suite is one ~17,700-example binary whose compile the
 # object cache barely helps (~35 s warm), and skipping DWARF takes ~17% off that. What it
 # costs: an UNEXPECTED exception's backtrace shows mangled names without file:line —
 # assertion failures still print `# spec/x_spec.cr:LINE`. CI keeps debug info (ci.yml).
@@ -79,8 +103,9 @@ test:
     crystal spec --no-debug
 
 # Run the specs that mirror what changed against BASE (scripts/spec_for_changes.sh) —
-# the pre-flight before `just test`: a change's own specs compile in 3–9 s where the
-# whole suite takes ~35 s. `just test-changed HEAD` covers uncommitted edits only.
+# the fast path used before `just test` and by CI for localized pull requests. A change's
+# own specs compile in 3–9 s where the whole suite takes ~35 s. `just test-changed HEAD`
+# covers uncommitted edits only; shared-source changes deliberately return the whole suite.
 [group('development')]
 test-changed base="origin/main":
     #!/usr/bin/env bash
@@ -90,9 +115,9 @@ test-changed base="origin/main":
     echo "$files" | sed 's/^/  /'
     crystal spec --no-debug $files
 
-# Run the spec files CI's matrix gives one runner, e.g. `just test-shard 2` for the
-# third of four. The partition is a function of the tree (scripts/spec_shard.sh), so
-# this reproduces exactly what a red shard in Actions ran — CI calls the same script.
+# Run one full-suite spec shard locally, e.g. `just test-shard 2` for the third of four.
+# CI's full path calls the same tree-derived partition script. Localized PRs use
+# `just test-changed` instead and do not enter this matrix.
 
 # Run one CI spec shard locally (INDEX is 0-based).
 [group('development')]
@@ -178,7 +203,7 @@ fix:
     lib/ameba/bin/ameba.cr --fix
 
 # Check that every version-bearing file agrees: shard.yml, src/gori.cr,
-# snap/snapcraft.yaml, aur/PKGBUILD and the spec assertion.
+# snap/snapcraft.yaml, packaging/aur/PKGBUILD and the spec assertion.
 [group('version')]
 version-check:
     crystal run scripts/version_check.cr
@@ -205,6 +230,16 @@ benchmark-check:
 benchmark:
     crystal build bench/proxy_bench.cr -o bin/proxy_bench --release
     ./bin/proxy_bench
+
+# Type-check every program in scripts/ without generating code.
+#
+# The sibling of `benchmark-check`, against the same silent rot: nothing else compiles
+# these, and `seed_demo.cr` — the demo database every manual TUI pass starts from — sat
+# unbuildable on main for four call sites' worth of an argument that grew in #1047. The CI
+# `benchmarks` job runs the SAME script.
+[group('development')]
+scripts-check:
+    scripts/script_check.sh
 
 # Seed the local "demo" project with a varied dataset for the TUI to explore.
 [group('demo')]

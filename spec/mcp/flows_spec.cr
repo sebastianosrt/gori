@@ -1,5 +1,17 @@
 require "../spec_helper"
 require "../support/mcp_harness"
+require "../../src/gori/tui/tab_controller"
+
+# The zero-arg call every get_current_context example makes.
+private CONTEXT_CALL = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_current_context","arguments":{}}})
+
+private def mcp_drive_with_filter(store, filter : Gori::MCP::ToolFilter, *lines) : Array(JSON::Any)
+  input = IO::Memory.new(lines.join('\n') + "\n")
+  output = IO::Memory.new
+  Gori::MCP::Server.new(store, allow_actions: true, verify_upstream: true,
+    tool_filter: filter, input: input, output: output).run
+  output.to_s.each_line.reject(&.strip.empty?).map { |line| JSON.parse(line) }.to_a
+end
 
 private def gzip_bytes(text : String) : Bytes
   io = IO::Memory.new
@@ -20,7 +32,7 @@ describe Gori::MCP::Server do
       end
     end
 
-    # `flows.id` is a REUSABLE rowid, so a clear restarts numbering and a forward cursor held
+    # `flows.id` was a REUSABLE rowid until V39, so a clear restarted numbering and a forward cursor held
     # from before it is permanently ahead of every row. `since` then returned `[]` forever
     # while the rows sat right there — "no new flows" and "your cursor is stranded" were the
     # same answer, and an agent polling this feed simply went blind.
@@ -28,6 +40,7 @@ describe Gori::MCP::Server do
       with_store do |store|
         3.times { |i| mcp_seed_flow(store, "h.test", "GET", "/p#{i}", 200) }
         store.clear_flows
+        reissue_rowids(store)
         fresh = mcp_seed_flow(store, "h.test", "GET", "/after-clear", 200)
         fresh.should eq(1) # ids really do restart — that is what strands the cursor
 
@@ -35,8 +48,49 @@ describe Gori::MCP::Server do
         resp = mcp_drive(store, call)[0]
         resp["result"]["isError"].as_bool.should be_true
         text = resp["result"]["content"][0]["text"].as_s
-        text.should contain("ahead of the newest flow")
+        text.should contain("ahead of every flow id this project has issued (1)")
         text.should contain("since=0")
+      end
+    end
+
+    # Since V39 an id is never reissued, so a cursor at the newest flow stays good through a
+    # delete of that flow or a clear: the next capture lands above it. Refusing it sent a tailing
+    # agent back to since=0 to re-read everything it had already seen.
+    it "keeps tailing from a cursor whose flow was deleted, or across a clear" do
+      with_store do |store|
+        3.times { |i| mcp_seed_flow(store, "h.test", "GET", "/p#{i}", 200) }
+        top = store.max_flow_id.not_nil!
+        store.delete_flow(top).should be_true
+        tail = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_history","arguments":{"since":#{top}}}})
+        mcp_tool_payload(mcp_drive(store, tail)[0])["flows"].as_a.should be_empty
+
+        store.clear_flows.should be_true
+        mcp_tool_payload(mcp_drive(store, tail)[0])["flows"].as_a.should be_empty
+        fresh = mcp_seed_flow(store, "h.test", "GET", "/after-clear", 200)
+        mcp_tool_payload(mcp_drive(store, tail)[0])["flows"].as_a.map(&.["id"].as_i64).should eq([fresh])
+      end
+    end
+
+    it "rejects a 'since' cursor beyond every id the project has issued, even when it is empty" do
+      with_store do |store|
+        3.times { |i| mcp_seed_flow(store, "h.test", "GET", "/p#{i}", 200) }
+        store.clear_flows.should be_true
+
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_history","arguments":{"since":22}}})
+        resp = mcp_drive(store, call)[0]
+        resp["result"]["isError"].as_bool.should be_true
+        text = resp["result"]["content"][0]["text"].as_s
+        text.should contain("ahead of every flow id this project has issued (3)")
+        text.should contain("since=0")
+      end
+    end
+
+    it "rejects a nonzero 'since' cursor on a project that never captured a flow" do
+      with_store do |store|
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_history","arguments":{"since":1}}})
+        resp = mcp_drive(store, call)[0]
+        resp["result"]["isError"].as_bool.should be_true
+        resp["result"]["content"][0]["text"].as_s.should contain("ahead of every flow id this project has issued (0)")
       end
     end
 
@@ -99,6 +153,53 @@ describe Gori::MCP::Server do
       end
     end
 
+    it "hide_static leaves out images, fonts and media, and composes with the rest" do
+      with_store do |store|
+        api = mcp_seed_flow(store, "a.test", "GET", "/api/me", 200, content_type: "application/json")
+        mcp_seed_flow(store, "a.test", "GET", "/logo", 200, content_type: "image/png")
+        mcp_seed_flow(store, "a.test", "GET", "/f.woff2", 304) # no Content-Type: by extension
+        gone = mcp_seed_flow(store, "a.test", "GET", "/gone.png", 404, content_type: "image/png")
+
+        call = ->(args : String) {
+          req = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_history","arguments":#{args}}})
+          mcp_tool_payload(mcp_drive(store, req)[0])
+        }
+        call.call(%({})).["flows"].as_a.size.should eq(4)
+        call.call(%({"hide_static":true})).["flows"].as_a.map(&.["id"].as_i64).should eq([gone, api])
+        call.call(%({"hide_static":true,"query":"status:200"})).["flows"].as_a.map(&.["id"].as_i64).should eq([api])
+        # An explicit id set is narrowed too, and says what did it.
+        named = call.call(%({"hide_static":true,"ids":[#{api},#{api + 1}]}))
+        named["filtered_out_ids"].as_a.map(&.as_i64).should eq([api + 1])
+        named["filtered_out_note"].as_s.should contain("hide_static")
+      end
+    end
+
+    it "returns a pending image before advancing the hide_static since cursor" do
+      with_store do |store|
+        prior = mcp_seed_flow(store, "a.test", "GET", "/prior", 200)
+        pending = store.insert_flow(Gori::Store::CapturedRequest.new(
+          created_at: 1_i64, scheme: "https", host: "a.test", port: 443, method: "GET",
+          target: "/uploads/avatar.png", http_version: "HTTP/1.1",
+          head: "GET /uploads/avatar.png HTTP/1.1\r\nHost: a.test\r\n\r\n".to_slice,
+          body: nil, source: Gori::FlowSource::Kind::Proxy))
+        api = mcp_seed_flow(store, "a.test", "GET", "/api", 200)
+
+        call = ->(since : Int64) {
+          req = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_history","arguments":{"hide_static":true,"since":#{since},"limit":10}}})
+          mcp_tool_payload(mcp_drive(store, req)[0])
+        }
+        first = call.call(prior)
+        first["flows"].as_a.map(&.["id"].as_i64).should eq([pending, api])
+        cursor = first["next_since"].as_i64
+
+        store.update_response(Gori::Store::CapturedResponse.new(
+          flow_id: pending, status: 200, content_type: "text/html",
+          head: "HTTP/1.1 200 OK\r\n\r\n".to_slice))
+        follow_up = call.call(cursor)
+        follow_up["flows"].as_a.map(&.["id"].as_i64).should_not contain(pending)
+      end
+    end
+
     it "in_scope composes with a QL query" do
       with_store do |store|
         mcp_seed_flow(store, "alpha.test", "GET", "/a", 200)
@@ -121,6 +222,33 @@ describe Gori::MCP::Server do
   end
 
   describe "get_flow" do
+    # The same `interim` / `interim_omitted` pair `gori run show --format json` emits; each head
+    # redacted like `response_head`, since a 1xx is a header block like any other.
+    it "lists the interim 1xx heads that preceded the response, redacted like response_head" do
+      with_store do |store|
+        id = mcp_seed_flow(store, "ex.test", "GET", "/page", 200)
+        interims = Gori::Store::Interims.new
+        interims.add(103, "HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\nSet-Cookie: sid=secret\r\n\r\n".to_slice)
+        store.update_response(Gori::Store::CapturedResponse.new(flow_id: id, status: 200,
+          head: "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_slice, interims: interims))
+        plain = mcp_seed_flow(store, "ex.test", "GET", "/plain", 200)
+
+        call = %({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"get_flow","arguments":{"id":#{id}}}})
+        payload = mcp_tool_payload(mcp_drive(store, call)[0])
+        entries = payload["interim"].as_a
+        entries.size.should eq(1)
+        entries[0]["status"].as_i.should eq(103)
+        entries[0]["relayed"].as_bool.should be_true
+        entries[0]["head"].as_s.should contain("Link: </a.css>; rel=preload")
+        entries[0]["head"].as_s.should_not contain("secret")
+        payload["interim_omitted"]?.should be_nil
+        payload["response_head"].as_s.should start_with("HTTP/1.1 200 OK")
+
+        call = %({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_flow","arguments":{"id":#{plain}}}})
+        mcp_tool_payload(mcp_drive(store, call)[0])["interim"]?.should be_nil
+      end
+    end
+
     it "decodes a gzip response body to text" do
       with_store do |store|
         id = mcp_seed_flow(store, "ex.test", "GET", "/", 200,
@@ -277,6 +405,66 @@ describe Gori::MCP::Server do
     end
   end
 
+  # One `Tools` keeps the last decoded body between pages instead of inflating it again for
+  # each. What must not change: the pages still tile the decoded body exactly, a second body
+  # interleaved between them is its own, and an id that is deleted and handed to a new flow
+  # pages the NEW flow's bytes — the memo is keyed on the stored bytes, not on the id.
+  describe "get_response_body_chunk sequential paging" do
+    page = ->(tools : Gori::MCP::Tools, id : Int64, offset : Int64) do
+      mcp_ok_json(tools, "get_response_body_chunk", %({"flow_id":#{id},"offset":#{offset},"limit":1000}))
+    end
+
+    it "tiles a compressed body exactly, page after page, with another body interleaved" do
+      with_store do |store|
+        text_a = String.build { |io| 900.times { |i| io << "row " << i << " ã\n" } }
+        text_b = "other body " * 300
+        head = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n"
+        a = mcp_seed_flow(store, "ex.test", "GET", "/a", 200, resp_head: head, resp_body: gzip_bytes(text_a))
+        b = mcp_seed_flow(store, "ex.test", "GET", "/b", 200, resp_head: head, resp_body: gzip_bytes(text_b))
+        tools = tools_for(store, allow_actions: false)
+        got_a = IO::Memory.new
+        got_b = IO::Memory.new
+        off_a = 0_i64
+        off_b = 0_i64
+        done_a = done_b = false
+        until done_a && done_b
+          unless done_a
+            p = page.call(tools, a, off_a)
+            p["representation"].as_s.should eq("decoded")
+            p["total_bytes"].as_i64.should eq(text_a.bytesize)
+            # A page boundary can split the 2-byte ã, and such a page comes back as base64.
+            got_a.write(p["encoding"].as_s == "base64" ? Base64.decode(p["base64"].as_s) : p["text"].as_s.to_slice)
+            off_a = p["next_offset"].as_i64? || off_a
+            done_a = p["complete"].as_bool
+          end
+          unless done_b
+            p = page.call(tools, b, off_b)
+            got_b << p["text"].as_s
+            off_b = p["next_offset"].as_i64? || off_b
+            done_b = p["complete"].as_bool
+          end
+        end
+        got_a.to_s.should eq(text_a)
+        got_b.to_s.should eq(text_b)
+      end
+    end
+
+    it "pages the new flow's bytes after the id it memoized is deleted and reused" do
+      with_store do |store|
+        head = "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n"
+        old_id = mcp_seed_flow(store, "ex.test", "GET", "/old", 200, resp_head: head, resp_body: gzip_bytes("OLD " * 1000))
+        tools = tools_for(store, allow_actions: false)
+        page.call(tools, old_id, 0_i64)["text"].as_s.should start_with("OLD OLD")
+        # Deleted OUTSIDE this Tools (the TUI, another agent): nothing clears the memo.
+        store.delete_flow(old_id).should be_true
+        reissue_rowids(store)
+        new_id = mcp_seed_flow(store, "ex.test", "GET", "/new", 200, resp_head: head, resp_body: gzip_bytes("NEW " * 1000))
+        new_id.should eq(old_id) # the pre-V39 allocator, handing the max id out again
+        page.call(tools, new_id, 1000_i64)["text"].as_s.should start_with("NEW NEW")
+      end
+    end
+  end
+
   describe "get_response_body_chunk offset validation" do
     it "flags an out-of-range offset instead of silently clamping" do
       with_store do |store|
@@ -391,6 +579,16 @@ describe Gori::MCP::Server do
     end
   end
 
+  it "list_sitemap hide_static leaves static endpoints out of the map" do
+    with_store do |store|
+      mcp_seed_flow(store, "a.test", "GET", "/api/me", 200, content_type: "application/json")
+      mcp_seed_flow(store, "a.test", "GET", "/logo.png", 200, content_type: "image/png")
+      req = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_sitemap","arguments":{"hide_static":true}}})
+      entries = mcp_tool_payload(mcp_drive(store, req)[0])["entries"].as_a
+      entries.map(&.["target"].as_s).should eq(["/api/me"])
+    end
+  end
+
   describe "list_sitemap query folding" do
     it "folds the query variants of one path into a single entry, summing their counts" do
       with_store do |store|
@@ -467,6 +665,127 @@ describe Gori::MCP::Server do
         payload["active_tab"].as_s.should eq("history")
       end
     end
+
+    # The operator's selection (#1091). The TUI owns this schema and the tool relays it
+    # verbatim, so these examples seed the row by hand — which is also how the read side gets
+    # covered without a TUI process in the loop.
+    it "relays the selection and names the call that turns it into data" do
+      with_store do |store|
+        store.set_setting(Gori::Store::UI_STATE_KEY, %({"active_tab":"history","selection":) +
+                                                     %({"kind":"flow","ids":[7,9],"target_source":"marks","marked_count":2,"truncated":false}}))
+        payload = mcp_tool_payload(mcp_drive(store, CONTEXT_CALL)[0])
+        payload["selection"]["ids"].as_a.map(&.as_i64).should eq([7_i64, 9_i64])
+        payload["selection"]["target_source"].as_s.should eq("marks")
+        # Only History has a one-call form, and saying so beats an agent discovering it by
+        # calling get_flow once per id.
+        payload["selection_next_call"].as_s.should contain("list_history{ids")
+      end
+    end
+
+    it "honors excluded intercept readers and does not suggest a hidden tool" do
+      with_store do |store|
+        store.set_setting(Gori::Store::UI_STATE_KEY, %({"active_tab":"intercept","selection":) +
+                                                     %({"kind":"intercept_item","ids":[7],"target_source":"cursor","marked_count":0,"truncated":false}}))
+        filter = Gori::MCP::ToolFilter.parse("get_current_context,-intercept_get,-intercept_list",
+          Gori::MCP::Tools::TOOL_NAMES, Gori::MCP::Tools::TOOL_DEPENDENCIES).as(Gori::MCP::ToolFilter)
+        responses = mcp_drive_with_filter(store, filter,
+          %({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+          %({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_current_context","arguments":{}}}),
+          %({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"intercept_get","arguments":{"item_id":7,"include_sensitive":true}}}))
+
+        listed = responses[0]["result"]["tools"].as_a.map(&.["name"].as_s)
+        listed.should contain("get_current_context")
+        listed.should_not contain("intercept_get")
+        listed.should_not contain("intercept_list")
+
+        context = mcp_tool_payload(responses[1])
+        context["selection_next_call"].as_s.should contain("intercept_get is not exposed")
+        context["selection_next_call"].as_s.should contain("cannot be read through MCP")
+
+        responses[2]["error"]["message"].as_s.should contain("not served by this gori MCP server")
+      end
+    end
+
+    it "points to list previews when full intercept detail is excluded" do
+      with_store do |store|
+        store.set_setting(Gori::Store::UI_STATE_KEY, %({"active_tab":"intercept","selection":) +
+                                                     %({"kind":"intercept_item","ids":[7],"target_source":"cursor","marked_count":0,"truncated":false}}))
+        filter = Gori::MCP::ToolFilter.parse("get_current_context,intercept_list,-intercept_get",
+          Gori::MCP::Tools::TOOL_NAMES, Gori::MCP::Tools::TOOL_DEPENDENCIES).as(Gori::MCP::ToolFilter)
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_current_context","arguments":{}}})
+        payload = mcp_tool_payload(mcp_drive_with_filter(store, filter, call)[0])
+        payload["selection_next_call"].as_s.should contain("intercept_list can show this item's preview and metadata")
+        payload["selection_next_call"].as_s.should contain("full detail is unavailable")
+      end
+    end
+
+    it "points a sitemap selection at the query that reaches its traffic" do
+      with_store do |store|
+        store.set_setting(Gori::Store::UI_STATE_KEY, %({"active_tab":"target","selection":) +
+                                                     %({"kind":"sitemap_node","nodes":[{"host":"a.test","path":"/v1"}],"marked_count":1}}))
+        payload = mcp_tool_payload(mcp_drive(store, CONTEXT_CALL)[0])
+        # These are NOT flow ids and the payload must never let that be guessed.
+        payload["selection"].as_h.has_key?("ids").should be_false
+        payload["selection_next_call"].as_s.should contain("SITEMAP NODES")
+      end
+    end
+
+    it "carries marks the operator left on a tab they are not looking at" do
+      with_store do |store|
+        store.set_setting(Gori::Store::UI_STATE_KEY, %({"active_tab":"repeater",) +
+                                                     %("marks_elsewhere":[{"tab":"history","kind":"flow","marked_count":4}]}))
+        payload = mcp_tool_payload(mcp_drive(store, CONTEXT_CALL)[0])
+        row = payload["marks_elsewhere"].as_a.first
+        row["tab"].as_s.should eq("history")
+        row["marked_count"].as_i.should eq(4)
+      end
+    end
+
+    it "says a row predating the selection channel has none, rather than inventing one" do
+      with_store do |store|
+        store.set_setting(Gori::Store::UI_STATE_KEY, %({"active_tab":"history","focus_pane":"body"}))
+        payload = mcp_tool_payload(mcp_drive(store, CONTEXT_CALL)[0])
+        payload["available"].as_bool.should be_true
+        payload.as_h.has_key?("selection").should be_false
+        payload.as_h.has_key?("selection_next_call").should be_false
+      end
+    end
+
+    it "degrades a malformed selection instead of failing the whole call" do
+      with_store do |store|
+        # A row written by a future gori, a half-written one, or outside interference. Every
+        # field here is read through `.try(&.as_*?)`, and the block is relayed as data — none
+        # of it may reach a cast error.
+        store.set_setting(Gori::Store::UI_STATE_KEY, %({"active_tab":"history","selection":[1,2,3]}))
+        resp = mcp_drive(store, CONTEXT_CALL)[0]
+        resp["result"]["isError"]?.try(&.as_bool?).should_not be_true
+        mcp_tool_payload(resp)["available"].as_bool.should be_true
+
+        store.set_setting(Gori::Store::UI_STATE_KEY, %({"active_tab":"history","selection":{"kind":42,"ids":"nope"}}))
+        resp = mcp_drive(store, CONTEXT_CALL)[0]
+        resp["result"]["isError"]?.try(&.as_bool?).should_not be_true
+        # An unrecognised kind simply gets no next-call line; it never guesses one.
+        mcp_tool_payload(resp).as_h.has_key?("selection_next_call").should be_false
+      end
+    end
+
+    it "answers `unknown` rather than `false` when it cannot look for a window" do
+      with_store do |store|
+        # This harness binds no db_path, which is the shape a `--db :memory:` or an
+        # unbound-then-bound server has. "I cannot see" and "nobody is there" are different
+        # answers and only one of them is safe to act on — the same rule `holds_capture`
+        # follows by being omitted rather than guessed.
+        payload = mcp_tool_payload(mcp_drive(store, CONTEXT_CALL)[0])
+        payload["tui"]["unknown"].as_bool.should be_true
+        payload["tui"].as_h.has_key?("live").should be_false
+      end
+    end
+
+    it "keeps a relayed History selection fetchable in ONE list_history call" do
+      # The promise `selection_next_call` makes. Two constants in two files, and the wrong
+      # drift turns "here is the set you marked" into "here is part of it".
+      (Gori::Tui::TabController::SELECTION_ID_CAP <= Gori::MCP::Tools::MCP_HISTORY_IDS_MAX).should be_true
+    end
   end
 
   describe "project_info" do
@@ -495,6 +814,36 @@ describe Gori::MCP::Server do
           payload = mcp_tool_payload(mcp_drive(store, call)[0])
           payload["count"].as_i.should eq(2)
           store.count.should eq(2)
+        ensure
+          File.delete?(path)
+        end
+      end
+    end
+
+    it "imports local OpenAPI refs through the shared importer" do
+      with_store do |store|
+        path = File.tempname("gori-mcp-import", ".json")
+        File.write(path, <<-JSON)
+          {
+            "openapi": "3.0.3",
+            "info": {"title": "t", "version": "1"},
+            "servers": [{"url": "https://api.example.test"}],
+            "components": {"parameters": {
+              "UserId": {"name": "id", "in": "path", "required": true,
+                         "schema": {"type": "integer"}}
+            }},
+            "paths": {"/users/{id}": {
+              "parameters": [{"$ref": "#/components/parameters/UserId"}],
+              "get": {"responses": {"200": {"description": "ok"}}}
+            }}
+          }
+          JSON
+        begin
+          call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"import_flows","arguments":{"kind":"oas","path":#{path.to_json}}}})
+          payload = mcp_tool_payload(mcp_drive(store, call)[0])
+          payload["count"].as_i.should eq(1)
+          detail = store.get_flow(store.recent_flows(1).first.id).not_nil!
+          detail.row.target.should eq("/users/1")
         ensure
           File.delete?(path)
         end
@@ -534,6 +883,84 @@ describe Gori::MCP::Server do
         resp["structuredContent"]["field"].as_s.should eq("kind")
         # The message enumerates the kinds; an agent that guessed wrong gets the real list.
         resp["content"][0]["text"].as_s.should contain("postman")
+        # …and it quotes back the value it refused, so the agent can see it was READ.
+        resp["content"][0]["text"].as_s.should contain(%("csv"))
+      end
+    end
+
+    # ABSENT and WRONG are two different mistakes, and only one of them has a value to look
+    # at again. "invalid 'kind'" for an argument that was never sent reads as a rejected
+    # value, which an agent answers by re-spelling the one it did send — `path` one line down
+    # in the same handler has always said this correctly.
+    it "says an omitted kind is MISSING, not invalid" do
+      with_store do |store|
+        call = %({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"import_flows","arguments":{"path":"/tmp/x"}}})
+        resp = mcp_drive(store, call)[0]["result"]
+        resp["isError"].as_bool.should be_true
+        resp["structuredContent"]["field"].as_s.should eq("kind")
+        text = resp["content"][0]["text"].as_s
+        text.should contain("missing required 'kind'")
+        text.should contain("har")
+      end
+    end
+
+    # #1244 — an agent holds a copied curl command as a string; `text` takes it directly.
+    it "imports curl text into History, one flow per request, with curl's meaning of -b" do
+      with_store do |store|
+        tools = tools_for(store)
+        text = "curl 'https://a.test/p' -b 'sid=1' -k -d 'x=1' ;\ncurl https://a.test/q"
+        payload = mcp_ok_json(tools, "import_flows", {kind: "curl", text: text}.to_json)
+        payload["count"].as_i.should eq(2)
+        payload.as_h.has_key?("path").should be_false
+        payload["notes"].as_a.map(&.as_s).join.should contain("-k")
+        flows = store.recent_flows(2).map { |f| store.get_flow(f.id).not_nil! }
+        post = flows.find! { |f| f.row.method == "POST" }
+        String.new(post.request_head).should contain("Cookie: sid=1\r\n")
+        post.request_body.not_nil!.should eq("x=1".to_slice)
+        post.row.host.should eq("a.test")
+      end
+    end
+
+    it "imports a curl command from a file" do
+      with_store do |store|
+        path = File.tempname("gori-mcp-import", ".sh")
+        File.write(path, "curl https://a.test/from-file\n")
+        begin
+          payload = mcp_ok_json(tools_for(store), "import_flows", {kind: "curl", path: path}.to_json)
+          payload["count"].as_i.should eq(1)
+        ensure
+          File.delete?(path)
+        end
+      end
+    end
+
+    it "refuses curl text that cannot become a request, with the importer's reason" do
+      with_store do |store|
+        r = tools_for(store).call("import_flows", JSON.parse({kind: "curl", text: "curl -d @body.json https://a.test/"}.to_json))
+        r.is_error.should be_true
+        r.text.should contain("local file")
+        store.count.should eq(0)
+      end
+    end
+
+    it "takes 'text' for any kind, and not beside 'path'" do
+      with_store do |store|
+        tools = tools_for(store)
+        # #1395: a HAR handed in as text is parsed (here: refused as malformed JSON), and no
+        # message names the temp file it was staged in.
+        r = tools.call("import_flows", JSON.parse({kind: "har", text: "x"}.to_json))
+        r.is_error.should be_true
+        r.text.should contain("not valid JSON")
+        r.text.should_not contain("gori-import")
+        r = tools.call("import_flows", JSON.parse({kind: "curl", text: "curl https://a.test/", path: "/tmp/x"}.to_json))
+        r.is_error.should be_true
+        r.text.should contain("not both")
+        # A blank `text` beside a path is absent, not a second source.
+        blank = tools.call("import_flows", JSON.parse({kind: "urls", path: "/nonexistent/x.txt", text: ""}.to_json))
+        blank.text.should_not contain("not both")
+        r = tools.call("import_flows", JSON.parse({kind: "curl"}.to_json))
+        r.is_error.should be_true
+        r.text.should contain("'path' or 'text'")
       end
     end
 
@@ -567,7 +994,7 @@ describe "MCP sitemap tags" do
       res = mcp_ok_json(tools, "set_sitemap_tag", %({"host":"acme.test","path":"/login?a=1","tag":"auth entry"}))
       res["tag"].as_s.should eq("auth entry")
 
-      tags = mcp_ok_json(tools, "list_sitemap_tags", "{}").as_a
+      tags = mcp_ok_json(tools, "list_sitemap_tags", "{}")["items"].as_a
       tags.size.should eq(1)
       tags.first["path"].as_s.should eq("/login?a=1")
 
@@ -585,7 +1012,7 @@ describe "MCP sitemap tags" do
       unfolded["tag"].as_s.should eq("auth entry")
 
       mcp_ok_json(tools, "set_sitemap_tag", %({"host":"acme.test","path":"/login?a=1"}))["cleared"].as_bool.should be_true
-      mcp_ok_json(tools, "list_sitemap_tags", "{}").as_a.empty?.should be_true
+      mcp_ok_json(tools, "list_sitemap_tags", "{}")["items"].as_a.empty?.should be_true
     end
   end
 
@@ -656,6 +1083,9 @@ describe "MCP get_current_context" do
       # A duplicate key is first/last-wins by parser and rejected outright by strict ones,
       # so count the RAW text — JSON.parse would silently collapse it.
       raw.scan(/"project":/).size.should eq 1
+      # The two keys #1091 added sit beside it and must not double either.
+      raw.scan(/"selection":/).size.should eq 0 # this row carries none
+      raw.scan(/"tui":/).size.should eq 1
       JSON.parse(raw)["project"].as_s.should eq "acme"
       JSON.parse(raw)["active_tab"].as_s.should eq "history"
     end

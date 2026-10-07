@@ -251,6 +251,7 @@ describe Gori::Tui::DecoderController do
     # `exec:` conversion the project open had held then ran its command the moment the tab
     # was pressed, and a selection left in OUTPUT was thrown away by a round trip elsewhere.
     it "neither runs a held exec: step nor disturbs the OUTPUT caret" do
+      posix_only!("exec:/bin/cat")
       with_decoder_host do |host|
         seed = DecoderController.new(host)
         seed.input_area.set_text("hi")
@@ -268,9 +269,9 @@ describe Gori::Tui::DecoderController do
         dc.focus_last                # OUTPUT
         dc.handle_body_key(key(Termisu::Input::Key::Down))
         dc.handle_body_key(shift(Termisu::Input::Key::Down))
-        dc.decoder_selection_active?.should be_true
+        dc.selection_active?.should be_true
         dc.on_enter
-        dc.decoder_selection_active?.should be_true
+        dc.selection_active?.should be_true
       end
     end
   end
@@ -280,7 +281,7 @@ describe Gori::Tui::DecoderController do
       with_decoder_host do |host|
         dc = DecoderController.new(host)
         dc.input_area.set_text("one\ntwo")
-        dc.handle_body_key(key(Termisu::Input::Key::LowerI, char: 'i')) # INS
+        dc.editor_enter_insert.should be_true # `i` is editor.insert; the shell calls this seam
         dc.handle_body_key(shift(Termisu::Input::Key::Down))
         dc.input_area.selection?.should be_true
         dc.goto_symbol.should eq :decoder_input # ⇧↓ on the last line stayed put
@@ -294,7 +295,7 @@ describe Gori::Tui::DecoderController do
         dc = DecoderController.new(host)
         dc.input_area.set_text("one\ntwo")
         dc.handle_body_key(shift(Termisu::Input::Key::Down))
-        dc.decoder_selection_active?.should be_true
+        dc.selection_active?.should be_true
         dc.handle_body_key(shift(Termisu::Input::Key::Down)) # already on the last line
         dc.goto_symbol.should eq :decoder_input
         dc.handle_body_key(shift(Termisu::Input::Key::Up))
@@ -335,6 +336,7 @@ describe Gori::Tui::DecoderController do
     # The re-derive withheld hooks for EVERY session, the one on screen included — so the
     # ^S that saved a chain replaced the decode the operator was reading with "chain held".
     it "keeps running the ACTIVE conversion's exec: step" do
+      posix_only!("exec:/bin/cat")
       with_decoder_host do |host|
         Gori::Settings.decoder_chains = [] of {String, String}
         dc = DecoderController.new(host)
@@ -373,6 +375,7 @@ describe Gori::Tui::DecoderController do
     end
 
     it "does not run the active conversation's exec: step for a gesture made elsewhere" do
+      posix_only!("exec:/bin/cat")
       with_decoder_host do |host|
         Gori::Settings.decoder_chains = [] of {String, String}
         dc = DecoderController.new(host)
@@ -390,6 +393,7 @@ describe Gori::Tui::DecoderController do
     end
 
     it "leaves a conversation no library edit can affect exactly as it is" do
+      posix_only!("exec:/bin/cat")
       with_decoder_host do |host|
         Gori::Settings.decoder_chains = [] of {String, String}
         dc = DecoderController.new(host)

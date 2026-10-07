@@ -8,6 +8,22 @@ require "../proxy/h2/head_codec" # PROTOCOL_MARKER — see FlowDetail#websocket?
 
 module Gori
   class Store
+    # Gives a stored enum its `label` (the lowercase member name) and that label's EXACT inverse
+    # (`from_label?`, or the name `parse:` gives). Called right after the enum, since an enum body
+    # cannot hold a macro call. Exact on purpose: stdlib `Enum.parse?` is case-insensitive and would widen which stored Rewriter
+    # labels count as known (`addheader` must stay inert — `MatchRule#inert?`).
+    macro lowercase_label(type, parse = from_label?)
+      enum {{ type }}
+        def label : String
+          to_s.downcase
+        end
+
+        def self.{{ parse.id }}(s : String) : {{ type }}?
+          values.find { |v| v.label == s }
+        end
+      end
+    end
+
     # Lifecycle of a captured flow. Stored as the enum value (INTEGER).
     enum FlowState
       Pending  # request captured, response not yet received
@@ -64,6 +80,10 @@ module Gori
       # client's own program). NOT "unknown".
       getter source_surface : FlowSource::Surface?
       getter source_ref : String?
+      # The request as the client sent it, when the operator EDITED it at Intercept before
+      # forwarding (#1378): `head`/`body` above are the edited bytes that went upstream, this is
+      # what they replaced. nil for every flow nobody edited. See the V44 migration.
+      getter intercept_original : Bytes?
 
       def initialize(@created_at, @scheme, @host, @port, @method, @target,
                      @http_version, @head, @body = nil,
@@ -72,7 +92,8 @@ module Gori
                      @h2_conn_id = nil, @h2_stream_id = nil, @short_circuited = false,
                      @advisory = nil, @connect_protocol = nil,
                      *, @source : FlowSource::Kind,
-                     @source_surface : FlowSource::Surface? = nil, @source_ref : String? = nil)
+                     @source_surface : FlowSource::Surface? = nil, @source_ref : String? = nil,
+                     @intercept_original : Bytes? = nil)
       end
     end
 
@@ -98,12 +119,119 @@ module Gori
       # — a response-side advisory has to be able to leave the request side's alone, so
       # `Store#update_one` only writes the column when this is non-nil.
       getter advisory : String?
+      # The interim 1xx responses the origin sent before `head`, or nil when it sent none —
+      # which is nearly every exchange. See `Interims`.
+      getter interims : Interims?
 
       def initialize(@flow_id, @status, @head, @body = nil, @reason = nil,
                      @content_type = nil, @ttfb_us = nil, @duration_us = nil,
                      @state = FlowState::Complete, @error = nil,
                      @body_truncated = false, @body_size = nil, @content_encoding = nil,
-                     @advisory = nil)
+                     @advisory = nil, @interims = nil)
+      end
+    end
+
+    # The interim (1xx) responses an origin sent before a flow's final one (RFC 9110 §15.2):
+    # a `100 Continue`, a `103 Early Hints`. The proxy relays each to the client byte-exact and
+    # reads on for the final response, and until this was kept the capture held only that final
+    # head — no surface could tell an interim had been sent at all.
+    #
+    # Stored beside the flow (`flow_interims`, V45), in wire order, and NOT prepended to
+    # `response_head`: every reader of that column parses it as ONE response (status, framing,
+    # content type, HAR, the Repeater seed, the cache classifier), and a 103 in front of a 200
+    # would make every one of them read the 103.
+    #
+    # Bounded, because the origin decides how many to send: the kept heads are a PREFIX of the
+    # ones that arrived — the first `MAX_KEPT` that fit in `MAX_BYTES`, the first one always,
+    # which is no larger than the head cap a final response already has. From the first head
+    # that does not fit, every later one is only counted in `omitted`; `accepting?` lets a
+    # caller that has to BUILD a head (h2 synthesizes one) skip the build once that point is
+    # reached.
+    class Interims
+      MAX_KEPT  = 16
+      MAX_BYTES = 64 * 1024
+      # The longest run of interims anyone counts. h1 refuses a longer run outright
+      # (`Proxy::ClientConn::MAX_INTERIM` is this); h2 relays frames it cannot refuse, so its
+      # capture stops counting here and says so instead (`saturated?`).
+      MAX_RUN = 64
+
+      # One interim response head: its status, its octets exactly as they arrived (an h2
+      # interim is the synthesized head `HeadCodec` gives any h2 response), and whether gori
+      # passed it on to the client. It does not always: RFC 9110 §15.2 forbids forwarding a
+      # 1xx to an HTTP/1.0 client, and a client can be gone before the write lands.
+      record Head, status : Int32, head : Bytes, relayed : Bool = true do
+        def relayed? : Bool
+          relayed
+        end
+      end
+
+      getter heads : Array(Head)
+      # How many interims arrived past the caps and were not kept.
+      getter omitted : Int32
+
+      @bytes : Int32
+
+      def initialize(@heads = [] of Head, @omitted = 0)
+        @bytes = @heads.sum(&.head.size)
+      end
+
+      # Would the next head still be considered for keeping? False once one has been omitted.
+      def accepting? : Bool
+        @omitted == 0 && @heads.size < MAX_KEPT && @bytes < MAX_BYTES
+      end
+
+      def add(status : Int32, head : Bytes, relayed : Bool = true) : Nil
+        if accepting? && (@heads.empty? || @bytes + head.size <= MAX_BYTES)
+          @heads << Head.new(status, head, relayed)
+          @bytes += head.size
+        else
+          omit
+        end
+      end
+
+      # Has this log counted `MAX_RUN` interims? A caller that cannot refuse the run stops there.
+      def saturated? : Bool
+        @heads.size + @omitted >= MAX_RUN
+      end
+
+      # Count one interim that is not kept, without its bytes.
+      def omit : Nil
+        @omitted += 1
+      end
+
+      def empty? : Bool
+        @heads.empty? && @omitted == 0
+      end
+
+      # Every kept head back to back, in arrival order — relayed or not.
+      def wire : Bytes
+        io = IO::Memory.new(@bytes)
+        @heads.each { |h| io.write(h.head) }
+        io.to_slice
+      end
+
+      # The kept heads the client actually received, back to back: what went out ahead of the
+      # final head.
+      def relayed_wire : Bytes
+        io = IO::Memory.new(@bytes)
+        @heads.each { |h| io.write(h.head) if h.relayed? }
+        io.to_slice
+      end
+
+      # The sentence a surface prints when the caps cut the list, or nil when nothing was cut.
+      def omitted_note : String?
+        return nil if @omitted == 0
+        "the origin sent #{@heads.size + @omitted} interim 1xx responses; gori kept the first " \
+        "#{@heads.size} (at most #{MAX_KEPT}, #{MAX_BYTES // 1024} KiB) and did not record the other #{@omitted}"
+      end
+
+      # The sentence a surface prints when a kept head never reached the client, or nil.
+      def unrelayed_note : String?
+        n = @heads.count { |h| !h.relayed? }
+        return nil if n == 0
+        "#{n} of the recorded interim 1xx response#{@heads.size == 1 ? "" : "s"} " \
+        "#{n == 1 ? "was" : "were"} not relayed to the client (an HTTP/1.0 client is never sent one, " \
+        "and a client can close before it arrives)"
       end
     end
 
@@ -168,12 +296,16 @@ module Gori
       getter source_surface : FlowSource::Surface?
       # The originating tool's own session/job id, opaque and meaningful only beside `source`.
       getter source_ref : String?
+      # The operator edited this request at Intercept, and the client's original is kept
+      # (`Store#intercept_original`, V44). Read off the side table, not a `flows` column.
+      getter? intercept_edited : Bool
 
       def initialize(@id, @created_at, @scheme, @method, @host, @port, @target,
                      @status, @size, @state, @response_size = nil, @duration_us = nil,
                      @content_type = nil, @short_circuited = false, @advisory = nil,
                      @request_content_type = nil, @connect_protocol = nil,
-                     @source = nil, @source_surface = nil, @source_ref = nil)
+                     @source = nil, @source_surface = nil, @source_ref = nil,
+                     @intercept_edited = false)
       end
 
       # Did gori itself put this request on the wire? nil (`source` not recorded) answers false:
@@ -253,6 +385,14 @@ module Gori
       def initialize(@row, @http_version, @request_head, @request_body,
                      @response_head, @response_body, @h2_conn_id = nil, @h2_stream_id = nil,
                      @request_body_truncated = false, @response_body_truncated = false, @error = nil, @sni = nil)
+      end
+
+      # Whether the capture cap cut the body on one side — `:request`, or anything else for
+      # the response — so the stored bytes are a PREFIX. A comparison over that side cannot
+      # call two matching prefixes matching bodies; `gori run compare` and MCP
+      # `compare_flows` both name such a side in `source_truncated`.
+      def body_truncated?(side : Symbol) : Bool
+        side == :request ? request_body_truncated? : response_body_truncated?
       end
 
       # Did this flow OPEN a WebSocket? The one place that answers it, across both transports
@@ -548,10 +688,6 @@ module Gori
         @opcode == 1
       end
 
-      def control? : Bool
-        @opcode >= 8
-      end
-
       # As `Store::WsMessage#notice?`, for the surfaces that hold an already-converted seed —
       # the TUI takes its `Array(WsOutMessage)` from a caller — so the guard is reachable on
       # whichever side of the conversion a reader sits.
@@ -598,10 +734,13 @@ module Gori
       High
       Critical
 
-      def label : String
-        to_s.downcase
+      # A stored value read back. A foreign or hand-edited row can hold any integer, and an
+      # out-of-range member raises in every exhaustive `case` over it; clamp to the scale.
+      def self.stored(value : Int32) : self
+        new(value.clamp(Info.value, Critical.value))
       end
     end
+    lowercase_label Severity
 
     # Triage state of an issue, independent of severity (stored as the enum
     # value; V12). Open is the default for a freshly captured issue.
@@ -610,6 +749,11 @@ module Gori
       Confirmed
       FalsePositive
       Resolved
+
+      # A stored value read back; see `Severity.stored`. An unknown state reads as Open.
+      def self.stored(value : Int32) : self
+        from_value?(value) || Open
+      end
 
       def label : String
         case self
@@ -625,19 +769,8 @@ module Gori
     enum LinkOwnerKind
       Issue
       Note
-
-      def label : String
-        to_s.downcase
-      end
-
-      def self.parse(s : String) : LinkOwnerKind?
-        case s
-        when "issue" then Issue
-        when "note"  then Note
-        else              nil
-        end
-      end
     end
+    lowercase_label LinkOwnerKind, parse: parse
 
     # Target workbench entity referenced by an `entity_links` row.
     enum LinkRefKind
@@ -645,20 +778,6 @@ module Gori
       Repeater
       Fuzz
       Miner
-
-      def label : String
-        to_s.downcase
-      end
-
-      def self.parse(s : String) : LinkRefKind?
-        case s
-        when "flow"     then Flow
-        when "repeater" then Repeater
-        when "fuzz"     then Fuzz
-        when "miner"    then Miner
-        else                 nil
-        end
-      end
 
       # Short tag for the TUI list (e.g. "[hist]").
       def tag : String
@@ -668,6 +787,7 @@ module Gori
         "miner"
       end
     end
+    lowercase_label LinkRefKind, parse: parse
 
     # A link from an Issue or Note to a workbench entity (flow/repeater/fuzz/miner).
     struct EntityLink
@@ -679,6 +799,233 @@ module Gori
       getter created_at : Int64
 
       def initialize(@id, @owner_kind, @owner_id, @ref_kind, @ref_id, @created_at)
+      end
+    end
+
+    # --- issue retest (V27, #1036) -------------------------------------------
+    #
+    # The three enums a retest PERSISTS. They live here beside `LinkRefKind` and `Severity`
+    # rather than in `Gori::Retest` for the reason every stored vocabulary does: the store is
+    # what reads them back off disk, and a spec that opens a project must not have to pull in
+    # the send engine to name a row's role. `Gori::Retest` aliases them, so there is one
+    # spelling in the source as well as one on disk.
+
+    # What a retest step is FOR. Ordering is `position`, never this: a role is a claim about
+    # MEANING, and deriving the run order from it would make "move this step up" silently
+    # re-label the step.
+    enum RetestRole
+      Setup
+      Baseline
+      Variant
+      Control
+      Cleanup
+
+      def self.parse?(s : String) : RetestRole?
+        v = s.strip.downcase
+        values.find { |r| r.label == v }
+      end
+
+      # Does a failure here invalidate the steps after it? A `Setup` establishes the
+      # precondition everything downstream measures against; a failed variant or control IS
+      # the result and stops nothing.
+      def precondition? : Bool
+        setup?
+      end
+    end
+    lowercase_label RetestRole
+
+    # What one step's result says. Six, not a bool: the four ways a step can fail to produce
+    # an answer are acted on differently, and folding them into `fail` reports a finding the
+    # run does not have — the split `Authorize::Target#unanswered?` exists to keep.
+    enum RetestOutcome
+      Pass
+      Fail
+      Inconclusive # sent, but the assertion could not be decided
+      Error        # the send failed at the network
+      Blocked      # gori REFUSED to send (scope, Sandbox, an exclude rule)
+      Skipped      # never attempted
+
+      def self.parse?(s : String) : RetestOutcome?
+        v = s.strip.downcase
+        values.find { |o| o.label == v }
+      end
+    end
+    lowercase_label RetestOutcome
+
+    # A run folded into one word — what a regression check exits on.
+    enum RetestVerdict
+      Pass
+      Fail
+      Inconclusive
+      Blocked
+
+      def self.parse?(s : String) : RetestVerdict?
+        v = s.strip.downcase
+        values.find { |x| x.label == v }
+      end
+    end
+    lowercase_label RetestVerdict
+
+    # One configured step of an issue's retest. `ref_kind`/`ref_id` reuse `LinkRefKind` so a
+    # step and an entity link name the same workbench object the same way; only `Repeater` is
+    # ever written today, and `Retest.plan` is the one place that says so.
+    #
+    # `assertion` is the TYPED spelling (`status:2xx`, `json:data.role=admin`, …), stored
+    # verbatim and parsed by `Retest::Assertion`. Empty means "record the outcome, assert
+    # nothing" — a legitimate step (a login, a cleanup) rather than a missing value.
+    struct RetestStep
+      getter id : Int64
+      getter issue_id : Int64
+      getter position : Int32
+      getter role : RetestRole
+      getter ref_kind : LinkRefKind
+      getter ref_id : Int64
+      getter assertion : String
+      getter created_at : Int64
+      getter updated_at : Int64
+
+      def initialize(@id, @issue_id, @position, @role, @ref_kind, @ref_id, @assertion,
+                     @created_at, @updated_at)
+      end
+
+      # Whether the object this step named was deleted (#1160). Stored as the NEGATED id —
+      # no migration, and it fails closed: every resolver looks the raw `ref_id` up, finds no
+      # row with a negative id, and reports the step missing, which is also all an older gori
+      # reading this database can do with it. Before V40 a positive id could be taken again by
+      # the next repeater (`repeaters.id` had no AUTOINCREMENT) and the step would re-bind to it.
+      def detached? : Bool
+        @ref_id < 0
+      end
+
+      # The id this step was created against, whether or not that object still exists — what
+      # a person or an agent should be shown. Resolve with `ref_id`, never with this.
+      def target_id : Int64
+        @ref_id.abs
+      end
+
+      # `repeater #3` — how a step names its target before anything resolves it.
+      def ref_label : String
+        base = "#{@ref_kind.label} ##{target_id}"
+        detached? ? "#{base} (deleted)" : base
+      end
+    end
+
+    # One bounded record of a retest having been run. The counts are stored rather than
+    # re-derived from the step rows so a summary listing costs one query, and so a run whose
+    # steps were pruned still says what it found.
+    struct RetestRun
+      getter id : Int64
+      getter issue_id : Int64
+      getter started_at : Int64
+      getter finished_at : Int64
+      getter surface : String? # FlowSource::Surface token, or nil when none was set
+      getter verdict : RetestVerdict
+      getter total : Int32
+      getter passed : Int32
+      getter failed : Int32
+      getter inconclusive : Int32
+      getter errored : Int32
+      getter blocked : Int32
+      getter skipped : Int32
+      getter note : String?
+
+      def initialize(@id, @issue_id, @started_at, @finished_at, @surface, @verdict, @total,
+                     @passed, @failed, @inconclusive, @errored, @blocked, @skipped, @note = nil)
+      end
+
+      def duration_us : Int64
+        {@finished_at - @started_at, 0_i64}.max
+      end
+    end
+
+    # One row of a run's result table.
+    #
+    # `label`/`method`/`url`/`assertion` are COPIES taken at run time, never a reference: a
+    # run summary is read weeks later, by which time the Repeater tab may have been renamed,
+    # edited or closed, and a row that re-resolved would describe a request that never ran.
+    # Same argument `IssueEvidenceMeta` makes for its provenance fields.
+    struct RetestRunStep
+      getter id : Int64
+      getter run_id : Int64
+      getter position : Int32
+      getter role : RetestRole
+      getter ref_kind : LinkRefKind
+      getter ref_id : Int64
+      getter label : String
+      getter method : String
+      getter url : String
+      getter assertion : String
+      getter outcome : RetestOutcome
+      getter detail : String
+      getter status : Int32?
+      getter duration_us : Int64?
+      getter bytes : Int64
+      getter flow_id : Int64? # the History row this send recorded, when it recorded one
+
+      def initialize(@id, @run_id, @position, @role, @ref_kind, @ref_id, @label, @method,
+                     @url, @assertion, @outcome, @detail, @status, @duration_us, @bytes,
+                     @flow_id)
+      end
+    end
+
+    # One frozen exchange's PROVENANCE, Issue membership and shape — everything the Issues
+    # detail, the project-wide Evidence tab, exports and markers need, and none of the bytes
+    # (V26, #1038/#1039). Issue links are mutable and many-to-many; the snapshot fields and
+    # hashes are not. An empty `issue_ids` is a deliberately retained orphan.
+    #
+    # `source_kind` reuses `LinkRefKind` because a snapshot is taken FROM a linkable thing
+    # and the two vocabularies must not drift; only Flow and Repeater are ever written (a
+    # fuzz or miner session has no single exchange to freeze), and `Evidence.freezable?`
+    # is the one place that says so.
+    struct IssueEvidenceMeta
+      getter id : Int64
+      getter issue_ids : Array(Int64)
+      getter created_at : Int64 # unix micros — when the copy was TAKEN, not when the source ran
+      getter source_kind : LinkRefKind
+      getter source_id : Int64
+      getter method : String
+      getter url : String
+      getter protocol : String?
+      getter status : Int32?
+      getter duration_us : Int64?
+      getter error : String?
+      getter? request_truncated : Bool
+      getter? response_truncated : Bool
+      getter request_sha256 : String
+      getter response_sha256 : String? # nil = no response was stored (an errored send)
+      getter bytes : Int64             # what the row costs against the evidence quota
+
+      def initialize(@id, @issue_ids, @created_at, @source_kind, @source_id, @method, @url,
+                     @protocol, @status, @duration_us, @error, @request_truncated,
+                     @response_truncated, @request_sha256, @response_sha256, @bytes)
+      end
+
+      def orphaned? : Bool
+        @issue_ids.empty?
+      end
+
+      # Flow source ids are negated when History deletes their row. Preserve the original id
+      # for provenance while making it impossible for a direct id lookup to reach a successor.
+      def source_detached? : Bool
+        @source_kind.flow? && @source_id < 0
+      end
+
+      # `hist #12` / `repeater #3` — the source as the RELATED row and the toasts name it.
+      def source_label : String
+        "#{@source_kind.tag} ##{@source_id.abs}#{source_detached? ? " (deleted)" : ""}"
+      end
+    end
+
+    # The frozen exchange itself: its meta plus the stored bytes, for the read-only viewer and
+    # the raw export. Mirrors `FlowDetail` over `FlowRow`.
+    struct IssueEvidence
+      getter meta : IssueEvidenceMeta
+      getter request_head : Bytes
+      getter request_body : Bytes?
+      getter response_head : Bytes?
+      getter response_body : Bytes?
+
+      def initialize(@meta, @request_head, @request_body, @response_head, @response_body)
       end
     end
 
@@ -749,20 +1096,61 @@ module Gori
       end
     end
 
+    # The Probe tab's LIST projection of the same row (`Store#probe_issue_rows`): every
+    # `ProbeIssue` field except the affected-URL list, which is replaced by its COUNT, taken in
+    # SQL. A list draws `×N`; parsing up to PROBE_AFFECTED_CAP URLs per row to get N was most
+    # of what a reload cost. A separate type rather than a `ProbeIssue` with an empty list, so
+    # a caller that needs the URLs cannot compile against a row that does not carry them — it
+    # fetches the full row (`get_probe_issue`) instead.
+    struct ProbeIssueRow
+      getter id : Int64
+      getter code : String
+      getter category : String
+      getter host : String
+      getter title : String
+      getter severity : Severity
+      getter status : Status
+      getter hit_count : Int64
+      getter affected_count : Int32
+      getter sample_flow_id : Int64?
+      getter evidence : String?
+      getter first_seen : Int64
+      getter last_seen : Int64
+      getter sample_repeater_id : Int64?
+
+      def initialize(@id, @code, @category, @host, @title, @severity, @status, @hit_count,
+                     @affected_count, @sample_flow_id, @evidence, @first_seen, @last_seen,
+                     @sample_repeater_id = nil)
+      end
+    end
+
+    # Either shape of a probe finding — what code that reads only the shared fields (the
+    # Probe filter, the list's lenses) accepts.
+    alias AnyProbeIssue = ProbeIssue | ProbeIssueRow
+
     # Which side of a flow a Match&Replace rule rewrites. Stored as the lowercase
     # member name ("request"/"response").
     enum RuleTarget
       Request
       Response
 
-      def label : String
-        to_s.downcase
-      end
-
+      # TOTAL, like `RuleOp.from_label` and `MatchKind.from_label` beside it: an unrecognised
+      # label reads as the CLI's own default rather than raising. `Enum.parse` is what this
+      # was, and `Store#match_rules` reads the column straight into it — so one `match_rules`
+      # row whose `target` had drifted (a hand-edited DB, a project file from a build whose
+      # label set differs; the table carries no CHECK constraint) took `gori run rewriter
+      # list` down with an `ArgumentError` backtrace, through `Rules.merged`. Two of the four
+      # enum fields on that row were already total and two were not, which is the whole bug.
+      #
+      # This is not a hole in input validation: CLI and MCP writes still refuse a bad label.
+      # Settings intentionally retains an unknown string for forward-compatible round trips.
+      # `from_label` is only the total enum projection; `Store#match_rules` carries the raw
+      # value into `MatchRule`, whose `inert?` guard prevents the projection from running.
       def self.from_label(s : String) : RuleTarget
-        parse(s)
+        from_label?(s) || Request
       end
     end
+    lowercase_label RuleTarget
 
     # Which PART of a message a Match&Replace rule rewrites: the HEAD (request/
     # status line + headers), the BODY (the entity — de-chunked, but not
@@ -781,12 +1169,11 @@ module Gori
       Body
       Ws
 
-      def label : String
-        to_s.downcase
-      end
-
+      # Total for the reason `RuleTarget.from_label` gives: a stored row must not raise on the
+      # way out of the store. `head` remains the legacy enum projection, and the raw database
+      # label is preserved beside it so this fallback cannot make the row executable.
       def self.from_label(s : String) : RulePart
-        parse(s)
+        from_label?(s) || Head
       end
 
       # One-letter tag for a rule row (the TUI Rewriter list and `gori run rewriter`).
@@ -801,6 +1188,7 @@ module Gori
         end
       end
     end
+    lowercase_label RulePart
 
     # What a Match&Replace rule DOES. `Replace` is the classic find/replace over the
     # selected PART (head or body). The three header ops act on the HEAD by header NAME
@@ -846,15 +1234,12 @@ module Gori
         end
       end
 
+      def self.from_label?(s : String) : RuleOp?
+        values.find { |v| v.label == s }
+      end
+
       def self.from_label(s : String) : RuleOp
-        case s
-        when "add_header"    then AddHeader
-        when "set_header"    then SetHeader
-        when "remove_header" then RemoveHeader
-        when "short_circuit" then ShortCircuit
-        when "pipe"          then Pipe
-        else                      Replace
-        end
+        from_label?(s) || Replace
       end
 
       # A header-name-keyed op (mutates the HEAD by name, not a substring gsub). Header
@@ -884,6 +1269,15 @@ module Gori
       def rewrite? : Bool
         !short_circuit?
       end
+
+      # Does `Rules#substitute` resolve `$NAME` tokens in this op's `replacement`? False only
+      # for `ShortCircuit`: a stub is a whole response the operator authored, sent exactly as
+      # written (`Rules#stub_for` never expands it), so a `$token` in it is literal body text.
+      # The env-grammar migration keys on this — re-spelling a stub's bytes would change what
+      # gori answers with, not how a reference resolves (P7).
+      def expands_tokens? : Bool
+        !short_circuit?
+      end
     end
 
     # How a `Replace` rule matches: a `Literal` substring or a `Regex` (with $1/\1
@@ -893,12 +1287,149 @@ module Gori
       Literal
       Regex
 
-      def label : String
-        to_s.downcase
+      def self.from_label(s : String) : MatchKind
+        from_label?(s) || Literal
+      end
+    end
+    lowercase_label MatchKind
+
+    # WHERE a `ShortCircuit` rule's answer comes from (#1237). Every other op ignores it.
+    #
+    #   - `Inline` / `File`: the stub in `replacement`, its body from `body_file` when that is
+    #     set. The two behave the same at request time (a legacy row carries only `body_file`),
+    #     and differ only in what a surface lets the operator edit.
+    #   - `Dir`: map-local. `body_file` names a DIRECTORY and the request path picks a file in
+    #     it (`RuleStub::MapLocal`); `replacement` is an optional head template.
+    #   - `Fault`: no response at all — the connection is closed, reset or held
+    #     (`RespondArgs#fault`); `replacement` stays EMPTY, so an older binary, which reads this
+    #     row as an inline stub, fails its head parse and answers the 502 stub.
+    #
+    # A sub-kind rather than new `RuleOp` members, on purpose: see `Schema::V33`.
+    enum RespondKind
+      Inline
+      File
+      Dir
+      Fault
+
+      # The sub-kind a row written before `respond` existed means: a `body_file` made it a file
+      # stub. Used where the column (or the settings key) is absent, never over a stored label.
+      def self.implied(body_file : String) : RespondKind
+        body_file.empty? ? Inline : File
+      end
+    end
+    lowercase_label RespondKind
+
+    # What a `Fault` rule does to the connection instead of answering (#1237).
+    #
+    #   - `Close`: FIN with no response bytes.
+    #   - `Reset`: `SO_LINGER 0` then close — a TCP RST on the client socket.
+    #   - `Hang`: hold without answering until the client gives up, bounded by
+    #     `RespondArgs#hang_ms` so it cannot pin a connection slot forever (P6).
+    enum FaultKind
+      Close
+      Reset
+      Hang
+    end
+    lowercase_label FaultKind
+
+    # The parameters of a short-circuit sub-kind, stored as a small JSON object in
+    # `match_rules.respond_args` (and the `respond_args` key of a global rule). `""` is `{}`.
+    #
+    # `parse` never raises and never guesses: a key this binary does not know, a value of the
+    # wrong type or out of range, or an unknown fault kind comes back as an error STRING, and
+    # `MatchRule` turns that into `inert?` — the #1242 contract, applied to this field. A future
+    # gori's `"throttle"` must not run here as a rule that merely lost its throttle.
+    struct RespondArgs
+      # Ceiling on `delay_ms` and `hang_ms`. Each held connection pins a fiber, an fd and one of
+      # `Server::MAX_CONNECTIONS` slots for the whole wait (P6).
+      MAX_WAIT_MS = 120_000
+      # A `hang` without its own bound holds for the client read timeout
+      # (`Proxy::SocketTuning::CLIENT_IO_TIMEOUT`, 30 s) — the wait a client would have met from
+      # gori itself.
+      DEFAULT_HANG_MS = 30_000
+      KEYS            = %w[strip_prefix fallthrough fault delay_ms hang_ms]
+
+      getter strip_prefix : String
+      getter? fallthrough : Bool
+      getter fault : FaultKind?
+      getter delay_ms : Int32
+      getter hang_ms : Int32
+
+      def initialize(@strip_prefix = "", @fallthrough = false, @fault = nil,
+                     @delay_ms = 0, @hang_ms = DEFAULT_HANG_MS)
       end
 
-      def self.from_label(s : String) : MatchKind
-        s == "regex" ? Regex : Literal
+      def self.parse(raw : String) : RespondArgs | String
+        return new if raw.strip.empty?
+        obj = begin
+          JSON.parse(raw).as_h?
+        rescue JSON::ParseException
+          nil
+        end
+        return "respond_args is not a JSON object" unless obj
+        obj.each { |key, val| key_error(key, val).try { |e| return e } }
+        # Every key present is known and well-typed by now (`key_error`).
+        new(obj["strip_prefix"]?.try(&.as_s) || "",
+          obj["fallthrough"]?.try(&.as_bool) || false,
+          obj["fault"]?.try { |f| f.as_s?.try { |l| FaultKind.from_label?(l) } },
+          obj["delay_ms"]?.try { |v| wait_ms(v) } || 0,
+          obj["hang_ms"]?.try { |v| wait_ms(v) } || DEFAULT_HANG_MS)
+      end
+
+      # Why one key cannot be read, or nil when it can.
+      private def self.key_error(key : String, val : JSON::Any) : String?
+        case key
+        when "strip_prefix" then "respond_args.strip_prefix is not a string" unless val.as_s?
+        when "fallthrough"  then "respond_args.fallthrough is not a boolean" if val.as_bool?.nil?
+        when "fault"
+          return nil if val.raw.nil? # the listing's own `"fault": null` reads back as no fault
+          label = val.as_s?
+          return "respond_args.fault is not a string" unless label
+          "unknown fault #{label.inspect}" unless FaultKind.from_label?(label)
+        when "delay_ms", "hang_ms"
+          "respond_args.#{key} is not 0..#{MAX_WAIT_MS}" unless wait_ms(val)
+        else
+          "unknown respond_args key #{key.inspect}"
+        end
+      end
+
+      private def self.wait_ms(val : JSON::Any) : Int32?
+        n = val.as_i64?
+        n && 0 <= n <= MAX_WAIT_MS ? n.to_i32 : nil
+      end
+
+      # These args with only what `respond` (and, for a fault, `fault`) reads: the rest go back to
+      # their defaults. What a surface applies when the operator switches a rule to a different
+      # answer, so a setting the new one ignores is not carried over for `respond_error` to refuse.
+      def for(respond : RespondKind, fault : FaultKind?) : RespondArgs
+        dir = respond.dir?
+        f = respond.fault? ? fault : nil
+        RespondArgs.new(dir ? @strip_prefix : "", dir && @fallthrough, f, @delay_ms,
+          f == FaultKind::Hang ? @hang_ms : DEFAULT_HANG_MS)
+      end
+
+      # The stored spelling: only the keys that differ from the defaults, in `KEYS` order, and
+      # `""` when none do — so a plain stub's row keeps an empty column.
+      def to_stored : String
+        return "" if self == RespondArgs.new
+        JSON.build { |j| j.object { write_fields(j, all: false) } }
+      end
+
+      # Every field, for a listing (`gori run rewriter list --json`, MCP `list_rules`).
+      def to_json(j : JSON::Builder) : Nil
+        j.object { write_fields(j, all: true) }
+      end
+
+      private def write_fields(j : JSON::Builder, all : Bool) : Nil
+        j.field "strip_prefix", @strip_prefix if all || !@strip_prefix.empty?
+        j.field "fallthrough", @fallthrough if all || @fallthrough
+        if f = @fault
+          j.field "fault", f.label
+        elsif all
+          j.field "fault", nil
+        end
+        j.field "delay_ms", @delay_ms if all || @delay_ms != 0
+        j.field "hang_ms", @hang_ms if all || @hang_ms != DEFAULT_HANG_MS
       end
     end
 
@@ -917,10 +1448,6 @@ module Gori
       Project
       Global
 
-      def label : String
-        to_s.downcase
-      end
-
       # Unknown → Project. Same tolerant shape `MatchKind.from_label` has, and the safe
       # direction: a mistyped scope addresses THIS project rather than every future one.
       def self.from_label(s : String) : RuleScope
@@ -932,6 +1459,7 @@ module Gori
         global? ? "G" : "P"
       end
     end
+    lowercase_label RuleScope
 
     # A Match&Replace rule (the "Rewriter" tab): rewrites a request/response HEAD
     # (request line + headers) or BODY (the entity body) in flight. Human-authored (P4),
@@ -944,7 +1472,8 @@ module Gori
     #
     # `body_file` belongs to `ShortCircuit` alone: a path whose bytes become the stub body,
     # instead of the inline body in `replacement`. Empty = inline (and every other op ignores
-    # it entirely).
+    # it entirely). For a `respond: dir` rule it names the DIRECTORY the request path is mapped
+    # into instead (`RespondKind`).
     #
     # `scope` says which store the rule came out of (see `RuleScope`) and `enabled` is always
     # the EFFECTIVE state in THIS project — for a global rule that is its own default unless
@@ -967,15 +1496,99 @@ module Gori
       # Whether THIS project overrides the global default of `enabled`. Always false for a
       # project rule — there is no default to disagree with. See `Store#rewriter_overrides`.
       getter? overridden : Bool
+      # The enum fallbacks above keep a drifted row readable by older callers. Carry its raw
+      # spelling beside those projections so the row stays visible and, via `inert?`, cannot
+      # accidentally run as one of those defaults. Settings rows already store these labels as
+      # strings; project rows need the same provenance after the SQLite read.
+      getter unknown_target : String?
+      getter unknown_part : String?
+      getter unknown_op : String?
+      getter unknown_match_kind : String?
+      getter unknown_keys : Array(String)?
+      # A `ShortCircuit` rule's sub-kind and its raw parameters (#1237) — see `RespondKind` and
+      # `RespondArgs`. `respond_args` is kept RAW so a row this binary cannot read is written
+      # back unchanged; `args` is its parse, done once here rather than per request.
+      getter respond : RespondKind
+      getter respond_args : String
+      getter unknown_respond : String?
+      getter args : RespondArgs
+      # Why `respond_args` did not parse, or nil. Only a short-circuit rule is made inert by it:
+      # no other op reads the field.
+      getter respond_args_error : String?
 
       def initialize(@id, @enabled, @target, @part, @pattern, @replacement,
                      @op = RuleOp::Replace, @match_kind = MatchKind::Literal,
                      @name = "", @host = "", @body_file = "",
-                     @scope = RuleScope::Project, @overridden = false)
+                     @scope = RuleScope::Project, @overridden = false,
+                     @unknown_target = nil, @unknown_part = nil,
+                     @unknown_op = nil, @unknown_match_kind = nil,
+                     @unknown_keys = nil,
+                     @respond = RespondKind::Inline, @respond_args = "",
+                     @unknown_respond = nil)
+        parsed = RespondArgs.parse(@respond_args)
+        if parsed.is_a?(String)
+          @args = RespondArgs.new
+          @respond_args_error = parsed
+        else
+          @args = parsed
+          @respond_args_error = nil
+        end
       end
 
       def global? : Bool
         @scope.global?
+      end
+
+      # Unknown labels are preserved for display and deletion, but never interpreted as the
+      # defaults returned by `from_label`. One shared predicate guards both rewrite and stub
+      # selection, as well as every surface that wants to describe the row as usable.
+      #
+      # The respond fields count only on a short-circuit rule, the one op that reads them.
+      def inert? : Bool
+        !@unknown_target.nil? || !@unknown_part.nil? || !@unknown_op.nil? || !@unknown_match_kind.nil? ||
+          !@unknown_keys.nil? || (@op.short_circuit? && (!@unknown_respond.nil? || !@respond_args_error.nil?))
+      end
+
+      def active? : Bool
+        enabled? && !inert?
+      end
+
+      def target_label : String
+        @unknown_target || @target.label
+      end
+
+      def part_label : String
+        @unknown_part || @part.label
+      end
+
+      def op_label : String
+        @unknown_op || @op.label
+      end
+
+      def match_kind_label : String
+        @unknown_match_kind || @match_kind.label
+      end
+
+      def respond_label : String
+        @unknown_respond || @respond.label
+      end
+
+      def inert_reason : String?
+        labels = [] of String
+        labels << "op #{@unknown_op.inspect}" if @unknown_op
+        labels << "target #{@unknown_target.inspect}" if @unknown_target
+        labels << "part #{@unknown_part.inspect}" if @unknown_part
+        labels << "match_kind #{@unknown_match_kind.inspect}" if @unknown_match_kind
+        if keys = @unknown_keys
+          labels << (keys.size == 1 ? "key #{keys.first.inspect}" : "keys #{keys.map(&.inspect).join(", ")}")
+        end
+        if @op.short_circuit?
+          labels << "respond #{@unknown_respond.inspect}" if @unknown_respond
+          if (err = @respond_args_error) && labels.empty?
+            return "#{err} (newer gori?)"
+          end
+        end
+        labels.empty? ? nil : "unknown #{labels.join(", ")} (newer gori?)"
       end
     end
 
@@ -1103,11 +1716,8 @@ module Gori
       Green
       Blue
       Purple
-
-      def label : String
-        to_s.downcase
-      end
     end
+    lowercase_label MarkerColor
 
     # HOW a Colormarker rule paints its row. `Full` tints the whole row's background; `Strip`
     # paints one saturated cell in a narrow column History reserves ahead of TIME.
@@ -1121,24 +1731,11 @@ module Gori
       Full
       Strip
 
-      def label : String
-        to_s.downcase
-      end
-
       def self.from_label(s : String) : MarkerStyle
         s.downcase == "full" ? Full : Strip
       end
-
-      # The one-letter column the Colormarker list and `gori run colormarker` print.
-      # Exhaustive `case` on purpose (like `RulePart#badge`): a third style must not silently
-      # render as an existing one.
-      def badge : Char
-        case self
-        in .full?  then 'F'
-        in .strip? then 'S'
-        end
-      end
     end
+    lowercase_label MarkerStyle
 
     # A Colormarker rule: paint the History rows whose flow matches `match_filter` in `color`,
     # using `style`. DISPLAY ONLY — nothing here reaches the proxy. A rule paints a row that
@@ -1262,12 +1859,21 @@ module Gori
       # still means today. PER TAB, so two tabs against one host can dial two different
       # ClientHellos; a reopened tab sends the one it was saved with.
       getter tls_preset : String?
+      # SHA-256 of the request that was SENT to get `response_head` (Schema V28) — the saved
+      # request bytes as this row held them at that moment, hashed the way
+      # `Evidence::Snapshot#request_sha256` hashes them.
+      #
+      # The row's request is mutable and its response is not rewritten with it, so this is the
+      # only thing that can say whether the pair still describes one exchange. nil = NOT
+      # RECORDED (a response persisted before V28, or by a projection that does not select the
+      # column), which is an unknown rather than a verdict — see `Evidence.from_repeater`.
+      getter response_request_sha256 : String?
 
       def initialize(@id, @target, @request, @http2, @auto_content_length, @flow_id, @position,
                      @response_head = nil, @response_body = nil, @response_error = nil,
                      @response_duration_us = nil, @name = nil, @sni = nil,
                      @tags = nil, @ws_keep_key = false, @ws_http_only = false,
-                     @tls_preset = nil)
+                     @tls_preset = nil, @response_request_sha256 = nil)
       end
     end
 
@@ -1289,11 +1895,12 @@ module Gori
       end
     end
 
-    # One persisted parameter-mining session (a sub-tab under the Miner tab). Stores the
-    # byte-exact `request` to re-run, plus opaque `config` JSON (locations, bucket sizes,
-    # concurrency) managed by the frontend. Results are NOT persisted (in-memory per
-    # session, like Repeater responses before V11).
-    struct MinerSessionRecord
+    # One persisted Miner or Sequencer session (a sub-tab under that tab). Stores the
+    # byte-exact `request` to re-run, plus opaque `config` JSON managed by the frontend (Miner:
+    # locations, bucket sizes, concurrency; Sequencer: mode, token location, goal, pacing).
+    # Results are NOT persisted: Miner's stay in memory per session, like Repeater responses
+    # before V11, and Sequencer's collected tokens are live secrets.
+    struct RequestSessionRecord
       getter id : Int64
       getter target : String
       getter request : Bytes
@@ -1307,6 +1914,9 @@ module Gori
       def initialize(@id, @target, @request, @http2, @sni, @config, @flow_id, @position, @name = nil)
       end
     end
+
+    alias MinerSessionRecord = RequestSessionRecord
+    alias SequencerSessionRecord = RequestSessionRecord
 
     # A configured OAST provider (the Providers sub-tab). `kind` is the ProviderKind label.
     struct OastProviderRecord
@@ -1338,9 +1948,12 @@ module Gori
       getter private_key_pem : String?
       getter token : String?
       getter last_poll_at : Int64?
+      # The GLOBAL provider it was registered with (`g_<id>`), "" for none, nil when not
+      # recorded — see schema V29.
+      getter provider_key : String?
 
       def initialize(@id, @created_at, @provider_id, @kind, @server_url, @correlation_id,
-                     @secret, @private_key_pem, @token, @last_poll_at)
+                     @secret, @private_key_pem, @token, @last_poll_at, @provider_key = nil)
       end
     end
 
@@ -1359,25 +1972,6 @@ module Gori
 
       def initialize(@id, @session_id, @created_at, @provider_uid, @protocol, @method,
                      @source_ip, @full_id, @raw_request, @raw_response)
-      end
-    end
-
-    # One persisted token-randomness session (a sub-tab under the Sequencer tab). Stores
-    # the byte-exact `request` to re-collect, plus opaque `config` JSON (mode, token
-    # location, goal, pacing) managed by the frontend. Collected tokens are NEVER
-    # persisted (live secrets, in-memory per session).
-    struct SequencerSessionRecord
-      getter id : Int64
-      getter target : String
-      getter request : Bytes
-      getter? http2 : Bool
-      getter sni : String?
-      getter config : String # opaque JSON managed by the frontend
-      getter flow_id : Int64?
-      getter position : Int32
-      getter name : String? # custom sub-tab label (nil = derive from the request line)
-
-      def initialize(@id, @target, @request, @http2, @sni, @config, @flow_id, @position, @name = nil)
       end
     end
 
@@ -1426,11 +2020,26 @@ module Gori
       getter surface : String?
       getter source_ref : String?
       getter snapshot_version : Int32
+      # The result-capture policy this run was archived under (issue #1240): "all" or
+      # "interesting". DEFAULTED so every construction site that predates the column keeps
+      # compiling, and a run written before it reads "all" — which is what it was.
+      getter keep : String
+      # The `idx` of the result this run's `stop_on` tripped on (issue #1270), or nil. Only a
+      # `condition_met` run carries one, and a `condition_met` run from before the column reads
+      # nil too: nil is "not recorded", never "no stop row". Defaulted like `keep`.
+      getter stop_idx : Int64?
 
       def initialize(@id, @session_id, @created_at, @finished_at, @target, @mode,
                      @total, @sent, @matched, @errors, @status, @http2 = false,
                      @sni = nil, @tls_preset = nil, @websocket = false,
-                     @surface = nil, @source_ref = nil, @snapshot_version = 0)
+                     @surface = nil, @source_ref = nil, @snapshot_version = 0,
+                     @keep = "all", @stop_idx = nil)
+      end
+
+      # Was this run's archive filtered — i.e. not every row was kept? Read by the listings to
+      # add a "N of M kept" note rather than let a filtered run read as a lost one.
+      def filtered? : Bool
+        @keep != "all"
       end
 
       # This run predates the V24 snapshot columns, so `http2` / `websocket` / `sni` /
@@ -1480,13 +2089,16 @@ module Gori
       getter wire : Bytes?
       getter ws_close_code : Int32?
       getter ws_frames_in : Int32?
+      # `Fuzz::Result#shape` (#1351); nil only on a row copied from a pre-V42 record.
+      getter shape : Int64?
 
       def initialize(@idx, @payloads, @position, @status, @length, @words, @lines,
                      @duration_us, @error, @matched, @incomplete, @extracted,
                      @request = nil, @response_head = nil, @response_body = nil,
                      @retried = false, @chain_error = nil, @grpc_status = nil,
                      @grpc_message = nil, @timed_out = false, @resent_count = 0,
-                     @wire = nil, @ws_close_code = nil, @ws_frames_in = nil)
+                     @wire = nil, @ws_close_code = nil, @ws_frames_in = nil,
+                     @shape = nil)
       end
     end
 
@@ -1520,6 +2132,8 @@ module Gori
       getter wire : Bytes?
       getter ws_close_code : Int32?
       getter ws_frames_in : Int32?
+      # The response-shape fingerprint (V42, #1351). NULL on a row saved before it existed.
+      getter shape : Int64?
 
       def initialize(@id, @run_id, @idx, @payloads, @status, @length, @words, @lines,
                      @duration_us, @error, @matched, @extracted,
@@ -1527,7 +2141,7 @@ module Gori
                      @position = nil, @incomplete = false, @retried = false,
                      @chain_error = nil, @grpc_status = nil, @grpc_message = nil,
                      @timed_out = false, @resent_count = 0, @wire = nil,
-                     @ws_close_code = nil, @ws_frames_in = nil)
+                     @ws_close_code = nil, @ws_frames_in = nil, @shape = nil)
       end
     end
 
@@ -1548,34 +2162,13 @@ module Gori
         prefix_truncated?(@row.request, @request_size)
       end
 
-      def response_head_truncated? : Bool
-        prefix_truncated?(@row.response_head, @response_head_size)
-      end
-
       def response_body_truncated? : Bool
         prefix_truncated?(@row.response_body, @response_body_size)
-      end
-
-      def wire_truncated? : Bool
-        prefix_truncated?(@row.wire, @wire_size)
       end
 
       private def prefix_truncated?(prefix : Bytes?, full_size : Int64?) : Bool
         return false unless full_size
         prefix.nil? || prefix.size.to_i64 < full_size
-      end
-    end
-
-    # An intercepted HTTP/2 connection (one per CONNECT→TLS h2 session). Its raw
-    # frames are the truth (P7); decoded streams project into `flows` separately.
-    struct H2Connection
-      getter id : Int64
-      getter created_at : Int64
-      getter host : String
-      getter port : Int32
-      getter alpn : String
-
-      def initialize(@id, @created_at, @host, @port, @alpn)
       end
     end
 
@@ -1597,8 +2190,9 @@ module Gori
       end
     end
 
-    # Best-effort notification that a flow row changed. Published AFTER commit.
-    record FlowEvent, id : Int64, kind : Symbol # :inserted | :updated
+    # Best-effort notification that a flow row changed or an upgraded tunnel closed. Row
+    # changes publish AFTER commit; tunnel completion is a non-blocking wakeup after transcript writes.
+    record FlowEvent, id : Int64, kind : Symbol # :inserted | :updated | :tunnel_completed
 
     # One row of the #124 append-only event feed (the AI firehose the MCP process tails).
     # `id` is the forward cursor key (monotonic AUTOINCREMENT); `created_at` is unix micros

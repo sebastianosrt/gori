@@ -6,14 +6,13 @@ module Gori
   module MCP
     class Tools
       # Add a scope rule (validates + dedupes, like `gori run project scope add`).
-      @[Tool("add_scope_rule", gated: true, agent_action: true)]
+      @[Tool("add_scope_rule", gated: true, agent_action: true, permission: "scope")]
       private def add_scope_rule(h) : Result
-        kind = str(h, "kind").try(&.strip.downcase) || "include"
+        kind = str(h, "kind").try(&.strip.downcase).presence || "include"
         return err("invalid 'kind' (expected #{Scope::KINDS.join("|")})", "INVALID_ARGUMENT", field: "kind") unless kind.in?(Scope::KINDS)
-        match_type = str(h, "match_type").try(&.strip.downcase) || "host"
+        match_type = str(h, "match_type").try(&.strip.downcase).presence || "host"
         return err("invalid 'match_type' (expected #{Scope::TYPES.join("|")})", "INVALID_ARGUMENT", field: "match_type") unless match_type.in?(Scope::TYPES)
-        pattern = str(h, "pattern").try(&.strip)
-        return err("missing required 'pattern'", "INVALID_ARGUMENT", field: "pattern") if pattern.nil? || pattern.empty?
+        pattern = required_str(h, "pattern")
         if e = Scope.validation_error(match_type, pattern)
           return err(e, "INVALID_ARGUMENT", field: "pattern")
         end
@@ -38,32 +37,24 @@ module Gori
         # Scope#add reloads @rules from the store before returning, so this lookup
         # already sees the freshly assigned id.
         rule = scope.rules.find { |r| r.kind == kind && r.match_type == match_type && r.pattern == pattern }
-        Result.new(JSON.build do |j|
-          j.object do
-            j.field "id", rule.try(&.id)
-            j.field "kind", kind
-            j.field "match_type", match_type
-            j.field "pattern", pattern
-          end
-        end)
+        Result.new({id: rule.try(&.id), kind: kind, match_type: match_type, pattern: pattern}.to_json)
       end
 
       # Edit an existing rule in place (the TUI's `e` on the scope list). Without this, the only
       # way to fix a typo'd pattern was delete + re-add, which changes the rule's id and — for a
       # moment — leaves the scope gate without it.
-      @[Tool("update_scope_rule", gated: true, agent_action: true)]
+      @[Tool("update_scope_rule", gated: true, agent_action: true, permission: "scope")]
       private def update_scope_rule(h) : Result
-        id = int(h, "id")
-        return err(id_error(h, "id"), "INVALID_ARGUMENT", field: "id") unless id
+        id = required_id(h, "id")
         scope = Scope.load(store)
         existing = scope.rules.find { |r| r.id == id }
         return not_found("no scope rule with id #{id}") unless existing
 
         # Every field defaults to the rule's CURRENT value, so a caller can change just the
         # pattern without restating kind/match_type.
-        kind = str(h, "kind").try(&.strip.downcase) || existing.kind
+        kind = str(h, "kind").try(&.strip.downcase).presence || existing.kind
         return err("invalid 'kind' (expected #{Scope::KINDS.join("|")})", "INVALID_ARGUMENT", field: "kind") unless kind.in?(Scope::KINDS)
-        match_type = str(h, "match_type").try(&.strip.downcase) || existing.match_type
+        match_type = str(h, "match_type").try(&.strip.downcase).presence || existing.match_type
         return err("invalid 'match_type' (expected #{Scope::TYPES.join("|")})", "INVALID_ARGUMENT", field: "match_type") unless match_type.in?(Scope::TYPES)
         # An ABSENT pattern keeps the current one; a SUPPLIED blank one is a mistake, not a
         # no-op — silently keeping the old pattern would report success for an edit that
@@ -113,10 +104,9 @@ module Gori
         end)
       end
 
-      @[Tool("delete_scope_rule", gated: true, agent_action: true)]
+      @[Tool("delete_scope_rule", gated: true, agent_action: true, permission: "scope")]
       private def delete_scope_rule(h) : Result
-        id = int(h, "id")
-        return err(id_error(h, "id"), "INVALID_ARGUMENT", field: "id") unless id
+        id = required_id(h, "id")
         scope = Scope.load(store)
         return not_found("no scope rule with id #{id}") unless scope.rules.any? { |r| r.id == id }
         # Through `Scope#remove`, not straight at the store, and confirm it committed — a
@@ -132,17 +122,17 @@ module Gori
         # it used to return a bare {id, deleted:true}, so an agent could black-hole the
         # proxy and read the write as ordinary success.
         blocks_all = scope.sandbox? && scope.include_count.zero?
-        Result.new(JSON.build { |j| j.object { j.field "id", id; j.field "deleted", true; j.field "blocks_all", blocks_all } })
+        Result.new({id: id, deleted: true, blocks_all: blocks_all}.to_json)
       end
 
-      @[Tool("set_scope_enabled", gated: true, agent_action: true)]
+      @[Tool("set_scope_enabled", gated: true, agent_action: true, permission: "scope")]
       private def set_scope_enabled(h) : Result
         enabled = optional_bool_arg(h, "enabled")
         return err("missing required 'enabled' (true or false)", "INVALID_ARGUMENT", field: "enabled") if enabled.nil?
         scope = Scope.load(store)
         committed = enabled ? scope.enable : scope.disable
         return busy("scope enable/disable NOT persisted (store busy or unwritable); the gate is unchanged") unless committed
-        Result.new(JSON.build { |j| j.object { j.field "enabled", enabled } })
+        Result.new({enabled: enabled}.to_json)
       end
 
       # Turn the HARD-CONTAINMENT sandbox gate on or off (the headless equivalent of the
@@ -150,7 +140,7 @@ module Gori
       # from set_scope_enabled (the display lens): the sandbox BLOCKS every request the
       # scope does not allow — with no include rule it blocks ALL captured traffic
       # (reported as blocks_all).
-      @[Tool("set_sandbox", gated: true, agent_action: true)]
+      @[Tool("set_sandbox", gated: true, agent_action: true, permission: "scope")]
       private def set_sandbox(h) : Result
         enabled = optional_bool_arg(h, "enabled")
         return err("missing required 'enabled' (true or false)", "INVALID_ARGUMENT", field: "enabled") if enabled.nil?
@@ -161,12 +151,7 @@ module Gori
         unless enabled ? scope.enable_sandbox : scope.disable_sandbox
           return busy("sandbox enable/disable NOT persisted (store busy or unwritable); the gate is unchanged")
         end
-        Result.new(JSON.build do |j|
-          j.object do
-            j.field "sandbox", enabled
-            j.field "blocks_all", enabled && scope.include_count == 0
-          end
-        end)
+        Result.new({sandbox: enabled, blocks_all: enabled && scope.include_count == 0}.to_json)
       end
 
       # The tools/list schemas for the scope & sandbox tools, kept beside the handlers that
@@ -177,7 +162,7 @@ module Gori
         return unless @allow_actions
 
         tool j, "add_scope_rule",
-          "Add a scope include/exclude rule (the Target/Sitemap ⇧S lens, and the intercept " \
+          "Add a scope include/exclude rule (the Target/Sitemap `s` lens, and the intercept " \
           "gate). Deduped on the kind/match_type/pattern triple." do |s|
           s.field "kind", enumprop("whether the rule brings hosts INTO scope or carves them out (default include)", Scope::KINDS)
           s.field "match_type", enumprop("how `pattern` is matched against a request (default host)", Scope::TYPES)

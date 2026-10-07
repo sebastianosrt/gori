@@ -72,6 +72,28 @@ describe Gori::Tui::RepeaterView do
     plain.contains?("PONG").should be_true
   end
 
+  it "decodes response JSON escapes only on demand when pretty reflow is off" do
+    view = RepeaterView.new
+    view.load_blank
+    view.pretty = false
+    view.apply(Gori::Repeater::Result.new(
+      "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_slice,
+      "{\"x\":\"\\u003c\\u200b\"}".to_slice, nil, 1000_i64))
+    view.focus_pane(:response)
+
+    raw = MemoryBackend.new(120, 20)
+    view.render(Screen.new(raw), Rect.new(0, 0, 120, 20))
+    raw.contains?("\\u003c\\u200b").should be_true
+    raw.contains?("u:decode").should be_true
+
+    view.toggle_unicode_decoding
+    decoded = MemoryBackend.new(120, 20)
+    view.render(Screen.new(decoded), Rect.new(0, 0, 120, 20))
+    decoded.contains?("<⟨ZWSP⟩").should be_true
+    decoded.contains?("u:wire").should be_true
+    decoded.contains?("2 escapes").should be_true
+  end
+
   it "load_blank seeds an editable, sendable scaffold (no source flow)" do
     view = RepeaterView.new
     view.load_blank
@@ -84,7 +106,27 @@ describe Gori::Tui::RepeaterView do
     backend.contains?("https://example.com").should be_true # target field
     backend.contains?("GET / HTTP/1.1").should be_true      # scaffold request line
     backend.contains?("Host: example.com").should be_true   # scaffold header
-    backend.contains?("— not sent — press ^R to resend —").should be_true
+    backend.contains?("not sent yet").should be_true
+    backend.contains?("press ^R to send").should be_true
+  end
+
+  it "uses live response key bindings and describes an unsent response as a first send" do
+    previous = Gori::Settings.keymap_overrides
+    begin
+      Gori::Settings.keymap_overrides = {"repeater.toggle-diff" => ["shift-e"], "repeater.send" => ["alt-r"]}
+      view = RepeaterView.new
+      view.menu_registry = Gori::Verbs.registry
+      view.load_blank
+      backend = MemoryBackend.new(120, 20)
+      view.render(Screen.new(backend), Rect.new(0, 0, 120, 20))
+      backend.contains?("⇧E:diff").should be_true
+      backend.contains?("d:diff").should be_false
+      backend.contains?("not sent yet").should be_true
+      backend.contains?("press ⌥R to send").should be_true
+      backend.contains?("resend").should be_false
+    ensure
+      Gori::Settings.keymap_overrides = previous
+    end
   end
 
   it "mirrors the target host into the Host header on the first edit of a blank tab" do
@@ -164,6 +206,21 @@ describe Gori::Tui::RepeaterView do
     view.request_text.should_not contain("Host: real.test")
   end
 
+  # Focus can leave the target while it still reads the placeholder, so the one-shot stays
+  # armed past a body edit: a Host typed then must survive the later target edit and send.
+  it "never clobbers a Host typed while the target was still the placeholder" do
+    view = RepeaterView.new
+    view.load_blank
+    view.focus_pane(:request) # target untouched → the one-shot stays armed
+    view.replace_edit_buffer("GET / HTTP/1.1\nHost: internal.local\nUser-Agent: gori\n\n")
+    view.focus_pane(:target)
+    view.enter_target_insert!
+    view.target.size.times { view.target_backspace }
+    "https://10.0.0.5".each_char { |c| view.target_insert(c) }
+    view.sync_host_to_target_once # send-time hook
+    view.request_text.should contain("Host: internal.local")
+  end
+
   # The response body is styled one visible line at a time and memoized (per-line) so an
   # unrelated re-render (a keystroke in the request editor) doesn't re-tokenize the pane.
   # The memo must be dropped in lockstep with the response view — a new send, or a pretty
@@ -230,30 +287,17 @@ describe Gori::Tui::RepeaterView do
     back.contains?("ALPHATOKEN").should be_true # cached Line uncorrupted by the intervening slices
   end
 
-  # Reveal mode is the surface built to inspect whitespace, and it was the one surface a
-  # tabbed line could not be scrolled across. Reveal.styled gives every control char a
-  # 1-column marker (tab → '→'), so the row DRAWS one cell per tab, but the h-scroll clamp
-  # measured the raw string with display_width, where a tab is 0 columns. On a tab-heavy
-  # line the clamp's ceiling collapsed to 0 and the offset was pinned there every frame, so
-  # the tail of the line was permanently unreachable no matter how far right you scrolled.
-  #
-  # ASSERTION INVERTED BY SOFT WRAP. The bug's root cause — a width measure that scores a
-  # tab 0 while the draw gives it a cell — is unchanged and still the thing under test, but
-  # it now shows up in the WRAP rather than in a scroll ceiling: `Wrap` must break this line
-  # on `grapheme_cols` (tab = 1), so the 74 drawn columns land on two rows and the tail is
-  # visible WITHOUT scrolling at all. Measured under display_width the line is 14 columns,
-  # would not wrap, and ENDTOK would be off the right edge again — so the assertion flips
-  # from "invisible until scrolled" to "visible on the continuation row", and the old
-  # failure mode is still caught.
+  # Reveal maps tabs to one-column arrows. In the normal pane, tabs instead occupy the width
+  # of their named badge; the reveal wrap must measure its own marker representation.
   it "wraps a tab-filled line by its DRAWN width in reveal mode, tail and all" do
     view = RepeaterView.new
     view.load_blank
     view.focus_pane(:response)
     hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
     line = "STARTTOK#{"\t" * 60}ENDTOK"
-    # The two measures disagree by the tab count — that gap IS the tail that used to vanish.
-    Screen.display_width(line).should eq(14)
-    Screen.draw_width(line).should eq(74)
+    Screen.display_width(line).should eq(314) # normal view renders ⟨TAB⟩ badges
+    revealed_width = Reveal.styled(line, false, 400).sum { |span| Screen.draw_width(span.text) }
+    revealed_width.should eq(74) # reveal uses one arrow cell per tab
     view.apply(Gori::Repeater::Result.new(hdr.to_slice, line.to_slice, nil, 1000_i64))
     view.reveal = true
 
@@ -299,7 +343,7 @@ describe Gori::Tui::RepeaterView do
     backend.contains?("PONG").should be_true
     # plain response mode: the diff toggle chip is inactive (muted), not lit — the
     # pane no longer carries a separate "response" chip (it's titled RESPONSE).
-    ry = (0...20).find { |y| backend.row(y).includes?("d:diff") }.not_nil!
+    ry = (0...20).find { |y| backend.row(y).includes?("⇧D:diff") }.not_nil!
     dx = backend.row(ry).index("diff").not_nil!
     backend.fg_at(dx, ry).should eq(Theme.muted) # diff segment inactive
   end
@@ -357,7 +401,7 @@ describe Gori::Tui::RepeaterView do
       view.render(Screen.new(backend), Rect.new(0, 0, 120, 20))
       backend.contains?("NEW").should be_true
       # response view kept — the diff toggle was NOT auto-opened (muted, inactive)
-      ry = (0...20).find { |y| backend.row(y).includes?("d:diff") }.not_nil!
+      ry = (0...20).find { |y| backend.row(y).includes?("⇧D:diff") }.not_nil!
       dx = backend.row(ry).index("diff").not_nil!
       backend.fg_at(dx, ry).should eq(Theme.muted) # diff tab NOT auto-opened
     end
@@ -377,9 +421,59 @@ describe Gori::Tui::RepeaterView do
     view.render(Screen.new(backend), Rect.new(0, 0, 120, 20))
     backend.contains?("repeater error: connection refused").should be_true
     # fell back to the response view — the diff toggle is inactive (muted)
-    ry = (0...20).find { |y| backend.row(y).includes?("d:diff") }.not_nil!
+    ry = (0...20).find { |y| backend.row(y).includes?("⇧D:diff") }.not_nil!
     dx = backend.row(ry).index("diff").not_nil!
     backend.fg_at(dx, ry).should eq(Theme.muted)
+  end
+
+  it "renders received response head next to the error on an errored send (#1428)" do
+    view = RepeaterView.new
+    view.load_blank
+    view.focus_pane(:response)
+
+    head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nContent-Length: 5\r\n\r\n".to_slice
+    err = Gori::Repeater::Result.new(head, nil, nil, 1200_i64, "conflicting Content-Length values")
+    view.apply(err)
+
+    backend = MemoryBackend.new(120, 20)
+    view.render(Screen.new(backend), Rect.new(0, 0, 120, 20))
+    backend.contains?("repeater error: conflicting Content-Length values").should be_true
+    backend.contains?("HTTP/1.1 200 OK").should be_true
+    backend.contains?("Content-Length: 3").should be_true
+    backend.contains?("Content-Length: 5").should be_true
+    backend.contains?("1.2ms · 83B").should be_true
+
+    wire = view.response_wire.should_not be_nil
+    wire[0].should eq(head)
+
+    # Hex view renders the received wire bytes, not "not sent yet"
+    view.toggle_resp_hex
+    view.resp_hex?.should be_true
+    hexb = MemoryBackend.new(120, 20)
+    view.render(Screen.new(hexb), Rect.new(0, 0, 120, 20))
+    hexb.contains?("— not sent yet —").should be_false
+    hexb.contains?("00000000").should be_true
+    hexb.contains?("48 54 54 50").should be_true # "HTTP"
+  end
+
+  it "renders error on hex view when send errored with no response bytes received (#1428)" do
+    view = RepeaterView.new
+    view.load_blank
+    view.focus_pane(:response)
+
+    # Before send: hex view shows "not sent yet"
+    view.toggle_resp_hex
+    hex_pre = MemoryBackend.new(120, 20)
+    view.render(Screen.new(hex_pre), Rect.new(0, 0, 120, 20))
+    hex_pre.contains?("— not sent yet —").should be_true
+
+    # After errored send with 0 bytes: shows error, not "not sent yet"
+    err = Gori::Repeater::Result.new(Bytes.empty, nil, nil, 500_i64, "connection reset by peer")
+    view.apply(err)
+    hex_post = MemoryBackend.new(120, 20)
+    view.render(Screen.new(hex_post), Rect.new(0, 0, 120, 20))
+    hex_post.contains?("— not sent yet —").should be_false
+    hex_post.contains?("repeater error: connection reset by peer").should be_true
   end
 
   it "auto-updates an existing Content-Length to match the edited body on send" do
@@ -619,22 +713,35 @@ describe Gori::Tui::RepeaterView do
     view.request_text.includes?("Content-Length: 0abc").should be_true
   end
 
-  # The reflection is itself an edit, so running it on the state ⌃Z just restored re-applies
-  # the change being undone: an auto-CL rewrite was unreachable by undo at any depth.
-  it "⌃Z restores a line the auto-Content-Length reflection rewrote" do
+  # The reflection is itself an edit. Run on the state ⌃Z just restored it re-applied the change
+  # being undone, so an auto-CL rewrite was unreachable by undo; skipping it instead left a
+  # snapshot between each keystroke and its reflection, where the pane showed a length the send
+  # would not use (#1417). It folds into the keystroke's step now: every ⌃Z lands on a state
+  # whose visible Content-Length is the one ^R sends.
+  it "⌃Z takes back a body edit with the Content-Length it reflected, one step per edit" do
     view = RepeaterView.new
     view.restore("https://h.test",
       "POST /x HTTP/1.1\nHost: h.test\nContent-Length: 99\n\nhi", false, true)
     view.pane_advance(1)
     view.goto_request_line(5)
     view.request_text.includes?("Content-Length: 2").should be_true # restore already reflected
+    view.edit_end
     view.edit_insert('!')
-    view.request_text.includes?("Content-Length: 3").should be_true # …and so did the keystroke
+    view.edit_home # end the typing run, so `?` is a step of its own
+    view.edit_end
+    view.edit_insert('?')
+    view.request_text.includes?("Content-Length: 4").should be_true
 
-    view.edit_undo # the reflection…
-    view.edit_undo # …then the keystroke
+    view.edit_undo
+    view.request_text.should end_with("hi!")
+    view.request_text.includes?("Content-Length: 3").should be_true
+
+    view.edit_undo
+    view.request_text.should end_with("\nhi")
     view.request_text.includes?("Content-Length: 2").should be_true
-    view.request_text.includes?("hi!").should be_false
+
+    view.edit_undo # restore's reflection was never a step: nothing brings back the stale 99
+    view.request_text.includes?("Content-Length: 99").should be_false
   end
 
   it "keeps the REQUEST editor's Content-Length in sync while editing the body" do
@@ -1024,7 +1131,7 @@ describe Gori::Tui::RepeaterView do
     # writes a CHUNK-scoped Content-Length into a buffer that `request_bytes` and the `^X`
     # snapshot both read WHOLE, and one number cannot be right for both framings:
     #
-    #   pane        Content-Length: 3    ← chunk 1's body, "AAA"; what `space ▸ g` sends
+    #   pane        Content-Length: 3    ← chunk 1's body, "AAA"; what Send group sends
     #   ^R          Content-Length: 60   ← re-synced whole; self-consistent, but the pane never
     #                                      said 60 and the operator authored TWO requests
     #   ^X then ^R  Content-Length: 3 over a 60-byte body — a desync gori INVENTED
@@ -1041,7 +1148,10 @@ describe Gori::Tui::RepeaterView do
         view.restore("http://h.test", draft, false, true) # auto-CL ON
         view.request_text.should contain("Content-Length: 3")
         ex = expect_raises(Gori::Fuzz::ChainError, /%%% separator/) { view.request_bytes }
-        ex.message.not_nil!.should contain("space ▸ g")
+        # Send group by its token, never a typed letter: the controller expands it (#1282).
+        ex.message.not_nil!.should contain("{space:repeater.send-group}")
+        Gori::Hotkeys.expand_menu_paths(Gori::Verbs.registry, ex.message.not_nil!)
+          .should contain(Gori::Hotkeys.route(Gori::Verbs.registry, "repeater.send-group").not_nil!)
         ex.message.not_nil!.should contain("^L")
       end
 
@@ -1100,7 +1210,6 @@ describe Gori::Tui::RepeaterView do
       it "refuses MINIMIZE, whose one keypress carries that framing hundreds of times" do
         view = RepeaterView.new
         view.restore("http://h.test", draft, false, true)
-        view.minimizable?.should be_false # was true
         view.minimize_refusal.not_nil!.should contain("%%% separator")
         view.minimize_refusal.not_nil!.should contain("several requests as one")
       end
@@ -1111,19 +1220,17 @@ describe Gori::Tui::RepeaterView do
         # `Minimize.run` reads base_text STRUCTURALLY as one request, so on a group buffer it
         # strips lines out of the operator's SECOND request whatever the Content-Length says.
         # A whole-buffer `^R` with ^L off is a legitimate byte-exact send; this is not.
-        view.minimizable?.should be_false
+        view.minimize_refusal.should_not be_nil
         String.new(view.request_bytes).should contain("Content-Length: 99") # ^R still allowed
       end
 
       it "COMPLEMENT: minimize still runs on an ordinary request, and names its other refusals" do
         plain = RepeaterView.new
         plain.restore("http://h.test", "GET /a?x=1 HTTP/1.1\nHost: h.test\n\n", false, true)
-        plain.minimizable?.should be_true
         plain.minimize_refusal.should be_nil
 
         marked = RepeaterView.new
         marked.restore("http://h.test", "GET /a?x=§1§ HTTP/1.1\nHost: h.test\n\n", false, true)
-        marked.minimizable?.should be_false
         marked.minimize_refusal.not_nil!.should contain("§…§")
 
         hex = RepeaterView.new
@@ -1136,7 +1243,7 @@ describe Gori::Tui::RepeaterView do
       it "COMPLEMENT: h2 minimizes and sends whole — %%% is not a separator there" do
         view = RepeaterView.new
         view.restore("http://h.test", draft, true, true) # http2: true
-        view.minimizable?.should be_true                 # send_pipeline is an h1 primitive
+        view.minimize_refusal.should be_nil              # send_pipeline is an h1 primitive
         # 61, not the 60 of the auto-CL-ON group: with no chunking the SECOND request's own
         # `Content-Length: 99` is left as body text rather than resynced to 2.
         view.request_text.should contain("Content-Length: 61")              # pane reads whole-buffer
@@ -1155,7 +1262,7 @@ describe Gori::Tui::RepeaterView do
         view = RepeaterView.new
         view.restore("http://h.test", text, false, true)
         view.pipeline_requests.size.should eq(2)
-        view.minimizable?.should be_false
+        view.minimize_refusal.should_not be_nil
       end
 
       it "COMPLEMENT: a CAPTURED %%% is inert, so it reflects and sends WHOLE, unrefused" do
@@ -1452,8 +1559,8 @@ describe Gori::Tui::RepeaterView do
 
       # hex-edit the payload: overtype 0xFF → 0xAB (length unchanged → prefix stays 3)
       view.toggle_request_hex.should be_true
-      view.hex_set_nibble('a')
-      view.hex_set_nibble('b')
+      view.hex_key(hex_ev('a'))
+      view.hex_key(hex_ev('b'))
       view.toggle_request_hex.should be_false # exit writes the edited payload back
       sent = view.request_bytes
       sent[(sent.size - 8)..].should eq(Bytes[0x00, 0x00, 0x00, 0x00, 0x03, 0xAB, 0x01, 0x02])
@@ -1573,6 +1680,130 @@ describe Gori::Tui::RepeaterView do
     String.new(view.request_bytes).should eq(req)
   end
 
+  # #1426: leaving hex was the one buffer mutation that did not reflect auto-CL, so a hex edit
+  # that grew the body left `Content-Length: 4` on screen while ^R's `finalize_wire` framed 5.
+  describe "leaving hex after a length-changing edit (#1426)" do
+    req = "POST /b HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n\r\nABCD"
+    append_e = ->(view : RepeaterView) do
+      view.toggle_request_hex.should be_true
+      8.times { view.hex_key(hex_ev(Termisu::Input::Key::Down)) } # ↓ clamps at the append slot
+      view.hex_key(hex_ev('4'))
+      view.hex_key(hex_ev('5')) # 0x45 = 'E'
+      view.toggle_request_hex.should be_false
+    end
+
+    it "shows the Content-Length the send will frame (auto-CL on)" do
+      view = RepeaterView.new
+      view.restore("http://127.0.0.1", req, false, true)
+      append_e.call(view)
+      view.request_text.should contain("Content-Length: 5")
+      view.request_text.should_not contain("Content-Length: 4")
+      String.new(view.request_bytes).should eq("POST /b HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nABCDE")
+      view.hex_exit_resync.should eq({"4", "5"}) # what the controller's toast names
+      view.dirty?.should be_true
+    end
+
+    it "keeps a hex-built mismatch as built when auto-CL is off" do
+      view = RepeaterView.new
+      view.restore("http://127.0.0.1", req, false, false)
+      append_e.call(view)
+      view.request_text.should contain("Content-Length: 4")
+      String.new(view.request_bytes).should eq("POST /b HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n\r\nABCDE")
+      view.hex_exit_resync.should be_nil
+    end
+
+    it "says nothing for an exit that left the length alone" do
+      view = RepeaterView.new
+      view.restore("http://127.0.0.1", req, false, true)
+      view.toggle_request_hex.should be_true
+      view.hex_key(hex_ev('5')) # overtype `P` → `_`: same length
+      view.hex_key(hex_ev('f'))
+      view.toggle_request_hex.should be_false
+      view.request_text.should contain("Content-Length: 4")
+      view.hex_exit_resync.should be_nil
+    end
+  end
+
+  # #1427: a TYPED line carries the editor's bare LF, which text mode's ^R promotes to CRLF in
+  # the head. Seeding hex from the raw line buffer made a pure peek change the wire — hex-mode
+  # ^R sent `HTTP/1.1\nHost`, a bare-LF head text mode never sends.
+  it "snapshots a typed request's head as the CRLF text mode sends" do
+    view = RepeaterView.new
+    view.restore("http://127.0.0.1", "GET /peek HTTP/1.1\nHost: h\n\n", false, false)
+    text_mode = String.new(view.request_bytes)
+    text_mode.should eq("GET /peek HTTP/1.1\r\nHost: h\r\n\r\n")
+    view.toggle_request_hex.should be_true
+    String.new(view.request_bytes).should eq(text_mode)
+    # A peek is not an edit to anything that compares the request to its saved row — the drift
+    # digest, the minimize snapshot, the cross-session reconcile.
+    view.request_text.should eq("GET /peek HTTP/1.1\nHost: h\n\n")
+    view.toggle_request_hex.should be_false # a peek writes nothing back
+    view.dirty?.should be_false
+    view.request_text.should eq("GET /peek HTTP/1.1\nHost: h\n\n")
+  end
+
+  it "reads the hex buffer as the request once it has been edited" do
+    view = RepeaterView.new
+    view.restore("http://127.0.0.1", "GET /peek HTTP/1.1\nHost: h\n\n", false, false)
+    view.toggle_request_hex.should be_true
+    view.hex_key(hex_ev('4')) # 'G' (0x47) → 0x47: the high nibble rewritten to itself…
+    view.hex_key(hex_ev('8')) # …then the low one: 0x48 'H'
+    view.request_text.should eq("HET /peek HTTP/1.1\r\nHost: h\r\n\r\n")
+    view.dirty?.should be_true
+  end
+
+  # The other side of #1427 (P7): a capture whose OWN head ends lines in a bare LF is the
+  # payload, and text mode promotes it on every send — so hex is the only road to those bytes.
+  it "keeps a captured bare-LF head byte-exact in hex" do
+    repeater_tmp_store do |store|
+      head = "GET /m HTTP/1.1\nHost: h.test\nX-A: 1\n\n"
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "http", host: "h.test", port: 80,
+        method: "GET", target: "/m", http_version: "HTTP/1.1",
+        head: head.to_slice, body: Bytes.new(0), source: Gori::FlowSource::Kind::Proxy))
+      view = RepeaterView.new
+      view.load(store.get_flow(id).not_nil!)
+      view.request_text.should eq(head) # the editor holds the capture's own line endings
+      view.toggle_request_hex.should be_true
+      String.new(view.request_bytes).should eq(head)
+    end
+  end
+
+  it "gives a header typed into an ordinary capture the CRLF text mode sends" do
+    repeater_tmp_store do |store|
+      head = "GET /c HTTP/1.1\r\nHost: h.test\r\n\r\n"
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "http", host: "h.test", port: 80,
+        method: "GET", target: "/c", http_version: "HTTP/1.1",
+        head: head.to_slice, body: Bytes.new(0), source: Gori::FlowSource::Kind::Proxy))
+      view = RepeaterView.new
+      view.load(store.get_flow(id).not_nil!)
+      view.evidence?.should be_true
+      view.replace_request("GET /c HTTP/1.1\r\nHost: h.test\r\nX-Typed: 1\n\r\n")
+      text_mode = String.new(view.request_bytes)
+      text_mode.should eq("GET /c HTTP/1.1\r\nHost: h.test\r\nX-Typed: 1\r\n\r\n")
+      view.toggle_request_hex.should be_true
+      String.new(view.request_bytes).should eq(text_mode)
+    end
+  end
+
+  # The body half of the same peek: a typed multipart body's delimiters are promoted on ^R,
+  # and the reflected Content-Length measures that CRLF form — so an LF snapshot shipped a
+  # body shorter than the header it went out under.
+  it "snapshots a typed multipart body in the CRLF form its Content-Length measures" do
+    view = RepeaterView.new
+    view.restore("http://127.0.0.1",
+      "POST /up HTTP/1.1\nHost: h\nContent-Type: multipart/form-data; boundary=XX\nContent-Length: 0\n\n" \
+      "--XX\nContent-Disposition: form-data; name=\"a\"\n\n1\n--XX--\n", false, true)
+    text_mode = String.new(view.request_bytes)
+    text_mode.should contain("\r\n\r\n--XX\r\nContent-Disposition")
+    view.toggle_request_hex.should be_true
+    hex_mode = String.new(view.request_bytes)
+    hex_mode.should eq(text_mode)
+    head, body = hex_mode.split("\r\n\r\n", limit: 2)
+    head.should contain("Content-Length: #{body.bytesize}")
+  end
+
   it "pipeline_requests keeps a bodied request's separator (no double terminator)" do
     view = RepeaterView.new
     req = "POST /a HTTP/1.1\nHost: h\nContent-Length: 4\n\ndata\n%%%\nGET /b HTTP/1.1\nHost: h\n"
@@ -1601,7 +1832,7 @@ describe Gori::Tui::RepeaterView do
     view.apply_group([{"GET /a HTTP/1.1", r1}, {"GET /b HTTP/1.1", r2}])
 
     view.group_mode?.should be_true
-    lines = view.resp_plain_lines
+    lines = resp_lines(view)
     lines.any?(&.includes?("req 1 · GET /a HTTP/1.1")).should be_true
     lines.any?(&.includes?("HTTP 200")).should be_true
     lines.any?(&.includes?("req 2 · GET /b HTTP/1.1")).should be_true
@@ -1848,7 +2079,8 @@ describe Gori::Tui::RepeaterView do
     view.restore("https://api.test", "GET / HTTP/1.1\n\n", false, true)
     backend = MemoryBackend.new(120, 20)
     view.render(Screen.new(backend), Rect.new(0, 0, 120, 20))
-    backend.contains?("— not sent — press ^R to resend —").should be_true
+    backend.contains?("not sent yet").should be_true
+    backend.contains?("press ^R to send").should be_true
   end
 
   it "restore re-populates a persisted last response (survives a reopen)" do
@@ -2096,7 +2328,7 @@ describe Gori::Tui::RepeaterView do
       "HTTP/1.1 200 OK\r\n\r\n".to_slice, "LINE1\nLINE2".to_slice, nil, 1000_i64)
     view.apply(ok)
     view.focus_pane(:response)
-    lines = view.resp_plain_lines
+    lines = resp_lines(view)
     lines.should_not be_empty
     view.resp_move(0, 0)
     view.resp_copy_text.should eq(lines[0])
@@ -2170,7 +2402,7 @@ describe Gori::Tui::RepeaterView do
       ok = Gori::Repeater::Result.new("HTTP/1.1 200 OK\r\n\r\n".to_slice, "KEEPME".to_slice, nil, 500_i64)
       view.apply(ok)
       view.focus_pane(:response)
-      store.update_repeater_response(rid, ok.head, ok.body, nil, ok.duration_us)
+      store.update_repeater_response(rid, ok.head, ok.body, nil, ok.duration_us, request_sha256: nil)
       store.flush
 
       row = store.repeaters_meta.find { |r| r.id == rid }.not_nil!
@@ -2405,6 +2637,86 @@ describe Gori::Tui::RepeaterView do
       view.request_text.should contain("  \"b\": [\n    1,\n    2\n  ]")
       view.dirty?.should be_true
       view.request_text.should_not contain("Content-Length: 30")
+    end
+  end
+
+  # `repeater.graphql-introspection[-legacy]`. The split GraphQL tab (and the SAML refusal) is
+  # in repeater_decode_spec.cr, beside the split-decode fixtures it needs.
+  describe "insert_graphql_introspection" do
+    get_request = "GET /graphql?query=%7Bme%7D&apikey=k HTTP/1.1\nHost: api.test\nAuthorization: Bearer t\n\n"
+
+    it "rewrites the request as the introspection POST and leaves the target alone" do
+      view = RepeaterView.new
+      view.restore("https://api.test", get_request, false, true)
+      view.insert_graphql_introspection(false).should eq("inserted the introspection query — send it with ^R")
+      head, _, body = view.request_text.partition("\n\n")
+      head.should eq("POST /graphql?apikey=k HTTP/1.1\nHost: api.test\nAuthorization: Bearer t\n" \
+                     "Content-Type: application/json\nContent-Length: #{body.bytesize}")
+      body.should eq(Gori::Graphql::Introspection.body)
+      view.target.should eq("https://api.test")
+      view.dirty?.should be_true
+    end
+
+    it "inserts the legacy query under its own status line" do
+      view = RepeaterView.new
+      view.restore("https://api.test", get_request, false, true)
+      view.insert_graphql_introspection(true).should eq("inserted the legacy introspection query — send it with ^R")
+      view.request_text.partition("\n\n")[2].should eq(Gori::Graphql::Introspection.body(legacy: true))
+    end
+
+    it "turns a rewrite error into the status line and edits nothing" do
+      view = RepeaterView.new
+      view.restore("https://api.test", "not a request line\nHost: api.test\n\n", false, true)
+      view.insert_graphql_introspection(false).should contain("request line")
+      view.request_text.should eq("not a request line\nHost: api.test\n\n")
+      view.dirty?.should be_false
+    end
+
+    it "is one undoable edit" do
+      view = RepeaterView.new
+      view.restore("https://api.test", get_request, false, true)
+      view.insert_graphql_introspection(false)
+      view.focus_pane(:request)
+      view.edit_undo
+      view.request_text.should eq(get_request)
+    end
+
+    it "refuses a %%% send group rather than drop every request after the first" do
+      group = "GET /graphql HTTP/1.1\nHost: a\n\n%%%\nGET /b HTTP/1.1\nHost: a\n\n"
+      view = RepeaterView.new
+      view.restore("https://a", group, false, true)
+      view.insert_graphql_introspection(false).should contain("%%%")
+      view.request_text.should eq(group)
+    end
+
+    it "refuses in hex mode" do
+      view = RepeaterView.new
+      view.restore("https://api.test", get_request, false, true)
+      view.toggle_request_hex.should be_true
+      view.insert_graphql_introspection(false).should contain("hex mode")
+      String.new(view.request_bytes).should start_with("GET /graphql?query=")
+    end
+
+    it "refuses in a WebSocket tab and in a gRPC tab" do
+      row = ->(target : String) {
+        Gori::Store::FlowRow.new(
+          id: 1_i64, created_at: 0_i64, scheme: "https", method: "GET", host: "api.test",
+          port: 443, target: target, status: 101, size: 0_i64, state: Gori::Store::FlowState::Complete)
+      }
+      ws_head = "GET /ws HTTP/1.1\r\nHost: api.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" \
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+      ws = RepeaterView.new
+      ws.load_ws(Gori::Store::FlowDetail.new(row.call("/ws"), "HTTP/1.1", ws_head.to_slice, nil, nil, nil),
+        [] of Gori::Store::WsOutMessage)
+      ws.insert_graphql_introspection(false).should contain("WebSocket")
+      ws.request_text.should start_with("GET /ws HTTP/1.1")
+
+      grpc_head = "POST /demo.Greeter/SayHello HTTP/2\r\nHost: api.test\r\ncontent-type: application/grpc\r\n\r\n"
+      grpc = RepeaterView.new
+      grpc.load_grpc(Gori::Store::FlowDetail.new(row.call("/demo.Greeter/SayHello"), "HTTP/2",
+        grpc_head.to_slice, Bytes[0, 0, 0, 0, 0], nil, nil))
+      grpc.insert_graphql_introspection(false).should contain("gRPC")
+      grpc.request_text.should start_with("POST /demo.Greeter/SayHello HTTP/2")
     end
   end
 

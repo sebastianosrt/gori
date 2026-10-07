@@ -1,19 +1,7 @@
 require "socket"
 require "openssl"
 require "./prefix_io"
-
-# Expose the transport socket an SSL wrapper drives, so proxy tunnels can set fd-level
-# socket options (read/write timeouts, keepalive) that OpenSSL::SSL::Socket does not forward
-# to the underlying socket. `#bio` is private on the class, but `OpenSSL::BIO#io` is public;
-# calling it from a method reopened onto the class is allowed. Guarded so a future stdlib
-# change degrades to "can't reach the socket" (the baseline timeout stays) instead of breaking.
-class OpenSSL::SSL::Socket
-  def gori_underlying_io : IO?
-    bio.io
-  rescue
-    nil
-  end
-end
+require "./socket_residue"
 
 module Gori::Proxy
   # Centralizes read/write timeouts and TCP keepalive for the proxy's client and upstream
@@ -24,10 +12,10 @@ module Gori::Proxy
   # and SO_KEEPALIVE takes over reaping a dead (half-open) peer without a wall-clock cutoff on
   # live-but-idle traffic. Resolving the underlying Socket through the TLS/PrefixIO wrappers lets
   # every seam relax by handle (`SocketTuning.relax(@io)`) without threading raw sockets through
-  # ClientConn/TlsMitm signatures.
+  # ClientConn/Tls::Tunnel signatures.
   module SocketTuning
     # Per-read/write timeout while reading a request head/body or writing a response. Matches
-    # the upstream leg's existing 30 s (Upstream::IO_TIMEOUT) — a stall THIS long between reads
+    # the upstream leg's existing 30 s (Settings.io_timeout) — a stall THIS long between reads
     # is treated as a dead/hostile peer. It is per-read (per 64 KiB copy iteration), not a
     # whole-body budget, so only a ≥30 s stall trips it, never a genuinely slow-but-progressing
     # transfer.
@@ -61,8 +49,9 @@ module Gori::Proxy
       end
     end
 
-    # Set the read+write timeout on `io`'s socket. No-op if the socket can't be resolved.
-    def self.arm(io : IO?, timeout : Time::Span) : Nil
+    # Set the read+write timeout on `io`'s socket (nil clears it). No-op if the socket can't
+    # be resolved.
+    def self.arm(io : IO?, timeout : Time::Span?) : Nil
       sock = underlying_socket(io) || return
       sock.read_timeout = timeout
       sock.write_timeout = timeout
@@ -72,10 +61,7 @@ module Gori::Proxy
 
     # Clear the read+write timeout on `io`'s socket, for entering a long-lived tunnel/relay.
     def self.relax(io : IO?) : Nil
-      sock = underlying_socket(io) || return
-      sock.read_timeout = nil
-      sock.write_timeout = nil
-    rescue
+      arm(io, nil)
     end
 
     # Enable TCP keepalive on a socket (best-effort tunables). Never fails the connection over

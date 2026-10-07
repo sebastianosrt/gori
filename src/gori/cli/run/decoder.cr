@@ -17,9 +17,8 @@ module Gori
         output_mode : Decoder::RenderAs? = nil
         input_flag : String? = nil
         format = :text
-        positional = [] of String
 
-        parser = OptionParser.new do |p|
+        positional = parse_args(args, "gori run decoder") do |p|
           p.banner = "Usage: gori run decoder <chain> [input] [options]\n\n" \
                      "Run INPUT through a left-to-right converter CHAIN (separators: > | ,).\n" \
                      "INPUT comes from the 2nd positional arg, --input, or STDIN (verbatim).\n\n" \
@@ -31,13 +30,8 @@ module Gori
                      "Run 'gori run decoder list' for every converter name."
           p.on("--input=STR", "Value to convert (else 2nd positional arg, else STDIN)") { |v| input_flag = v }
           p.on("-oMODE", "--output=MODE", "Render final bytes: auto (default) | text | base64 | hex") { |v| output_mode = parse_render_mode(v) }
-          p.on("--format=FMT", "Output: text (default) | json (per-step detail)") { |v| format = parse_format(v, [:text, :json]) }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = before + after }
-          p.invalid_option { |f| abort "gori run decoder: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run decoder: missing value for #{f}" }
+          format_flag(p, [:text, :json], "Output: text (default) | json (per-step detail)") { |f| format = f }
         end
-        parser.parse(args)
 
         abort "gori run decoder: missing <chain> (e.g. 'base64-decode'; see 'gori run decoder list')" if positional.empty?
         abort "gori run decoder: too many arguments (expected <chain> [input])" if positional.size > 2
@@ -46,7 +40,7 @@ module Gori
 
         (msg = decoder_input_twice_error(input_flag, positional[1]?)) && abort(msg)
         input_str = input_flag || positional[1]?
-        input_str ||= STDIN.gets_to_end unless STDIN.tty?
+        input_str ||= read_stdin_fallback(STDIN, "gori run decoder", "input") unless STDIN.tty?
         abort "gori run decoder: no input (pass it as an argument, --input, or via STDIN)" if input_str.nil?
 
         result = Decoder.run(Decoder.shared_registry, input_str.to_slice, chain)
@@ -56,20 +50,21 @@ module Gori
         else
           if final_bytes = result.output
             rendered, render = Decoder.display(final_bytes, output_mode)
-            # Neutralize ANSI/OSC on a live terminal for auto/text. A pipe or an explicit
-            # hex/base64 render stays byte-exact — the default job of this command is
-            # "give me the decoded bytes".
-            if STDOUT.tty? && render.text?
-              STDOUT.puts CLI::Output.term_safe_multiline(rendered)
-            else
-              STDOUT.puts rendered
-            end
+            write_decoder_output(STDOUT, rendered, render, STDOUT.tty?)
           end
           report_convert_failure(result) unless result.ok?
         end
         # A broken chain exits non-zero in BOTH formats — the json branch previously always
         # exited 0, burying "ok":false (inconsistent with the text view + intercept acks).
         exit 1 unless result.ok?
+      end
+
+      private def self.write_decoder_output(io : IO, rendered : String,
+                                            render : Decoder::RenderAs, terminal : Bool) : Nil
+        # Neutralize ANSI/OSC on a live terminal for text. Piped output stays byte-exact —
+        # the default job of this command is "give me the decoded bytes".
+        rendered = CLI::Output.term_safe_multiline(rendered) if terminal && render.text?
+        CLI::Output.write_value(io, rendered, terminal)
       end
 
       # The sentence `cmd_decoder` aborts with when `<chain>` holds no converter at all, or nil
@@ -152,16 +147,12 @@ module Gori
 
       private def self.cmd_decoder_list(args : Array(String)) : Nil
         format = :text
-        parser = OptionParser.new do |p|
-          p.banner = "Usage: gori run decoder list [options]\n\nList every converter (name, category, direction)."
-          p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.invalid_option { |f| abort "gori run decoder list: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run decoder list: missing value for #{f}" }
-        end
-        parse_no_positionals(parser, args, "gori run decoder list",
+        parse_no_positionals(args, "gori run decoder list",
           "`decoder list` takes no positional arguments; to run a value through a chain use " \
-          "`gori run decoder <chain> [input]`")
+          "`gori run decoder <chain> [input]`") do |p|
+          p.banner = "Usage: gori run decoder list [options]\n\nList every converter (name, category, direction)."
+          format_flag(p, [:text, :json], "Output: text (default) | json") { |f| format = f }
+        end
 
         registry = Decoder.shared_registry
         if format == :json
@@ -188,14 +179,25 @@ module Gori
         end
       end
 
-      # The text listing, one row per converter. The name column is MEASURED, not fixed:
-      # `quoted-printable-encode` is 23 chars and a saved chain's name is whatever the
-      # operator typed, and a fixed 22 put those rows' columns one (or many) cells off the rest.
+      # The text listing, one row per converter. EVERY column is MEASURED, not fixed:
+      # `quoted-printable-encode` is 23 chars and a saved chain's name is whatever the operator
+      # typed, and a fixed 22 put those rows' columns one (or many) cells off the rest.
+      #
+      # The two columns behind it were left hard-coded when the name was measured, and the
+      # category then outgrew its 11: `Category::Serialization`'s label is 13, so every
+      # msgpack/cbor/java/viewstate/php/pickle row pushed its DIRECTION and DESCRIPTION two
+      # cells right of the other seventy. `ljust(n)` is only a separator while the value is
+      # SHORTER than n — measuring is what makes that true for a table whose contents grow.
       def self.decoder_list_lines(registry : Decoder::Registry) : Array(String)
-        name_w = registry.max_of(&.name.size)
-        registry.map do |c|
-          line = "#{c.name.ljust(name_w)}  #{c.category.label.ljust(11)}  #{c.direction.to_s.downcase.ljust(9)}  #{c.description}"
-          (u = c.unusable) && (line += "  [unusable: #{u}]")
+        # The cells are built first and the widths measured off THEM, so what is measured is
+        # what is printed. Measuring `direction.to_s` while padding `direction.to_s.downcase`
+        # agrees only for as long as every spelling stays ASCII — the same latent mismatch
+        # that broke the category column, one enum over.
+        rows = registry.map { |c| {c.name, c.category.label, c.direction.to_s.downcase, c.description, c.unusable} }
+        widths = {0, 1, 2}.map { |i| rows.max_of { |r| r[i].as(String).size } }
+        rows.map do |(name, cat, dir, desc, unusable)|
+          line = "#{name.ljust(widths[0])}  #{cat.ljust(widths[1])}  #{dir.ljust(widths[2])}  #{desc}"
+          (u = unusable) && (line += "  [unusable: #{u}]")
           line
         end
       end

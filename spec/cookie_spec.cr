@@ -14,7 +14,8 @@ private FLASK_COMPRESSED  = ".eJyrVkpJLElUslJyHAWDCijpKBXl56QCY6a0OLVIqRYAhzxtRA
 private DJANGO            = "eyJ1c2VyX2lkIjo0MiwiYWRtaW4iOnRydWUsIm5hbWUiOiJhbGljZSJ9:1wqQs6:ofPm07XfGfVUimPfVs9Bdy5M7H0cxBS_265YiN3lQsY"
 private DJANGO_SALTED     = "eyJ1c2VyX2lkIjo0MiwiYWRtaW4iOnRydWUsIm5hbWUiOiJhbGljZSJ9:1wqQs6:9xbI_dkuxU80EIQKjrNucKXsYJ2IMbwYIy8_Y6FkKyw" # salt "my.custom.salt"
 private DJANGO_COMPRESSED = ".eJyrVkpJLElUslJyHAWDCijpKBXl56QCY6a0OLVIqRYAhzxtRA:1wqR8J:8cg4YrNnvAr1qe7zFsz_Lu83Y4LH95Sq0A7AW1M3RqE"
-private DJANGO_SHA1       = "eyJhIjoxfQ:1wqR8T:8BooTFI1B28NGHSf42JyGt1Or-0" # algorithm sha1, payload {"a":1}
+private DJANGO_SESSION    = "eyJfYXV0aF91c2VyX2lkIjoiMSJ9:1wqQs6:UBVpRFYEZlbUro450HHxNtbw_5mIw2NleDtSo4KHYKw" # signed_cookies SessionStore, Django 6.1.1
+private DJANGO_SHA1       = "eyJhIjoxfQ:1wqR8T:8BooTFI1B28NGHSf42JyGt1Or-0"                                   # algorithm sha1, payload {"a":1}
 private RACK              = "BAh7BkkiCXVzZXIGOgZFVEkiCmFsaWNlBjsAVA==--9156ef2ac6989f37064259efa196770c3ee052ca"
 
 describe Gori::Cookie do
@@ -71,17 +72,17 @@ describe Gori::Cookie do
     it "int_to_b64 is the itsdangerous timestamp codec (plain unix, minimal big-endian)" do
       # The FLASK vector's timestamp segment decodes back to a real unix second.
       seg = FLASK.split('.')[1]
-      Gori::Cookie.int_to_b64(Gori::Cookie.b64_to_int(seg)).should eq(seg)
+      Gori::Cookie.int_to_b64(Gori::Cookie.b64_to_int?(seg).not_nil!).should eq(seg)
     end
 
     it "b64_to_int? answers nil (not raise) on an invalid or oversized segment" do
-      # The tolerant DECODE sibling of b64_to_int, mirroring the nil contract base62_decode
+      # The DECODE reader, mirroring the nil contract base62_decode
       # already gives Django, so a mangled Flask timestamp renders "(invalid …)"/null instead
       # of raising CookieError and refusing the whole cookie.
       seg = FLASK.split('.')[1]
-      Gori::Cookie.b64_to_int?(seg).should eq(Gori::Cookie.b64_to_int(seg)) # a real ts still decodes
-      Gori::Cookie.b64_to_int?("@@@bad@@@").should be_nil                   # not valid base64
-      Gori::Cookie.b64_to_int?("AAAAAAAAAAAAAAAA").should be_nil            # decodes to > 8 bytes
+      Gori::Cookie.b64_to_int?(seg).should_not be_nil            # a real ts still decodes
+      Gori::Cookie.b64_to_int?("@@@bad@@@").should be_nil        # not valid base64
+      Gori::Cookie.b64_to_int?("AAAAAAAAAAAAAAAA").should be_nil # decodes to > 8 bytes
     end
 
     it "b64_to_int? answers nil (not a wrapped-negative) on an 8-byte value past Int64::MAX" do
@@ -103,10 +104,17 @@ describe Gori::Cookie do
       JSON.parse(Gori::Cookie.decode_json(cookie, "flask"))["timestamp"].raw.should be_nil
     end
 
-    it "secure_compare is length- and content-exact" do
-      Gori::Cookie.secure_compare("abc", "abc").should be_true
-      Gori::Cookie.secure_compare("abc", "abd").should be_false
-      Gori::Cookie.secure_compare("abc", "ab").should be_false
+    it "detect_django_algo reads sha1/sha256 off the signature byte length" do
+      # HMAC-SHA1 is 20 raw bytes, HMAC-SHA256 is 32 — an unambiguous tell with no secret,
+      # so a surface can pick the right algorithm for a black-box Django cookie without a
+      # flag (the "correct secret reads as ✗ bad key on a SHA-1 app" trap). nil when the
+      # cookie is not a 3-part Django token (Flask/Rack have no colons) or the signature is
+      # some other length, so the caller falls back to its default.
+      Gori::Cookie.detect_django_algo(DJANGO_SHA1).should eq("sha1")
+      Gori::Cookie.detect_django_algo(DJANGO).should eq("sha256")
+      Gori::Cookie.detect_django_algo(FLASK).should be_nil
+      Gori::Cookie.detect_django_algo(RACK).should be_nil
+      Gori::Cookie.detect_django_algo("a:b:@@@").should be_nil # non-base64 signature segment
     end
   end
 
@@ -117,7 +125,9 @@ describe Gori::Cookie do
     end
 
     it "re-signs byte-identically (round-trip) with the correct secret" do
-      Gori::Cookie::Flask.resign(FLASK, SECRET).should eq(FLASK)
+      p = Gori::Cookie::Flask.parse(FLASK)
+      input = Gori::Cookie::Flask.signing_input(p)
+      "#{input}.#{Gori::Cookie::Flask.compute_sig(input, SECRET)}".should eq(FLASK)
     end
 
     it "decodes the payload, timestamp, and signature" do
@@ -142,6 +152,13 @@ describe Gori::Cookie do
       Gori::Cookie::Flask.verify(forged, "other").should be_false
     end
 
+    it "forges and decodes a payload with a number past Int64, keeping its digits (#1200)" do
+      forged = Gori::Cookie::Flask.forge(%({"uid":18446744073709551615,"admin":true}), SECRET, 1785656674_i64)
+      Gori::Cookie::Flask.verify(forged, SECRET).should be_true
+      Gori::Cookie.decode(forged, "flask").should contain("18446744073709551615")
+      Gori::Cookie.decode_json(forged, "flask").should contain(%("uid":18446744073709551615))
+    end
+
     it "decodes a cookie with a mangled timestamp instead of crashing (Django parity)" do
       # A crafted timestamp segment must not refuse the whole cookie: the payload and
       # signature are perfectly readable, and Django already degrades this gracefully.
@@ -160,13 +177,24 @@ describe Gori::Cookie do
     end
 
     it "re-signs byte-identically" do
-      Gori::Cookie::Django.resign(DJANGO, SECRET).should eq(DJANGO)
+      p = Gori::Cookie::Django.parse(DJANGO)
+      input = Gori::Cookie::Django.signing_input(p)
+      "#{input}:#{Gori::Cookie::Django.compute_sig(input, SECRET)}".should eq(DJANGO)
     end
 
     it "honors a custom salt (the signed-with-salt variant)" do
       # Same payload+ts, different salt → different signature; each verifies under its own.
       Gori::Cookie::Django.verify(DJANGO_SALTED, SECRET, salt: "my.custom.salt").should be_true
       Gori::Cookie::Django.verify(DJANGO_SALTED, SECRET).should be_false # default salt must fail
+    end
+
+    # The cookie-session backend signs with plain `signing.dumps(salt=SESSION_SALT)`. gori used
+    # to wrap the secret in Django 6.0's `django.http.cookies` prefix for this salt, which only
+    # `get_cookie_signer()` applies, so a real session cookie never verified.
+    it "verifies a real signed_cookies session cookie under the session salt" do
+      Gori::Cookie::Django.verify(DJANGO_SESSION, SECRET, salt: Gori::Cookie::Django::SESSION_SALT).should be_true
+      Gori::Cookie::Django.forge(%({"_auth_user_id":"1"}), SECRET, 1785656674_i64,
+        salt: Gori::Cookie::Django::SESSION_SALT).should eq(DJANGO_SESSION)
     end
 
     it "honors the sha1 algorithm variant" do
@@ -184,16 +212,18 @@ describe Gori::Cookie do
       forged = Gori::Cookie::Django.forge(%({"admin":true}), SECRET, 1785656674_i64)
       Gori::Cookie::Django.verify(forged, SECRET).should be_true
     end
+
+    it "forges and decodes a payload with a number past Int64, keeping its digits (#1200)" do
+      forged = Gori::Cookie::Django.forge(%({"uid":18446744073709551615}), SECRET, 1785656674_i64)
+      Gori::Cookie::Django.verify(forged, SECRET).should be_true
+      Gori::Cookie.decode(forged, "django").should contain("18446744073709551615")
+    end
   end
 
   describe "Rack" do
     it "verifies the golden cookie, rejects a wrong secret" do
       Gori::Cookie.verify(RACK, SECRET).should be_true
       Gori::Cookie.verify(RACK, "wrong").should be_false
-    end
-
-    it "re-signs byte-identically" do
-      Gori::Cookie::Rack.resign(RACK, SECRET).should eq(RACK)
     end
 
     it "surfaces the opaque marshalled value as hex + ascii, never verifying" do
@@ -206,6 +236,21 @@ describe Gori::Cookie do
     it "forges from an opaque base64 value + secret" do
       value = RACK.split("--").first
       Gori::Cookie::Rack.forge(value, SECRET).should eq(RACK) # same value+secret → same cookie
+    end
+
+    it "verifies, cracks and re-signs the percent-escaped form Rack puts on the wire" do
+      wire = RACK.sub("==--", "%3D%3D--")
+      Gori::Cookie.verify(wire, SECRET).should be_true
+      Gori::Cookie.crack(wire, ["x", SECRET]).should eq(SECRET)
+      Gori::Cookie::Rack.forge(wire.rpartition("--")[0], SECRET).should eq(wire)
+      JSON.parse(Gori::Cookie.decode_json(wire))["value_size"].as_i.should eq(28)
+    end
+
+    it "escapes a forged value's `+`, which Rack would read back as a space" do
+      forged = Gori::Cookie::Rack.forge("a+b/c=", SECRET)
+      forged.should start_with("a%2Bb%2Fc%3D--")
+      Gori::Cookie.verify(forged, SECRET).should be_true
+      Gori::Cookie::Rack.forge(forged.rpartition("--")[0], SECRET).should eq(forged)
     end
 
     # A cookie is bytes lifted verbatim off the wire, so the tail after "--" need not be valid
@@ -303,5 +348,16 @@ describe Gori::Cookie do
         Gori::Cookie::Flask.forge("{not json", SECRET, 0_i64)
       end
     end
+  end
+end
+
+describe "Gori::Cookie.decode_json" do
+  # A cookie's payload is whatever its issuer put there; one that is not UTF-8 used to make the
+  # whole document invalid JSON.
+  it "stays valid UTF-8 JSON when the payload is not" do
+    payload = Base64.urlsafe_encode(Bytes[0x7b, 0x22, 0x75, 0x22, 0x3a, 0x22, 0xff, 0x22, 0x7d], padding: false)
+    json = Gori::Cookie.decode_json("#{payload}.Zm9v.c2ln", "flask")
+    json.valid_encoding?.should be_true
+    JSON.parse(json)
   end
 end

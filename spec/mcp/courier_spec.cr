@@ -1,0 +1,521 @@
+require "../spec_helper"
+require "../../src/gori/mcp/courier"
+require "../support/mcp_harness"
+
+private alias Courier = Gori::MCP::Courier
+
+# A courier over a real store with every route injected: what it emits, what it writes to the
+# socket, and what it records, without a fiber (the tick is driven by hand).
+private class Rig
+  getter frames = [] of String
+  getter store : Gori::Store
+  property client : String? = "claude-code"
+  property? channels = false
+  property inbox : String? = nil
+  property codex : Gori::MCP::CodexQueue::Session? = nil
+  getter codex_lookups = 0
+  # The in-flight ledger the other readers in the process share with the courier.
+  property? claimable = true
+  getter claimed_ids = [] of Int64
+  getter released_ids = [] of Int64
+  # Runs inside a claim — the window in which another reader in the process can carry a row.
+  property on_claim : Proc(Int64, Nil)? = nil
+
+  def initialize(@store)
+  end
+
+  # How many times the courier asked the process to expire its questions (#1324).
+  getter expiries = 0
+
+  def courier(pid = 77_i64) : Courier
+    Courier.new(pid: pid, store: -> { @store.as(Gori::Store?) }, client: -> { @client },
+      channels: -> { @channels }, emit: ->(f : String) { @frames << f; nil }, inbox: -> { @inbox },
+      codex: -> { @codex_lookups += 1; @codex },
+      claim: ->(id : Int64) { @claimed_ids << id; @on_claim.try(&.call(id)); @claimable },
+      release: ->(id : Int64) { @released_ids << id; nil },
+      expire: -> { @expiries += 1; nil },
+      answered: ->(qid : Int64) { @answered << qid; nil })
+  end
+
+  # The question ids the courier reported closed as it read their rows.
+  getter answered = [] of Int64
+end
+
+private def with_fake_inbox(&)
+  posix_only!("Claude Code's inbox is a Unix socket gori only looks for on POSIX")
+  dir = File.tempname("gori-courier")
+  Dir.mkdir_p(dir)
+  path = File.join(dir, "1.sock")
+  server = UNIXServer.new(path)
+  got = [] of String
+  spawn do
+    while client = server.accept?
+      got.concat(client.gets_to_end.lines)
+      client.close
+    end
+  end
+  begin
+    yield path, got
+  ensure
+    server.close rescue nil
+    FileUtils.rm_rf(dir)
+  end
+end
+
+describe Gori::MCP::Courier do
+  it "starts at the feed's end so a late joiner never replays old messages" do
+    with_store do |store|
+      store.post_agent_message("before you came", "all", nil)
+      rig = Rig.new(store)
+      c = rig.courier
+      c.tick.should eq(0)
+      rig.frames.should be_empty
+      store.post_agent_message("after", "all", nil)
+      c.tick.should eq(1)
+      c.delivered.should eq(1)
+    end
+  end
+
+  # The courier is not the only reader any more: `operator_messages` has always been able to
+  # pick a message up inside the 500ms before a tick, and the tool-result carry (#1090 layer
+  # four) does so on every call the agent makes. A route that skips this test writes the same
+  # instruction to the session twice — for Codex, a second turn spent acting on it again.
+  it "does not deliver a message a confirmed route already carried to this session" do
+    with_fake_inbox do |path, got|
+      with_store do |store|
+        rig = Rig.new(store)
+        rig.inbox = path
+        c = rig.courier(5_i64)
+        c.tick
+        m = store.post_agent_message("already carried", "pid:5", nil)
+        carried = store.record_agent_delivery(m, Gori::AgentDelivery::VIA_TOOL_RESULT,
+          "grok pid 5", true, pid: 5_i64)
+        c.tick.should eq(1) # the page held it…
+        c.delivered.should eq(0)
+        Fiber.yield
+        got.should be_empty                                            # …and nothing was written to the session
+        store.agent_deliveries_after(carried, 10).rows.should be_empty # nor claimed a second time
+      end
+    end
+  end
+
+  it "leaves a message for polling when there is no live route, and records why" do
+    with_store do |store|
+      rig = Rig.new(store)
+      rig.client = "codex"
+      c = rig.courier(9_i64)
+      c.tick
+      m = store.post_agent_message("hi codex", "pid:9", "history")
+      c.tick.should eq(1)
+      d = store.agent_deliveries_after(m, 10).rows.first
+      d.via.should eq("poll")
+      d.ok.should be_true # a deposit is not a failure
+      d.pid.should eq(9)
+      d.target_label.should eq("codex pid 9")
+      d.reason.not_nil!.should contain("operator_messages")
+      rig.frames.should be_empty
+    end
+  end
+
+  it "skips messages addressed to another courier" do
+    with_store do |store|
+      rig = Rig.new(store)
+      c = rig.courier(9_i64)
+      c.tick
+      store.post_agent_message("not for you", "pid:10", nil)
+      c.tick.should eq(0)
+      store.agent_deliveries_after(0, 10).rows.should be_empty
+      # …and the cursor still moved past it: the next tick does not rescan
+      mine = store.post_agent_message("for you", "pid:9", nil)
+      c.tick.should eq(1)
+      c.cursor.should eq(mine)
+    end
+  end
+
+  it "pushes a channel frame only when channels are on AND the client is Claude Code" do
+    with_store do |store|
+      rig = Rig.new(store)
+      rig.channels = true
+      c = rig.courier
+      c.tick
+      m = store.post_agent_message("fuzz the login", "all", "history", [3_i64, 4_i64])
+      c.tick.should eq(1)
+      rig.frames.size.should eq(1)
+      f = JSON.parse(rig.frames[0])
+      f["method"].should eq("notifications/claude/channel")
+      f["params"]["content"].as_s.should start_with("fuzz the login")
+      f["params"]["content"].as_s.should end_with(Gori::MCP::OperatorNote::REPLY_HINT)
+      f["params"]["meta"]["message_id"].should eq(m.to_s)
+      f["params"]["meta"]["from_tab"].should eq("history")
+      f["params"]["meta"]["flow_ids"].should eq("3,4")
+      f["id"]?.should be_nil # a notification, never a request
+      d = store.agent_deliveries_after(m, 10).rows.first
+      d.via.should eq("channel")
+      d.ok.should be_true
+      # A channel push is unverifiable, so it must NOT retire the message: operator_messages
+      # still owes it (a session that never registered the channel would otherwise lose it
+      # silently). Only a confirmed route — socket or the agent's own pickup — carries it.
+      store.delivered_agent_message_ids(0_i64, 77_i64).includes?(m).should be_false
+      store.agent_messages_after(0_i64, 77_i64).rows.map(&.id).should contain(m)
+
+      # channels on, but a client that is not Claude Code: no push, socket/poll instead
+      rig.client = "codex"
+      store.post_agent_message("again", "all", nil)
+      c.tick
+      rig.frames.size.should eq(1)
+    end
+  end
+
+  it "writes to the inbox socket when one exists, framed as relayed operator intent" do
+    with_store do |store|
+      with_fake_inbox do |path, got|
+        rig = Rig.new(store)
+        rig.inbox = path
+        c = rig.courier
+        c.tick
+        m = store.post_agent_message("look at issue 4", "all", "issues")
+        c.tick.should eq(1)
+        # the fake server's fiber needs a moment to read
+        deadline = Time.instant + 2.seconds
+        until got.size >= 1 || Time.instant >= deadline
+          sleep 20.milliseconds
+        end
+        # one user line, preceded by an auth line when this spec itself runs under a Claude
+        # session that exports CLAUDE_CODE_MESSAGING_TOKEN
+        got.size.should be >= 1
+        JSON.parse(got.last)["message"]["content"].as_s.should start_with("[gori] The operator at the gori TUI says (from the issues tab): look at issue 4")
+        d = store.agent_deliveries_after(m, 10).rows.first
+        d.via.should eq("socket")
+        d.ok.should be_true
+        rig.frames.should be_empty
+      end
+    end
+  end
+
+  it "records a failed socket write as a warning delivery instead of raising" do
+    with_store do |store|
+      rig = Rig.new(store)
+      rig.inbox = "/nonexistent/gori.sock"
+      c = rig.courier
+      c.tick
+      m = store.post_agent_message("x", "all", nil)
+      c.tick.should eq(1)
+      d = store.agent_deliveries_after(m, 10).rows.first
+      # Nothing else could take it, so the row is the poll deposit — and it is a WARNING, not
+      # the reassuring "left for … to pick up": a door was shut, which is not the same thing as
+      # this client having no door.
+      d.via.should eq(Gori::AgentDelivery::VIA_POLL)
+      d.ok.should be_false
+      d.reason.not_nil!.should contain("socket:")
+      d.reason.not_nil!.should contain("operator_messages")
+    end
+  end
+
+  # A socket PATH that exists is not a session that is listening: `/tmp/cc-socks/<pid>.sock`
+  # outlives the process that bound it and pids are reused, so a `gori mcp` under another
+  # client can find a dead Claude socket at its parent's pid. Committing to it used to cost the
+  # hand-off that would have worked.
+  it "falls through to the next route when the socket it found is dead" do
+    with_store do |store|
+      mcp_with_fake_codex do |log|
+        rig = Rig.new(store)
+        rig.client = "codex"
+        rig.inbox = "/nonexistent/stale.sock" # a leftover from a session that is gone
+        rig.codex = Gori::MCP::CodexQueue::Session.new("01a0b92e-f7d0-77d3-8ba9-61e53e67a768", "/tmp/h")
+        c = rig.courier
+        c.tick
+        m = store.post_agent_message("still reaches codex", "all", nil)
+        c.tick.should eq(1)
+        File.read(log).lines[4].should contain("still reaches codex")
+        d = store.agent_deliveries_after(m, 10).rows.first
+        d.via.should eq(Gori::AgentDelivery::VIA_CODEX_QUEUE)
+        d.ok.should be_true
+      end
+    end
+  end
+
+  # The channel is the only route that cannot say whether it landed, so it goes LAST. An
+  # operator turning the preview on must not lose the socket: a Claude Code session launched
+  # without the development-channels flag drops the push without a word, and the socket is the
+  # one route that would have woken it.
+  it "prefers the confirmed inbox socket over the channel push when both are available" do
+    with_fake_inbox do |path, _got|
+      with_store do |store|
+        rig = Rig.new(store)
+        rig.channels = true
+        rig.inbox = path
+        c = rig.courier
+        c.tick
+        m = store.post_agent_message("fuzz the login", "all", nil)
+        c.tick.should eq(1)
+        rig.frames.should be_empty # no push: the confirmed door answered
+        d = store.agent_deliveries_after(m, 10).rows.first
+        d.via.should eq(Gori::AgentDelivery::VIA_SOCKET)
+        # …and the socket RETIRES it, which the push would not have done.
+        store.delivered_agent_message_ids(0_i64, 77_i64).includes?(m).should be_true
+      end
+    end
+  end
+
+  it "queues into the parent Codex thread when the client is Codex, and that carries it" do
+    with_store do |store|
+      mcp_with_fake_codex do |log|
+        rig = Rig.new(store)
+        rig.client = "codex-mcp-client"
+        rig.codex = Gori::MCP::CodexQueue::Session.new("01a0b92e-f7d0-77d3-8ba9-61e53e67a768", "/tmp/h")
+        c = rig.courier
+        c.tick
+        m = store.post_agent_message("look at issue 4", "all", "issues", [12_i64, 13_i64])
+        c.tick.should eq(1)
+        queued = File.read(log).lines[4]
+        queued.should start_with("[gori] The operator at the gori TUI says (from the issues tab): look at issue 4")
+        # The row is retired by this route, so what it held has to be in the line.
+        queued.should contain("12, 13")
+        queued.should contain("in_reply_to #{m}")
+        d = store.agent_deliveries_after(m, 10).rows.first
+        d.via.should eq(Gori::AgentDelivery::VIA_CODEX_QUEUE)
+        d.ok.should be_true
+        # CARRIED: a hand-off the CLI accepted retires the message from the poll backstop.
+        Gori::AgentDelivery::CARRIED.includes?(d.via).should be_true
+      end
+    end
+  end
+
+  it "looks the Codex thread up once per tick, not once per message" do
+    with_store do |store|
+      mcp_with_fake_codex do |_|
+        rig = Rig.new(store)
+        rig.client = "codex-mcp-client"
+        rig.codex = Gori::MCP::CodexQueue::Session.new("01a0b92e-f7d0-77d3-8ba9-61e53e67a768", "/tmp/h")
+        c = rig.courier
+        c.tick
+        before = rig.codex_lookups
+        3.times { |i| store.post_agent_message("m#{i}", "all", nil) }
+        c.tick.should eq(3)
+        # In production that proc forks an `lsof`; three rows of one broadcast go to the same
+        # parent and cannot disagree about which thread it is on.
+        (rig.codex_lookups - before).should eq(1)
+      end
+    end
+  end
+
+  it "leaves the message for polling when the parent is a Codex with no thread open" do
+    with_store do |store|
+      rig = Rig.new(store)
+      rig.client = "codex-mcp-client"
+      rig.codex = nil
+      c = rig.courier
+      c.tick
+      m = store.post_agent_message("x", "all", nil)
+      c.tick.should eq(1)
+      d = store.agent_deliveries_after(m, 10).rows.first
+      d.via.should eq(Gori::AgentDelivery::VIA_POLL)
+      d.ok.should be_true
+    end
+  end
+
+  it "never looks for a Codex thread on behalf of another client" do
+    with_store do |store|
+      rig = Rig.new(store)
+      rig.client = "antigravity"
+      # A session is there for the taking; the client name is what says it is not ours.
+      rig.codex = Gori::MCP::CodexQueue::Session.new("01a0b92e-f7d0-77d3-8ba9-61e53e67a768", "/tmp/h")
+      c = rig.courier
+      c.tick
+      m = store.post_agent_message("x", "all", nil)
+      c.tick.should eq(1)
+      store.agent_deliveries_after(m, 10).rows.first.via.should eq(Gori::AgentDelivery::VIA_POLL)
+    end
+  end
+
+  it "does not starve behind a full page of messages for other sessions" do
+    with_store do |store|
+      rig = Rig.new(store)
+      rig.client = "codex"
+      c = rig.courier(9_i64)
+      c.tick
+      first = store.post_agent_message("one for me", "pid:9", nil)
+      60.times { store.post_agent_message("someone else", "pid:10", nil) }
+      last = store.post_agent_message("also for me", "pid:9", nil)
+      c.tick.should eq(1)        # the first page (50 rows) held only the first
+      c.cursor.should be < last  # …and the cursor stopped at what was scanned, not the feed's end
+      c.tick.should eq(1)        # the next page finds the one behind the noise
+      c.cursor.should be >= last # its own delivery rows land after the high-water it read
+      store.agent_deliveries_after(0, 100).rows.map(&.message_id).should eq([first, last])
+      c.tick.should eq(0)
+    end
+  end
+
+  it "rebases its cursor when the store is swapped underneath it" do
+    with_store do |a|
+      with_store do |b|
+        b.post_agent_message("old in b", "all", nil)
+        current = a
+        c = Courier.new(pid: 1_i64, store: -> { current.as(Gori::Store?) }, client: -> { "claude-code".as(String?) },
+          channels: -> { false }, emit: ->(_f : String) { nil }, inbox: -> { nil.as(String?) })
+        c.tick
+        current = b
+        c.tick.should eq(0) # not "old in b"
+        b.post_agent_message("new in b", "all", nil)
+        c.tick.should eq(1)
+      end
+    end
+  end
+
+  # The delivery ROW is written when a hand-off finishes, and `codex queue` parks the fiber for
+  # up to ten seconds before it does. Whoever else in this process reads the same feed in that
+  # window has to be told the message is already on its way, or the agent gets it twice.
+  it "announces a message as in flight for the length of the hand-off, and gives it back" do
+    with_fake_inbox do |path, _got|
+      with_store do |store|
+        rig = Rig.new(store)
+        rig.inbox = path
+        c = rig.courier
+        c.tick
+        m = store.post_agent_message("one line", "all", nil)
+        c.tick.should eq(1)
+        rig.claimed_ids.should eq([m])
+        rig.released_ids.should eq([m]) # the durable row answers for it from here on
+      end
+    end
+  end
+
+  it "does not deliver a later row another route carried while an earlier one was handed off" do
+    with_fake_inbox do |path, got|
+      with_store do |store|
+        rig = Rig.new(store)
+        rig.inbox = path
+        c = rig.courier(5_i64)
+        c.tick
+        one = store.post_agent_message("one", "pid:5", nil)
+        two = store.post_agent_message("two", "pid:5", nil)
+        rig.on_claim = ->(id : Int64) do
+          store.record_agent_delivery(two, Gori::AgentDelivery::VIA_TOOL_RESULT, "t pid 5", true, pid: 5_i64) if id == one
+          nil
+        end
+        c.tick.should eq(2)
+        c.delivered.should eq(1)
+        Fiber.yield
+        got.join.should_not contain("two")
+      end
+    end
+  end
+
+  # `--read-only` has no writer, so no delivery row can stop the courier and the tool-result
+  # carry from each sending what the other already had: an in-process ledger does.
+  it "on a read-only store, records what it carried and skips what another route carried" do
+    with_fake_inbox do |path, got|
+      dir = File.tempname("gori-ro")
+      Dir.mkdir_p(dir)
+      db = File.join(dir, "p.db")
+      rw = Gori::Store.open(db)
+      ro = Gori::Store.open(db, read_only: true, background_index: false)
+      ledger = Set(Int64).new
+      begin
+        c = Courier.new(pid: 5_i64, store: -> { ro.as(Gori::Store?) }, client: -> { "claude-code".as(String?) },
+          channels: -> { false }, emit: ->(_f : String) { nil }, inbox: -> { path.as(String?) },
+          codex: -> { nil.as(Gori::MCP::CodexQueue::Session?) }, carried: -> { ledger })
+        c.tick
+        one = rw.post_agent_message("one", "pid:5", nil)
+        two = rw.post_agent_message("two", "pid:5", nil)
+        ledger << two # the tool-result carry handed it over first
+        c.tick.should eq(2)
+        c.delivered.should eq(1)
+        ledger.should contain(one)
+        Fiber.yield
+        got.join.should_not contain("two")
+      ensure
+        ro.close
+        rw.close
+        FileUtils.rm_rf(dir)
+      end
+    end
+  end
+
+  it "leaves a message alone while another route in this process is handing it over" do
+    with_fake_inbox do |path, got|
+      with_store do |store|
+        rig = Rig.new(store)
+        rig.inbox = path
+        rig.claimable = false
+        c = rig.courier
+        c.tick
+        m = store.post_agent_message("somebody else has it", "all", nil)
+        c.tick.should eq(1)
+        c.delivered.should eq(0)
+        Fiber.yield
+        got.should be_empty
+        store.agent_deliveries_after(m, 10).rows.should be_empty
+        # …and the cursor stopped below it. A claim is TEMPORARY — the holder may fail — so
+        # unlike a row a confirmed route already carried, this one is still owed.
+        c.cursor.should be < m
+        rig.claimable = true
+        c.tick.should eq(1)
+        c.delivered.should eq(1)
+        store.agent_deliveries_after(m, 10).rows.first.via.should eq(Gori::AgentDelivery::VIA_SOCKET)
+      end
+    end
+  end
+end
+
+# #1324: `ask_operator` answers ride this courier like any operator message, framed as the
+# answer they are, and the courier's tick is what expires this process's questions.
+describe Gori::MCP::Courier, "ask_operator answers" do
+  it "asks for expiries on every tick, even when the feed has not moved" do
+    with_store do |store|
+      rig = Rig.new(store)
+      c = rig.courier
+      c.tick
+      c.tick
+      rig.expiries.should eq(2)
+    end
+  end
+
+  it "writes an answer to the inbox socket framed as the answer to that question" do
+    with_store do |store|
+      with_fake_inbox do |path, got|
+        rig = Rig.new(store)
+        rig.inbox = path
+        c = rig.courier(77_i64)
+        qid = store.record_agent_question("Add api.example.com to scope?", nil, ["yes", "no"], nil, "claude-code pid 77", 77_i64, Int64::MAX)
+        q = store.open_agent_questions(qid - 1, 0_i64).first
+        c.tick
+        store.close_agent_question(q, Gori::AgentQuestion::OUTCOME_ANSWERED, "yes", "operator", "tui")
+        c.tick.should eq(1)
+        deadline = Time.instant + 2.seconds
+        until got.size >= 1 || Time.instant >= deadline
+          sleep 20.milliseconds
+        end
+        content = JSON.parse(got.last)["message"]["content"].as_s
+        content.should start_with("[gori] The operator answered your ask_operator question ##{qid}")
+        content.should contain(%("yes"))
+        content.should contain("not an authorization")
+      end
+    end
+  end
+
+  # Read is enough: the expiry check cannot see an answer the operator has since cleared from
+  # the feed, so the clock stops the moment the courier reads the row.
+  it "reports each closing row as it reads it, delivered or not" do
+    with_store do |store|
+      rig = Rig.new(store)
+      c = rig.courier(77_i64)
+      qid = store.record_agent_question("q", nil, ["a", "b"], nil, "claude-code pid 77", 77_i64, Int64::MAX)
+      q = store.open_agent_questions(qid - 1, 0_i64).first
+      c.tick
+      store.post_agent_message("unrelated", "all", nil)
+      store.close_agent_question(q, Gori::AgentQuestion::OUTCOME_DISMISSED, nil, "operator", "tui")
+      c.tick
+      rig.answered.should eq([qid])
+    end
+  end
+
+  it "names the question and the outcome in a channel push" do
+    m = Gori::AgentMessage.new(9_i64, "(expired without an answer)", "pid:1", nil, [] of Int64, 0_i64,
+      in_reply_to: 5_i64, outcome: "expired", question: "send anyway?")
+    frame = JSON.parse(Courier.channel_frame(m))["params"]
+    frame["content"].as_s.should contain("expired with no answer")
+    frame["meta"]["in_reply_to"].as_s.should eq("5")
+    frame["meta"]["outcome"].as_s.should eq("expired")
+  end
+end

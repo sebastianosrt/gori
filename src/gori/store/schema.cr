@@ -1,4 +1,5 @@
 require "db"
+require "./scope_match" # V31's backfill calls gori_static_asset; `migrate!` installs it
 
 module Gori
   class Store
@@ -71,7 +72,8 @@ module Gori
         # are bounded by retention.
         #
         # trigram tokenizer => case-insensitive SUBSTRING matching (like a body: LIKE), just
-        # indexed. Query terms must be >=3 chars (QL falls back to a BLOB LIKE scan below that).
+        # indexed. Query terms must be >=3 chars; below that QL scans the stored bytes with
+        # the same literal REGEXP its index-free `body:` uses (see ql.cr's `body_cond`).
         #
         # CONTENTLESS (content='') because we already store the raw bodies in
         # flows.{request,response}_body — the default FTS5 shadow %_content copy would be pure
@@ -760,10 +762,9 @@ module Gori
       # then rebuilds it here in the same transaction: microseconds on an empty table, and it
       # keeps every database, new or migrated, on exactly one definition.
       #
-      # `sequencer_sessions` is NOT rebuilt. `LinkRefKind.parse` accepts only
-      # flow|repeater|fuzz|miner, so nothing can reference a sequencer session and there is no
-      # id to protect today — `delete_sequencer_session` takes the cascade pre-emptively, and
-      # its comment says that whoever adds a `Sequencer` variant needs this rebuild too.
+      # `sequencer_sessions` is NOT rebuilt here: no link can name one (`LinkRefKind.parse`
+      # accepts only flow|repeater|fuzz|miner). That undercounted its holders — a peer TUI's tab
+      # and an Activity row keep a session id too — and V41 moves it.
       # `flows` is not swept either, and must not be: the prune paths delete from the BOTTOM
       # (`id <= cutoff`), so `MAX(id)` survives and a pruned flow's id never returns — its
       # links are already safely `(gone)`.
@@ -1223,8 +1224,937 @@ module Gori
         "UPDATE fuzz_runs SET snapshot_version = 1 WHERE surface IN ('tui', 'cli', 'mcp')",
       ]
 
+      # Frozen issue evidence (#1038): an IMMUTABLE copy of one exchange at the moment it proved
+      # a finding, owned by the issue it proves.
+      #
+      # A copy, not a "protect this flow from retention" flag on `flows`, because the product
+      # contract is that ordinary workbench activity must never change what the evidence says
+      # — and both live sources are mutable in ways a flag cannot stop. A Repeater tab holds
+      # exactly ONE response, and the next send REPLACES it (`update_repeater_response`); the
+      # working tab must stay editable and sendable, so the only way to keep the response that
+      # confirmed the finding is to keep a copy that the tab's next send cannot reach. A flow
+      # is only ever DELETED, but a flag would then have to be honoured by three prune paths,
+      # `delete_flows`, `clear_flows` and every export's "no longer captured" branch. The
+      # bytes are already capture-capped per flow, and `bytes` is summed against
+      # `Evidence::QUOTA_BYTES` on every freeze so the table stays bounded.
+      #
+      # `source_kind`/`source_id` preserve PROVENANCE. A flow `source_id` is negated when its
+      # row is deleted, keeping the original id readable while preventing a later row from
+      # inheriting the source reference. The live row may otherwise be re-sent tomorrow and
+      # this snapshot must read exactly as it does today. `request_sha256`/`response_sha256` are the hashes
+      # of the stored bytes (head + body), written at freeze time so a later reader — an export,
+      # a report — can state what it was handed.
+      #
+      # Evidence and Issue membership are separate: bytes stay even when the last Issue is
+      # unlinked/deleted, and one immutable copy may support several findings (#1039).
+      # AUTOINCREMENT is required now that `evidence_issue_links` points AT an evidence id:
+      # a deleted id must never be reused underneath a stale peer's pending link operation.
+      V26 = [
+        <<-SQL,
+          CREATE TABLE issue_evidence (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at         INTEGER NOT NULL,
+            source_kind        TEXT    NOT NULL,
+            source_id          INTEGER NOT NULL,
+            method             TEXT    NOT NULL,
+            url                TEXT    NOT NULL,
+            protocol           TEXT,
+            status             INTEGER,
+            duration_us        INTEGER,
+            error              TEXT,
+            request_head       BLOB    NOT NULL,
+            request_body       BLOB,
+            response_head      BLOB,
+            response_body      BLOB,
+            request_truncated  INTEGER NOT NULL DEFAULT 0,
+            response_truncated INTEGER NOT NULL DEFAULT 0,
+            request_sha256     TEXT    NOT NULL,
+            response_sha256    TEXT,
+            bytes              INTEGER NOT NULL
+          )
+          SQL
+        <<-SQL,
+          CREATE TABLE evidence_issue_links (
+            evidence_id INTEGER NOT NULL,
+            issue_id    INTEGER NOT NULL,
+            created_at  INTEGER NOT NULL,
+            PRIMARY KEY (evidence_id, issue_id)
+          )
+          SQL
+        # The Issues detail lists an issue's snapshots in freeze order on every open; the
+        # reverse index makes a global evidence row's linked Issue ids cheap to resolve.
+        "CREATE INDEX idx_evidence_issue_links_issue ON evidence_issue_links (issue_id, evidence_id)",
+        "CREATE INDEX idx_evidence_issue_links_evidence ON evidence_issue_links (evidence_id, issue_id)",
+        # The History detail and the Repeater ask "does a frozen copy of THIS exist" per open.
+        "CREATE INDEX idx_issue_evidence_source ON issue_evidence (source_kind, source_id)",
+      ]
+
+      # Issue-linked retest (#1036): an ordered, role-tagged list of Repeater sends with one
+      # assertion each, plus a bounded record of what happened the last few times it ran.
+      #
+      # SEPARATE from `entity_links`, deliberately, and the issue says why: an evidence link
+      # answers "what material is related", while a retest step additionally carries order,
+      # role, an assertion and execution state. Folding the two would make unlinking a piece
+      # of evidence silently delete a test step, and adding a link silently add one.
+      #
+      # `issue_retest_steps.ref_kind`/`ref_id` reuse the `entity_links` vocabulary so both
+      # name a workbench object the same way; only `repeater` is written today (`Retest.plan`
+      # refuses the rest), and the column is TEXT rather than a constant so a later kind does
+      # not need a migration to be nameable.
+      #
+      # Runs are a CHILD of the issue and cascade with it (`delete_issue`), unlike frozen
+      # evidence: a run summary is a statement about one issue's check and means nothing
+      # detached from it, where a frozen exchange is bytes that outlive any filing. The
+      # newest `Retest::RUN_HISTORY` runs per issue are kept; `record_retest_run` prunes.
+      #
+      # AUTOINCREMENT on both parents, for the reason V26 gives: `issue_retest_run_steps`
+      # points AT a run id, and a reused id would silently re-parent an orphaned result row.
+      V27 = [
+        <<-SQL,
+          CREATE TABLE issue_retest_steps (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_id   INTEGER NOT NULL,
+            position   INTEGER NOT NULL,
+            role       TEXT    NOT NULL,
+            ref_kind   TEXT    NOT NULL,
+            ref_id     INTEGER NOT NULL,
+            assertion  TEXT    NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+          )
+          SQL
+        "CREATE INDEX idx_issue_retest_steps_issue ON issue_retest_steps (issue_id, position, id)",
+        <<-SQL,
+          CREATE TABLE issue_retest_runs (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_id     INTEGER NOT NULL,
+            started_at   INTEGER NOT NULL,
+            finished_at  INTEGER NOT NULL,
+            surface      TEXT,
+            verdict      TEXT    NOT NULL,
+            total        INTEGER NOT NULL,
+            passed       INTEGER NOT NULL,
+            failed       INTEGER NOT NULL,
+            inconclusive INTEGER NOT NULL,
+            errored      INTEGER NOT NULL,
+            blocked      INTEGER NOT NULL,
+            skipped      INTEGER NOT NULL,
+            note         TEXT
+          )
+          SQL
+        "CREATE INDEX idx_issue_retest_runs_issue ON issue_retest_runs (issue_id, started_at, id)",
+        # `label`/`method`/`url`/`assertion` are COPIES taken at run time, not references: a
+        # run is read after the Repeater tab has been renamed, edited or closed, and a row
+        # that re-resolved would describe a request that never ran.
+        <<-SQL,
+          CREATE TABLE issue_retest_run_steps (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id      INTEGER NOT NULL,
+            position    INTEGER NOT NULL,
+            role        TEXT    NOT NULL,
+            ref_kind    TEXT    NOT NULL,
+            ref_id      INTEGER NOT NULL,
+            label       TEXT    NOT NULL,
+            method      TEXT    NOT NULL,
+            url         TEXT    NOT NULL,
+            assertion   TEXT    NOT NULL,
+            outcome     TEXT    NOT NULL,
+            detail      TEXT    NOT NULL,
+            status      INTEGER,
+            duration_us INTEGER,
+            bytes       INTEGER NOT NULL DEFAULT 0,
+            flow_id     INTEGER
+          )
+          SQL
+        "CREATE INDEX idx_issue_retest_run_steps_run ON issue_retest_run_steps (run_id, position, id)",
+      ]
+
+      # `repeaters.response_request_sha256` — the SHA-256 of the tab's SAVED request as it
+      # stood when the response beside it was written (#1038).
+      #
+      # A `repeaters` row holds the tab's CURRENT request and its LAST response, and nothing
+      # tied the two together: edit the request after a send and the row reads as one
+      # exchange that never happened. That is tolerable for a workbench tab — the pane shows
+      # what it shows — and NOT tolerable for frozen evidence, whose whole promise is the
+      # request and the response of ONE exchange. This column is what lets a freeze tell the
+      # two apart: `update_repeater_response` writes the digest of the request that was sent
+      # beside the response, and `Evidence.from_repeater` compares it against the digest of
+      # the request the row holds now.
+      #
+      # Over the SAVED request bytes (`repeaters.request`), not the wire: the send seam
+      # expands `$NAME` bindings and overlays the active session slot, so a wire digest would
+      # differ from the stored request on every tab that uses either and report drift on all
+      # of them.
+      #
+      # NULL on every row written before this column, and NULL means NOT RECORDED — not "no
+      # drift" and not "drifted". `from_repeater` leaves `request_drifted` false there: an
+      # unknown is not an accusation, and the docs' "freeze right after the send" is still
+      # the rule for a response persisted by an older gori.
+      V28 = [
+        "ALTER TABLE repeaters ADD COLUMN response_request_sha256 TEXT",
+      ]
+
+      # Which saved provider an OAST session was registered with, when that provider is a GLOBAL
+      # one (#1192). `provider_id` can only name a row of this project's `oast_providers`, so a
+      # global provider's session carried no identity and was re-resolved by kind + endpoint —
+      # which binds the FIRST match, and so the wrong token whenever two global providers share
+      # an endpoint. Holds the provider's scope-qualified key (`g_<id>`, `ProviderConfig#key`),
+      # "" for a session registered with no saved provider at all (`gori run oast listen
+      # --save`, an MCP `oast_start` given a kind and host), and NULL for a project provider
+      # (`provider_id` says it) or a row written before this column. NULL is "not recorded",
+      # and `Oast::Sessions.resolve` says what it does with that.
+      V29 = [
+        "ALTER TABLE oast_sessions ADD COLUMN provider_key TEXT",
+      ]
+
+      # The result-capture policy a saved fuzz run was written under (issue #1240): `all` (every
+      # row) or `interesting` (matched rows plus the ones carrying an observed fact — an error, a
+      # re-send, a truncated capture, the stop condition). Recorded so a filtered archive reads
+      # "12 of 100,000 rows kept (keep: interesting)" rather than looking like a lost run — the
+      # counters (`sent`/`matched`/`errors`) stay whole-run and `idx` stays the payload position,
+      # so a kept row's gaps are the dropped rows. DEFAULT 'all', which is what every run before
+      # this column was: the archive kept everything.
+      V30 = [
+        "ALTER TABLE fuzz_runs ADD COLUMN keep TEXT NOT NULL DEFAULT 'all'",
+      ]
+
+      # V31 — the hide-static lens (#1239). `static:` and the lens read a COLUMN decided once,
+      # when the response lands (`Store#update_one`), rather than calling `gori_static_asset`
+      # per row per query: `content_type` and `status` sit AFTER the body BLOBs, so reading
+      # them walks every row's overflow chain, and the Sitemap's DISTINCT — which otherwise
+      # never leaves `idx_flows_sitemap` — went from ~4 ms to ~156 ms at 100k flows with the
+      # lens on, re-run on every data_version tick (P6).
+      #
+      # The partial index is that DISTINCT with the lens on, covered: ~2.5 ms on the same set.
+      # The rows a project already holds are classified by `BACKFILLS[31]`, not here — see there.
+      V31 = [
+        "ALTER TABLE flows ADD COLUMN static_asset INTEGER NOT NULL DEFAULT 0",
+        "CREATE INDEX idx_flows_sitemap_nonstatic ON flows (host, target, method) WHERE static_asset = 0",
+      ]
+
+      # V32 has no schema shape to add; its backfill clears materialized classifications made
+      # under V31's original narrower rules. Appending a data-only version makes already-V31
+      # projects reclassify their rows once without rebuilding the table or index.
+      V32 = [] of String
+
+      # V33 — where a short-circuit rule's answer comes from (#1237). `respond` is the sub-kind
+      # (`inline` | `file` | `dir` | `fault`, `Store::RespondKind`) and `respond_args` its
+      # parameters as a small JSON object (`Store::RespondArgs`). A sub-kind of `short_circuit`
+      # rather than a new `op`: an older binary reads an unknown op as inert (#1242) only from
+      # that release on, while every release since #511 already fails a `dir` or `fault` row
+      # CLOSED — a directory is "not a regular file", and a fault row's empty head does not parse,
+      # so both answer the 502 stub instead of reaching the origin.
+      #
+      # The UPDATE is plain SQL, so it lives here and not in BACKFILLS: a row that already had a
+      # `body_file` was a file stub, and saying so keeps `respond` truthful for every surface
+      # that lists it.
+      V33 = [
+        "ALTER TABLE match_rules ADD COLUMN respond TEXT NOT NULL DEFAULT 'inline'",
+        "ALTER TABLE match_rules ADD COLUMN respond_args TEXT NOT NULL DEFAULT ''",
+        "UPDATE match_rules SET respond = 'file' WHERE op = 'short_circuit' AND body_file != ''",
+      ]
+
+      # Which result a saved fuzz run's `stop_on` tripped on (issue #1270): the `idx` of that
+      # row, written by the terminal update only when the run committed `condition_met`. NULL
+      # on every other run, and on every `condition_met` run written before this column — NULL
+      # means NOT RECORDED, not "no row", and nothing here can recover it: the per-row
+      # `stop_hit` flag was never stored, an `after_matches` stop trips on a row that flag does
+      # not mark, and concurrency lets later in-flight rows meet the condition too. On the run
+      # row rather than a `fuzz_results` column because it is one fact about the run, and it
+      # costs no result projection a byte.
+      V34 = [
+        "ALTER TABLE fuzz_runs ADD COLUMN stop_idx INTEGER",
+      ]
+
+      # V35 — endpoints referenced in captured JavaScript (#1243). DERIVED rows: `JsRefs.scan`
+      # reads bodies already in the store and sends nothing, so every row here is a projection
+      # of a flow and is deleted WITH that flow (`delete_flow_set`, `clear_flows`, both retention
+      # sweeps). Not flows, deliberately: a Pending or stub flow would read as "a request was
+      # attempted" in History, QL and every export, and nothing was.
+      #
+      # `path` is the Sitemap's query-less node path (`Sitemap.path_part(node_path)`), the key the
+      # tree attaches on; `target` keeps the query the literal carried, for a replay. `host` is
+      # `Url.parse`'s lowercased host. `flags` bit 0 = the literal sat in a comment, bit 1 = it
+      # was a template literal cut at `${…}`. `base` names what a relative literal was resolved
+      # against (absolute|page|referer|guessed). `body_offset` is a byte offset into the decoded
+      # response body — not `offset`, which is an SQL keyword.
+      #
+      # `js_ref_scans` records WHICH flows were scanned, per flow rather than as a watermark:
+      # `flows.id` was a reused rowid until V39 (see `detach_flow_refs`), so after a `history clear`
+      # the next capture was handed ids BELOW any "scanned up to" mark and would never be scanned. A marker
+      # row dies with its flow, so a reused id starts unscanned. `version` is the extractor's
+      # (`JsRefs::VERSION`): a flow scanned by an older one reads as unscanned again.
+      V35 = [
+        <<-SQL,
+          CREATE TABLE js_refs (
+            id          INTEGER PRIMARY KEY,
+            flow_id     INTEGER NOT NULL,
+            scheme      TEXT    NOT NULL,
+            host        TEXT    NOT NULL,
+            port        INTEGER NOT NULL,
+            path        TEXT    NOT NULL,
+            target      TEXT    NOT NULL,
+            literal     TEXT    NOT NULL,
+            body_offset INTEGER NOT NULL,
+            line        INTEGER NOT NULL,
+            flags       INTEGER NOT NULL DEFAULT 0,
+            base        TEXT    NOT NULL,
+            created_at  INTEGER NOT NULL,
+            UNIQUE(host, path, flow_id)
+          )
+          SQL
+        "CREATE INDEX idx_js_refs_flow ON js_refs (flow_id)",
+        <<-SQL,
+          CREATE TABLE js_ref_scans (
+            flow_id    INTEGER PRIMARY KEY,
+            version    INTEGER NOT NULL,
+            refs       INTEGER NOT NULL,
+            scanned_at INTEGER NOT NULL
+          )
+          SQL
+      ]
+
+      # V36 — the rows `Store#abandon_all_pending` finalises: Pending captures that were sent.
+      # It runs on the writer at every session open and twice at close, and without this its
+      # `state = 0 AND unsent = 0` was a full scan of `flows` — and both columns sit past the
+      # body BLOBs (see V31), so it walked every row's overflow chain. The index holds only
+      # in-flight flows, so it stays a handful of entries on any project, and a capture pays
+      # one small insert/delete pair for it.
+      #
+      # `0` is `FlowState::Pending.value`, spelled literally because SQLite uses a partial index
+      # only for a query whose WHERE carries the same literal (a bound `?` never matches);
+      # `abandon_all_pending` interpolates the enum, and `spec/store/pending_index_spec.cr`
+      # holds the two together and checks the plan.
+      V36 = [
+        "CREATE INDEX idx_flows_pending ON flows (id) WHERE state = 0 AND unsent = 0",
+      ]
+
+      # V37 — the History list, answered without touching a `flows` row. Every column
+      # `Store::SELECT_ROW` reads, plus every non-BLOB column a QL term filters on
+      # (`static_asset`), so a list page and a QL filter over the projection are one scan of
+      # this index. `id` LEADS, so the index is in rowid order and `ORDER BY id DESC LIMIT n`
+      # still stops after n matches instead of sorting.
+      #
+      # Round 1 tried this shape and measured nothing worth keeping (see the note in
+      # `Store.open`): with 8 KB bodies every row fit its leaf page and the 64 MiB cache held
+      # them. Real captures carry MB bodies, and then the leaf pages are spread through the
+      # whole file between overflow pages, and every column stored after the BLOBs (`status`
+      # onwards) is an overflow-chain walk. At 200k flows / 6.5 GB, 2% with 0.5–2 MB bodies:
+      # `host:` with no match 121 -> 9.4 ms, `src:repeater` 1061 -> 7.3 ms, `respsize:>1.5M`
+      # 252 -> 1.9 ms. ~121 B per flow on disk, ~1.3% more instructions per captured flow.
+      #
+      # A column added to `SELECT_ROW` or read by a new QL term belongs HERE too (a new
+      # version recreating the index), or every list read falls back to the table:
+      # `spec/store/list_index_spec.cr` pins the plans so that fails loudly.
+      V37 = [
+        "CREATE INDEX idx_flows_list ON flows (id, created_at, scheme, method, host, port, target, " \
+        "status, request_size, response_size, state, duration_us, content_type, short_circuited, " \
+        "advisory, request_content_type, connect_protocol, source, source_surface, source_ref, " \
+        "static_asset)",
+      ]
+
+      # V38 — `idx_flows_sitemap` widened from (host, target, method) to every column the
+      # Sitemap reads. `sitemap_entries_detailed` (MCP list_sitemap, `gori run sitemap`) and
+      # `endpoint_observations` (the retest diff) read `status`, `created_at`, `content_type`
+      # and `response_size`, all stored after the body BLOBs, so each page walked every row's
+      # overflow chain: ~1.2 s per page at 200k flows / 6.5 GB, at ANY offset, because the
+      # GROUP BY had to see every row before the first one came out. Covered, and grouped in
+      # the index's order (both queries spell their GROUP BY in their ORDER BY order), a page
+      # stops after its groups. The DISTINCT tree query, the host completion and the
+      # (host, target) lookups keep the prefix they used, now covered too.
+      #
+      # `static_asset` rides along so the hide-static lens stays covered on the wide query;
+      # the plain DISTINCT with the lens on still prefers `idx_flows_sitemap_nonstatic`, which
+      # is smaller. `spec/store/sitemap_index_spec.cr` pins the plans.
+      V38 = [
+        "DROP INDEX idx_flows_sitemap",
+        "CREATE INDEX idx_flows_sitemap ON flows (host, target, method, scheme, port, http_version, " \
+        "status, created_at, content_type, response_size, static_asset)",
+      ]
+
+      # V39 — a flow id, once issued, is never issued again, and neither is an h2 connection id.
+      #
+      # Both were `INTEGER PRIMARY KEY` without AUTOINCREMENT, so SQLite handed a new row
+      # `max(rowid)+1`: after `history clear`, or a delete of the newest flows, the next capture
+      # took an id that had named another flow. Every holder of one then pointed at the wrong
+      # traffic without noticing — TUI marks, an open detail, an MCP job's results, a
+      # `list_history` cursor an agent kept, and above all a PEER process, which never saw the
+      # delete. #1342 patched the consumers that were visibly wrong; this removes the cause.
+      # `h2_connections` had the same shape: a browser's connection outlives a clear, and the
+      # next one took its id and shared its frame log.
+      #
+      # Seeded the way V10 seeds (read its comment): past the highest id ANYTHING still
+      # references, not just `MAX(id)`, so a stranded reference in an emptied table cannot be
+      # handed its id back. That list is every column `detach_flow_refs` nulls, the columns a
+      # flow's delete removes with it (`ws_messages`, `js_refs`, `js_ref_scans`), the FTS rowids
+      # (the contentless index is keyed by `flows.id`, so a stray entry would put search hits on
+      # a new flow), the polymorphic refs and a flow evidence `source_id`, which is NEGATED when
+      # its flow goes. `flows.h2_conn_id` and `h2_frames.conn_id` seed `h2_connections`.
+      #
+      # These statements are the REBUILD, the V10 shape: new table, enumerated copy (never
+      # `SELECT *`), drop, rename, every index recreated, then the seed — which must follow the
+      # rename, because `sqlite_sequence` rows follow `RENAME TO` and the seed reads the table
+      # by its final name. Between the copy and the drop `rebuild_v39` runs `verify_v39_copy`,
+      # which a bare replay skips: it is there for tables with rows in them. The column order is
+      # V1's with V2..V31's ADD COLUMNs appended, and it is kept exactly: everything after the
+      # body BLOBs is an overflow-chain walk, and V31, V37 and V38 are built on that. No trigger
+      # or view names `flows`, nothing declares a foreign key, and `foreign_keys` is off on
+      # every gori connection, so neither the DROP nor the RENAME rewrites anything else.
+      #
+      # `migrate!` runs them only when it cannot do better. Measured: a copy of a 3.4 GB,
+      # 100k-flow project held the write lock 16-21 s, and left the file at 6.75 GB, because the
+      # old table's pages go to the freelist until a compact. The same 16 s had already been
+      # measured and refused as an open-time cost (`detach_flow_refs`' comment, #552): a peer
+      # waiting on the 5 s `busy_timeout` gets `database is locked`. AUTOINCREMENT does not change
+      # a table's on-disk format — it only changes how the next rowid is picked, through
+      # `sqlite_sequence` — so `Schema.autoincrement_in_place` makes it the change SQLite
+      # documents for format-preserving schema edits (lang_altertable.html, "otheralter"): edit
+      # the stored CREATE text, bump `schema_version`, then the same seed. Milliseconds at any
+      # size. The rebuild remains the definition a bare connection replays (specs build every
+      # historical shape that way) and the fallback for a SQLite that refuses the edit.
+      #
+      # Every `flows` column in table order, spelled once for the copy and for its verification.
+      V39_FLOW_COLUMNS = "id, created_at, scheme, host, port, method, target, http_version, sni, alpn, " \
+                         "tls_version, request_head, request_body, response_head, response_body, status, " \
+                         "reason, content_type, request_size, response_size, state, ttfb_us, duration_us, " \
+                         "error, h2_conn_id, h2_stream_id, request_body_truncated, response_body_truncated, " \
+                         "unsent, fts_dirty, short_circuited, advisory, request_content_type, " \
+                         "connect_protocol, source, source_surface, source_ref, static_asset"
+
+      V39_COPY = [
+        <<-SQL,
+          CREATE TABLE flows_v39 (
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at              INTEGER NOT NULL,
+            scheme                  TEXT    NOT NULL,
+            host                    TEXT    NOT NULL,
+            port                    INTEGER NOT NULL,
+            method                  TEXT    NOT NULL,
+            target                  TEXT    NOT NULL,
+            http_version            TEXT    NOT NULL,
+            sni                     TEXT,
+            alpn                    TEXT,
+            tls_version             TEXT,
+            request_head            BLOB    NOT NULL,
+            request_body            BLOB,
+            response_head           BLOB,
+            response_body           BLOB,
+            status                  INTEGER,
+            reason                  TEXT,
+            content_type            TEXT,
+            request_size            INTEGER NOT NULL DEFAULT 0,
+            response_size           INTEGER,
+            state                   INTEGER NOT NULL,
+            ttfb_us                 INTEGER,
+            duration_us             INTEGER,
+            error                   TEXT,
+            h2_conn_id              INTEGER,
+            h2_stream_id            INTEGER,
+            request_body_truncated  INTEGER NOT NULL DEFAULT 0,
+            response_body_truncated INTEGER NOT NULL DEFAULT 0,
+            unsent                  INTEGER NOT NULL DEFAULT 0,
+            fts_dirty               INTEGER NOT NULL DEFAULT 0,
+            short_circuited         INTEGER NOT NULL DEFAULT 0,
+            advisory                TEXT,
+            request_content_type    TEXT,
+            connect_protocol        TEXT,
+            source                  TEXT,
+            source_surface          TEXT,
+            source_ref              TEXT,
+            static_asset            INTEGER NOT NULL DEFAULT 0
+          )
+          SQL
+        "INSERT INTO flows_v39 (#{V39_FLOW_COLUMNS}) SELECT #{V39_FLOW_COLUMNS} FROM flows",
+        <<-SQL,
+          CREATE TABLE h2_connections_v39 (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at INTEGER NOT NULL,
+            host       TEXT    NOT NULL,
+            port       INTEGER NOT NULL,
+            alpn       TEXT    NOT NULL
+          )
+          SQL
+        "INSERT INTO h2_connections_v39 (id, created_at, host, port, alpn) " \
+        "SELECT id, created_at, host, port, alpn FROM h2_connections",
+      ]
+
+      # Nothing here runs before `Schema.verify_v39_copy` has compared the copies with the
+      # originals (see `rebuild_v39`): a DROP is the one statement that cannot be taken back.
+      V39_SWAP = [
+        "DROP TABLE flows",
+        "ALTER TABLE flows_v39 RENAME TO flows",
+        # Every index `flows` carried at V38, in the shape its latest version gave it.
+        "CREATE INDEX idx_flows_created_at ON flows (created_at)",
+        "CREATE INDEX idx_flows_status ON flows (status)",
+        "CREATE INDEX idx_flows_h2_conn ON flows (h2_conn_id)",
+        "CREATE INDEX idx_flows_sizes ON flows (request_size, response_size)",
+        "CREATE INDEX idx_flows_fts_dirty ON flows (id) WHERE fts_dirty = 1",
+        "CREATE INDEX idx_flows_sitemap_nonstatic ON flows (host, target, method) WHERE static_asset = 0",
+        "CREATE INDEX idx_flows_pending ON flows (id) WHERE state = 0 AND unsent = 0",
+        V37[0],
+        V38[1],
+        "DROP TABLE h2_connections",
+        "ALTER TABLE h2_connections_v39 RENAME TO h2_connections",
+      ]
+
+      # The same filtered seed V40 uses (`Schema.seed_sql`): a crafted archive's TEXT, REAL or
+      # top-of-int64 value in one of these columns would otherwise win the maximum, and hide the
+      # real references, or leave every later capture failing with SQLITE_FULL. `magnitude`, not
+      # `ABS`, which raises on the one int64 it cannot negate and would abort the upgrade. Each ref
+      # keeps its seek: rowid, `idx_flows_h2_conn` (never the row, whose `h2_conn_id` sits after
+      # the bodies), and the FTS index read from its top end.
+      V39_SEED = seed_sql("flows", [
+        "SELECT id AS v FROM flows",
+        "SELECT rowid AS v FROM flows_fts WHERE rowid < #{SEED_CEILING} ORDER BY rowid DESC LIMIT 1",
+        "SELECT flow_id AS v FROM ws_messages",
+        "SELECT flow_id AS v FROM js_refs",
+        "SELECT flow_id AS v FROM js_ref_scans",
+        "SELECT flow_id AS v FROM issues",
+        "SELECT flow_id AS v FROM repeaters",
+        "SELECT flow_id AS v FROM fuzz_sessions",
+        "SELECT flow_id AS v FROM miner_sessions",
+        "SELECT flow_id AS v FROM sequencer_sessions",
+        "SELECT flow_id AS v FROM issue_retest_run_steps",
+        "SELECT flow_id AS v FROM events",
+        "SELECT flow_id AS v FROM intercept_held",
+        "SELECT flow_id AS v FROM probe_oast_probes",
+        "SELECT sample_flow_id AS v FROM probe_issues",
+        "SELECT ref_id AS v FROM entity_links WHERE ref_kind = 'flow'",
+        "SELECT ref_id AS v FROM issue_retest_steps WHERE ref_kind = 'flow'",
+        "SELECT ref_id AS v FROM issue_retest_run_steps WHERE ref_kind = 'flow'",
+        "SELECT #{magnitude("source_id")} AS v FROM issue_evidence WHERE source_kind = 'flow'",
+      ]) + seed_sql("h2_connections", [
+        "SELECT id AS v FROM h2_connections",
+        "SELECT h2_conn_id AS v FROM flows",
+        "SELECT conn_id AS v FROM h2_frames",
+      ])
+
+      V39 = V39_COPY + V39_SWAP + V39_SEED
+
+      # One table V40 moves to `INTEGER PRIMARY KEY AUTOINCREMENT`, spelled once. `copy` and
+      # `swap` are its V10-shaped rebuild (read V10's comment): an enumerated copy into
+      # `<table>_autoinc`, then — only after `verify_rebuilt_copies` has compared it with the
+      # original — drop, rename, every index recreated. `seed` starts `sqlite_sequence` past the
+      # highest id the table or anything outside it still holds, whichever path moved it.
+      # `refs` are those outside holders, one `SELECT <value> AS v FROM …` each, a row per value
+      # (the seed takes the maximum). `body` is the column list exactly as V39 left it, the
+      # ADD COLUMNs appended in order.
+      record TableRebuild, table : String, columns : Array(String), body : String,
+        indexes : Array(String), refs : Array(String) do
+        def temp : String
+          "#{table}_autoinc"
+        end
+
+        def copy : Array(String)
+          cols = columns.join(", ")
+          ["CREATE TABLE #{temp} (\n#{body}\n)",
+           "INSERT INTO #{temp} (#{cols}) SELECT #{cols} FROM #{table}"]
+        end
+
+        def swap : Array(String)
+          ["DROP TABLE #{table}", "ALTER TABLE #{temp} RENAME TO #{table}"] + indexes
+        end
+
+        # After EVERY swap, because a ref can name another rebuilt table by its final name.
+        def seed : Array(String)
+          Schema.seed_sql(table, ["SELECT id AS v FROM #{table}"] + refs)
+        end
+      end
+
+      SEED_CEILING = 1_i64 << 62
+
+      # Start `table`'s `sqlite_sequence` row at the highest of `refs`, one `SELECT <value> AS v
+      # FROM …` each (V39 and V40 both). Only an integer below SEED_CEILING counts, filtered inside
+      # each ref BEFORE its maximum is taken, so one odd value cannot hide the real ones beside it.
+      # No gori issues ids at the ceiling, and a sequence at the top of the int64 range would make
+      # every later insert fail with SQLITE_FULL; text or a REAL is not an id at all. SQLite still
+      # never hands out an id at or below `MAX(id)`. A ref over one indexed column keeps its
+      # min/max lookup: the subquery flattens to `MAX(col) … WHERE col < ceiling`.
+      def self.seed_sql(table : String, refs : Array(String)) : Array(String)
+        values = refs.join("\n              UNION ALL ") do |ref|
+          "SELECT MAX(v) AS v FROM (#{ref}) WHERE v < #{SEED_CEILING} AND typeof(v) = 'integer'"
+        end
+        ["DELETE FROM sqlite_sequence WHERE name = '#{table}'",
+         "INSERT INTO sqlite_sequence (name, seq)\n" \
+         "  SELECT '#{table}', COALESCE(MAX(v), 0) FROM (\n              #{values}\n  )"]
+      end
+
+      # `ABS` raises on the one int64 it cannot negate; a negation there turns REAL instead, and
+      # the seed drops it. Negative ids are DETACHED references (see `delete_repeater`).
+      private def self.magnitude(col : String) : String
+        "CASE WHEN #{col} < 0 THEN -#{col} ELSE #{col} END"
+      end
+
+      # The N of a project custom probe rule's finding code, `custom_p_<N>`.
+      private def self.custom_rule_n(col : String, from : String) : String
+        "SELECT CAST(substr(#{col}, 10) AS INTEGER) AS v FROM #{from} " \
+        "WHERE #{col} GLOB 'custom_p_[0-9]*' AND substr(#{col}, 10) NOT GLOB '*[^0-9]*'"
+      end
+
+      # V40 — an id on these eight tables, once issued, is never issued again (#1344).
+      #
+      # Each was `INTEGER PRIMARY KEY` without AUTOINCREMENT, so SQLite handed a new row
+      # `max(rowid)+1` and a delete of the newest rows, or a wipe, gave the next insert an id
+      # that had named another row. Whatever still held the old id then acted on the new row
+      # without noticing, and the holder is usually another PROCESS (`gori mcp`, `gori run`, a
+      # peer TUI) that never saw the delete: a Probe finding's `sample_repeater_id` linked an
+      # issue to an unrelated tab, a recreated custom rule inherited the deleted one's finding
+      # code (`custom_p_<id>`) and with it the suppressions and false-positive rows, a stale
+      # `add_retest_step` passed the gone-issue guard, a stale `delete_scope_rule` could drop
+      # an EXCLUDE, a stale `delete_fuzz_run` removed another saved run. V10 did this for the
+      # fuzz and miner sessions and V39 for `flows`; this is the same decision for the rest
+      # (DESIGN.md §7).
+      #
+      # Seeded past every reference a surviving row can hold: the columns and polymorphic refs
+      # that name each table, negated (detached) refs by magnitude, the session slots' refresh
+      # steps and the disabled-rule set in `settings` (their keys spelled out, not read from
+      # `SESSION_SLOTS_KEY`/`PROBE_DISABLED_KEY`: a migration is history and must not follow a
+      # later rename), the custom rule codes, and the provenance a flow row carries in
+      # `source_ref` ("12" for a Repeater send, "issue #3 step 1", "project rule #4 · …") —
+      # read from `idx_flows_list`, which covers `source`/`source_ref`, never from `flows`.
+      #
+      # Moved the way V39 moves `flows` (read its comment): `move_to_autoincrement` edits each
+      # eligible table's stored CREATE text in place (`autoincrement_in_place`), which is
+      # milliseconds and touches no row, and gives any table it cannot edit the verified
+      # rebuild — cheap here, since these tables hold hundreds to a few thousand rows. Every
+      # table V1 or a later ADD COLUMN wrote is eligible; the rebuild is for a SQLite that
+      # refuses the edit or a CREATE text gori did not write. The statements below are that rebuild, which is what
+      # a bare replay runs.
+      ID_REBUILDS = [
+        TableRebuild.new("repeaters",
+          %w[id created_at updated_at target request http2 auto_content_length flow_id position
+            response_head response_body response_error response_duration_us name sni tags
+            ws_keep_key ws_http_only tls_preset response_request_sha256],
+          <<-SQL,
+            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at              INTEGER NOT NULL,
+            updated_at              INTEGER NOT NULL,
+            target                  TEXT    NOT NULL,
+            request                 TEXT    NOT NULL,
+            http2                   INTEGER NOT NULL DEFAULT 0,
+            auto_content_length     INTEGER NOT NULL DEFAULT 1,
+            flow_id                 INTEGER,
+            position                INTEGER NOT NULL DEFAULT 0,
+            response_head           BLOB,
+            response_body           BLOB,
+            response_error          TEXT,
+            response_duration_us    INTEGER,
+            name                    TEXT,
+            sni                     TEXT,
+            tags                    TEXT,
+            ws_keep_key             INTEGER NOT NULL DEFAULT 0,
+            ws_http_only            INTEGER NOT NULL DEFAULT 0,
+            tls_preset              TEXT,
+            response_request_sha256 TEXT
+            SQL
+          ["CREATE INDEX idx_repeaters_position ON repeaters (position, id)"],
+          ["SELECT repeater_id AS v FROM ws_messages",
+           "SELECT ref_id AS v FROM entity_links WHERE ref_kind = 'repeater'",
+           "SELECT #{magnitude("ref_id")} AS v FROM issue_retest_steps WHERE ref_kind = 'repeater'",
+           "SELECT #{magnitude("ref_id")} AS v FROM issue_retest_run_steps WHERE ref_kind = 'repeater'",
+           "SELECT #{magnitude("source_id")} AS v FROM issue_evidence WHERE source_kind = 'repeater'",
+           "SELECT sample_repeater_id AS v FROM probe_issues",
+           # `json_each` raises on text that is not JSON, and `e.value` of a non-object entry
+           # is not a JSON object: both are routed to an empty one rather than abort the upgrade.
+           "SELECT #{magnitude("r.value")} AS v FROM settings s, " \
+           "json_each(CASE WHEN json_valid(s.value) THEN s.value ELSE '[]' END) e, " \
+           "json_each(CASE WHEN e.type = 'object' THEN e.value ELSE '{}' END, '$.refresh') r " \
+           "WHERE s.key = 'authorize_identities' AND r.type = 'integer'",
+           "SELECT CAST(source_ref AS INTEGER) AS v FROM flows WHERE source = 'repeater' " \
+           "AND source_ref GLOB '[0-9]*' AND source_ref NOT GLOB '*[^0-9]*'"]),
+
+        TableRebuild.new("probe_custom_rules",
+          %w[id title description side region kind pattern severity enabled],
+          <<-SQL,
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            title       TEXT    NOT NULL,
+            description TEXT    NOT NULL DEFAULT '',
+            side        TEXT    NOT NULL,
+            region      TEXT    NOT NULL,
+            kind        TEXT    NOT NULL,
+            pattern     TEXT    NOT NULL,
+            severity    TEXT    NOT NULL,
+            enabled     INTEGER NOT NULL DEFAULT 1
+            SQL
+          [] of String,
+          [custom_rule_n("code", "probe_issues"),
+           custom_rule_n("code", "probe_suppressions"),
+           custom_rule_n("code", "probe_oast_probes"),
+           custom_rule_n("rule_id", "probe_oast_probes"),
+           custom_rule_n("d.value", "settings s, json_each(CASE WHEN json_valid(s.value) THEN s.value ELSE '[]' END) d") +
+           " AND s.key = 'probe_disabled_rules' AND d.type = 'text'"]),
+
+        TableRebuild.new("probe_issues",
+          %w[id code category host title severity status hit_count affected sample_flow_id
+            sample_repeater_id evidence first_seen last_seen],
+          <<-SQL,
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            code               TEXT    NOT NULL,
+            category           TEXT    NOT NULL,
+            host               TEXT    NOT NULL,
+            title              TEXT    NOT NULL,
+            severity           INTEGER NOT NULL,
+            status             INTEGER NOT NULL DEFAULT 0,
+            hit_count          INTEGER NOT NULL DEFAULT 1,
+            affected           TEXT    NOT NULL DEFAULT '[]',
+            sample_flow_id     INTEGER,
+            sample_repeater_id INTEGER,
+            evidence           TEXT,
+            first_seen         INTEGER NOT NULL,
+            last_seen          INTEGER NOT NULL,
+            UNIQUE(code, host)
+            SQL
+          ["CREATE INDEX idx_probe_issues_cat ON probe_issues (category, host)",
+           "CREATE INDEX idx_probe_issues_triage ON probe_issues (severity DESC, last_seen DESC)"],
+          [] of String),
+
+        TableRebuild.new("issues",
+          %w[id created_at updated_at title severity host flow_id notes status cvss],
+          <<-SQL,
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            title      TEXT    NOT NULL,
+            severity   INTEGER NOT NULL,
+            host       TEXT,
+            flow_id    INTEGER,
+            notes      TEXT    NOT NULL DEFAULT '',
+            status     INTEGER NOT NULL DEFAULT 0,
+            cvss       TEXT
+            SQL
+          ["CREATE INDEX idx_issues_severity ON issues (severity)",
+           "CREATE INDEX idx_issues_triage ON issues (severity DESC, created_at DESC)"],
+          ["SELECT owner_id AS v FROM entity_links WHERE owner_kind = 'issue'",
+           "SELECT issue_id AS v FROM evidence_issue_links",
+           "SELECT issue_id AS v FROM issue_retest_steps",
+           "SELECT issue_id AS v FROM issue_retest_runs",
+           "SELECT CAST(substr(source_ref, 8) AS INTEGER) AS v FROM flows " \
+           "WHERE source = 'retest' AND source_ref GLOB 'issue #[0-9]*'"]),
+
+        TableRebuild.new("match_rules",
+          %w[id enabled target pattern replacement position part op match_kind name host
+            body_file respond respond_args],
+          <<-SQL,
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            enabled      INTEGER NOT NULL DEFAULT 1,
+            target       TEXT    NOT NULL,
+            pattern      TEXT    NOT NULL,
+            replacement  TEXT    NOT NULL DEFAULT '',
+            position     INTEGER NOT NULL DEFAULT 0,
+            part         TEXT    NOT NULL DEFAULT 'head',
+            op           TEXT    NOT NULL DEFAULT 'replace',
+            match_kind   TEXT    NOT NULL DEFAULT 'literal',
+            name         TEXT    NOT NULL DEFAULT '',
+            host         TEXT    NOT NULL DEFAULT '',
+            body_file    TEXT    NOT NULL DEFAULT '',
+            respond      TEXT    NOT NULL DEFAULT 'inline',
+            respond_args TEXT    NOT NULL DEFAULT ''
+            SQL
+          [] of String,
+          # A mocked flow names the rule that answered it (`Rules#stub_ref`).
+          ["SELECT CAST(substr(source_ref, 15) AS INTEGER) AS v FROM flows " \
+           "WHERE source_ref GLOB 'project rule #[0-9]*'"]),
+
+        TableRebuild.new("scope_rules",
+          %w[id kind match_type pattern],
+          <<-SQL,
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind       TEXT NOT NULL DEFAULT 'include',
+            match_type TEXT NOT NULL DEFAULT 'host',
+            pattern    TEXT NOT NULL,
+            UNIQUE(kind, match_type, pattern)
+            SQL
+          [] of String, [] of String),
+
+        TableRebuild.new("host_overrides",
+          %w[id host ip],
+          <<-SQL,
+            id   INTEGER PRIMARY KEY AUTOINCREMENT,
+            host TEXT NOT NULL UNIQUE,
+            ip   TEXT NOT NULL
+            SQL
+          [] of String, [] of String),
+
+        # The spool is a private file per run and holds nothing this project's ids index.
+        TableRebuild.new("fuzz_runs",
+          %w[id session_id created_at finished_at target mode total sent matched errors status
+            http2 sni tls_preset websocket surface source_ref snapshot_version keep stop_idx],
+          <<-SQL,
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id       INTEGER,
+            created_at       INTEGER NOT NULL,
+            finished_at      INTEGER,
+            target           TEXT    NOT NULL,
+            mode             TEXT    NOT NULL,
+            total            INTEGER,
+            sent             INTEGER NOT NULL DEFAULT 0,
+            matched          INTEGER NOT NULL DEFAULT 0,
+            errors           INTEGER NOT NULL DEFAULT 0,
+            status           TEXT    NOT NULL DEFAULT 'running',
+            http2            INTEGER NOT NULL DEFAULT 0,
+            sni              TEXT,
+            tls_preset       TEXT,
+            websocket        INTEGER NOT NULL DEFAULT 0,
+            surface          TEXT,
+            source_ref       TEXT,
+            snapshot_version INTEGER NOT NULL DEFAULT 0,
+            keep             TEXT    NOT NULL DEFAULT 'all',
+            stop_idx         INTEGER
+            SQL
+          ["CREATE INDEX idx_fuzz_runs_session ON fuzz_runs (session_id, id)"],
+          ["SELECT run_id AS v FROM fuzz_results"]),
+      ]
+
+      V40_COPY = ID_REBUILDS.flat_map(&.copy)
+      V40_SWAP = ID_REBUILDS.flat_map(&.swap)
+
+      # Run on either path, after the move. The index is new in V40: closing a Repeater tab
+      # clears it from the findings it raised (`delete_repeater`), on the writer fiber, and
+      # without it that scans every finding.
+      V40_AFTER = [
+        "CREATE INDEX idx_probe_issues_sample_repeater ON probe_issues (sample_repeater_id) " \
+        "WHERE sample_repeater_id IS NOT NULL",
+      ] + ID_REBUILDS.flat_map(&.seed)
+
+      V40 = V40_COPY + V40_SWAP + V40_AFTER
+
+      # V41 — `sequencer_sessions` gets V40's treatment, which V10 withheld because no link could
+      # name a session. A link is not the only holder: a peer TUI keeps its tab's row id, and a
+      # delete of the newest session followed by a new one handed that id to the new row, which
+      # the peer's `reconcile` took for its own tab and its next save overwrote. An Activity row's
+      # `goto_session_id` opened the new session the same way. Moved as V40 moves its tables
+      # (`move_to_autoincrement`), and seeded past both holders the project keeps: the events
+      # that point at a session, and a `sequencer` link, which `LinkRefKind` cannot make today
+      # but `delete_sequencer_session` already cascades.
+      V41_REBUILDS = [
+        TableRebuild.new("sequencer_sessions",
+          %w[id created_at updated_at target request http2 sni config flow_id position name],
+          <<-SQL,
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            target     TEXT    NOT NULL,
+            request    BLOB    NOT NULL,
+            http2      INTEGER NOT NULL DEFAULT 0,
+            sni        TEXT,
+            config     TEXT    NOT NULL DEFAULT '',
+            flow_id    INTEGER,
+            position   INTEGER NOT NULL DEFAULT 0,
+            name       TEXT
+            SQL
+          ["CREATE INDEX idx_sequencer_sessions_position ON sequencer_sessions (position, id)"],
+          ["SELECT goto_session_id AS v FROM events WHERE goto_tab = 'sequencer'",
+           "SELECT ref_id AS v FROM entity_links WHERE ref_kind = 'sequencer'"]),
+      ]
+
+      V41_AFTER = V41_REBUILDS.flat_map(&.seed)
+      V41       = V41_REBUILDS.flat_map(&.copy) + V41_REBUILDS.flat_map(&.swap) + V41_AFTER
+
+      # V42 — the response-shape fingerprint of each saved fuzz result (#1351): `Fuzz::Shape`,
+      # computed by `Matcher#build` over the decoded body before the retention policy drops it,
+      # so a saved run clusters by shape even when its bodies were not kept. A signed INTEGER
+      # holding the FNV-1a 64 bits. NULL on every row written before this column; those rows
+      # cluster by `Shape.approximate` (outcome + metrics), and the surfaces say so.
+      V42 = [
+        "ALTER TABLE fuzz_results ADD COLUMN shape INTEGER",
+      ]
+
+      # V43 — a JavaScript reference is keyed by its ORIGIN (#1371): `UNIQUE(host, path, flow_id)`
+      # kept one row per (host, path) per scanned flow, so a bundle naming both
+      # `http://h:8080/p` and `https://h/p` stored whichever resolved first and the other origin
+      # was never drawn, listed or counted. Rebuilt with scheme and port in the key; the rows
+      # are copied as they are (each old row is still unique under the wider key), so nothing
+      # has to be rescanned — a flow scanned before this upgrade just keeps the one origin it
+      # stored until a rescan (`sitemap js --scan --rescan`) reads it again. No triggers or
+      # views name the table, and the rebuild starts from whatever `js_refs` is there, so a
+      # replay (the index specs wind `user_version` back) converges on the same shape.
+      V43 = [
+        <<-SQL,
+          CREATE TABLE js_refs_v43 (
+            id          INTEGER PRIMARY KEY,
+            flow_id     INTEGER NOT NULL,
+            scheme      TEXT    NOT NULL,
+            host        TEXT    NOT NULL,
+            port        INTEGER NOT NULL,
+            path        TEXT    NOT NULL,
+            target      TEXT    NOT NULL,
+            literal     TEXT    NOT NULL,
+            body_offset INTEGER NOT NULL,
+            line        INTEGER NOT NULL,
+            flags       INTEGER NOT NULL DEFAULT 0,
+            base        TEXT    NOT NULL,
+            created_at  INTEGER NOT NULL,
+            UNIQUE(host, path, scheme, port, flow_id)
+          )
+          SQL
+        "INSERT OR IGNORE INTO js_refs_v43 (id, flow_id, scheme, host, port, path, target, literal, " \
+        "body_offset, line, flags, base, created_at) SELECT id, flow_id, scheme, host, port, path, target, " \
+        "literal, body_offset, line, flags, base, created_at FROM js_refs",
+        "DROP TABLE js_refs",
+        "ALTER TABLE js_refs_v43 RENAME TO js_refs",
+        "CREATE INDEX idx_js_refs_flow ON js_refs (flow_id)",
+      ]
+
+      # V44 — the request a client sent before the operator EDITED it at Intercept (#1378). Only
+      # the post-edit bytes reach `flows` (they are what went upstream), so without this the
+      # audit trail lost what the client actually sent. A side table keyed by flow id, not a
+      # `flows` column: a handful of rows ever hold a value, a BLOB column would sit after the
+      # body BLOBs, and a row's existence IS the "edited at Intercept" flag `SELECT_ROW` reads
+      # with a primary-key probe. `request` is the whole message (head + body) as held.
+      V44 = [
+        <<-SQL,
+          CREATE TABLE IF NOT EXISTS intercept_originals (
+            flow_id INTEGER PRIMARY KEY,
+            request BLOB    NOT NULL
+          )
+          SQL
+      ]
+
+      # V45 — the interim 1xx responses an origin sent before a flow's final one (`Interims`):
+      # a 103 Early Hints, a 100 Continue. The proxy relayed them and kept only the final head.
+      # A side table for V44's reasons — almost no flow has one, and a `flows` BLOB would sit
+      # after the body BLOBs — and not a prefix of `response_head`, which every reader parses as
+      # one response. One row per kept head, `seq` in wire order; `relayed` is 0 for a head the
+      # client never received (an HTTP/1.0 client, or one gone mid-write). `omitted` is the
+      # flow's count of heads past the caps, repeated on each of its rows so it needs no table
+      # of its own.
+      V45 = [
+        <<-SQL,
+          CREATE TABLE IF NOT EXISTS flow_interims (
+            flow_id INTEGER NOT NULL,
+            seq     INTEGER NOT NULL,
+            status  INTEGER NOT NULL,
+            head    BLOB    NOT NULL,
+            relayed INTEGER NOT NULL DEFAULT 1,
+            omitted INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (flow_id, seq)
+          ) WITHOUT ROWID
+          SQL
+      ]
+
+      # Data statements that call gori's OWN SQL functions, run by `migrate!` right after the
+      # version they complete. Kept out of MIGRATIONS because that list is plain schema that a
+      # bare connection can replay (specs build every historical shape that way), and a bare
+      # connection has no `gori_static_asset`; `migrate!` registers it before running these.
+      #
+      # 31: rewrite only rows that ARE static (an UPDATE storing 0 over the default would still
+      # rewrite every row's overflow chain), and only completed responses with a status the rule
+      # can call static, so a pending or failed transfer is never even classified. ~2.5 s once
+      # at 100k flows, 40% of them 20 KB images.
+      # 32: only clear old positive flags that the current classifier rejects. The rule changes
+      # in #1257 add exclusions, never newly-static cases, so this scans the old positive subset
+      # and leaves still-static rows and their overflow chains untouched.
+      BACKFILLS = {
+        31 => "UPDATE flows SET static_asset = 1 " \
+              "WHERE state = #{FlowState::Complete.value} AND (status BETWEEN 200 AND 299 OR status = 304) " \
+              "AND gori_static_asset(content_type, target, status) = 1",
+        32 => "UPDATE flows SET static_asset = 0 WHERE static_asset = 1 " \
+              "AND (state != #{FlowState::Complete.value} OR gori_static_asset(content_type, target, status) = 0)",
+      }
+
       MIGRATIONS = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11, V12, V13, V14, V15, V16, V17,
-                    V18, V19, V20, V21, V22, V23, V24, V25]
+                    V18, V19, V20, V21, V22, V23, V24, V25, V26, V27, V28, V29, V30, V31, V32, V33,
+                    V34, V35, V36, V37, V38, V39, V40, V41, V42, V43, V44, V45]
 
       def self.migrate!(db : DB::Database, read_only : Bool = false) : Nil
         db.using_connection do |conn|
@@ -1277,8 +2207,13 @@ module Gori
                 "(this build understands up to v#{VERSION}) — upgrade gori, or point " \
                 "--db/--project at another database")
             end
+            # A backfill calls gori's own SQL functions, and not every caller hands in a pooled
+            # Store connection — a bench fixture migrates a bare `DB.open`. Registering is
+            # idempotent, so a Store connection pays nothing.
+            conn.as(SQLite3::Connection).gori_install_scope_match if current < VERSION
             MIGRATIONS[current..]?.try &.each_with_index(offset: current) do |statements, idx|
-              statements.each { |sql| conn.exec(sql) }
+              run_statements(conn, statements).each { |sql| conn.exec(sql) }
+              BACKFILLS[idx + 1]?.try { |sql| conn.exec(sql) }
               conn.exec("PRAGMA user_version = #{idx + 1}")
             end
             conn.exec("COMMIT")
@@ -1288,6 +2223,306 @@ module Gori
           end
         end
       end
+
+      # The statements one MIGRATIONS entry actually runs. V39–V41 do their table move in code
+      # first and leave only their seeds; V42 is skipped when its column is already there.
+      private def self.run_statements(conn : DB::Connection, statements : Array(String)) : Array(String)
+        if statements.same?(V39)
+          rebuild_v39(conn) unless autoincrement_in_place(conn.as(SQLite3::Connection))
+          V39_SEED
+        elsif statements.same?(V40)
+          move_to_autoincrement(conn.as(SQLite3::Connection), ID_REBUILDS, 40)
+          V40_AFTER
+        elsif statements.same?(V41)
+          move_to_autoincrement(conn.as(SQLite3::Connection), V41_REBUILDS, 41)
+          V41_AFTER
+        elsif statements.same?(V42) && column?(conn, "fuzz_results", "shape")
+          # SQLite has no `ADD COLUMN IF NOT EXISTS`, and every migration since V36 is
+          # replay-safe: a project whose `user_version` was wound back (the index specs rebuild
+          # an older shape that way) already holds the column.
+          [] of String
+        else
+          statements
+        end
+      end
+
+      private def self.column?(conn : DB::Connection, table : String, column : String) : Bool
+        !conn.query_one?("SELECT 1 FROM pragma_table_info(?) WHERE name = ?", table, column,
+          as: Int64).nil?
+      end
+
+      # The tables V39 moves to AUTOINCREMENT, and the one clause each CREATE text carries.
+      private AUTOINCREMENT_TABLES = {"flows", "h2_connections"}
+
+      # Every table the CURRENT schema keeps as AUTOINCREMENT, read off the migrations rather
+      # than listed: a CREATE that says AUTOINCREMENT (a `_vNN` or `_autoinc` copy renamed onto
+      # its table counts as that table), V39's in-place tables, and V40's and V41's. An archive
+      # written before one of them got there has no sequence row for it, and the migration seeds
+      # one from what the table holds, so the archive check reads them all (`ProjectArchive`).
+      # spec/store/table_id_autoincrement_migration_spec.cr holds it equal to a fresh store's.
+      class_getter autoincrement_tables : Set(String) do
+        created = MIGRATIONS.flat_map(&.to_a).flat_map do |sql|
+          sql.scan(/CREATE TABLE(?: IF NOT EXISTS)?\s+"?(\w+)"?\s*\(([^;]*?\bAUTOINCREMENT\b)/i).map(&.[1].sub(/_(?:v\d+|autoinc)\z/, ""))
+        end
+        (created + AUTOINCREMENT_TABLES.to_a + (ID_REBUILDS + V41_REBUILDS).map(&.table)).to_set
+      end
+      private ROWID_CLAUSE      = "INTEGER PRIMARY KEY"
+      private ROWID_DECLARATION = /\(\s*"?id"?\s+INTEGER PRIMARY KEY\s*,/
+
+      # V39 without the copy: rewrite each table's stored CREATE to say AUTOINCREMENT and bump
+      # `schema_version`, so every connection — this one included, verified — reparses it. The
+      # rows, the indexes and the FTS rowids are not touched, because nothing about their bytes
+      # changes. Runs inside `migrate!`'s transaction, under a savepoint of its own.
+      #
+      # Returns false, having changed nothing, when it cannot be sure: a CREATE text that is not
+      # the one V1 wrote (exactly one rowid clause, no AUTOINCREMENT yet), or a SQLite that
+      # refuses the edit. `migrate!` then runs the V39 rebuild, which always works and only
+      # costs time. SQLITE_DBCONFIG_DEFENSIVE is what refuses it — it blocks `writable_schema`
+      # and a `schema_version` write — and some builds turn it on by default (macOS's system
+      # libsqlite3 does, checked), so it is lifted for these statements and put back. The
+      # read-back of the cookie is the check that the bump landed (without it, the other
+      # connections would keep the old definition), and the reparsed columns must match the old
+      # ones exactly — or the savepoint is rolled back and the verified rebuild runs instead.
+      #
+      # Nothing here reads a row: every check is on the schema. `PRAGMA quick_check` did stand
+      # here, and it walks the whole table, bodies' overflow chains included — 10-16 s on a
+      # 3.3 GB History, measured, under the write lock a peer waits 5 s for. What it guarded (an
+      # edit landing somewhere other than the rowid clause) is what `in_place_eligible?` rules
+      # out before the edit, from the text alone: with the phrase present exactly once and first,
+      # the blind `replace()` can only extend the rowid clause.
+      #
+      # `tables` defaults to V39's; V40 and V41 pass the ones `in_place_eligible?` accepts.
+      def self.autoincrement_in_place(conn : SQLite3::Connection,
+                                      tables : Enumerable(String) = AUTOINCREMENT_TABLES) : Bool
+        return false if tables.empty? || !tables.all? { |table| in_place_eligible?(conn, table) }
+
+        shape = tables.map { |table| column_shape(conn, table) }
+        defensive = conn.gori_swap_defensive(false)
+        conn.exec("SAVEPOINT autoincrement_in_place")
+        begin
+          cookie = conn.scalar("PRAGMA schema_version").as(Int64)
+          conn.exec("PRAGMA writable_schema = ON")
+          names = tables.join(", ") { |t| "'#{t}'" }
+          conn.exec("UPDATE sqlite_master SET sql = replace(sql, '#{ROWID_CLAUSE}', '#{ROWID_CLAUSE} AUTOINCREMENT') " \
+                    "WHERE type = 'table' AND name IN (#{names})")
+          conn.exec("PRAGMA schema_version = #{cookie + 1}")
+          conn.exec("PRAGMA writable_schema = OFF")
+          moved = conn.scalar("PRAGMA schema_version").as(Int64) == cookie + 1 &&
+                  tables.map { |table| column_shape(conn, table) } == shape
+        rescue SQLite3::Exception
+          moved = false
+        end
+        if moved
+          conn.exec("RELEASE autoincrement_in_place")
+        else
+          conn.exec("PRAGMA writable_schema = OFF") rescue nil
+          conn.exec("ROLLBACK TO autoincrement_in_place")
+          conn.exec("RELEASE autoincrement_in_place")
+        end
+        moved
+      ensure
+        conn.gori_swap_defensive(defensive) unless defensive.nil?
+      end
+
+      # The stored CREATE text is the one gori wrote: its FIRST column is `id INTEGER PRIMARY KEY`,
+      # spelled as V1 spells it, the phrase appears nowhere else in any case or spacing (the edit
+      # is a blind `replace()`), there is no AUTOINCREMENT yet, and there is nothing a text edit
+      # could reach into unseen — no CHECK or GENERATED expression, no comment — nor a WITHOUT
+      # ROWID tail, where SQLite refuses AUTOINCREMENT outright. ADD COLUMNs
+      # append plain declarations, so every table any gori wrote passes; anything else, such as
+      # a crafted archive, takes the verified rebuild.
+      def self.in_place_eligible?(conn : DB::Connection, table : String) : Bool
+        sql = conn.query_one?("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", table, as: String)
+        return false if sql.nil? || sql.includes?("--") || sql.includes?("/*")
+        return false if sql.matches?(/\b(CHECK|GENERATED|AUTOINCREMENT)\b/i) || sql.matches?(/\bWITHOUT\s+ROWID\b/i)
+        sql.matches?(ROWID_DECLARATION) && sql.scan(/integer\s+primary\s+key/i).size == 1
+      end
+
+      # V40's and V41's move: every eligible table in place, in one edit; the rest — or all of
+      # them, when SQLite refuses the edit — by the verified rebuild. The seed (and V40's new
+      # index) follow in the version's `_AFTER` statements either way. Returns the tables that
+      # were rebuilt.
+      def self.move_to_autoincrement(conn : SQLite3::Connection, rebuilds : Array(TableRebuild),
+                                     version : Int32) : Array(String)
+        eligible = rebuilds.select { |r| in_place_eligible?(conn, r.table) }
+        eligible.clear unless autoincrement_in_place(conn, eligible.map(&.table))
+        rebuild = rebuilds - eligible
+        return [] of String if rebuild.empty?
+        begin
+          rebuild.each { |r| r.copy.each { |sql| conn.exec(sql) } }
+          verify_rebuilt_copies(conn, rebuild, version)
+          rebuild.each { |r| r.swap.each { |sql| conn.exec(sql) } }
+        rescue ex : SQLite3::Exception
+          raise ex unless ex.code == LibSQLite3::Code::FULL.value
+          raise Gori::Error.new("not enough free disk space to upgrade this project: this gori rebuilds " \
+                                "#{rebuild.join(", ", &.table)} once. Nothing was changed; free some space " \
+                                "and open it again")
+        end
+        rebuild.map(&.table)
+      end
+
+      # Each column as SQLite parses it — position, name, type, NOT NULL, default, key — so the
+      # in-place edit can check it changed nothing but the rowid rule.
+      private def self.column_shape(conn : DB::Connection, table : String) : Array(String)
+        conn.query_all("SELECT cid || '|' || name || '|' || type || '|' || \"notnull\" || '|' || " \
+                       "COALESCE(dflt_value, '-') || '|' || pk FROM pragma_table_info(?)", table, as: String)
+      end
+
+      # V39's fallback: copy, verify, swap (see V39). It writes a second copy of the History
+      # table inside one transaction, so the WAL grows by the table's size and the file by as
+      # much again at the checkpoint. A disk that fills part-way answers SQLITE_FULL, which
+      # would otherwise reach the operator as "database or disk is full" with no hint that this
+      # open needs room for a one-time rebuild, or how much.
+      def self.rebuild_v39(conn : DB::Connection) : Nil
+        need = 2_i64 * conn.scalar("PRAGMA page_count").as(Int64) * conn.scalar("PRAGMA page_size").as(Int64)
+        begin
+          V39_COPY.each { |sql| conn.exec(sql) }
+          verify_v39_copy(conn)
+          V39_SWAP.each { |sql| conn.exec(sql) }
+        rescue ex : SQLite3::Exception
+          raise ex unless ex.code == LibSQLite3::Code::FULL.value
+          raise Gori::Error.new("not enough free disk space to upgrade this project: this gori rebuilds " \
+                                "its History table once, which needs about #{approx_size(need)} free " \
+                                "(twice the project file). Nothing was changed; free some space and open it again")
+        end
+      end
+
+      private def self.approx_size(bytes : Int64) : String
+        return "#{(bytes / 1_073_741_824).round(1)} GB" if bytes >= 1_073_741_824
+        "#{(bytes / 1_048_576).ceil.to_i} MB"
+      end
+
+      private V39_BLOBS = {"request_head", "request_body", "response_head", "response_body"}
+
+      # Compare V39's copies with the tables they replace, BEFORE either original is dropped, and
+      # raise on any difference — `migrate!` then rolls the whole upgrade back and the project
+      # stays on the version it had, whole. A bug here would otherwise commit a damaged `flows`
+      # table, and that is the one outcome of this migration nobody can undo.
+      #
+      # Whole-table: row count, lowest and highest id, and the summed length of every BLOB
+      # column (`length()` of a BLOB reads the record header, not the overflow chain). Every
+      # row: every non-BLOB column compared with `IS` — the columns after the BLOBs walk each
+      # overflow chain, which the fallback can afford, since it holds the write lock for
+      # seconds anyway. The body BYTES of the lowest, the highest and up to 64 random ids are
+      # compared too; the rest are checked by length. And the FTS rowids at both ends of the
+      # index must still name a row exactly where they named one before, since the contentless
+      # index is keyed by `flows.id` and is not copied at all.
+      def self.verify_v39_copy(conn : DB::Connection) : Nil
+        totals = "COUNT(*), MIN(id), MAX(id), " + V39_BLOBS.join(", ") { |c| "SUM(length(#{c}))" }
+        before = conn.query_one("SELECT #{totals} FROM flows", as: {Int64, Int64?, Int64?, Int64?, Int64?, Int64?, Int64?})
+        after = conn.query_one("SELECT #{totals} FROM flows_v39", as: {Int64, Int64?, Int64?, Int64?, Int64?, Int64?, Int64?})
+        v39_copy_mismatch("flows totals #{before} became #{after}") unless before == after
+
+        plain = V39_FLOW_COLUMNS.split(", ").reject { |c| V39_BLOBS.includes?(c) }
+        same = plain.join(" AND ") { |c| v39_same(c) }
+        equal = conn.scalar("SELECT COUNT(*) FROM flows o JOIN flows_v39 n ON n.id = o.id WHERE #{same}").as(Int64)
+        v39_copy_mismatch("#{before[0] - equal} of #{before[0]} rows differ outside the bodies") unless equal == before[0]
+
+        sample = [] of Int64
+        conn.query("SELECT id FROM (SELECT id FROM flows ORDER BY random() LIMIT 64) " \
+                   "UNION SELECT MIN(id) FROM flows UNION SELECT MAX(id) FROM flows") do |rs|
+          rs.each { rs.read(Int64?).try { |id| sample << id } }
+        end
+        unless sample.empty?
+          bodies = V39_BLOBS.join(" AND ") { |c| v39_same(c) }
+          equal = conn.scalar("SELECT COUNT(*) FROM flows o JOIN flows_v39 n ON n.id = o.id " \
+                              "WHERE o.id IN (#{sample.join(", ")}) AND #{bodies}").as(Int64)
+          v39_copy_mismatch("#{sample.size - equal} of #{sample.size} sampled bodies differ") unless equal == sample.size
+        end
+
+        fts = [] of Int64
+        {"DESC", "ASC"}.each do |dir|
+          conn.query("SELECT rowid FROM flows_fts ORDER BY rowid #{dir} LIMIT 32") { |rs| rs.each { fts << rs.read(Int64) } }
+        end
+        fts.uniq.each do |id|
+          was = conn.scalar("SELECT COUNT(*) FROM flows WHERE id = ?", id).as(Int64)
+          now = conn.scalar("SELECT COUNT(*) FROM flows_v39 WHERE id = ?", id).as(Int64)
+          v39_copy_mismatch("search index entry #{id} resolved to #{was} row(s), now #{now}") unless was == now
+        end
+
+        h2_count = conn.scalar("SELECT COUNT(*) FROM h2_connections").as(Int64)
+        h2_same = conn.scalar("SELECT COUNT(*) FROM h2_connections o JOIN h2_connections_v39 n ON n.id = o.id " \
+                              "WHERE o.created_at IS n.created_at AND o.host IS n.host AND o.port IS n.port " \
+                              "AND o.alpn IS n.alpn").as(Int64)
+        h2_copied = conn.scalar("SELECT COUNT(*) FROM h2_connections_v39").as(Int64)
+        unless h2_same == h2_count && h2_copied == h2_count
+          v39_copy_mismatch("h2_connections: #{h2_count} rows, #{h2_copied} copied, #{h2_same} identical")
+        end
+      end
+
+      # One column of `o` (the original) and `n` (the copy) holding the same value. `IS` alone
+      # compares under column affinity, so a TEXT '443' in a column the copy declares INTEGER
+      # reads as equal to the 443 the copy converted it to; the storage class has to match too.
+      private def self.v39_same(column : String) : String
+        "o.#{column} IS n.#{column} AND typeof(o.#{column}) = typeof(n.#{column})"
+      end
+
+      private def self.v39_copy_mismatch(what : String) : NoReturn
+        raise Gori::Error.new("schema v39: the rebuilt History table does not match the original " \
+                              "(#{what}); the upgrade was rolled back and nothing was changed")
+      end
+
+      # Compare each rebuild's copy with the table it replaces, BEFORE any original is dropped,
+      # and raise on any difference: `migrate!` then rolls the whole upgrade back and the project
+      # stays on the version it had, whole. A DROP is the one statement here nobody can take
+      # back, so a bug in a copy must not reach it.
+      #
+      # The column names first, both tables against the rebuild's list. Then totals (row count,
+      # lowest and highest id, the summed `length()` of every column), which name WHAT differs.
+      # Then every row, since these tables are small: joined on id, each column compared the way
+      # V39's check compares (`v39_same`: `IS` and the same storage class), so a NULL matches
+      # only a NULL and a BLOB compares by its bytes. With the counts equal and `id` unique on
+      # both sides, every row matching is the whole table matching.
+      def self.verify_rebuilt_copies(conn : DB::Connection, rebuilds : Enumerable(TableRebuild), version : Int32) : Nil
+        rebuilds.each do |r|
+          # The list is the copy's AND the comparison's, so a column missing from it would vanish
+          # unnoticed.
+          {r.table, r.temp}.each do |t|
+            names = conn.query_all("SELECT name FROM pragma_table_info(?) ORDER BY cid", t, as: String)
+            rebuild_mismatch(version, r.table, "#{t} has columns #{names}") unless names == r.columns
+          end
+          totals = "COUNT(*), MIN(id), MAX(id), " + r.columns.join(", ") { |c| "SUM(length(#{c}))" }
+          before = int_row(conn, "SELECT #{totals} FROM #{r.table}")
+          after = int_row(conn, "SELECT #{totals} FROM #{r.temp}")
+          unless before == after
+            rebuild_mismatch(version, r.table, "totals #{before} became #{after}")
+          end
+          same = r.columns.join(" AND ") { |c| v39_same(c) }
+          equal = conn.scalar("SELECT COUNT(*) FROM #{r.table} o JOIN #{r.temp} n ON n.id = o.id WHERE #{same}").as(Int64)
+          count = before.first || 0_i64
+          rebuild_mismatch(version, r.table, "#{count - equal} of #{count} rows differ") unless equal == count
+        end
+      end
+
+      private def self.int_row(conn : DB::Connection, sql : String) : Array(Int64?)
+        row = [] of Int64?
+        conn.query_one(sql) { |rs| rs.column_count.times { row << rs.read(Int64?) } }
+        row
+      end
+
+      private def self.rebuild_mismatch(version : Int32, table : String, what : String) : NoReturn
+        raise Gori::Error.new("schema v#{version}: the rebuilt #{table} table does not match the original " \
+                              "(#{what}); the upgrade was rolled back and nothing was changed")
+      end
     end
+  end
+end
+
+# `sqlite3_db_config` is variadic and the shard binds none of it. Additive, like ScopeMatch's.
+lib LibSQLite3
+  fun db_config = sqlite3_db_config(SQLite3, Int32, ...) : Int32
+end
+
+class SQLite3::Connection
+  private DBCONFIG_DEFENSIVE = 1010
+
+  # Set SQLITE_DBCONFIG_DEFENSIVE on this connection and return what it was, so a caller can
+  # put it back. Only the in-place AUTOINCREMENT edit (V39, V40, V41) lifts it (see
+  # `Schema.autoincrement_in_place`).
+  def gori_swap_defensive(on : Bool) : Bool
+    was = 0
+    LibSQLite3.db_config(@db, DBCONFIG_DEFENSIVE, -1, pointerof(was))
+    LibSQLite3.db_config(@db, DBCONFIG_DEFENSIVE, on ? 1 : 0, Pointer(Int32).null)
+    was != 0
   end
 end

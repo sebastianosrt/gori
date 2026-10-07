@@ -27,13 +27,13 @@ module Gori
 
       r.register Verb::Definition.new(
         "sitemap.query", "Filter (QL)", "Filter the tree with a query (host: path: method: status: tag: …)",
-        Verb::Scope::Sitemap, [Verb::Chord.new("/")], group: :view) { |ctx| ctx.sitemap_query; nil }
+        Verb::Scope::Sitemap, [Verb::Chord.new("/")], group: :view, intent: :filter) { |ctx| ctx.sitemap_query; nil }
 
       # `y` — the cursor row's host/path, or every marked row one per line. The lists this
       # sits beside (History, Probe, Issues) all copy on `y`; the tree was the one that did not.
       r.register Verb::Definition.new(
         "sitemap.copy", "Copy", "Copy the cursor row's host/path — or every marked row, one per line",
-        Verb::Scope::Sitemap, [Verb::Chord.new("y")], mnemonic: 'y') { |ctx| ctx.read_copy; nil }
+        Verb::Scope::Sitemap, [Verb::Chord.new("y")], intent: :copy) { |ctx| ctx.read_copy; nil }
 
       # --- multi-select marks (mirrors History #442) ---
       # Marks make the EXISTING action menu act on N paths — the batch verbs below read the
@@ -41,13 +41,26 @@ module Gori
       # `sitemap.batch-*` twins and no second menu: one declaration, one call path.
       #
       # `t` marks here as it does in History (mutt's tag key, and the same many-times-per-minute
-      # triage gesture that earns it an L1 bare key there). Tagging moves up to ⇧T, so the two
-      # lists finally agree on what `t` means. NOTE the deliberate divergence from History's ⇧T
-      # (mark-all): a tree has no useful "mark every row" — it would sweep hosts and folders
-      # into the same batch as the endpoints under them.
+      # triage gesture that earns it an L1 bare key there).
       r.register Verb::Definition.new(
         "sitemap.mark-toggle", "Mark path", "Mark/unmark this path and step down — the action menu then acts on every marked path",
-        Verb::Scope::Sitemap, [Verb::Chord.new("t")], group: :triage) { |ctx| ctx.sitemap_mark_toggle; nil }
+        Verb::Scope::Sitemap, [Verb::Chord.new("t")], group: :triage, intent: :mark) { |ctx| ctx.sitemap_mark_toggle; nil }
+
+      # ⇧T, the `t`/⇧T pair History, Issues and the Intercept queue all carry. It was held back
+      # on the argument that "a tree has no useful mark every row — it would sweep hosts and
+      # folders into the same batch as the endpoints under them", and that argument is answered
+      # rather than overruled: `mark_all_visible` marks only rows carrying a METHOD, so a host
+      # and a folder cannot enter the batch at all. The set is what the tree SHOWS — the `/`
+      # filter and the open folds — which is the same sentence History's ⇧T answers to.
+      #
+      # `Chord.new("t", shift: true)`, NOT `Chord.new("T")`: a typed capital normalises to
+      # shift+lowercase, so the capital spelling can never fire. menu_key skips shift chords,
+      # hence the :mark_all intent's 'T' — which `sitemap.tag` gives up below, because the menu
+      # letter has to name what the chord beside it does.
+      r.register Verb::Definition.new(
+        "sitemap.mark-all", "Mark all (shown)", "Mark every captured path the tree currently shows — hosts and folders are skipped",
+        Verb::Scope::Sitemap, [Verb::Chord.new("t", shift: true)],
+        intent: :mark_all, group: :triage) { |ctx| ctx.sitemap_mark_all; nil }
 
       # ⇧↑/⇧↓ extend a contiguous range from the anchor — the keyboard form of a GUI
       # shift+click. Free in this scope: Keymap#lookup matches a Chord record EXACTLY, so
@@ -70,46 +83,65 @@ module Gori
         "sitemap.mark-clear", "Clear marks", "Drop every mark (esc does the same)",
         Verb::Scope::Sitemap,
         available: ->(ctx : Verb::ExecContext) { ctx.sitemap_marked_count > 0 },
-        mnemonic: 'N') { |ctx| ctx.sitemap_mark_clear; nil }
+        intent: :mark_clear) { |ctx| ctx.sitemap_mark_clear; nil }
 
       # Tag the selected path (or every marked path) with a free-text memo; a group fold node
-      # toasts. MENU-ONLY, on 'T'.
+      # toasts. MENU-ONLY, on 'm' — for the memo the description names.
       #
-      # It used to hold the ⇧T chord, and that was the one letter whose MEANING changed
-      # between sibling list tabs: History, Issues and Intercept all read `t`/⇧T as
-      # "mark / mark all", so a hand that learnt the pair there opened a text prompt here.
-      # ⇧T is deliberately left UNBOUND in this scope rather than reassigned — see
-      # `sitemap.mark-toggle` above for why a tree has no useful "mark every row" today, and
-      # keep the letter free for the day one is worth having. Tagging loses nothing by being
-      # a space-menu entry: `sitemap.mark-clear` is menu-only for the same reason.
+      # It held the ⇧T CHORD once, and that was the one letter whose meaning changed between
+      # sibling list tabs: History, Issues and Intercept all read `t`/⇧T as "mark / mark all",
+      # so a hand that learnt the pair there opened a text prompt here. It then kept 'T' as its
+      # menu letter while the chord sat unbound, which was the same lie one tier down — and
+      # `sitemap.mark-all` now holds both. Tagging loses nothing by being a space-menu entry:
+      # `sitemap.mark-clear` is menu-only for the same reason.
       r.register Verb::Definition.new(
         "sitemap.tag", "Tag path", "Pin a free-text memo to the selected — or every marked — path (filter with tag:)",
         Verb::Scope::Sitemap,
-        mnemonic: 'T', group: :triage) { |ctx| ctx.sitemap_tag; nil }
+        mnemonic: 'm', group: :triage) { |ctx| ctx.sitemap_tag; nil }
 
       # `g` — fold/unfold path-param ids (/users/<uuid> → {uuid}, /users/1,2,3… → [1, 2, 3 … +N]).
       r.register Verb::Definition.new(
         "sitemap.toggle-grouping", "Fold ids", "Fold path-param ids into {uuid}/{hex}/{date} and [1, 2, 3 …] groups",
-        Verb::Scope::Sitemap, [Verb::Chord.new("g")], group: :view) { |ctx| ctx.sitemap_toggle_grouping; nil }
+        Verb::Scope::Sitemap, [Verb::Chord.new("g")], intent: :fold_ids, group: :view) { |ctx| ctx.sitemap_toggle_grouping; nil }
 
       # `⇧G` — fold/unfold the query-string variants of one path (/search?q=1 + /search?q=2
       # → /search). A SEPARATE axis from `g`, and deliberately not folded into it: `g` says
       # "show me every literal id", which is not the same wish as "show me every fuzz payload
       # that was ever sent to /search". Spelled Chord.new("g", shift: true), NOT Chord.new("G")
-      # — the latter never fires (see verbs/comparer.cr). A shift chord yields no menu key, so
-      # the action menu gets an explicit mnemonic ('g' is already the id toggle's).
+      # — the latter never fires (see verbs/comparer.cr). Both are Display… rows (#1274):
+      # `Z g` folds ids and `Z q` queries.
       r.register Verb::Definition.new(
         "sitemap.toggle-query-fold", "Fold queries", "Fold the query-string variants of a path into one node (/search?q=1, /search?q=2 → /search)",
         Verb::Scope::Sitemap, [Verb::Chord.new("g", shift: true)],
-        mnemonic: 'Q', group: :view) { |ctx| ctx.sitemap_toggle_query_fold; nil }
+        intent: :fold_queries, group: :view) { |ctx| ctx.sitemap_toggle_query_fold; nil }
 
-      # Toggle the scope lens from the Sitemap too (History has its own ⇧S binding).
-      # scope_toggle_lens reloads the active sitemap, and the bar shows the ⇧S chip —
-      # so the toggle is reachable where its effect is visible. Mnemonic 's' for the
-      # action menu (its only chord is ⇧S, which yields no menu key).
+      # Endpoints captured JavaScript references (#1243). The scan reads bodies already in the
+      # project and sends NOTHING, so it needs no confirm; the toggle shows or hides what a scan
+      # stored. Menu-only, both: the tree's bare keys are spent, and neither is a
+      # many-times-a-minute gesture. 'J' names JavaScript ('j' is `sitemap.down`'s bare key,
+      # which a menu letter must not shadow); the toggle is a Display… row, `Z J` (#1274).
+      r.register Verb::Definition.new(
+        "sitemap.js-scan", "Scan JavaScript", "Read captured JS responses and inline scripts for endpoints nobody requested (sends nothing)",
+        Verb::Scope::Sitemap, [] of Verb::Chord, mnemonic: 'J', group: :view) { |ctx| ctx.sitemap_js_scan; nil }
+
+      r.register Verb::Definition.new(
+        "sitemap.toggle-js-refs", "Toggle JS references", "Show/hide the paths captured JavaScript references and no request reached",
+        Verb::Scope::Sitemap, [] of Verb::Chord, intent: :js_refs, group: :view) { |ctx| ctx.sitemap_toggle_js_refs; nil }
+
+      # Toggle the scope lens from the Sitemap too (the lens key itself is the Global `s`).
+      # scope_toggle_lens reloads the active sitemap, and the bar shows the `s scope` chip —
+      # so the toggle is reachable where its effect is visible. Mnemonic 's' for the action
+      # menu; the verb carries no chord of its own, so it never shadows the Global one.
       r.register Verb::Definition.new(
         "sitemap.scope-toggle", "Toggle scope lens", "Filter the tree to in-scope endpoints on/off",
-        Verb::Scope::Sitemap, [] of Verb::Chord, mnemonic: 's', group: :scope) { |ctx| ctx.scope_toggle_lens; nil } # the Global `s` is the key
+        Verb::Scope::Sitemap, [] of Verb::Chord, intent: :scope_lens, group: :scope) { |ctx| ctx.scope_toggle_lens; nil } # the Global `s` is the key
+
+      # The hide-static lens (#1239), shared with History. Menu-only for the reason History's
+      # twin gives; this tab has no `v` picker, so the menu is its door (and the chip, while on):
+      # Display… → `s`, the letter History's twin reads.
+      r.register Verb::Definition.new(
+        "sitemap.toggle-static", "Toggle static assets", "Hide images, fonts and media from the tree on/off (shared with History)",
+        Verb::Scope::Sitemap, [] of Verb::Chord, intent: :static_assets, group: :view) { |ctx| ctx.toggle_static_assets; nil }
 
       # `a` — add the cursor row to the project scope, pre-filling the SAME popup the Project
       # tab's `a` opens (hence the same chord): a host row seeds a `host` rule, a path row a
@@ -119,29 +151,43 @@ module Gori
         "sitemap.scope-add", "Add to scope", "Add the selected host — or host + path — to the scope rules",
         Verb::Scope::Sitemap, [Verb::Chord.new("a")], mnemonic: 'a', group: :scope) { |ctx| ctx.sitemap_scope_add; nil }
 
-      # Menu-only (`space → d`): spider + brute-force the selected host/path (opens the Discover
+      # Menu-only (Send flow to… → `D`): spider + brute-force the selected host/path (opens the Discover
       # config popup). It sat on bare `d` — the key that DELETES a row on History, Issues and
       # Probe, one ⇥ away — so a hand trained on those put requests on the wire here.
       r.register Verb::Definition.new(
         "sitemap.discover", "Discover here", "Spider + brute-force the selected host or path subtree",
-        Verb::Scope::Sitemap, [] of Verb::Chord, mnemonic: 'd', group: :send) { |ctx| ctx.sitemap_discover; nil }
+        Verb::Scope::Sitemap, [] of Verb::Chord, intent: :to_discover, group: :send) { |ctx| ctx.sitemap_discover; nil }
 
       # `o` — read the bytes behind the selected endpoint: resolve its representative captured
-      # flow and open History's detail on it. Same chord and same shape as the Issues tab's
-      # `issue.open-flow` (verbs/issues.cr) and Probe's `probe.open-flow` — "o opens the
-      # evidence" is now one gesture everywhere a list row stands in for a flow.
+      # flow and open History's detail on it. Same chord and same shape as Probe's
+      # `probe.open-flow` — "o opens the evidence" wherever a list row stands in for a flow.
+      # (The Issues detail had the third one; it went when the primary flow became the first
+      # RELATED row, where `s` opens it like every other row's source.)
       #
       # Cursor-only even with marks set (SITEMAP_CURSOR_ONLY in runner.cr): a detail overlay
       # shows one flow, so there is nothing for a batch to mean here.
       r.register Verb::Definition.new(
         "sitemap.open-flow", "Open flow", "Open the selected endpoint's captured request/response in History",
-        Verb::Scope::Sitemap, [Verb::Chord.new("o")], mnemonic: 'o', group: :view) { |ctx| ctx.sitemap_open_flow; nil }
+        Verb::Scope::Sitemap, [Verb::Chord.new("o")], intent: :open, group: :view) { |ctx| ctx.sitemap_open_flow; nil }
 
       # `r` — send the selected endpoint (or every marked one) to Repeater, resolving a
       # representative captured flow per path.
       r.register Verb::Definition.new(
         "sitemap.repeater", "Send to Repeater", "Open the selected — or every marked — endpoint's captured request in Repeater",
-        Verb::Scope::Sitemap, [Verb::Chord.new("r")], mnemonic: 'r', group: :send) { |ctx| ctx.sitemap_repeater; nil }
+        Verb::Scope::Sitemap, [Verb::Chord.new("r")], mnemonic: 'r', intent: :to_repeater, pinned: true, group: :send) { |ctx| ctx.sitemap_repeater; nil }
+
+      # `p` — the parameter inventory (#1231) for the cursor row: a host row lists every
+      # endpoint on it, any other row the endpoints under it (a `{uuid}` fold included).
+      r.register Verb::Definition.new(
+        "sitemap.params", "Parameters here", "List the parameter names the selected host or subtree takes (Params sub-tab)",
+        Verb::Scope::Sitemap, [Verb::Chord.new("p")], mnemonic: 'p', group: :view) { |ctx| ctx.sitemap_params; nil }
+
+      # `⇧E` — the marked paths (else the cursor's host or subtree) as an OpenAPI 3.0.3 document
+      # (#1241). ⇧E because it is the export key on every tab that has one (Issues, Sequencer,
+      # Evidence), spelled as a shift chord for the reason issues.export-key gives.
+      r.register Verb::Definition.new(
+        "sitemap.export", "Export OpenAPI…", "Write the selected — or every marked — host or subtree as an OpenAPI 3.0.3 document (asks for the path)",
+        Verb::Scope::Sitemap, [Verb::Chord.new("e", shift: true)], intent: :export, group: :send) { |ctx| ctx.sitemap_export; nil }
 
       r.register Verb::Definition.new(
         "sitemap.to-menu", "Back to sub-tabs", "Move focus up to the Sitemap/Discover strip", Verb::Scope::Sitemap,

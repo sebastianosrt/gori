@@ -1,6 +1,7 @@
 require "json"
 require "../../authorize/plan"
 require "../../scope"
+require "../../plural"
 
 module Gori
   module MCP
@@ -20,7 +21,10 @@ module Gori
       # of them: it dials a FRESH connection per identity on purpose (`Engine.live`), so a
       # ten-flow selection under three identities is thirty handshakes.
 
-      @[Tool("authorize_start", gated: true, agent_action: true)]
+      AUTHORIZE_QUERY_LIMIT = PageLimit.new(Authorize::Plan::DEFAULT_LIMIT, AUTHORIZE_MAX_FLOWS)
+
+      @[Tool("authorize_start", gated: true, agent_action: true, env_refresh: true,
+        requires: ["authorize_status", "authorize_results", "authorize_stop", "ql_reference"], permission: "send")]
       private def authorize_start(h) : Result
         allow_unscoped = bool_arg(h, "allow_unscoped", false)
         ob = outbound(allow_unscoped)
@@ -121,8 +125,12 @@ module Gori
         end
         ajob.bypasses += target.same_count
         ajob.reviews += target.trials.count { |t| !t.baseline? && t.verdict.review? }
+        # Stored for the life of the job, and no payload reads the request or body bytes: the
+        # counts above were taken from the full target, the stored one keeps only the head.
+        stored = target.without_bytes
+        ajob.bypassed << stored if target.same_count > 0
         if ajob.results.size < AUTHORIZE_MAX_STORED
-          ajob.results << target
+          ajob.results << stored
         else
           ajob.truncated = true
         end
@@ -150,19 +158,15 @@ module Gori
         j.field("failed") do
           j.array do
             ajob.failures.each do |(flow_id, url, msg)|
-              j.object do
-                j.field "flow_id", flow_id
-                j.field "url", Serialize.text(url)
-                j.field "error", Serialize.text(msg)
-              end
+              {flow_id: flow_id, url: Serialize.text(url), error: Serialize.text(msg)}.to_json(j)
             end
           end
         end
       end
 
-      @[Tool("authorize_status", gated: true)]
+      @[Tool("authorize_status", gated: true, read_only: true, permission: "send")]
       private def authorize_status(h) : Result
-        ajob = lookup_authorize_job(h)
+        ajob = lookup_job(h, @authorize_jobs, "authorize", "status", missing_field: "job_id")
         return ajob if ajob.is_a?(Result)
         Result.new(JSON.build do |j|
           j.object do
@@ -194,36 +198,32 @@ module Gori
         end)
       end
 
+      AUTHORIZE_RESULTS_LIMIT = PageLimit.new(50, 500)
+
       # The verdicts, per replayed request. The headline fields come FIRST and are computed
       # over the whole job, never over the page: a bypass on request 40 must not be invisible
       # to a caller who read page 1 and stopped.
-      @[Tool("authorize_results", gated: true)]
+      @[Tool("authorize_results", gated: true, read_only: true, permission: "send")]
       private def authorize_results(h) : Result
-        ajob = lookup_authorize_job(h)
+        ajob = lookup_job(h, @authorize_jobs, "authorize", "results", missing_field: "job_id")
         return ajob if ajob.is_a?(Result)
-        req_off = optional_int_arg(h, "offset")
-        req_lim = optional_int_arg(h, "limit")
-        offset = clamp_nonneg(req_off)
-        limit = clamp(req_lim, 50, 500)
-        page = ajob.results[offset, limit]? || [] of Authorize::Target
+        pg = page_args(h, AUTHORIZE_RESULTS_LIMIT)
+        page = ajob.results[pg.offset, pg.limit]? || [] of Authorize::Target
         Result.new(JSON.build do |j|
           j.object do
             emit_authorize_headline(j, ajob)
             emit_authorize_identities(j, ajob)
-            j.field("bypasses") { j.array { ajob.results.each { |t| authorize_bypass_json(j, t) } } }
+            j.field("bypasses") { j.array { ajob.bypassed.each { |t| authorize_bypass_json(j, t) } } }
             j.field("results") { j.array { page.each { |t| authorize_target_json(j, t) } } }
             # The send-level failure total, here as well as in `authorize_status`: a caller
             # that jumps straight to the verdicts should not have to make a second call to
             # learn how many of the sends behind them never got an answer.
             j.field "errors", ajob.errors
             j.field "blocked", ajob.blocked
-            j.field "returned", page.size
-            j.field "offset", offset
+            emit_page(j, pg, page.size)
             j.field "total_available", ajob.results.size
-            j.field "limit", limit
-            emit_clamp(j, req_off, offset, req_lim, limit)
-            j.field "page_complete", offset + page.size >= ajob.results.size
-            j.field "has_more", offset + page.size < ajob.results.size
+            j.field "page_complete", pg.offset + page.size >= ajob.results.size
+            j.field "has_more", pg.offset + page.size < ajob.results.size
             j.field "job_complete", ajob.status != :running
             j.field "incomplete_reason", incomplete_reason(ajob.status)
             j.field "results_truncated", ajob.truncated?
@@ -234,20 +234,11 @@ module Gori
         end)
       end
 
-      @[Tool("authorize_stop", gated: true, agent_action: true)]
+      @[Tool("authorize_stop", gated: true, agent_action: true, permission: "send")]
       private def authorize_stop(h) : Result
-        ajob = lookup_authorize_job(h)
+        ajob = lookup_job(h, @authorize_jobs, "authorize", "stop", missing_field: "job_id")
         return ajob if ajob.is_a?(Result)
-        ajob.stop
         stop_and_report(ajob)
-      end
-
-      private def lookup_authorize_job(h) : AuthorizeJob | Result
-        id = str(h, "job_id")
-        return err("missing required 'job_id'", "INVALID_ARGUMENT", field: "job_id") if id.nil? || id.empty?
-        job = @authorize_jobs[id]?
-        return not_found("no authorize job #{id}") unless job
-        job_project_mismatch(job) || job
       end
 
       # --- the finding ---------------------------------------------------------
@@ -308,12 +299,12 @@ module Gori
         when "error"
           why = ajob.unanswered_reason
           "nothing came back — every send failed for #{ajob.unanswered} of " \
-          "#{ajob.replayed} request#{ajob.replayed == 1 ? "" : "s"} replayed" \
+          "#{Gori.plural(ajob.replayed, "request")} replayed" \
           "#{why ? " (#{Serialize.text(why)})" : ""}. Nothing was compared, so this is NOT " \
           "evidence that access control works — check the host is reachable from here and re-run"
         when "BYPASS"
           "BROKEN ACCESS CONTROL: #{ajob.bypasses} identity result#{ajob.bypasses == 1 ? "" : "s"} across " \
-          "#{ajob.results.count { |t| t.same_count > 0 }} request#{ajob.results.count { |t| t.same_count > 0 } == 1 ? "" : "s"} " \
+          "#{Gori.plural(ajob.bypassed.size, "request")} " \
           "matched the baseline response — a non-baseline identity was served the same resource. " \
           "Confirm the identity is genuinely lower-privilege, then raise it."
         when "review"
@@ -327,7 +318,7 @@ module Gori
             else
               ""
             end
-          "no identity matched the baseline outright, but #{ajob.reviews} result#{ajob.reviews == 1 ? "" : "s"} " \
+          "no identity matched the baseline outright, but #{Gori.plural(ajob.reviews, "result")} " \
           "need review (same status class, divergent body — a tailored denial and a per-user page " \
           "look alike)#{anchored}"
         else
@@ -337,7 +328,7 @@ module Gori
           n = ajob.unanswered
           unreached = n > 0 ? " · #{n} of them could not be reached at all and #{n == 1 ? "is" : "are"} " \
                               "evidence of nothing (see `unanswered_count`)" : ""
-          "#{ajob.replayed} request#{ajob.replayed == 1 ? "" : "s"} replayed · no identity matched the baseline " \
+          "#{Gori.plural(ajob.replayed, "request")} replayed · no identity matched the baseline " \
           "(access control appears enforced for the identities tested)#{unreached}"
         end
       end
@@ -349,7 +340,7 @@ module Gori
         tail = "; this is NOT evidence that access control works"
         if ajob.blocked > 0
           why = ajob.blocked_reason
-          return "nothing was sent — #{ajob.blocked} request#{ajob.blocked == 1 ? "" : "s"} were refused " \
+          return "nothing was sent — #{Gori.plural(ajob.blocked, "request")} were refused " \
                  "before the socket#{why ? " (#{Serialize.text(why)})" : ""}#{tail}"
         end
         if ajob.failed > 0
@@ -429,13 +420,13 @@ module Gori
         j.field("skipped") do
           j.array do
             skipped.each do |s|
-              j.object do
-                j.field "flow_id", s.flow_id
-                j.field "method", Serialize.text(s.method)
-                j.field "url", Serialize.text(s.url)
-                j.field "reason", s.reason.to_s
-                j.field "reason_label", s.label
-              end
+              {
+                flow_id:      s.flow_id,
+                method:       Serialize.text(s.method),
+                url:          Serialize.text(s.url),
+                reason:       s.reason.to_s,
+                reason_label: s.label,
+              }.to_json(j)
             end
           end
         end
@@ -461,10 +452,10 @@ module Gori
           return unknown
         end
         options = Authorize::PlanOptions.new(store,
-          flow_ids: authorize_flow_ids(h),
+          flow_ids: id_list_arg(h, "flow_ids"),
           query: str(h, "query"),
-          limit: bounded_int_arg(h, "limit", Authorize::Plan::DEFAULT_LIMIT.to_i64,
-            min: 1_i64, max: AUTHORIZE_MAX_FLOWS.to_i64).to_i,
+          limit: bounded_int_arg(h, "limit", AUTHORIZE_QUERY_LIMIT.default.to_i64,
+            min: 1_i64, max: AUTHORIZE_QUERY_LIMIT.max.to_i64).to_i,
           identities_json: authorize_identities_json(h),
           unsafe_methods: bool_arg(h, "unsafe_methods", false),
           # Same rule as the sibling sweeps: the tool argument can only make verification
@@ -572,7 +563,8 @@ module Gori
                  else
                    "every selected flow's host (#{hosts.join(", ")}) is outside the project's configured scope"
                  end
-        remedy = sc ? Outbound.remedy(sc, "allow_unscoped:true") : "add a scope include rule or pass allow_unscoped:true"
+        # No verdict to phrase from (the first flow is gone): an out-of-scope one reads the same.
+        remedy = scope_remedy(sc || ScopeCheck.new(Outbound::OUT_OF_SCOPE, "", nil, true))
         err("#{reason}; #{remedy}", "SCOPE_BLOCKED", field: "allow_unscoped",
           details: JSON.parse({
             "scope_decision" => sc.try(&.decision) || "out_of_scope",
@@ -594,14 +586,7 @@ module Gori
         end
       end
 
-      # The flow ids to replay, in the order given — through the shared `id_list_arg`, which
-      # is this reader lifted into `tools.cr` so the repeater bulk tools cannot grow a second
-      # grammar for the same shape.
-      private def authorize_flow_ids(h) : Array(Int64)
-        id_list_arg(h, "flow_ids")
-      end
-
-      # The explicit identity set as the JSON text `Authorize.parse_json` reads — the SAME
+      # The explicit identity set as the JSON text `SessionSlot.parse_json` reads — the SAME
       # format the TUI's identities pane persists and `gori run authorize --identities FILE`
       # takes, so one shape describes an identity everywhere. An array is accepted inline (the
       # natural tool-call shape) and re-serialized; a string is passed through for a client
@@ -610,12 +595,14 @@ module Gori
         v = h["identities"]?
         return nil if v.nil? || v.raw.nil?
         if arr = v.as_a?
-          return arr.to_json
+          text = arr.to_json
+          Authorize.explicit_json_error(text).try { |why| raise Gori::Error.new("invalid 'identities': #{why}") }
+          return text
         end
         if s = v.as_s?
           text = s.strip
           return nil if text.empty?
-          # Validated HERE rather than left to `Authorize.parse_json`, whose tolerant reader
+          # Validated HERE rather than left to `SessionSlot.parse_json`, whose tolerant reader
           # degrades a malformed blob to an EMPTY list — which would surface as "fewer than two
           # identities" and send the caller looking for a missing identity instead of a typo.
           parsed = (JSON.parse(text) rescue nil)
@@ -623,6 +610,7 @@ module Gori
             raise Gori::Error.new("invalid 'identities' (expected a JSON array of identity objects, " \
                                   "e.g. [{\"name\":\"anonymous\",\"remove\":[\"Cookie\"]}])")
           end
+          Authorize.explicit_json_error(text).try { |why| raise Gori::Error.new("invalid 'identities': #{why}") }
           return text
         end
         raise Gori::Error.new("invalid 'identities' (expected an array of identity objects, got " \
@@ -659,12 +647,13 @@ module Gori
           "with authorize_status; read the verdicts with authorize_results; end with authorize_stop). " \
           "ACTIVE: sends flows × identities real requests, on a FRESH connection per identity " \
           "(connection-oriented auth would otherwise fake a bypass). Capped at #{AUTHORIZE_MAX_SENDS} sends." do |s|
-          s.field "flow_ids", authorize_flow_ids_prop
+          s.field "flow_ids", id_list_prop("captured flow ids to replay, in the order given (ids come from list_history). " \
+                                           "An array of integers, a single integer, or a comma list. Combined with 'query' " \
+                                           "when both are passed; at least one of the two is required.")
           s.field "query", strprop("QL query over history whose rows are replayed too (same grammar as " \
                                    "list_history — call ql_reference). Appended after flow_ids")
           s.field "lenient", boolprop("search a `field:` QL does not implement as literal TEXT instead of refusing the query (default false) — a typo free-texts its whole token, selects no rows, and reads as \"nothing matched, widen it\"")
-          s.field "limit", intprop("max rows the query may contribute (default #{Authorize::Plan::DEFAULT_LIMIT}, " \
-                                   "max #{AUTHORIZE_MAX_FLOWS}) — every row becomes one request PER identity")
+          s.field "limit", limitprop("max rows the query may contribute — every row becomes one request PER identity", AUTHORIZE_QUERY_LIMIT)
           s.field "identities", authorize_identities_prop
           s.field "unsafe_methods", boolprop("also replay flows whose method is not GET/HEAD/OPTIONS " \
                                              "(default false). A replayed POST/PUT/PATCH/DELETE runs the " \
@@ -704,7 +693,7 @@ module Gori
           "`review` — usually one stale baseline credential, not N quiet endpoints." do |s|
           s.field "job_id", strprop("id from authorize_start"), required: true
           s.field "offset", intprop("start row (default 0)")
-          s.field "limit", intprop("max requests per page (default 50, max 500)")
+          s.field "limit", limitprop("max requests per page", AUTHORIZE_RESULTS_LIMIT)
         end
 
         tool j, "authorize_stop",
@@ -713,14 +702,6 @@ module Gori
           "partial comparison must not read as \"enforced\")." do |s|
           s.field "job_id", strprop("id from authorize_start"), required: true
         end
-      end
-
-      # The `flow_ids` schema, through the shared `id_list_prop` — the same `oneOf` every
-      # list-of-ids argument advertises, kept beside the reader that honours it.
-      private def authorize_flow_ids_prop : JSON::Any
-        id_list_prop("captured flow ids to replay, in the order given (ids come from list_history). " \
-                     "An array of integers, a single integer, or a comma list. Combined with 'query' " \
-                     "when both are passed; at least one of the two is required.")
       end
 
       # The `identities` schema: an array of identity objects, or the same array as a JSON

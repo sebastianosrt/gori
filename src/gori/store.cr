@@ -6,6 +6,7 @@ require "./media_type"
 require "./store/models"
 require "./store/safe_regexp"
 require "./store/scope_match"
+require "./store/cache_status_fn"
 require "./store/schema"
 require "./store/compact"
 require "./store/scope_rules"
@@ -13,6 +14,8 @@ require "./store/host_overrides"
 require "./store/settings_kv"
 require "./store/issues"
 require "./store/entity_links"
+require "./store/issue_evidence"
+require "./store/issue_retest"
 require "./store/probe_issues"
 require "./store/probe_rules"
 require "./store/probe_oast"
@@ -24,16 +27,19 @@ require "./store/display_columns"
 require "./store/grpc_reflection"
 require "./store/repeater_sessions"
 require "./store/fuzz_sessions"
-require "./store/miner_sessions"
+require "./store/request_sessions"
 require "./store/oast_sessions"
-require "./store/sequencer_sessions"
 require "./store/fuzz_runs"
 require "./store/event_log"
+require "./store/agent_messages"
+require "./store/agent_questions"
 require "./store/intercept_bridge"
 require "./store/h2_frames"
 require "./store/reads"
 require "./store/query_control"
 require "./store/sitemap_tags"
+require "./store/js_refs"
+require "./store/env_write_guard"
 require "./ql"
 require "./open_lock"
 
@@ -121,11 +127,19 @@ module Gori
 
     # Generic write (scope rules / settings / issues) run on the writer
     # connection; reply carries last_insert_rowid (meaningful for INSERTs).
+    #
+    # `event?` marks the one kind of generic write the writer loop has to COUNT: an append to
+    # `events`. The sweep that caps that table rides the cadence below, and that cadence counts
+    # FLOW inserts — which is zero for the surfaces that write the most events (see
+    # EVENTS_TRIM_INTERVAL). The flag is on the op rather than on a counter Store bumps from the
+    # caller's fiber so the count stays where every other one already is: on the writer fiber,
+    # after the batch COMMITTED, needing no lock and crediting nothing that rolled back.
     struct ExecTask < WriteOp
       getter run : DB::Connection -> Nil
       getter reply : Channel(Int64)
+      getter? event : Bool
 
-      def initialize(@run, @reply)
+      def initialize(@run, @reply, @event = false)
       end
     end
 
@@ -189,6 +203,13 @@ module Gori
     # arrive from the caller. `Settings::DEFAULT_RETENTION_FLOWS` references this constant, so
     # the number itself lives only here.
     RETENTION_DEFAULT = 100_000
+    # SQLite's busy handler is a process-wide blocking wait from Crystal's point of view: while
+    # it sleeps in C, this cooperative scheduler cannot run another fiber. Long-lived surfaces
+    # therefore use the generous default below only for ordinary short-lived contention; the CLI
+    # passes its own smaller budget so a command sharing a project with a live TUI fails promptly
+    # and can name the retryable condition to the operator (#1118).
+    SQLITE_BUSY_TIMEOUT_MS      = 5_000
+    DB_CHECKOUT_TIMEOUT_SECONDS =   5.0
     # Pass this for a store that must never delete history: a read-oriented or
     # count-only open, and the MCP server's own store. Named rather than a bare 0 so the
     # intent is legible at the call site and greppable across surfaces.
@@ -200,18 +221,32 @@ module Gori
     # Inserts between retention sweeps — amortizes the prune cost.
     PRUNE_INTERVAL = 2_000
 
-    # Newest `events` rows kept. This is the ONE table in the schema with no cleanup path at
-    # all: `oast_callbacks` and `fuzz_runs` are deleted with their session, `intercept_commands`
-    # is wiped by `clear_intercept_state!` at every capture start, and `flows` has retention —
-    # events were only ever inserted. Fourteen call sites write them (job lifecycle, agent
-    # actions, binding warnings), so a long-lived project accumulates them for as long as it
-    # is used, and nothing ever gave the rows back.
+    # Newest `events` rows kept. Every surface writes them (job lifecycle, agent actions, binding
+    # warnings, config changes — `spec/store/event_source_registry_spec.cr` is what counts the
+    # producers, so this does not carry a number that drifts), so a long-lived project
+    # accumulates them for as long as it is used; `trim_events` gives the rows back, on the
+    # cadence below.
     #
     # A COUNT rather than an age: the reader is a forward cursor
     # (`events_after(since_id, limit)`), so what an agent tailing the feed needs is that recent
     # rows are still there, not that any particular day is. 50k is far past what any session
     # produces — these are lifecycle rows, not per-request — and keeps the table at a few MB.
     EVENTS_RETENTION = 50_000
+    # Event inserts between `events` retention sweeps.
+    #
+    # `events` needs a cadence of its OWN because the one beside it counts FLOW inserts, and the
+    # two surfaces that write the most events insert no flows at all: a `gori mcp` server (every
+    # mutating tool call is an `agent_action` row) and a TUI session with capture off (config
+    # edits, binding warnings, job lifecycle). For those `prune` — the only caller of
+    # `trim_events` — never ran once, so EVENTS_RETENTION was a cap nothing enforced and the
+    # table grew for the life of the project. `events_recent` already documents the consequence
+    # from the reading end: past the cap its scan window stops short of the feed, and the pane
+    # has to qualify "no events match" with how far back it actually looked.
+    #
+    # A sweep is one index-served MIN lookup on the primary key and, in the common case, no
+    # DELETE at all, so 1 000 keeps it far off the write path while bounding the overshoot to
+    # 2% of the cap.
+    EVENTS_TRIM_INTERVAL = 1_000
     # Ids per statement when a batch write binds an `IN (?,?,…)` list. SQLite caps bound
     # parameters at SQLITE_MAX_VARIABLE_NUMBER, which is 999 on anything built before 3.32 —
     # so a set larger than that does not merely run slower, the statement RAISES and the whole
@@ -266,13 +301,16 @@ module Gori
     # enabled, a view-only second TUI — passes false, because an idle tick that takes the
     # write lock is the #752 two-writer condition, and those surfaces already drain on demand
     # (`index_pending!` before a `body:` query). Ignored when `read_only` (there is no writer).
+    #
     def self.open(path : String, events : Channel(FlowEvent)? = nil,
                   probe_events : Channel(FlowEvent)? = nil,
                   retention_flows : Int32 = RETENTION_DEFAULT,
                   authorize_events : Channel(FlowEvent)? = nil,
                   read_only : Bool = false,
                   background_index : Bool = true,
-                  events_retention : Int32 = EVENTS_RETENTION) : Store
+                  events_retention : Int32 = EVENTS_RETENTION,
+                  busy_timeout_ms : Int32 = SQLITE_BUSY_TIMEOUT_MS,
+                  checkout_timeout_seconds : Float64 = DB_CHECKOUT_TIMEOUT_SECONDS) : Store
       # `cache_size` is negative because SQLite reads that as KiB rather than pages: -64000
       # is 64 MiB. The default is -2000 (2 MiB) PER CONNECTION, which on a long-lived project
       # means every unindexed History filter re-reads pages off disk with almost no reuse —
@@ -289,25 +327,25 @@ module Gori
       # catches exactly this), and copying just the `.db` loses the tail. gori's close path
       # depends on the pool closing every connection to get SQLite's last-connection
       # checkpoint, and that only holds at 1. Raise this only with that fixed first.
-      # MEASURED, so nobody re-proposes it: a COVERING INDEX over every column `SELECT_ROW`
-      # reads was tried on top of this and reverted. It is genuinely used (EXPLAIN QUERY PLAN
-      # says `SCAN flows USING COVERING INDEX`), but on the worst case it exists for — a filter
-      # matching almost nothing, so SQLite cannot stop early — it bought 7.5 ms -> 6.5 ms at
-      # 100k rows with 8 KB bodies, for 3% off sustained INSERT throughput and ~20 MB per 100k
-      # rows. The reason it pays so little is the line below: with a 64 MiB page cache the
-      # table pages are already resident, so the overflow-chain traversal the index was meant
-      # to avoid is not what the query was spending its time on. The two genuinely slow filters
-      # (`header:` 164 ms, `body:` LIKE 452 ms) scan the BLOBs themselves and no projection
-      # index can touch them.
+      # The COVERING INDEX over every column `SELECT_ROW` reads (`idx_flows_list`, schema V37)
+      # was tried once on top of this (#665) and reverted: with 8 KB bodies it bought
+      # 7.5 ms -> 6.5 ms at 100k rows, because every row fit its leaf page and this cache held
+      # them. That measurement was the wrong corpus, not the wrong idea. With realistic MB
+      # bodies (200k flows / 6.5 GB, 2% of 0.5–2 MB) the leaf pages scatter between overflow
+      # pages across the whole file, no cache holds them, and every column after the BLOBs is
+      # an overflow-chain walk — `host:` with no match took 121 ms, `src:repeater` 1061 ms;
+      # the index answers both in under 10 ms (V37 has the numbers). The filters that scan the
+      # BLOBs themselves (`header:`, index-free `body:`, `body~`) are still out of its reach.
       #
       # `max_pool_size` is bounded BECAUSE of `cache_size`: crystal-db's default is unlimited,
       # and 64 MiB is a per-CONNECTION ceiling, so N concurrent readers (the TUI render fiber,
       # the writer, the probe passive and catch-up fibers, a second `gori mcp` process) could
       # each claim one. Eight caps the worst case at ~512 MiB instead of unbounded, and is
       # well past the handful of readers gori actually runs at once.
-      url = "sqlite3:#{path}?journal_mode=wal&synchronous=normal&busy_timeout=5000" \
-            "&cache_size=-64000&max_pool_size=8"
+      url = "sqlite3:#{path}?journal_mode=wal&synchronous=normal&busy_timeout=#{busy_timeout_ms}" \
+            "&cache_size=-64000&max_pool_size=8&checkout_timeout=#{checkout_timeout_seconds}"
       refuse_non_database(path)
+      refuse_foreign_database(path, read_only, busy_timeout_ms)
       # Announce that this process has the database open, for as long as it is (see OpenLock).
       # Taken BEFORE `DB.open` so the window in which a peer could delete the file out from
       # under a half-built store does not exist.
@@ -365,6 +403,32 @@ module Gori
     # per connection below.
     MMAP_SIZE = 256 * 1024 * 1024
 
+    # WAL pages the writer lets accumulate before its COMMIT runs an automatic checkpoint
+    # (SQLite's default is 1000). That checkpoint runs synchronously inside the writer's
+    # COMMIT, on the one scheduler thread every proxy fiber shares, and on macOS the system
+    # SQLite is built with `checkpoint_fullfsync` on, so each one is ~2 F_FULLFSYNC (~4 ms).
+    # Profiled under keep-alive proxy load it was 11-31% of busy time (h1) and 28% (h2).
+    # 4000 pages (~16 MB at 4 KiB) runs a quarter as many checkpoints, and hot index pages
+    # rewritten between them are copied back once instead of four times. The cost is a longer
+    # single stall when one does run (max ~16-20 ms vs ~12-16 ms in a commit-latency bench
+    # with the fsyncs in, while commits over 2 ms fell from ~88 to ~21 per 6000).
+    # checkpoint_fullfsync stays on: it is what makes a checkpoint durable on Apple hardware.
+    WAL_AUTOCHECKPOINT_PAGES = 4000
+
+    # `journal_size_limit`: after a checkpoint resets the WAL, the next write truncates the
+    # file back to this size. Without it the `-wal` keeps its high-water mark forever — a
+    # long-lived reader (a second `gori mcp`, a slow export) that holds a checkpoint back
+    # can grow it far past the autocheckpoint size, and it would stay that big on disk.
+    WAL_SIZE_LIMIT = 64 * 1024 * 1024
+
+    # The writer's own page cache, in KiB (negative = KiB, as in the URL's -64000). The pool's
+    # 64 MiB is sized for READERS re-scanning BLOB-heavy `flows` pages under a History filter;
+    # the writer holds its connection for the life of the store and mostly appends, so its
+    # cache fills with pages it never reads again and stays resident. Measured over 60 s of
+    # keep-alive proxy load (`gori run capture`): throughput no lower at 8 MiB, peak RSS
+    # 185 -> 129 MB.
+    WRITER_CACHE_KIB = -8000
+
     # THE one place a fresh pool connection is configured.
     #
     # crystal-db's `setup_connection` ASSIGNS its block (`@setup_connection = proc` in
@@ -385,6 +449,9 @@ module Gori
         # The Scope match functions, for the rule shapes whose native SQL spelling does not
         # mean what the in-memory lens means (see ScopeMatch).
         sqlite.gori_install_scope_match
+        # `gori_cache_status(response_head)` for QL `cache:` — computed on read, so it costs a
+        # query that names the field and nothing else (see CacheStatusFn).
+        sqlite.gori_install_cache_status
         sqlite.exec("PRAGMA mmap_size = #{MMAP_SIZE}")
         # After migrate. A read-only store must not be able to write even if a caller forgets
         # the @writes-closed degradation — SQLite refuses the statement instead of taking
@@ -407,14 +474,24 @@ module Gori
     # terminating NUL. Written as an escape — a raw NUL in a source literal is invisible.
     SQLITE_MAGIC = "SQLite format 3\u0000".to_slice
 
-    # How many flows a project database holds, WITHOUT opening it as a Store.
+    # What one pass over another project's database is worth reading while it is open: the
+    # flow count below, and the operator's `description`. A LISTING wants both and must not
+    # pay two opens for them — on a host holding a project per worktree that is hundreds of
+    # extra file opens, which is the cost #1085 went to some trouble to remove.
+    #
+    # The description read has its own rescue, deliberately: it is the OPTIONAL half, and a
+    # database old enough to have no `settings` table must still yield its flow count rather
+    # than have the outer rescue turn the whole census into "could not measure".
+    record ProjectCensus, flows : Int64?, description : String?
+
+    # How many flows a project database holds (`.flows`), WITHOUT opening it as a Store.
     #
     # `Store.open` migrates (a WRITE), takes the shared open lock and installs the 64 MiB
     # page cache — none of which a census wants, and the migration alone rewrites the file,
     # so a census of N projects would rewrite N databases. This is the read-only
     # counterpart: one connection, one aggregate, and no pragmas but the busy timeout.
     #
-    # `nil` means "could not tell" — missing, unreadable, not a database, or a schema with
+    # A `nil` count means "could not tell" — missing, unreadable, not a database, or a schema with
     # no `flows` table (a project half-created by an older gori). Every caller must treat
     # that as NOT empty: hiding a project the census failed to measure makes it invisible,
     # and invisible is a worse failure than noisy.
@@ -430,8 +507,8 @@ module Gori
     # it. Putting the db file back to its pre-census value would then make `gori run project
     # list` sort a project by one time and print another, and every later reader (MCP
     # `list_projects`, the TUI picker) would see the older time for good.
-    def self.captured_flows(path : String) : Int64?
-      return nil unless File.exists?(path)
+    def self.project_census(path : String) : ProjectCensus
+      return ProjectCensus.new(nil, nil) unless File.exists?(path)
       # Same pre-flight `Store.open` and `Compact.measure` run, and for the first of their
       # two reasons: a non-database file leaks the driver's fd inside `DB.open`, and this
       # is a path that opens hundreds of files in one command.
@@ -442,7 +519,14 @@ module Gori
       db = DB.open("sqlite3:#{path}?busy_timeout=2000")
       begin
         db.exec("PRAGMA query_only = ON")
-        db.scalar("SELECT COUNT(*) FROM flows").as(Int64)
+        flows = db.scalar("SELECT COUNT(*) FROM flows").as(Int64)
+        desc = begin
+          db.query_one?("SELECT value FROM settings WHERE key = ?", Project::DESCRIPTION_KEY,
+            as: String).try(&.presence)
+        rescue
+          nil
+        end
+        ProjectCensus.new(flows, desc)
       ensure
         db.close
         # Both files, each to what a reader must still get. The db file goes to the ACTIVITY
@@ -458,7 +542,7 @@ module Gori
         put_back(wal, wal_before, wal_before || activity)
       end
     rescue
-      nil
+      ProjectCensus.new(nil, nil)
     end
 
     private def self.mtime_of(file : String) : Time?
@@ -544,6 +628,69 @@ module Gori
       raise Gori::Error.new("cannot open #{path}: not a valid SQLite database (wrong file header)")
     end
 
+    # Refuse a SQLite file that is not a gori project, BEFORE anything below writes to it
+    # (#1171). `Store.open` is not a reader: the open lock drops `<path>.open.lock` beside the
+    # file, the URL's `journal_mode=wal` switches it to WAL and leaves `-wal`/`-shm`,
+    # `harden_permissions` chmods it 0600, and `Schema.migrate!` creates gori's 40-odd tables
+    # in it — a read-only open included, because a STALE gori schema must still migrate. So a
+    # mistyped `gori run history --db places.sqlite` rewrote another tool's database and then
+    # printed "no flows". Everything here is judged through a short connection of its own,
+    # opened without a pragma that writes, and closed before any of that happens.
+    #
+    # What counts as gori's: `user_version` 0 with no tables (a database nobody has
+    # initialised yet), or a nonzero `user_version` beside a `flows` table (V1 created it, no
+    # migration drops it). A version-0 file WITH tables is someone else's — gori's migrations
+    # are one transaction, so a half-migrated gori file does not exist — and so is a nonzero
+    # version with no `flows`: the version is another application's own counter, and
+    # migrating from it would run gori's ALTERs against that application's tables.
+    #
+    # An EMPTY database (a 0-byte file, or one with no tables) is refused only on a
+    # READ-ONLY open. There is nothing in it to read, and initialising it would be the same
+    # write the read path must not make; a writable open (`run import --db`, `capture --db`,
+    # "created if absent") keeps turning an empty file into a project, as it always has.
+    #
+    # A connection that cannot be made or read here (busy past the timeout, unreadable)
+    # does NOT refuse: this check exists to name a foreign file, and the open below already
+    # reports those failures in its own words.
+    private def self.refuse_foreign_database(path : String, read_only : Bool, busy_ms : Int32) : Nil
+      info = File.info?(path)
+      return unless info && info.file?
+      if info.size.zero?
+        return unless read_only
+        raise Gori::Error.new("cannot open #{path}: not a gori project (the file is empty, and a read-only open does not create one)")
+      end
+      version, tables = begin
+        peek_schema(path, busy_ms)
+      rescue DB::Error | SQLite3::Exception | IO::Error
+        return
+      end
+      if version == 0
+        if tables.empty?
+          return unless read_only
+          raise Gori::Error.new("cannot open #{path}: not a gori project (the database is empty, and a read-only open does not create one)")
+        end
+        shown = tables.first(3).join(", ") + (tables.size > 3 ? ", …" : "")
+        raise Gori::Error.new("cannot open #{path}: not a gori project (it holds tables gori did not create: #{shown})")
+      end
+      return if tables.includes?("flows")
+      raise Gori::Error.new("cannot open #{path}: not a gori project (schema version #{version}, but no flows table)")
+    end
+
+    # `user_version` and the user table names, through a connection that writes nothing:
+    # no `journal_mode` in the URL (that pragma is what converts a file to WAL), and
+    # `query_only` on the one connection the reads then use.
+    private def self.peek_schema(path : String, busy_ms : Int32) : {Int32, Array(String)}
+      DB.open("sqlite3:#{path}?busy_timeout=#{busy_ms}") do |db|
+        db.using_connection do |conn|
+          conn.exec("PRAGMA query_only = ON")
+          version = conn.scalar("PRAGMA user_version").as(Int64).to_i
+          tables = conn.query_all("SELECT name FROM sqlite_master WHERE type = 'table' " \
+                                  "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name", as: String)
+          {version, tables}
+        end
+      end
+    end
+
     # The db (and its WAL/SHM sidecars) hold captured request/response bytes — cookies,
     # Authorization headers, credentials in POST bodies. Lock them to 0600 so the secret
     # store isn't world-readable even if the enclosing dir's perms are ever loosened or the
@@ -562,19 +709,13 @@ module Gori
       @write_failures.get
     end
 
-    # Raw h2 frames dropped because the writer was saturated. Capture of the raw
-    # frame log is best-effort under load; the reconstructed flows stay complete
-    # (the assembler accumulates bodies in memory, independent of this log).
-    def h2_frames_dropped : Int32
-      @h2_frames_dropped.get
-    end
-
     def initialize(@db : DB::Database, @events : Channel(FlowEvent)? = nil,
                    @probe_events : Channel(FlowEvent)? = nil,
                    @retention_flows : Int32 = RETENTION_DEFAULT,
                    @authorize_events : Channel(FlowEvent)? = nil,
                    @prune_interval : Int32 = PRUNE_INTERVAL,
                    @events_retention : Int32 = EVENTS_RETENTION,
+                   @events_trim_interval : Int32 = EVENTS_TRIM_INTERVAL,
                    @open_lock : OpenLock? = nil,
                    @read_only : Bool = false,
                    @background_index : Bool = true)
@@ -584,6 +725,8 @@ module Gori
       @write_failures = Atomic(Int32).new(0)
       @h2_frames_dropped = Atomic(Int32).new(0)
       @inserts_since_prune = 0
+      @events_since_trim = 0
+      @h2_unattributed_reaped = false # writer-fiber-only; see `prune`
       # Writer-fiber-only hint: does `flows.fts_dirty = 1` possibly have rows? Starts true so a
       # db reopened with a backlog (a killed process, or a batch dropped under saturation) gets
       # drained without waiting for a capture to hint at it; set false the moment an indexing
@@ -653,6 +796,16 @@ module Gori
       @probe_generation
     end
 
+    # Ops taken by EVERY store's writer fiber in this process, cumulative. A liveness signal,
+    # not a count of rows: a change between two reads means something wrote in between (read
+    # by `IdleGc` so it never collects under capture). Process-wide on purpose, since the GC
+    # heap it guards is. Single-threaded scheduler: plain Int64 (no -Dpreview_mt).
+    @@write_ops = 0_i64
+
+    def self.write_ops : Int64
+      @@write_ops
+    end
+
     # --- write API (called from proxy fibers) --------------------------------
     #
     # BARRIER NOTE: a returned flow write is committed and readable through every projection
@@ -720,6 +873,21 @@ module Gori
       reply.receive
     rescue Channel::ClosedError
       nil
+    end
+
+    # Called after both tunnel directions and their transcript finish. This is only a wakeup
+    # hint for the headless capture printer, so keep it on the same non-blocking, drop-on-full
+    # path as ordinary flow events (P6).
+    def notify_tunnel_complete(flow_id : Int64) : Nil
+      return if flow_id <= 0
+      events = @events || return
+      select
+      when events.send(FlowEvent.new(flow_id, :tunnel_completed))
+      else
+        # Same best-effort, non-blocking policy as ordinary flow events; never stall the proxy.
+      end
+    rescue Channel::ClosedError
+      # session shutdown raced with the final tunnel close
     end
 
     # Restores a flow's captured WebSocket transcript — the import path, where the messages
@@ -940,6 +1108,12 @@ module Gori
     # is no defence against a deadlock. It is the same hazard `writer_loop` already protects
     # against from the other side, where a failed batch must not kill the writer "or every
     # blocked caller (and close()) deadlocks".
+    # Whether `close` has run. For a holder that keeps a Store it did not open and must not
+    # write through one somebody else has since closed (`SessionRefresh::Runner`, #1233).
+    def closed? : Bool
+      @closed
+    end
+
     def close : Nil
       return if @closed
       @closed = true
@@ -1051,10 +1225,13 @@ module Gori
       @writer_conn_suspect = false
       conn || begin
         fresh = @db.checkout
-        # Bound the WAL file so it doesn't grow without limit under sustained writes (the
-        # default is 1000 pages; set it explicitly on the writer). Per CONNECTION, so it has to
-        # be re-issued on every one the writer takes, not once at startup.
-        fresh.exec("PRAGMA wal_autocheckpoint=1000") rescue nil
+        # Both per CONNECTION, so they have to be re-issued on every one the writer takes, not
+        # once at startup. See WAL_AUTOCHECKPOINT_PAGES / WAL_SIZE_LIMIT / WRITER_CACHE_KIB.
+        # The connection goes back to the pool only at teardown, so readers keep the URL's
+        # 64 MiB.
+        fresh.exec("PRAGMA wal_autocheckpoint=#{WAL_AUTOCHECKPOINT_PAGES}") rescue nil
+        fresh.exec("PRAGMA journal_size_limit=#{WAL_SIZE_LIMIT}") rescue nil
+        fresh.exec("PRAGMA cache_size=#{WRITER_CACHE_KIB}") rescue nil
         @writer_conn = fresh
       end
     end
@@ -1193,6 +1370,21 @@ module Gori
       ::Log.warn { "retention prune skipped (no usable writer connection): #{ex.message}" } # gori.log (#411)
     end
 
+    # The `events` sweep on its own cadence. Same shape and same reason as `prune_safely`:
+    # `trim_events` rescues its own statement, but not the `writer_conn` checkout it is handed.
+    #
+    # Answers whether the sweep RAN, which its caller needs — a skipped sweep must not reset the
+    # cadence counter. `trim_events`' own rescue marks the connection suspect and returns, so a
+    # true here means the statement was issued, not that rows went.
+    private def trim_events_safely : Bool
+      return false if @writer_conn_suspect # a condemned connection: the next sweep takes these rows
+      trim_events(writer_conn)
+      true
+    rescue ex
+      ::Log.warn { "event-log trim skipped (no usable writer connection): #{ex.message}" } # gori.log (#411)
+      false
+    end
+
     private def writer_connection_loop : Nil
       # Cleared once per loop, not per connection — the loop takes and retires many. It stays
       # the discriminator `writer_loop`'s rescue reads to tell "the loop died" from "the final
@@ -1210,6 +1402,7 @@ module Gori
           while ops.size < BATCH_MAX && (extra = drain_one)
             ops << extra
           end
+          @@write_ops &+= ops.size
 
           # Batch the burst into one transaction (amortize fsync, P6), then fire
           # replies + events only AFTER commit so nothing observes uncommitted
@@ -1323,9 +1516,25 @@ module Gori
             # so counting it as a single InsertFlow (or 0) let a large import bypass the
             # retention sweep, keeping the DB far over its cap until enough live captures accrue.
             @inserts_since_prune += ops.sum { |op| op.is_a?(InsertFlow) ? 1 : (op.is_a?(InsertImportBatch) ? op.pairs.size : 0) }
+            # Events carry their own count for the reason EVENTS_TRIM_INTERVAL gives: the sum
+            # above is 0 for every process that writes events and captures nothing, so the
+            # sweep below was the branch the two chattiest surfaces never reached.
+            @events_since_trim += ops.count { |op| op.is_a?(ExecTask) && op.event? }
             if @inserts_since_prune >= @prune_interval
               prune_safely
               @inserts_since_prune = 0
+            end
+            if @events_since_trim >= @events_trim_interval
+              # Zeroed only when the sweep actually RAN. `prune` above may sweep `events` too,
+              # and then this one finds nothing to delete — one indexed MIN lookup, which is
+              # cheaper than the bookkeeping needed to skip it. What is NOT cheap is crediting a
+              # sweep that did not happen: `prune` returns above its own `trim_events` on a
+              # condemned writer connection, and `prune_safely` swallows a failed checkout
+              # outright, so zeroing on either would put the counter back to 0 with the rows
+              # still there — another full interval before the next attempt, for as long as the
+              # connection keeps failing. That is the unbounded growth this cadence exists to
+              # stop, reinstated by the branch meant to stop it.
+              @events_since_trim = 0 if trim_events_safely
             end
           else
             # NOT the IndexBatch ops: `index_replies` (collected from this same `ops` array) is
@@ -1358,7 +1567,15 @@ module Gori
         # the connection is half-closed and `#close` must not re-close the pool (see there).
         if last = @writer_conn
           @writer_conn = nil
-          @writer_conn_suspect ? retire_writer_conn(last) : last.release
+          if @writer_conn_suspect
+            retire_writer_conn(last)
+          else
+            # Back to the pool, where a reader may take it for the rest of the session (a writer
+            # fiber that died mid-loop leaves the store open): undo the writer-only page cache
+            # (WRITER_CACHE_KIB) so it serves reads with the pool's -64000 like every other.
+            last.exec("PRAGMA cache_size=-64000") rescue nil
+            last.release
+          end
         end
       end
     end
@@ -1370,15 +1587,20 @@ module Gori
     # another PRUNE_INTERVAL inserts, simply tries again).
     #
     # The cutoff is the id of the OLDEST flow that SURVIVES, seeked from the rows that actually
-    # exist — deliberately not `MAX(id) - @retention_flows`. `flows.id` is monotonic but NOT
-    # gapless (INTEGER PRIMARY KEY without AUTOINCREMENT, and `delete_flow`/`delete_flows` remove
-    # arbitrary mid-history ids from the History tab, MCP and `gori run history`), and that
+    # exist — deliberately not `MAX(id) - @retention_flows`. `flows.id` is monotonic (AUTOINCREMENT
+    # since V39) but NOT gapless (`delete_flow`/`delete_flows` remove arbitrary mid-history ids
+    # from the History tab, MCP and `gori run history`), and that
     # arithmetic is "the newest N" only on a gap-free space. With 10 flows of which 6
     # mid-history ones were hand-deleted (1, 2, 9, 10 survive) and 15 more captured, a cap of 20
     # computed `cutoff = 25 - 20 = 5` and destroyed flows 1 and 2 — out of 19 rows, under a cap
     # of 20, where nothing at all should have been dropped. Irreversible, and reported as an
     # ordinary retention drop. `Compact.prune_old_flows` already documents and fixes this exact
     # arithmetic; the two sweeps now share one definition of "the newest N".
+    #
+    # Found from the LOW end (`oldest_excess_cutoff`) rather than by walking the newest
+    # `@retention_flows` rows down from the top: that walk read up to the cap's worth of table
+    # rows (100k by default), leaf pages of head/body bytes and all, on every sweep — measured
+    # ~1.2 s cold / 5 ms warm for 40k of 50k×8 KB flows — while most sweeps drop nothing.
     private def prune(conn : DB::Connection) : Nil
       # BEFORE the retention early-returns. The reap below is not retention — it removes frames
       # whose connection row does not exist, which no cap has any opinion about — and putting it
@@ -1387,9 +1609,12 @@ module Gori
       # `cutoff <= 0`. The comment there promised a db carrying frames from an older build would
       # heal itself; for those it did not.
       #
-      # Still on the prune cadence (once per PRUNE_INTERVAL inserts), so a project that never
-      # inserts another flow heals only via `compact` — which reaps the same rows.
-      reap_unattributed_h2_frames(conn)
+      # Once per Store instance, on the first sweep — not on every one: it is a full scan of
+      # `h2_frames` (~35 ms per million frames). Orphans come from a db an older build wrote,
+      # whose clear dropped the rows of connections a browser kept open and logging (the guard in
+      # `insert_h2_frame` only refuses id <= 0); `clear_flows` now keeps those rows. Retried on
+      # the next sweep if it failed.
+      @h2_unattributed_reaped = reap_unattributed_h2_frames(conn) unless @h2_unattributed_reaped
       # Each of the three sweeps below runs on the SAME connection, and the suspect flag is only
       # read back when the loop next asks for one — i.e. after this method returns. So a sweep
       # that has already condemned this connection must stop rather than let the next two burn a
@@ -1405,46 +1630,10 @@ module Gori
       trim_events(conn)
       return if @writer_conn_suspect # as above: do not run the retention sweep on a dead connection
       return if @retention_flows <= 0
-      # Served by the primary key: a rightmost-leaf descending scan of @retention_flows rows.
-      oldest_kept = conn.query_one?(
-        "SELECT MIN(id) FROM (SELECT id FROM flows ORDER BY id DESC LIMIT ?)",
-        @retention_flows, as: Int64?)
-      return unless oldest_kept # no flows at all
-      cutoff = oldest_kept - 1  # everything strictly below the oldest survivor goes
-      return if cutoff <= 0
+      return unless cutoff = oldest_excess_cutoff(conn, "flows", @retention_flows)
       dropped = 0_i64
       write_transaction(conn) do |c|
-        # NOTE (known limitation): a WebSocket flow still streaming frames after `retention_flows`
-        # newer flows push its id below the cutoff is reaped here mid-stream, which also stops
-        # Probe WS scanning on it. A liveness guard like the h2 one below is the fix, but it must
-        # compare ws_message.created_at against a WS-relative recency floor (flows.created_at and
-        # ws_messages.created_at are set from different sources), so it is left for a focused
-        # retention change rather than bundled here.
-        # Only CAPTURED ws messages (repeater_id IS NULL, real flow_id) cascade with their
-        # pruned flow. WebSocket-Repeater output rows (update_repeater_ws_messages) are stored
-        # with the sentinel flow_id = 0 and keyed by repeater_id, so a bare `flow_id <= cutoff`
-        # (cutoff is always > 0 here) matched EVERY repeater row and wiped saved repeater traffic
-        # on each sweep. Gate on repeater_id so repeater-owned rows are never reaped by flow retention.
-        c.exec("DELETE FROM ws_messages WHERE flow_id <= ? AND repeater_id IS NULL", cutoff)
-        c.exec("DELETE FROM flows_fts WHERE rowid <= ?", cutoff)
-        c.exec("DELETE FROM flows WHERE id <= ?", cutoff)
-        # Read changes() IMMEDIATELY after the flows delete — it reports the most recent
-        # statement, so any query in between (including the h2 reaping below) would replace it.
-        dropped = c.scalar("SELECT changes()").as(Int64)
-        # h2 frames/connections key off conn_id, not flow id. Reap a connection's raw
-        # log only once it's (a) not referenced by any surviving flow AND (b) INACTIVE
-        # — its newest frame is older than the oldest kept flow. Keying (b) on frame
-        # recency, not the connection's OPEN time, is the fix: a long-lived in-flight
-        # stream (flow not projected yet, but still logging frames) has recent frames,
-        # so it's never wiped. The old `h2_connections.created_at < oldest` guard
-        # deleted exactly such a stream once retention churn advanced the window past
-        # its open time, leaving a dangling h2_conn_id + empty frame log. (b)'s absence
-        # of any recent frame still lets genuinely-orphaned connections be reaped.
-        oldest = c.query_one?("SELECT MIN(created_at) FROM flows", as: Int64?) || Int64::MAX
-        stale = "id NOT IN (SELECT h2_conn_id FROM flows WHERE h2_conn_id IS NOT NULL) " \
-                "AND id NOT IN (SELECT conn_id FROM h2_frames WHERE created_at >= ?)"
-        c.exec("DELETE FROM h2_frames WHERE conn_id IN (SELECT id FROM h2_connections WHERE #{stale})", oldest)
-        c.exec("DELETE FROM h2_connections WHERE #{stale}", oldest)
+        dropped = Store.delete_flows_through(c, cutoff)
       end
       # Say that history was dropped. A sweep is otherwise completely silent, so a flow the
       # operator looked at an hour ago simply vanishing is indistinguishable from a bug. At most
@@ -1457,6 +1646,49 @@ module Gori
       mark_writer_conn_suspect
     end
 
+    # Delete every flow with `id <= cutoff` (cutoff > 0) and what hangs off it, on `conn` and
+    # inside the caller's transaction: the one cascade the retention sweep (`prune`) and
+    # `Compact.prune_old_flows` share. Returns how many flow rows went.
+    protected def self.delete_flows_through(conn : DB::Connection, cutoff : Int64) : Int64
+      # NOTE (known limitation): a WebSocket flow still streaming frames after `retention_flows`
+      # newer flows push its id below the cutoff is reaped here mid-stream, which also stops
+      # Probe WS scanning on it. A liveness guard like the h2 one below is the fix, but it must
+      # compare ws_message.created_at against a WS-relative recency floor (flows.created_at and
+      # ws_messages.created_at are set from different sources), so it is left for a focused
+      # retention change rather than bundled here.
+      # Only CAPTURED ws messages (repeater_id IS NULL, real flow_id) cascade with their
+      # pruned flow. WebSocket-Repeater output rows (update_repeater_ws_messages) are stored
+      # with the sentinel flow_id = 0 and keyed by repeater_id, so a bare `flow_id <= cutoff`
+      # (cutoff is always > 0 here) matched EVERY repeater row and wiped saved repeater traffic
+      # on each sweep. Gate on repeater_id so repeater-owned rows are never reaped by flow retention.
+      conn.exec("DELETE FROM ws_messages WHERE flow_id <= ? AND repeater_id IS NULL", cutoff)
+      conn.exec("DELETE FROM flows_fts WHERE rowid <= ?", cutoff)
+      # JS references are derived from their flow's body (V35) and go with it.
+      conn.exec("DELETE FROM js_refs WHERE flow_id <= ?", cutoff)
+      conn.exec("DELETE FROM js_ref_scans WHERE flow_id <= ?", cutoff)
+      conn.exec("DELETE FROM intercept_originals WHERE flow_id <= ?", cutoff)
+      conn.exec("DELETE FROM flow_interims WHERE flow_id <= ?", cutoff)
+      conn.exec("DELETE FROM flows WHERE id <= ?", cutoff)
+      # Read changes() IMMEDIATELY after the flows delete — it reports the most recent
+      # statement, so any query in between (including the h2 reaping below) would replace it.
+      dropped = conn.scalar("SELECT changes()").as(Int64)
+      # h2 frames/connections key off conn_id, not flow id. Reap a connection's raw
+      # log only once it's (a) not referenced by any surviving flow AND (b) INACTIVE
+      # — its newest frame is older than the oldest kept flow. Keying (b) on frame
+      # recency, not the connection's OPEN time, is the fix: a long-lived in-flight
+      # stream (flow not projected yet, but still logging frames) has recent frames,
+      # so it's never wiped. The old `h2_connections.created_at < oldest` guard
+      # deleted exactly such a stream once retention churn advanced the window past
+      # its open time, leaving a dangling h2_conn_id + empty frame log. (b)'s absence
+      # of any recent frame still lets genuinely-orphaned connections be reaped.
+      oldest = conn.query_one?("SELECT MIN(created_at) FROM flows", as: Int64?) || Int64::MAX
+      stale = "id NOT IN (SELECT h2_conn_id FROM flows WHERE h2_conn_id IS NOT NULL) " \
+              "AND id NOT IN (SELECT conn_id FROM h2_frames WHERE created_at >= ?)"
+      conn.exec("DELETE FROM h2_frames WHERE conn_id IN (SELECT id FROM h2_connections WHERE #{stale})", oldest)
+      conn.exec("DELETE FROM h2_connections WHERE #{stale}", oldest)
+      dropped
+    end
+
     # Frames whose connection row does not exist at all. The guard in `insert_h2_frame` stops new
     # ones, but a db that ran an older build carries however many it wrote, and the retention
     # sweep can never reach them — it selects through `h2_connections`, and that is exactly the
@@ -1465,31 +1697,51 @@ module Gori
     # `h2_connections.id` is an INTEGER PRIMARY KEY so the subquery yields no NULL, which is what
     # makes `NOT IN` safe here. Served by `idx_h2_frames_conn`. Its own transaction and its own
     # rescue, like the sweep it runs ahead of: this must never cost the batch that just committed.
-    private def reap_unattributed_h2_frames(conn : DB::Connection) : Nil
+    #
+    # Answers whether the reap ran, so a failed one is retried on the next sweep.
+    private def reap_unattributed_h2_frames(conn : DB::Connection) : Bool
       conn.exec("DELETE FROM h2_frames WHERE conn_id NOT IN (SELECT id FROM h2_connections)")
+      true
     rescue ex
       ::Log.warn { "unattributed h2-frame reap failed (will retry): #{ex.message}" } # gori.log (#411)
       # A failed statement outlives the call that issued it — the driver leaves it un-reset.
       mark_writer_conn_suspect
+      false
     end
 
-    # Keep the newest EVENTS_RETENTION rows. Shaped like the flows sweep — find the oldest
-    # survivor by walking the primary key backwards, then delete strictly below it — so the
-    # common case (already under the cap) costs one indexed lookup and no delete at all.
+    # Keep the newest EVENTS_RETENTION rows. Shaped like the flows sweep — `oldest_excess_cutoff`,
+    # then delete up to it — so the common case (already under the cap) costs one COUNT and no
+    # delete at all.
     #
     # `id` is AUTOINCREMENT, so it is monotonic and never reused: deleting below a cutoff can
     # never take a row a reader's watermark has not already passed.
     private def trim_events(conn : DB::Connection) : Nil
-      oldest_kept = conn.query_one?(
-        "SELECT MIN(id) FROM (SELECT id FROM events ORDER BY id DESC LIMIT ?)",
-        @events_retention, as: Int64?)
-      return unless oldest_kept
-      cutoff = oldest_kept - 1
-      return if cutoff <= 0
+      return unless cutoff = oldest_excess_cutoff(conn, "events", @events_retention)
       conn.exec("DELETE FROM events WHERE id <= ?", cutoff)
     rescue ex
       ::Log.warn { "event-log trim failed (will retry): #{ex.message}" } # gori.log (#411)
       mark_writer_conn_suspect
+    end
+
+    # The id of the newest row that has to go for `table` to hold at most `keep` rows, or nil
+    # when it already does. Everything `id <= cutoff` is then exactly the oldest excess.
+    #
+    # Counted and then seeked from the LOW end, not by walking the newest `keep` rows down from
+    # the top: `COUNT(*)` reads the smallest index (or the table's leaf pages without decoding a
+    # row), and the OFFSET walks only the excess, which a sweep every PRUNE_INTERVAL inserts
+    # keeps about that size. Still gap-safe for the reason `prune` spells out: it counts rows
+    # that exist, never `MAX(id) - keep`.
+    #
+    # ONE statement, so the count and the seek read one snapshot. As two autocommit statements a
+    # peer process (a second gori on the project running its own sweep) could delete low rows in
+    # between, and the stale count would push the offset past the excess and drop rows that were
+    # meant to stay — irreversibly. The old single-statement form could only ever under-delete.
+    private def oldest_excess_cutoff(conn : DB::Connection, table : String, keep : Int32) : Int64?
+      return nil if keep <= 0 # a non-positive cap is "unlimited", as the old `LIMIT` read it
+      conn.query_one?(
+        "SELECT id FROM #{table} WHERE (SELECT COUNT(*) FROM #{table}) > ?1 " \
+        "ORDER BY id LIMIT 1 OFFSET (SELECT COUNT(*) FROM #{table}) - ?1 - 1",
+        keep, as: Int64)
     end
 
     # One gori.log line per sweep that actually removed history, naming the setting that
@@ -1524,17 +1776,27 @@ module Gori
     # (import reference placeholders that were never sent) are EXCLUDED — they are permanently
     # Pending by design, not orphaned in-flight captures, so finalising them to Error would
     # fabricate a network failure for data the operator imported (#408).
+    #
+    # The WHERE is PENDING_WHERE, literal and not bound, so it matches `idx_flows_pending`'s
+    # (V36) and the SELECT reads only that index; the UPDATE then touches the collected rows by
+    # primary key, in the same transaction, so nothing can turn Pending in between.
     private def abandon_all_pending(conn : DB::Connection, message : String) : Array(Int64)
       ids = [] of Int64
-      conn.query("SELECT id FROM flows WHERE state = ? AND unsent = 0", FlowState::Pending.value) do |rs|
+      conn.query("SELECT id FROM flows WHERE #{PENDING_WHERE}") do |rs|
         rs.each { ids << rs.read(Int64) }
       end
-      return ids if ids.empty?
-      conn.exec(
-        "UPDATE flows SET state = ?, error = ?, status = 0 WHERE state = ? AND unsent = 0",
-        FlowState::Error.value, message, FlowState::Pending.value)
+      ids.each_slice(ID_CHUNK) do |slice|
+        args = [FlowState::Error.value, message] of DB::Any
+        slice.each { |id| args << id }
+        conn.exec("UPDATE flows SET state = ?, error = ?, status = 0, static_asset = 0 " \
+                  "WHERE id IN (#{Array.new(slice.size, "?").join(", ")})", args: args)
+      end
       ids
     end
+
+    # The rows `abandon_all_pending` finalises, spelled exactly as `idx_flows_pending`'s WHERE:
+    # SQLite picks a partial index only for a query carrying the same literal terms.
+    PENDING_WHERE = "state = #{FlowState::Pending.value} AND unsent = 0"
 
     # Non-blocking receive for batching a burst (no `try_receive?` in stdlib).
     # Returns the next immediately-available op, or nil if none/closed.
@@ -1591,7 +1853,7 @@ module Gori
     # A failure here must not kill the writer or lose capture: it runs in its own
     # transaction and swallows errors, leaving the rows dirty for the next attempt.
     private def index_pending_batch(conn : DB::Connection, *, try_lock : Bool = false) : Int32?
-      rows = [] of {Int64, Bytes, Bytes?, Bytes?, Bytes?, String?}
+      rows = [] of {Int64, Bytes, Int64?, Bytes?, Int64?, String?}
       begin
         # Cheap lock-free probe first, served by the partial index on `fts_dirty`. An idle
         # writer runs this every FTS_IDLE_TICK, and an empty backlog must not open a write
@@ -1614,20 +1876,29 @@ module Gori
           # path skipped binary bodies on. A synthesised response (an import, a test double) can
           # carry a content type that never appeared in its head bytes, and deriving the marker
           # from the head would silently start indexing a binary body those callers marked.
+          #
+          # TWO phases, so a body the skip rule rejects is never read: `substr(body, 1, N)` loads
+          # the WHOLE blob before cutting it (only `length()` is served from the record header),
+          # so an image or a gzip stream was copied out in full just to be thrown away. Phase one
+          # reads what decides the skip — heads, content_type, body lengths; phase two fetches
+          # the capped body for the sides that will actually be indexed.
           c.query(
-            "SELECT id, request_head, substr(request_body, 1, ?), response_head, substr(response_body, 1, ?), " \
-            "content_type FROM flows WHERE fts_dirty = 1 ORDER BY id LIMIT ?",
-            FTS_INDEX_MAX, FTS_INDEX_MAX, FTS_BATCH) do |rs|
+            "SELECT id, request_head, length(request_body), response_head, length(response_body), " \
+            "content_type FROM flows WHERE fts_dirty = 1 ORDER BY id LIMIT ?", FTS_BATCH) do |rs|
             rs.each do
-              rows << {rs.read(Int64), rs.read(Bytes), rs.read(Bytes?),
-                       rs.read(Bytes?), rs.read(Bytes?), rs.read(String?)}
+              rows << {rs.read(Int64), rs.read(Bytes), rs.read(Int64?),
+                       rs.read(Bytes?), rs.read(Int64?), rs.read(String?)}
             end
           end
-          rows.each do |(id, req_head, req_body, resp_head, resp_body, resp_ct)|
+          rows.each do |(id, req_head, req_len, resp_head, resp_len, resp_ct)|
             # The request side has no content_type column, so its marker comes from its head —
-            # exactly what the old path did for the request body.
-            req = body_fts_text(req_head, req_body)
-            resp = resp_head.nil? ? "" : body_fts_text(resp_head, resp_body, resp_ct)
+            # exactly what the old path did for the request body. The same rule as
+            # `body_fts_text`, split so it runs before the body is fetched.
+            want_req = (req_len || 0) > 0 && Store.body_fts_indexed?(req_head)
+            want_resp = (resp_len || 0) > 0 && !resp_head.nil? && Store.body_fts_indexed?(resp_head, resp_ct)
+            req_body, resp_body = fts_capped_bodies(c, id, want_req, want_resp)
+            req = req_body.try { |b| String.new(b) } || ""
+            resp = resp_body.try { |b| String.new(b) } || ""
             # Contentless FTS5 forbids UPDATE, so a refresh is DELETE (a cheap tombstone under
             # contentless_delete=1) + INSERT. Unconditional rather than tracking whether this row
             # was ever indexed: it makes a re-index idempotent — and a double index pass, or one
@@ -1652,15 +1923,41 @@ module Gori
       end
     end
 
+    # Phase two of `index_pending_batch`: the FTS_INDEX_MAX-capped bodies of the sides it will
+    # index (nil for a side it skips), in one point read on the primary key.
+    private def fts_capped_bodies(conn : DB::Connection, id : Int64, req : Bool, resp : Bool) : {Bytes?, Bytes?}
+      if req && resp
+        conn.query_one("SELECT substr(request_body, 1, ?), substr(response_body, 1, ?) FROM flows WHERE id = ?",
+          FTS_INDEX_MAX, FTS_INDEX_MAX, id, as: {Bytes?, Bytes?})
+      elsif req
+        {conn.query_one("SELECT substr(request_body, 1, ?) FROM flows WHERE id = ?", FTS_INDEX_MAX, id, as: Bytes?), nil}
+      elsif resp
+        {nil, conn.query_one("SELECT substr(response_body, 1, ?) FROM flows WHERE id = ?", FTS_INDEX_MAX, id, as: Bytes?)}
+      else
+        {nil, nil}
+      end
+    end
+
     # The FTS text for one side, given that side's raw head and its already-capped body.
     # Skips a body that is binary by content type or compressed by Content-Encoding — the same
     # rule the old on-commit path applied. `ct`, when given (the response side), is the stored
     # content_type column and takes precedence over whatever the head says; the head is still
     # scanned for Content-Encoding, which has no column.
-    private def body_fts_text(head : Bytes, body : Bytes?, ct : String? = nil) : String
+    #
+    # Class-level, and public, because the indexer is not the only reader that has to agree with
+    # it: `ProjectSearch` scans the bodies the index has not reached yet, and a body it matched
+    # that the indexer then skips would flip the same search's answer once the backlog drains.
+    def self.body_fts_text(head : Bytes, body : Bytes?, ct : String? = nil) : String
       return "" if body.nil? || body.empty?
-      return "" if ct && binary_content?(ct)
-      skip_body_fts?(head) ? "" : String.new(body)
+      body_fts_indexed?(head, ct) ? String.new(body) : ""
+    end
+
+    # The skip half of `body_fts_text`, for a caller that decides before it has the body (the
+    # indexer does, so it never reads a body it would drop): does a non-empty body under this
+    # head and content type get indexed at all?
+    def self.body_fts_indexed?(head : Bytes, ct : String? = nil) : Bool
+      return false if ct && binary_content?(ct)
+      !skip_body_fts?(head)
     end
 
     # Does this op leave a flow row `fts_dirty`? (Only flow writes touch the index.)
@@ -1718,18 +2015,35 @@ module Gori
       args << req.source.token
       args << req.source_surface.try(&.token)
       args << req.source_ref
-      res = conn.exec(
-        "INSERT INTO flows " \
-        "(created_at, scheme, host, port, method, target, http_version, " \
-        " sni, alpn, tls_version, request_head, request_body, request_size, state, " \
-        " h2_conn_id, h2_stream_id, request_body_truncated, unsent, short_circuited, advisory, " \
-        " request_content_type, connect_protocol, source, source_surface, source_ref, fts_dirty) " \
-        "VALUES (?,?,?,?,?,?,?,?,?,?,#{head_slot},?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)", args: args)
+      # No response means no static classification yet. `update_one` makes the one decision
+      # after a completed response lands.
+      args << 0
+      res = conn.exec(head_slot == "?" ? SQL_INSERT_FLOW : SQL_INSERT_FLOW_EMPTY_HEAD, args: args)
       # The INSERT's own result carries the rowid — no separate `SELECT last_insert_rowid()`.
       # No flows_fts write here: `fts_dirty = 1` hands the trigram work to the off-commit
       # indexer, so a capture commit no longer pays for tokenization (see V4 / await_op).
-      res.last_insert_id
+      id = res.last_insert_id
+      # An Intercept edit's pre-edit request (V44), in the flow's own transaction so the row
+      # never reads as edited without its original, nor the other way round.
+      if orig = req.intercept_original
+        conn.exec("INSERT OR REPLACE INTO intercept_originals (flow_id, request) VALUES (?, ?)", id, orig)
+      end
+      id
     end
+
+    # `insert_one`'s statement, once per `Store.blob_slot` answer for `request_head` — built at
+    # first use rather than interpolated on every captured flow, like `SQL_INSERT_H2_FRAME_*`.
+    private def self.sql_insert_flow(head_slot : String) : String
+      "INSERT INTO flows " \
+      "(created_at, scheme, host, port, method, target, http_version, " \
+      " sni, alpn, tls_version, request_head, request_body, request_size, state, " \
+      " h2_conn_id, h2_stream_id, request_body_truncated, unsent, short_circuited, advisory, " \
+      " request_content_type, connect_protocol, source, source_surface, source_ref, static_asset, fts_dirty) " \
+      "VALUES (?,?,?,?,?,?,?,?,?,?,#{head_slot},?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)"
+    end
+
+    private SQL_INSERT_FLOW            = sql_insert_flow("?")
+    private SQL_INSERT_FLOW_EMPTY_HEAD = sql_insert_flow("X''")
 
     private def update_one(conn : DB::Connection, resp : CapturedResponse) : Nil
       body_size = resp.body_size || resp.body.try(&.size.to_i64) || 0_i64
@@ -1747,13 +2061,20 @@ module Gori
             -- side may already have written an advisory on this row and a bare `advisory = ?`
             -- would erase it. COALESCE keeps whatever is stored when the DTO carries nothing.
             advisory = COALESCE(?, advisory),
+            -- Only a completed exchange is a successful fetch: an upstream error may retain
+            -- an origin's 2xx status while its body is incomplete. Persist the decision here,
+            -- after the response arrives, rather than classifying pending requests or per row
+            -- on every read.
+            static_asset = CASE WHEN ? = 1 THEN gori_static_asset(?, target, ?) ELSE 0 END,
             fts_dirty = 1
           WHERE id = ?
           SQL
         resp.head, resp.body, resp.status, resp.reason, resp.content_type,
         response_size,
         resp.state.value, resp.ttfb_us, resp.duration_us, resp.error,
-        resp.body_truncated? ? 1 : 0, resp.advisory, resp.flow_id)
+        resp.body_truncated? ? 1 : 0, resp.advisory,
+        resp.state == FlowState::Complete ? 1 : 0, resp.content_type, resp.status, resp.flow_id)
+      write_interims(conn, resp.flow_id, resp.interims)
       # `fts_dirty = 1` again: the response side just appeared (or changed), so whatever the
       # indexer wrote for this row is stale. Re-dirtying an already-dirty row is a no-op, so
       # the common case — response landing before the indexer ever reached the row — is
@@ -1761,10 +2082,25 @@ module Gori
       # re-insert. That also makes a double update_response idempotent (last write wins).
     end
 
+    # The interim 1xx heads that preceded this response (V45), in the response's own
+    # transaction. Nothing at all for the common flow that had none; a response that carries
+    # some replaces whatever an earlier write of the same flow left, as the row itself does.
+    # An empty head is skipped rather than bound: an empty `Bytes` can bind as NULL, and one
+    # NOT NULL failure would fail the writer's whole batch.
+    private def write_interims(conn : DB::Connection, flow_id : Int64, interims : Interims?) : Nil
+      return unless interims && !interims.heads.empty?
+      conn.exec("DELETE FROM flow_interims WHERE flow_id = ?", flow_id)
+      interims.heads.each_with_index do |h, seq|
+        next if h.head.empty?
+        conn.exec("INSERT INTO flow_interims (flow_id, seq, status, head, relayed, omitted) VALUES (?, ?, ?, ?, ?, ?)",
+          flow_id, seq, h.status, h.head, h.relayed? ? 1 : 0, interims.omitted)
+      end
+    end
+
     # Skip body FTS for clearly-binary content types (images/media/archives/
     # octet-stream/protobuf) — never usefully body-searched and the dominant byte
     # volume. Text AND unknown types are still indexed so search isn't quietly lost.
-    private def binary_content?(ct : String?) : Bool
+    private def self.binary_content?(ct : String?) : Bool
       return false unless ct
       c = ct.downcase
       c.starts_with?("image/") || c.starts_with?("video/") || c.starts_with?("audio/") ||
@@ -1777,14 +2113,41 @@ module Gori
     # both markers read in ONE pass over the head. A non-identity Content-Encoding means the
     # body is stored in COMPRESSED wire form: high-entropy bytes that explode the trigram
     # index while being unsearchable for readable text (you can't `body:` a gzip stream).
-    private def skip_body_fts?(head : Bytes) : Bool
+    private def self.skip_body_fts?(head : Bytes) : Bool
       ct, ce = head_markers(head)
       binary_content?(ct) || encoded?(ce)
     end
 
     # {Content-Type, Content-Encoding} header values from a raw head BLOB (either nil), read
-    # in a single pass so a skip decision costs one scan, not one per header.
-    private def head_markers(head : Bytes) : {String?, String?}
+    # in a single pass so a skip decision costs one scan, not one per header. The LAST of a
+    # repeated header wins (unlike `MediaType.of`, which takes the first).
+    #
+    # Run per flow by the FTS indexer, so a pure-ASCII head is walked as bytes
+    # (`AsciiBytes.each_head_field`, the same line/chomp/colon/strip rules as the `String` scan
+    # below) and allocates only the two values; a head with any byte >= 0x80 takes the
+    # `String` scan verbatim (1.9µs / 2.5 KB → 0.18µs / 80 B, `bench/head_markers_bench.cr`).
+    # Public (`:nodoc:`) only so `spec/store/head_markers_spec.cr` can hold the two paths to
+    # one answer.
+    #
+    # :nodoc:
+    def self.head_markers(head : Bytes) : {String?, String?}
+      return head_markers_string(head) unless AsciiBytes.ascii_only?(head)
+      ct = nil.as(String?)
+      ce = nil.as(String?)
+      AsciiBytes.each_head_field(head) do |na, nz, va, vz|
+        if AsciiBytes.range_eq_ci?(head, na, nz, CONTENT_TYPE_NAME)
+          ct = String.new(head[va, vz - va])
+        elsif AsciiBytes.range_eq_ci?(head, na, nz, CONTENT_ENCODING_NAME)
+          ce = String.new(head[va, vz - va])
+        end
+      end
+      {ct, ce}
+    end
+
+    private CONTENT_TYPE_NAME     = "content-type".to_slice
+    private CONTENT_ENCODING_NAME = "content-encoding".to_slice
+
+    private def self.head_markers_string(head : Bytes) : {String?, String?}
       ct = nil.as(String?)
       ce = nil.as(String?)
       String.new(head).each_line do |raw|
@@ -1802,7 +2165,7 @@ module Gori
 
     # A non-identity Content-Encoding ⇒ the body is compressed (skip it from FTS). `ce` comes
     # from head_markers already stripped, so downcase alone suffices.
-    private def encoded?(ce : String?) : Bool
+    private def self.encoded?(ce : String?) : Bool
       return false unless ce
       c = ce.downcase
       !c.empty? && c != "identity"
@@ -1819,11 +2182,17 @@ module Gori
       # owns it, so the rule has a single implementation rather than this copy plus that one.
       slot = Store.blob_slot(args, op.payload)
       Store.bind_ws_shape(args, op.shape)
-      conn.exec(
-        "INSERT INTO ws_messages (flow_id, repeater_id, created_at, direction, opcode, payload, " \
-        "fin, rsv, masked, mask_key, frames, declared_len) " \
-        "VALUES (?,?,?,?,?,#{slot},?,?,?,?,?,?)", args: args)
+      conn.exec(slot == "?" ? SQL_INSERT_WS : SQL_INSERT_WS_EMPTY_PAYLOAD, args: args)
     end
+
+    private SQL_INSERT_WS =
+      "INSERT INTO ws_messages (flow_id, repeater_id, created_at, direction, opcode, payload, " \
+      "fin, rsv, masked, mask_key, frames, declared_len) " \
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+    private SQL_INSERT_WS_EMPTY_PAYLOAD =
+      "INSERT INTO ws_messages (flow_id, repeater_id, created_at, direction, opcode, payload, " \
+      "fin, rsv, masked, mask_key, frames, declared_len) " \
+      "VALUES (?,?,?,?,?,X'',?,?,?,?,?,?)"
 
     # Append `value` to `args` and answer the placeholder to write in its slot — `X''` for an
     # EMPTY slice, `?` otherwise.
@@ -1926,9 +2295,12 @@ module Gori
       "VALUES (?,?,?,?,?,?,?,?)"
 
     # Runs a write closure on the writer connection; returns last_insert_rowid.
-    private def exec_task(run : DB::Connection -> Nil) : Int64
+    #
+    # `event: true` only from `insert_event` — it tells the writer loop this op appended to
+    # `events`, which is what drives that table's own retention sweep (see EVENTS_TRIM_INTERVAL).
+    private def exec_task(run : DB::Connection -> Nil, *, event : Bool = false) : Int64
       reply = Channel(Int64).new(1) # buffered: the writer must never block sending a reply
-      @writes.send(ExecTask.new(run, reply))
+      @writes.send(ExecTask.new(run, reply, event))
       reply.receive
     rescue Channel::ClosedError
       0_i64 # store closing — caller (settings/issues/flush) degrades, doesn't raise
@@ -1947,11 +2319,31 @@ module Gori
       false # store closing — treat as a failed write
     end
 
+    # `exec_task_ok` for ONE statement aimed at ONE row by id: true only when the batch
+    # committed AND the statement matched a row.
+    #
+    # `exec_task_ok` answers "did the batch COMMIT", and an `UPDATE … WHERE id = ?` against an
+    # id a peer deleted commits fine having matched nothing — so a caller that reads its true as
+    # "the row now holds these bytes" is wrong exactly when a second gori is closing tabs. The
+    # window is real on any surface that dials between reading the row and writing to it (a
+    # headless send, a minimize) and it is the class #1118 set out to close. `changes()` is read
+    # inside the same transaction, right after the statement, which is the only place it is
+    # unambiguous (`update_scope_rule`, `finish_fuzz_run` do the same by hand).
+    private def exec_task_row(run : DB::Connection -> Nil) : Bool
+      changed = 0_i64
+      ok = exec_task_ok ->(c : DB::Connection) {
+        run.call(c)
+        changed = c.scalar("SELECT changes()").as(Int64)
+        nil
+      }
+      ok && changed > 0
+    end
+
     private def read_issue(rs : DB::ResultSet) : Issue
       Issue.new(
         rs.read(Int64), rs.read(Int64), rs.read(Int64), rs.read(String),
-        Severity.new(rs.read(Int32)), rs.read(String?), rs.read(Int64?), rs.read(String),
-        Status.new(rs.read(Int32)), rs.read(String?))
+        Severity.stored(rs.read(Int32)), rs.read(String?), rs.read(Int64?), String.new(rs.read(Bytes)),
+        Status.stored(rs.read(Int32)), rs.read(String?))
     end
 
     private def try_read_entity_link(rs : DB::ResultSet) : EntityLink?
@@ -1989,10 +2381,17 @@ module Gori
       source = rs.read(String?).try { |t| FlowSource::Kind.parse?(t) }
       source_surface = rs.read(String?).try { |t| FlowSource::Surface.parse?(t) }
       source_ref = rs.read(String?)
+      intercept_edited = rs.read(Int64) != 0
       FlowRow.new(id, created_at, scheme, method, host, port, target,
-        status, req_size + (resp_size || 0_i64), state, resp_size, duration_us, content_type,
+        status, total_size(req_size, resp_size), state, resp_size, duration_us, content_type,
         short_circuited, advisory, request_content_type, connect_protocol,
-        source, source_surface, source_ref)
+        source, source_surface, source_ref, intercept_edited)
+    end
+
+    # A row's request + response size. Each column fits Int64 but a foreign or hand-edited row
+    # can make their sum overflow, which took down every read that listed the row.
+    private def total_size(req : Int64, resp : Int64?) : Int64
+      (req.to_i128 + (resp || 0)).clamp(Int64::MIN, Int64::MAX).to_i64
     end
 
     # Column order MUST match EVENT_COLS.

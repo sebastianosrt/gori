@@ -32,6 +32,7 @@ require "./read_cursor"
 require "./text_read_state"
 require "./line_field_read"
 require "./subtab_clone"
+require "../hotkeys"
 # The class body continues in `repeater_view/` — one class-reopen file per slice, the same
 # shape `runner.cr` uses. This file keeps the state (ivars + initialize) every slice reads.
 require "./repeater_view/content"
@@ -58,6 +59,7 @@ require "./repeater_view/session"
 require "./repeater_view/target_field"
 require "./repeater_view/ws"
 require "./subtab_marks"
+require "../plural"
 
 module Gori::Tui
   # The Repeater workbench (a tab). Layout: a target URL field on top, then a split
@@ -83,6 +85,11 @@ module Gori::Tui
     end
 
     property name : String? # custom sub-tab chip label (nil = derive from the request); set separately from restore()
+    # How many FROZEN copies exist of this tab's exchange (#1038) — the RESPONSE border's
+    # marker. It says a copy exists, never that the tab is locked: the request stays
+    # editable and the next send still replaces the response, which is exactly why the
+    # copy was taken. Set by the controller (open, tab switch, reconcile, after a freeze).
+    property frozen_count : Int32 = 0
     # Flat multi-label tags (V31) for organizing/filtering the sub-tab strip. Set
     # separately from restore() — like @name, the reconcile clobber never touches it.
     property tags : Array(String) = [] of String
@@ -102,6 +109,17 @@ module Gori::Tui
     # from, and dropping it on the first keystroke puts the substitution straight back on
     # the commonest workflow there is.
     getter? evidence : Bool
+
+    # The registry the border chips read their menu letters from (`␣Pr:FRAME`, `␣Pw:KEY`,
+    # `␣Pt:…`), set by the controller that makes the view (#1295). Nil in a bare view, whose
+    # chips then read `␣` alone (`Hotkeys.menu_chip`).
+    property menu_registry : Verb::Registry? = nil
+
+    # The compact menu path for `id` on a chip — `␣Pr` — spelled once for the draw and the
+    # hit-test, which must agree cell for cell.
+    private def menu_chip(id : String) : String
+      Hotkeys.menu_chip(@menu_registry, id)
+    end
 
     def initialize
       @name = nil
@@ -148,6 +166,7 @@ module Gori::Tui
       @resp_hex_bytes = nil.as(Bytes?)         # cached combined head+body of the last result (hex source)
       @pretty = Settings.pretty_bodies_default # 'p' pretty-prints the response body (display only); pushed from the runner
       @resp_pretty_applied = false             # whether Pretty actually reflowed the current response (drives the chip)
+      @decode_unicode = false                  # 'u' decodes JSON \u escapes for display only
       @req_hex_edit = nil.as(HexEdit?)         # ^X: editable byte buffer for the REQUEST (authoritative while set)
       @scroll_req = 0                          # scroll offset for the hex request editor
       @focus = :request
@@ -172,6 +191,11 @@ module Gori::Tui
       # One-entry memo for the PLAIN text of a response line — see `resp_line_text`.
       @resp_text_i = -1
       @resp_text = ""
+      @resp_search_memo = Wrap::SearchMemo.new # ^F whole-line scans of the response pane
+      # One-entry memo of the DIFF pane's decorated line — see `diff_decorated`.
+      @diff_deco_text = nil.as(String?)
+      @diff_deco_kind = Repeater::DiffKind::Same
+      @diff_deco = ""
       # Gutter + content width from the LAST render of whichever response pane is active.
       # Hit-testing and the scroll walkers read these rather than re-deriving them, because
       # the per-mode line counts the gutter is sized from are not all the same
@@ -247,7 +271,7 @@ module Gori::Tui
       @grpc_compressed = false    # the editable message's compressed flag (preserved on reframe)
       @grpc_payload = Bytes.empty # the current (possibly hex-edited) single-message payload
       @grpc_lines_cache = nil.as(Array({String, Color})?)
-      # `␣E` FIELDS: the schema-typed form over that same payload (#828). Available only when
+      # `␣Pf` FIELDS: the schema-typed form over that same payload (#828). Available only when
       # a descriptor set resolves the rpc being sent — with none loaded this whole slice is
       # inert and the tab is exactly what it was. See repeater_view/grpc_fields.cr.
       @grpc_fields = false
@@ -308,7 +332,7 @@ module Gori::Tui
       # non-base64 key. See `WsEngine.build_handshake`.
       @ws_keep_key = false
       # The TLS fingerprint THIS TAB presents (#844), or nil for "whatever the destination's
-      # outbound_tls policy says" — which is what every tab did before it existed. `␣T` cycles
+      # outbound_tls policy says" — which is what every tab did before it existed. `␣Pt` cycles
       # it; the TARGET band carries a chip whenever it is set.
       #
       # PER TAB, which is the entire point: two tabs against one host with different values
@@ -345,6 +369,14 @@ module Gori::Tui
       # NAME instead of per buffer. Baseline = the names the CAPTURE arrived with; empty on a
       # draft, where every `$` is the operator's by definition. See `operator_env_vars`.
       @evidence_env_names = Set(String).new
+      # The same baseline for the SEND-time namespaces, keyed the way a token is looked up
+      # there — `Env.literal_keys`, the editor's own literal set. See `evidence_send_literals`.
+      @evidence_send_literals = Set(String).new
+      # The bytes both sets were DERIVED from and the grammar revision they were derived under,
+      # so a mid-session `env.syntax` flip re-derives them instead of answering the old
+      # grammar's question (see `adopt_evidence_env_seed`).
+      @evidence_env_seed = ""
+      @evidence_env_rev = Env.highlight_rev
       @marker_regions_rev = -1
       @marker_regions_cache = [] of {Int32, Int32, Int32}
       # §…§ spans + the chain under the cursor, cached on the editor revision (marked_spans)

@@ -7,6 +7,15 @@ private def help_view_key(char : Char) : Termisu::Event::Key
   Termisu::Event::Key.new(Termisu::Input::Key.from_char(char), char: char)
 end
 
+# Each SECTIONS item beside the row `shortcut_rows` rendered for it. Paired by position, not by
+# text: several descriptions repeat across sections (the Copy rows, the two rule lists).
+private def help_item_rows(registry : Gori::Verb::Registry?) : Array({String, HelpView::Item, HelpView::Row})
+  items = HelpView::SECTIONS.flat_map { |(title, its)| its.map { |i| {title, i} } }
+  rows = HelpView.shortcut_rows(registry).select(&.kind.== :item)
+  rows.size.should eq(items.size)
+  items.zip(rows).map { |((title, item), row)| {title, item, row} }
+end
+
 describe Gori::Tui::HelpView do
   it "renders the grouped shortcut sections" do
     view = HelpView.new
@@ -50,6 +59,20 @@ describe Gori::Tui::HelpView do
   # sheet both surfaces draw) rather than the SECTIONS literal: the check is that the row names
   # the key the registry actually binds. (Authorize had no row at all until this rollout, though
   # TAB_SECTION already pointed its Shortcuts popup at the section.)
+  # A key column of `^P`, five times over, said nothing about which palette entry to pick.
+  # Each chordless row spells `^P → <title>` across its two columns, with the title the
+  # palette actually lists, so typing it finds the row.
+  it "names the palette entry on every chordless ^P row" do
+    registry = Gori::Verbs.registry
+    help_item_rows(registry).each do |(title, item, row)|
+      next unless title == "GLOBAL" && row.a == "^P →"
+      id = item.verb_id.should_not be_nil
+      row.b.should start_with("#{registry[id].title} — ")
+    end
+    help_item_rows(registry).count { |(title, _, row)| title == "GLOBAL" && row.a.starts_with?("^P") }.should eq(6)
+    HelpView.shortcut_rows(registry).none?(&.b.includes?("hold-mode")).should be_true
+  end
+
   it "names the clear-all chord in every tab that has one" do
     registry = Gori::Verbs.registry
     rows = HelpView.shortcut_rows(registry)
@@ -103,6 +126,22 @@ describe Gori::Tui::HelpView do
       HelpView.shortcut_rows(registry).find(&.b.==("pick flow A · flow B")).not_nil!.a.should eq("a · b")
     end
 
+    # `>` was free before #1295, so a user may have put a Global verb there, which then wins
+    # the key on every tab (`Keymap.global_claims`). Help must not keep promising the bare
+    # `>` for the Send card; `space >` is what still opens it.
+    it "stops naming the bare > for Send flow to… once a Global rebind took it" do
+      registry = Gori::Verbs.registry
+      send_row = ->(rows : Array(HelpView::Row)) { rows.find(&.b.starts_with?("send flow to… card")).not_nil! }
+      send_row.call(HelpView.shortcut_rows(registry)).a.should eq(">")
+      prev = Gori::Settings.keymap_overrides
+      begin
+        Gori::Settings.keymap_overrides = {"nav.next-tab" => [">"]}
+        send_row.call(HelpView.shortcut_rows(registry)).a.should eq("space → >")
+      ensure
+        Gori::Settings.keymap_overrides = prev
+      end
+    end
+
     # The `y` + `^Y` Copy pairs are rebindable since #932 — the READ letter moves, `^Y` is
     # pinned — and the Repeater's row followed while the Fuzzer, JWT and Cookie rows stayed
     # literal, so one rebind moved one row out of four.
@@ -121,6 +160,60 @@ describe Gori::Tui::HelpView do
         Gori::Settings.keymap_overrides = prev
       end
       HelpView.shortcut_rows(registry).select(&.b.starts_with?("copy selection/pane")).map(&.a).uniq!.should eq(["y · ^Y"])
+    end
+  end
+
+  # #1274: a verb-id row whose verb has no chord printed its hand-written `space → X` without
+  # any check, and three had drifted — Tag subtab said `a` (the menu said `t`), gRPC reframe
+  # said `F` (it was `R`), and one row named `oast.promote`, a verb that never existed.
+  describe "space-menu paths" do
+    it "names only registered verbs" do
+      registry = Gori::Verbs.registry
+      ids = HelpView::SECTIONS.flat_map { |(_, items)| items.compact_map(&.verb_id) }
+      ids.size.should be > 50 # the sheet still carries its verb-id rows
+      ids.reject { |id| registry[id]? }.should be_empty
+    end
+
+    it "prints a menu-only verb's menu path from the registry, and the chord for the rest" do
+      registry = Gori::Verbs.registry
+      menu_only = 0
+      help_item_rows(registry).each do |(title, item, row)|
+        next unless id = item.verb_id
+        want = if chord = Gori::Hotkeys.binding_for(registry, id)
+                 Gori::Hotkeys.display_label(chord)
+               else
+                 menu_only += 1
+                 Gori::Hotkeys.route(registry, id) || item.key
+               end
+        row.a.should eq(Gori::Hotkeys.retag(want)), "#{title}: #{id}"
+      end
+      menu_only.should be > 5
+    end
+
+    # The class, not the rows: every `space → X` (or `space → > f`, a family member one level
+    # down) anywhere on the rendered sheet must be the menu path of a verb that row names — by
+    # verb id or by a `{space:…}` token. A literal letter typed into SECTIONS names no verb, so
+    # it fails here whether or not it is right.
+    it "never prints a menu letter the row's own verbs do not carry" do
+      registry = Gori::Verbs.registry
+      seen = 0
+      help_item_rows(registry).each do |(title, item, row)|
+        named = [item.verb_id].compact
+        "#{item.key} #{item.desc}".scan(Gori::Hotkeys::SPACE_TOKEN_RE) { |m| named << m[1] }
+        paths = named.compact_map { |id| registry.menu_keys(id).try(&.join(' ')) }
+        "#{row.a} #{row.b}".scan(/space → (\S(?: [^\s·](?=\s|$))?)/) do |m|
+          seen += 1
+          paths.should contain(m[1]), "#{title}: `#{row.a}` prints space → #{m[1]}"
+        end
+        "#{row.a} #{row.b}".should_not contain("{space:")
+      end
+      seen.should be > 15
+    end
+
+    it "reads as the space menu, never a raw token, without a registry" do
+      HelpView.shortcut_rows(nil).each { |r| "#{r.a} #{r.b}".should_not contain("{space:") }
+      HelpView.shortcut_rows(nil).find(&.b.==("tag the active sub-tab (or every marked one)"))
+        .not_nil!.a.should eq(Gori::Hotkeys::MENU_PATH_FALLBACK)
     end
   end
 

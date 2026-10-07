@@ -101,7 +101,7 @@ describe Gori::Probe::Active::XxeOast do
         oob: XmlMinter.new(quoted))).not_nil!
       String.new(plan.request).should contain("SYSTEM '#{quoted}'")
       ["file:///tmp/example", "https://oast.example/xml123#fragment", "https://oast.example/a\nb",
-       "https://oast.example/\"'"].each do |payload|
+       "https://oast.example/\"'", "https://oast.example:99999999999/xml123"].each do |payload|
         rule.plan(detail, Gori::Probe::Active::Options.new(allow_unsafe: true,
           oob: XmlMinter.new(payload))).should be_nil
       end
@@ -160,8 +160,10 @@ describe Gori::Probe::Active::XxeOast do
     with_store do |store|
       detail = xml_flow(store)
       backend = XmlBackend.new
-      disabled = Gori::Probe::Active::RULES.map(&.info.id).reject { |id| id == "xxe_oast" }.to_set
-      disabled.delete("request_smuggling") # default-off membership means ENABLED
+      # Everything off except xxe_oast. Subtract DEFAULT_DISABLED_RULES: a default-OFF id PRESENT in
+      # the stored set means ENABLED (the flip), so it must be ABSENT to stay off.
+      disabled = Gori::Probe::Active::RULES.map(&.info.id).to_set - Gori::Probe::DEFAULT_DISABLED_RULES
+      disabled.delete("xxe_oast")
       dets = Gori::Probe::Active.analyze(detail, outbound: ungated_outbound, overrides: nil,
         backend: backend, disabled: disabled,
         opts: Gori::Probe::Active::Options.new(allow_unsafe: true, oob: XmlMinter.new),
@@ -185,8 +187,10 @@ describe Gori::Probe::Active::XxeOast do
     with_store do |store|
       backend = XmlBackend.new(fail: true)
       recorded = [] of String
-      disabled = Gori::Probe::Active::RULES.map(&.info.id).reject { |id| id == "xxe_oast" }.to_set
-      disabled.delete("request_smuggling")
+      # Everything off except xxe_oast. Subtract DEFAULT_DISABLED_RULES: a default-OFF id PRESENT in
+      # the stored set means ENABLED (the flip), so it must be ABSENT to stay off.
+      disabled = Gori::Probe::Active::RULES.map(&.info.id).to_set - Gori::Probe::DEFAULT_DISABLED_RULES
+      disabled.delete("xxe_oast")
       Gori::Probe::Active.analyze(xml_flow(store), outbound: ungated_outbound, overrides: nil,
         backend: backend, disabled: disabled,
         opts: Gori::Probe::Active::Options.new(allow_unsafe: true, oob: XmlMinter.new),

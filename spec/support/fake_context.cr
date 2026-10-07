@@ -15,7 +15,8 @@ class FakeExecContext < Gori::Verb::ExecContext
   getter calls = [] of Call
 
   property selected : Int64? = nil
-  property current_tab : Symbol = :history # settable so tab-gated verbs (Decoder, …) can be exercised
+  property current_tab : Symbol = :history    # settable so tab-gated verbs (Decoder, …) can be exercised
+  property focused_section : Symbol = :common # settable so pane-gated chords can be exercised
 
   # The recorded method names in dispatch order — the usual assertion target.
   def call_names : Array(Symbol)
@@ -84,6 +85,14 @@ class FakeExecContext < Gori::Verb::ExecContext
     @subtab_search_tab_count
   end
 
+  def subtab_jump(n : Int32) : Nil
+    rec(:subtab_jump, n)
+  end
+
+  def open_tab_goto : Nil
+    rec(:open_tab_goto)
+  end
+
   def repeater_toggle_http2 : Nil
     rec(:repeater_toggle_http2)
   end
@@ -97,6 +106,8 @@ class FakeExecContext < Gori::Verb::ExecContext
   def repeater_read_mode? : Bool
     @repeater_read_mode
   end
+
+  property? repeater_split_request : Bool = false # a SAML/GraphQL/WS tab: Display…'s envelope row
 
   property fuzzer_results_saveable : Bool = false
 
@@ -224,6 +235,11 @@ class FakeExecContext < Gori::Verb::ExecContext
     @diff_rows_shown
   end
 
+  # --- params (the parameter inventory under Target) ---
+
+  property? params_rows_shown : Bool = false
+  property? params_targeted : Bool = false
+
   property decoder_read_mode : Bool = false # settable so grouped-menu specs can exercise COMMON's Copy
 
   def decoder_read_mode? : Bool
@@ -330,6 +346,10 @@ class FakeExecContext < Gori::Verb::ExecContext
     @probe_detail_read
   end
 
+  def probe_affected_selected? : Bool
+    probe_detail_readable?
+  end
+
   def sequencer_analysis_readable? : Bool
     @sequencer_analysis
   end
@@ -379,6 +399,68 @@ class FakeExecContext < Gori::Verb::ExecContext
     editor_focused
   end
 
+  # --- Verb::Scope::Editor (verbs/editor.cr). `editor_pane` is the wider gate — a text editor
+  # pane has focus, READ **or** INS — and `editor_read_mode` the narrower READ half the bare
+  # -letter editor verbs hang off; set both to exercise `editor.insert` and friends.
+  property? editor_pane : Bool = false
+  property? editor_read_mode : Bool = false
+
+  def editor_enter_insert : Nil
+    rec(:editor_enter_insert)
+  end
+
+  def editor_append_insert : Nil
+    rec(:editor_append_insert)
+  end
+
+  def editor_exit_insert : Nil
+    rec(:editor_exit_insert)
+  end
+
+  def editor_undo : Nil
+    rec(:editor_undo)
+  end
+
+  def editor_to_top : Nil
+    rec(:editor_to_top)
+  end
+
+  def editor_to_bottom : Nil
+    rec(:editor_to_bottom)
+  end
+
+  def editor_word_move(dir : Int32) : Nil
+    rec(:editor_word_move)
+  end
+
+  def editor_line_insert(dir : Int32) : Nil
+    rec(:editor_line_insert)
+  end
+
+  def editor_delete_selection : Nil
+    rec(:editor_delete_selection)
+  end
+
+  def editor_paste : Nil
+    rec(:editor_paste)
+  end
+
+  def editor_delete_line : Nil
+    rec(:editor_delete_line)
+  end
+
+  def editor_yank_line : Nil
+    rec(:editor_yank_line)
+  end
+
+  def editor_goto_line : Nil
+    rec(:editor_goto_line)
+  end
+
+  def editor_find : Nil
+    rec(:editor_find)
+  end
+
   getter send_to_opened : Bool = false
 
   def send_to_open : Nil
@@ -392,12 +474,41 @@ class FakeExecContext < Gori::Verb::ExecContext
     @detail_navigable
   end
 
+  # Settable per verb id — what the space menu draws in a row's hint column.
+  property menu_states = {} of String => String
+
+  def menu_state(verb_id : String) : String?
+    @menu_states[verb_id]?
+  end
+
+  # Settable per id, like the Runner's READ_SEND / mark-count titles.
+  property menu_titles = {} of String => String
+
   def space_menu_title(verb_id : String) : String?
-    nil
+    @menu_titles[verb_id]?
   end
 
   # Settable so the issue-notes read verbs can be exercised.
   property? issues_notes_read_mode : Bool = false
+
+  # The Issues detail's RELATED cursor, as the two evidence gates (#1038) read it.
+  property? issue_related_freezable : Bool = false
+  property? issue_related_frozen : Bool = false
+  # A RELATED row is under the cursor — `issue.goto-link`'s gate, which does not care which
+  # KIND of row it is (every one has a source tab).
+  property? issue_related_goto : Bool = false
+
+  # Does the open issue have a retest card to open (#1036)? Settable so both sides of
+  # `issue.retest`'s gate can be exercised.
+  property? issue_retest_available : Bool = false
+
+  property selected_evidence : Int64? = nil
+  property? evidence_has_links : Bool = false
+  property? evidence_source_available : Bool = false
+
+  def selected_evidence_id : Int64?
+    @selected_evidence
+  end
 
   # The four linkable-entity ids, settable so both sides of the link.* gates can be
   # exercised (a verb is offered only once the entity has a persisted row to point at).

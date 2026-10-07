@@ -1,6 +1,6 @@
 require "socket"
 require "./sink"
-require "./connect"
+require "./tls/tunnel"
 require "./head_rewriter"
 require "./extractor"
 require "../interceptor"
@@ -18,7 +18,7 @@ require "./h2/frame"
 
 module Gori::Proxy
   # The listening proxy. Accepts client connections and spawns one ClientConn
-  # fiber per connection. TLS interception is injected as an optional TlsMitm
+  # fiber per connection. TLS interception is injected as an optional Tls::Tunnel
   # (nil => HTTPS CONNECT requests are blind-tunnelled).
   class Server
     getter host : String
@@ -56,7 +56,7 @@ module Gori::Proxy
     # carries one mode string, and `serve_connection` branches on the four in order.
     getter? socks5 : Bool
 
-    def initialize(@host : String, @port : Int32, @sink : FlowSink, @tls : TlsMitm? = nil,
+    def initialize(@host : String, @port : Int32, @sink : FlowSink, @tls : Tls::Tunnel? = nil,
                    @rewriter : HeadRewriter? = nil, @interceptor : Gori::Interceptor? = nil,
                    @host_overrides : Gori::HostOverrides? = nil,
                    max_connections : Int32 = MAX_CONNECTIONS,
@@ -960,9 +960,18 @@ module Gori::Proxy
     # decides where the client's session actually terminates. The passthrough LIST is still
     # matched on the name (`Settings.tls_passthrough?` at each caller) — the operator wrote it
     # against names — which is exactly the split #529 is.
+    #
+    # `origin_scheme: "https"` — the same answer `dial_tls_result` hardcodes for the decrypting
+    # branch, and for both callers. `serve_pinned_tls` has SEEN a ClientHello, so the origin is
+    # TLS beyond doubt. `serve_socks5_target` has seen nothing, and the connection may turn out
+    # to be SMTP or SSH — but the host is on `tls_passthrough`, a list the operator writes
+    # against TLS destinations, and an environment that exports only `HTTPS_PROXY` names the
+    # proxy that carries CONNECT tunnels, which is the only shape a passthrough can use anyway.
+    # The default `"http"` selected `HTTP_PROXY`/`ALL_PROXY`, so an HTTPS_PROXY-only
+    # environment was bypassed for exactly the traffic it exists to carry (#1114).
     private def relay_passthrough(host : String, port : Int32, stream : IO,
                                   client : TCPSocket, pin : String? = nil) : Bool
-      upstream = Upstream.dial(host, port, overrides: @host_overrides, pin: pin)
+      upstream = Upstream.dial(host, port, overrides: @host_overrides, pin: pin, origin_scheme: "https")
       return false unless upstream
       begin
         SocketTuning.relax(stream)

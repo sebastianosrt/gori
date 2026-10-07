@@ -36,14 +36,14 @@ module Gori
 
         def dedup_key(detail : Store::FlowDetail, opts : Options = Options::DEFAULT) : String?
           g = gate(detail, opts) || return nil
-          key_string(detail, g[0], g[1])
+          endpoint_key(detail, g[0], g[1])
         end
 
         def plan(detail : Store::FlowDetail, opts : Options = Options::DEFAULT) : Plan?
           g = gate(detail, opts) || return nil
           method_up, path = g
           request = rebuild_with_xfh(detail.request_head, detail.request_body)
-          Plan.new(request, [] of Param, key_string(detail, method_up, path))
+          Plan.new(request, [] of Param, endpoint_key(detail, method_up, path))
         end
 
         def detections(plan : Plan, result : Repeater::Result, detail : Store::FlowDetail) : Array(Detection)
@@ -68,10 +68,6 @@ module Gori
           return nil unless method_allowed?(method_up, opts)
           return nil unless host_reflection_prone?(detail)
           {method_up, path_only(Active.origin_form(target))}
-        end
-
-        private def key_string(detail : Store::FlowDetail, method_upcase : String, path : String) : String
-          "host_header_injection|#{detail.row.host}:#{detail.row.port}|#{method_upcase}|#{path}"
         end
 
         # A redirect that already points at its own Host (the reset-link shape — any content type) OR
@@ -120,10 +116,7 @@ module Gori
         end
 
         private def body_reflects?(result : Repeater::Result) : Bool
-          decoded, _ = Proxy::Codec::ContentDecode.decode(result.head, result.body, BODY_CAP)
-          bytes = decoded || result.body
-          return false if bytes.nil? || bytes.empty?
-          authority_reflection?(String.new(bytes[0, {bytes.size, BODY_CAP}.min]).scrub, PROBE_HOST)
+          authority_reflection?(decoded_text(result), PROBE_HOST)
         end
 
         # Does `token` appear as the AUTHORITY host of an absolute/scheme-relative URL in `text`? The
@@ -141,18 +134,6 @@ module Gori
             end
           end
           false
-        end
-
-        private def decoded_body(head : Bytes?, body : Bytes?) : Bytes?
-          return nil if body.nil? || body.empty?
-          decoded, _ = Proxy::Codec::ContentDecode.decode(head, body, BODY_CAP)
-          b = decoded || body
-          b[0, {b.size, BODY_CAP}.min]
-        end
-
-        private def path_only(origin_target : String) : String
-          qi = origin_target.index('?')
-          qi ? origin_target[0...qi] : origin_target
         end
 
         # Rebuild the request with a single authoritative `X-Forwarded-Host: <probe>` after the request

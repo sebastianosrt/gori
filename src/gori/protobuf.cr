@@ -376,14 +376,17 @@ module Gori
     end
 
     # Read a protobuf varint. Up to 10 bytes (64-bit value + overflow nibble).
-    # Returns {value, new_pos, ok}.
-    private def read_varint(data : Bytes, pos : Int32) : {UInt64, Int32, Bool}
+    # Returns {value, new_pos, ok}. Public for `Lens`, which reads packed runs with it.
+    def read_varint(data : Bytes, pos : Int32) : {UInt64, Int32, Bool}
       value = 0_u64
       shift = 0
       10.times do
         return {0_u64, pos, false} if pos >= data.size
         b = data[pos]
         pos += 1
+        # The 10th byte holds bit 63 and nothing else: anything above 1 overflowed 64 bits,
+        # and dropping those bits would read a malformed varint as a well-formed one.
+        return {0_u64, pos, false} if shift == 63 && b > 1
         value |= (b.to_u64 & 0x7f_u64) << shift
         return {value, pos, true} if (b & 0x80) == 0
         shift += 7

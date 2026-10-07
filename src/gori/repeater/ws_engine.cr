@@ -62,44 +62,15 @@ module Gori
       # exempt from this: there is at most one, and it is the row that matters.
       MAX_CONTROL_MESSAGES = 64
 
-      # A request head declares a WebSocket upgrade — the single source of truth for "is this
-      # repeater a WebSocket flow?" across the TUI restore paths, the CLI and MCP.
-      #
-      # The regex itself moved to `Proxy::WS` (#742) so that `Store::FlowDetail#websocket?`
-      # can ask the same question without requiring this file (→ `flow_request.cr` →
-      # `store.cr`, a cycle). Same bytes, same answer; this is where the REPEATER asks it.
-      #
-      # And note what it therefore means: this predicate is the HTTP/1.1 half ONLY — a head
-      # that opens a socket with an `Upgrade:` handshake answered by a 101. An RFC 8441
-      # extended CONNECT captured over h2 (#733) is a real WebSocket and still answers FALSE
-      # here, because it is opened a different way.
-      #
-      # "Is this a WebSocket gori can re-establish" is `replayable?` below, and it is that
-      # question — not this one — that every seed, every surface gate and `Repeater::Plan`'s
-      # engine choice asks. The distinction used to be moot (there was only one transport) and
-      # keeping the two spellings apart is what stops an h1-only assumption from riding along
-      # into a caller that now has two.
-      UPGRADE_HEADER = Proxy::WS::UPGRADE_HEADER
-
-      def self.upgrade_request?(request : String) : Bool
-        Proxy::WS.upgrade_request?(request)
-      end
-
-      # The RFC 8441 half: `CONNECT` plus the `:protocol websocket` the stored head carries as
-      # its `X-Gori-Protocol` marker. Delegated to the codec for the reason `upgrade_request?`
-      # is — the predicate's home is `Proxy::WS`, and this is where the REPEATER asks it.
-      def self.extended_connect_request?(request : String) : Bool
-        Proxy::WS.extended_connect_request?(request)
-      end
-
       # THE gate: is this a WebSocket `send` can re-open, over either transport?
       #
       # One predicate rather than a two-clause test spelled out at each of the dozen-odd sites
       # that ask (the TUI's three seeds, `gori run repeater`/`fuzz`, four MCP tools, both
       # Minimize surfaces, `Repeater::Plan` and `Fuzz::Plan`). Those sites were written when
-      # `upgrade_request?` WAS the answer, and every one of them would otherwise have had to be
-      # taught the second transport separately — which is exactly how the h1 predicate itself
-      # ended up with three copies (#390, #394, #397).
+      # `Proxy::WS.upgrade_request?` — the HTTP/1.1 `Upgrade:` half ONLY — WAS the answer, and
+      # every one of them would otherwise have had to be taught the second transport
+      # separately — which is exactly how the h1 predicate itself ended up with three copies
+      # (#390, #394, #397).
       def self.replayable?(request : String) : Bool
         Proxy::WS.upgrade_request?(request) || Proxy::WS.extended_connect_request?(request)
       end
@@ -197,15 +168,17 @@ module Gori
                     overrides : Gori::HostOverrides? = nil,
                     keep_key : Bool = false,
                     deadline : Time::Span = DRAIN_DEADLINE,
-                    tls_preset : String? = nil) : Result
+                    tls_preset : String? = nil,
+                    cancel : Proc(Bool)? = nil) : Result
         if Proxy::WS.extended_connect_request?(String.new(upgrade_request))
           return send_over_h2(upgrade_request, out_messages, scheme: scheme, host: host,
             port: port, verify_upstream: verify_upstream, sni: sni, idle: idle,
-            overrides: overrides, keep_key: keep_key, deadline: deadline, tls_preset: tls_preset)
+            overrides: overrides, keep_key: keep_key, deadline: deadline, tls_preset: tls_preset,
+            cancel: cancel)
         end
         send_over_h1(upgrade_request, out_messages, scheme: scheme, host: host, port: port,
           verify_upstream: verify_upstream, sni: sni, idle: idle, overrides: overrides,
-          keep_key: keep_key, deadline: deadline, tls_preset: tls_preset)
+          keep_key: keep_key, deadline: deadline, tls_preset: tls_preset, cancel: cancel)
       end
 
       # The HTTP/1.1 Upgrade transport — what `send` has always been, unchanged below the
@@ -217,7 +190,8 @@ module Gori
                                     overrides : Gori::HostOverrides? = nil,
                                     keep_key : Bool = false,
                                     deadline : Time::Span = DRAIN_DEADLINE,
-                                    tls_preset : String? = nil) : Result
+                                    tls_preset : String? = nil,
+                                    cancel : Proc(Bool)? = nil) : Result
         started = Time.instant
         # The connect + handshake reads get a generous io_timeout so a slow-but-valid
         # upgrade (cold start / auth / slow proxy) isn't mistaken for a dead origin;
@@ -231,12 +205,15 @@ module Gori
         # "connect failed: host:port" for an untrusted certificate, a plaintext port and an
         # origin that accepts the connection and then goes silent.
         upstream, dial_error = if tls
-                                 Proxy::Upstream.dial_tls_result(host, port, verify: verify_upstream, sni: sni, io_timeout: ht, overrides: overrides, tls_preset: tls_preset)
+                                 Proxy::Upstream.dial_tls_result(host, port, verify: verify_upstream,
+                                   sni: sni, io_timeout: ht, overrides: overrides,
+                                   tls_preset: tls_preset, cancel: cancel)
                                else
                                  Proxy::Upstream.dial_result(host, port, io_timeout: ht, overrides: overrides)
                                end
         return err(Engine.connect_error(scheme, host, port, verify_upstream, dial_error), started) unless upstream
 
+        watcher = Proxy::Upstream.watch_cancel(upstream, cancel)
         begin
           handshake, keys = build_handshake(upgrade_request, keep_key)
           upstream.write(handshake)
@@ -247,18 +224,32 @@ module Gori
           # a time pins this fiber for as long as it cares to trickle. `underlying_socket`
           # returns nil for an IO with no settable socket, in which case the deadline is skipped
           # and the behaviour is unchanged.
-          head = Proxy::Codec::Http1.read_head(upstream,
+          head_result = Proxy::Codec::Http1.read_response_head_result(upstream,
             deadline: Proxy::SocketTuning::HEAD_DEADLINE,
             timeout_sock: Proxy::SocketTuning.underlying_socket(upstream))
           # `Engine.no_response_error`, not a local copy of the sentence: a plain `ws://` target
           # behind a proxy that answers the CONNECT and then closes without relaying anything is
           # the same shape as the h1 repeater's clean-EOF case, and a hand-duplicated string here
           # would silently miss the proxy-tunnel clause that builder now carries.
-          return err(Engine.no_response_error(host, port), started) unless head
+          # `dial_tls_result` resolves its environment route as `https`, while the cleartext
+          # dialer resolves it as `http`. Keep the diagnostic on that same origin-scheme axis:
+          # a `wss://` no-response must mention HTTPS_PROXY when that is the proxy that carried
+          # the successful CONNECT tunnel.
+          head = head_result.head?
+          unless head
+            message = if head_result.state == Proxy::Codec::Http1::HeadReadResult::State::Empty
+                        Engine.no_response_error(host, port, tls ? "https" : "http")
+                      else
+                        detail = head_result.failure_message("response head",
+                          deadline: Proxy::SocketTuning::HEAD_DEADLINE)
+                        "#{detail} from #{host}:#{port}"
+                      end
+            return Result.new(head_result.bytes, [] of Message, Engine.elapsed(started), error: message)
+          end
 
           resp = Proxy::Codec::Http1.parse_response_head(head)
           unless resp.status == 101
-            return Result.new(head, [] of Message, elapsed(started),
+            return Result.new(head, [] of Message, Engine.elapsed(started),
               error: "server did not upgrade (status #{resp.status})", upgraded: false)
           end
           note = verify_accept(resp, keys)
@@ -268,6 +259,7 @@ module Gori
           # mid-exchange IO errors itself, so reaching here means the handshake failed.
           err(ex.message || "ws repeater error", started)
         ensure
+          watcher.try(&.stop)
           upstream.close rescue nil
         end
       end
@@ -336,7 +328,7 @@ module Gori
         note = with_delivery_note(note, sent, messages.size, st.close_code)
         note = with_unsent_note(note, sent, out_messages.size, st)
         note = with_transport_note(note, sent, out_messages.size, st)
-        Result.new(head, messages, elapsed(started), note: note,
+        Result.new(head, messages, Engine.elapsed(started), note: note,
           close_code: st.close_code, upgraded: true, truncated: st.truncated)
       end
 
@@ -354,7 +346,8 @@ module Gori
                                     overrides : Gori::HostOverrides? = nil,
                                     keep_key : Bool = false,
                                     deadline : Time::Span = DRAIN_DEADLINE,
-                                    tls_preset : String? = nil) : Result
+                                    tls_preset : String? = nil,
+                                    cancel : Proc(Bool)? = nil) : Result
         started = Time.instant
         # `ws`/`wss` fold to the scheme the dial and the `:scheme` pseudo-header both need.
         # `Fuzz::Origin` folds at construction and `Repeater::Plan` on its tuple path; a WS
@@ -368,8 +361,9 @@ module Gori
         # for http — so an origin that has no h2, an untrusted certificate and a plaintext port
         # addressed as https all report in the words every other h2 send reports them in.
         conn, dial_error = H2Engine.dial(dial_scheme, host, port, verify_upstream, sni,
-          HANDSHAKE_TIMEOUT, overrides, tls_preset)
+          HANDSHAKE_TIMEOUT, overrides, tls_preset, cancel)
         return err(dial_error || "h2 connect failed", started) unless conn
+        watcher = Proxy::Upstream.watch_cancel(conn.io, cancel)
         begin
           opened = H2WsStream.open(conn, request, scheme: dial_scheme, host: host, port: port,
             stall: idle)
@@ -379,7 +373,7 @@ module Gori
             # there was one — `answered?` then reports that the origin replied, exactly as a
             # 403 to an h1 upgrade does.
             reason = opened.error || "server did not upgrade (status #{opened.status})"
-            return Result.new(opened.head, [] of Message, elapsed(started),
+            return Result.new(opened.head, [] of Message, Engine.elapsed(started),
               error: reason, note: opened.note, upgraded: false)
           end
           # `keep_key` has no RFC 8441 form to honour: §5.1 drops `Sec-WebSocket-Key` and
@@ -403,6 +397,7 @@ module Gori
           # `run_session`'s drain swallows mid-exchange IO errors and reports them as notes.
           err(ex.message || "ws-over-h2 repeater error", started)
         ensure
+          watcher.try(&.stop)
           conn.close rescue nil
         end
       end
@@ -1027,11 +1022,7 @@ module Gori
       end
 
       private def self.err(message : String, started : Time::Instant) : Result
-        Result.new(Bytes.new(0), [] of Message, elapsed(started), error: message)
-      end
-
-      private def self.elapsed(started : Time::Instant) : Int64
-        (Time.instant - started).total_microseconds.to_i64
+        Result.new(Bytes.new(0), [] of Message, Engine.elapsed(started), error: message)
       end
     end
   end

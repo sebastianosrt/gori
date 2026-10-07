@@ -29,8 +29,10 @@ module Gori
       Sitemap         # the Sitemap sub-tab (under Target) has focus
       Discover        # the Discover sub-tab (under Target) has focus
       Diff            # the Diff sub-tab (under Target) has focus — the retest report
+      Params          # the Params sub-tab (under Target) has focus — the parameter inventory
       Issues          # the Issues list has focus
       IssuesDetail    # an issue's detail is open
+      Evidence        # project-wide immutable snapshot archive
       Probe           # the Probe scan-issue list has focus
       ProbeDetail     # a Probe issue's detail is open
       ProbeRules      # the Probe tab's Rules sub-tab has focus (built-in + custom rule list)
@@ -48,7 +50,22 @@ module Gori
       HostOverrides   # the Project tab's HOST OVERRIDES list has focus
       Env             # the Project tab's ENVIRONMENT var list has focus
       ProjectActivity # the Project tab's ACTIVITY pane has focus (the #124 event feed)
+      # Two panes that own every key they want, so no verb is registered here. Each is its own
+      # scope, not History's Body, so a History row (and a static family row such as Send flow
+      # to…, which draws whenever the scope registers a member) cannot reach their space menu
+      # or their bare keys.
+      ProjectSettings # the Project tab's NETWORK settings pane has focus
+      Help            # the Help tab has focus
       PaletteOpen     # the command palette overlay is up
+      # The FOCUS dimension the other scopes don't have. Every scope above names a TAB (or an
+      # overlay); `Keymap#lookup` is keyed by one of them alone, so a tab whose panes want the
+      # same letter for two things could not say so and hand-rolled the second meaning in
+      # `handle_body_key` — the root cause KEY_AUDIT §2d names. Editor is consulted AHEAD of the
+      # tab's own scope whenever the focused pane is a text editor (Runner#scope_chain), which
+      # is exactly the pane set those hand-rolled arms were disambiguating. It is ADDITIVE: the
+      # tab scope is still consulted behind it, so a Repeater chord still fires in the Repeater's
+      # request editor, and Global still backs both.
+      Editor # the focused body pane is a text editor (READ or INS)
     end
 
     # The KIND of action, orthogonal to Scope (where it fires). Drives the
@@ -60,6 +77,17 @@ module Gori
       Navigation # moves focus around the app (tab jumps, back to projects)
       Settings   # edits configuration (settings:*)
       System     # app lifecycle (quit, the palette itself)
+    end
+
+    # Which surface LISTS a verb (#1282). `Space` (the default) gives it a space-menu row;
+    # `Palette` gives it none, at either level, and leaves it to the palette's typed search
+    # (which finds the focused tab's actions) and to its chords. The space menu is for the
+    # frequent, the palette for the long tail: a row that duplicates a direct chord for an
+    # editing or navigation convenience, or a once-a-session configuration action, is placed
+    # `menu: :palette`. Either way the verb runs through `Definition#call`.
+    enum Placement
+      Space
+      Palette
     end
 
     # A keybinding as pure data (no terminal dependency). The TUI converts a
@@ -124,9 +152,6 @@ module Gori
       getter category : Category
       getter chords : Array(Chord)
       getter? hidden : Bool
-      # Exposed for discoverability but not yet functional — the palette shows it
-      # dimmed with a "soon" badge so users aren't surprised when it only toasts.
-      getter? coming_soon : Bool
       # The single key that fronts this verb in the bottom-right "space" action
       # menu (helix leader). Optional: a verb already carrying a plain single-char
       # chord (y / f / / …) gets its menu key from that for free (see #menu_key);
@@ -156,13 +181,61 @@ module Gori
       # is what makes them scannable. Defaults to :none, which renders exactly as
       # before (no header, no subdivision), so an untagged scope is unchanged.
       getter group : Symbol
+      # The sections (the active controller's `command_section`) in which this verb's CHORDS
+      # fire, or nil for anywhere its scope does. A FOCUS gate on the key alone: the palette
+      # and the space menu still run the verb wherever `available?` says (the menu already
+      # draws a row only in its own `section`). It exists for a bare key one pane of a tab
+      # owns while another pane's menu row spells the same letter — the Repeater's `p` pretty-
+      # prints the RESPONSE while the request menu's `p` rewrites the request. Declared here
+      # rather than folded into the `available:` lambda so the R1 guard
+      # (spec/tui/menu_letter_meaning_spec.cr) can see which panes a chord is live in. Out of
+      # its sections the press falls through the scope chain exactly like an unavailable verb
+      # (`Keymap#resolve`), so a gate on a letter Global binds would reach Global — the guard
+      # catches that as its own violation.
+      getter chord_sections : Array(Symbol)?
+      # The recurring intent this verb answers (`Verb::Lexicon`), which fixes its space-menu
+      # letter: `:filter` is `/` on every tab that has one. A verb with an intent does not
+      # spell a `mnemonic:` as well (`Registry#validate_intents!`). Nil for a scope-local
+      # action, whose letter stays its own mnemonic or chord.
+      getter intent : Symbol?
+      # The `Verb::Family` this verb is a member of, or nil. Never spelled at registration: it
+      # is derived from `intent` (a family's letter table names its member intents) and set by
+      # `Registry#register_family`, so a member cannot name one family and answer another's
+      # intent.
+      getter family : Symbol?
+      # A family member that ALSO keeps a level-1 row under its own letter (a `mnemonic:` or its
+      # bare chord) — the loop action of the tab, e.g. Send to Repeater on the list scopes. Only
+      # a member may be pinned, and only a pinned member may spell a `mnemonic:`
+      # (`Registry#validate_intents!`).
+      getter? pinned : Bool
+      # Where the verb is listed (`Placement`): a space-menu row, or the palette's search only.
+      # A palette-only verb has no `menu_key`, spells no `mnemonic:` and is never a family
+      # member (`Registry#validate_intents!`), and its route in hint and Help text is
+      # `Hotkeys.route`'s `^P → <title>` rather than a menu path.
+      getter menu : Placement
+      # The verb whose chord ALSO reaches this one, for a pane-aware pair: the Repeater's `^X`
+      # (`repeater.toggle-hex`) toggles the hex of whichever pane has focus, so the response
+      # pane's hex row (`repeater.toggle-resp-hex`) advertises `^X` although a scope binds a
+      # chord to one verb (`Registry#validate_chords!`). `Hotkeys.binding_for` reads it when
+      # this verb has no chord of its own, so the space menu's hint column, Help and the
+      # palette name the key that works here and follow a rebind of it. It binds nothing:
+      # the keymap and the R1 guard see only the other verb's chord. Boot checks the pair
+      # (same scope, and a chord live in this verb's section).
+      getter chord_of : String?
+      # Extra words the palette's typed search matches besides the title and id: the names an
+      # operator searches for that the title does not say. `settings.keys` is found by "vim" and
+      # "helix" though its title is "Settings: Keys". Search only — nothing draws them.
+      getter keywords : Array(String)
 
       def initialize(@id : String, @title : String, @description : String, @scope : Scope,
                      @chords : Array(Chord) = [] of Chord, @hidden : Bool = false,
                      @available : ExecContext -> Bool = ->(_ctx : ExecContext) { true },
-                     @coming_soon : Bool = false, @category : Category = Category::Action,
+                     @category : Category = Category::Action,
                      @mnemonic : Char? = nil, @section : Symbol = :common,
-                     @group : Symbol = :none,
+                     @group : Symbol = :none, @chord_sections : Array(Symbol)? = nil,
+                     @intent : Symbol? = nil, @pinned : Bool = false,
+                     @menu : Placement = Placement::Space, @chord_of : String? = nil,
+                     @keywords : Array(String) = [] of String,
                      &@handler : ExecContext -> String?)
       end
 
@@ -170,13 +243,57 @@ module Gori
         @available.call(ctx)
       end
 
-      # The key the space menu shows + binds: an explicit mnemonic, else the first
-      # plain single-char chord (no ctrl/alt/shift), else nil (verb is excluded
-      # from the menu — it has no single-key handle). Hidden nav chords like
-      # "enter"/"left"/"space" are multi-char names, so they never qualify.
+      # Whether a press of one of this verb's chords may fire it in the focused section —
+      # `chord_sections`, asked by the scope chain on top of `available?`.
+      def chord_live?(ctx : ExecContext) : Bool
+        return true unless secs = @chord_sections
+        secs.includes?(ctx.focused_section)
+      end
+
+      # This verb as a member of `family` (nil: of none) — the one way `family` is set, used by
+      # `Registry#register_family`. A copy: a Definition is a value.
+      def tagged(family : Symbol?) : Definition
+        copy = dup
+        copy.family = family
+        copy
+      end
+
+      protected setter family : Symbol?
+
+      # Whether only the palette lists this verb (`menu: :palette`): it has no space-menu row.
+      def palette_only? : Bool
+        @menu.palette?
+      end
+
+      # A member of a `Verb::Family`: the space menu lists it one level down, under the family.
+      def member? : Bool
+        !@family.nil?
+      end
+
+      # Whether the space menu can show this verb at EITHER level: its own level-1 letter, or a
+      # row inside its family. What decides "this section has something to show"
+      # (`Registry#has_section?`) and the menu's candidate set — `menu_key` alone answers only
+      # level 1, and an unpinned member has none.
+      def menu_listed? : Bool
+        return false if palette_only?
+        member? || !menu_key.nil?
+      end
+
+      # The LEVEL-1 key the space menu shows + binds: an explicit mnemonic, else the intent's
+      # lexicon letter, else the first plain single-char chord (no ctrl/alt/shift), else
+      # nil (verb is excluded from level 1 — it has no single-key handle). Hidden nav
+      # chords like "enter"/"left"/"space" are multi-char names, so they never qualify.
+      # A family member has no level-1 key unless it is `pinned?`: its letter is the family's
+      # (`Registry#l2_key`), and a chord-derived letter would otherwise keep holding a level-1
+      # slot the family exists to free. A palette-only verb has none: its chords stay chords.
       def menu_key : Char?
+        return nil if palette_only?
+        return nil if member? && !pinned?
         if m = @mnemonic
           return m
+        end
+        if (i = @intent) && (l = Lexicon.letter(i))
+          return l
         end
         @chords.each do |c|
           next if c.ctrl || c.alt || c.shift
@@ -193,8 +310,11 @@ module Gori
   end
 end
 
+require "./verb/family"
 require "./verb/registry"
+require "./verb/lexicon"
 require "./verb/os_profile"
+require "./verb/keyset"
 require "./verb/keymap"
 require "./verb/reserved"
 require "./verb/conflicts"

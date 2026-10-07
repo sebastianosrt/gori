@@ -21,6 +21,12 @@ private def heads(result : Gori::Import::ParseResult) : Array(String)
   result.flows.map { |pair| String.new(pair.request.head) }
 end
 
+module Gori::Import::Postman
+  def self.fill_path_params_for_spec(url : String, node : JSON::Any?, vars : Gori::Import::Vars::Table) : String
+    fill_path_params(url, node, vars)
+  end
+end
+
 describe Gori::Import::Postman do
   it "walks nested folders, not just the top-level item array" do
     # A flat read of `collection.item` imports almost nothing from a real export: every
@@ -52,6 +58,17 @@ describe Gori::Import::Postman do
       JSON
     result.flows.map(&.request.target).should eq(["/bare", "/raw?x=1", "/deep/path?k=v"])
     result.flows[2].request.port.should eq(8443)
+  end
+
+  it "places component query parameters before a path fragment" do
+    result = parse(<<-JSON)
+      {"info": {"name": "n"},
+       "item": [{"request": {"method": "GET", "url": {
+          "protocol": "https", "host": ["a", "test"],
+          "path": ["search#client-fragment"],
+          "query": [{"key": "q", "value": "wanted"}]}}}]}
+      JSON
+    result.flows.first.request.target.should eq("/search?q=wanted")
   end
 
   it "expands {{variables}} from the collection and from folder scope" do
@@ -92,6 +109,39 @@ describe Gori::Import::Postman do
          "item": [{"request": {"method": "GET", "url": "{{a}}/x"}}]}
         JSON
     end
+  end
+
+  # `a = "{{a}}" × 30` and a URL of `{{a}}`: ~200 bytes of JSON, 30^5 copies (121 MB) after
+  # the five passes — and k = 100 is 10^10. The entry is refused past the growth budget; the
+  # collection's other entries still import.
+  it "refuses a self-multiplying variable instead of expanding it" do
+    bomb = "{{a}}" * 30
+    result = parse(<<-JSON)
+      {"info": {"name": "n"},
+       "variable": [{"key": "a", "value": "#{bomb}"}],
+       "item": [{"request": {"method": "GET", "url": "https://h.test/{{a}}"}},
+                {"request": {"method": "GET", "url": "https://h.test/ok"}}]}
+      JSON
+    result.flows.map(&.request.target).should eq(["/ok"])
+    result.skipped.should eq(1)
+    expect_raises(Gori::Error, /expand past/) do
+      Gori::Import::Vars.expand("{{a}}", Gori::Import::Vars::Table{"a" => bomb})
+    end
+  end
+
+  # The budget is the ENTRY's, not each field's: a 1 MB variable in 20 headers is 20 MB for one
+  # request although no single header comes near the budget — and 200 headers of a 14 MB chain
+  # was gigabytes.
+  it "charges every field of one request to the same growth budget" do
+    headers = (1..20).map { |i| %({"key": "X-#{i}", "value": "{{big}}"}) }.join(", ")
+    result = parse(<<-JSON)
+      {"info": {"name": "n"},
+       "variable": [{"key": "big", "value": "#{"x" * 1_000_000}"}],
+       "item": [{"request": {"method": "GET", "url": "https://h.test/many", "header": [#{headers}]}},
+                {"request": {"method": "GET", "url": "https://h.test/one", "header": [{"key": "X", "value": "{{big}}"}]}}]}
+      JSON
+    result.flows.map(&.request.target).should eq(["/one"])
+    result.skipped.should eq(1)
   end
 
   it "skips a URL with a braced host but keeps a brace in the path" do
@@ -157,6 +207,38 @@ describe Gori::Import::Postman do
     # neither `https://` nor the `:8443` port is touched.
     result.flows.first.request.target.should eq("/users/42/posts/:slug")
     result.flows.first.request.port.should eq(8443)
+  end
+
+  it "substitutes URL variables in a path with non-ASCII segments or host" do
+    variables = JSON.parse(%([{"key":"id","value":"1"}]))
+    table = Gori::Import::Vars::Table.new
+    fill = ->(url : String) { Gori::Import::Postman.fill_path_params_for_spec(url, variables, table) }
+    fill.call("https://a.test/사용자/:id").should eq("https://a.test/사용자/1")
+    fill.call("https://例え.jp/users/:id?q=1").should eq("https://例え.jp/users/1?q=1")
+    fill.call("https://a.test/users/:id/é?x=:id").should eq("https://a.test/users/1/é?x=:id")
+  end
+
+  it "substitutes URL variables in the path but leaves query and fragment data unchanged" do
+    variables = JSON.parse(%([{"key":"id","value":"42"}]))
+    raw = "http://a.test/items/:id?filter=:id#client/:id"
+    filled = Gori::Import::Postman.fill_path_params_for_spec(
+      raw, variables, Gori::Import::Vars::Table.new)
+    filled.should eq("http://a.test/items/42?filter=:id#client/:id")
+
+    protocol_relative = Gori::Import::Postman.fill_path_params_for_spec(
+      "//:id@a.test/items/:id?filter=:id#client/:id", variables,
+      Gori::Import::Vars::Table.new)
+    protocol_relative.should eq("//:id@a.test/items/42?filter=:id#client/:id")
+
+    result = parse(<<-JSON)
+      {"info": {"name": "n"},
+       "item": [{"request": {"method": "GET", "url": {
+          "raw": "http://a.test/items/:id?filter=:id#client/:id",
+          "host": ["a", "test"], "path": ["items", ":id"],
+          "query": [{"key": "filter", "value": ":id"}],
+          "variable": [{"key": "id", "value": "42"}]}}}]}
+      JSON
+    result.flows.first.request.target.should eq("/items/42?filter=:id")
   end
 
   it "drops disabled headers and keeps duplicates in order" do
@@ -263,6 +345,22 @@ describe Gori::Import::Postman do
     hs[1].should contain("Bearer FOLDER")
     hs[2].should contain("Bearer OWN")
     hs[3].should_not contain("Authorization")
+  end
+
+  it "replaces the request's own same-named header with the signed one, and signs nothing for an empty token" do
+    result = parse(<<-JSON)
+      {"info": {"name": "n"},
+       "auth": {"type": "bearer", "bearer": [{"key": "token", "value": "COLL"}]},
+       "item": [
+         {"request": {"method": "GET", "url": "https://a.test/x",
+           "header": [{"key": "authorization", "value": "Bearer MINE"}]}},
+         {"request": {"method": "GET", "url": "https://a.test/empty",
+           "auth": {"type": "bearer", "bearer": [{"key": "token", "value": ""}]}}}]}
+      JSON
+    hs = heads(result)
+    hs[0].scan(/authorization/i).size.should eq(1)
+    hs[0].should contain("Authorization: Bearer COLL")
+    hs[1].should_not contain("Authorization")
   end
 
   it "rejects a v1 collection with an actionable message" do

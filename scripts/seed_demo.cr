@@ -9,7 +9,7 @@
 #   Probe                                                             — passive scan + active findings + custom rules
 #   Decoder                                                           — pre-loaded conversion sub-tabs
 #   Authorize                                                         — the identities (session slots) to replay as
-#   Env (bindings)                                                    — project `$KEY` vars a Repeater tab uses
+#   Env (bindings)                                                    — project env vars a Repeater tab uses
 #
 # The JWT and Comparer tabs keep NO per-project state, so nothing can be seeded into them.
 # Their material is one keystroke away instead: the Decoder's `session JWT` sub-tab holds the
@@ -316,7 +316,24 @@ COOKIE_SECRET = "s3cr3t"                # Flask / Django
 RACK_SECRET   = "changeme-please-12345" # Rack wants a longer key
 COOKIE_TS     = 1718787600_i64
 
+# The demo WRITES tokens into bytes it stores — a Repeater target, a header, a slot overlay,
+# the tour prose — so it has to spell them the way THIS install reads them (`env.syntax`): a
+# bare `$token` on a namespaced machine is a literal, and the seeded tab would send it as one.
+# `Env.spell` is the only speller in the repo; loading the settings is what makes it answer
+# for this home rather than for the compiled-in default.
+
+# A BUILD-time env var (`$ENV.API` / bare `$API`).
+def env_token(name : String) : String
+  Gori::Env.spell(name, Gori::Env::Namespace::Env)
+end
+
+# A SEND-time session binding (`$BIND.token` / bare `$token`).
+def bind_token(name : String) : String
+  Gori::Env.spell(name, Gori::Env::Namespace::Bind)
+end
+
 Paths.ensure_dirs
+Settings.load # after ensure_dirs: a home with no `env.syntax` adopts namespaced and writes it
 registry = ProjectRegistry.new(Paths.projects_dir)
 
 # Fresh start: drop any existing "demo" project.
@@ -333,7 +350,7 @@ project = registry.create("demo",
   "and graphql-ws sockets, grpc-web and a connect-udp tunnel; GraphQL, SAML and framework-signed " \
   "cookies; every HTTP method from TRACE and QUERY to WebDAV's PROPFIND/VERSION-CONTROL, " \
   "with the hosts and paths that stress a fixed-width column (punycode, homograph, RTL, " \
-  "double-width, zero-width, a 2.5 GB truncated body); Repeater (incl. a WS and a `$KEY`-bound tab)/" \
+  "double-width, zero-width, a 2.5 GB truncated body); Repeater (incl. a WS and a token-bound tab)/" \
   "Fuzzer/Miner/Sequencer sessions; Rewriter rules + session bindings; project env vars; " \
   "colormarker rules; an OAST listener with callbacks; passive AND active probe findings; " \
   "and entity links tying issues and notes to related workbench items.")
@@ -1627,19 +1644,20 @@ ids[:repeater_hahwul] = store.insert_repeater("https://www.hahwul.com", hahwul_r
   true, true, ids[:hahwul_home], 3)
 store.set_repeater_name(ids[:repeater_hahwul], "hahwul home")
 
-# A tab written in `$KEY` rather than literals: `$API` is a project env var (below) and
-# `$token` is a session BINDING produced by the extract rule on /api/login. Both stay
+# A tab written in TOKENS rather than literals: `API` is a project env var (below) and
+# `token` is a session BINDING produced by the extract rule on /api/login. They come from two
+# different tables, which is why they are spelled through two different namespaces; both stay
 # unexpanded in the editor and resolve at send time — that is the whole point of the
 # Env/Bindings pair, and this tab is where you watch it happen (^E opens the env overlay).
 bound_req = replay_req("GET", "api.demo.test", "/v1/users/1",
-  {"Authorization" => "Bearer $token", "X-Client" => "$UA"})
-ids[:repeater_bound] = store.insert_repeater("$API", bound_req.to_slice,
+  {"Authorization" => "Bearer #{bind_token("token")}", "X-Client" => env_token("UA")})
+ids[:repeater_bound] = store.insert_repeater(env_token("API"), bound_req.to_slice,
   false, true, nil, 4)
-store.set_repeater_name(ids[:repeater_bound], "bound $token")
+store.set_repeater_name(ids[:repeater_bound], "bound #{bind_token("token")}")
 store.set_repeater_tags(ids[:repeater_bound], "bindings env")
 
 # A WebSocket tab. A repeater is a WS session when its request bytes are an upgrade
-# handshake (Repeater::WsEngine.upgrade_request?) — nothing else marks it — and the
+# handshake (Proxy::WS.upgrade_request?) — nothing else marks it — and the
 # outbound frames live in ws_messages beside the captured ones.
 ws_repeater_req = String.build do |b|
   b << "GET /ws/chat HTTP/1.1\r\n"
@@ -1681,8 +1699,15 @@ store.set_repeater_tags(ids[:repeater_ssrf], "ssrf oast")
 idor_resp_body = %({"id":2,"name":"Bob","email":"bob@demo.test","role":"admin","phone":"+1-555-0102"})
 idor_resp_head = "HTTP/1.1 200 OK\r\nServer: nginx/1.25.3\r\nContent-Type: application/json\r\n" \
                  "Content-Length: #{idor_resp_body.bytesize}\r\n\r\n"
+#
+# `request_sha256` (V28) is the digest of the request these bytes answered — the same
+# `Evidence.request_digest` every send surface writes — so a seeded response is paired with
+# its request and `Evidence.from_repeater` reads the tab as UNDRIFTED until someone edits it.
+# A seeded nil would read as "a response whose request cannot be checked" and make the demo's
+# freeze say nothing, which is the one thing #1047 added the column to stop.
 store.update_repeater_response(ids[:repeater_idor], idor_resp_head.to_slice,
-  idor_resp_body.to_slice, nil, 34_000_i64)
+  idor_resp_body.to_slice, nil, 34_000_i64,
+  request_sha256: Evidence.request_digest(idor_req.to_slice))
 
 fuzz_template = replay_req("GET", "api.demo.test", "/v1/users/§1§",
   {"Authorization" => "Bearer #{jwt}"})
@@ -2424,9 +2449,9 @@ store.insert_rule(S::RuleTarget::Request, S::RulePart::Head, "cdn.demo.test/asse
 puts "• inserted 7 rewriter rules (2 active, 5 staged)"
 
 # --- Session bindings: the READ half of the Rewriter tab (extract rules) -----
-# An extract rule pulls a value OUT of a response and publishes it as `$name`, which the
-# send paths then substitute — so a token that rotates is written once, not pasted into
-# every tab. `bound $token` (Repeater) is the tab that consumes these.
+# An extract rule pulls a value OUT of a response and publishes it under a name in the BIND
+# namespace, which the send paths then substitute — so a token that rotates is written once,
+# not pasted into every tab. The Repeater tab named after the `token` binding consumes these.
 store.insert_extract_rule("token", "host:shop.demo.test path:/api/login",
   ExtractKind::JsonPath, selector: "token", host: "shop.demo.test")
 store.insert_extract_rule("sid", "host:shop.demo.test path:/api/login",
@@ -2439,7 +2464,7 @@ store.insert_extract_rule("csrf", "host:shop.demo.test path:/login",
 store.insert_extract_rule("request_id", "host:api.demo.test",
   ExtractKind::Header, selector: "X-Request-Id", host: "api.demo.test", enabled: false)
 
-# --- Project env vars (`$KEY`, the BUILD-time layer) ------------------------
+# --- Project env vars (the ENV namespace, the BUILD-time layer) -------------
 # Global vars live in settings.json; these are the project's own and follow the db, not
 # the operator. They stay literal in every editor and expand only at send time.
 Env.save_project(store, [
@@ -2606,6 +2631,43 @@ store.add_link(S::LinkOwnerKind::Note, NOTE_LINKS, S::LinkRefKind::Repeater, ids
 
 puts "• inserted entity links on issues + notes"
 
+# --- Frozen evidence (#1038/#1039) — what the Evidence tab archives ----------
+# The tab stays hidden until a project holds a snapshot, so a demo without one cannot show
+# it at all. Three states, because they read differently: a CONFIRMED issue with two copies
+# (the before/after pair `c` compares), one snapshot shared by two issues, and an ORPHAN —
+# the copy whose last Issue link was removed, which only the project-wide archive can find.
+frozen_ids = [] of Int64
+{ {f1, :xss}, {f1, :login}, {f2, :idor}, {f3, :err500} }.each do |(issue, key)|
+  next unless detail = store.get_flow(ids[key])
+  id, status = store.freeze_evidence(issue, Gori::Evidence.from_flow(detail))
+  frozen_ids << id if status.ok?
+end
+store.link_evidence(frozen_ids[2], f4) if frozen_ids.size > 2   # one copy, two findings
+store.unlink_evidence(frozen_ids[3], f3) if frozen_ids.size > 3 # …and one kept without any
+puts "• froze #{frozen_ids.size} evidence snapshots (1 shared by two issues, 1 orphaned)"
+
+# --- Issue retest (#1036) — the check a finding carries ----------------------
+# The Issue detail's retest line and the RETEST card are both drawn only once an issue HAS
+# one, so a demo without a retest cannot show either. The IDOR issue gets the canonical
+# shape the feature exists for: log in, anchor on the victim's own record, then ask for
+# somebody else's and expect to be refused — plus a control that should come back byte-for-
+# byte identical to the anchor. The XSS issue gets a single unasserted step, which is what
+# "record the outcome and assert nothing" looks like in the list.
+retest_steps = [
+  {f2, S::RetestRole::Setup, ids[:repeater_token]?, ""},
+  {f2, S::RetestRole::Baseline, ids[:repeater_idor]?, "status:200"},
+  {f2, S::RetestRole::Variant, ids[:repeater_idor]?, "json-absent:email"},
+  {f2, S::RetestRole::Control, ids[:repeater_idor]?, "body:same"},
+  {f1, S::RetestRole::Variant, ids[:repeater_xss]?, ""},
+]
+retest_added = 0
+retest_steps.each do |(issue, role, rid, assertion)|
+  next unless rid
+  _, status = store.add_retest_step(issue, role, S::LinkRefKind::Repeater, rid, assertion)
+  retest_added += 1 if status.ok?
+end
+puts "• added #{retest_added} retest steps (a 4-step IDOR check, plus one unasserted step)"
+
 # --- Act six: the lists beside History, and the tabs that opened empty -------
 # Act five stressed History's columns. Every OTHER tab draws the same kind of row — a
 # fixed strip of user-supplied text, laid out by hand — and until now the demo handed
@@ -2638,20 +2700,25 @@ repeater_resp = ->(status : String, headers : String, body : String) {
 xss_body = "<!doctype html><html><head><title>Search — Demo Shop</title></head><body>" \
            "<h1>Results for <script>alert(1)</script></h1><p>0 products found.</p></body></html>\n"
 xss_head, xss_bytes = repeater_resp.call("200 OK", "Content-Type: text/html; charset=utf-8\r\n", xss_body)
-store.update_repeater_response(ids[:repeater_xss], xss_head, xss_bytes, nil, 61_000_i64)
+store.update_repeater_response(ids[:repeater_xss], xss_head, xss_bytes, nil, 61_000_i64,
+  request_sha256: Evidence.request_digest(xss_req.to_slice))
 
 # The OAuth tab, answered with a REFUSAL — a send that reached the origin and came back
 # 4xx is a different state from one that never connected, and the tab has to show both.
 token_body = %({"error":"invalid_grant","error_description":"refresh token expired"})
 token_head, token_bytes = repeater_resp.call("401 Unauthorized",
   "Content-Type: application/json\r\nWWW-Authenticate: Bearer error=\"invalid_grant\"\r\n", token_body)
-store.update_repeater_response(ids[:repeater_token], token_head, token_bytes, nil, 121_000_i64)
+store.update_repeater_response(ids[:repeater_token], token_head, token_bytes, nil, 121_000_i64,
+  request_sha256: Evidence.request_digest(token_req.to_slice))
 
 # …and the tab whose send never got an answer at all. `response_error` with an empty head
 # is the shape a dial failure leaves behind, and it is the one a demo can never produce by
 # running something.
+# (The digest rides along here too: the dial failed, but it failed on THESE request bytes,
+# and a row that says so stays readable as undrifted rather than uncheckable.)
 store.update_repeater_response(ids[:repeater_bound], Bytes.empty, nil,
-  "dial tcp: no route to host (api.demo.test:443)", 5_002_000_i64)
+  "dial tcp: no route to host (api.demo.test:443)", 5_002_000_i64,
+  request_sha256: Evidence.request_digest(bound_req.to_slice))
 
 # ## The History view library (#776)
 #
@@ -2675,8 +2742,8 @@ store.insert_saved_view("한글 호스트", "host:쇼핑몰.한국 OR host:xn--3
 # The Authorize tab replays one request as several identities; the identities are project
 # state (`Store::SESSION_SLOTS_KEY`) and the queue is not, so this is the half a seeder can
 # fill — and without it the tab's `i` list is empty and "send to Authorize" has nothing to
-# replay AS. `customer` claims the `token` extract rule, so its `$token` resolves from ITS
-# OWN binding table rather than the global one; `anonymous` strips credentials instead of
+# replay AS. `customer` claims the `token` extract rule, so its `token` binding resolves from
+# ITS OWN table rather than the global one; `anonymous` strips credentials instead of
 # setting them, which is the comparison that finds a missing authorization check.
 admin_jwt = make_jwt(WEAK_SECRET,
   %({"alg":"HS256","typ":"JWT"}),
@@ -2684,7 +2751,7 @@ admin_jwt = make_jwt(WEAK_SECRET,
 store.set_setting(S::SESSION_SLOTS_KEY, SessionSlot.serialize([
   SessionSlot.as_captured,
   SessionSlot.new("anonymous", remove_headers: ["Authorization", "Cookie"]),
-  SessionSlot.new("customer", [{"Authorization", "Bearer $token"}], rules: ["token"]),
+  SessionSlot.new("customer", [{"Authorization", "Bearer #{bind_token("token")}"}], rules: ["token"]),
   SessionSlot.new("admin", [{"Authorization", "Bearer #{admin_jwt}"}, {"X-Demo-Role", "admin"}]),
 ]))
 
@@ -2859,7 +2926,7 @@ Space → `l` (links) on this sub-tab opens the overlay; `↵`/`o` jumps to the 
 - **XSS PoC** repeater — re-send the reflected /search payload
 - **IDOR probe** repeater — GET /v1/users/2 with the customer token (opens WITH its last response)
 - **SSRF → OAST** repeater — POST /v1/import with an OAST payload host
-- **bound $token** repeater — written in `$API` / `$token` / `$UA`, resolved at send time
+- **bound #{bind_token("token")}** repeater — written in `#{env_token("API")}` / `#{bind_token("token")}` / `#{env_token("UA")}`, resolved at send time
 - **WS chat** repeater — a WebSocket session (upgrade handshake + 4 outbound frames)
 - **OAuth refresh** repeater — re-run the token exchange with a different client
 - **user id enum** fuzz — sweep /v1/users/{id} (positions marked §1§)
@@ -2884,9 +2951,10 @@ Which tab does what on this demo (send a selection to a tool with Space → the 
   a forced CSP, a request-body privilege flip, and a SHORT-CIRCUIT that answers the JS
   bundle locally). Toggle one on, then re-send from Repeater to watch it take effect.
 - **Rewriter → bindings** — 5 extract rules (the READ half). `token` (jsonpath) and `sid`
-  (cookie) are lifted from /api/login and published as `$token` / `$sid`.
-- **Env (^E)** — 5 project vars: `$API`, `$SHOP`, `$AUTH`, `$UA`, `$ADMIN_ID`. The
-  "bound $token" Repeater tab is written entirely in them; they expand only at send time.
+  (cookie) are lifted from /api/login and published as `#{bind_token("token")}` / `#{bind_token("sid")}`.
+- **Env (^E)** — 5 project vars: `#{env_token("API")}`, `#{env_token("SHOP")}`, `#{env_token("AUTH")}`,
+  `#{env_token("UA")}`, `#{env_token("ADMIN_ID")}`. The "bound #{bind_token("token")}" Repeater tab is
+  written entirely in them; they expand only at send time.
 - **Colormarker** — 7 row-colour rules (first match wins): 5xx red, 401/403 orange,
   legacy.demo.test purple, websocket blue, the token exchange green, gRPC/SSE green strip.
 - **OAST** — the out-of-band listener. It holds the DNS + HTTP callbacks the server made
@@ -2930,7 +2998,8 @@ note_start = <<-NOTES4
 3. **The Decoder** already has five sub-tabs loaded. Run the SAML one, then the Flask
    cookie one (`cookie-decode` auto-detects Flask vs Rack vs Django).
 4. **JWT** — send the login token (Space → JWT), crack the secret, re-forge the payload.
-5. **Repeater** — "bound $token" is written in `$API`/`$token`. Open the env overlay (^E)
+5. **Repeater** — "bound #{bind_token("token")}" is written in `#{env_token("API")}` /
+   `#{bind_token("token")}`. Open the env overlay (^E)
    to see where those come from, then look at the "WS chat" tab: a WebSocket session with
    four outbound frames queued.
 6. **Issues** — 18 of them, deliberately across all four triage states. The two on

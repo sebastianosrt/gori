@@ -1,7 +1,10 @@
 require "./active/types"
+require "./active/evidence"
 require "./active/insertion_points"
 require "./active/reflected_param"
 require "./active/error_based_sqli"
+require "./active/boolean_sqli"
+require "./active/time_based_sqli"
 require "./active/cors_reflection"
 require "./active/forbidden_bypass"
 require "./active/nginx_alias_traversal"
@@ -19,6 +22,10 @@ require "./active/request_smuggling"
 require "./active/ssrf_oast"
 require "./active/xxe_oast"
 require "./active/cmd_injection_oast"
+require "./active/rfi_oast"
+require "./active/ratelimit_bypass"
+require "./active/forbidden_method_bypass"
+require "./active/insecure_http_methods"
 require "../outbound"
 require "../scope"
 require "../fuzz/engine"
@@ -30,7 +37,7 @@ module Gori
     # file under `active/`; the analyzer iterates RULES, sending each rule's probe and folding
     # its detections. To add a check: drop a new `Rule` subclass in `active/` and append it here.
     module Active
-      # The primary rule, reused for the registry AND the module-level facade.
+      # The primary rule, first in the registry.
       PRIMARY = ReflectedParam.new
 
       # The empty "nothing turned off" set — a shared constant so the `disabled` default in
@@ -40,27 +47,15 @@ module Gori
 
       RULES = [PRIMARY, CorsReflection.new, ForbiddenBypass.new,
                NginxAliasTraversal.new, BackslashPowered.new,
-               ErrorBasedSqli.new,
+               ErrorBasedSqli.new, BooleanBlindSqli.new, TimeBlindSqli.new,
                GraphqlIntrospection.new, LfiParamTraversal.new,
                OpenRedirect.new, HostHeaderInjection.new,
                CrlfInjection.new, PathNormalizationBypass.new,
                UrlRewriteBypass.new, Ssti.new,
                NextjsActionNoAuth.new, RequestSmuggling.new,
-               SsrfOast.new, CmdInjectionOast.new, XxeOast.new] of Rule
-
-      # Convenience facade over the primary (reflected-param) rule. The analyzer drives the
-      # whole RULES list; these keep a stable single-rule entry point for callers/tests.
-      def self.dedup_key(detail : Store::FlowDetail, opts : Options = Options::DEFAULT) : String?
-        PRIMARY.dedup_key(detail, opts)
-      end
-
-      def self.plan(detail : Store::FlowDetail, opts : Options = Options::DEFAULT) : Plan?
-        PRIMARY.plan(detail, opts)
-      end
-
-      def self.detections(plan : Plan, result : Repeater::Result, detail : Store::FlowDetail) : Array(Detection)
-        PRIMARY.detections(plan, result, detail)
-      end
+               SsrfOast.new, CmdInjectionOast.new, XxeOast.new, RfiOast.new,
+               RateLimitBypass.new, ForbiddenMethodBypass.new,
+               InsecureHttpMethods.new] of Rule
 
       # The WHOLE probe request, marked as bytes the session-binding pass must copy through
       # untouched (`Fuzz::Backend#send`'s `verbatim`). Not a convenience — the provenance of
@@ -119,6 +114,44 @@ module Gori
         rng.begin == rng.end ? "#{rng.begin} req/flow" : "#{rng.begin}–#{rng.end} req/flow"
       end
 
+      # Would `analyze` with this `seen` set send anything for `detail`? True when at least one
+      # enabled rule applies (non-nil `dedup_key`) to a surface not already probed. Cheap —
+      # `dedup_key` builds no canary and no request — so a headless scan asks it before charging
+      # its active budget, and a flow that only repeats probed surfaces costs no budget unit.
+      #
+      # A short-circuited flow is NOT fresh: `analyze` refuses it outright (#511, the guard
+      # below) and never sends or records anything, so charging the budget for one would let
+      # repeat Match&Replace-stubbed captures exhaust `active_limit` before a real endpoint is
+      # reached — the exact "cap spent on one surface" failure `seen` exists to prevent. The TUI
+      # path skips these the same way (`maybe_enqueue_active`).
+      def self.fresh?(detail : Store::FlowDetail, opts : Options, disabled : Set(String),
+                      seen : Set(String)) : Bool
+        return false if detail.row.short_circuited?
+        RULES.any? do |rule|
+          next false if Probe.rule_disabled?(rule.info.id, disabled)
+          key = rule.dedup_key(detail, opts)
+          !key.nil? && !seen.includes?(key)
+        rescue
+          true # a rule that raises is analyze's to isolate and report, not this gate's to hide
+        end
+      end
+
+      # The plan `analyze` should send for one rule, or nil to skip it. When a `seen` set is
+      # given, a surface already probed (its `dedup_key` in the set) is rejected before the plan
+      # is built, and the key of a plan that WILL be sent is recorded — the headless twin of the
+      # analyzer's `@active_seen`. Without a set, every rule with a plan is sent.
+      private def self.planned(rule : Rule, detail : Store::FlowDetail, opts : Options,
+                               seen : Set(String)?) : Plan?
+        if seen
+          key = rule.dedup_key(detail, opts)
+          return nil if key.nil? || seen.includes?(key)
+        end
+        plan = rule.plan(detail, opts)
+        return nil unless plan
+        seen.try &.<<(plan.dedup_key)
+        plan
+      end
+
       # Synchronously execute enabled Active rules against a flow (for headless / CLI scans).
       # `outbound` is the REQUIRED scope decision (Gori::Outbound): a Sandbox block or an
       # explicit exclude rule HARD-blocks the probe at the socket seam even when the caller
@@ -150,13 +183,18 @@ module Gori
       # deliberately Store-free (rules depend only on the codec, the body decoder and the
       # sender); the caller that owns a Store — `Probe::Scan`, the TUI analyzer — persists it.
       # A caller that passes nothing simply does not participate in out-of-band checks.
+      # `seen` (optional) is a caller-owned set of `Plan#dedup_key`s already probed. When given,
+      # a rule whose key is in it is skipped and every key this call probes is added, so a scan
+      # over many captures of one endpoint probes it once — the headless twin of the analyzer's
+      # `@active_seen`. Nil keeps the old one-flow-in-isolation behaviour.
       def self.analyze(detail : Store::FlowDetail, verify_upstream : Bool = true,
                        timeout : Time::Span = 10.seconds, *, outbound : Outbound,
                        overrides : Gori::HostOverrides?,
                        backend : Fuzz::Backend? = nil, opts : Options = Options::DEFAULT,
                        disabled : Set(String) = NO_DISABLED,
                        on_error : Proc(String, Exception, Nil)? = nil,
-                       on_oob : Proc(String, OutOfBand::Candidate, Nil)? = nil) : Array(Detection)
+                       on_oob : Proc(String, OutOfBand::Candidate, Nil)? = nil,
+                       seen : Set(String)? = nil) : Array(Detection)
         # A short-circuited flow is refused before a single probe is sent (#511). Its baseline
         # response came from a Match&Replace stub, not from the origin, so every differential
         # this builds would be measuring the rule — and the probes themselves WOULD reach the
@@ -197,7 +235,11 @@ module Gori
           # batch outright. Send FAILURES are not exceptions (Fuzz returns an errored Result and
           # `result.ok?` skips), so what this catches is a rule bug on hostile input.
           begin
-            plan = rule.plan(detail, opts)
+            # `seen` is the scan's surface dedup — the same `dedup_key` set the TUI analyzer
+            # keeps in `@active_seen`. `planned` rejects a repeat surface WITHOUT building its
+            # plan, and records the key before the send, so a surface whose probe failed is not
+            # retried by every later capture of it. nil ⇒ nothing to send for this rule.
+            plan = planned(rule, detail, opts, seen)
             next unless plan
             result = sender.send(plan.request, Fuzz::Backend.all_verbatim(plan.request))
             unless result.ok?

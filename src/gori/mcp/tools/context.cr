@@ -1,8 +1,11 @@
 require "json"
 require "base64"
 require "../../store"
+require "../../agent_presence"
 require "../serialize"
 require "../../proxy/codec/http1"
+require "../../redact/policy"
+require "../../redact/wire"
 
 module Gori
   module MCP
@@ -20,7 +23,7 @@ module Gori
             # payload said so — a caller would have to know that the allowlist deliberately reads
             # an empty include set as "block all" rather than "allow all" to derive it.
             j.field "blocks_all", scope.sandbox? && scope.include_count.zero?
-            # `enabled` is the CAPTURE-side lens (the Target/Sitemap ⇧S filter). The gate that
+            # `enabled` is the CAPTURE-side lens (the Target/Sitemap `s` filter). The gate that
             # decides whether THIS server may send — send_request, send_websocket, fuzz, mine,
             # probe active — is `Outbound`, and it keys off `Scope#configured?`, which reads the
             # rules "REGARDLESS of the enabled flag". So `enabled:false` beside a populated rule
@@ -32,16 +35,11 @@ module Gori
               scope.configured? ? "active requests (send_request, send_websocket, fuzz_*, mine_*, probe active) " \
                                   "are matched against the rules below whatever `enabled` says; an unmatched " \
                                   "target is refused SCOPE_BLOCKED unless you pass allow_unscoped:true" : "no scope rules are configured, so EVERY active request is refused " \
-                                                                                                          "SCOPE_BLOCKED unless you pass allow_unscoped:true — add_scope_rule to change that"
+                                                                                                        "SCOPE_BLOCKED unless you pass allow_unscoped:true — #{add_scope_rule_hint} to change that"
             j.field "rules" do
               j.array do
                 store.scope_rules.each do |(id, kind, match_type, pattern)|
-                  j.object do
-                    j.field "id", id
-                    j.field "kind", kind
-                    j.field "match_type", match_type
-                    j.field "pattern", pattern
-                  end
+                  {id: id, kind: kind, match_type: match_type, pattern: pattern}.to_json(j)
                 end
               end
             end
@@ -63,6 +61,13 @@ module Gori
             j.field "workspace_bound", !@workspace_root.nil?
             j.field "read_only", !@allow_actions
             if s = @store
+              # The one place a project's DESCRIPTION is readable headlessly. `create_project`
+              # takes it, `gori run project create --description` writes it and the TUI's
+              # Project tab edits it — and nothing outside that tab ever handed it back, so an
+              # agent could write the engagement's scope note and then never see it again, its
+              # own included. Reported here rather than in `list_projects`, which is a roster
+              # that deliberately opens no databases; this call already holds one open.
+              j.field "description", s.setting(Project::DESCRIPTION_KEY)
               j.field "flows", s.count
               j.field "issues", s.count_issues
               j.field "total_bytes", s.total_size
@@ -72,11 +77,11 @@ module Gori
               # a long-running engagement is off by the whole length of it.
               j.field "earliest_created_at", s.earliest_created_at
               if ea = s.earliest_created_at
-                j.field "earliest_created_at_iso", Serialize.unix_micros_iso(ea)
+                j.field "earliest_created_at_iso", Gori.iso_micros(ea)
               end
               j.field "latest_created_at", s.latest_created_at
               if la = s.latest_created_at
-                j.field "latest_created_at_iso", Serialize.unix_micros_iso(la)
+                j.field "latest_created_at_iso", Gori.iso_micros(la)
               end
             elsif reason = @bind_error
               # Unbound because the configured project FAILED to open, not because none was
@@ -84,21 +89,30 @@ module Gori
               # distinction (and the reason) belongs in its answer as a field, not only in
               # the prose note.
               j.field "bind_error", reason
-              j.field "note", "The configured project could not be opened (#{reason}). " \
-                              "Call list_projects, then switch_project or create_project."
+              j.field "note", "The configured project could not be opened (#{reason}); " \
+                              "#{project_recovery}."
             else
-              j.field "note", "No project bound. Call list_projects, create_project, or switch_project before traffic tools."
+              # The recovery names only the binders THIS server advertises (#1136) — the
+              # same sentence `no_project` writes, so the tool an agent calls to orient
+              # itself and the error it is orienting itself out of cannot disagree.
+              j.field "note", "No project bound; #{project_recovery}."
             end
           end
         end)
       end
 
-      # What the user is currently viewing in the gori TUI, recorded cross-process to the
-      # project store (Store::UI_STATE_KEY) by the running TUI. Read-only. The ui-state lives in
-      # THIS project's db, so it always describes this project — freshness is reported via
-      # age_seconds (there is no live-TUI heartbeat), not a name comparison that would skew on
-      # display-name-vs-slug.
-      @[Tool("get_current_context")]
+      # What the operator is viewing AND has selected in the gori TUI, recorded cross-process
+      # to the project store (Store::UI_STATE_KEY) by the running TUI. Read-only. The ui-state
+      # lives in THIS project's db, so it always describes this project — not a name
+      # comparison that would skew on display-name-vs-slug.
+      #
+      # Two independent signals, and they answer different questions (#1091): `age_seconds`
+      # says when the view last MOVED (the TUI writes only on change — there is still no
+      # heartbeat, deliberately), and the `tui` block says whether a window is attached RIGHT
+      # NOW, off the flock marker directory beside the database. Neither corrects the other.
+      @[Tool("get_current_context", requires: [
+        "list_history", "get_issue", "list_sitemap", "get_repeater_context",
+      ])]
       private def get_current_context : Result
         raw = store.setting(Store::UI_STATE_KEY)
         parsed = raw.try do |r|
@@ -110,12 +124,18 @@ module Gori
         rescue
           nil
         end
+        windows = live_tui_windows
         Result.new(JSON.build do |j|
           j.object do
             j.field "project", @project_name # the project/db this server serves
+            # ABOVE the available/unavailable fork on purpose: "a window is attached but has
+            # not recorded a view yet" is a real state — a TUI opened seconds ago, or one
+            # sitting on a tab that publishes nothing — and it used to come out as "the gori
+            # TUI may not have run against it", which is a different and wrong claim.
+            emit_tui_presence(j, windows)
             if parsed.nil?
               j.field "available", false
-              j.field "note", raw.nil? ? "No UI state recorded for this project — the gori TUI may not have run against it." : "Recorded UI state was unreadable."
+              j.field "note", no_ui_state_note(raw, windows)
             else
               j.field "available", true
               # NB: "project" is emitted once, above this branch — repeating it here put a
@@ -140,20 +160,22 @@ module Gori
               if st = parsed["subtab"]?.try(&.as_i64?)
                 j.field "subtab", st
               end
-              if rec = parsed["recorded_at"]?.try(&.as_i64?)
-                j.field "recorded_at", rec
-                # A corrupt/out-of-range recorded_at must not sink the whole tool: Time.unix_ms
-                # raises on out-of-range, so guard it — keep the raw value, drop derived fields.
-                iso = begin
-                  Time.unix_ms(rec).to_rfc3339
-                rescue
-                  nil
-                end
-                if iso
-                  j.field "recorded_at_iso", iso
-                  j.field "age_seconds", (Time.utc.to_unix_ms - rec) // 1000
-                end
+              # The operator's SELECTION (#1091), relayed VERBATIM rather than field-by-field.
+              # A deliberate break from the hand-picked shape around it, for two reasons: the
+              # TUI owns this schema (a tab that learns to publish a selection must not also
+              # be a change here, with a silent drop as its failure mode), and there is nothing
+              # to redact — ids, node paths and chip numbers, no header bytes. The precedent is
+              # `emit_tui_repeater`, which only rebuilds its subtree because that one carries
+              # credentials. Size is already bounded by the writer's SELECTION_ID_CAP.
+              if sel = parsed["selection"]?
+                j.field "selection", sel
+                # The one thing only this side knows: which tool turns the selection into data.
+                emit_selection_next_call(j, sel)
               end
+              if elsewhere = parsed["marks_elsewhere"]?
+                j.field "marks_elsewhere", elsewhere
+              end
+              emit_recorded_at(j, parsed, windows)
             end
           end
         end)
@@ -189,22 +211,25 @@ module Gori
           "QUERY_SYNTAX", field: "filter")
       end
 
-      @[Tool("get_repeater_context")]
+      REPEATER_CONTEXT_LIMIT = PageLimit.new(50, 500)
+
+      @[Tool("get_repeater_context", requires: ["get_response_body_chunk"])]
       private def get_repeater_context(h) : Result
         ui = parse_ui_state
         repeater_id = int(h, "id")
         return Result.new(id_error(h, "id"), is_error: true) if repeater_id.nil? && present?(h, "id")
         include_content = bool_arg(h, "include_content", false)
         include_sensitive = bool_arg(h, "include_sensitive", false)
-        req_lim = optional_int_arg(h, "limit")
-        req_off = optional_int_arg(h, "offset")
-        limit = clamp(req_lim, 50, 500)
-        offset = clamp_nonneg(req_off)
+        pg = page_args(h, REPEATER_CONTEXT_LIMIT)
         query_str = str(h, "query").try(&.strip)
         query_rx = query_str.try { |q| q.empty? ? nil : Regex.new(Regex.escape(q), Regex::Options::IGNORE_CASE) }
         include_response_body = bool_arg(h, "include_response_body", false)
         req_body_cap = optional_int_arg(h, "max_body_bytes")
         body_cap = clamp(req_body_cap, MCP_REPEATER_BODY_DEFAULT, MCP_REPEATER_BODY_MAX)
+        # The project's default body redaction (#1035), as `get_flow` applies it. A Repeater
+        # request is authored, but the credential in it came from the traffic — the TUI's copy
+        # menu sanitizes it for the same reason. `include_sensitive` turns it off.
+        tally = include_sensitive ? nil : Redact::Policy.ambient(store).try { |m| BodyTally.new(m) }
 
         # The sub-tab filter the operator types into the TUI's `/`, over the SAME grammar
         # (`tag:` `name:` `host:`/`target:` `method:`/`verb:` `status:`, `-` to negate, bare
@@ -232,10 +257,10 @@ module Gori
         filtered_repeaters = repeater_narrow(all_repeaters, query_rx, filter)
 
         total_count = filtered_repeaters.size
-        paginated_repeaters = if offset >= filtered_repeaters.size
+        paginated_repeaters = if pg.offset >= filtered_repeaters.size
                                 [] of Store::RepeaterRecord
                               else
-                                filtered_repeaters[offset, Math.min(limit, filtered_repeaters.size - offset)]
+                                filtered_repeaters[pg.offset, Math.min(pg.limit, filtered_repeaters.size - pg.offset)]
                               end
 
         # Response bodies are the one field on this tool that costs a BLOB read per row
@@ -269,7 +294,7 @@ module Gori
                 end
               end
               if include_content && (repeater = ui["repeater"]?)
-                emit_tui_repeater(j, repeater, include_sensitive)
+                emit_tui_repeater(j, repeater, include_sensitive, tally)
               elsif ui["repeater"]?
                 j.field "tui_repeater_available", true
               end
@@ -277,9 +302,9 @@ module Gori
             j.field "content_included", include_content
             j.field "sensitive_headers_redacted", !include_sensitive if include_content
             j.field "total_count", total_count
-            j.field "offset", offset
-            j.field "limit", limit
-            emit_clamp(j, req_off, offset, req_lim, limit)
+            j.field "offset", pg.offset
+            j.field "limit", pg.limit
+            emit_clamp(j, pg.req_off, pg.offset, pg.req_lim, pg.limit)
             # A filter string whose every term was dropped narrows NOTHING, and a listing that
             # answered "here is everything" while the caller believed it had filtered is the
             # shape `ql_explain` was fixed for. Named, not silently applied.
@@ -295,16 +320,17 @@ module Gori
                 "last_response_body is hydrated for the first #{MCP_REPEATER_BODY_ROWS} rows of a page only " \
                 "(each is a separate BLOB read) — narrow with id/filter, or page, to read the rest"
             end
-            j.field "has_more", offset + paginated_repeaters.size < total_count
+            j.field "has_more", pg.offset + paginated_repeaters.size < total_count
             j.field "sessions" do
               j.array do
                 paginated_repeaters.each do |r|
                   emit_repeater_session(j, r, include_content, include_sensitive,
                     tui_index: tui_index[r.id]?,
-                    response_body_cap: body_ids.includes?(r.id) ? body_cap : nil)
+                    response_body_cap: body_ids.includes?(r.id) ? body_cap : nil, tally: tally)
                 end
               end
             end
+            Serialize.emit_redaction_note(j, tally.try(&.note)) if include_content || include_response_body
             unless on_repeater
               j.field "note", "TUI is not on the Repeater tab — `tui_repeater` may be stale; use `sessions` for persisted tabs."
             end
@@ -312,19 +338,17 @@ module Gori
         end)
       end
 
-      private def emit_repeater_sessions(j : JSON::Builder, include_content : Bool = false,
-                                         include_sensitive : Bool = false) : Nil
-        store.repeaters_mcp.each do |r|
-          emit_repeater_session(j, r, include_content, include_sensitive)
-        end
-      end
-
       private def emit_repeater_session(j : JSON::Builder, r : Store::RepeaterRecord,
                                         include_content : Bool = false,
                                         include_sensitive : Bool = false,
                                         tui_index : Int32? = nil,
-                                        response_body_cap : Int32? = nil) : Nil
+                                        response_body_cap : Int32? = nil,
+                                        tally : BodyTally? = nil) : Nil
         j.object do
+          # `id` is the name every repeater tool takes it under (`update_repeater{id}`, and what
+          # `create_repeater` returns); `db_id` is the older spelling, kept beside it so a caller
+          # that learned it keeps working (#1393).
+          j.field "id", r.id
           j.field "db_id", r.id
           # The number the operator reads off the sub-tab chip ("6:POST /api"), beside the id
           # every tool here takes. Both, always, because holding one and needing the other is
@@ -347,11 +371,22 @@ module Gori
           # existed, so a listing of untouched sessions is unchanged. An agent replaying one
           # through `send_request{repeater_id}` inherits this unless it passes its own.
           j.field "tls_preset", r.tls_preset if r.tls_preset
+          # Beside the settings, because it is the one field here that is not one: the stored
+          # bytes of an unterminated request render identically to a well-formed one in every
+          # view gori has (#1075), so a listing is the only place an agent can find the odd
+          # session out before it replays it and reads the origin's bare 400.
+          emit_head_unterminated(j, CLI::Run.unterminated_head?(r.request,
+            ws_http_only: r.ws_http_only?, http2: r.http2?))
           r_request_text = String.new(r.request).scrub
           if include_content
-            emit_capped_text(j, "request", Serialize.redact_head(String.new(r.request), include_sensitive),
-              raw: r.request, include_sensitive: include_sensitive,
-              read_more: %(get_response_body_chunk(repeater_id: #{r.id}, part: "request", offset: …)))
+            request = String.new(r.request)
+            more = %(get_response_body_chunk(repeater_id: #{r.id}, part: "request", offset: …))
+            if (t = tally) && (clean = redacted_wire(request, t))
+              request = clean
+              more = nil # the chunk tool pages the stored, unredacted bytes
+            end
+            emit_capped_text(j, "request", Serialize.redact_head(request, include_sensitive),
+              raw: r.request, include_sensitive: include_sensitive, read_more: more)
             # What the credential headers are WIRED to, with the credentials still withheld —
             # `redact_head` above blanks `Authorization: Bearer $AUTH` and a live token
             # identically, so without this the operator cannot confirm an env binding without
@@ -370,6 +405,10 @@ module Gori
 
           if Repeater::WsEngine.replayable?(r_request_text)
             ws_msgs = store.ws_messages_for_repeater(r.id)
+            if include_content && (t = tally)
+              ws_msgs, frames = Redact::Wire.ws_messages(ws_msgs, t.matcher)
+              t.ws_frames += frames.size
+            end
             j.field "ws_mode", true
             j.field "ws_message_count", ws_msgs.size
             j.field "ws_messages" do
@@ -426,7 +465,7 @@ module Gori
               Serialize.emit_head_base64(j, "last_response_head", head, include_sensitive)
             end
           end
-          emit_repeater_response_body(j, r, head, response_body_cap, include_sensitive) if response_body_cap
+          emit_repeater_response_body(j, r, head, response_body_cap, include_sensitive, tally) if response_body_cap
         end
       end
 
@@ -442,28 +481,72 @@ module Gori
       # read describe the same bytes the same way.
       private def emit_repeater_response_body(j : JSON::Builder, r : Store::RepeaterRecord,
                                               head : Bytes?, cap : Int32,
-                                              include_sensitive : Bool) : Nil
+                                              include_sensitive : Bool,
+                                              tally : BodyTally? = nil) : Nil
         full = store.get_repeater_full(r.id)
         body = full.try(&.response_body)
         # Distinguishes "never sent / no body" from "omitted": the caller ASKED for a body
         # here, so silence would be the only reading left and it is the wrong one.
-        return j.field "last_response_body_absent", true if body.nil? || body.empty?
+        if body.nil? || body.empty?
+          j.field "last_response_body_absent", true
+          return
+        end
 
         decoded, note = Proxy::Codec::ContentDecode.decode(head, body)
         bytes = decoded || body
+        more = %(get_response_body_chunk(repeater_id: #{r.id}, part: "response", offset: …))
+        if t = tally
+          bytes = redacted_message(head, body, t)
+          more = nil # the chunk tool pages the stored, unredacted bytes
+        end
         text = String.new(bytes)
         emit_capped_text(j, "last_response_body", text,
-          raw: bytes, include_sensitive: include_sensitive,
-          read_more: %(get_response_body_chunk(repeater_id: #{r.id}, part: "response", offset: …)),
-          cap: cap)
+          raw: bytes, include_sensitive: include_sensitive, read_more: more, cap: cap)
         j.field "last_response_body_representation", decoded ? "decoded" : "raw"
         j.field "last_response_body_decode_note", note if note
         # `emit_capped_text` names a cursor only when it CUT. A body that fits but is not
         # UTF-8 was still altered — scrubbed — and the caller needs the same pointer to read
         # the bytes as bytes.
-        unless text.valid_encoding? || text.bytesize > cap
-          j.field "last_response_body_read_more",
-            %(get_response_body_chunk(repeater_id: #{r.id}, part: "response", offset: …))
+        if more && !text.valid_encoding? && text.bytesize <= cap
+          j.field "last_response_body_read_more", more
+        end
+      end
+
+      # A Repeater buffer through the body profile, or nil when the profile left it alone. The
+      # head is framed as the TUI sends it first — a typed line ends in a bare LF, and
+      # `Wire.wire` finds no body without a CRLF blank line — and the sanitized copy is used
+      # only when it changed something, because its head is reframed (Content-Length rewritten,
+      # a transfer coding undone) and this text is what an agent edits and writes back.
+      private def redacted_wire(text : String, tally : BodyTally) : String?
+        clean, result, decoded = Redact::Wire.wire(String.new(Env.normalize_wire(text)), tally.matcher)
+        return unless result.redacted? || result.withheld?
+        tally.bodies += result.count
+        tally.decoded = true if decoded
+        clean
+      end
+
+      # A stored response body as `get_flow` shows it under the profile: sanitized, and a
+      # transfer that failed to decode withheld whole rather than a half-inflated prefix. Not a
+      # `transfer_decoded`: the head this tool shows beside it is the stored one, not reframed.
+      private def redacted_message(head : Bytes?, body : Bytes, tally : BodyTally) : Bytes
+        clean = Redact::Wire.message(head, body, tally.matcher)
+        tally.bodies += clean.count
+        clean.body || Bytes.empty
+      end
+
+      # What the body profile did across one `get_repeater_context` answer: the counts and the
+      # transfer flag its `body_redaction` reports, gathered from every emitter it passes.
+      private class BodyTally
+        getter matcher : Redact::Matcher
+        property bodies = 0
+        property ws_frames = 0
+        property? decoded = false
+
+        def initialize(@matcher)
+        end
+
+        def note : Serialize::RedactionNote
+          Serialize::RedactionNote.new(@matcher.profile.name, @bodies, @ws_frames, decoded?)
         end
       end
 
@@ -510,12 +593,13 @@ module Gori
       # running redact_head over those two text fields; every other field (summary, status,
       # ws payloads-as-body, timings) passes through unchanged. With include_sensitive the blob
       # is emitted verbatim, matching the sessions policy and the sensitive_headers_redacted flag.
-      private def emit_tui_repeater(j : JSON::Builder, repeater : JSON::Any, include_sensitive : Bool) : Nil
+      private def emit_tui_repeater(j : JSON::Builder, repeater : JSON::Any, include_sensitive : Bool,
+                                    tally : BodyTally?) : Nil
         if include_sensitive
           j.field "tui_repeater", repeater
           return
         end
-        j.field("tui_repeater") { redact_tui_repeater(j, repeater, nil) }
+        j.field("tui_repeater") { redact_tui_repeater(j, repeater, nil, tally) }
       end
 
       # Re-emit the repeater snapshot with redaction. The raw-HTTP-text fields
@@ -524,16 +608,137 @@ module Gori
       # redact_head over any string reached under one of those keys, at any depth — a
       # top-level-only pass would miss the nested request and leak its headers. Everything
       # else passes through verbatim.
-      private def redact_tui_repeater(j : JSON::Builder, value : JSON::Any, key : String?) : Nil
+      private def redact_tui_repeater(j : JSON::Builder, value : JSON::Any, key : String?,
+                                      tally : BodyTally?) : Nil
         if (key == "request" || key == "upgrade_request") && (s = value.as_s?)
+          s = tally.try { |t| redacted_wire(s, t) } || s
           j.string Serialize.redact_head(s, false)
+        elsif key == "messages" && (s = value.as_s?) && (t = tally) && (result = t.matcher.body(s.to_slice)).redacted?
+          # The WebSocket tab's outgoing-frame editor, sanitized as the stored frames are.
+          t.ws_frames += result.count
+          j.string result.text
         elsif obj = value.as_h?
-          j.object { obj.each { |k, v| j.field(k) { redact_tui_repeater(j, v, k) } } }
+          j.object { obj.each { |k, v| j.field(k) { redact_tui_repeater(j, v, k, tally) } } }
         elsif arr = value.as_a?
-          j.array { arr.each { |v| redact_tui_repeater(j, v, nil) } }
+          j.array { arr.each { |v| redact_tui_repeater(j, v, nil, tally) } }
         else
           value.to_json(j)
         end
+      end
+
+      # How old a `ui_state` row has to be before a live window is worth explaining (see the
+      # freshness note). A minute: shorter and every ordinary pause earns a sentence.
+      STILL_WATCHING_SECONDS = 60
+
+      # The gori TUI windows attached to this project's database, or nil when this server
+      # cannot look at all (`--db :memory:`, an unbound start, a spec harness that passed no
+      # path). nil and empty are different answers and both reach the payload as such — the
+      # same rule `holds_capture` follows, where a guessed `false` would be a claim.
+      #
+      # Kind-filtered by DIRECTORY (`AgentPresence::KIND_TUI`), which matters: this very
+      # process announces its own `mcp` marker the moment it binds, so an unfiltered read is
+      # never empty and would report a live TUI in every session forever.
+      private def live_tui_windows : Array(AgentPresence::Entry)?
+        path = @db_path
+        return nil if path.nil? || path.empty?
+        AgentPresence.live(path, kind: AgentPresence::KIND_TUI)
+      end
+
+      # When the view last MOVED, and — only when it needs explaining — what an old timestamp
+      # under a live window actually means.
+      private def emit_recorded_at(j : JSON::Builder, parsed : JSON::Any,
+                                   windows : Array(AgentPresence::Entry)?) : Nil
+        rec = parsed["recorded_at"]?.try(&.as_i64?)
+        return if rec.nil?
+        j.field "recorded_at", rec
+        # A corrupt/out-of-range recorded_at must not sink the whole tool: Time.unix_ms raises
+        # on out-of-range, so guard it — keep the raw value, drop the derived fields.
+        iso = begin
+          Time.unix_ms(rec).to_rfc3339
+        rescue
+          return
+        end
+        age = (Time.utc.to_unix_ms - rec) // 1000
+        j.field "recorded_at_iso", iso
+        j.field "age_seconds", age
+        # The marker and this timestamp answer DIFFERENT questions and neither corrects the
+        # other: one says a window is attached, the other says when the view last MOVED — and
+        # the TUI records only on change. So a live window over an old row means the operator
+        # has not moved, which is the opposite of stale. Said as a note; `age_seconds` itself
+        # is never massaged.
+        return unless age > STILL_WATCHING_SECONDS && windows && !windows.empty?
+        j.field "freshness_note",
+          "a gori TUI is attached right now, and this row is old only because the TUI records " \
+          "when the view MOVES — the operator has been sitting on this one, not away from it"
+      end
+
+      # Why there is no view to report. A window that is attached but has not published one
+      # (just opened, or sitting on a tab that publishes nothing) is a different state from a
+      # project the TUI has never been pointed at — and before #1091 both came out as the
+      # latter, which is a claim rather than an absence.
+      private def no_ui_state_note(raw : String?, windows : Array(AgentPresence::Entry)?) : String
+        return "Recorded UI state was unreadable." unless raw.nil?
+        return "A gori TUI is attached to this project but has not recorded a view yet." if windows && !windows.empty?
+        "No UI state recorded for this project — the gori TUI may not have run against it."
+      end
+
+      private def emit_tui_presence(j : JSON::Builder, windows : Array(AgentPresence::Entry)?) : Nil
+        j.field("tui") do
+          j.object do
+            if windows.nil?
+              # Not `live:false`: "I cannot see" and "nobody is there" are different, and only
+              # one of them is safe to act on.
+              j.field "unknown", true
+              j.field "note", "this server has no database path to look beside, so it cannot tell whether a TUI is open"
+              next
+            end
+            j.field "live", !windows.empty?
+            j.field "windows", windows.size
+            windows.each do |w|
+              next unless w.holds_capture
+              j.field "holds_capture", true
+              w.pid.try { |p| j.field "pid", p }
+              break
+            end
+            if windows.size > 1
+              j.field "note",
+                "#{windows.size} gori TUI windows are attached to this project and they share ONE " \
+                "ui_state row (the window holding capture wins, and a view-only window takes it " \
+                "over after a minute of the holder not moving) — this selection may belong to the " \
+                "other window"
+            end
+          end
+        end
+      end
+
+      # Name the call that turns a selection into data. Only this side knows the tool names,
+      # and only History has a one-call form — saying so beats an agent discovering it by
+      # calling `get_flow` two hundred times.
+      private def emit_selection_next_call(j : JSON::Builder, selection : JSON::Any) : Nil
+        kind = selection.as_h?.try { |o| o["kind"]?.try(&.as_s?) }
+        note =
+          case kind
+          when "flow"
+            "list_history{ids: selection.ids} returns them all in one call, in this order"
+          when "issue"
+            "get_issue{id} per id in selection.ids (there is no batch form)"
+          when "sitemap_node"
+            "these are SITEMAP NODES, not flow ids — each is a {host, path}. " \
+            "list_history{query: \"host:H path:P\"} reaches the traffic behind one; " \
+            "list_sitemap{query: \"host:H\"} reads the node"
+          when "intercept_item"
+            if serves?("intercept_get")
+              intercept_note = "intercept_get{item_id} per id in selection.ids, valid only while the hold lasts"
+              intercept_note += " (intercept_list says whether the bridge is still live)" if serves?("intercept_list")
+              intercept_note
+            elsif serves?("intercept_list")
+              "intercept_get is not exposed; intercept_list can show this item's preview and metadata, " \
+              "but full detail is unavailable"
+            else
+              "intercept_get is not exposed by this server; this held item cannot be read through MCP"
+            end
+          end
+        j.field "selection_next_call", note if note
       end
 
       private def parse_ui_state : JSON::Any?
@@ -559,33 +764,60 @@ module Gori
 
         tool j, "project_info",
           "Project totals: flow count, issue count, captured bytes, earliest capture time, " \
+          "the operator's project `description` (what this engagement is for — the one call " \
+          "that reads back what create_project stored), " \
           "plus which project/db is being served and how it was selected. When unbound " \
-          "(bound:false), call list_projects / create_project / switch_project first. " \
+          "(bound:false), #{project_recovery}. " \
+          "This is the LIVE binding, and it overrides the server instructions — those " \
+          "describe the binding as of the call that produced them and no switch_project " \
+          "updates them. " \
           "Always verify this before reading or mutating security-test data." { }
 
         tool j, "get_current_context",
-          "What the user is currently viewing in the gori TUI: active tab, focused pane, the " \
-          "History-selected flow id (only when on the History tab), and sub-tab index — so you " \
-          "can act on \"what I'm looking at right now\" without the user pasting ids. Reflects an " \
-          "open (or last-open) gori TUI for THIS project. `age_seconds` shows how long since the " \
-          "TUI last recorded focus (there is no live-TUI heartbeat) — use it to judge freshness; " \
-          "`available:false` means the TUI never ran against this project." { }
+          "What the operator is looking at in the gori TUI — and WHAT THEY HAVE SELECTED, so " \
+          "\"do X with the rows I marked\" is one call instead of a request to paste ids. " \
+          "Reports the active tab, focused pane, sub-tab index and the History-selected flow id, " \
+          "plus — on the four list tabs (History, Issues, Sitemap, Intercept) — a `selection` " \
+          "block. `selection.ids` is the set every TUI batch verb would act on: the MARKED rows " \
+          "when any are marked, else the ONE row under the cursor, else the flow an open detail " \
+          "pins; `target_source` says which of the three, so do not re-derive that rule. " \
+          "`selection_next_call` names the available tool that turns them into data, or says " \
+          "when a required follow-up is not exposed — only History has a one-call form " \
+          "(`list_history{ids}`). SITEMAP SELECTS (host, path) PAIRS, not flow ids: " \
+          "it reports `nodes` and no `ids` at all, which is what `kind` is there to tell you. " \
+          "`truncated` is the ONLY signal that the array was cut, and a partial list is not a " \
+          "safe thing to act on. Do not infer it from `marked_count`, which describes the MARK " \
+          "SET and is reported even when `target_source` overrides it: with a drill-in open you " \
+          "get one id beside `marked_count:4` and nothing was cut. `marked_hidden_count` is " \
+          "marks the operator's own filter is hiding. " \
+          "`marked_subtabs` are CHIP NUMBERS on a sub-tab strip, which shift whenever a session " \
+          "is created, deleted or moved — cross-reference them through get_repeater_context " \
+          "before acting. `marks_elsewhere` names tabs holding marks this `selection` does not " \
+          "carry — each row is a `tab` plus a count, and a `kind` only where those marks have " \
+          "one (a sub-tab strip's do not). " \
+          "`tui.live` says a gori TUI window is attached to this project's database and " \
+          "`tui.windows` how many (two windows share ONE state row, so a selection may be the " \
+          "other one's). It is evidence, not proof: when this server cannot look you get " \
+          "`tui.unknown` rather than a false. `recorded_at`/`age_seconds` are when the view last " \
+          "MOVED — the TUI records on change, so an old timestamp under a live window means the " \
+          "operator is sitting still, not that this is stale. `available:false` means no TUI has " \
+          "published a view for this project yet." { }
 
         tool j, "get_repeater_context",
           "The Repeater workbench state. Defaults to metadata only so request headers, WebSocket " \
           "payloads, response headers, and the live TUI editor snapshot are not copied into the " \
           "model context. Set include_content=true only when those bytes are necessary. Supports " \
-          "single-id lookup, pagination, and filtering. Every session reports BOTH ids: 'db_id', " \
-          "which every repeater tool takes, and 'tui_index', the 1-based number the TUI paints on " \
-          "its sub-tab chip — the number the operator says out loud. tui_index shifts whenever a " \
-          "session is created, deleted or moved, so read it fresh; db_id is the durable address." do |s|
+          "single-id lookup, pagination, and filtering. Every session reports BOTH ids: 'id' (also " \
+          "as 'db_id'), which every repeater tool takes, and 'tui_index', the 1-based number the TUI " \
+          "paints on its sub-tab chip — the number the operator says out loud. tui_index shifts " \
+          "whenever a session is created, deleted or moved, so read it fresh; id is the durable address." do |s|
           s.field "id", intprop("return one repeater DATABASE id (not a tui_index)")
-          s.field "limit", intprop("max rows to return (default 50, max 500)")
+          s.field "limit", limitprop("max rows to return", REPEATER_CONTEXT_LIMIT)
           s.field "offset", intprop("start row (default 0)")
           s.field "query", strprop("case-insensitive SUBSTRING match over a session's name, target URL and stored request bytes. For a field query (tags, host, method, last status) use 'filter' — both may be passed and both must match")
           s.field "filter", strprop("the same sub-tab filter language the TUI's `/` takes, matched in memory: #{Repeater::SubtabFilter::FIELDS.map { |f| "#{f}:" }.join(" ")}, `-` before a term negates it, and a bare word searches name/summary/target/tags. `status:` is the LAST send's outcome as one token — a code (`status:404`, and `status:4` matches every 4xx by prefix), `status:error`, or `status:unsent`. ANDed with 'query' when both are given")
           s.field "include_content", boolprop("include request text, WebSocket payloads, response head, the env-binding shape of each credential header, and the live TUI repeater snapshot (default false; may expose secrets)")
-          s.field "include_sensitive", boolprop("with include_content, return Authorization/Cookie/Set-Cookie/API-key header values instead of [REDACTED] (default false)")
+          s.field "include_sensitive", boolprop("with include_content, return Authorization/Cookie/Set-Cookie/API-key header values instead of [REDACTED], and bodies without the project's default redaction profile (default false)")
           s.field "include_response_body", boolprop("also inline each session's stored last response BODY, decoded and capped (default false). Its own BLOB read per row, so it is hydrated for the first #{MCP_REPEATER_BODY_ROWS} rows of a page and the rest are reported as omitted — pass 'id' or narrow with 'filter' to read one. Page past the cap with get_response_body_chunk")
           s.field "max_body_bytes", intprop("cap for each inlined response body (default #{MCP_REPEATER_BODY_DEFAULT}, max #{MCP_REPEATER_BODY_MAX})")
         end

@@ -54,6 +54,7 @@ module Gori
     enum Channel
       Homebrew
       Snap
+      Chocolatey
       Pacman
       Deb
       Rpm
@@ -103,6 +104,32 @@ module Gori
       raise Error.new("#{what}: #{ex.message.presence || ex.class}")
     end
 
+    # io_guard for an HTTP exchange, which fails in one more way than plain I/O: when
+    # what answered does not speak HTTP (a captive portal, a TLS-terminating middlebox,
+    # a port running something else), stdlib's response parser raises a BARE
+    # `Exception` ("Invalid HTTP response", "Unsupported HTTP version", "Invalid HTTP
+    # status code") and conflicting Content-Length headers raise an `ArgumentError`.
+    # Those are the server's bytes, not a bug of ours, yet they backtraced out of
+    # `gori update`. So is a body that claims gzip/deflate encoding and is not (the
+    # API fetch leaves stdlib's decompression on). Matched on the exact class, so a
+    # subclass still gets its trace.
+    private def self.http_guard(what : String, &)
+      io_guard(what) { yield }
+    rescue ex
+      unless ex.class.in?(Exception, ArgumentError, Compress::Gzip::Error, Compress::Deflate::Error)
+        raise ex
+      end
+      raise Error.new("#{what}: #{ex.message.presence || ex.class}")
+    end
+
+    # A redirect that would carry an https download onto plain http. Refused rather
+    # than followed: on the redirect fallback there may be no checksum at all, and
+    # then the transport is the only thing standing between the operator and a binary
+    # any on-path host could have swapped.
+    def self.https_downgrade?(from : String, to : String) : Bool
+      from.downcase.starts_with?("https://") && !to.downcase.starts_with?("https://")
+    end
+
     # `URI.parse` on a NETWORK-supplied string. Every URL this module parses past the first
     # one comes from the release JSON (`browser_download_url`) or a `Location` header, and
     # `URI.parse` raises on both a malformed authority (`URI::Error`) and an out-of-range
@@ -118,9 +145,19 @@ module Gori
     # A `Location` header resolved against the URL it came from. Absolute targets pass
     # through; a relative one is resolved, which PARSES the server-supplied value and so
     # carries the same raise surface `parse_url` guards — wrapped rather than left bare.
+    #
+    # Also where an https download is kept on https (see https_downgrade?): every
+    # redirect target passes through here, absolute or resolved.
     private def self.resolve_redirect(url : String, location : String) : String
-      return location if location.starts_with?("http://") || location.starts_with?("https://")
-      parse_url(url, "invalid download URL: #{url}").resolve(location).to_s
+      target = if location.starts_with?("http://") || location.starts_with?("https://")
+                 location
+               else
+                 parse_url(url, "invalid download URL: #{url}").resolve(location).to_s
+               end
+      if https_downgrade?(url, target)
+        raise Error.new("refusing to follow a redirect from #{url} to plain http: #{target}")
+      end
+      target
     rescue ex : URI::Error | OverflowError
       raise Error.new("invalid redirect target #{location.inspect} from #{url}: #{ex.message.presence || ex.class}")
     end
@@ -208,8 +245,8 @@ module Gori
       nil
     end
 
-    # Stand-in for the API payload, built from a tag alone, so the redirect path
-    # can reuse parse_release/resolve_asset_from_json unchanged. Asset names are
+    # Stand-in for the API's release, built from a tag alone, so the redirect path
+    # can reuse select_asset/resolve_asset unchanged. Asset names are
     # derived exactly as release-binary.yml builds them. Digests come from the
     # release's SHA256SUMS when it has them; without one verify_sha256! no-ops, so
     # the caller warns that the checksum check was skipped (see update_binary).
@@ -219,10 +256,10 @@ module Gori
     # When that guess is wrong the versioned name 404s and the alias — which
     # carries no version to get wrong — is the one name still worth trying, so it
     # has to already be in the list the retry looks through.
-    def self.synthesize_release_json(tag : String, os : String = current_os,
-                                     arch : String = current_arch,
-                                     digest : String? = nil,
-                                     alias_digest : String? = nil) : String
+    def self.synthesize_release(tag : String, os : String = current_os,
+                                arch : String = current_arch,
+                                digest : String? = nil,
+                                alias_digest : String? = nil) : Release
       entries = [] of {String, String?}
       entries << {asset_name(tag, os, arch), digest}
       # Guarded: alias_asset_name shares asset_name's unsupported-OS raise, and
@@ -230,22 +267,9 @@ module Gori
       if alias_name = (alias_asset_name(os, arch) rescue nil)
         entries << {alias_name, alias_digest}
       end
-      JSON.build do |json|
-        json.object do
-          json.field "tag_name", tag
-          json.field "assets" do
-            json.array do
-              entries.each do |(name, hex)|
-                json.object do
-                  json.field "name", name
-                  json.field "browser_download_url", "#{DOWNLOAD_BASE}/#{tag}/#{name}"
-                  json.field "digest", "sha256:#{hex}" if hex
-                end
-              end
-            end
-          end
-        end
-      end
+      Release.new(tag, entries.map do |(name, hex)|
+        Asset.new(name, "#{DOWNLOAD_BASE}/#{tag}/#{name}", digest: hex.try { |h| "sha256:#{h}" })
+      end)
     end
 
     # {asset name => sha256} from the release's SHA256SUMS, empty when the release
@@ -271,25 +295,32 @@ module Gori
       {} of String => String
     end
 
-    # fetch_latest_release_json, but when GitHub refuses (rate limit, outage) it
-    # names the release through the redirect endpoint instead. Returns the JSON
-    # and whether it came from that fallback, so the caller can say so.
+    # fetch_latest_release_json, parsed, but when GitHub refuses (rate limit,
+    # outage) it names the release through the redirect endpoint instead. Returns
+    # the release and, when it came from that fallback, why the API was passed
+    # over (nil otherwise), so the caller can say so. Only the FETCH falls back:
+    # a body that does not parse is reported as itself.
     #
     # Falls back on any fetch error rather than only 403: resolve_tag_via_redirect
     # validates its own answer, so a genuine "no releases" still surfaces the
-    # original error instead of being papered over.
-    def self.fetch_latest_release_json_with_fallback(api_url : String? = nil, *,
-                                                     timeout : Time::Span = HTTP_TIMEOUT) : {String, Bool}
-      {fetch_latest_release_json(api_url, timeout: timeout), false}
-    rescue ex
-      raise ex unless default_api?(api_url)
-      tag = resolve_tag_via_redirect(timeout)
-      raise ex unless tag
-      sums = fetch_checksums(tag)
-      alias_name = (alias_asset_name(current_os, current_arch) rescue nil)
-      {synthesize_release_json(tag,
-        digest: sums[asset_name(tag, current_os, current_arch)]?,
-        alias_digest: alias_name.try { |n| sums[n]? }), true}
+    # original error instead of being papered over. Which is also why the reason
+    # travels back: a rejected token or a TLS failure is worth knowing about even
+    # when the update went through anyway.
+    def self.fetch_latest_release_with_fallback(api_url : String? = nil, *,
+                                                timeout : Time::Span = HTTP_TIMEOUT) : {Release, String?}
+      json = begin
+        fetch_latest_release_json(api_url, timeout: timeout)
+      rescue ex
+        raise ex unless default_api?(api_url)
+        tag = resolve_tag_via_redirect(timeout)
+        raise ex unless tag
+        sums = fetch_checksums(tag)
+        alias_name = (alias_asset_name(current_os, current_arch) rescue nil)
+        return {synthesize_release(tag,
+          digest: sums[asset_name(tag, current_os, current_arch)]?,
+          alias_digest: alias_name.try { |n| sums[n]? }), ex.message.presence || ex.class.to_s}
+      end
+      {parse_release(json), nil}
     end
 
     # Maps a non-200 releases-API status onto the error we surface. Split out of
@@ -329,7 +360,7 @@ module Gori
         HttpTransport.client(uri, connect_timeout: timeout, read_timeout: timeout)
       end
       begin
-        response = io_guard("could not reach #{host}") do
+        response = http_guard("could not reach #{host}") do
           client.get(uri.request_target, headers: headers)
         end
         raise api_error(response.status_code, response.body) unless response.status_code == 200
@@ -353,6 +384,13 @@ module Gori
       client = io_guard("could not download #{url}") do
         HttpTransport.client(uri, connect_timeout: HTTP_TIMEOUT, read_timeout: HTTP_TIMEOUT)
       end
+      # The file is wanted byte for byte, as published. Left on, stdlib asks for gzip
+      # and transparently inflates any response that carries Content-Encoding, dropping
+      # Content-Length as it does — so the completeness check below silently stopped
+      # running, and a server that labels a .tar.gz as gzip-encoded handed us the
+      # inner tar: a size/sha256 failure at best, and on the redirect fallback, where
+      # neither may be known, an unpacked tar installed as the release.
+      client.compress = false
       begin
         # Capture result outside the HTTP block (block return is not always the method return).
         result = 0_i64
@@ -360,7 +398,7 @@ module Gori
         # Guards the whole streamed exchange, not just the connect: a reset or a
         # read timeout part-way through tens of MB is the commonest way this
         # fails, and it surfaces from inside the block.
-        io_guard("could not download #{url}") do
+        http_guard("could not download #{url}") do
           client.get(uri.request_target, headers: headers) do |response|
             code = response.status_code
             if {301, 302, 303, 307, 308}.includes?(code)
@@ -445,7 +483,14 @@ module Gori
       begin
         FileUtils.cp(source, tmp)
         File.chmod(tmp, 0o755)
-        File.rename(tmp, target)
+        {% if flag?(:win32) %}
+          replace_running_exe(tmp, target, dir)
+        {% else %}
+          File.rename(tmp, target)
+        {% end %}
+      rescue ex : Error
+        File.delete?(tmp)
+        raise ex # replace_running_exe's own account of where the old binary went
       rescue ex
         File.delete?(tmp)
         raise Error.new(
@@ -453,6 +498,27 @@ module Gori
           "(the binary already installed there was left untouched)"
         )
       end
+    end
+
+    # Windows will not rename over a running .exe, but it will rename the running one. So the
+    # old binary moves aside first and moves back if the new one cannot take its place. Then
+    # it is deleted if it can be; a running one cannot, and keeps the temp prefix so a later
+    # run's sweep deletes it once nothing runs it.
+    private def self.replace_running_exe(tmp : String, target : String, dir : String) : Nil
+      aside = File.join(dir, "#{INSTALL_TMP_PREFIX}old.#{Process.pid}.#{Random::Secure.hex(4)}")
+      File.rename(target, aside) if File.file?(target)
+      begin
+        File.rename(tmp, target)
+      rescue ex
+        begin
+          File.rename(aside, target) if File.exists?(aside)
+        rescue
+          raise Error.new("failed to install binary to #{target}: #{ex.message}, and the old binary " \
+                          "could not be moved back: it is at #{aside}; rename it to #{target}")
+        end
+        raise ex
+      end
+      File.delete?(aside) rescue nil
     end
 
     # Remove `.gori-update.*` siblings stranded by an interrupted run.
@@ -485,12 +551,18 @@ module Gori
     end
 
     # Crystal has no Dir.mktmpdir; create a unique dir under Dir.tempdir and clean up.
+    #
+    # The binary is downloaded and verified in here, then installed — often under
+    # sudo — so the directory has to be ours alone between those two steps. Hence a
+    # CSPRNG name and an exclusive 0700 `mkdir`: `File.tempname` draws from the
+    # non-cryptographic PRNG, and `mkdir_p` happily adopts a directory someone else
+    # created first in a shared /tmp, who could then swap the verified file out.
     private def self.with_tempdir(prefix : String, &)
-      dir = File.tempname(prefix, "")
+      dir = File.join(Dir.tempdir, "#{prefix}#{Random::Secure.hex(8)}")
       # A TMPDIR that has been removed, or points somewhere unwritable, is an
       # operator condition and gets a message like every other one.
       io_guard("could not create a temporary directory under #{File.dirname(dir)}") do
-        Dir.mkdir_p(dir)
+        Dir.mkdir(dir, 0o700)
       end
       begin
         yield dir
@@ -740,12 +812,12 @@ module Gori
                            release_json : String? = nil,
                            api_url : String? = nil,
                            force_progress : Bool = false) : Nil
-      json, via_redirect = if provided = release_json
-                             {provided, false}
-                           else
-                             fetch_latest_release_json_with_fallback(api_url)
-                           end
-      release = parse_release(json)
+      release, fallback_reason = if provided = release_json
+                                   {parse_release(provided), nil.as(String?)}
+                                 else
+                                   fetch_latest_release_with_fallback(api_url)
+                                 end
+      via_redirect = !fallback_reason.nil?
       ver = release.version
       local = normalize_version(VERSION)
 
@@ -759,7 +831,7 @@ module Gori
         return
       end
 
-      asset = resolve_asset_from_json(json, current_os, current_arch)
+      asset = resolve_asset(release, current_os, current_arch)
 
       # Fail fast on unsafe macOS layouts before downloading tens of MB.
       if asset_is_archive?(asset.name) && !supports_archive_lib_layout?(target_path)
@@ -781,8 +853,11 @@ module Gori
         )
       end
 
-      if via_redirect
-        io.puts "Note: the GitHub release API was unavailable (rate limit or outage);"
+      if fallback_reason
+        # The reason, not a guess at it: this used to say "rate limit or outage" for
+        # every failure, which hid a rejected token or a TLS problem behind an update
+        # that went through anyway, and left the operator nothing to act on.
+        io.puts "Note: the GitHub release API was unavailable: #{fallback_reason}"
         io.puts "      resolved #{display_version(release.tag_name)} from #{RELEASES_LATEST_URL} instead."
       end
 
@@ -821,7 +896,8 @@ module Gori
       path = exe_path || resolve_executable_path
       resolved_owner = owner || (system_package_path?(path) ? probe_package_owner(path) : OwnerResult::None)
       resolved_family = os_family || load_os_family
-      channel = detect_channel(path, owner: resolved_owner, os_family: resolved_family)
+      channel = detect_channel(path, owner: resolved_owner, os_family: resolved_family,
+        chocolatey_root: ENV["ChocolateyInstall"]?)
 
       io.puts "gori #{display_version(VERSION)}"
       io.puts "install channel: #{channel.to_s.downcase} (#{path})"

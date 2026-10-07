@@ -32,10 +32,13 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     }
     lo.on_remove = -> { remove_selected_link(lo) }
     # Runs after the shell has dropped this card (see Overlay#on_close). At most one of
-    # the two is armed: a source key sets pending_add, ↵/o sets `opening`, esc neither.
+    # the three is armed: a source key sets pending_add, `f` sets pending_freeze, ↵/o sets
+    # `opening`, esc none of them.
     lo.on_close = -> {
       if kind = lo.pending_add
         open_link_add_picker(lo, kind)
+      elsif lo.pending_freeze?
+        freeze_from_links_card(lo)
       elsif link = opening
         navigate_link_ref(link.ref_kind, link.ref_id)
       end
@@ -113,7 +116,13 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
 
   private def remove_selected_link(lo : LinksOverlay) : Nil
     return unless link = lo.selected_entity_link
-    @session.store.remove_link(link.id)
+    # By what the row LINKS, as MCP `remove_link` and `gori run links rm` do, not by its row id:
+    # `entity_links.id` is a rowid, so after a peer removed this link and added another, the
+    # id on screen can name the other one.
+    unless @session.store.remove_link(link.owner_kind, link.owner_id, link.ref_kind, link.ref_id)
+      @toast = "link NOT removed (project busy) — it is unchanged"
+      return
+    end
     lo.reload(@session.store)
     refresh_link_owners(lo.owner_kind, lo.owner_id)
     @toast = "link removed"
@@ -129,28 +138,41 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   end
 
   # ↵ on the link picker. The two create rows hand off — "+ New issue…" to the NEW ISSUE
-  # form, "+ New note…" to a blank note — and every other row takes the link directly.
+  # form, "+ New note…" to a blank note — and a note row takes the link directly.
   # A create row arms on_close rather than opening the next modal here, because that
   # modal claims @overlay and the shell's close would tear it straight back down;
   # on_close runs after the drop, so the hand-off is the last write (see Overlay).
-  private def link_picked(lp : LinkPicker, refs : Array({Store::LinkRefKind, Int64})) : Bool
+  #
+  # An ISSUE row rides on_close for the same reason (#1038): ↵ there freezes the refs that
+  # have an exchange, and a gate raises a confirm. The picker's own on_close (put the History
+  # drill-in back) is folded into that hand-off as `back`, so the operator still lands where
+  # they linked from. A note takes the pointer alone — a note owns no evidence.
+  private def link_picked(lp : LinkPicker, refs : Array({Store::LinkRefKind, Int64}),
+                          snaps : Array(LinkSnapshot)) : Bool
+    back = lp.on_close || -> { }
     if kind = lp.selected_create
       # The filter doubles as the new issue's title: type it, ↵, and the form is filled.
       typed = lp.query.strip
-      lp.on_close = kind.issue? ? -> { open_issue_form_for_link(refs, typed) } : -> { create_note_and_link(refs) }
+      lp.on_close = if kind.issue?
+                      -> { open_issue_form_freezing(refs, snaps, typed) }
+                    else
+                      -> { create_note_and_link(refs) }
+                    end
       return true
     end
     if row = lp.selected_row
-      if commit_links_to_owner(row.kind, row.id, refs) && refs.size == 1
+      # The toast names WHICH owner took the link, built from the owner's IDENTITY rather
+      # than the row's display label — `3:` there is a sub-tab position, not an id.
+      case row.kind
+      in .issue?
+        issue_id, owner = row.id, "issue ##{row.id}: #{link_title_snip(row.name)}"
+        lp.on_close = -> { link_and_freeze(issue_id, owner, snaps, back) }
+      in .note?
         # commit_links_to_owner already reported the counts for a batch; the single case
-        # names WHICH owner took the link. One list now holds both kinds, so a bare
-        # "linked" no longer says what was picked. Built from the owner's IDENTITY, not
-        # from the row's display label — `3:` there is a sub-tab position, not an id.
-        owner = case row.kind
-                in .issue? then "issue ##{row.id}: #{link_title_snip(row.name)}"
-                in .note?  then "note #{link_title_snip(row.name)}"
-                end
-        @toast = "linked to #{owner}"
+        # names the note.
+        if commit_links_to_owner(row.kind, row.id, refs) && refs.size == 1
+          @toast = "linked to note #{link_title_snip(row.name)}"
+        end
       end
     end
     true
@@ -161,7 +183,11 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   # pending link with it; nothing is parked on the Runner. `typed` is whatever was in the
   # filter box, and it WINS over the flow-derived title: the operator naming the issue is
   # more specific than "GET /path".
-  private def open_issue_form_for_link(refs : Array({Store::LinkRefKind, Int64}), typed : String = "") : Nil
+  #
+  # `snapshots` (#1038) are the copies taken before the form opened — by the link picker, or
+  # by History's Add issue; the form writes them once the issue exists.
+  private def open_issue_form_for_link(refs : Array({Store::LinkRefKind, Int64}), typed : String = "",
+                                       snapshots : Array(Evidence::Snapshot) = [] of Evidence::Snapshot) : Nil
     ref = refs.first
     # The form's own fields describe ONE flow (title/host/evidence); the rest of a marked
     # set rides along as extra_flow_ids and is linked after the insert (#442).
@@ -170,11 +196,11 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
       if row = @session.store.flow_row(ref[1])
         title = typed.empty? ? "#{row.method} #{row.target}" : typed
         open_issue_form(IssueForm.new(title, row.host, ref[1],
-          link_ref: ref, extra_flow_ids: extra))
+          link_ref: ref, extra_flow_ids: extra, snapshots: snapshots))
         return
       end
     end
-    open_issue_form(IssueForm.new(typed, link_ref: ref, extra_flow_ids: extra))
+    open_issue_form(IssueForm.new(typed, link_ref: ref, extra_flow_ids: extra, snapshots: snapshots))
   end
 
   # Blank note + link the workbench ref(s), then ask open vs stay. Reached from the link
@@ -190,44 +216,30 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     offer_open_created(:note, note_id)
   end
 
-  # After create-and-link from a workbench picker: offer to jump to the new
-  # owner, or stay on the caller tab. Default selection is stay (cancel) so a
-  # reflexive ↵ doesn't yank focus away mid-recon.
+  # After create-and-link a NOTE from a workbench picker: offer to jump to it, or stay on the
+  # caller tab. Default selection is stay (cancel) so a reflexive ↵ doesn't yank focus away
+  # mid-recon.
+  #
+  # The ISSUE half of this is gone (#F19). An issue filed by hand is read next in ~every case,
+  # so that path stopped asking: `Runner#open_filed_issue` opens the new issue's detail and the
+  # toast names the way back. A note is different in kind — it is a place to WRITE, filed
+  # mid-recon and returned to later — so the question is still a real one here.
   private def offer_open_created(kind : Symbol, id : Int64) : Nil
-    # Drop whatever raised this BEFORE the confirm goes up. The issue path arrives from
-    # inside the NEW ISSUE form's own on_commit, so `confirm` would otherwise capture
-    # that form as its `parent` and restore it on close — landing "stay" back on a
-    # filled-in create form for the issue that was just created, where a reflexive ↵
-    # files a duplicate. The note path already gets here with nothing held (it runs from
-    # the picker's on_close), so this is a no-op there.
+    # Drop whatever raised this BEFORE the confirm goes up, so the card's `parent` is not a
+    # modal that would be restored under "stay".
     leave_overlay
+    # The card carries the standing toast as its first line, because the status row no longer
+    # can: while a confirm is up that row holds the card's KEYS (see `Runner#status_line`).
+    news = @toast
     case kind
-    when :issue
-      confirm("ISSUE CREATED",
-        "issue ##{id} created and linked.\nOpen it now, or stay here?",
-        confirm_label: "open", cancel_label: "stay", danger: false) do
-        navigate_to_created_issue(id)
-      end
     when :note
       confirm("NOTE CREATED",
-        "note created and linked.\nOpen it now, or stay here?",
+        "#{news || "note created and linked."}\nOpen it now, or stay here?",
         confirm_label: "open", cancel_label: "stay", danger: false) do
         navigate_to_created_note(id)
       end
     else
       @overlay = OverlayKind::None
-    end
-  end
-
-  private def navigate_to_created_issue(id : Int64) : Nil
-    @active_tab = :issues
-    @focus = :body
-    @overlay = OverlayKind::None
-    if issues_controller.view.open_by_id(@session.store, id)
-      @toast = "opened issue ##{id}"
-    else
-      issues_controller.view.reload(@session.store)
-      @toast = "issue ##{id} created"
     end
   end
 
@@ -341,12 +353,14 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     doc.notes.each_with_index do |entry, i|
       # "untitled", not "note N": `name` is what the toast says after the kind word, and
       # that fallback rendered as "linked to note note 1".
-      name = Notes.title(entry.text) || "untitled"
-      # The BODY's first line, not the note's — line one is the title, and echoing it in
-      # the detail column just prints every note's name twice.
-      body = entry.text.lines.map(&.strip).reject(&.empty?)
+      # The line AFTER the title's, not "line two" — `Notes.title` may take a LATER line
+      # (a first line that is a bare "#" heads nothing), and re-deriving "line one is the
+      # title" here printed every such note's name twice, in both columns. `title_and_detail`
+      # answers both from the one scan that knows which line it used.
+      raw_title, detail = Notes.title_and_detail(entry.text)
+      name = raw_title || "untitled" # not "note N": the toast reads "linked to note <name>"
       rows << LinkPicker::Row.new(Store::LinkOwnerKind::Note, entry.id, "#{i + 1}:#{name}",
-        name, body.size > 1 ? body[1] : "")
+        name, detail)
     end
     rows
   end

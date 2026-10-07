@@ -13,12 +13,24 @@ module Gori
     PROBE_COLS = "id, code, category, host, title, severity, status, hit_count, affected, " \
                  "sample_flow_id, evidence, first_seen, last_seen, sample_repeater_id"
 
+    # PROBE_COLS with `affected` replaced by its element count — the `ProbeIssueRow` shape.
+    # Guarded so a row whose JSON will not parse counts 0 (what `parse_affected` answers for it)
+    # instead of `json_array_length` raising and failing the whole list read. One knowing
+    # difference: a well-formed array of NON-strings (never written by gori — a foreign or
+    # corrupt row) counts its elements, where the full parse answers []. Checking every element's
+    # type in SQL tripled the read's cost to cover a row nothing produces.
+    PROBE_ROW_COLS = "id, code, category, host, title, severity, status, hit_count, " \
+                     "CASE WHEN json_valid(affected) AND json_type(affected) = 'array' " \
+                     "THEN json_array_length(affected) ELSE 0 END, " \
+                     "sample_flow_id, evidence, first_seen, last_seen, sample_repeater_id"
+
     # Group-merge upsert keyed by (code, host): a read-modify-write run INSIDE the writer
     # closure (atomic — the writer is the only writer), which a plain ON CONFLICT can't do
     # because it must dedup+cap the affected-URL JSON and raise severity to the max seen.
     # No-op when (code, host) is in probe_suppressions (hard-deleted this project).
     def upsert_probe_issue(d : Probe::Detection) : Nil
       upsert_probe_issues(StaticArray[d])
+      nil
     end
 
     # The same upsert for a whole scan's worth of detections, in ONE writer round-trip.
@@ -38,13 +50,17 @@ module Gori
     #
     # `probe_generation` bumps once per batch instead of once per detection, which is also what
     # the Probe tab wants — see the repaint-rate note at tui/runner.cr.
-    def upsert_probe_issues(ds : Indexable(Probe::Detection)) : Nil
-      return if ds.empty?
+    #
+    # Answers whether the batch COMMITTED (true for an empty one): the live Analyzer ignores it,
+    # but a headless `probe_scan{persist}` reports it, since "persisted" over a rolled-back
+    # batch would send an agent to triage rows that are not there.
+    def upsert_probe_issues(ds : Indexable(Probe::Detection)) : Bool
+      return true if ds.empty?
       # One timestamp for the batch: these detections are one observation of one flow, and
       # spreading now_us across them would only add microseconds of skew to first/last_seen.
       ts = now_us
       wrote = false
-      exec_task ->(c : DB::Connection) {
+      ok = exec_task_ok ->(c : DB::Connection) {
         ds.each do |d|
           if c.query_one?("SELECT 1 FROM probe_suppressions WHERE code = ? AND host = ?",
                d.code, d.host, as: Int64)
@@ -55,8 +71,7 @@ module Gori
             d.code, d.host, as: {Int64, String, Int32, String?, String})
           if existing
             id, aff_json, sev, prev_evidence, prev_title = existing
-            urls = parse_affected(aff_json)
-            urls << d.url if !urls.includes?(d.url) && urls.size < PROBE_AFFECTED_CAP
+            new_aff = merged_affected(d.code, d.host, aff_json, d.url)
             new_sev = sev > d.severity.value ? sev : d.severity.value
             # Keep the title in sync with the highest-severity observation: a code whose title
             # is severity-dependent (reflected_param: HTML ⇒ Medium "Reflected parameter" vs
@@ -69,9 +84,15 @@ module Gori
             # isn't masked by the first-wins COALESCE. Other codes keep their first
             # representative sample.
             new_evidence = Store.accumulate_evidence?(d.code) ? Store.merge_evidence(prev_evidence, d.evidence) : (prev_evidence || d.evidence)
-            c.exec("UPDATE probe_issues SET hit_count = hit_count + 1, affected = ?, severity = ?, " \
-                   "title = ?, evidence = ?, last_seen = ? WHERE id = ?",
-              urls.to_json, new_sev, new_title, new_evidence, ts, id)
+            if new_aff
+              c.exec("UPDATE probe_issues SET hit_count = hit_count + 1, affected = ?, severity = ?, " \
+                     "title = ?, evidence = ?, last_seen = ? WHERE id = ?",
+                new_aff, new_sev, new_title, new_evidence, ts, id)
+            else # `affected` would be written back byte for byte — see `merged_affected`
+              c.exec("UPDATE probe_issues SET hit_count = hit_count + 1, severity = ?, " \
+                     "title = ?, evidence = ?, last_seen = ? WHERE id = ?",
+                new_sev, new_title, new_evidence, ts, id)
+            end
           else
             # OR IGNORE: this is a SELECT-then-INSERT across a transaction, so a peer process that
             # inserted the same (code, host) in between would land on the table\'s UNIQUE — and a
@@ -88,7 +109,8 @@ module Gori
         end
         nil
       }
-      bump_probe_generation if wrote # after commit (exec_task blocks until writer replies)
+      bump_probe_generation if wrote && ok # after commit (exec_task_ok blocks until the writer replies)
+      ok
     end
 
     # Codes whose evidence is a TYPE LABEL drawn from a small vocabulary (a secret kind, an
@@ -161,6 +183,27 @@ module Gori
       list
     rescue
       [] of ProbeIssue # never crash the run loop over a read
+    end
+
+    # Every finding, in `probe_issues`' order, WITHOUT the affected-URL lists: the Probe tab's
+    # list read. Whole for the reasons `ProbeView#reload` gives (its lenses, filter and tallies
+    # run over the full set), but no longer paying a JSON parse of up to PROBE_AFFECTED_CAP URLs
+    # per row for a list that only draws the count — at 5k findings x 50 URLs that parse was
+    # ~90% of a reload. A caller that needs the URLs reads one row with `get_probe_issue`.
+    def probe_issue_rows : Array(ProbeIssueRow)
+      list = [] of ProbeIssueRow
+      @db.query("SELECT #{PROBE_ROW_COLS} FROM probe_issues ORDER BY severity DESC, last_seen DESC") do |rs|
+        rs.each do
+          list << ProbeIssueRow.new(
+            rs.read(Int64), rs.read(String), rs.read(String), rs.read(String), rs.read(String),
+            Severity.stored(rs.read(Int32)), Status.stored(rs.read(Int32)), rs.read(Int64),
+            rs.read(Int64).to_i32, rs.read(Int64?), rs.read(String?),
+            rs.read(Int64), rs.read(Int64), rs.read(Int64?))
+        end
+      end
+      list
+    rescue
+      [] of ProbeIssueRow # never crash the run loop over a read
     end
 
     # One PAGE plus the true total, both decided in SQL.
@@ -278,27 +321,38 @@ module Gori
       [] of {String, String}
     end
 
-    def probe_suppressed?(code : String, host : String) : Bool
-      !@db.query_one?("SELECT 1 FROM probe_suppressions WHERE code = ? AND host = ?",
-        code, host, as: Int64).nil?
-    rescue
-      false
-    end
-
     private def bump_probe_generation : Nil
       @probe_generation += 1
+    end
+
+    # A cheap "has probe_issues moved?" key for a reader that has to notice a PEER process's
+    # writes too — `probe_generation` counts this process's commits only, so an MCP
+    # `probe_dismiss` or a `gori run probe` against the same project never moves it.
+    #
+    # Every write path moves at least one of the three: an insert adds a row and a new id, a
+    # delete or a clear drops the count, and every UPDATE (re-hit, status change, bulk dismiss)
+    # stamps `last_seen` with the time of the write. The third is a SUM, not a MAX: a stamp that
+    # is not the table's newest — a peer whose `now_us` was taken before it waited on the write
+    # lock, or any row stamped ahead of this clock (an archive from a fast machine) — leaves the
+    # MAX where it was. Summed over the low 32 bits so 250k rows cannot overflow SQLite's
+    # integer SUM (which raises rather than wraps). The two writes that move none are
+    # `detach_flow_refs` nulling a `sample_flow_id` and `delete_repeater` nulling a
+    # `sample_repeater_id` — a reader that acts on either sample reads the row fresh
+    # (`get_probe_issue`) rather than trusting a listed copy.
+    #
+    # Served from `idx_probe_issues_triage` as a covering scan, so it never walks the `affected`
+    # overflow pages: ~0.2 ms at 5k findings.
+    def probe_issues_fingerprint : {Int64, Int64, Int64}
+      @db.query_one("SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(SUM(last_seen & 4294967295), 0) FROM probe_issues",
+        as: {Int64, Int64, Int64})
+    rescue
+      {-1_i64, -1_i64, -1_i64} # unreadable: differs from every real key, so a reader re-reads
     end
 
     def count_probe_issues : Int32
       @db.scalar("SELECT COUNT(*) FROM probe_issues").as(Int64).to_i
     rescue
       0
-    end
-
-    # Probe-issue count per Severity value (index 0=Info … 4=Critical). Small table — a
-    # plain scan, GROUP BY on the severity column.
-    def probe_severity_counts : StaticArray(Int64, 5)
-      severity_tally("SELECT severity, COUNT(*) FROM probe_issues GROUP BY severity")
     end
 
     # Distinct (tech code, host, evidence) rows — the raw material for the project's
@@ -347,7 +401,7 @@ module Gori
     private def read_probe_issue(rs : DB::ResultSet) : ProbeIssue
       ProbeIssue.new(
         rs.read(Int64), rs.read(String), rs.read(String), rs.read(String), rs.read(String),
-        Severity.new(rs.read(Int32)), Status.new(rs.read(Int32)), rs.read(Int64),
+        Severity.stored(rs.read(Int32)), Status.stored(rs.read(Int32)), rs.read(Int64),
         parse_affected(rs.read(String)), rs.read(Int64?), rs.read(String?),
         rs.read(Int64), rs.read(Int64), rs.read(Int64?))
     end
@@ -356,6 +410,91 @@ module Gori
       Array(String).from_json(json)
     rescue
       [] of String
+    end
+
+    # The `affected` column after one more hit on `url`: parse it, add the URL unless it is
+    # already there or the list is at PROBE_AFFECTED_CAP, serialize — or nil when that would
+    # write back exactly the bytes already stored, so the UPDATE can leave the column alone.
+    #
+    # During a fuzz run the passive rules re-detect the same issue on every result, and the
+    # list is already full (or already holds the URL) for nearly all of them: the parse of a
+    # 50-URL array and its re-serialization ran per result on the writer fiber, the capture
+    # path's one writer (P6). `AffectedMemo` holds what the last write to a (code, host) made
+    # of its list, and answers only while the stored string is byte-identical to it, so a
+    # write from anywhere else — another process, a delete and re-insert — is a miss, and a
+    # miss is the full path, verbatim. Writer-fiber-only, like every other writer cache.
+    private def merged_affected(code : String, host : String, stored : String, url : String) : String?
+      key = {code, host}
+      memo = @probe_affected_memo[key]?
+      if memo && memo.json == stored
+        return nil if memo.includes?(url) || memo.size >= PROBE_AFFECTED_CAP
+        json = memo.append(url)
+        @probe_affected_memo.delete(key) unless memo.valid?
+        return json
+      end
+      urls = parse_affected(stored)
+      urls << url if !urls.includes?(url) && urls.size < PROBE_AFFECTED_CAP
+      json = urls.to_json
+      @probe_affected_memo.clear if @probe_affected_memo.size >= PROBE_AFFECTED_MEMO_CAP
+      if m = AffectedMemo.from_json?(json)
+        @probe_affected_memo[key] = m
+      else
+        @probe_affected_memo.delete(key)
+      end
+      json
+    end
+
+    # Bounds `@probe_affected_memo`: the issues a run keeps re-hitting are a handful, and a
+    # miss is only the full path plus one parse to seed the entry.
+    PROBE_AFFECTED_MEMO_CAP = 64
+
+    @probe_affected_memo = {} of {String, String} => AffectedMemo
+
+    # One `affected` string and what `parse_affected` makes of it — the membership and the
+    # count the cap/dedup rule reads — held only while writing the parsed list back
+    # reproduces the string exactly (`valid?`). That is the property that lets an unchanged
+    # hit skip the rewrite and an append be a splice: both are then byte-identical to the
+    # parse/add/`to_json` they stand in for. A string it does not hold (a URL that does not
+    # survive a JSON round trip, say) is simply never memoised, and takes the full path.
+    private class AffectedMemo
+      getter json : String
+      getter size : Int32
+      getter? valid : Bool = true
+
+      def self.from_json?(json : String) : AffectedMemo?
+        urls = Array(String).from_json(json)
+        return nil unless urls.to_json == json
+        new(json, urls)
+      rescue
+        nil
+      end
+
+      def initialize(@json : String, urls : Array(String))
+        @urls = urls.to_set
+        @size = urls.size
+      end
+
+      def includes?(url : String) : Bool
+        @urls.includes?(url)
+      end
+
+      # The json the full path writes after appending `url` (`to_json` of the parsed list plus
+      # `url`: the stored string minus its `]`, a comma, the new element), and the memo moved
+      # onto it. The parsed form of the new element must serialize back to the same bytes for
+      # the memo to stay exact; when it does not, `valid?` goes false and the caller drops it.
+      def append(url : String) : String
+        element = url.to_json
+        @json = String.build do |io|
+          io.write(@json.to_slice[0, @json.bytesize - 1])
+          io << ',' unless @size == 0
+          io << element << ']'
+        end
+        parsed = String.from_json(element)
+        @valid = parsed.to_json == element
+        @urls << parsed
+        @size += 1
+        @json
+      end
     end
   end
 end

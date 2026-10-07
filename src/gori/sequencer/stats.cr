@@ -1,5 +1,6 @@
 require "compress/deflate"
 require "./types"
+require "../plural"
 
 module Gori::Sequencer
   # The randomness math — pure, byte-level, stdlib-only, spec-testable in isolation
@@ -58,6 +59,13 @@ module Gori::Sequencer
     # max excursion that small over that many bits is not a near-miss — see `cusum_p`.
     CUSUM_MAX_TERMS = 10_000
 
+    # Int32 entries (1 MiB) the per-symbol-bit bias pass may use as scratch before it stops
+    # tallying per column and asks each token directly instead. The band this bounds is the
+    # one that shape is FOR — many short tokens, where the table is a few kilobytes — and a
+    # corpus of few but very long tokens falls out of it on the `min_len` side. See
+    # `symbol_bit_ones`.
+    BIAS_TALLY_MAX = 1 << 18
+
     enum Verdict
       Pass
       Warn
@@ -95,9 +103,10 @@ module Gori::Sequencer
     record TestRow, name : String, value : String, detail : String, verdict : Verdict
 
     # Which bytes of a token the byte-level tests may read — see the variable region in
-    # `analyze`. Every column of the aligned window that never varies is skipped; every byte
-    # outside the window is kept (a corpus of mixed lengths has no column evidence out there,
-    # so nothing is known to be constant). `full` keeps everything.
+    # `analyze`. Every structural column of the aligned window (one that never varies, or
+    # varies over a small slice of the alphabet) is skipped; every byte outside the window is
+    # kept (a corpus of mixed lengths has no column evidence out there, so nothing is known to
+    # be constant). `full` keeps everything.
     struct Region
       def initialize(@min_len : Int32, @constant : Array(Bool), @from_end : Bool, @all : Bool = false)
       end
@@ -171,6 +180,10 @@ module Gori::Sequencer
       # `effective_entropy` already; naming the count is what tells an operator that a
       # 40-character token is really a 24-character one.
       constant_positions : Int32 = 0,
+      # Positions that DO vary, but over a small slice of the alphabet (a UUID's variant
+      # nibble) — see `partial_columns`. Skipped by the byte-level tests like the constant ones,
+      # and credited only the entropy the sample shows them to carry (`partial_credit`).
+      partial_positions : Int32 = 0,
       # Whether the per-position window was anchored to the END of each token rather than its
       # start — see `analyze`. Always false for a fixed-length corpus, where the two agree.
       aligned_from_end : Bool = false do
@@ -183,7 +196,7 @@ module Gori::Sequencer
           "sequential pattern · effective entropy #{effective_entropy.round(1)}b"
         else
           fails = tests.count(&.verdict.fail?)
-          "effective entropy #{effective_entropy.round(1)}b · #{fails == 0 ? "all tests passed" : "#{fails} test#{fails == 1 ? "" : "s"} failed"}"
+          "effective entropy #{effective_entropy.round(1)}b · #{fails == 0 ? "all tests passed" : "#{Gori.plural(fails, "test")} failed"}"
         end
       end
     end
@@ -204,16 +217,33 @@ module Gori::Sequencer
       #
       # It runs BEFORE the byte-frequency pass because its output decides which bytes that pass
       # is allowed to look at — see the variable region below.
-      per_pos, effective, const_mask, aligned_from_end =
+      per_pos, effective, const_mask, distinct_at, aligned_from_end =
         aligned_positions(usable, min_len, n, variable_length: len_min != len_max)
       shannon_total = per_pos.sum
       constant_positions = const_mask.count(true)
 
       region_bytes = variable_region(usable, min_len, const_mask, aligned_from_end)
+      gcounts = byte_counts(region_bytes)
+      # Columns that vary over a small slice of the alphabet (a UUID's variant nibble) are
+      # structure too — see `partial_columns`. `structural` is every column the byte-level tests
+      # skip: the constant ones, plus these when excluding them still leaves bytes to measure.
+      structural = const_mask
+      partial = partial_columns(distinct_at, gcounts.count(&.positive?), n)
+      partial_positions = partial.count(true)
+      if partial_positions > 0
+        mask = const_mask.map_with_index { |c, i| c || partial.unsafe_fetch(i) }
+        narrowed = Region.new(min_len, mask, aligned_from_end).bytes(usable)
+        if narrowed.empty?
+          partial_positions = 0
+        else
+          region_bytes = narrowed
+          gcounts = byte_counts(region_bytes)
+          structural = mask
+          effective += partial_credit(usable, min_len, partial, distinct_at, per_pos, aligned_from_end)
+        end
+      end
       total_bytes = region_bytes.size.to_i64
 
-      gcounts = Array(Int32).new(256, 0)
-      region_bytes.each { |b| gcounts[b] += 1 }
       present = [] of UInt8
       gcounts.each_with_index { |c, i| present << i.to_u8 if c > 0 }
       charset_size = present.size
@@ -241,7 +271,7 @@ module Gori::Sequencer
       # would fail every bit test even when the underlying value is perfectly random.
       # Byte → alphabet index as a flat 256-entry LUT rather than a Hash. This is probed once
       # per sample byte by three separate loops below (the bit-bias scan, symbol_bits and
-      # symbol_seq), and the sample reaches millions of bytes, so a direct index beats hashing
+      # serial_test), and the sample reaches millions of bytes, so a direct index beats hashing
       # every one of them. -1 marks a byte absent from the alphabet (never hit: the table is
       # built from the bytes actually present).
       idx_of = Array(Int32).new(256, -1)
@@ -256,21 +286,12 @@ module Gori::Sequencer
       # Per-symbol-bit bias over the fixed window (feeds the chart + a test). Anchored to the
       # same end as the per-position pass above — a suffix-aligned corpus measured from the
       # start would score every column's bias against bytes from different logical fields.
-      window_bits = min_len * bps
-      ones_at = Array(Int32).new(window_bits, 0)
-      if bps > 0
-        usable.each do |t|
-          sl = t.to_slice
-          (0...min_len).each do |p|
-            v = idx_of.unsafe_fetch(sl[aligned_from_end ? sl.size - min_len + p : p])
-            (0...bps).each { |k| ones_at[p * bps + k] += 1 if (v >> (bps - 1 - k)) & 1 == 1 }
-          end
-        end
-      end
-      bit_bias = ones_at.map { |c| (c.to_f / n - 0.5).abs }
+      ones_at = symbol_bit_ones(usable, min_len, bps, idx_of, charset_size, aligned_from_end)
+      bit_bias = ones_at.map { |ones| (ones.to_f / n - 0.5).abs }
 
       bits = symbol_bits(region_bytes, idx_of, bps)
-      sym_seq = symbol_seq(region_bytes, idx_of)
+      # Monobit / Runs / Long run / Cusum all read this ONE walk of the bitstream — see `BitScan`.
+      bit_scan = scan_bits(bits)
       # Over the WHOLE tokens, not the region: whether one value follows another is a property
       # of the value an operator was issued, and a counter hidden behind a constant prefix is
       # exactly what `detect_sequential` already goes out of its way to find.
@@ -280,22 +301,22 @@ module Gori::Sequencer
       tests << uniqueness_test(unique, n, duplicate_count)
       tests << TestRow.new("Sequential", seq ? "detected" : "none", seq_detail,
         seq ? Verdict::Fail : Verdict::Pass)
-      tests << structure_test(constant_positions, min_len, aligned_from_end)
-      tests << gate_bits(monobit_test(bits, small), pow2)
+      tests << structure_test(constant_positions, partial_positions, min_len, aligned_from_end)
+      tests << gate_bits(monobit_test(bit_scan, small), pow2)
       tests << gate_bits(poker_test(bits, small), pow2)
-      tests << gate_bits(runs_test(bits, small), pow2)
-      tests << gate_bits(longrun_test(bits, small), pow2)
+      tests << gate_bits(runs_test(bit_scan, small), pow2)
+      tests << gate_bits(longrun_test(bit_scan, small), pow2)
       tests << chi_square_test(gcounts, present, total_bytes, small)
-      tests << serial_test(sym_seq, small)
+      tests << serial_test(region_bytes, idx_of, small)
       tests << compression_test(region_bytes, total_bytes, charset_size, small)
-      tests << gate_bits(bit_bias_test(ones_at, n, small, const_mask, bps), pow2)
+      tests << gate_bits(bit_bias_test(ones_at, n, small, structural, bps), pow2)
       # The three NIST-style additions. Each reads the SAME symbol bitstream the four classic
       # bit tests do, so each is gated on a power-of-two alphabet for the same reason, and each
       # catches a failure the existing table cannot: Cusum a drift that shows up only partway
       # through the stream (the monobit total stays balanced), Approx entropy a repeating block
       # structure (frequencies stay uniform), Spectral a periodicity — the signature of an LCG
       # or a time-seeded counter, which passes every frequency-and-runs test there is.
-      tests << gate_bits(cusum_test(bits, small), pow2)
+      tests << gate_bits(cusum_test(bit_scan, small), pow2)
       tests << gate_bits(approx_entropy_test(bits, small), pow2)
       tests << gate_bits(spectral_test(bits, small), pow2)
 
@@ -311,7 +332,8 @@ module Gori::Sequencer
         sequential: seq, rating: rating, tests: tests,
         char_counts: char_counts, len_hist: len_hist, len_min: len_min, len_max: len_max,
         per_pos_entropy: per_pos, bit_bias: bit_bias,
-        constant_positions: constant_positions, aligned_from_end: aligned_from_end)
+        constant_positions: constant_positions, partial_positions: partial_positions,
+        aligned_from_end: aligned_from_end)
     end
 
     # The per-position pass, anchored to whichever END of the token carries more entropy.
@@ -325,11 +347,11 @@ module Gori::Sequencer
     # an arbitrary anchor choice decide the grade. A fixed-length corpus yields identical
     # windows, so it never pays for the second pass.
     private def self.aligned_positions(usable : Array(String), min_len : Int32, n : Int32,
-                                       variable_length : Bool) : {Array(Float64), Float64, Array(Bool), Bool}
-      per_pos, effective, mask = positional(usable, min_len, n, from_end: false)
-      return {per_pos, effective, mask, false} unless variable_length
-      s_pos, s_eff, s_mask = positional(usable, min_len, n, from_end: true)
-      s_eff > effective ? {s_pos, s_eff, s_mask, true} : {per_pos, effective, mask, false}
+                                       variable_length : Bool) : {Array(Float64), Float64, Array(Bool), Array(Int32), Bool}
+      per_pos, effective, mask, distinct = positional(usable, min_len, n, from_end: false)
+      return {per_pos, effective, mask, distinct, false} unless variable_length
+      s_pos, s_eff, s_mask, s_distinct = positional(usable, min_len, n, from_end: true)
+      s_eff > effective ? {s_pos, s_eff, s_mask, s_distinct, true} : {per_pos, effective, mask, distinct, false}
     end
 
     # THE VARIABLE REGION: every byte except those sitting at a window column that never varies.
@@ -357,7 +379,8 @@ module Gori::Sequencer
     end
 
     # Per-position byte entropy over a fixed window of `min_len` positions, with the
-    # effective-entropy budget (Σ log2 distinct) and a mask marking the columns that never vary.
+    # effective-entropy budget (Σ log2 distinct), a mask marking the columns that never vary,
+    # and each column's distinct-byte count.
     # `from_end` reads position p as the p-th byte from the END of each token; both returned
     # arrays are in token order (left to right within the window), so a caller charting them
     # never has to know which anchor won.
@@ -365,9 +388,10 @@ module Gori::Sequencer
     # One 256-entry column table, refilled per position rather than reallocated: this runs
     # twice for a variable-length corpus and min_len reaches the hundreds.
     private def self.positional(usable : Array(String), min_len : Int32, n : Int32,
-                                from_end : Bool) : {Array(Float64), Float64, Array(Bool)}
+                                from_end : Bool) : {Array(Float64), Float64, Array(Bool), Array(Int32)}
       per_pos = Array(Float64).new(min_len, 0.0)
       constant = Array(Bool).new(min_len, false)
+      distinct_at = Array(Int32).new(min_len, 0)
       effective = 0.0
       col = Array(Int32).new(256, 0)
       (0...min_len).each do |p|
@@ -380,8 +404,68 @@ module Gori::Sequencer
         per_pos[p] = shannon(col, n.to_i64)
         effective += Math.log2(distinct.to_f) if distinct > 0
         constant[p] = distinct == 1
+        distinct_at[p] = distinct
       end
-      {per_pos, effective, constant}
+      {per_pos, effective, constant, distinct_at}
+    end
+
+    # PARTIALLY FIXED columns: ones that vary, but over far fewer byte values than the rest of
+    # the token draws from. A UUIDv4's RFC 9562 variant nibble is the case that matters — 2
+    # fixed bits, so it only ever reads 8/9/a/b in a hex alphabet of 16. Left in the variable
+    # region it is the constant-prefix problem one step further: those four bytes are
+    # over-represented in the pooled byte frequencies, its two fixed bits land in the symbol
+    # bitstream every 124 bits, and chi-square, poker and bit bias fail on 122 bits of CSPRNG
+    # output — a WEAK or CRITICAL headline beside an effective-entropy line reading 122.
+    #
+    # Those tests assume every byte they read is drawn from ONE distribution over the pooled
+    # alphabet. A column confined to a small subset of that alphabet is a different field, not
+    # a biased draw from the same one, so it is structure and is judged by what it holds — its
+    # own entropy, credited in `analyze` — rather than pooled with the columns it does not
+    # resemble.
+    #
+    # "Far fewer" is measured against what uniform draws would show: n draws from a k-symbol
+    # alphabet reveal k(1 - (1 - 1/k)^n) distinct values on average, and a column showing at
+    # most half of that is flagged. Chance does not get there: the distinct count of a truly
+    # uniform column sits within a couple of values of its mean (its variance never exceeds the
+    # mean — at n=20, k=64 the mean is 17.3 with a standard deviation of 1.5), so a random column
+    # misses the bar by many deviations at every sample size the tests run at, and the count
+    # scales with n, so a small sample is not mistaken for a small alphabet. A column that is
+    # skewed but still reaches most of the alphabet — a biased generator — stays in the region,
+    # where chi-square and the bit tests are there to catch it.
+    private def self.partial_columns(distinct : Array(Int32), k : Int32, n : Int32) : Array(Bool)
+      return Array(Bool).new(distinct.size, false) if k <= 1
+      expected = k * (1.0 - (1.0 - 1.0 / k) ** n)
+      distinct.map { |d| d > 1 && d <= expected / 2 }
+    end
+
+    # The change to `effective_entropy` for the partial columns: out goes their Σ log2(distinct),
+    # in comes what the sample can vouch for. No test reads a partial column any more, so
+    # nothing would catch a skew inside one or a dependence between them — twelve columns that
+    # always repeat one value from a-d are 2 bits, not 24. So the credit is their measured
+    # Shannon entropy, per column (a skew) and capped by the JOINT entropy of the columns taken
+    # together (a dependence). For a UUID's lone variant nibble used evenly, all three agree at
+    # 2 bits; neither measure can exceed log2(distinct).
+    private def self.partial_credit(usable : Array(String), min_len : Int32, partial : Array(Bool),
+                                    distinct_at : Array(Int32), per_pos : Array(Float64),
+                                    from_end : Bool) : Float64
+      cols = (0...min_len).select { |i| partial.unsafe_fetch(i) }
+      capacity = cols.sum { |i| Math.log2(distinct_at.unsafe_fetch(i).to_f) }
+      marginal = cols.sum { |i| per_pos.unsafe_fetch(i) }
+      tuples = Hash(String, Int32).new(0)
+      usable.each do |t|
+        sl = t.to_slice
+        w0 = from_end ? sl.size - min_len : 0
+        key = String.build(cols.size) { |io| cols.each { |i| io.write_byte(sl.unsafe_fetch(w0 + i)) } }
+        tuples[key] += 1
+      end
+      joint = shannon_hash(tuples, usable.size)
+      Math.min(marginal, joint) - capacity
+    end
+
+    private def self.byte_counts(bytes : Bytes) : Array(Int32)
+      counts = Array(Int32).new(256, 0)
+      bytes.each { |b| counts[b] += 1 }
+      counts
     end
 
     # A raw fixed-width bit test (monobit/poker/runs/long-run/bit-bias) only measures true
@@ -423,14 +507,69 @@ module Gori::Sequencer
 
     private def self.uniqueness_test(unique : Int32, n : Int32, dups : Int32) : TestRow
       TestRow.new("Uniqueness", "#{unique}/#{n}",
-        dups > 0 ? "#{dups} duplicate#{dups == 1 ? "" : "s"}" : "all distinct",
+        dups > 0 ? Gori.plural(dups, "duplicate") : "all distinct",
         dups > 0 ? Verdict::Fail : Verdict::Pass)
     end
 
-    private def self.monobit_test(bits : Array(UInt8), small : Bool) : TestRow
+    # Everything four of the bit tests read off the symbol bitstream, collected in ONE pass.
+    #
+    # Monobit, Runs, Long run and Cusum are each a single linear walk of the same
+    # multi-megabit array, and they were four of them: Monobit and Runs BOTH called
+    # `bits.count(1_u8)` (the same count, twice), Long run walked it again for the longest
+    # identical stretch and Cusum a fourth time for the random walk's largest excursion. On a
+    # 50,000-token sample that is 6.4M elements traversed four times — 82 ms of the report's
+    # 153, re-paid on every TUI throttle tick and every MCP `sequence_results` poll (P6).
+    # None of the four needs anything the others compute, so the scan is hoisted here and each
+    # test keeps its own guards, thresholds and wording over the numbers it already used
+    # (measured, `bench/sequencer_stats_bench.cr`).
+    record BitScan,
+      size : Int32,
+      ones : Int64,
+      runs : Int64,
+      longest : Int32,
+      excursion : Int32
+
+    # `prev = 2_u8` (never a bit value) is `longrun_test`'s own opener, kept so the first
+    # element starts a run of 1; `runs` counts TRANSITIONS + 1, which is what
+    # `(1...size).each { runs += 1 if bits[i] != bits[i - 1] }` computed.
+    private def self.scan_bits(bits : Array(UInt8)) : BitScan
       n = bits.size
+      ones = 0_i64
+      runs = n > 0 ? 1_i64 : 0_i64
+      longest = 0
+      cur = 0
+      prev = 2_u8
+      walk = 0
+      excursion = 0
+      ptr = bits.to_unsafe
+      i = 0
+      while i < n
+        b = ptr[i]
+        if b == 1_u8
+          ones += 1
+          walk += 1
+        else
+          walk -= 1
+        end
+        if b == prev
+          cur += 1
+        else
+          runs += 1 unless i == 0
+          cur = 1
+          prev = b
+        end
+        longest = cur if cur > longest
+        a = walk.abs
+        excursion = a if a > excursion
+        i += 1
+      end
+      BitScan.new(n, ones, runs, longest, excursion)
+    end
+
+    private def self.monobit_test(scan : BitScan, small : Bool) : TestRow
+      n = scan.size
       return insufficient("Monobit", "#{n} bits") if n < 100
-      ones = bits.count(1_u8).to_i64
+      ones = scan.ones
       z = (2.0 * ones - n) / Math.sqrt(n.to_f)
       p = two_sided(z)
       TestRow.new("Monobit", "z=#{fmt(z)}", "ones #{pct(ones.to_f / n)}", grade(p, small))
@@ -450,14 +589,13 @@ module Gori::Sequencer
       TestRow.new("Poker", "X=#{fmt(x)}", "df 15", grade(p, small))
     end
 
-    private def self.runs_test(bits : Array(UInt8), small : Bool) : TestRow
-      n = bits.size
+    private def self.runs_test(scan : BitScan, small : Bool) : TestRow
+      n = scan.size
       return insufficient("Runs", "#{n} bits") if n < 100
-      ones = bits.count(1_u8).to_i64
+      ones = scan.ones
       zeros = n - ones
       return TestRow.new("Runs", "constant", "all bits identical", Verdict::Fail) if ones == 0 || zeros == 0
-      runs = 1_i64
-      (1...bits.size).each { |i| runs += 1 if bits[i] != bits[i - 1] }
+      runs = scan.runs
       mu = 2.0 * ones * zeros / n + 1.0
       variance = 2.0 * ones * zeros * (2.0 * ones * zeros - n) / (n.to_f * n * (n - 1))
       return insufficient("Runs", "#{runs} runs") if variance <= 0
@@ -466,21 +604,10 @@ module Gori::Sequencer
       TestRow.new("Runs", "#{runs}", "expected #{mu.round(0).to_i}", grade(p, small))
     end
 
-    private def self.longrun_test(bits : Array(UInt8), small : Bool) : TestRow
-      n = bits.size
+    private def self.longrun_test(scan : BitScan, small : Bool) : TestRow
+      n = scan.size
       return insufficient("Long run", "#{n} bits") if n < 100
-      longest = 0
-      cur = 0
-      prev = 2_u8
-      bits.each do |b|
-        if b == prev
-          cur += 1
-        else
-          cur = 1
-          prev = b
-        end
-        longest = cur if cur > longest
-      end
+      longest = scan.longest
       exp = Math.log2(n.to_f)
       verdict = if longest >= 2.5 * exp
                   small ? Verdict::Warn : Verdict::Fail
@@ -510,14 +637,20 @@ module Gori::Sequencer
     # Lag-1 serial correlation over the concatenated SYMBOL stream (detects structure /
     # transitions a uniform frequency table would miss), using the alphabet indices so a
     # hex/base64 encoding doesn't inject spurious correlation.
-    private def self.serial_test(seq : Array(Int32), small : Bool) : TestRow
-      m = seq.size
+    #
+    # The indices are read straight off the region's bytes through `idx_of` rather than from a materialized index array: that array was one Int32 per region
+    # byte (6.4 MB on a 50k×32 hex sample) on a path the TUI re-runs on a throttle and every MCP
+    # poll re-runs from scratch. Same sums in the same order, so `r` is bit-identical.
+    private def self.serial_test(region : Bytes, idx_of : Array(Int32), small : Bool) : TestRow
+      m = region.size
       return insufficient("Serial corr", "#{m} symbols") if m < 100
       sx = 0.0; sy = 0.0; sxy = 0.0; sx2 = 0.0; sy2 = 0.0
       pairs = m - 1
-      (0...pairs).each do |i|
-        x = seq[i].to_f; y = seq[i + 1].to_f
+      x = idx_of.unsafe_fetch(region.unsafe_fetch(0)).to_f
+      (1..pairs).each do |i|
+        y = idx_of.unsafe_fetch(region.unsafe_fetch(i)).to_f
         sx += x; sy += y; sxy += x * y; sx2 += x * x; sy2 += y * y
+        x = y
       end
       den = Math.sqrt((pairs * sx2 - sx * sx) * (pairs * sy2 - sy * sy))
       r = den == 0 ? 0.0 : (pairs * sxy - sx * sy) / den
@@ -563,10 +696,17 @@ module Gori::Sequencer
     # How much of the token is skeleton rather than secret. INFO, never a FAIL: these columns
     # already contribute 0 to `effective_entropy`, so grading them again would charge the same
     # weakness twice — this row exists to explain a low headline figure, not to lower it.
-    private def self.structure_test(constant : Int32, min_len : Int32, from_end : Bool) : TestRow
+    private def self.structure_test(constant : Int32, partial : Int32, min_len : Int32, from_end : Bool) : TestRow
       return TestRow.new("Structure", "—", "no fixed window", Verdict::Info) if min_len <= 0
       anchor = from_end ? "aligned to token end" : "aligned to token start"
-      detail = constant == 0 ? "every position varies · #{anchor}" : "#{min_len - constant} varying · #{anchor}"
+      varying = min_len - constant - partial
+      detail = if constant + partial == 0
+                 "every position varies · #{anchor}"
+               elsif partial == 0
+                 "#{varying} varying · #{anchor}"
+               else
+                 "#{varying} varying · #{partial} partially fixed · #{anchor}"
+               end
       TestRow.new("Structure", "#{constant}/#{min_len} fixed", detail, Verdict::Info)
     end
 
@@ -574,16 +714,10 @@ module Gori::Sequencer
     # largest absolute excursion. A generator whose bias appears only partway through the stream
     # — a counter that rolls over, a pool that degrades once it drains — keeps a balanced ONES
     # TOTAL and sails through Monobit while walking far off zero here.
-    private def self.cusum_test(bits : Array(UInt8), small : Bool) : TestRow
-      n = bits.size
+    private def self.cusum_test(scan : BitScan, small : Bool) : TestRow
+      n = scan.size
       return insufficient("Cusum", "#{n} bits") if n < 100
-      s = 0
-      z = 0
-      bits.each do |b|
-        s += b == 1_u8 ? 1 : -1
-        a = s.abs
-        z = a if a > z
-      end
+      z = scan.excursion
       # A walk that never leaves zero is not a near-miss — it is a perfectly alternating stream.
       return TestRow.new("Cusum", "z=0", "walk never leaves 0", small ? Verdict::Warn : Verdict::Fail) if z == 0
       p = cusum_p(z, n)
@@ -634,15 +768,30 @@ module Gori::Sequencer
     # φ^(m): Σ π ln π over the 2^m block patterns of the CIRCULARLY extended bitstream (the
     # last m-1 bits wrap onto the first), so all n windows exist and the two φ values are
     # comparable. A flat 2^m counter array, rolled with a shift-and-mask.
+    #
+    # The wrap is split out of the loop rather than expressed as `(i + m - 1) % n`. `m` is at
+    # most APEN_M_MAX+1 and `n` at least APEN_MIN_BITS, so only the LAST m-1 windows wrap at
+    # all — the modulo was an integer division per bit, twice per report, over a stream that
+    # reaches 6.4M bits. Identical indices, and so identical counts.
     private def self.block_phi(bits : Array(UInt8), m : Int32) : Float64
       n = bits.size
       counts = Array(Int32).new(1 << m, 0)
+      cp = counts.to_unsafe
+      bp = bits.to_unsafe
       mask = (1 << m) - 1
       v = 0
-      (0...(m - 1)).each { |i| v = ((v << 1) | bits.unsafe_fetch(i)) & mask }
-      n.times do |i|
-        v = ((v << 1) | bits.unsafe_fetch((i + m - 1) % n)) & mask
-        counts[v] += 1
+      (0...(m - 1)).each { |i| v = ((v << 1) | bp[i]) & mask }
+      straight = n - (m - 1)
+      i = 0
+      while i < straight
+        v = ((v << 1) | bp[i + m - 1]) & mask
+        cp[v] += 1
+        i += 1
+      end
+      while i < n
+        v = ((v << 1) | bp[i + m - 1 - n]) & mask
+        cp[v] += 1
+        i += 1
       end
       total = n.to_f
       s = 0.0
@@ -733,10 +882,11 @@ module Gori::Sequencer
       0.5 * Math.erfc(-x / Math.sqrt(2.0))
     end
 
-    # `constant`/`bps` locate the window columns that never vary, whose bits are skipped. A
+    # `constant`/`bps` locate the structural window columns, whose bits are skipped. A
     # constant column's ones-count is 0 or n by definition, so every one of its bits scores
     # |z| = √n and counted as "biased" — a token behind an 8-character prefix reported 85 of 160
-    # positions biased on a corpus whose varying region was flawless. Structure is reported by
+    # positions biased on a corpus whose varying region was flawless, and a UUIDv4's variant
+    # nibble has two such bits of its own (`partial_columns`). Structure is reported by
     # its own INFO row; this row is about the bits that were supposed to be random.
     private def self.bit_bias_test(ones_at : Array(Int32), n : Int32, small : Bool,
                                    constant : Array(Bool), bps : Int32) : TestRow
@@ -763,11 +913,21 @@ module Gori::Sequencer
 
     # ── sequential detection ────────────────────────────────────────────────────────
 
+    # The shape guards (`decimal_byte?` below, `Char#hex?` per byte for hex) run over BYTES
+    # rather than characters. `each_char` on a String allocates an iterator per token and
+    # decodes UTF-8 to answer a question about ASCII, and this runs once per token on a sample
+    # that reaches 50,000. The answers are the same: a multi-byte character has no byte in
+    # either ASCII range, so a token carrying one is rejected by the byte test exactly where
+    # the char test rejected it.
+    private def self.decimal_byte?(b : UInt8) : Bool
+      b >= 0x30_u8 && b <= 0x39_u8
+    end
+
     private def self.detect_sequential(tokens : Array(String)) : {Bool, String}
       n = tokens.size
       return {false, "n/a"} if n < 3
       # Numeric fast path — incrementing/decrementing counters.
-      if tokens.all? { |t| !t.empty? && t.size <= 18 && t.each_char.all?(&.ascii_number?) }
+      if tokens.all? { |t| !t.empty? && t.bytesize <= 18 && t.to_slice.all? { |b| decimal_byte?(b) } }
         vals = tokens.map(&.to_i64)
         inc = (1...vals.size).all? { |i| vals[i] > vals[i - 1] }
         dec = (1...vals.size).all? { |i| vals[i] < vals[i - 1] }
@@ -789,6 +949,16 @@ module Gori::Sequencer
         if n >= SMALL_SAMPLE && (step = constant_step(vals.sort))
           return {true, "constant step #{step} (sorted — arrival order was shuffled)"}
         end
+        # A counter with jitter (a time-based id, a step plus noise) collected with two
+        # replays swapped is neither monotonic nor evenly stepped, yet tracks arrival order
+        # as closely as the hex path's correlation test asks — the same values spelled in hex
+        # were flagged. Gated like the sorted check: three random values correlate by chance.
+        # Offset by the minimum first: a 1.7e15 time-based id with small jitter loses its whole
+        # spread to the sum-of-squares in raw magnitude.
+        lo = vals.min
+        if n >= SMALL_SAMPLE && (r = pearson(Array(Float64).new(n, &.to_f), vals.map { |v| (v - lo).to_f })).abs > 0.9
+          return {true, "corr=#{fmt(r)}"}
+        end
         return {false, "non-monotonic"}
       end
       # Hex path — same correlation idea as the general path below, but decodes each
@@ -801,12 +971,28 @@ module Gori::Sequencer
       # general path despite being a textbook sequential counter. Decoding nibbles first
       # keeps the magnitude linear in the counter's real value, matching the numeric fast
       # path's precision for decimal tokens above.
-      if tokens.all? { |t| !t.empty? && t.each_char.all? { |c| c.ascii_number? || ('a'..'f').includes?(c) || ('A'..'F').includes?(c) } }
+      if tokens.all? { |t| !t.empty? && t.to_slice.all?(&.unsafe_chr.hex?) }
         skip = common_prefix_len(tokens)
         xs = Array(Float64).new(n, &.to_f)
         ys = tokens.map { |t| hex_leading_value(t, skip) }
         r = pearson(xs, ys)
-        return {r.abs > 0.9, "corr=#{fmt(r)}"}
+        return {true, "corr=#{fmt(r)}"} if r.abs > 0.9
+        # Order-independent second look, the SAME one the decimal fast path above already
+        # takes and for the same reason: collection order is not issuance order once
+        # concurrency > 1, so two in-flight replays can complete swapped and a textbook
+        # incrementing counter arrives shuffled. Correlation with arrival order then falls to
+        # ~0 and the row reads "none" — a clean bill of health for the exact token shape this
+        # test exists to catch. Measured on `2..301` as `%08x`: corr 1.00 in order, 0.02
+        # shuffled. Hex is where this matters most, because it is what session ids are
+        # actually spelled in; decimal got the fix and hex did not.
+        #
+        # The general path below cannot reuse it — see its own comment — but this one can,
+        # because a hex token's varying region IS a number, so the sorted values either form
+        # an even arithmetic progression or they do not.
+        if n >= SMALL_SAMPLE && (vals = hex_span_values(tokens, skip)) && (step = constant_step(vals.sort!))
+          return {true, "constant step #{step} (sorted — arrival order was shuffled)"}
+        end
+        return {false, "corr=#{fmt(r)}"}
       end
       # General path — correlation of arrival order with a leading-byte magnitude. Shares
       # the same order-dependency the numeric fast path had above (arrival order can be
@@ -858,17 +1044,63 @@ module Gori::Sequencer
       v
     end
 
+    # The exact integer value of each token's VARYING hex region (everything past the shared
+    # prefix), or nil when one of them is too wide to hold — the sorted-step check needs exact
+    # arithmetic, where `hex_leading_value`'s Float64 magnitude would round.
+    #
+    # 15 digits = 60 bits, so the product always fits an Int64. A wider varying region is
+    # declined rather than truncated: the high digits of a counter are not themselves an even
+    # progression once the low ones are dropped, so a truncated read could only ever turn a
+    # real answer into a wrong one. A counter is normally zero-padded, which puts its constant
+    # head into `skip` and leaves a narrow tail here.
+    # Over the token's own bytes rather than a `byte_slice` per token: `analyze` runs on a UI
+    # throttle over a sample that reaches 50,000, and the width guard below then declines on
+    # the FIRST token of a wide corpus — so a full random-hex sample pays one bounds check
+    # here, not 50,000 String allocations.
+    private def self.hex_span_values(tokens : Array(String), skip : Int32) : Array(Int64)?
+      vals = Array(Int64).new(tokens.size)
+      tokens.each do |t|
+        sl = t.to_slice
+        start = skip.clamp(0, sl.size)
+        return nil if sl.size - start <= 0 || sl.size - start > 15
+        v = 0_i64
+        i = start
+        while i < sl.size
+          b = sl.unsafe_fetch(i)
+          nibble = case b
+                   when 0x30_u8..0x39_u8 then (b - 0x30_u8).to_i32
+                   when 0x61_u8..0x66_u8 then (b - 0x61_u8).to_i32 + 10
+                   when 0x41_u8..0x46_u8 then (b - 0x41_u8).to_i32 + 10
+                   else                       return nil
+                   end
+          v = v * 16 + nibble
+          i += 1
+        end
+        vals << v
+      end
+      vals
+    end
+
     # Like `leading_value`, but for hex text: decodes each character to its NIBBLE value
     # (0-15) instead of using the character's raw ASCII byte — see the hex path in
     # `detect_sequential` for why the distinction matters. Window widened to 16 chars (64
     # bits of hex) to match `leading_value`'s 8-BYTE window at one hex digit per nibble.
+    #
+    # Over the token's own BYTES, the same reason `hex_span_values` gives one method up: this
+    # is called once per token on a sample that reaches 50,000, and `t.chars` allocated a
+    # full Array(Char) — then `chars[start, 16]` a second one — per token, ~13 MB of garbage
+    # on a 50k×32 hex corpus for a 16-byte read. Only tokens the hex guard in
+    # `detect_sequential` already accepted reach here, so every byte is an ASCII hex digit and
+    # the byte window and the char window are the same window.
     private def self.hex_leading_value(t : String, skip : Int32 = 0) : Float64
       v = 0.0
-      chars = t.chars
-      start = {skip, chars.size}.min
-      chars[start, {16, chars.size - start}.min].each do |c|
-        nibble = c.ascii_number? ? (c.ord - '0'.ord) : (c.downcase.ord - 'a'.ord + 10)
-        v = v * 16.0 + nibble
+      sl = t.to_slice
+      i = {skip, sl.size}.min
+      stop = {i + 16, sl.size}.min
+      while i < stop
+        b = sl.unsafe_fetch(i)
+        v = v * 16.0 + (b <= 0x39_u8 ? (b - 0x30_u8).to_i32 : ((b | 0x20_u8) - 0x61_u8).to_i32 + 10)
+        i += 1
       end
       v
     end
@@ -896,6 +1128,103 @@ module Gori::Sequencer
 
     # ── shared numeric helpers ──────────────────────────────────────────────────────
 
+    # How many tokens carry a 1 in each bit of the fixed `min_len × bps` symbol-bit window —
+    # the per-symbol-bit bias that feeds the chart and `bit_bias_test`. Anchored to whichever
+    # end `aligned_positions` chose: a suffix-aligned corpus measured from the start would
+    # score every column's bias against bytes from different logical fields.
+    #
+    # Counted per (COLUMN, SYMBOL) first, then expanded to per-bit once. Asking the question a
+    # bit at a time walked `min_len × bps` of them per token — 6.4M bounds-checked increments
+    # on a 50,000-token hex sample, 23 ms of a 153 ms report — when the answer depends only on
+    # WHICH SYMBOL stands in each column. The tally costs one increment per column per token (a
+    # quarter of that at hex's bps 4, a sixth at base64's 6) and the expansion is
+    # `min_len × (charset + 1) × bps`, thousands of ops rather than millions.
+    #
+    # Keyed on the ALPHABET INDEX rather than the raw byte, so the table is
+    # `min_len × (charset + 1)` — 17 slots per column for hex, 65 for base64 — instead of
+    # `min_len × 256`. The window is read over whole tokens, so a corpus of long tokens (a
+    # multi-KB JWT) would otherwise pay a kilobyte of scratch per token BYTE on a report the
+    # TUI re-runs on a throttle. `BIAS_TALLY_MAX` is the far end of the same worry.
+    #
+    # The extra slot is for a byte with NO alphabet index. `idx_of` is -1 for a byte that
+    # appears only in a structural column — those bytes are cut from the variable region the
+    # alphabet was built from — and -1 shifts to all-ones, so such a byte counts toward every
+    # bit, exactly as the per-bit form did. A constant column contributes the same count to all
+    # of its bits either way, which `bit_bias_test` then skips by its structural mask.
+    private def self.symbol_bit_ones(usable : Array(String), min_len : Int32, bps : Int32,
+                                     idx_of : Array(Int32), charset_size : Int32,
+                                     from_end : Bool) : Array(Int32)
+      ones_at = Array(Int32).new(min_len * bps, 0)
+      return ones_at if bps <= 0
+      slots = charset_size + 1 # …+ the "absent from the alphabet" bucket
+      # The tally only pays where its two terms are the small ones, and BOTH can stop being
+      # so. Its table and its expansion are `min_len × slots`, independent of the sample size:
+      # with fewer tokens than slots the expansion alone already costs more than asking every
+      # token directly, and with very long tokens `min_len` carries the table past everything
+      # else the report allocates (measured on 300 × 200 KB byte-soup tokens: a 205 MB scratch
+      # array for no gain in time). Outside the band, ask directly — the same increments, in
+      # the shape the count-per-column form is an optimization OF.
+      if usable.size < slots || min_len.to_i64 * slots > BIAS_TALLY_MAX
+        return bit_ones_per_token(usable, ones_at, min_len, bps, idx_of, from_end)
+      end
+      col_counts = Array(Int32).new(min_len * slots, 0)
+      cc = col_counts.to_unsafe
+      ix = idx_of.to_unsafe
+      usable.each do |t|
+        sl = t.to_slice
+        sp = sl.to_unsafe + (from_end ? sl.size - min_len : 0)
+        p = 0
+        while p < min_len
+          v = ix[sp[p]]
+          cc[p * slots + (v < 0 ? charset_size : v)] += 1
+          p += 1
+        end
+      end
+      oa = ones_at.to_unsafe
+      p = 0
+      while p < min_len
+        row = p * slots
+        s = 0
+        while s < slots
+          count = cc[row + s]
+          expand_bit_ones(oa, p * bps, s == charset_size ? -1 : s, bps, count) if count > 0
+          s += 1
+        end
+        p += 1
+      end
+      ones_at
+    end
+
+    # `symbol_bit_ones` asked one token at a time — the form the per-column tally is an
+    # optimization OF, and the one that stays right where the tally's own two terms stop being
+    # the small ones. Fills and returns `ones_at`.
+    private def self.bit_ones_per_token(usable : Array(String), ones_at : Array(Int32),
+                                        min_len : Int32, bps : Int32, idx_of : Array(Int32),
+                                        from_end : Bool) : Array(Int32)
+      oa = ones_at.to_unsafe
+      usable.each do |t|
+        sl = t.to_slice
+        sp = sl.to_unsafe + (from_end ? sl.size - min_len : 0)
+        p = 0
+        while p < min_len
+          expand_bit_ones(oa, p * bps, idx_of.unsafe_fetch(sp[p]), bps, 1)
+          p += 1
+        end
+      end
+      ones_at
+    end
+
+    # Add `count` to each of the `bps` bit slots of one column whose symbol index is `v`,
+    # MSB-first — the same bit order `symbol_bits` writes the bitstream in.
+    private def self.expand_bit_ones(oa : Pointer(Int32), at : Int32, v : Int32,
+                                     bps : Int32, count : Int32) : Nil
+      k = 0
+      while k < bps
+        oa[at + k] += count if (v >> (bps - 1 - k)) & 1 == 1
+        k += 1
+      end
+    end
+
     # The symbol bitstream over the variable region: each byte → its alphabet index → `bps` bits
     # (MSB-first). Empty when the alphabet has ≤ 1 symbol (no bits to test).
     #
@@ -912,13 +1241,6 @@ module Gori::Sequencer
       bits
     end
 
-    # The sequence of alphabet indices (for serial correlation). Presized for the same reason.
-    private def self.symbol_seq(region : Bytes, idx_of : Array(Int32)) : Array(Int32)
-      seq = Array(Int32).new(region.size)
-      region.each { |b| seq << idx_of.unsafe_fetch(b) }
-      seq
-    end
-
     private def self.shannon(counts : Array(Int32), n : Int64) : Float64
       return 0.0 if n <= 0
       h = 0.0
@@ -930,7 +1252,7 @@ module Gori::Sequencer
       h
     end
 
-    private def self.shannon_hash(counts : Hash(Int32, Int32), n : Int32) : Float64
+    private def self.shannon_hash(counts : Hash(K, Int32), n : Int32) : Float64 forall K
       return 0.0 if n <= 0
       h = 0.0
       counts.each_value do |c|
@@ -944,6 +1266,7 @@ module Gori::Sequencer
     private def self.classify(present : Array(UInt8)) : String
       return "—" if present.empty?
       chars = present.map(&.chr)
+      return "digits" if chars.all?(&.ascii_number?)
       return "lower-hex" if chars.all? { |c| c.ascii_number? || ('a'..'f').includes?(c) }
       return "upper-hex" if chars.all? { |c| c.ascii_number? || ('A'..'F').includes?(c) }
       return "hex" if chars.all? { |c| c.ascii_number? || ('a'..'f').includes?(c) || ('A'..'F').includes?(c) }

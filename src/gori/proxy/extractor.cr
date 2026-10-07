@@ -22,55 +22,14 @@ module Gori::Proxy
   # `extracts?` is a LOCK-FREE atomic read, checked before anything is allocated: a proxy with
   # no extract rule pays one integer compare per response and nothing else (P6).
   #
-  # `extracts_body?` is the expensive one. A head-scoped descriptor (cookie / header) reads the
-  # parsed head, which every response already has; a body-scoped one (regex / position /
-  # jsonpath) needs the entity, which means BUFFERING a response that would otherwise stream —
-  # exactly what `HeadRewriter#rewrites_response_body?` gates today, and gated the same way.
-  #
-  # `extracts_body_for_host?` is the same question asked ABOUT ONE HOST, and it exists for one
-  # caller: the h2 downgrade gate (`tls/tunnel.cr`). A body-scoped extraction is the same
-  # requirement as a body rewrite — the entity has to be in hand — so it earns the same
-  # downgrade to HTTP/1.1, and per #526 it must earn it only for the hosts its glob can
-  # actually match. Downgrading a host no rule matches is the regression #531 fixed.
+  # `extracts_body_for_host?` asks whether a body-scoped rule is live for ONE HOST. A head-scoped
+  # descriptor (cookie / header) reads the parsed head, which every response already has; a
+  # body-scoped one (regex / position / jsonpath) needs the entity, which means buffering a
+  # response that would otherwise stream. ClientConn uses it for
+  # each response on a multi-host HTTP/1 connection; the h2 downgrade gate uses it for the
+  # CONNECT host. A body-scoped extraction needs the entity in hand, so it earns the same
+  # downgrade to HTTP/1.1 only for hosts its glob can actually match. Downgrading a host no rule
+  # matches is the regression #531 fixed.
   module ResponseExtract
-    # Is ANY enabled extract rule live? Read per response, so it must not lock.
-    def extracts? : Bool
-      false
-    end
-
-    # Is any enabled extract rule live whose descriptor needs the response ENTITY?
-    # Read per response (`ClientConn` deciding whether to buffer), so it must not lock.
-    def extracts_body? : Bool
-      false
-    end
-
-    # `extracts_body?` narrowed to one host. Called once per CONNECT, never per message, so an
-    # implementation may take a lock.
-    def extracts_body_for_host?(host : String) : Bool
-      false
-    end
-
-    # Offer one DELIVERED response to the extract rules.
-    #
-    # `head` and `body` are the bytes as FORWARDED, and they must be framed consistently with
-    # each other — the implementation runs them through `Codec::ContentDecode`, so a body
-    # already de-chunked alongside a head still declaring `Transfer-Encoding: chunked` would
-    # be de-chunked a second time into garbage. Handing over the pair the client received is
-    # what makes that automatic rather than a rule to remember.
-    #
-    # `body` is nil when this response was not buffered — a streaming (SSE / close-delimited /
-    # 101) or oversized body, or the h2 relay, where DATA is never held. A body-scoped rule
-    # that matches such a response records a miss naming THAT reason, rather than reporting
-    # that its selector found nothing.
-    #
-    # `method` / `target` come from the REQUEST that was actually sent, because that is what the
-    # rule's condition (`InterceptFilter`) scopes on — a response carries neither.
-    #
-    # Must never raise into the proxy path and must never block: an extract rule cannot be
-    # allowed to fail a response the client is waiting on.
-    def observe_response(head : Bytes, body : Bytes?, *,
-                         method : String, host : String, target : String,
-                         scheme : String, status : Int32, flow_id : Int64? = nil) : Nil
-    end
   end
 end

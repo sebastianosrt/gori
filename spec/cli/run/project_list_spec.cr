@@ -12,9 +12,26 @@ require "file_utils"
 
 # Private CLI glue — reopen the module for bare-call wrappers (see project_spec.cr).
 module Gori::CLI::Run
+  # `default_db` defaults to the head of `counted`, which is what the caller derived before
+  # `--query` could narrow the list — so an example that passes none keeps meaning exactly
+  # what it did when `project_list_rows` took the head itself.
   def self.project_list_rows_for_spec(counted : Array({Gori::Project, Int64?}), active_db : String?,
-                                      all : Bool) : Array(ProjectListRow)
-    project_list_rows(counted, active_db, all)
+                                      all : Bool,
+                                      default_db : String? = counted.first?.try(&.[0].db_path)) : Array(ProjectListRow)
+    registry = Gori::ProjectRegistry.new(Gori::Paths.projects_dir)
+    entries = counted.map do |project, flows|
+      {Gori::ProjectRegistry::Entry.new(project, registry.id_of(project),
+        File.basename(project.dir), registry.workspace_of(project)),
+       Gori::Store::ProjectCensus.new(flows, nil)}
+    end
+    project_list_rows(entries, default_db, active_db, all)
+  end
+
+  def self.project_list_notes_for_spec(query : String?, entries : Array(Gori::ProjectRegistry::Entry),
+                                       matched : Array(Gori::ProjectRegistry::Entry),
+                                       rows : Array(ProjectListRow), hidden : Int32,
+                                       default_db : String?) : Array(String)
+    project_list_notes(query, entries, matched, rows, hidden, default_db)
   end
 
   def self.resolve_read_project_for_spec(project_name : String?, db_path : String?) : Gori::Project
@@ -73,13 +90,13 @@ private def project_at(dir : String) : Gori::Project
 end
 
 describe Gori::Store do
-  describe ".captured_flows" do
+  describe ".project_census" do
     it "counts a project's flows without opening (and migrating) it as a Store" do
       with_project_root do |registry|
         project = registry.create("spec proj")
-        Gori::Store.captured_flows(project.db_path).should eq(0)
+        Gori::Store.project_census(project.db_path).flows.should eq(0)
         with_project_store(project) { |store| 2.times { seed_project_flow(store) } }
-        Gori::Store.captured_flows(project.db_path).should eq(2)
+        Gori::Store.project_census(project.db_path).flows.should eq(2)
       end
     end
 
@@ -92,7 +109,7 @@ describe Gori::Store do
         # "current project" marker is read off.
         old = Time.utc(2020, 1, 2, 3, 4, 5)
         File.utime(old, old, project.db_path)
-        Gori::Store.captured_flows(project.db_path).should eq(1)
+        Gori::Store.project_census(project.db_path).flows.should eq(1)
         File.info(project.db_path).modification_time.to_unix.should eq(old.to_unix)
       end
     end
@@ -119,7 +136,7 @@ describe Gori::Store do
         File.utime(newer, newer, wal)
         project.last_modified.try(&.to_unix).should eq(newer.to_unix) # the premise
 
-        Gori::Store.captured_flows(project.db_path).should eq(1)
+        Gori::Store.project_census(project.db_path).flows.should eq(1)
         project.last_modified.try(&.to_unix).should eq(newer.to_unix)
       end
     end
@@ -127,16 +144,49 @@ describe Gori::Store do
     it "answers nil — not 0 — for something that is not a readable project db" do
       with_project_root do |registry|
         project = registry.create("spec proj")
-        Gori::Store.captured_flows(File.join(project.dir, "nope.db")).should be_nil
+        Gori::Store.project_census(File.join(project.dir, "nope.db")).flows.should be_nil
         junk = File.join(project.dir, "junk.db")
         File.write(junk, "this is not a database")
-        Gori::Store.captured_flows(junk).should be_nil
+        Gori::Store.project_census(junk).flows.should be_nil
       end
     end
   end
 end
 
 describe "gori run project list" do
+  it "neutralizes legacy terminal controls in human project names" do
+    safe_name = Gori::CLI::Output.term_safe("bad\e]0;owned\a")
+    safe_name.should contain("bad")
+    safe_name.should contain("owned")
+    safe_name.should_not contain('\e')
+    safe_name.should_not contain('\a')
+
+    safe_c1_name = Gori::CLI::Output.term_safe("bad\u{009b}name")
+    safe_c1_name.should contain("bad")
+    safe_c1_name.should contain("name")
+    safe_c1_name.should_not contain("\u{009b}")
+
+    source = File.read(File.join(__DIR__, "..", "..", "..", "src", "gori", "cli", "run", "project.cr"))
+    source.should contain("CLI::Output.pad(terminal_project_name(pr.name), 24)")
+    source.should contain("terminal_project_name(project.name, quoted: true)")
+    source.should contain("terminal_project_name(project.name)}  (id")
+    source.should contain("projects.map { |project| terminal_project_name(project.name) }")
+
+    cli_root = File.join(__DIR__, "..", "..", "..", "src", "gori", "cli")
+    run_source = File.read(File.join(cli_root, "run.cr"))
+    run_source.should contain("CLI::Output.term_safe(project.name)")
+    run_source.should contain("CLI::Output.term_safe(project.name) }.join")
+    run_source.should contain("CLI::Output.term_safe(name)")
+    run_source.should contain("CLI::Output.term_safe(name).inspect")
+    run_source.should contain("CLI::Output.term_safe(line)")
+    rewriter = File.read(File.join(cli_root, "run", "rewriter.cr"))
+    rewriter.should contain("CLI::Output.term_safe(project.name)")
+    colormarker = File.read(File.join(cli_root, "run", "colormarker.cr"))
+    colormarker.should contain("CLI::Output.term_safe(project.name)")
+    source.should contain("terminal_project_name(positional.first)")
+    source.should contain("terminal_project_name(name)}'")
+  end
+
   it "omits a project with nothing captured in it" do
     with_project_root do |registry|
       busy = registry.create("busy")
@@ -180,6 +230,62 @@ describe "gori run project list" do
       rows = Gori::CLI::Run.project_list_rows_for_spec(counted, open_in_tui.db_path, false)
       rows.map(&.project.name).should eq(["busy", "open in tui"])
       rows.map(&.tui_active).should eq([false, true])
+    end
+  end
+
+  # `--query` (#1085). It narrows the ROW SOURCE, so the two things derived from that source
+  # — the `◆` marker and the "empty projects hidden" tally — have to keep meaning what they
+  # meant, and every way the shortened list could be misread has to be said out loud.
+  it "keeps the ◆ marker on the project a --project-less run reads, whatever --query left first" do
+    with_project_root do |registry|
+      default = registry.create("default project")
+      other = registry.create("acme staging")
+      # What `--query=acme` hands the row builder: `default` is gone from the list, but it
+      # is still the project every `gori run` without --project would read.
+      counted = [{other, 9_i64.as(Int64?)}]
+      rows = Gori::CLI::Run.project_list_rows_for_spec(counted, nil, false, default.db_path)
+      rows.map(&.project.name).should eq(["acme staging"])
+      rows.map(&.current).should eq([false]) # NOT promoted by being first in a filtered list
+      # Same list, no filter: the head is the default and wears the marker.
+      unfiltered = [{default, 0_i64.as(Int64?)}, {other, 9_i64.as(Int64?)}]
+      Gori::CLI::Run.project_list_rows_for_spec(unfiltered, nil, false)
+        .map(&.current).should eq([true, false])
+    end
+  end
+
+  it "says why the list is short, and never lets a --query miss read as an empty host" do
+    with_project_root do |registry|
+      default = registry.create("default project")
+      busy = registry.create("acme busy")
+      quiet = registry.create("acme quiet")
+      entries = [default, busy, quiet].map do |pr|
+        Gori::ProjectRegistry::Entry.new(pr, "id#{pr.name.size}", File.basename(pr.dir), nil)
+      end
+
+      # A query that matched nothing: the count of what IS here, so nobody re-creates a
+      # project they already have.
+      miss = Gori::CLI::Run.project_list_notes_for_spec("zzz", entries, [] of Gori::ProjectRegistry::Entry,
+        [] of Gori::CLI::Run::ProjectListRow, 0, default.db_path)
+      miss.size.should eq(1) # and NOT a second line re-listing the default as excluded
+      miss.first.should contain("no project matched --query=zzz")
+      miss.first.should contain("3 projects on this host")
+
+      # A query that matched, but whose empty projects were hidden: the tally counts within
+      # the MATCHED set, not against the whole registry.
+      matched = entries[1..]
+      rows = Gori::CLI::Run.project_list_rows_for_spec([{busy, 9_i64.as(Int64?)}], nil, false, default.db_path)
+      notes = Gori::CLI::Run.project_list_notes_for_spec("acme", entries, matched, rows, 1, default.db_path)
+      notes.first.should contain("1 empty project hidden")
+      # ...and the ◆ the query filtered out is named, because that marker is this listing's
+      # only answer to "which project am I on?".
+      notes.last.should contain("does not match --query=acme")
+      notes.last.should contain(File.basename(default.dir))
+
+      # No query, nothing hidden, the default present: nothing to say.
+      full = Gori::CLI::Run.project_list_rows_for_spec(
+        [{default, 1_i64.as(Int64?)}], nil, false, default.db_path)
+      Gori::CLI::Run.project_list_notes_for_spec(nil, entries, entries, full, 0, default.db_path)
+        .should be_empty
     end
   end
 

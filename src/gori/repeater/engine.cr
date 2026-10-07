@@ -2,6 +2,7 @@ require "../proxy/upstream"
 require "../proxy/codec/http1"
 require "../proxy/codec/body"
 require "../proxy/socket_tuning"
+require "wait_group"
 
 module Gori
   module Repeater
@@ -21,12 +22,9 @@ module Gori
       # from a *display* truncation (gori capping what it shows).
       getter? incomplete : Bool
       # Whether ANY response byte (even an interim 1xx) was received before this Result was
-      # built. It answers the one question the pool's stale-retry needs and `response.nil?`
-      # cannot: a failure with no response yet means the request never reached the application
-      # and is safe to re-send, but a failure AFTER a 1xx means the origin already has the whole
-      # request (gori writes it up front), so re-sending would double a non-idempotent side
-      # effect. Only set on the error paths; a normal Result carries a non-nil `response`, where
-      # this is irrelevant.
+      # built. A false value does not by itself permit a retry: a timeout or an invalid head
+      # can still follow a delivered request. retryable_stale? carries the narrower read/write
+      # outcome the HTTP/1 pool needs.
       getter? delivered : Bool
       # The read ended on an IDLE TIMEOUT — the origin held the socket open and simply stopped
       # sending — rather than on a close or a completed body. `incomplete?` says the captured
@@ -47,13 +45,17 @@ module Gori
       # an agent reads this, and both showed a clean single send.
       getter? retried : Bool
 
+      # Whether a reused HTTP/1 socket failed at the request write or at a zero-byte EOF/reset
+      # read, the narrow cases ConnPool may replay. A timeout or any received response bytes
+      # leave this false even when delivered? is false.
+      getter? retryable_stale : Bool
+
       # The exact request bytes this exchange WROTE, when the sender that made it knows them
-      # and a consumer has to hold them — `Fuzz::Sender` sets it, because the bytes it sends
-      # are not the bytes it was handed: the send seam substitutes `$NAME` and writes the
-      # active session slot's header overlay, and `Fuzz::HistoryRecord` was recording flows
-      # from the pre-seam template (the Repeater half of that is `Repeater::Sender#wire`).
-      # nil everywhere else — the engines are handed final bytes and every other consumer
-      # already has them.
+      # and a consumer has to hold them. `Fuzz::Sender` sets it because its send seam substitutes
+      # bindings and writes the active session slot's header overlay before History records the
+      # request. `Discover::Sender` sets it because a `$GEN.*` header is deliberately different
+      # on the next reconstruction, while a finding's Exchange must retain the value the origin
+      # actually saw. The engines themselves are handed final bytes and leave it nil.
       getter wire : Bytes?
 
       # The tail is KEYWORD-ONLY (`*`), and that is load-bearing rather than a style choice.
@@ -68,15 +70,29 @@ module Gori
       # leaves the sweep to the compiler.
       def initialize(@head, @body, @response, @duration_us, @error = nil, @incomplete = false, *,
                      @delivered = false, @timed_out = false, @retried = false,
-                     @wire : Bytes? = nil)
+                     @wire : Bytes? = nil, @retryable_stale = false, @cut_short = false,
+                     @lf_framed = false)
       end
+
+      # A head of this exchange — the final one or an interim 1xx before it — ended on a
+      # bare-LF blank line, so gori framed it off the lenient reading and the socket must not
+      # serve another exchange (`ConnPool.reusable_response?`). The final head alone cannot say
+      # so for an interim.
+      getter? lf_framed : Bool
+
+      # An h2 single-packet race member whose stream was still open when the read ended (the
+      # deadline, a GOAWAY, the socket dropping): its response is kept, incomplete, but its
+      # `duration_us` is when the collector closed it — in member order — not an arrival time.
+      # `Timing` drops it as a sample; the race itself still reports the response.
+      getter? cut_short : Bool
 
       # The same outcome, carrying the bytes that produced it. A struct, so this returns a
       # copy: the seam that knows the wire (`Fuzz::Sender`) is one layer above the engine that
       # builds the Result.
       def with_wire(wire : Bytes) : Result
         Result.new(@head, @body, @response, @duration_us, @error, @incomplete,
-          delivered: @delivered, timed_out: @timed_out, retried: @retried, wire: wire)
+          delivered: @delivered, timed_out: @timed_out, retried: @retried, wire: wire,
+          retryable_stale: @retryable_stale, cut_short: @cut_short, lf_framed: @lf_framed)
       end
 
       def ok? : Bool
@@ -93,7 +109,8 @@ module Gori
         # one spec that asserted it. The constructor now REFUSES a positional tail (see there),
         # so this shape is the only one that compiles.
         Result.new(@head, @body, @response, @duration_us, @error, @incomplete,
-          delivered: @delivered, timed_out: @timed_out, retried: true, wire: @wire)
+          delivered: @delivered, timed_out: @timed_out, retried: true, wire: @wire,
+          retryable_stale: @retryable_stale, lf_framed: @lf_framed)
       end
     end
 
@@ -106,30 +123,23 @@ module Gori
                     verify_upstream : Bool, sni : String? = nil,
                     timeout : Time::Span? = nil,
                     overrides : Gori::HostOverrides? = nil,
-                    tls_preset : String? = nil) : Result
+                    tls_preset : String? = nil,
+                    cancel : Proc(Bool)? = nil) : Result
         started = Time.instant
         # `timeout` is a PER-OPERATION bound (connect, and idle between reads/writes),
-        # not a total request deadline — same model as the proxy's IO_TIMEOUT. A true
+        # not a total request deadline — same model as the proxy's `Settings.io_timeout`. A true
         # whole-request deadline would need a timer fiber racing a socket close.
-        upstream, dial_error = dial_result(scheme, host, port, verify_upstream, sni, timeout, overrides, tls_preset)
+        upstream, dial_error = dial_result(scheme, host, port, verify_upstream, sni, timeout,
+          overrides, tls_preset, cancel)
         return error(connect_error(scheme, host, port, verify_upstream, dial_error), started) unless upstream
 
         begin
-          exchange(upstream, request, host, port, started)
+          Proxy::Upstream.with_cancel(upstream, cancel) do
+            exchange(upstream, request, host, port, started, origin_scheme: scheme)
+          end
         ensure
           upstream.close rescue nil
         end
-      end
-
-      # Opens ONE upstream connection to the origin, or nil when the dial (or, for https,
-      # the TLS handshake) failed. Public because a keep-alive pool has to own the socket's
-      # lifetime across many exchanges — `send` above is the same dial plus a single
-      # exchange plus a close. `timeout` is the per-operation bound (connect, and idle
-      # between reads/writes), exactly as in `send`.
-      def self.dial(scheme : String, host : String, port : Int32, verify_upstream : Bool,
-                    sni : String?, timeout : Time::Span?,
-                    overrides : Gori::HostOverrides?, tls_preset : String? = nil) : IO?
-        dial_result(scheme, host, port, verify_upstream, sni, timeout, overrides, tls_preset)[0]
       end
 
       # The same dial, paired with WHY there is no socket. Every active send path in gori
@@ -145,12 +155,14 @@ module Gori
       def self.dial_result(scheme : String, host : String, port : Int32, verify_upstream : Bool,
                            sni : String?, timeout : Time::Span?,
                            overrides : Gori::HostOverrides?,
-                           tls_preset : String? = nil) : {IO?, Proxy::Upstream::DialError?}
+                           tls_preset : String? = nil,
+                           cancel : Proc(Bool)? = nil) : {IO?, Proxy::Upstream::DialError?}
         ct = timeout || Settings.connect_timeout
         it = timeout || Settings.io_timeout
         if scheme == "https"
           Proxy::Upstream.dial_tls_result(host, port, verify: verify_upstream, sni: sni,
-            connect_timeout: ct, io_timeout: it, overrides: overrides, tls_preset: tls_preset)
+            connect_timeout: ct, io_timeout: it, overrides: overrides, tls_preset: tls_preset,
+            cancel: cancel)
         else
           Proxy::Upstream.dial_result(host, port, connect_timeout: ct, io_timeout: it, overrides: overrides)
         end
@@ -188,7 +200,7 @@ module Gori
               results << Result.new(Bytes.new(0), nil, nil, 0_i64, "skipped — the connection closed earlier in the group")
               next
             end
-            r = exchange(upstream, request, host, port, Time.instant)
+            r = exchange(upstream, request, host, port, Time.instant, origin_scheme: scheme)
             results << r
             # A failed OR incomplete exchange leaves the socket unusable for the rest: an
             # error is self-evident; an incomplete body (origin cut it short, or we hit the
@@ -200,6 +212,128 @@ module Gori
           upstream.close rescue nil
         end
         results
+      end
+
+      # Fire N DISTINCT requests as close to simultaneously as one process can — the
+      # multi-endpoint race / last-byte-sync primitive (#1236). Each member gets its OWN
+      # dedicated connection to the shared origin, every member's final byte is held back, and
+      # all of them are released in one tight loop, so the requests land within the same narrow
+      # window on the server. This is the primitive behind TOCTOU across DISTINCT endpoints
+      # (`POST /apply-coupon` racing `POST /checkout`).
+      #
+      # Contrast the two neighbours: `send_pipeline` is ONE connection, sequential; the Fuzzer
+      # race (`Fuzz::Sender#send_race`) is N BYTE-IDENTICAL copies of one template. This is N
+      # connections released together carrying N DISTINCT `wires` — so `Fuzz::Sender#send_race`
+      # now delegates here, passing N identical wires, and the Repeater passes hand-authored
+      # distinct ones.
+      #
+      # The caller owns GATING: every wire here has already cleared the Layer-2 send gate, and a
+      # warm-up (a SECOND, different request on each socket) must be gated by the caller too.
+      # `on_warmup` fires once per warm-up exchange actually performed, for callers that count
+      # the extra wire sends (`Fuzz::Sender#extra_requests`). The socket-retirement rule after a
+      # warm-up (`ConnPool.reusable_response?`) and the release discipline (one tight loop, no
+      # I/O between writes; fan-out read only once every byte is on the wire — P6) carry over
+      # verbatim from the Fuzzer race.
+      #
+      # Refuses the whole release if fewer than 2 connections survive assembly — racing one
+      # connection proves nothing.
+      def self.race_h1(wires : Array(Bytes), *, scheme : String, host : String, port : Int32,
+                       verify_upstream : Bool, sni : String? = nil,
+                       timeout : Time::Span? = nil,
+                       overrides : Gori::HostOverrides? = nil,
+                       tls_preset : String? = nil,
+                       warmup : Bytes? = nil,
+                       on_warmup : (-> Nil)? = nil) : Array(Result)
+        return [] of Result if wires.empty?
+        n = wires.size
+        results = Array(Result?).new(n) { nil }
+        sockets = Array(IO?).new(n) { nil }
+
+        # ── assemble: dial, optionally warm up, write everything but the final byte ─────────
+        n.times do |i|
+          socket, error = assemble_race_conn(wires[i], scheme, host, port, verify_upstream, sni,
+            timeout, overrides, tls_preset, warmup, on_warmup)
+          sockets[i] = socket
+          results[i] = error if error
+        end
+
+        live = (0...n).select { |i| sockets[i] }
+        if live.size < 2
+          live.each { |i| sockets[i].try(&.close) rescue nil }
+          return (0...n).map do |i|
+            results[i] || Result.new(Bytes.new(0), nil, nil, 0_i64,
+              "race: could not assemble enough live connections (#{live.size} of #{n})")
+          end
+        end
+
+        # ── release: one tight loop, no sleep/channel-op/other I/O between writes ───────────
+        started = Time.instant
+        live.each do |i|
+          next unless socket = sockets[i]
+          wire = wires[i]
+          begin
+            socket.write(wire[wire.size - 1, 1])
+          rescue ex
+            # A broken socket here must not stop writing to the REST of the group — that would
+            # desynchronize the release far worse than losing one member.
+            results[i] = Result.new(Bytes.new(0), nil, nil, 0_i64, "race: release write failed — #{ex.message}")
+            socket.close rescue nil
+            sockets[i] = nil
+          end
+        end
+
+        # ── read: no longer time-critical once every byte is on the wire — fan out ──────────
+        released = (0...n).select { |i| sockets[i] }
+        done = WaitGroup.new(released.size)
+        released.each do |i|
+          spawn do
+            if socket = sockets[i]
+              results[i] = read_response(socket, wires[i], host, port, started, origin_scheme: scheme)
+              socket.close rescue nil
+            end
+          ensure
+            done.done
+          end
+        end
+        done.wait
+
+        (0...n).map { |i| (r = results[i]) ? r.with_wire(wires[i]) : Result.new(Bytes.new(0), nil, nil, 0_i64, "race: no result") }
+      end
+
+      # Dial one race member's connection, optionally warm it up, and write everything but the
+      # final byte — the per-member half of `race_h1`'s assemble loop, split out so the loop
+      # itself stays a straight fan-out. Returns `{socket, nil}` on success (the socket holds the
+      # withheld last byte), or `{nil, error}` for a member that could not be assembled.
+      private def self.assemble_race_conn(wire : Bytes, scheme : String, host : String, port : Int32,
+                                          verify_upstream : Bool, sni : String?, timeout : Time::Span?,
+                                          overrides : Gori::HostOverrides?, tls_preset : String?,
+                                          warmup : Bytes?, on_warmup : (-> Nil)?) : {IO?, Result?}
+        if wire.size < 2
+          # Nothing to hold back — a hand-built member too short to split. Record an error rather
+          # than slice a negative/empty tail; it counts against the live floor in the caller.
+          return {nil, Result.new(Bytes.new(0), nil, nil, 0_i64, "race: request too short to hold back a byte")}
+        end
+        upstream, dial_error = dial_result(scheme, host, port, verify_upstream, sni, timeout, overrides, tls_preset)
+        unless upstream
+          msg = connect_error(scheme, host, port, verify_upstream, dial_error)
+          return {nil, Result.new(Bytes.new(0), nil, nil, 0_i64, "race: dial failed — #{msg}")}
+        end
+        if w = warmup
+          wr = exchange(upstream, w, host, port, Time.instant, origin_scheme: scheme)
+          on_warmup.try(&.call)
+          unless ConnPool.reusable_response?(wr, request_method(w))
+            upstream.close rescue nil
+            return {nil, Result.new(Bytes.new(0), nil, nil, 0_i64,
+              "race: warmup failed — #{wr.error || "the connection will not survive to the race request"}")}
+          end
+        end
+        begin
+          upstream.write(wire[0, wire.size - 1]) # sync=true already flushes; no second syscall needed
+        rescue ex
+          upstream.close rescue nil
+          return {nil, Result.new(Bytes.new(0), nil, nil, 0_i64, "race: write failed — #{ex.message}")}
+        end
+        {upstream, nil}
       end
 
       # The exact error string a clean EOF before ANY response byte produces. A keep-alive
@@ -215,8 +349,8 @@ module Gori
       # value through every dial's return tuple (which would touch `ClientConn`'s live-MITM
       # path and every other engine's signature for a clause only THIS message needs). A plain,
       # unproxied miss keeps today's exact wording: `proxied_via` is nil for a direct route.
-      def self.no_response_error(host : String, port : Int32) : String
-        "no response from #{host}:#{port}#{Proxy::Upstream.proxy_tunnel_note(Proxy::Upstream.proxied_via(host))}"
+      def self.no_response_error(host : String, port : Int32, origin_scheme : String = "http") : String
+        "no response from #{host}:#{port}#{Proxy::Upstream.proxy_tunnel_note(Proxy::Upstream.proxied_via(host, origin_scheme, port))}"
       end
 
       # Writes one request on an already-open connection and reads its single response
@@ -228,14 +362,15 @@ module Gori
       # any more: `Fuzz::ConnPool` reuses one socket across a sweep's requests. Both apply
       # the SAME retirement rule to the socket afterwards (error or incomplete ⇒ unusable).
       def self.exchange(upstream : IO, request : Bytes, host : String, port : Int32,
-                        started : Time::Instant) : Result
+                        started : Time::Instant, *, origin_scheme : String = "http") : Result
         upstream.write(request)
         upstream.flush
-        read_response(upstream, request, host, port, started)
+        read_response(upstream, request, host, port, started, origin_scheme: origin_scheme)
       rescue ex
         # A write/flush failure — no response byte was ever attempted, so this is always the
         # pre-delivery case (see `read_response`'s own rescue for the post-head-read one).
-        error(exchange_error(ex, host, port, nil), started, delivered: false)
+        error(exchange_error(ex, host, port, nil), started, delivered: false,
+          retryable_stale: true)
       end
 
       # The read half of `exchange`, split out so a caller can write a request in TWO
@@ -245,11 +380,13 @@ module Gori
       # releases them together, and only reads responses afterwards (reading is no longer
       # time-critical once every byte has been written).
       def self.read_response(upstream : IO, request : Bytes, host : String, port : Int32,
-                             started : Time::Instant) : Result
-        head = read_response_head(upstream)
-        return error(no_response_error(host, port), started) unless head
+                             started : Time::Instant, *, origin_scheme : String = "http") : Result
+        head_result = read_response_head(upstream)
+        head = head_result.head?
+        return response_head_error(head_result, host, port, started, origin_scheme) unless head
 
         resp = Proxy::Codec::Http1.parse_response_head(head)
+        lf_framed = Proxy::Codec::Http1.lf_terminated_head?(head)
         # Skip interim 1xx informational responses (RFC 9110 §15.2): a captured request
         # carrying `Expect: 100-continue`, or an origin/CDN that emits 103 Early Hints,
         # would otherwise return the 100/103 as the repeater result. Read on until the final
@@ -270,9 +407,12 @@ module Gori
           interim_seen += 1
           interim_status = resp.status
           return error("too many interim 1xx responses from #{host}:#{port}", started, delivered: true) if interim_seen > MAX_INTERIM
-          head = read_response_head(upstream)
-          return error("upstream closed after interim 1xx from #{host}:#{port}", started, delivered: true) unless head
+          head_result = read_response_head(upstream)
+          head = head_result.head?
+          return response_head_error(head_result, host, port, started, origin_scheme,
+            interim: interim_status) unless head
           resp = Proxy::Codec::Http1.parse_response_head(head)
+          lf_framed ||= Proxy::Codec::Http1.lf_terminated_head?(head)
         end
         # A reply whose status-line can't be parsed (no HTTP-version, or a non-numeric status —
         # garbage/non-HTTP, or an h2 stack answering this h1 request) is flagged `malformed?` by
@@ -292,7 +432,7 @@ module Gori
           # without it a streaming origin (SSE/heartbeat) or a multi-GB body hangs or OOMs
           # this single-threaded send. A capped body comes back complete:false → incomplete.
           body, complete = Proxy::Codec::Body.read_complete(upstream, framing, len, Proxy::Codec::Body::CAPTURE_READ_MAX)
-          Result.new(head, body, resp, elapsed(started), incomplete: !complete)
+          Result.new(head, body, resp, elapsed(started), incomplete: !complete, lf_framed: lf_framed)
         rescue ex
           # The head was already read + parsed. A framing rejection (CL+TE — precisely the
           # ambiguous response a smuggling/desync probe is hunting) or a mid-body read error
@@ -305,13 +445,14 @@ module Gori
           # origin never closed. It is also the shape a time-based payload produces against an
           # origin that streams its head first, which `Fuzz::Matcher#eligible?` has to see.
           Result.new(head, nil, resp, elapsed(started), error: ex.message || "response read failed",
-            incomplete: true, timed_out: ex.is_a?(IO::TimeoutError))
+            incomplete: true, timed_out: ex.is_a?(IO::TimeoutError), lf_framed: lf_framed)
         end
       rescue ex
-        # `head` is nil iff we failed before/at the FIRST head read (a write error, or a reset
-        # on a parked socket) — the pre-delivery case the pool may re-send. A raise AFTER a head
-        # was read (an interim-1xx read that then reset) means the origin already has the whole
-        # request, so mark it delivered and do not re-send a non-idempotent one.
+        # The head reader turns ordinary EOF, reset, timeout, and unfinished-head outcomes into
+        # a Result above. This rescue is for exceptions escaping the read or parser: a complete
+        # head already read (including an interim 1xx) means the origin got the request, so mark
+        # it delivered. Replay eligibility comes only from the explicit stale marker, never
+        # from this exception shape.
         # `timed_out` distinguishes "the origin went silent and the read timed out" from every
         # other way an exchange can fail, and its doc on `Result` has always said so — but only
         # the h2 engine ever set it, so on the h1 path (which is most sends, and every
@@ -328,10 +469,8 @@ module Gori
       # A bare `ex.message` — `"Read timed out"` — names neither the origin nor the one fact
       # that decides what a caller may do next. An origin that answers `100 Continue` and then
       # goes silent is the h1 twin of the case `H2Engine.no_response` writes a careful sentence
-      # for, and it read identically to a plain silent origin: same message, same `error_kind`,
-      # and (before `delivered?` reached a surface) the same `retryable: true`. The two are
-      # opposite instructions — the interim proves the origin has the whole request, because
-      # gori writes it up front.
+      # for, and it read identically to a plain silent origin. The two are opposite instructions
+      # — the interim proves the origin has the whole request, because gori writes it up front.
       #
       # Only the INTERIM case is reworded. With no interim there is nothing gori knows that
       # `ex.message` does not, and inventing a host-shaped sentence for every socket error
@@ -345,6 +484,32 @@ module Gori
         "#{tail} (RFC 9110 §15.2: a 1xx precedes the final response, it is not one)"
       end
 
+      private def self.response_head_error(result : Proxy::Codec::Http1::HeadReadResult,
+                                           host : String, port : Int32, started : Time::Instant,
+                                           origin_scheme : String, interim : Int32? = nil) : Result
+        message = if interim && result.timed_out? && result.bytes.empty?
+                    # Keep the established origin-facing wording for an interim response
+                    # followed by silence. The detailed head reader reports this timeout as
+                    # a result (rather than raising into `read_response`'s rescue), so route
+                    # it through the same sentence used by that older exception path.
+                    exchange_error(result.error || IO::TimeoutError.new("response head read timed out"),
+                      host, port, interim)
+                  elsif result.state == Proxy::Codec::Http1::HeadReadResult::State::Empty
+                    if interim
+                      "upstream closed after interim 1xx from #{host}:#{port}"
+                    else
+                      no_response_error(host, port, origin_scheme)
+                    end
+                  else
+                    detail = result.failure_message("response head",
+                      deadline: Proxy::SocketTuning::HEAD_DEADLINE)
+                    interim ? "#{detail} after interim #{interim} from #{host}:#{port}" : "#{detail} from #{host}:#{port}"
+                  end
+        Result.new(result.bytes, nil, nil, elapsed(started), message,
+          incomplete: result.received?, delivered: result.received? || !interim.nil?,
+          timed_out: result.timed_out?, retryable_stale: result.retryable_empty_read? && interim.nil?)
+      end
+
       # Read a response head with a TOTAL head-assembly deadline (parity with the proxy's
       # client read, client_conn.cr:111). The per-operation io_timeout only bounds the gap
       # BETWEEN reads, so a slowloris origin dripping the head one byte at a time (each byte
@@ -352,8 +517,11 @@ module Gori
       # freeze every other tool. HEAD_DEADLINE caps the whole head. underlying_socket returns
       # nil for an IO with no settable socket, in which case read_head simply skips the
       # deadline (unchanged behaviour), so this is safe on every transport.
-      private def self.read_response_head(upstream : IO) : Bytes?
-        Proxy::Codec::Http1.read_head(upstream,
+      #
+      # `read_response_head_result` also ends a head on a bare-LF blank line, as the proxy does;
+      # a pool never reuses the socket behind one (`ConnPool.reusable_response?`).
+      private def self.read_response_head(upstream : IO) : Proxy::Codec::Http1::HeadReadResult
+        Proxy::Codec::Http1.read_response_head_result(upstream,
           deadline: Proxy::SocketTuning::HEAD_DEADLINE,
           timeout_sock: Proxy::SocketTuning.underlying_socket(upstream))
       end
@@ -361,9 +529,9 @@ module Gori
       # An error Result with no head/body, timed from `started` (shared with the pool, which
       # reports a failed dial the same way `send` does).
       def self.error(message : String, started : Time::Instant, delivered : Bool = false,
-                     timed_out : Bool = false) : Result
+                     timed_out : Bool = false, retryable_stale : Bool = false) : Result
         Result.new(Bytes.new(0), nil, nil, elapsed(started), message,
-          delivered: delivered, timed_out: timed_out)
+          delivered: delivered, timed_out: timed_out, retryable_stale: retryable_stale)
       end
 
       # Why the dial produced no socket.
@@ -423,7 +591,9 @@ module Gori
         "connect failed: #{host}:#{port} — host unreachable (DNS/refused/timeout)"
       end
 
-      private def self.elapsed(started : Time::Instant) : Int64
+      # Microseconds since `started` — the `Result` duration the h1, h2 and WebSocket engines
+      # all report.
+      def self.elapsed(started : Time::Instant) : Int64
         (Time.instant - started).total_microseconds.to_i64
       end
 

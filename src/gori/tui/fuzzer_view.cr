@@ -26,6 +26,7 @@ require "./fuzz_advanced_overlay"
 require "../repeater/flow_request"
 require "../env"
 require "./highlight"
+require "./repeater_view/target_field"
 require "../saml"
 require "../jwt"
 require "../graphql"
@@ -33,6 +34,8 @@ require "../form_data"
 require "./subtab_clone"
 require "./fuzzer_result_window"
 require "./subtab_marks"
+require "../hotkeys"
+require "../plural"
 
 module Gori::Tui
   # One Fuzzer/Intruder session (a sub-tab under the Fuzzer tab). Holds the editable
@@ -44,6 +47,11 @@ module Gori::Tui
   # `mode clusterbomb`, `list a,b,c`, `match status:200,500`, `concurrency 50`.
   class FuzzerView
     include SubtabRef # a sub-tab strip may hold a mark on this view (#683)
+    # The TARGET card's URL + TLS SNI fields, exactly as RepeaterView's: an https vhost sweep
+    # seeded from History (⇧I) needs an SNI, and `@sni` is persisted, restored, reconciled,
+    # cloned and handed to `build_engine` like the Repeater's.
+    include TargetField
+    @registry : Verb::Registry? = nil
     enum ResultIoState
       Idle
       Spooling
@@ -64,6 +72,11 @@ module Gori::Tui
       time_hist : Array(Int32), time_min : Int64, time_max : Int64
 
     @results : Deque(Fuzz::Result)
+
+    # One line of the GROUPED results list (#1351): a cluster's header — its representative
+    # row — or one of its members when the cluster is expanded. Parallel to `sorted_results`.
+    # `in_window` is how many of the cluster's members the display window still holds.
+    record GroupLine, cluster : Fuzz::Clusters::Cluster, header : Bool, in_window : Int32 = 0
 
     STATUS_MAX_ROWS =  6 # ≤ this many distinct codes → per-code bars; else collapse to classes
     DIST_MIN_TOTAL  = 60 # narrowest bottom width that still earns a sidebar
@@ -88,6 +101,19 @@ module Gori::Tui
     property job_id : Int32 # bottom-bar/notification job handle (0 = no active job)
     getter config : Fuzz::Config
     getter matcher : Fuzz::Matcher
+    getter run_keep : Fuzz::Keep
+    # The index of the result this run's `stop_on` tripped on (issue #1270): the live run's
+    # `DoneEvent#stop_index`, or a reopened run's `fuzz_runs.stop_idx`, so both mark the same
+    # row. Nil unless the run ended `condition_met`.
+    getter run_stop_idx : Int64?
+
+    def set_registry(registry : Verb::Registry) : Nil
+      @registry = registry
+    end
+
+    private def key_label(id : String, fallback : String) : String
+      @registry.try { |r| Hotkeys.binding_label(r, id, fallback) } || fallback
+    end
 
     PANE_ORDER = [:target, :template, :config, :results]
 
@@ -104,6 +130,9 @@ module Gori::Tui
       # `RepeaterView#seed_draft_baselines` for the model. Empty on a draft, where every `$`
       # is the operator's by definition.
       @evidence_env_names = Set(String).new
+      # The bytes that set was derived from, and the grammar revision it was derived under.
+      @evidence_env_seed = ""
+      @evidence_env_rev = Env.highlight_rev
       @editor = TextArea.new
       @editor.gutter = true
       # Soft wrap, Burp-style, exactly as the Repeater's request pane: a long header, URL or
@@ -145,6 +174,21 @@ module Gori::Tui
       @s_grpc_fields = ""
       @s_m_regex = "" # regex fields buffered as source strings, compiled on commit
       @s_f_regex = ""
+      # `stop_on` (issue #1240): `@s_stop_after` ends the run once the matchers hit N times
+      # (blank = never), `@s_stop_on` is one DIM:SPEC condition term (blank = none, compiled to
+      # `Matcher#stop_condition` by `commit_buffers`, its grammar errors surfaced by
+      # `stop_on_error`). Buffers like the numeric/regex ones, for the same "a field can be
+      # cleared mid-edit" reason.
+      @s_stop_after = ""
+      @s_stop_on = ""
+      # The request-time macro (#1350), as typed in the ADVANCED card. Buffers, not a `Spec`, for
+      # the reason the ones above are: a half-typed cadence must not break the overlay, and what
+      # the operator typed is what the card shows again. `commit_buffers` builds the spec
+      # (`Fuzz::Config#request_macro`); `macro_error` names a value that does not read.
+      @s_macro_steps = ""
+      @s_macro_every = ""
+      @s_macro_expect = ""
+      @s_macro_on_failure = ""
       # Memoized "Run · N requests" count, recomputed only when the config signature
       # (mode + sets + marker count) changes, so the summary row never rebuilds sources each frame.
       @run_count_cache = nil.as(Int64?)
@@ -159,7 +203,7 @@ module Gori::Tui
       # which the user may have edited (adding/removing §…§ markers) since the run.
       @run_template = nil.as(Fuzz::Template?)
       @pending_template = nil.as(Fuzz::Template?)
-      # {update_content_length?, add_content_length_when_missing?, keep_bodies} as of the run
+      # {update_content_length?, add_cl_when_missing (always true), keep_bodies} as of the run
       # that produced @results — frozen alongside @run_template for the same reason: the
       # reconstruction and the note that names the retention policy must describe THAT run,
       # not whatever the CONFIG pane says now.
@@ -197,10 +241,27 @@ module Gori::Tui
       # about THIS template buffer, and an edit that adds a Content-Length must retract it.
       @unframed_body = false
       @unframed_body_rev = -1
+      @unused_sets = 0
+      @payload_reports = [] of Gori::PayloadFrom::Report
+      @macro_info = nil.as(Gori::RequestMacro::Info?)
       @sel = 0
       @scroll = 0
+      @results_last_h = 0 # result rows the last frame drew — the PgUp/PgDn step
       @sort = :index
       @matched_only = false
+      # Group RESULTS by response shape (#1351): one representative row per cluster, folded
+      # by default and expanded with →. `@clusters` counts the WHOLE run — every appended
+      # result, or every stored row of a reopened run — while the members a cluster expands to
+      # are the rows still in the display window. The order is `o`'s value while grouped.
+      @grouped = false
+      @group_order = Fuzz::Clusters::Order::Rare
+      @expanded = Set(Int64).new
+      @expanded_rev = 0
+      @clusters = Fuzz::Clusters.new
+      @group_lines = [] of GroupLine
+      # Header rows drawn from a cluster's metrics-only representative (no member left in the
+      # window), by result index — see `outside_window?`.
+      @outside_reps = Set(Int64).new
       # §-region offsets, recomputed only when the buffer changes (keyed on @editor.edits).
       # Backs BOTH the template tint colours and the Sets→marker chips, so they can't disagree.
       @marker_text_rev = -1
@@ -246,6 +307,7 @@ module Gori::Tui
       @sorted_cache_rev = -1_i64
       @sorted_cache_sort = :index
       @sorted_cache_matched = false
+      @sorted_cache_group = nil.as({Fuzz::Clusters::Order, Int32}?)
       @sorted_cache_at = Time.instant # see SORT_REFRESH
       @progress = nil.as(Fuzz::Progress?)
       @run_total = nil.as(Int64?)
@@ -258,6 +320,11 @@ module Gori::Tui
       @run_tls_preset = nil.as(String?)
       @run_websocket = false
       @run_max_requests = nil.as(Int64?)
+      # The archive policy this run's spool/Shift-E was frozen under (issue #1240) — captured at
+      # `begin_run` like the other `@run_*` snapshot fields, so a post-run config edit does not
+      # change what the saved run records.
+      @run_keep = Fuzz::Keep::All
+      @run_stop_idx = nil.as(Int64?)
       @saved_run_id = nil.as(Int64?)
       @failed_save_run_id = nil.as(Int64?)
       @result_io_state = ResultIoState::Idle
@@ -295,7 +362,8 @@ module Gori::Tui
       # body on EVERY scroll keystroke. The selected row is fixed while the detail is open
       # (same invariant @decoded_index relies on), so this only recomputes on pane/row change.
       @detail_lines_cache = nil.as(Array(String)?)
-      @detail_lines_key = nil.as({Symbol, Int64}?)
+      @detail_lines_key = nil.as({Symbol, Int64, Bool}?)
+      @detail_note_count = 0
       # The Array `@detail_read` is currently pointed at, compared by IDENTITY — see
       # `sync_detail_source`.
       @detail_source_lines = nil.as(Array(String)?)
@@ -303,7 +371,7 @@ module Gori::Tui
       # theme revision so a palette switch rebuilds it. Held in lockstep with the plain
       # @detail_lines_cache; the plain lines still back the gutter/cursor/selection math.
       @detail_styled_cache = nil.as(Array(Highlight::Line)?)
-      @detail_styled_key = nil.as({Symbol, Int64}?)
+      @detail_styled_key = nil.as({Symbol, Int64, Bool}?)
       @detail_styled_rev = 0_u32
       @focus = :template
       @loaded = false
@@ -324,7 +392,7 @@ module Gori::Tui
     #     the site's own text with every payload in the set. Escaping keeps the bytes:
     #     `render` puts the single `§` back on the wire, the Content-Length still agrees,
     #     and ^K still marks whatever the operator actually points at. (RepeaterView's
-    #     `space ▸ f` seed applies the same escape at the same kind of seam.)
+    #     `space ▸ F` seed applies the same escape at the same kind of seam.)
     #   * no `.scrub`. A capture is EVIDENCE and may legitimately not be valid UTF-8 — a
     #     protobuf/gRPC frame, a gzip'd POST, a latin-1 form field. Scrubbing rewrote each
     #     such byte to the three bytes of U+FFFD before the operator ever saw the request,
@@ -444,6 +512,7 @@ module Gori::Tui
       @name = SubtabClone.copy_name(src.name)
       @dirty = true
       @result_window.clear
+      reset_clusters
       @run_result_count = 0_i64
       @run_matched_count = 0_i64
       @run_error_count = 0_i64
@@ -466,11 +535,6 @@ module Gori::Tui
       @editor.wire_text
     end
 
-    def sni_override : String?
-      s = @sni.strip
-      s.empty? ? nil : s
-    end
-
     def summary(max : Int32 = 28) : String
       line = (@editor.first_nonblank_line || "").strip
       parts = line.split(' ')
@@ -490,10 +554,6 @@ module Gori::Tui
       else
         summary(max)
       end
-    end
-
-    def mark_dirty : Nil
-      @dirty = true
     end
 
     def clear_dirty : Nil
@@ -604,20 +664,31 @@ module Gori::Tui
       @template_mode == InputMode::Insert
     end
 
+    # `editing_sni?` rides along on :target the way RepeaterView's does: the SNI row takes
+    # characters whenever it is the active field (`FuzzerController#edit_target` routes to
+    # `edit_sni` before it consults the mode at all), and clicking the TARGET mode badge
+    # while that row is open drops `@target_mode` to READ without closing it — which left
+    # a field still swallowing letters while the shell believed a digit was the tab bar's.
     def pane_insert?(pane : Symbol) : Bool
       case pane
       when :template then template_insert? || chain_pane_active?
-      when :target   then target_insert?
+      when :target   then target_insert? || editing_sni?
       else                false
       end
     end
 
     def enter_target_insert! : Nil
       @target_mode = InputMode::Insert
+      @target_read.clear_selection # INSERT edits move the text under a READ anchor
     end
 
     def exit_target_insert! : Nil
       @target_mode = InputMode::Read
+    end
+
+    # The template buffer READ-mode edits run against (`TabController#editor_text_buffer`).
+    def read_edit_buffer : {TextArea, TextReadState}?
+      @focus == :template ? {@editor, @template_read} : nil
     end
 
     def enter_template_insert! : Nil
@@ -762,7 +833,7 @@ module Gori::Tui
       # as if this keystroke had placed them (mark_word already refuses honestly).
       if text == before
         n = Fuzz::Template.parse(before).position_count
-        return "already marked (#{n} position#{n == 1 ? "" : "s"}) — Clear markers first to re-derive" unless n.zero?
+        return "already marked (#{Gori.plural(n, "position")}) — Clear markers first to re-derive" unless n.zero?
         # A `§` with no POSITION around it — an escaped `§§`, which is what `#load` makes of
         # a capture's own `§`, or a half-open one the operator typed. `Template.auto_mark`
         # is a no-op on either, and the "nothing to mark" line below would be a plain untruth
@@ -773,7 +844,7 @@ module Gori::Tui
       @editor.set_text(restore_wire_eols(text))
       @dirty = true
       n = Fuzz::Template.parse(text).position_count
-      "auto-marked #{n} position#{n == 1 ? "" : "s"}"
+      "auto-marked #{Gori.plural(n, "position")}"
     end
 
     # Flip the run transport between HTTP/1.1 and HTTP/2 (`^V`), picking which engine the
@@ -849,7 +920,7 @@ module Gori::Tui
         "marker opened — move the cursor and ^T again to close the region"
       else
         n = Fuzz::Template.parse(@editor.text).position_count
-        "marked point — #{n} position#{n == 1 ? "" : "s"}"
+        "marked point — #{Gori.plural(n, "position")}"
       end
     end
 
@@ -939,6 +1010,7 @@ module Gori::Tui
     def begin_run(total : Int64?) : Nil
       @run_generation += 1
       @result_window.clear
+      reset_clusters
       @run_result_count = 0_i64
       @run_matched_count = 0_i64
       @run_error_count = 0_i64
@@ -973,6 +1045,8 @@ module Gori::Tui
       @run_tls_preset = @config.tls_preset
       @run_websocket = @pending_websocket
       @run_max_requests = @config.max_requests
+      @run_keep = @config.keep
+      @run_stop_idx = nil
       @saved_run_id = nil
       @failed_save_run_id = nil
       @loaded_saved_run = false
@@ -980,16 +1054,21 @@ module Gori::Tui
       clear_detail_decode # a new run reuses request indices → drop the old decode cache
     end
 
-    def finish_run(status : String? = nil, archive_ready : Bool = true) : Nil
+    def finish_run(status : String? = nil, archive_ready : Bool = true,
+                   stop_idx : Int64? = nil) : Nil
       @running = false
       if value = status
         @run_status = value
       end
+      # Only a `condition_met` ending has a stop row — the same rule the Store's terminal
+      # update applies, so the live pane and the run ⇧E saves cannot disagree about it.
+      @run_stop_idx = @run_status == "condition_met" ? stop_idx : nil
       @result_io_state = archive_ready ? ResultIoState::Ready : ResultIoState::Failed
     end
 
-    def terminal_status(progress : Fuzz::Progress, stopped : Bool, errored : Bool = false) : String
-      Fuzz.terminal_status(progress, stopped, @run_max_requests, errored)
+    def terminal_status(progress : Fuzz::Progress, stopped : Bool, errored : Bool = false,
+                        stop_reason : String? = nil) : String
+      Fuzz.terminal_status(progress, stopped, @run_max_requests, errored, stop_reason)
     end
 
     def apply_progress(p : Fuzz::Progress) : Nil
@@ -1003,8 +1082,20 @@ module Gori::Tui
       @run_result_count += 1
       @run_matched_count += 1 if r.matched?
       @run_error_count += 1 if r.error
+      @clusters.add(r)
+      # The window keeps index order, so a concurrent run's late result lands ABOVE rows
+      # already drawn (#1432). In the identity view that shifts every row below it by one;
+      # follow the selected row, and the viewport when the row lands above it. Eviction then
+      # shifts all of them back by what left the front — a late row older than a full
+      # window's first lands at 0 and is evicted at once, which nets to no move.
+      identity = @sort == :index && !@matched_only && !@grouped
+      if identity
+        at = @result_window.insertion_point(r.index)
+        @sel += 1 if at <= @sel && @sel < @results.size
+        @scroll += 1 if at < @scroll
+      end
       evicted = @result_window.append(r)
-      if evicted > 0 && @sort == :index && !@matched_only
+      if evicted > 0 && identity
         @sel = {@sel - evicted, 0}.max
         @scroll = {@scroll - evicted, 0}.max
       end
@@ -1023,12 +1114,16 @@ module Gori::Tui
       @results.size
     end
 
-    def retained_result_bytes : Int64
-      @result_window.bytes
+    # Also true for a grouped header drawn from its cluster's own metrics-only representative
+    # (#1351) — the window no longer holds that row, so neither pane has its bytes to show and
+    # no Repeater/Comparer seed may be cut from it.
+    def result_display_truncated?(result : Fuzz::Result) : Bool
+      @result_window.projected?(result.index) || outside_window?(result)
     end
 
-    def result_display_truncated?(result : Fuzz::Result) : Bool
-      @result_window.projected?(result.index)
+    # A grouped header whose representative has left the display window (#1351).
+    def outside_window?(result : Fuzz::Result) : Bool
+      @grouped && @outside_reps.includes?(result.index)
     end
 
     def results_windowed? : Bool
@@ -1090,7 +1185,7 @@ module Gori::Tui
       Fuzz::SavedRunMeta.new(session_id, @run_target, @run_mode, @run_total,
         created_at: @run_started_at, http2: @run_http2, sni: @run_sni,
         tls_preset: @run_tls_preset, websocket: @run_websocket, surface: "tui",
-        source_ref: "tui:#{session_id}:#{@run_started_at}")
+        source_ref: "tui:#{session_id}:#{@run_started_at}", keep: @run_keep.label)
     end
 
     def saved_run_counters : {Int64, Int64, Int64, String}
@@ -1108,23 +1203,37 @@ module Gori::Tui
     def load_saved_run(run : Store::FuzzRunRecord,
                        records : Array(Store::FuzzResultRecord)) : Nil
       window = FuzzerResultWindow.new
-      records.each { |record| window.append(Fuzz::Persistence.result(record)) }
-      load_saved_run(run, window)
+      clusters = Fuzz::Clusters.new
+      records.each do |record|
+        result = Fuzz::Persistence.result(record)
+        clusters.add(result)
+        window.append(result)
+      end
+      load_saved_run(run, window, clusters)
     end
 
     # The production restore path. It takes the WINDOW the reader fiber filled, not its rows:
     # `adopt` carries the projection marks across, and re-appending already-projected rows
     # would drop them (see `FuzzerResultWindow#adopt`).
-    def load_saved_run(run : Store::FuzzRunRecord, window : FuzzerResultWindow) : Nil
+    #
+    # `clusters` is the reader's aggregate over EVERY stored row of the run, not just the
+    # window's; without one (a caller that only has the window) the window is grouped.
+    def load_saved_run(run : Store::FuzzRunRecord, window : FuzzerResultWindow,
+                       clusters : Fuzz::Clusters? = nil) : Nil
       @run_generation += 1
       @result_window.adopt(window)
+      reset_clusters(clusters || Fuzz::Clusters.new.tap { |c| window.rows.each { |row| c.add(row) } })
       apply_saved_run(run)
     end
 
     def load_saved_run(run : Store::FuzzRunRecord, rows : Array(Fuzz::Result)) : Nil
       @run_generation += 1
       @result_window.clear
-      rows.each { |row| @result_window.append(row) }
+      reset_clusters
+      rows.each do |row|
+        @clusters.add(row)
+        @result_window.append(row)
+      end
       apply_saved_run(run)
     end
 
@@ -1143,6 +1252,8 @@ module Gori::Tui
       @run_mode = run.mode
       @run_tls_preset = run.tls_preset
       @run_websocket = run.websocket?
+      @run_keep = Fuzz::Keep.parse?(run.keep) || Fuzz::Keep::All
+      @run_stop_idx = run.stop_idx
       @saved_run_id = run.id
       @failed_save_run_id = nil
       @loaded_saved_run = true
@@ -1168,12 +1279,14 @@ module Gori::Tui
       if @loaded_saved_run
         @run_generation += 1
         @result_window.clear
+        reset_clusters
         @run_result_count = 0_i64
         @run_matched_count = 0_i64
         @run_error_count = 0_i64
         @results_rev += 1
         @progress = nil
         @run_total = nil
+        @run_stop_idx = nil
       end
       @saved_run_id = nil
       @loaded_saved_run = false
@@ -1273,7 +1386,11 @@ module Gori::Tui
         f_words: @matcher.filter_words || "", f_regex: @s_f_regex,
         grpc_fields: @s_grpc_fields,
         tls_preset: @config.tls_preset || "",
-        m_time: @matcher.match_time || "", f_time: @matcher.filter_time || "")
+        m_time: @matcher.match_time || "", f_time: @matcher.filter_time || "",
+        stop_after: @s_stop_after, stop_on: @s_stop_on,
+        keep_interesting: @config.keep.interesting?,
+        macro_steps: @s_macro_steps, macro_every: @s_macro_every,
+        macro_expect: @s_macro_expect, macro_on_failure: @s_macro_on_failure)
     end
 
     # Write the overlay's edited knobs back into the engine buffers (regexes stay as
@@ -1313,6 +1430,16 @@ module Gori::Tui
       # payload is the only evidence for (see `Fuzz::Matcher#match_time`).
       @matcher.match_time = blank_nil(s.m_time)
       @matcher.filter_time = blank_nil(s.f_time)
+      # `stop_on` buffers stay as typed — `commit_buffers` compiles them at build/persist time,
+      # so a half-typed condition never breaks the overlay. `keep` is a plain policy the archive
+      # reads (`Fuzz::Keep`); the toggle picks between its two values.
+      @s_stop_after = s.stop_after
+      @s_stop_on = s.stop_on
+      @config.keep = s.keep_interesting ? Fuzz::Keep::Interesting : Fuzz::Keep::All
+      @s_macro_steps = s.macro_steps
+      @s_macro_every = s.macro_every
+      @s_macro_expect = s.macro_expect
+      @s_macro_on_failure = s.macro_on_failure
       @dirty = true
     end
 
@@ -1364,8 +1491,15 @@ module Gori::Tui
     # block forever. Those report nil → the Run row just omits the count; the exact
     # total is still computed off this path when the run actually starts.
     private def estimated_set_size(s : SetSpec) : Int64?
+      # A project set is a read of the store: never on the render fiber, every frame. Its size is
+      # known when the run is built (`Plan.build` resolves it), which is when the confirm and the
+      # run-start line say it.
+      return nil if s.kind == :project
       if s.kind == :file
-        info = File.info?(s.value)
+        # The file the engine will open, not the text in the field: a bare name is a catalog list
+        # (`Fuzz::WordlistFile` resolves it the same way), and stat'ing it from the working
+        # directory would drop the count for every list the completion inserts by name.
+        info = File.info?(Gori::WordlistCatalog.resolve_path(s.value))
         return nil unless info && info.type.file? && info.size <= COUNT_FILE_CAP
       end
       Fuzz::PayloadSet.new(build_source(s)).size
@@ -1400,18 +1534,84 @@ module Gori::Tui
     # Push the buffered numeric/regex fields into @config/@matcher (before a run and
     # before persistence) so they reflect the edited buffers.
     private def commit_buffers : Nil
-      @config.concurrency = (@s_conc.to_i? || 20).clamp(1, 1000)
+      # Int64 reads, then clamp: `buffer_error` accepts anything `to_i64?` parses, and a value
+      # past Int32 read with `to_i?` fell back to the default while the row kept showing it.
+      @config.concurrency = (@s_conc.to_i64? || 20_i64).clamp(1, 1000).to_i
       @config.rps = @s_rate.to_f?.try { |r| r > 0 ? r : nil }
-      @config.timeout = @s_timeout.to_i?.try { |t| t > 0 ? t.seconds : nil }
-      @config.retries = (@s_retries.to_i? || 0).clamp(0, 1000)
+      @config.timeout = @s_timeout.to_i64?.try { |t| t > 0 ? t.clamp(1, Int32::MAX).seconds : nil }
+      @config.retries = (@s_retries.to_i64? || 0_i64).clamp(0, 1000).to_i
       # Blank / unparsable / <= 0 all mean "no cap" — the same reading `--max-requests`
       # and MCP give an absent key, so clearing the field really does remove the ceiling.
       @config.max_requests = @s_max_req.to_i64?.try { |n| n > 0 ? n : nil }
       # Blank / unparsable / <= 0 all mean "off" — same reading as every other numeric
       # buffer here. Clamped at the same ceiling the engine itself clamps at.
-      @config.race_count = @s_race.to_i?.try { |n| n > 0 ? n.clamp(1, Fuzz::Engine::MAX_RACE_SIZE) : nil }
+      @config.race_count = @s_race.to_i64?.try { |n| n > 0 ? n.clamp(1, Fuzz::Engine::MAX_RACE_SIZE).to_i : nil }
       @matcher.match_regex = @s_m_regex.empty? ? nil : (Regex.new(@s_m_regex) rescue nil)
       @matcher.filter_regex = @s_f_regex.empty? ? nil : (Regex.new(@s_f_regex) rescue nil)
+      # `stop_on` (issue #1240): blank / <= 0 = never, same reading as the numeric buffers. The
+      # condition is compiled from the one DIM:SPEC term; a GRAMMAR error leaves it nil and is
+      # named by `stop_on_error` (like an invalid regex left nil above), while a value-level typo
+      # rides through on a built matcher and is named by `@matcher.spec_error`.
+      @config.stop_after_matches = @s_stop_after.to_i?.try { |n| n > 0 ? n : nil }
+      @matcher.stop_condition = compiled_stop_condition
+      @config.request_macro = macro_spec
+    end
+
+    # The ADVANCED card's macro rows as a spec, or nil when no steps are named (which is every
+    # run that came before). A cadence or policy that does not read leaves the default here and
+    # is named by `macro_error` — `commit_buffers` may fall back, `build_engine` may not.
+    private def macro_spec : Gori::RequestMacro::Spec?
+      steps = Gori::RequestMacro::Spec.parse_steps(@s_macro_steps)
+      return nil if steps.empty?
+      cadence = Gori::RequestMacro::Cadence.parse?(@s_macro_every) || Gori::RequestMacro::Cadence.request
+      policy = Gori::RequestMacro::OnFailure.parse?(@s_macro_on_failure) || Gori::RequestMacro::OnFailure::Skip
+      expect = @s_macro_expect.split(',').map(&.strip).reject(&.empty?)
+      Gori::RequestMacro::Spec.new(steps, cadence, policy, expect)
+    end
+
+    # A macro row that is non-blank and does not read, named — the twin of `buffer_error`. Rows
+    # with no steps typed are ignored on purpose (that is "no macro"), but a cadence typed beside
+    # no steps is a knob that would silently do nothing, so it is named too.
+    private def macro_error : String?
+      steps = Gori::RequestMacro::Spec.parse_steps(@s_macro_steps)
+      every = @s_macro_every.strip
+      policy = @s_macro_on_failure.strip
+      if steps.empty?
+        stray = [] of String
+        stray << "Macro cadence" unless every.empty?
+        stray << "Macro must rebind" unless @s_macro_expect.strip.empty?
+        stray << "Macro on failure" unless policy.empty?
+        return nil if stray.empty?
+        return "#{stray.join(", ")} only apply to a macro — name its steps in Macro steps, or clear them"
+      end
+      if !every.empty? && Gori::RequestMacro::Cadence.parse?(every).nil?
+        return "invalid Macro cadence: #{every} (request, off, or a number of requests)"
+      end
+      if !policy.empty? && Gori::RequestMacro::OnFailure.parse?(policy).nil?
+        return "invalid Macro on failure: #{policy} (skip or stop)"
+      end
+      nil
+    end
+
+    # The `@s_stop_on` buffer compiled to a condition matcher, or nil — split out of
+    # `commit_buffers` so that method stays under the complexity ceiling. A grammar error
+    # yields nil (named by `stop_on_error`), mirroring how the regex buffers nil on a bad
+    # pattern; a value-level typo rides through on the built matcher to `spec_error`.
+    private def compiled_stop_condition : Fuzz::Matcher?
+      spec = @s_stop_on.strip
+      return nil if spec.empty?
+      cond = Fuzz::Matcher.new
+      Fuzz.apply_stop_term(spec, cond).nil? ? cond : nil
+    end
+
+    # The stop-condition buffer's GRAMMAR error, or nil — the twin of `regex_error`, named for
+    # the same reason: `commit_buffers` nils an uncompilable term, which would otherwise stop
+    # nothing with no feedback. A value-level typo (`status:2OO`) is not caught here; it rides a
+    # built condition and is named by `@matcher.spec_error` with every other dimension.
+    private def stop_on_error : String?
+      spec = @s_stop_on.strip
+      return nil if spec.empty?
+      Fuzz.apply_stop_term(spec, Fuzz::Matcher.new)
     end
 
     private def sync_buffers : Nil
@@ -1423,6 +1623,9 @@ module Gori::Tui
       @s_race = @config.race_count.try(&.to_s) || ""
       @s_m_regex = @matcher.match_regex.try(&.source) || ""
       @s_f_regex = @matcher.filter_regex.try(&.source) || ""
+      # `@s_stop_on` is a raw-text buffer restored by `apply_config_json` (like `@s_grpc_fields`),
+      # so only the numeric match count is mirrored back from `@config` here.
+      @s_stop_after = @config.stop_after_matches.try(&.to_s) || ""
     end
 
     # A message when a non-empty regex buffer failed to compile (commit_buffers nils
@@ -1442,13 +1645,24 @@ module Gori::Tui
         {"Concurrency", @s_conc, "a whole number"}, {"Rate", @s_rate, "requests per second"},
         {"Timeout", @s_timeout, "whole seconds"}, {"Retries", @s_retries, "a whole number"},
         {"Max requests", @s_max_req, "a whole number"}, {"Race", @s_race, "a whole number"},
+        {"Stop after N hits", @s_stop_after, "a whole number"},
       }.each do |(name, buf, form)|
         v = buf.strip
         next if v.empty?
         ok = name == "Rate" ? !v.to_f?.nil? : !v.to_i64?.nil?
         return "invalid #{name}: #{v} (#{form})" unless ok
       end
-      nil
+      stop_after_range_error
+    end
+
+    # "Stop after N hits" parses as a number but still ran as "never stop" when it was negative
+    # or past Int32 (`commit_buffers` reads it with `to_i?`), a value the CLI's
+    # `--stop-after-matches` and MCP's `stop_on.after_matches` both refuse. 0 stays "off", the
+    # reading Max requests and Race give it.
+    private def stop_after_range_error : String?
+      n = @s_stop_after.strip.to_i64?
+      return nil if n.nil? || (0_i64..Int32::MAX.to_i64).includes?(n)
+      "invalid Stop after N hits: #{@s_stop_after.strip} (0 to #{Int32::MAX}; blank or 0 = off)"
     end
 
     # --- engine assembly -----------------------------------------------------
@@ -1461,7 +1675,8 @@ module Gori::Tui
     # proxy path uses (`Proxy::Upstream.dial`). It still DEFAULTS to nil for the specs and any
     # caller with no project to load one from, not because the tab skips them.
     def build_engine(verify : Bool, scope : Gori::Scope,
-                     overrides : Gori::HostOverrides? = nil) : {Fuzz::Engine?, String?}
+                     overrides : Gori::HostOverrides? = nil,
+                     project : Gori::Store? = nil) : {Fuzz::Engine?, String?}
       commit_buffers
       if err = regex_error
         return {nil, err} # don't silently run match-everything on a bad pattern
@@ -1469,6 +1684,16 @@ module Gori::Tui
       # A numeric field the commit above fell back from (`Timeout 1.5` → no timeout,
       # `Concurrency 50x` → 20) kept SHOWING the typed text while the run used the default.
       if err = buffer_error
+        return {nil, err}
+      end
+      # A `stop_on` term with a bad dimension or an uncompilable regex — named before the run so
+      # the condition is not silently dropped (its value-level typos are caught by spec_error).
+      if err = stop_on_error
+        return {nil, err}
+      end
+      # A macro row that does not read (a cadence of `sometimes`) — named, not applied as the
+      # default, which would run a per-request macro the operator did not ask for.
+      if err = macro_error
         return {nil, err}
       end
       # A status/size/… spec that can never fire (`2OO`, `>1O0`) ran the whole sweep as
@@ -1492,13 +1717,20 @@ module Gori::Tui
         target: @target, http2: @http2,
         sources: @sets.map { |s| build_source(s) }, config: @config, matcher: @matcher,
         grpc_fields: grpc_field_specs,
-        verify: verify, sni: sni_override, overrides: overrides, env_vars: operator_env_vars)
+        verify: verify, sni: sni_override, overrides: overrides, env_vars: operator_env_vars,
+        # The project a Project set reads (#1352). The live TUI reports the search-index backlog
+        # instead of waiting on a writer (`project_drain_fts: false`): this runs on the event loop.
+        project: project, project_drain_fts: false)
+      @payload_reports = [] of Gori::PayloadFrom::Report # a failed build must not leave the last run's
+      @macro_info = nil                                  # …nor its macro
       plan = Fuzz::Plan.build(options, Gori::Outbound.interactive(scope))
+      @payload_reports = plan.payload_reports
+      @macro_info = plan.request_macro_info
       @pending_template = plan.template # committed to @run_template in begin_run (see result_request)
       # Freeze the CL knobs + retention policy the same way: the reconstruction in
       # `result_request` has to reproduce what THIS run's generator did, and its note has to
       # name the retention THIS run used — not what the CONFIG pane says after a post-run edit.
-      @pending_policy = {@config.update_content_length?, @config.add_content_length_when_missing?,
+      @pending_policy = {@config.update_content_length?, true,
                          @matcher.keep_bodies}
       @pending_auto_encode = plan.auto_encode
       # The generator's OWN answer, not `@config.reframe_grpc?`: the knob is only half of it —
@@ -1521,6 +1753,14 @@ module Gori::Tui
       # template has a body nothing frames, so the origin reads it as zero-length.
       @unframed_body = plan.unframed_body?
       @unframed_body_rev = @editor.edits
+      # Payload sets this mode will never draw from (see `Fuzz::Plan#unused_payload_sets`).
+      # NOT revision-scoped the way the two framing facts above are, and it cannot be: it turns
+      # on the SET LIST and the MODE, and neither has an edit counter — `@editor.edits` tracks
+      # the template buffer only, so guarding on it would retract the claim when the operator
+      # types in the template and keep it when they change the very rows it is about. Instead
+      # it is written on EVERY `build_engine` (0 included, below), so it only ever describes
+      # the plan just built — which is the tick the run-start line reads it on.
+      @unused_sets = plan.unused_payload_sets
       {plan.engine, nil}
     rescue ex : Fuzz::PlanError
       {nil, fuzz_plan_error(ex)}
@@ -1579,8 +1819,33 @@ module Gori::Tui
     # the text and `@evidence` are set — the baseline has to describe the bytes gori was
     # handed, and the editor's answer has to match the provenance those bytes carry.
     private def seed_env_baseline : Nil
-      @evidence_env_names = Env.token_names(@editor.wire_text).to_set
-      @editor.env_literal_names = @evidence ? @evidence_env_names : Set(String).new
+      wire = @editor.wire_text
+      @evidence_env_seed = wire
+      @evidence_env_rev = Env.highlight_rev
+      # BARE names in the ENV namespace for the baseline (it subtracts from a bare-keyed
+      # table), the SEED BYTES for the editor (it paints what the grammar spells — a qualified
+      # `ENV.id` namespaced, a bare `id` otherwise — and re-derives its own set from them).
+      # See `RepeaterView::Group#adopt_evidence_env_seed`, whose pair this mirrors, for why the
+      # bytes and not the two derived sets: the operator can flip `env.syntax` mid-session, and a
+      # set computed at seed time then answers the wrong grammar's question.
+      @evidence_env_names = derive_evidence_env_names(wire)
+      @editor.env_literal_source = @evidence ? wire : nil
+    end
+
+    private def derive_evidence_env_names(wire : String) : Set(String)
+      Env.token_names(wire, ns: Env::Namespace::Env).to_set
+    end
+
+    # The baseline, re-derived from the seed bytes when the grammar has moved since. Read through
+    # this and never off the ivar: its consumer is on the RUN path, where being one grammar behind
+    # means fuzzing a request whose captured `$id` was replaced by a project value.
+    private def evidence_env_names : Set(String)
+      rev = Env.highlight_rev
+      if @evidence_env_rev != rev
+        @evidence_env_rev = rev
+        @evidence_env_names = derive_evidence_env_names(@evidence_env_seed)
+      end
+      @evidence_env_names
     end
 
     # The `$KEY` table THIS template may substitute from, or nil to substitute nothing.
@@ -1593,7 +1858,7 @@ module Gori::Tui
     # tabs hold the same bytes for the same flow and must not answer this differently.
     private def operator_env_vars : Hash(String, String)?
       return nil unless @evidence
-      Env.vars_without(@evidence_env_names)
+      Env.vars_without(evidence_env_names)
     end
 
     private def evidence_template : String
@@ -1623,9 +1888,13 @@ module Gori::Tui
       in Fuzz::PlanError::Reason::UnresolvedEnv
         "unresolved env #{ex.detail} — add it in the Project tab's ENV pane"
       in Fuzz::PlanError::Reason::BadRaceCount
-        "race needs at least 2 connections — set Race to 2 or more (^O config)"
+        if needed = ex.detail
+          "race needs #{needed} requests, over Max requests — raise it or lower Race (^O config)"
+        else
+          "race needs at least 2 connections — set Race to 2 or more (^O config)"
+        end
       in Fuzz::PlanError::Reason::TlsPreset
-        # The ORDINARY path here, unlike the Repeater's `␣T` (which cycles known names and so
+        # The ORDINARY path here, unlike the Repeater's `␣Pt` (which cycles known names and so
         # cannot produce one): the advanced card's TLS fingerprint row is a TEXT field, so a
         # typo reaches this branch on the operator's first run. `ex.message` already names
         # every preset that does exist.
@@ -1661,6 +1930,43 @@ module Gori::Tui
                          "chunked Transfer-Encoding, and Auto Content-Length is off — the " \
                          "origin will read a zero-length body. Turn on ^O ▸ Advanced ▸ " \
                          "Auto Content-Length, or declare the header yourself"
+
+    # How many payload-set rows the LAST built plan will never draw from, and this surface's
+    # sentence for it. `gori run fuzz` and MCP say the same fact with their own remedies; here
+    # the remedy is the CONFIG pane's own mode row, because that is what the operator would
+    # reach for. 0 on every ordinary run, so the run-start line is unchanged for them.
+    def unused_payload_sets : Int32
+      @unused_sets
+    end
+
+    # What each Project set read for the plan just built (#1352): flows and values counted, the
+    # sensitive-value policy, what cut it short. Empty for a run with none. Never a value.
+    def payload_reports : Array(Gori::PayloadFrom::Report)
+      @payload_reports
+    end
+
+    # What the request-time macro does to the run just built (#1350): the steps, the cadence, and
+    # the parallelism it leaves. nil for a run with none. Read by the controller for the run-start
+    # line, the way `payload_reports` and `unused_sets_note` are.
+    def macro_info : Gori::RequestMacro::Info?
+      @macro_info
+    end
+
+    # The sentence, built rather than a constant: unlike `CL_REWRITE_NOTE` the count and the
+    # mode are both in it, and the remedy differs by mode — too many sets under Sniper wants a
+    # different mode, while too many under Pitchfork wants another marked position.
+    def unused_sets_note : String
+      n = @unused_sets
+      remedy =
+        if @config.mode.per_position?
+          "#{@config.mode.label} draws set k for position k and this template marks " \
+          "#{position_count} — mark another position (^A / ^K / ^T), or remove the extra set"
+        else
+          "#{@config.mode.label} uses ONE shared set — switch ^O ▸ Mode to pitchfork " \
+          "(lockstep) or clusterbomb (every combination) to use them all"
+        end
+      "#{n} payload set#{n == 1 ? "" : "s"} will not be used: #{remedy}"
+    end
 
     # Whether the run targets HTTP/2 — for Probe's synthetic RepeaterRecord (see
     # FuzzerController#probe_scan_fuzz_result), which needs to know the protocol
@@ -1698,11 +2004,18 @@ module Gori::Tui
       when :list    then Fuzz::InlineList.new(SetSpec.list_values(s.value))
       when :file    then Fuzz::WordlistFile.new(s.value)
       when :preset  then Fuzz::PresetSource.new(s.value)
+      when :project then build_project_source(s)
       when :null    then Fuzz::NullPayloads.new(s.value.to_i? || 1)
       when :numbers then build_numbers(s.value)
       when :brute   then build_brute(s.value)
       else               Fuzz::InlineList.new([s.value])
       end
+    end
+
+    # A `:project` set as the source the plan builder reads (#1352). Nothing is read here.
+    private def build_project_source(s : SetSpec) : Fuzz::PayloadSource
+      spec = s.project_spec || raise Gori::Error.new("a project payload set could not be read back — edit it and choose its source again")
+      Fuzz::ProjectSource.new(spec)
     end
 
     private def build_numbers(value : String) : Fuzz::NumberRange
@@ -1733,6 +2046,11 @@ module Gori::Tui
       @sel
     end
 
+    # The PgUp/PgDn step: the result rows the last frame drew, minus two of overlap.
+    def results_page_rows : Int32
+      {@results_last_h - 2, 1}.max
+    end
+
     # Mouse: select a row without opening its detail (clamped to the live view).
     def select_result_row(idx : Int32) : Nil
       view = sorted_results
@@ -1741,10 +2059,74 @@ module Gori::Tui
     end
 
     def cycle_sort : String
+      # Grouped, the list is clusters and `o` orders THEM: rare first (the odd answers), then
+      # the largest, then by first appearance.
+      if @grouped
+        @group_order = Fuzz::Clusters::Order.from_value((@group_order.value + 1) % Fuzz::Clusters::Order.values.size)
+        @sel = 0
+        return "cluster order: #{@group_order.label}"
+      end
       order = [:index, :status, :length, :words, :time]
       i = order.index(@sort) || 0
       @sort = order[(i + 1) % order.size]
       "sort: #{@sort}"
+    end
+
+    # The `o` chip on the RESULTS border: the sort column, or the cluster order while grouped.
+    # One spelling for the draw and the hit-test.
+    private def sort_chip : String
+      @grouped ? @group_order.label : @sort.to_s
+    end
+
+    getter? grouped : Bool
+
+    # The run's response-shape clusters (#1351) — whole-run, whatever the window holds.
+    getter clusters : Fuzz::Clusters
+
+    def toggle_grouped : String
+      @grouped = !@grouped
+      @sel = 0
+      @scroll = 0
+      return "showing every result" unless @grouped
+      n = @clusters.size
+      # `{space:fuzz.sort}`, never a bare `o`: the sort is menu-only in the Fuzzer. The
+      # controller expands the token through the registry.
+      "grouped by response shape · #{Gori.plural(n, "cluster")}#{overflow_chip} · ←/→ fold · {space:fuzz.sort} order"
+    end
+
+    # The grouped line under the cursor, nil when the list is not grouped.
+    def selected_group_line : GroupLine?
+      return nil unless @grouped
+      sorted_results # the lines are built with the view
+      @group_lines[@sel]?
+    end
+
+    # → / ← on a grouped list: expand the selected cluster, or fold it back to its header.
+    # Folding from a member lands the cursor on that cluster's header. True when it acted.
+    def fold_group(expand : Bool) : Bool
+      return false unless line = selected_group_line
+      id = line.cluster.id
+      changed = expand ? @expanded.add?(id) : @expanded.delete(id)
+      return false unless changed
+      @expanded_rev += 1
+      view = sorted_results
+      at = (0...view.size).find { |i| (g = @group_lines[i]?) && g.header && g.cluster.id == id }
+      @sel = at || 0
+      true
+    end
+
+    private def reset_clusters(clusters : Fuzz::Clusters = Fuzz::Clusters.new) : Nil
+      @clusters = clusters
+      @expanded.clear
+      @expanded_rev += 1
+    end
+
+    def matched_only? : Bool
+      @matched_only
+    end
+
+    def dist_shown? : Bool
+      @show_dist
     end
 
     def toggle_matched_only : String
@@ -2047,6 +2429,7 @@ module Gori::Tui
     private def reusable_sorted_cache : Array(Fuzz::Result)?
       c = @sorted_cache
       return nil unless c && @sorted_cache_sort == @sort && @sorted_cache_matched == @matched_only
+      return nil unless @sorted_cache_group == group_key
       return c if @sorted_cache_rev == @results_rev
       return c if @running && copies_results? && Time.instant - @sorted_cache_at < SORT_REFRESH
       nil
@@ -2058,123 +2441,88 @@ module Gori::Tui
       if cached = reusable_sorted_cache
         return cached
       end
+      held = held_index_row
       rows = @matched_only ? @results.select(&.matched?) : @results.to_a
       sorted =
-        case @sort
-        when :status then rows.sort_by { |r| r.status || -1 }
-        when :length then rows.sort_by(&.length)
-        when :words  then rows.sort_by(&.words)
-        when :time   then rows.sort_by(&.duration_us)
-        else              rows
+        if @grouped
+          group_rows(rows)
+        else
+          case @sort
+          when :status then rows.sort_by { |r| r.status || -1 }
+          when :length then rows.sort_by(&.length)
+          when :words  then rows.sort_by(&.words)
+          when :time   then rows.sort_by(&.duration_us)
+          else              rows
+          end
         end
+      if held && (at = sorted.bsearch_index { |r| r.index >= held.index })
+        @sel = at
+      end
       @sorted_cache = sorted
       @sorted_cache_rev = @results_rev
       @sorted_cache_sort = @sort
       @sorted_cache_matched = @matched_only
+      @sorted_cache_group = group_key
       @sorted_cache_at = Time.instant
       sorted
+    end
+
+    # Matched-only under `o:index` is index-ordered like the identity view, so a late hit lands
+    # above the cursor there too (#1432) — the copy `append_result` cannot shift. The row the
+    # cursor is on in the cache being replaced, when that cache has this same shape, for the
+    # rebuild to find again (the next row on, when the window has evicted it).
+    private def held_index_row : Fuzz::Result?
+      return nil unless @sort == :index && @matched_only && !@grouped
+      return nil unless @sorted_cache_sort == :index && @sorted_cache_matched && @sorted_cache_group.nil?
+      @sorted_cache.try(&.[@sel]?)
     end
 
     # Does the current view shape COPY @results, or hand it back as-is? `:index` with no
     # matched-only filter is the identity, and an identity needs neither a rebuild nor a
     # throttle — this is what keeps the default view perfectly live.
     private def copies_results? : Bool
-      @sort != :index || @matched_only
+      @sort != :index || @matched_only || @grouped
     end
 
-    # --- target editing ------------------------------------------------------
-    # The TARGET card holds two single-line fields — the URL and the TLS SNI override —
-    # selected by @target_field (^S toggles), exactly as RepeaterView's does. The mutators
-    # below self-route, so the controller's key handling is the same for both rows.
-    #
-    # The knob was already whole here: `@sni` is persisted with the session, restored,
-    # compared by the reconcile, cloned by Duplicate and handed to `build_engine`. Only the
-    # AFFORDANCE was missing, so a fuzz session seeded from History (⇧I) could never present
-    # anything but the dialed IP — an https vhost sweep is exactly the run that needs one,
-    # and the sole working route was to open the request in the Repeater, set SNI there, and
-    # hand it back with `space ▸ Send to Fuzzer`.
-    def editing_sni? : Bool
-      @target_field == :sni
+    # What the grouped projection depends on beyond the rows: its order and which clusters are
+    # open. nil when ungrouped, so a cached flat list is never mistaken for a grouped one.
+    private def group_key : {Fuzz::Clusters::Order, Int32}?
+      @grouped ? {@group_order, @expanded_rev} : nil
     end
 
-    def toggle_sni_field : Nil
-      if @target_field == :sni
-        @target_field = :url
-      else
-        @target_field = :sni
-        @scx = @sni.size
-        @target_mode = InputMode::Insert
+    # The grouped list: each cluster's header (its lowest-index member still in the window, or
+    # the cluster's own metrics-only representative once the window has evicted them all), then
+    # its window members in index order when it is expanded. `@group_lines` is rebuilt beside
+    # it, so line `i` describes row `i`. `rows` is already matched-only-filtered when that lens
+    # is on, and then only clusters holding a match are listed.
+    private def group_rows(rows : Array(Fuzz::Result)) : Array(Fuzz::Result)
+      members = Hash(Int64, Array(Fuzz::Result)).new
+      rows.each { |r| (members[Fuzz::Clusters.key(r)[0]] ||= [] of Fuzz::Result) << r }
+      lines = [] of GroupLine
+      out = [] of Fuzz::Result
+      outside = Set(Int64).new
+      @clusters.sorted(@group_order, @matched_only).each do |c|
+        mem = members[c.id]?.try(&.sort_by!(&.index)) || [] of Fuzz::Result
+        if first = mem.first?
+          out << first
+        else
+          # Under the matched-only lens the header is the cluster's first HIT, never a row the
+          # lens hides.
+          rep = (@matched_only ? c.matched_representative : nil) || c.representative
+          out << rep
+          outside << rep.index
+        end
+        lines << GroupLine.new(c, true, mem.size)
+        next unless @expanded.includes?(c.id)
+        mem.each_with_index do |m, k|
+          next if k == 0
+          out << m
+          lines << GroupLine.new(c, false, mem.size)
+        end
       end
-    end
-
-    # Drop back to URL editing (↵/↑/esc in the SNI field) without changing the value.
-    def exit_sni_field : Nil
-      @target_field = :url
-    end
-
-    def target_insert(ch : Char) : Nil
-      if @target_field == :sni
-        @sni = "#{@sni[0, @scx]}#{ch}#{@sni[@scx..]}"
-        @scx += 1
-      else
-        @target = "#{@target[0, @tcx]}#{ch}#{@target[@tcx..]}"
-        @tcx += 1
-      end
-      @dirty = true
-    end
-
-    def target_backspace : Nil
-      if @target_field == :sni
-        return if @scx == 0
-        @sni = "#{@sni[0, @scx - 1]}#{@sni[@scx..]}"
-        @scx -= 1
-      else
-        return if @tcx == 0
-        @target = "#{@target[0, @tcx - 1]}#{@target[@tcx..]}"
-        @tcx -= 1
-      end
-      @dirty = true
-    end
-
-    def target_move(d : Int32) : Nil
-      if @target_field == :sni
-        @scx = (@scx + d).clamp(0, @sni.size)
-      else
-        @tcx = (@tcx + d).clamp(0, @target.size)
-      end
-    end
-
-    # Home/End on the target/SNI row, ⇧ EXTENDING — the Repeater twin of these carries the
-    # reasoning: assigning the caret directly DROPPED the selection ⇧Home/⇧End was asking to
-    # grow, because the anchor lives in `@target_read` and a bare assignment never reaches it.
-    # A bare press still clears the anchor, which is what the INSERT-mode callers rely on.
-    def target_home(selecting : Bool = false) : Nil
-      if @target_field == :sni
-        @scx = @target_read.move_cx(@scx, -@scx, @sni.size, selecting: selecting)
-      else
-        @tcx = @target_read.move_cx(@tcx, -@tcx, @target.size, selecting: selecting)
-      end
-    end
-
-    def target_end(selecting : Bool = false) : Nil
-      if @target_field == :sni
-        @scx = @target_read.move_cx(@scx, @sni.size - @scx, @sni.size, selecting: selecting)
-      else
-        @tcx = @target_read.move_cx(@tcx, @target.size - @tcx, @target.size, selecting: selecting)
-      end
-    end
-
-    def target_read_move(dc : Int32, selecting : Bool = false) : Nil
-      return if target_insert?
-      if @target_field == :sni
-        @scx = @target_read.move_cx(@scx, dc, @sni.size, selecting: selecting)
-      else
-        @tcx = @target_read.move_cx(@tcx, dc, @target.size, selecting: selecting)
-      end
-    end
-
-    def target_copy_text : String
-      @target_field == :sni ? @target_read.copy_text(@sni, @scx) : @target_read.copy_text(@target, @tcx)
+      @group_lines = lines
+      @outside_reps = outside
+      out
     end
 
     # --- template editing ----------------------------------------------------
@@ -2304,15 +2652,6 @@ module Gori::Tui
       @editor.page(dir * @editor.page_rows, selecting: selecting)
     end
 
-    # THE shared editor keymap over the template — see `TextArea#handle_motion_key`. Dirties
-    # only on a real buffer change (⌥⌫ is the one mutation in the set).
-    def template_motion_key(ev : Termisu::Event::Key) : Bool
-      before = @editor.edits
-      return false unless @editor.handle_motion_key(ev)
-      @dirty = true if @editor.edits != before
-      true
-    end
-
     # ⌃/⌥ + ←/→ — one word instead of one character. Pure motion.
     def template_word_move(dir : Int32, selecting : Bool = false) : Nil
       dir < 0 ? @editor.word_left(selecting) : @editor.word_right(selecting)
@@ -2340,6 +2679,21 @@ module Gori::Tui
       @template_read.move(@editor, dr, dc, selecting: selecting)
     end
 
+    # READ-mode top / bottom of the template (`editor.top` / `editor.bottom`).
+    def template_read_to_edge(dir : Int32) : Nil
+      return if template_insert? || chain_pane_active?
+      @template_read.to_edge(@editor, dir)
+    end
+
+    # READ-mode undo (`editor.undo`). `template_undo` is the INS ladder's ^Z; this one hands
+    # the caret it restored back to the read cursor, which is what READ paints from.
+    def template_read_undo : Bool
+      return false if template_insert? || chain_pane_active?
+      template_undo
+      @template_read.sync_from(@editor)
+      true
+    end
+
     # PageUp / PageDown with the pane in READ mode — a screenful of the editor that draws it.
     def template_read_page(dir : Int32, selecting : Bool = false) : Nil
       template_read_move(dir * @editor.page_rows, 0, selecting: selecting)
@@ -2355,11 +2709,6 @@ module Gori::Tui
     def template_scroll_view(step : Int32) : Nil
       return if chain_pane_active?
       @editor.scroll_view(step)
-    end
-
-    # The template editor's viewport offset — what a wheel notch over the TEMPLATE moves.
-    def template_scroll : Int32
-      @editor.scroll
     end
 
     # One selection model per mode — see RepeaterView#request_copy_text, which this mirrors.
@@ -2398,7 +2747,7 @@ module Gori::Tui
       case @focus
       # INS has its own selection model (the editor's `@sel_anchor`); reporting only the READ
       # side made a visible ⇧arrow band uncopyable — see RepeaterView#pane_selection?.
-      when :template then pane_insert?(:template) ? @editor.selection? : @template_read.selection?
+      when :template then pane_insert?(:template) ? @editor.selection? : @template_read.selection?(@editor)
       when :target   then !pane_insert?(:target) && @target_read.selection?(@target_field == :sni ? @scx : @tcx)
       when :detail   then detail_navigable? && @detail_read.selection?
       else                false
@@ -2443,6 +2792,11 @@ module Gori::Tui
           j.field "retries", @config.retries
           j.field "max_requests", @config.max_requests
           j.field "race_count", @config.race_count
+          # `stop_on` (issue #1240): the match count, the raw DIM:SPEC condition text (the same
+          # "store what the operator typed" reasoning as `grpc_fields`), and the archive policy.
+          j.field "stop_after_matches", @config.stop_after_matches
+          j.field "stop_on", @s_stop_on
+          j.field "keep", @config.keep.label
           j.field "follow", @config.follow_redirects?
           j.field "calibrate", @config.auto_calibrate?
           j.field "keep_alive", @config.keep_alive?
@@ -2465,6 +2819,12 @@ module Gori::Tui
           # ADVANCED card has to show again, and a spec that no longer resolves (the descriptor
           # set moved) must come back as itself rather than silently vanish on restore.
           j.field "grpc_fields", @s_grpc_fields
+          # The request-time macro (#1350), as typed — the same "store what the operator typed"
+          # reasoning as `grpc_fields` and `stop_on`.
+          j.field "macro_steps", @s_macro_steps
+          j.field "macro_every", @s_macro_every
+          j.field "macro_expect", @s_macro_expect
+          j.field "macro_on_failure", @s_macro_on_failure
         end
       end
     end
@@ -2484,6 +2844,7 @@ module Gori::Tui
       obj["retries"]?.try(&.as_i?).try { |n| @config.retries = n }
       @config.max_requests = obj["max_requests"]?.try(&.as_i64?)
       @config.race_count = obj["race_count"]?.try(&.as_i?)
+      apply_stop_on_json(obj)
       @config.follow_redirects = obj["follow"]?.try(&.as_bool?) || false
       @config.auto_calibrate = obj["calibrate"]?.try(&.as_bool?) || false
       # A session persisted before this key existed reads as nil ⇒ keep the ctor default
@@ -2515,9 +2876,20 @@ module Gori::Tui
       @matcher.filter_regex = obj["filter_regex"]?.try(&.as_s?).try { |s| Regex.new(s) rescue nil }
       @matcher.extract = obj["extract"]?.try(&.as_s?).try { |s| Regex.new(s) rescue nil }
       @s_grpc_fields = string_knob(obj, "grpc_fields")
+      apply_macro_json(obj)
       sync_buffers # mirror the restored config/matcher into the editable buffers
     rescue
       # tolerate a malformed/older config blob — keep defaults
+    end
+
+    # The `stop_on` knobs (issue #1240), restored together — split out of `apply_config_json`
+    # so that method stays under the complexity ceiling. Absent (a session saved before these
+    # keys existed) reads as nil / blank / all: no stop condition and an unfiltered archive,
+    # which every saved tab was.
+    private def apply_stop_on_json(obj : Hash(String, JSON::Any)) : Nil
+      @config.stop_after_matches = obj["stop_after_matches"]?.try(&.as_i?)
+      @s_stop_on = string_knob(obj, "stop_on")
+      @config.keep = Fuzz::Keep.parse?(obj["keep"]?.try(&.as_s?)) || Fuzz::Keep::All
     end
 
     # A persisted STRING knob, or "" for a session saved before the key existed (and for a
@@ -2526,6 +2898,16 @@ module Gori::Tui
     # to be added has one example to follow instead of a fourth spelling.
     private def string_knob(obj : Hash(String, JSON::Any), key : String) : String
       obj[key]?.try(&.as_s?) || ""
+    end
+
+    # The macro rows, restored together — split out of `apply_config_json` so that method stays
+    # under the complexity ceiling. Absent (a session saved before the feature) reads as blank,
+    # i.e. no macro.
+    private def apply_macro_json(obj : Hash(String, JSON::Any)) : Nil
+      @s_macro_steps = string_knob(obj, "macro_steps")
+      @s_macro_every = string_knob(obj, "macro_every")
+      @s_macro_expect = string_knob(obj, "macro_expect")
+      @s_macro_on_failure = string_knob(obj, "macro_on_failure")
     end
 
     private def apply_sets_json(arr : JSON::Any?) : Nil
@@ -2544,6 +2926,7 @@ module Gori::Tui
       when "list"    then :list
       when "file"    then :file
       when "preset"  then :preset
+      when "project" then :project
       when "numbers" then :numbers
       when "null"    then :null
       when "brute"   then :brute
@@ -2628,26 +3011,11 @@ module Gori::Tui
       @show_dist ? "distribution shown" : "distribution hidden"
     end
 
-    # The TARGET card grows to a second content row (4 high vs 3) whenever an SNI override is
-    # set OR is being edited, so the override is always visible and the input row only
-    # appears once you reach for it (^S). Same rule and same numbers as RepeaterView.
-    private def sni_active? : Bool
-      !@sni.strip.empty? || (editing_sni? && @focus == :target)
-    end
-
-    private def target_card_h : Int32
-      sni_active? ? 4 : 3
-    end
-
     # The TARGET card row prefixes (marker + the field value 1 col to its right). Constants
     # so render_target and the click→caret mapping agree on the value base.
     TARGET_PREFIX = "›"
     SNI_PREFIX    = "SNI ›"
     SNI_BADGE     = " SNI "
-
-    private def field_base(rect : Rect, prefix : String) : Int32
-      rect.x + 2 + prefix.size + 1
-    end
 
     private def render_target(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.h < 2
@@ -2673,36 +3041,6 @@ module Gori::Tui
       end
     end
 
-    # One single-line field row of the TARGET card: a marker prefix, then the value, with the
-    # block caret + terminal cursor when this row is the active field. Mirrors
-    # RepeaterView#draw_target_row, including the `Screen.draw_width` caret measure that
-    # `target_click_to_cursor`'s `Screen.column_for` inverts and that `paint_char_span_bg`
-    # uses for the selection tint — the three-way agreement `display_width` broke on a value
-    # holding a zero-width char.
-    private def draw_target_row(screen : Screen, rect : Rect, row : Int32, prefix : String, value : String,
-                                cx : Int32, active : Bool, insert : Bool) : Nil
-      screen.text(rect.x + 2, row, prefix, active ? Theme.accent : Theme.muted)
-      base = field_base(rect, prefix)
-      w = {rect.right - base - 1, 1}.max
-      Highlight.draw(screen, base, row, Highlight.env_line(value, Theme.text_bright), width: w)
-      # AFTER the value and before the caret — see `RepeaterView#draw_target_row`, whose note
-      # carries the reasoning: `Highlight.draw` writes its own `bg` over every cell, so a band
-      # painted first was erased on the same frame and this row's ⇧←/→ selection was invisible.
-      if active && !insert
-        if span = @target_read.selection_span(cx)
-          paint_char_span_bg(screen, base, row, value, span[0], span[1], Theme.accent_bg)
-        end
-      end
-      if active
-        cursor_x = base + Screen.draw_width(value[0, cx])
-        if cursor_x < rect.right - 1
-          ch = cx < value.size ? value[cx] : ' '
-          screen.cell(cursor_x, row, ch, Theme.bg, insert ? Theme.accent : Theme.accent_bg)
-          screen.cursor(cursor_x, row)
-        end
-      end
-    end
-
     private def render_template(screen : Screen, rect : Rect, focused : Bool) : Nil
       return if rect.w < 2 || rect.h < 2
       spans = marker_spans
@@ -2716,8 +3054,10 @@ module Gori::Tui
       # Repeater's ^R:SEND so the muscle memory transfers. A gold button while idle, recessed
       # while a run streams (^X stops it). The old CONFIG "Run" row is gone; the request-count
       # estimate stays there as a passive summary (render_run_summary).
-      run_x = Frame.action_badge(screen, rect.right - 1, rect.y, min_x, "^R", "RUN", !running?)
-      pretty_x = Frame.toggle_badge(screen, run_x, rect.y, min_x, "^U", "PRETTY", false)
+      run_x = Frame.action_badge(screen, rect.right - 1, rect.y, min_x,
+        key_label("fuzz.run", "^R"), "RUN", !running?)
+      pretty_x = Frame.toggle_badge(screen, run_x, rect.y, min_x,
+        key_label("fuzz.pretty-template", "^U"), "PRETTY", false)
       # The mode chip states the pane's REAL mode, not `focused && …`: `template_chrome_hit` and
       # `apply_chrome_click` both read `template_insert?` alone, so gating the LABEL on focus made
       # an unfocused pane that had retained INS draw " ↵:READ " (8 cols) over a 5-col " INS " hit
@@ -3024,11 +3364,14 @@ module Gori::Tui
         # written with no reader at all: the spool's failure was announced once, on the
         # run-start status line, and the completion toast then overwrote it — so a sweep whose
         # archive died read exactly like one that can still be promoted, and the only remaining
-        # difference was a ⇧S that quietly does nothing. Beside `saved ##{id}` because the two
+        # difference was a ⇧E that quietly does nothing. Beside `saved ##{id}` because the two
         # answer the same question and are mutually exclusive (a failed archive is never Saved).
         archive = archive_failed? ? " · archive unavailable" : ""
         saved = @saved_run_id.try { |id| " · saved ##{id}" } || ""
-        "#{result_count} sent#{extra} · #{matched_count} hit#{window}#{archive}#{saved}"
+        # The row the run ended on (issue #1270), standing — the row itself can be scrolled
+        # away, windowed out, or hidden by the matched-only lens.
+        stop = FuzzerView.stop_chip(@run_stop_idx)
+        "#{result_count} sent#{extra} · #{matched_count} hit#{stop}#{window}#{archive}#{saved}#{shapes_chip}"
       end
     end
 
@@ -3042,9 +3385,12 @@ module Gori::Tui
       # that resumes after it (`╭─ RESULTS 0 sent · 0 hit────` read as one glued token).
       screen.text(rect.x + 11, rect.y, "#{count} ", Theme.muted, Theme.bg)
       min_x = rect.x + 11 + count.size + 1 # badges never overwrite the count
-      rx = Frame.toggle_badge(screen, rect.right - 1, rect.y, min_x, "v", "DIST", @show_dist)
-      rx = Frame.toggle_badge(screen, rx, rect.y, min_x, "m", "MATCH", @matched_only)
-      Frame.toggle_badge(screen, rx, rect.y, min_x, "o", @sort.to_s, false) # sort: a value chip, never lit
+      rx = Frame.toggle_badge(screen, rect.right - 1, rect.y, min_x,
+        key_label("fuzz.dist", "v"), "DIST", @show_dist)
+      rx = Frame.toggle_badge(screen, rx, rect.y, min_x,
+        key_label("fuzz.matched", "m"), "MATCH", @matched_only)
+      Frame.toggle_badge(screen, rx, rect.y, min_x,
+        key_label("fuzz.sort", "o"), sort_chip, false) # sort: a value chip, never lit
       inner = rect.inset(1, 1)
       view = sorted_results
       @sel = @sel.clamp(0, {view.size - 1, 0}.max)
@@ -3057,25 +3403,61 @@ module Gori::Tui
         TrafficEmptyState.render(screen, inner, variant: :fuzzer_results, running: @running)
         return
       end
-      header = "  #   payload                 status  len      words   time"
+      # Grouped, the first column is the cluster's size (`▸×12`, `▾` when open) and a member's
+      # index is indented under it, so the column is two cells wider.
+      header = @grouped ? "  ×N    payload                 status  len      words   time" : "  #   payload                 status  len      words   time"
       screen.text(inner.x, inner.y, header, Theme.muted, Theme.bg, width: inner.w)
       rows_h = {inner.h - 1, 0}.max
+      @results_last_h = rows_h
       (0...rows_h).each do |i|
         ri = @scroll + i
         break if ri >= view.size
-        render_result_row(screen, inner, inner.y + 1 + i, view[ri], ri == @sel)
+        render_result_row(screen, inner, inner.y + 1 + i, view[ri], ri == @sel, @grouped ? @group_lines[ri]? : nil)
       end
       # Gauge rides the rows region (below the header row), so its track lines up with
       # what @scroll actually windows.
       Frame.scroll_gauge(screen, Rect.new(inner.x, inner.y + 1, inner.w, rows_h), view.size, @scroll, focused)
     end
 
-    private def render_result_row(screen : Screen, inner : Rect, y : Int32, r : Fuzz::Result, selected : Bool) : Nil
+    # ` · N shapes` while the list is grouped — the one place the cluster count stands.
+    private def shapes_chip : String
+      return "" unless @grouped
+      n = @clusters.size
+      " · #{Gori.plural(n, "shape")}#{overflow_chip}"
+    end
+
+    # Rows past `Clusters::MAX_CLUSTERS` distinct shapes are in no cluster, so no grouped row
+    # lists them; say how many, and how many of them were hits, rather than let them vanish.
+    private def overflow_chip : String
+      return "" unless @clusters.truncated?
+      hits = @clusters.overflow_matched
+      " · #{@clusters.overflow_rows} ungrouped#{hits > 0 ? " (#{Gori.plural(hits, "hit")})" : ""}"
+    end
+
+    STOP_ROW_MARK = "stop row"
+
+    # The ` · stop #N` chip for a run's stop row (issue #1270), or "" when it has none — ONE
+    # spelling for the RESULTS border, the run picker and the load status line.
+    def self.stop_chip(idx : Int64?) : String
+      idx ? " · stop ##{idx}" : ""
+    end
+
+    # Is `r` the result this run's `stop_on` tripped on? By index against the RUN's record, not
+    # `r.stop_hit?`: an `after_matches` stop trips on a plain match, several in-flight rows can
+    # meet the condition after the one that fired, and a reopened row carries no flag at all.
+    def stop_row?(r : Fuzz::Result) : Bool
+      !@run_stop_idx.nil? && r.index == @run_stop_idx
+    end
+
+    private def render_result_row(screen : Screen, inner : Rect, y : Int32, r : Fuzz::Result, selected : Bool,
+                                  group : GroupLine? = nil) : Nil
       bg = selected ? Theme.accent_bg : Theme.bg
       screen.fill(Rect.new(inner.x, y, inner.w, 1), bg) if selected
-      screen.cell(inner.x, y, selected ? '▎' : (r.matched? ? '✓' : ' '), r.matched? ? Theme.accent : Theme.muted, bg)
+      # A cluster header is ✓ when ANY member matched, not only its representative.
+      hit = group && group.header ? group.cluster.matched > 0 : r.matched?
+      screen.cell(inner.x, y, selected ? '▎' : (hit ? '✓' : ' '), hit ? Theme.accent : Theme.muted, bg)
       payload = r.payloads.join(", ")
-      line = "#{r.index.to_s.ljust(4)} #{payload_cell(payload)}"
+      line = "#{index_cell(r, group)} #{payload_cell(payload)}"
       # `width:` on BOTH of these: they used to draw unclamped, so a payload cell that
       # measured short (see payload_cell) pushed the status cell past `inner.right`, over
       # the card's right border and across the gap into the DIST sidebar.
@@ -3092,15 +3474,20 @@ module Gori::Tui
       # cell per call PAST the card's border — which is how an over-wide payload leaked into
       # the DIST sidebar. `Screen#text` returns immediately on a width of 0, so 0 is a clean
       # no-draw and the gRPC `x2` chain no-ops instead of cascading.
+      # The row this run's `stop_on` tripped on (issue #1270). A word, not a glyph: the
+      # candidates are East-Asian-ambiguous width and shear a CJK terminal. Ahead of an error
+      # or chain note, whose text runs to the border and would clip a trailing marker.
+      stop = stop_row?(r)
       if err = r.error
-        screen.text(x, y, err, Theme.red, bg, width: {inner.right - x, 0}.max)
+        screen.text(x, y, stop ? "#{STOP_ROW_MARK} · #{err}" : err, Theme.red, bg, width: {inner.right - x, 0}.max)
       elsif r.chain_error
         # The send succeeded, but this row is not the request the operator declared: a `¦chain`
         # did not run so its payload went out RAW, or a schema-known gRPC field's declaration
         # could not hold the payload so that field kept the capture's own value. Flag it in the
         # list (the detail request pane names which, and why) so neither is invisible among
         # clean rows. #567/H3 Finding 1; the gRPC half is #843.
-        screen.text(x, y, "⚠ payload not as declared", Theme.yellow, bg, width: {inner.right - x, 0}.max)
+        note = "⚠ payload not as declared"
+        screen.text(x, y, stop ? "#{STOP_ROW_MARK} · #{note}" : note, Theme.yellow, bg, width: {inner.right - x, 0}.max)
       else
         line = "#{Fmt.size(r.length).ljust(8)} #{r.words.to_s.ljust(7)} #{Fmt.dur(r.duration_us)}"
         # Compact per-row markers — the detail panes carry the full story; here they flag a SHORT
@@ -3109,6 +3496,8 @@ module Gori::Tui
         # not the CLI classifier: the TUI has no CLI dependency.
         line += "  ⚠ incomplete" if r.incomplete?
         line += "  ⟳ ×#{r.resent_count}" if r.resent?
+        line += "  #{STOP_ROW_MARK}" if stop
+        line += window_note(group)
         # For a gRPC target the h2 `:status` to the left is 200 by definition; THIS is the
         # call's real outcome. Only rendered when the response carried it, so a non-gRPC row
         # is unchanged — same fields `cli/output.cr:fuzz_row_text` already renders.
@@ -3120,6 +3509,25 @@ module Gori::Tui
           screen.text(x, y, line, selected ? Theme.text : Theme.muted, bg, width: {inner.right - x, 0}.max)
         end
       end
+    end
+
+    # On a grouped header whose cluster outgrew the display window: how many of its members
+    # the window still lists, so an open `▾×5000` over three rows does not read as complete.
+    private def window_note(group : GroupLine?) : String
+      return "" unless group && group.header
+      # Against what the lens lists: the members in the window are hits only under matched-only.
+      total = @matched_only ? group.cluster.matched : group.cluster.count
+      return "" unless group.in_window < total
+      "  #{group.in_window}/#{total} in window"
+    end
+
+    # The first column: the row's index, or grouped (#1351) the cluster size on a header row
+    # (`▸×12` folded, `▾×12` open) and the index indented beneath it on a member row.
+    private def index_cell(r : Fuzz::Result, group : GroupLine?) : String
+      return r.index.to_s.ljust(4) unless @grouped
+      return "  #{r.index}".ljust(6) unless group && group.header
+      glyph = @expanded.includes?(group.cluster.id) ? '▾' : '▸'
+      "#{glyph}×#{group.cluster.count}".ljust(6)
     end
 
     # The payload cell, exactly PAYLOAD_COL_W display COLUMNS wide — never `String#size`.
@@ -3356,22 +3764,32 @@ module Gori::Tui
       end
     end
 
+    # Keyed on `stop_row?` too: a row becomes the stop row when its run finishes, after its
+    # lines may already be cached, and the key is what makes the note appear (issue #1270).
     private def detail_lines(r : Fuzz::Result) : Array(String)
-      key = {@detail_pane, r.index}
+      key = {@detail_pane, r.index, stop_row?(r)}
       if (c = @detail_lines_cache) && @detail_lines_key == key
         return c
       end
+      notes = [] of String
       lines =
         case @detail_pane
         when :saml    then saml_detail_lines
         when :jwt     then jwt_detail_lines
         when :graphql then graphql_detail_lines
         when :params  then form_detail_lines
-        when :request then detail_request_lines(r)
-        else               detail_response_lines(r)
+        when :request then detail_request_lines(r, notes)
+        else               detail_response_lines(r, notes)
         end
+      if @detail_pane.in?(:request, :response)
+        # Both message panes open on the stop row's note, whichever one the operator left
+        # selected: the list marker says WHICH row, this says what it means once opened.
+        notes.unshift("(the run's stop_on tripped on this result — it ended the run)") if stop_row?(r)
+        lines = notes + lines
+      end
       @detail_lines_cache = lines
       @detail_lines_key = key
+      @detail_note_count = notes.size
       lines
     end
 
@@ -3379,15 +3797,23 @@ module Gori::Tui
     # plain @detail_lines_cache (+ theme revision). Request/response panes go through the
     # full message highlighter; the decoded panes style per line with their body kind.
     # 1:1 with `lines`, so the plain strings still drive the gutter/cursor/selection.
+    #
+    # The message panes' leading notes (`@detail_note_count`, set with the lines) are styled as
+    # plain text and kept OUT of the message highlighter, which reads line 0 as the start line —
+    # a note there used to take the start line's colour and push the real request/status line
+    # down into header styling.
     private def detail_styled(r : Fuzz::Result, lines : Array(String)) : Array(Highlight::Line)
-      key = {@detail_pane, r.index}
+      key = {@detail_pane, r.index, stop_row?(r)}
       if (c = @detail_styled_cache) && @detail_styled_key == key && @detail_styled_rev == Theme.revision
         return c
       end
+      n = @detail_pane.in?(:request, :response) ? @detail_note_count.clamp(0, lines.size) : 0
+      notes = lines[0, n].map { |ln| Highlight.body_styled(ln, :text) }
+      message = lines[n..]
       styled =
         case @detail_pane
-        when :request  then Highlight.from_lines(lines, request: true)
-        when :response then Highlight.from_lines(lines, request: false)
+        when :request  then notes + Highlight.from_lines(message, request: true)
+        when :response then notes + Highlight.from_lines(message, request: false)
         when :graphql  then lines.map { |ln| Highlight.body_styled(ln, :graphql) }
         when :jwt      then lines.map { |ln| Highlight.body_styled(ln, :json) }
         when :saml     then lines.map { |ln| Highlight.body_styled(ln, :xml) }
@@ -3427,11 +3853,18 @@ module Gori::Tui
     # What the two detail panes say for a row the BOUNDED DISPLAY dropped. Deliberately NOT
     # phrased as "not retained": `FuzzerResultWindow` projects a row past its 64 MiB ceiling
     # down to metrics, and the run kept every byte — they are in the spool, and in the archive
-    # once ⇧S has run. One definition per pane, because the request half was already written
+    # once ⇧E has run. One definition per pane, because the request half was already written
     # out twice (the detail pane and the seed note the Repeater/Comparer carry) and a third
     # copy is how the two come to word one fact differently.
     def self.display_omitted_request_note : String
       "(request unavailable in the bounded display — exact fields remain in the saved archive)"
+    end
+
+    # A grouped header drawn from its cluster's representative after the display window let
+    # that row go (#1351). Neither "not retained" nor "in the archive": the pane cannot know
+    # which, since the cluster keeps the row's metrics and never its bytes.
+    def self.outside_window_note(index : Int64) : String
+      "(result ##{index} has left the bounded display window — → lists this cluster's members still in it; a saved run keeps every row)"
     end
 
     def self.display_omitted_response_note : String
@@ -3512,7 +3945,7 @@ module Gori::Tui
     # The frozen {update_cl, add_cl_when_missing, keep_bodies} of the run that produced
     # @results, falling back to the live config for a view whose results predate the freeze.
     private def run_policy : {Bool, Bool, Symbol}
-      @run_policy || {@config.update_content_length?, @config.add_content_length_when_missing?,
+      @run_policy || {@config.update_content_length?, true,
                       @matcher.keep_bodies}
     end
 
@@ -3521,7 +3954,7 @@ module Gori::Tui
     # the detail pane shows.
     def result_request_note(r : Fuzz::Result) : String?
       if result_display_truncated?(r)
-        return FuzzerView.display_omitted_request_note
+        return outside_window?(r) ? FuzzerView.outside_window_note(r.index) : FuzzerView.display_omitted_request_note
       end
       return nil unless r.request.nil?
       note = FuzzerView.reconstruction_note(run_policy[2])
@@ -3556,32 +3989,35 @@ module Gori::Tui
       result_request(r).bytes
     end
 
-    private def detail_request_lines(r : Fuzz::Result) : Array(String)
+    # The message lines, with every note about them unshifted onto `notes` instead — see
+    # `detail_styled` for why the two are kept apart.
+    private def detail_request_lines(r : Fuzz::Result, notes : Array(String)) : Array(String)
       req = result_request(r)
       if req.display_omitted
-        return [FuzzerView.display_omitted_request_note]
+        notes << (outside_window?(r) ? FuzzerView.outside_window_note(r.index) : FuzzerView.display_omitted_request_note)
+        return [] of String
       end
       lines = String.new(req.bytes).scrub.split('\n').map(&.rstrip('\r'))
-      lines.unshift(FuzzerView.reconstruction_note(run_policy[2])) if req.reconstructed
-      lines.unshift(FuzzerView.withheld_hook_note) if req.chain_withheld
+      notes.unshift(FuzzerView.reconstruction_note(run_policy[2])) if req.reconstructed
+      notes.unshift(FuzzerView.withheld_hook_note) if req.chain_withheld
       # This pane already SHOWS what actually went out for a row whose `¦chain` did not run, or
       # whose gRPC field declaration could not hold the payload (result_request replays the same
       # passes the engine did). Say WHY, so the operator doesn't read those bytes as the request
       # they declared. The reason names itself — `chain '…' step '…' failed` vs `field role: …`
       # — so the prefix stays neutral. #567/H3 Finding 1; the gRPC half is #843.
       if ce = r.chain_error
-        lines.unshift("(payload not as declared: #{ce})")
+        notes.unshift("(payload not as declared: #{ce})")
       end
       # The `--retries` config re-sent this request after a network error (DISTINCT from a
       # keep-alive re-send) — a note here because it qualifies the REQUEST that went out, and
       # the raw bytes above give no hint that they were sent more than once.
       if r.resent?
-        lines.unshift("(re-sent #{r.resent_count}× after a network error — --retries)")
+        notes.unshift("(re-sent #{r.resent_count}× after a network error — --retries)")
       end
       lines
     end
 
-    private def detail_response_lines(r : Fuzz::Result) : Array(String)
+    private def detail_response_lines(r : Fuzz::Result, notes : Array(String)) : Array(String)
       # The send failed, so there is no response to retain — say THAT, not the retention
       # policy. Fuzz::Engine builds a refused/failed Result with an empty head (engine.cr,
       # the scope/sandbox path), and Matcher#present returns nil for it under every
@@ -3590,25 +4026,35 @@ module Gori::Tui
       # is still a payload that can fail to send), and why it failed outranks where its bytes
       # went.
       if err = r.error
-        return ["(send failed: #{err})"]
+        notes << "(send failed: #{err})"
+        return [] of String
       end
       # The DISPLAY window dropped this row's bytes, the run did not — the third answer this
       # pane did not have. `FuzzerResultWindow` projects a row over its 64 MiB ceiling to
       # metrics only while the archive still holds every byte, so reporting it as "not
-      # retained by this run" tells the operator the evidence does not exist at the moment ⇧S
+      # retained by this run" tells the operator the evidence does not exist at the moment ⇧E
       # is about to save it. `detail_request_lines` has always drawn the distinction
       # (`ResultRequest#display_omitted`); this pane read a nil `head` as the retention policy.
       if result_display_truncated?(r)
-        return [FuzzerView.display_omitted_response_note]
+        notes << (outside_window?(r) ? FuzzerView.outside_window_note(r.index) : FuzzerView.display_omitted_response_note)
+        return [] of String
       end
       head = r.head
-      return ["(response not retained by this run)"] unless head
+      unless head
+        notes << "(response not retained by this run)"
+        return [] of String
+      end
       # `Result#body` is retained in its captured wire form. Read the response pane through
       # the same decoded-entity seam as the Fuzzer matcher, at the same output ceiling, so the
       # body on screen agrees with the row's decoded length/word/line metrics without changing
       # the evidence kept on the result.
       body = Entity.bytes(head, r.body, Proxy::Codec::Body::CAPTURE_READ_MAX)
       lines = String.new(head).scrub.split('\n').map(&.rstrip('\r'))
+      # The head carries its own terminator, so the split already ends in two blanks; the body
+      # gets ONE separator, as History's drill-in draws it (#1433).
+      while lines.last? == ""
+        lines.pop
+      end
       if body && !body.empty?
         lines << ""
         lines.concat(String.new(body).scrub.split('\n').map(&.rstrip('\r')))
@@ -3618,7 +4064,7 @@ module Gori::Tui
       # row's own flags, not the CLI classifier — the TUI has no CLI dependency — keeping the
       # timeout distinction the operator needs to tell "raise the deadline" from "origin closed".
       if r.incomplete?
-        lines.unshift(r.timed_out? ? "(incomplete — the read deadline expired; the response is truncated)" : "(incomplete — the response is truncated)")
+        notes.unshift(r.timed_out? ? "(incomplete — the read deadline expired; the response is truncated)" : "(incomplete — the response is truncated)")
       end
       lines
     end
@@ -3657,7 +4103,7 @@ module Gori::Tui
 
     private def form_detail_lines : Array(String)
       fields = @d_form || return [] of String
-      lines = ["▸ #{fields.size} field#{fields.size == 1 ? "" : "s"}", ""]
+      lines = ["▸ #{Gori.plural(fields.size, "field")}", ""]
       fields.each do |f|
         tag = f.source == :query ? "?" : " "
         note = f.note
@@ -3686,15 +4132,6 @@ module Gori::Tui
         to = Screen.column_for_click(@target, mx - field_base(rect, TARGET_PREFIX))
         @tcx = @target_read.move_cx(@tcx, to - @tcx, @target.size, selecting: selecting)
       end
-    end
-
-    # Pointer moved with the button held over the target card — READ mode only, for the
-    # reason spelled out on `RepeaterView#target_drag_to_cursor`: INSERT paints no band, so
-    # extending there would plant a selection nothing draws and `target_copy_text` would
-    # still honour it.
-    def target_drag_to_cursor(rect : Rect, mx : Int32, my : Int32) : Nil
-      return if target_insert?
-      target_click_to_cursor(rect, mx, my, selecting: true)
     end
 
     # Double-click: take the word the press already placed the caret on, spreading from THAT
@@ -3820,9 +4257,9 @@ module Gori::Tui
       return nil if pane.w < 2 || my != pane.y
       min_x = pane.x + 11 + results_count_label.size + 1
       Frame.right_badge_hit(mx, my, pane.y, pane.right - 1, min_x, [
-        {:dist, "v", "DIST"},
-        {:match, "m", "MATCH"},
-        {:sort, "o", @sort.to_s},
+        {:dist, key_label("fuzz.dist", "v"), "DIST"},
+        {:match, key_label("fuzz.matched", "m"), "MATCH"},
+        {:sort, key_label("fuzz.sort", "o"), sort_chip},
       ] of {Symbol, String, String})
     end
 
@@ -3841,7 +4278,10 @@ module Gori::Tui
       label = @http2 ? "TEMPLATE (h2)" : "TEMPLATE"
       min_x = left.x + label.size + 4
       right_edge = left.right - 1
-      badges = [{:run, "^R", "RUN"}, {:pretty, "^U", "PRETTY"}] of {Symbol, String, String}
+      badges = [
+        {:run, key_label("fuzz.run", "^R"), "RUN"},
+        {:pretty, key_label("fuzz.pretty-template", "^U"), "PRETTY"},
+      ] of {Symbol, String, String}
       if hit = Frame.right_badge_hit(mx, my, left.y, right_edge, min_x, badges)
         return hit
       end

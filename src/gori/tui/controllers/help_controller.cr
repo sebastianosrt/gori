@@ -66,13 +66,19 @@ module Gori::Tui
     end
 
     def command_scope : Verb::Scope
-      Verb::Scope::Body
+      Verb::Scope::Help
     end
 
     # Search is a single-line editor: bracketed paste must type into it rather than being
     # refused as a command-bearing paste by the shell's safety gate.
     def body_badge : Symbol
       @help.searching? ? :editor : :body
+    end
+
+    # …and for the same reason the badge says `editor`, the digit family stands down while
+    # it is open: `/` then `^1` or `base64` is a search for a key, not a tab jump.
+    def body_takes_text? : Bool
+      @help.searching?
     end
 
     # PageUp/PageDown/Home/End over the (long) Help cheat-sheet. move() clamps the top;

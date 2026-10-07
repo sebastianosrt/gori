@@ -80,6 +80,7 @@ module Gori::Tui
     # the band from one place — the hand-rolled `Wrap.mark_search` call sites this component
     # was extracted from are exactly the drift that argument is about.
     @search_hl = ""
+    @search_memo = Wrap::SearchMemo.new
 
     # `gutter` draws 1-based line numbers (`Gutter`), like the Decoder OUTPUT and the Repeater
     # panes; a pane whose rows are not source lines (the Comparer's diff rows, a field list)
@@ -142,7 +143,12 @@ module Gori::Tui
     end
 
     # The ^F query to band in `render`. "" clears it.
-    setter search_hl : String
+    # An empty query frees the memo's whole-line scans now, not at this pane's next render: a
+    # pane that is not drawn again (the Repeater's hidden decoded/editor twin) would keep them.
+    def search_hl=(q : String) : Nil
+      @search_hl = q
+      @search_memo.clear if q.empty?
+    end
 
     # ^F search: 0-based indices of the lines containing `query`, case-insensitively.
     #
@@ -303,6 +309,36 @@ module Gori::Tui
       layout_of(0, @last_cw).row_of(@cursor.cx) == 0
     end
 
+    # …and the other end: the test a controller uses to decide whether ↓ should leave for the
+    # pane BELOW. `at_top?`'s mirror, and it owes the same wrap correction — a caret on the
+    # last logical line but three visual rows short of its end still has rows under it here.
+    #
+    # It does NOT test `@scroll`, which is the asymmetry with `at_top?` and is deliberate: the
+    # top edge is reached by scrolling to it, but a pane shorter than its viewport never
+    # scrolls at all, so a bottom test gated on the scroll offset would answer false forever
+    # on exactly the short content this is asked about. The caret's position is the whole
+    # question; `ensure_visible` guarantees the window follows it.
+    #
+    # An EMPTY pane answers true — the same choice `IssuesView#links_at_bottom?` makes, since a
+    # pane with no rows has no caret to move and the key must not become a no-op. It needs no
+    # arm of its own: `@size == 0` puts `last` at -1, which any caret clears, and `wrapping?`
+    # is already false without content. `spec/tui/read_pane_wrap_spec.cr` pins the answer so
+    # this stays true if either changes.
+    # `visual` is the half `at_top?` never needed a switch for, and it must match how the
+    # CALLER'S ↓ steps. A pane whose ↓ is `move` walks visual rows, so its bottom edge is the
+    # last row of the last line (`visual: true`). A pane whose ↓ is `goto_line` — Probe's
+    # AFFECTED URLS, where one row is one URL and the wrapped remainder is the same entry —
+    # steps LOGICAL lines, and asking the visual question there answers false on a wrapped
+    # last URL forever: `goto_line` has clamped, so the caret cannot advance, and the visual
+    # test says there is still somewhere to go. The key does nothing at all.
+    def at_bottom?(visual : Bool = true) : Bool
+      last = @size - 1
+      return false unless @cursor.cy >= last
+      return true unless visual && wrapping?
+      lay = layout_of(last, @last_cw)
+      lay.row_of(@cursor.cx) >= lay.rows - 1
+    end
+
     # --- mouse ----------------------------------------------------------------
 
     # Place the caret at (mx, my) inside `rect` — the SAME rect `render` was given.
@@ -452,23 +488,29 @@ module Gori::Tui
       # case wrap exists to display.
       cached_li = -1
       cached_line = ""
-      # Hoisted beside the line for the same reason the line itself is: `mark_search` scans a
-      # downcased copy of the WHOLE logical line, so computing it inside the row loop would
-      # downcase a viewport-filling line once per drawn row. Built only while a query is live.
-      cached_lower = ""
+      # `mark_search` scans the WHOLE logical line; the pane's memo keeps that scan across the
+      # rows and frames that draw the same line (see `Wrap::SearchMemo`).
+      @search_memo.clear if @search_hl.empty?
+      # …and the STYLED line, which had been left out of that rule even though it is the more
+      # expensive of the two providers: `styled_at` tokenises the line where `line_at` only
+      # materialises it, and `draw_row` was calling it once per DRAWN ROW. A wrapped 4 KB JSON
+      # line filling the viewport was therefore re-tokenised ~`rect.h` times per frame — the
+      # exact multiplication `TextArea#styled_line` already memoises away for its own draw.
+      # Only the per-row SLICE of it is row-specific, and that stays in `draw_row`.
+      cached_styled = nil.as(Highlight::Line?)
       rows.each_with_index do |vr, i|
         if vr.li != cached_li
           cached_li = vr.li
           cached_line = @line_at.call(vr.li)
-          cached_lower = @search_hl.empty? ? "" : cached_line.downcase
+          cached_styled = styled_at.try(&.call(vr.li))
         end
-        draw_row(screen, rect, rect.y + i, vr, cached_line, gw, cw, focused, styled_at, fg, bg)
+        draw_row(screen, rect, rect.y + i, vr, cached_line, gw, cw, focused, cached_styled, fg, bg)
         # Between the text and the chrome ON PURPOSE: the band goes OVER the drawn glyphs (it
         # is what makes a match findable at a glance) and UNDER the caret/selection, so the
         # match the ^F prompt just jumped to still shows where the cursor sits inside it.
         unless @search_hl.empty?
           Wrap.mark_search(screen, rect.x + gw, rect.y + i, cached_line, vr.a, vr.b,
-            @search_hl, rect.x + gw + cw, xoff: @xscroll, lower: cached_lower)
+            @search_hl, rect.x + gw + cw, xoff: @xscroll, memo: @search_memo)
         end
         paint_chrome(screen, rect.x + gw, rect.y + i, vr, cached_line, spans, focused, cw)
       end
@@ -508,11 +550,13 @@ module Gori::Tui
       @xscroll = @xscroll.clamp(0, {widest - cw, 0}.max)
     end
 
-    # One drawn row: its gutter cell and its slice of `plain`, coloured through `styled_at` when
-    # the caller supplied one. The chrome (band + caret) goes over the top of it separately.
+    # One drawn row: its gutter cell and its slice of `plain`, coloured through `styled` when
+    # the caller supplied a `styled_at` provider. `styled` is the WHOLE logical line, already
+    # resolved once by the caller (see the memo in `render`) — this only slices it to the row.
+    # The chrome (band + caret) goes over the top of it separately.
     private def draw_row(screen : Screen, rect : Rect, y : Int32, vr : Wrap::Row, plain : String,
                          gw : Int32, cw : Int32, focused : Bool,
-                         styled_at : (Int32 -> Highlight::Line)?, fg : Color, bg : Color) : Nil
+                         styled : Highlight::Line?, fg : Color, bg : Color) : Nil
       if gw > 0
         # The line number rides the FIRST visual row of a logical line and nothing else (Burp
         # style). A continuation row gets a blank of the same width rather than no write at all,
@@ -524,8 +568,7 @@ module Gori::Tui
         end
       end
       whole = vr.a == 0 && vr.b >= plain.size
-      if styled_at
-        sl = styled_at.call(vr.li)
+      if sl = styled
         # Char offsets, not columns: `Wrap::Layout` decided the break by walking clusters and
         # handed back char indices, so slicing by column here would re-derive it with a second
         # measure — and the colours would land off the glyphs they belong to.

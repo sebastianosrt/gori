@@ -33,11 +33,11 @@ describe Gori::SessionSlots do
     it "shares the Authorize identities row, in both directions" do
       with_store do |store|
         store.set_setting(Gori::Store::AUTHORIZE_IDENTITIES_KEY,
-          Gori::Authorize.serialize([Gori::Authorize::Identity.new("admin", set_headers: [{"Cookie", "s=1"}])]))
+          Gori::SessionSlot.serialize([Gori::Authorize::Identity.new("admin", set_headers: [{"Cookie", "s=1"}])]))
         Gori::SessionSlots.load(store).slots.map(&.name).should eq(["admin"])
 
         Gori::SessionSlots.load(store).save([Slot.new("low-priv", rules: ["SESSION"])]).should be_true
-        Gori::Authorize.parse_json(store.setting(Gori::Store::AUTHORIZE_IDENTITIES_KEY))
+        Gori::SessionSlot.parse_json(store.setting(Gori::Store::AUTHORIZE_IDENTITIES_KEY))
           .map(&.name).should eq(["low-priv"])
         Gori::Store::SESSION_SLOTS_KEY.should eq(Gori::Store::AUTHORIZE_IDENTITIES_KEY)
       end
@@ -192,6 +192,19 @@ describe Gori::SessionSlots do
         slots.activate("admin")
         sent = slot_overlay(slots, "GET / HTTP/1.1\r\nHost: h\r\n\r\n", {"SESSION" => "ADMINTOKEN"})
         sent.should contain("Authorization: Bearer ADMINTOKEN")
+      end
+    end
+
+    it "sends captured token-looking values literally while resolving manual values" do
+      with_store do |store|
+        slots = Gori::SessionSlots.load(store)
+        slots.save([Slot.new("captured",
+          set_headers: [{"Authorization", "Bearer $BIND.TOKEN"}, {"X-Manual", "$BIND.TOKEN"}],
+          literal_headers: ["authorization"])])
+        slots.activate("captured")
+        sent = slot_overlay(slots, "GET / HTTP/1.1\r\nHost: h\r\n\r\n", {"BIND.TOKEN" => "EXPANDED"})
+        sent.should contain("Authorization: Bearer $BIND.TOKEN")
+        sent.should contain("X-Manual: EXPANDED")
       end
     end
 

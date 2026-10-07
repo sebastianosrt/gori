@@ -50,9 +50,11 @@ class Gori::Tui::RepeaterView
     rescue
       nil
     end
+    # The request is one wire blob; split it so its body is projected as a body (#1162).
+    req_head, req_body = req ? Env.split_head_body(req) : {nil, nil}
     ComparerSlot.from_exchange(
       "repeater", ComparerSlot.method_of(req), @target,
-      req, nil, res.head.empty? ? nil : res.head, res.body,
+      req_head, req_body, res.head.empty? ? nil : res.head, res.body,
       status: res.response.try(&.status), duration_us: res.duration_us, error: res.error)
   end
 
@@ -128,8 +130,20 @@ class Gori::Tui::RepeaterView
   # names `expand_wire` as what promotes it — shipping one inside a head is itself a
   # front-end/back-end desync primitive, i.e. a different test than the one on screen.
   private def expanded_text_to_bytes(text : String) : Bytes
-    wire = @evidence ? Env.expand_wire(text, operator_env_vars) : Env.expand_wire(text)
+    # `unescape: Owns::None` on the evidence branch, and it is not belt-and-braces. `Escape::Preserve`
+    # is a BARE-mode knob: under the namespaced grammar `unescape_set` ignores it and returns the
+    # pass's own `resolve` set, so this call consumed `$$ENV.X` — and a replay of captured bytes
+    # holding `$$ENV.PATH` shipped `$ENV.PATH`. An evidence path expands nothing the capture brought
+    # and unescapes nothing either: a `$$` in captured bytes is two bytes the origin sent.
+    wire = @evidence ? Env.expand_wire(text, operator_env_vars, unescape: Env::Owns::None) : Env.expand_wire(text)
     Repeater::FlowRequest.normalize_multipart_body(wire)
+  end
+
+  # `expanded_text_to_bytes` MINUS the `$KEY` pass: the line-ending fixups the editor owes
+  # the wire, and nothing else. The `^X` hex snapshot seeds from this so a peek shows the
+  # bytes text mode sends (#1427).
+  private def text_wire_form(text : String) : Bytes
+    Repeater::FlowRequest.normalize_multipart_body(Env.normalize_wire(text))
   end
 
   # The env vars an EVIDENCE tab may substitute: every registered name EXCEPT the ones the
@@ -151,8 +165,11 @@ class Gori::Tui::RepeaterView
   # already had one and it stays literal, because gori cannot tell the two occurrences apart
   # and evidence wins when it cannot. `$$` escapes to a literal `$` on every path already,
   # so the operator has a spelling for either intent.
+  # Through the METHOD, not the ivar: the baseline re-derives itself from the seed bytes when the
+  # token grammar has moved since the seed (`evidence_env_names`), and this is the path where
+  # answering the old grammar's question sends a project value the capture never carried.
   private def operator_env_vars : Hash(String, String)
-    Env.vars_without(@evidence_env_names)
+    Env.vars_without(evidence_env_names)
   end
 
   # §…§ marker send: parse the CRLF wire form as a Fuzz template and render each marked
@@ -224,6 +241,24 @@ class Gori::Tui::RepeaterView
   def inflight=(value : Bool) : Nil
     @inflight = value
   end
+
+  # Did the LAST send's wire go out with an unterminated head (#1075)?
+  #
+  # Set by the controller on the UI fiber from `plan.wire_bytes` — the bytes the socket got —
+  # and read back when the result lands, so the toast that reports the origin's answer can
+  # say what gori knew about the request before the origin ever saw it. It cannot be derived
+  # in the drain: by then the operator may have typed a terminator into the editor, and the
+  # question is about the message that was sent, not about what is on screen now.
+  #
+  # Never a refusal or a repair: an unterminated head is a legitimate thing to put on a
+  # socket and the repeater exists to send non-standard HTTP. The toast says it with
+  # `CLI::Run.unterminated_head_chip`, the short spelling of the sentence the CLI and MCP
+  # print — one owner, so the wording cannot drift between surfaces.
+  #
+  # Only ever true for an HTTP/1.1 send: h2 re-encodes the head as a field list with no
+  # terminator in it, and a framed WebSocket handshake is re-terminated by `WsEngine`, so
+  # neither can be accused of putting a truncated head on the wire.
+  property? sent_head_unterminated : Bool = false
 
   getter? auto_content_length : Bool
 
@@ -331,6 +366,47 @@ class Gori::Tui::RepeaterView
     else
       "failed to pretty-print (unsupported or malformed body)"
     end
+  end
+
+  # `repeater.graphql-introspection[-legacy]`: rewrite this tab's request into a POST of the
+  # introspection query to the same endpoint (`Graphql::Introspection.rewrite_request`). Only
+  # the request text changes: the target, the session slot and the operator's other headers
+  # stay as they are, so the query goes out with the session under test. Returns the status.
+  def insert_graphql_introspection(legacy : Bool) : String
+    if refusal = graphql_introspection_refusal
+      return refusal
+    end
+    graphql_split = @decode_kind == :graphql
+    # A GraphQL split tab: the ENVELOPE is the request. A pending decoded edit goes into it
+    # first, so what the rewrite keeps (the headers) is what the operator last typed.
+    commit_decoded if graphql_split
+    begin
+      # `wire_text`, so every kept header keeps the terminator it was written with.
+      rewritten = Graphql::Introspection.rewrite_request(@editor.wire_text, legacy)
+    rescue ex : Gori::Error
+      return ex.message || "the request could not be rewritten"
+    end
+    # ONE undoable edit: a wrong palette row is a ^Z away, not a lost request.
+    @editor.replace_all(rewritten, 0)
+    # Re-decode so the DECODED pane shows the new query and the splice target is the JSON body
+    # it now lives in — a GET binding's `?query=` is gone from the request line.
+    refresh_decoded if graphql_split
+    @dirty = true
+    "inserted the #{legacy ? "legacy " : ""}introspection query — send it with ^R"
+  end
+
+  # Why this tab cannot take the introspection query, or nil. `ws_mode?`, not `@ws_mode`: a
+  # handshake the operator switched to plain HTTP sends as one, so it rewrites as one.
+  private def graphql_introspection_refusal : String?
+    return "hex mode active — leave it to insert the introspection query" if request_hex?
+    return "a WebSocket tab has no HTTP body to put the introspection query in" if ws_mode?
+    return "a gRPC tab sends protobuf, not a GraphQL query" if @grpc_mode
+    return "a SAML tab — open the GraphQL endpoint in a tab of its own" if @decode_kind == :saml
+    if group_document?(@editor.wire_lines)
+      return "request holds a %%% separator, so the rewrite would drop every request after the " \
+             "first — insert the query in a tab of its own"
+    end
+    nil
   end
 
   def apply(result : Repeater::Result) : Nil

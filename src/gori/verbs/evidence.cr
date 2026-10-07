@@ -1,0 +1,81 @@
+require "../verb"
+
+module Gori
+  module Verbs
+    def self.register_evidence(r : Verb::Registry) : Nil
+      selected = ->(ctx : Verb::ExecContext) { !ctx.selected_evidence_id.nil? }
+
+      r.register Verb::Definition.new(
+        "evidence.open", "Open frozen evidence", "Inspect the immutable request and response",
+        Verb::Scope::Evidence, [Verb::Chord.new("enter"), Verb::Chord.new("l"), Verb::Chord.new("right")],
+        available: selected, intent: :open, group: :view) { |ctx| ctx.evidence_open; nil }
+
+      r.register Verb::Definition.new(
+        "evidence.filter", "Filter evidence", "Filter by issue, host, method, HTTP status, confirmation, source or date",
+        Verb::Scope::Evidence, [Verb::Chord.new("/")], group: :view, intent: :filter) { |ctx| ctx.evidence_filter; nil }
+
+      r.register Verb::Definition.new(
+        "evidence.compare", "Compare snapshots", "Pin this snapshot as A, then choose B and compare their frozen bytes",
+        Verb::Scope::Evidence, [Verb::Chord.new("c")], available: selected, group: :view) { |ctx| ctx.evidence_compare; nil }
+
+      r.register Verb::Definition.new(
+        "evidence.issue", "Open linked Issue", "Open an Issue linked to this snapshot",
+        Verb::Scope::Evidence, [Verb::Chord.new("i")],
+        available: ->(ctx : Verb::ExecContext) { selected.call(ctx) && ctx.evidence_has_links? },
+        group: :triage) { |ctx| ctx.evidence_open_issue; nil }
+
+      r.register Verb::Definition.new(
+        "evidence.source", "Open original source", "Open the History flow or Repeater tab when it still exists",
+        Verb::Scope::Evidence, [Verb::Chord.new("s")],
+        available: ->(ctx : Verb::ExecContext) { selected.call(ctx) && ctx.evidence_source_available? },
+        group: :view) { |ctx| ctx.evidence_open_source; nil }
+
+      # `y` — the copy every other list scope binds, on the one tab the audit found without
+      # it. Bare `y` is free across Scope::Evidence (o/`/`/c/i/s/⇧E/r/d are its claims), and
+      # `copy-as` keeps the shifted `Y` menu letter beside it, exactly as History pairs them.
+      # Both ends go through the ambient #1035 body policy; `copy` writes the whole exchange,
+      # which is what the card's `y` does for the pane it happens to be showing.
+      r.register Verb::Definition.new(
+        "evidence.copy", "Copy", "Copy the frozen request and response as text, through the project's body-redaction policy",
+        Verb::Scope::Evidence, [Verb::Chord.new("y")],
+        available: selected, intent: :copy, group: :copy) { |ctx| ctx.evidence_copy; nil }
+
+      r.register Verb::Definition.new(
+        "evidence.copy-as", "Copy as…", "Copy the frozen request/response through the project's body-redaction policy",
+        Verb::Scope::Evidence, available: selected, intent: :copy_as, group: :copy) { |ctx| ctx.copy_as_open; nil }
+
+      # `⇧E`, not `e`: `e` is Edit in every scope that has something to edit, and the
+      # archive has nothing — the same pairing `issues.export-key` and `notes.export` use
+      # (spelled shift + lowercase, because a typed capital normalises to that and a bare
+      # "E" chord could never fire).
+      r.register Verb::Definition.new(
+        "evidence.export", "Export evidence", "Write a redacted JSON copy to a file",
+        Verb::Scope::Evidence, [Verb::Chord.new("e", shift: true)], available: selected,
+        intent: :export, group: :copy) { |ctx| ctx.evidence_export; nil }
+
+      r.register Verb::Definition.new(
+        "evidence.repeater", "Duplicate into Repeater", "Create an editable Repeater tab from the frozen request",
+        Verb::Scope::Evidence, [Verb::Chord.new("r")], available: selected,
+        group: :send, intent: :to_repeater, pinned: true) { |ctx| ctx.evidence_duplicate_repeater; nil }
+
+      # Menu-only, like `link.*.attach`: both open a picker, and neither has a chord to
+      # spare here. Link is the lexicon's `L` on every tab (#1274); it was `k`, which the
+      # controller claims as list nav and every list reads as "move up".
+      r.register Verb::Definition.new(
+        "evidence.link", "Link Issue…", "Link this snapshot to another Issue without changing its bytes",
+        Verb::Scope::Evidence, available: selected,
+        intent: :link, group: :triage) { |ctx| ctx.evidence_link_issue; nil }
+
+      r.register Verb::Definition.new(
+        "evidence.unlink", "Unlink Issue…", "Remove one Issue link without changing the snapshot",
+        Verb::Scope::Evidence,
+        available: ->(ctx : Verb::ExecContext) { selected.call(ctx) && ctx.evidence_has_links? },
+        mnemonic: 'u', group: :triage) { |ctx| ctx.evidence_unlink_issue; nil }
+
+      r.register Verb::Definition.new(
+        "evidence.delete", "Delete evidence", "Delete this immutable copy after confirming every affected Issue link",
+        Verb::Scope::Evidence, [Verb::Chord.new("d")], available: selected,
+        group: :danger, intent: :delete) { |ctx| ctx.evidence_delete; nil }
+    end
+  end
+end

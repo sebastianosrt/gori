@@ -5,6 +5,7 @@ weight = 20
 
 [extra]
 group = "Core"
+shot = "repeater"
 +++
 
 Once you've captured an interesting flow, **Repeater** and the **Fuzzer** are where you test it.
@@ -13,16 +14,24 @@ Once you've captured an interesting flow, **Repeater** and the **Fuzzer** are wh
 
 Repeater is a request workbench. Send a flow to it, edit any part of the request, and re-send. The response, timing, and a diff against the previous response are shown side by side. Sessions persist with the project, so you can come back to them later.
 
-Once a few dozen have piled up, the chip strip scrolls and hunting along it with `←`/`→` stops being practical. Press **`f`** anywhere on the strip and every session is listed, filtered as you type by name, method, path, target host or `#tag`; `Enter` jumps to the one you picked. The same list sits behind the **`⌕`** at the strip's left edge; click it, or reach it with `←` from the first chip. Every workbench strip has both: Fuzzer, Notes, Decoder, JWT, Comparer, Miner and Sequencer alike.
+**Paste a curl command** to start from one: Space → **Paste cURL** (`U`), or the palette, opens a box you paste into, and `Enter` opens each request as a new sub-tab. It reads the command with curl's own meaning of every flag (`-b` is a cookie, `-d` a body, `-u` basic auth, `-G` moves the data into the query), keeps each `-H` line exactly as typed and in order, and leaves out curl's own `User-Agent`/`Accept`, so a request gori exported with **Copy as → cURL** comes back byte-for-byte. Like a shell, `Enter` continues a command that ends in `\` or an open quote. Transport flags (`-k`, `-x`, `-L`, `--resolve`, timeouts) are ignored and named in the status line, since gori sends through its own network settings, and a flag that reads a local file (`-d @body.json`, `-F f=@a.png`, `-T`) is refused with the reason. gori parses the command; it never runs it.
+
+**Ask a GraphQL endpoint for its schema** without typing the query: on a tab that holds a request to the endpoint, `Ctrl-P` → **GraphQL: insert introspection query** rewrites it into a `POST` of the standard introspection query (the one GraphiQL sends) to the same path. The target, the active session slot and every other header stay as they were, each with its own line ending, so the query goes out with the session you are testing; only `Content-Type` and `Content-Length` are replaced, and a GET binding's `query`/`variables`/`operationName` parameters leave the request line. **GraphQL: insert legacy introspection query** drops `subscriptionType` and the directives block for an older server that fails the whole query on a field it does not know. Either is one undoable edit (`Ctrl-Z`), and nothing is sent until you press `Ctrl-R`. A hex, WebSocket, gRPC or SAML tab, or one holding a `%%%` group, refuses it with the reason.
+
+Once a few dozen have piled up, the chip strip scrolls and hunting along it with `←`/`→` stops being practical. Press **`f`** anywhere on the strip and every session is listed, filtered as you type by name, method, path, target host or `#tag`; `Enter` jumps to the one you picked. The same list sits behind the **`⌕`** at the strip's left edge; click it, or reach it with `←` from the first chip. Every workbench strip has both: Fuzzer, Notes, Decoder, JWT, Cookie, Comparer, Miner and Sequencer alike.
 
 Sub-tabs can also be **marked** for a batch. On the strip, `t` marks the chip under you and steps right, `Shift-T` marks every chip the `/` filter shows, and `Esc` clears the marks before it leaves the strip. A marked chip wears a `▌` bar. Marks change **what the sub-tab actions act on**, not which actions exist, the rule History's list already follows:
 
 > the target is **the marks if any are set, else the active chip**
 
-So `Shift-T` → `Ctrl-W` closes every open session behind one confirm, `Ctrl-R` sends the marked ones together (each on its own connection, up to 20, after a confirm), `Space` → `d` duplicates them, and `Space` → `t` tags them all with what you type. The space menu opened from the strip reads `SPACE · 3 MARKED` and its entries rename themselves (`Close 3 sub-tabs`, `Send 3 sub-tabs`); an action that stays single-target says `(cursor)`. A mark the filter is hiding is called out in the confirm rather than closed quietly. Every workbench strip marks, closes and duplicates this way: Fuzzer, Notes, Decoder, JWT, Cookie, Comparer, Miner and Sequencer alike; sending is Repeater's.
+So `Shift-T` → `Ctrl-W` closes every open session behind one confirm, `Ctrl-R` sends the marked ones together (each on its own connection, up to 20, after a confirm), `Space` → `d` duplicates them, and `Space` → `g` tags them all with what you type (`t` on the strip marks, and so does the menu's `t`, so tagging keeps its own letter). From a body pane the same rows are one level down, under `Space` → `T` (**Sub-tabs…**). The space menu opened from the strip reads `SPACE · 3 MARKED` and its entries rename themselves (`Close 3 sub-tabs`, `Send 3 sub-tabs`); an action that stays single-target says `(cursor)`. A mark the filter is hiding is called out in the confirm rather than closed quietly. Every workbench strip marks and closes this way (Fuzzer, Notes, Decoder, JWT, Cookie, Comparer, Miner and Sequencer alike), and all of them but Sequencer duplicate too; sending is Repeater's.
+
+Three request-pane actions send more than one request at once. `Space` → `G` (**Race marked sub-tabs**) fires the marked sub-tabs (at least two, up to 20) as one synchronized race: over HTTP/1.1 each goes on its own connection with the last bytes released together, over HTTP/2 as a single-packet send. Every marked tab must share one origin and transport, and each response is shown with its timing. Headless it is `gori run repeater race <id> <id>…` ([CLI Reference](/reference/cli/#run-repeater)); over MCP, `race_requests`. `Space` → `g` (**Send group (one connection)**) pipelines every request in the pane, split on a lone `%%%` line, over one keep-alive connection and shows each response; it works on HTTP/1.1 in plain-text mode only.
+
+`Space` → `B` (**Timing analysis (A vs B)**) is a **differential timing** test over exactly two marked sub-tabs: the earlier chip on the strip is A, the later one B. It asks how many pairs to send (30 by default, up to 500), discards 3 warm-up pairs, then releases A and B together each time the way a race does (HTTP/2 single-packet on one connection, HTTP/1.1 last-byte sync on two), so network and server-load noise hits both alike. The verdict is taken on **response order**, not on latency: in how many pairs A arrived after B, with a two-sided sign test that must clear p < 0.01 to name a side. The card reports `A consistently slower`, `B consistently slower`, `no measurable difference`, or `inconclusive` when fewer than 20 pairs had both responses, next to each variant's min/quartiles/max and distribution, never a single number. A pair where either side errored is dropped rather than counted fast or slow. The pair must share one origin and transport, as a race does, and `Esc` cancels a run. Headless it is `gori run repeater timing <idA> <idB>` (`--count`, `--warmup`, `--interleaved` to send A and B one after the other, alternating which goes first, instead of racing them, `--format json`); over MCP, `timing_requests`.
 
 <figure class="tui-shot">
-  <img src="/images/tui/repeater.svg" alt="gori Repeater tab with an editable HTTP/2 request pane, a response pane showing headers and a JSON body, and a replayed 200 in 1152ms status line">
+  <img src="/images/tui/repeater.svg" alt="gori Repeater tab with an editable HTTP/2 request pane, a response pane showing headers and a JSON body, and a sent → 200 status line">
   <figcaption><strong>Repeater</strong>: an editable request on the left, the live response and timing on the right, with a diff against the previous send.</figcaption>
 </figure>
 
@@ -30,8 +39,8 @@ Repeater handles more than HTTP/1:
 
 - **HTTP/2** requests are re-sent over a real h2 connection.
 - **WebSocket** repeater opens a handshake (an RFC 6455 `Upgrade:` request over HTTP/1.1, or an RFC 8441 extended `CONNECT` over HTTP/2, whichever the session holds), then replays your messages **one at a time**: each one goes out, the server's answer is drained until the socket falls quiet, and only then does the next leave.
-- **gRPC** repeater reuses the HTTP/2 engine for framed messages. A unary call (exactly one framed message) exposes its payload for hex editing with `^X`, and, when a descriptor set declares the rpc, for FIELD editing with `␣E`: pick a schema-known field, type a value, and the message is re-encoded around it with every other byte copied from the capture ([`.proto` as a lens](/guide/proxy/#proto-schema)). A 0- or multi-message body is re-sent verbatim. The 5-byte length prefix in front of the message is governed by the `␣F:FRAME` toggle on the request card. It is **on** by default in the tab, so an edited unary message goes out well-formed and the origin accepts the call. Turn it **off** to send the captured prefix in front of your edited payload, because a prefix that disagrees with its payload is one of the standard gRPC parser tests. Headless the default is the other way round: `gori run repeater send` (MCP `send_request`) sends the prefix as captured unless you pass `--reframe-grpc` / `reframe_grpc: true`.
-- A **decode** mode re-encodes edited SAML / GraphQL payloads on send. (To decode or edit a JWT, use the [Decoder](/guide/decoder/) tab's `jwt-decode`.)
+- **gRPC** repeater reuses the HTTP/2 engine for framed messages. A unary call (exactly one framed message) exposes its payload for hex editing with `^X`, and, when a descriptor set declares the rpc, for FIELD editing with `␣Pf`: pick a schema-known field, type a value, and the message is re-encoded around it with every other byte copied from the capture ([`.proto` as a lens](/guide/proxy/#proto-schema)). A 0- or multi-message body is re-sent verbatim. The 5-byte length prefix in front of the message is governed by the `␣Pr:FRAME` toggle on the request card. It is **on** by default in the tab, so an edited unary message goes out well-formed and the origin accepts the call. Turn it **off** to send the captured prefix in front of your edited payload, because a prefix that disagrees with its payload is one of the standard gRPC parser tests. Headless the default is the other way round: `gori run repeater send` (MCP `send_request`) sends the prefix as captured unless you pass `--reframe-grpc` / `reframe_grpc: true`.
+- A **decode** mode re-encodes edited SAML / GraphQL payloads on send. (To decode or edit a JWT, send it to the [JWT](/guide/jwt/) tab; the Decoder's `jwt-decode` only reads one.)
 
 That one-at-a-time order is the point on WebSocket. A socket carries a conversation, so a script whose third message depends on the answer to the second only replays faithfully if gori waits in between, and the transcript then reads in wire order, instead of listing everything you sent ahead of everything the server said. Three things follow from it:
 
@@ -49,26 +58,79 @@ gori run repeater <flow-id> --target https://staging.example.com --diff
 
 ## Environment Variables
 
-Outbound requests support `$KEY`-style substitution. Tokens stay as literal text in the editor and expand only at send time: in Repeater, the Fuzzer, the Miner, Intercept forwards, `gori run`, and MCP `send_request`.
+Outbound requests carry three kinds of token, told apart by their namespace:
 
-Define variables in two places (project wins on a key collision):
+| Token | Resolves from | When |
+|-------|---------------|------|
+| `$ENV.KEY` | env vars, global or per-project | at build time, before the request is framed |
+| `$BIND.NAME` | a [session binding](/guide/proxy/#session-bindings) an extract rule filled | at send time, out of the active identity's table |
+| `$GEN.NAME` | a built-in value generator | at send time, once per outbound request |
+
+Tokens stay as literal text in the editor and expand only on the way out: in Repeater, the Fuzzer, the Miner, Intercept forwards, `gori run`, and MCP `send_request`. In a Repeater request opened from a capture, or a message held at Intercept, a token the captured bytes already carried is sent as it was; only the ones you type expand.
+
+`GEN` provides the values commonly needed while probing a target, without a Decoder chain or a stored secret:
+
+| Token | Output |
+|-------|--------|
+| `$GEN.UUID` | UUID v4 |
+| `$GEN.RANDOM` | cryptographically secure unsigned 64-bit integer, in decimal |
+| `$GEN.RANDOM_HEX` | 128 cryptographically secure random bits, as 32 lowercase hex characters |
+| `$GEN.TIMESTAMP` | Unix time in seconds |
+| `$GEN.TIMESTAMP_MS` | Unix time in milliseconds |
+| `$GEN.ISO8601` | current UTC time in RFC 3339 form, with milliseconds |
+| `$GEN.USER_AGENT` | a real desktop browser User-Agent (Chrome, Edge, Firefox, Safari), drawn at random from a list built into gori, so two sends can get the same one. On an `https`/`wss` request whose TLS preset is `chrome`, `firefox` or `safari` (the send's own, or the destination's `outbound_tls` rule), it draws only from that browser, so the header agrees with the handshake. It contains spaces, so use it in a header, not the request line |
+| `$GEN.USER_AGENT_CHROME` | the same, narrowed to Chrome and Edge, to pair with the `chrome` TLS preset |
+| `$GEN.USER_AGENT_FIREFOX` | the same, narrowed to Firefox, to pair with the `firefox` TLS preset |
+| `$GEN.USER_AGENT_SAFARI` | the same, narrowed to Safari, to pair with the `safari` TLS preset |
+
+To draw from your own list instead, open **Settings → Editor & Keys → User-Agents** (or `Ctrl-P` → **Settings: User-Agents**) and enter one User-Agent per line, or run `gori settings user-agents --set FILE` (`-` reads stdin; `--reset` goes back to the built-in list). Your list replaces the built-in one. A family name with none of your lines, for example `$GEN.USER_AGENT_SAFARI` with no Safari line, still uses the built-in family. Under a browser TLS preset, the plain `$GEN.USER_AGENT` uses your lines of that browser, or all of your lines when you listed none of it. `gori settings user-agents` prints the list in use, and MCP `list_env` reports whether it is yours.
+
+The same generator name used more than once in one request has the same value. The next request mints again. Generators run only for operator-authored request text at the final send seam; captured evidence and Fuzzer payload bytes remain literal.
+
+Define env vars in two places (project wins on a key collision):
 
 | Layer | Where |
 |-------|-------|
 | **Global** | Preferences (`Ctrl-,`) → **Editor & Keys** → **Env**, `Ctrl-P` → **Settings: Env**, or the `env` section of `settings.json` |
 | **Project** | **Project** tab → **ENV** pane (`a` add, `e` edit, `d` delete) |
 
-Default prefix is `$` (changeable via **Change prefix** in the ENV space menu, or `env.prefix` in settings). Keys are `A-Z a-z _` followed by `A-Z a-z 0-9 _`.
+The namespace is uppercase and case-sensitive; the name after the dot is `A-Z a-z _` followed by `A-Z a-z 0-9 _`. The sigil is `$` by default (changeable via **Change prefix**, which the palette finds from the ENV pane, or `env.prefix` in settings); the namespace spelling is not.
+
+Anything else that starts with the sigil is a byte. A GraphQL variable (`$id`), a MongoDB operator (`$ne`), an OData option (`$filter`) and a JSON Schema keyword (`$ref`) are not references and need **no escape** — paste that body and send it as written. To ship the text of a token itself, double the sigil: `$$ENV.KEY` sends `$ENV.KEY`, `$$BIND.NAME` sends `$BIND.NAME`, and a bare `$$` is two literal bytes. Each pass consumes only its own escape, so `$$BIND.NAME` survives env expansion and `$$ENV.KEY` survives the binding pass.
+
+That "a bare `$NAME` is just a byte" rule is about **request text** — a body, a header, a payload you pasted. It does not hold in a [Match & Replace](/guide/proxy/#match-replace) **replacement**, which exists only to inject a value: a bare `$NAME` there that names a known env var, extract rule or claimed session binding is a rule the grammar moved out from under, so gori **does not apply that rule** and writes an event naming the re-spelling. Fix it to `$ENV.NAME` / `$BIND.NAME`, or write `$$NAME` if the literal text really is what you meant.
 
 An unknown token stays visible as literal text wherever a request is *shown*. The editor keeps what you typed, and the highlighter marks an unregistered token differently from a registered one. It is not sent, though: Repeater, the Fuzzer, the Miner, the Sequencer and Discover each refuse a run whose request line, headers or target still name a variable that resolves to nothing, and say which one, as do minimize, an intercept forward you edited, and a WebSocket message. Set it, or drop the token. The check covers the request head only. A `$` inside a body is treated as a byte, so binary uploads replay unchanged. A WebSocket **text** message has no head, so the whole payload is checked; a **binary** message is never checked, and never expanded.
 
 ```http
 GET /api/me HTTP/1.1
 Host: api.example.com
-Authorization: Bearer $TOKEN
+Authorization: Bearer $BIND.SESSION
+X-Api-Key: $ENV.API_KEY
 ```
 
-Values that appear in captured traffic can be masked back to `$KEY` when copying or displaying, so secrets stay as tokens rather than raw strings.
+Values that appear in captured traffic can be masked back to their token when copying or displaying, so secrets stay as tokens rather than raw strings.
+
+### Bare syntax, and the automatic upgrade
+
+Namespaced is the grammar. A project written before namespaces existed is **re-spelled automatically the first time it opens** — in the TUI, in a `gori run …`, or in a `gori mcp` server, whichever gets there first:
+
+- Repeater drafts and their WebSocket frames, Fuzzer templates, Miner and Sequencer requests, rewrite-rule replacements, session-slot headers, and the tokens a masking pass wrote into issue titles and notes.
+- **Captured evidence is left exactly as it was.** A capture expands nothing, so its `$id` is a byte the origin sent.
+- A backup of the database is written beside it first — `gori.db.pre-namespaced-<timestamp>` — and the run that does the work prints one line per project saying how many tokens moved and where the backup is. Global rewrite rules live in `settings.json` and are re-spelled by the same start, with a `settings.json.pre-namespaced-<timestamp>` copy; one that names a *project* var or an extract rule is named for you to fix instead, because a rule that rewrites every project cannot be re-spelled from inside one.
+
+```bash
+gori settings env-syntax        # print the grammar in force, and where it came from
+gori settings env-syntax bare   # opt out
+```
+
+That command is the only switch — no TUI key sets the grammar, because switching it has to
+re-spell stored tokens, which a setting on its own cannot do. A TUI session or a `gori mcp` server
+that is already running **follows** the switch on its own: it picks up the new grammar, re-spells
+the project it has open, and says what it did (a notification and an ACTIVITY row in the TUI, a log
+line for MCP).
+
+`env.syntax = bare` is the opt-out: bare `$KEY` for an env var, bare `$NAME` for a binding, `$$` for a literal `$`. Each project re-spells itself **back** the next time it opens, escaping a literal `$NAME` that would otherwise start resolving. Note that bare is the ambiguous grammar — a GraphQL `$id` in a body really does collide with an env var named `id`, which is what the escape and `--verbatim` are for. Generators have no bare spelling: `$GEN.UUID` remains literal under the bare grammar. The rest of this documentation spells tokens the namespaced way; on a bare install, read ENV and BIND tokens without the namespace (`$KEY`, `$NAME`).
 
 ## Fuzzer
 
@@ -88,25 +150,82 @@ The Fuzzer is an Intruder-style engine: mark positions in a request, attach payl
 | `pitchfork` | Parallel sets: payload *n* from each set together |
 | `clusterbomb` | Every combination across all sets |
 
+The first two take **one** payload set; the last two take one per marked position. Pass more sets than the mode consumes and gori says how many it will not draw from, and how to use them, before the run starts — two wordlists under the default `sniper` sweep the first one into every position.
+
 ### Positions and Payloads
 
-Mark positions with `§…§` markers in the request, or let gori place them automatically. Payload sets can be a built-in preset (`sqli`, `xss`, `traversal`, `format-string`, `bad-strings`, `command-injection`) for a fast start with no file, a wordlist, an explicit list, a numeric range, N empty (null) payloads, or brute-force character sets. A preset can merge an extra file (built-in first, de-duped), and composes with any other set. Processors let you transform each payload on the way out: prefix/suffix, URL/base64/hex encoding, case folding, hashing, or a regex replace.
+Mark positions with `§…§` markers in the request, or let gori place them automatically. Payload sets can be a built-in preset (`sqli`, `xss`, `traversal`, `format-string`, `bad-strings`, `command-injection`, `cache-delimiters`) for a fast start with no file, a wordlist (a file, or the name of a list in the [catalog](#wordlist-catalog)), an explicit list, a numeric range, N empty (null) payloads, or brute-force character sets. A preset can merge an extra file (built-in first, de-duped), and composes with any other set. Processors let you transform each payload on the way out: prefix/suffix, URL/base64/hex encoding, case folding, hashing, or a regex replace.
 
 A gRPC message is the one place a marker cannot go usefully; see [Sweeping a gRPC Field](#sweeping-a-grpc-field), where the position is a schema-known field rather than a byte range.
 
-A single marker can also carry a Decoder chain of its own. Put the cursor inside it and press `Ctrl-Y` to open the chain editor, which previews the value through every step before you send. Anything you [saved in the Decoder library](/guide/decoder/#building-a-chain) can be called there by name, so a chain you built once is one word in a marker: `§admin¦myenc > url-encode§`. Repeater markers work the same way.
+A single marker can also carry a Decoder chain of its own. Put the cursor inside it and press `Ctrl-Q` to open the chain editor, which previews the marker's value through each step before you send (an `exec:` step is withheld from the preview and runs only on send). Anything you [saved in the Decoder library](/guide/decoder/#building-a-chain) can be called there by name, so a chain you built once is one word in a marker: `§admin¦myenc > url-encode§`. Repeater markers work the same way — in the TUI tab. Markers are a drafting language the tab renders on send, so the headless surfaces do not render them: `gori run repeater send`, MCP `send_request` and a retest step **refuse** a session whose `§…§` the tab would render, rather than put the literal `§` bytes on the wire. Remove the markers before sending from there, sweep the marked request as a Fuzzer template (`gori run fuzz --request=FILE`, `fuzz_start{template}`), or pass `--verbatim` / `verbatim:true` to say the stored bytes are the message. A `§` the capture itself carried is untouched: gori cannot tell it from one you typed, so the tab leaves it inert and every surface replays it byte-exact.
+
+### Wordlist Catalog
+
+Lists you reuse live in one place, `wordlists/` under `GORI_HOME` (`~/.gori/wordlists` by default). Every file there is a **named list**, and a name works anywhere a wordlist path does, from any working directory: `gori run fuzz -w common.txt`, `gori run mine --wordlist common.txt`, `discover --wordlist`, `cookie --crack --wordlist`, the Wordlist payload set in the Fuzzer, and the `wordlist` argument of the MCP `fuzz_start`, `mine_start`, `discover_start` and `cookie_crack`.
+
+- **Resolution.** A value with a `/` in it is a path and is opened exactly as given. A bare name is looked up in the **current directory first**, then in the catalog, so a file you have right here still wins over a saved list of the same name. A bare name found in neither place is refused as not found; `fuzz -w` and Cookie cracking also say the two places they looked.
+- **Names.** Letters and digits of any script, `_`, `.`, `+`, `-` and inner spaces, at most 200 bytes, never starting with `.` or `-`. A name is a file name, not a path: nothing that can leave the directory is accepted, and `gori` refuses to write through or over a symlink you keep there.
+- **The bytes are never normalized.** A list is the raw file. A blank line and a line starting with `#` are payloads to the Fuzzer, while the Miner and Discover keep reading those two shapes as formatting, exactly as they do for a path. Saving keeps every line as given.
+- **Managing lists.** `gori run wordlist` lists, shows, saves, renames and deletes them (see the [CLI reference](/reference/cli/#run-wordlist)); in the TUI, `Ctrl-S` in the List payload editor saves the values as a list, the Wordlist type's blank-field dropdown offers your favorites, recents and the catalog (by name), and `w` on the Target → Params sub-tab saves the listed parameter names into it; agents use `list_wordlists`, `get_wordlist`, `save_wordlist`, `rename_wordlist` and `delete_wordlist` (the [MCP guide](/guide/mcp/) lists them).
+- **Safe by default.** Listings and `show` never print a list's values (a list can be a credential list): `gori run wordlist show NAME --head N` and MCP `get_wordlist{include_values:true}` are the explicit ask, and both are bounded. Saved lists are owner-only (`0600` in a `0700` directory), written atomically, and never replace an existing list unless you say so (`--overwrite`, `overwrite:true`, or a second `Enter` in the TUI). Listing a multi-GB list costs a `stat`; a line count reads at most 32 MiB.
+- **Not a project feature.** The catalog is global, and a project never silently inherits a list: a name is something you typed. Contents are newline-delimited text; there are no descriptions or tags.
+
+```bash
+# a list saved once, used from anywhere
+gori run sitemap params --host api.example.com --format names | gori run wordlist save api-params.txt
+gori run mine 42 --wordlist api-params.txt
+```
+
+### Payloads from the Project
+
+The project already holds the target's own vocabulary: the parameter names its endpoints take, the values its clients send, the paths it serves, the endpoints its JavaScript points at, the tokens your extract rules pull out. A **project payload source** turns a slice of that into a set without a wordlist file to write first. It has two parts: a [QL query](/reference/query-language/) that picks the flows, and a **projection** that turns them into values.
+
+```bash
+gori run fuzz 42 --auto --payload-from 'host:api.example.com param-values'
+gori run mine 42 --payload-from 'host:api.example.com param-names'
+```
+
+| Projection | Values |
+| ---------- | ------ |
+| `param-names` | Parameter names of the selected requests (a JSON member contributes its leaf name) |
+| `param-values` | Parameter values, decoded once (`hello%20world` is `hello world`), so a query or form position encodes them exactly once |
+| `path-segments` | Request-path segments as captured (percent-encoded, which a path position takes raw) |
+| `js-endpoints` | Endpoint paths found in the selected flows' JavaScript. It reads what `gori run sitemap js --scan` stored and scans nothing |
+| `extracted` | Values your stored [extract rules](/guide/proxy/#session-bindings) pull out of the selected flows' stored responses (`extracted:NAME` for one rule): the rule's host glob and condition apply as they do live. Needs the sensitive opt-in |
+
+The descriptor is `<QL> <projection>`: the **last word** is the projection, and everything before it is the query (quote a value containing spaces, as QL always asks). A lone projection reads every flow. It reads the project and **sends nothing**: a source is built with nothing resolved, and the plan builder reads the project once, the same way on every surface, so the request count in the preflight and the confirm is the resolved size.
+
+- **The selection is strict.** A field QL does not have (`methd:GET`), a term QL would silently drop (`status:>=oops`, which would otherwise select the whole host) and a regex that cannot compile are refused, naming the term. A source is an exact selection, not a search you can eyeball.
+- **Bounded and reproducible.** It reads the newest 2000 flows, keeps at most 10,000 distinct values within an 8 MiB budget, skips a value over 4096 bytes and counts it. The order is newest flow first and first sighting wins, so the same project and options give the same list. What ended a read short is said, never silent: `--payload-from-max-flows` and `--payload-from-max-values` raise the first two. `js-endpoints` is one read of the stored references, so `--payload-from-max-flows` does not apply to it and its value cap tops out just under 50,000 (the report names the cap it applied).
+- **Secrets stay out by default.** Only the request's own inputs (query, form, multipart, JSON) are read; cookies and headers need `--payload-from-locations`. A value the project's redaction policy would mask (a credential-named field, a JWT or key shape, a JavaScript endpoint with a token in its path) is withheld and **counted**. A parameter *name* is never withheld, because a name is not a value. `--payload-from-sensitive` (MCP `include_sensitive`) is the explicit opt-in; it is reported on the run, and `extracted` refuses to run without it. The live session-binding table is never read: `extracted` re-applies the stored rules to stored responses and stores nothing.
+- **Values are kept as captured.** Nothing is trimmed or filtered. A value holding CR, LF or NUL is kept and counted in the report (`framing_values`), and what a position does with it is that position's own rule: query and form positions percent-encode it, a path position takes it raw.
+- **An empty source is a refusal**, not a clean run of zero requests. The message says why: no flow matched, nothing of that kind was in them, or everything was withheld as sensitive.
+- **Where it works.** `gori run fuzz` and `mine` (repeatable `--payload-from`, with `--payload-from-sensitive`, `--payload-from-locations` and the two caps applying to every source; a run with no `--flow`/`--project`/`--db` has no project to read and says so); MCP `fuzz_start` (`{"payload_from": "<QL> <projection>"}` in `payloads`, with `include_sensitive`, `locations`, `max_flows`, `max_values` beside it) and `mine_start` (`payload_from` plus `payload_from_*`); the Fuzzer's **Project** payload type, which asks for the query, the projection and the opt-in (off) and reads the project when the run starts. The run says what each source read, and never returns a value: `payload_sources` in the MCP reply, one `payload-from:` line on stderr, the run-start line in the TUI.
+- **In the Miner** a source must be `param-names`, and its names are tested in a fixed order: your explicit `--name`s, the project's names, the built-in list, then `--wordlist`, each name once at its first position. The TUI Miner popup has no text field, so it keeps seeding a mine with the host's other endpoints' names automatically; `--payload-from` is the headless spelling of choosing the slice yourself.
+- **Keep one for later.** `gori run wordlist save NAME --payload-from '<QL> <projection>' --project NAME` (MCP `save_wordlist{payload_from}`) saves the result as a list in the [catalog](#wordlist-catalog): an explicit act that names a project. It leaves out a value with a line break (a file holds one value per line) and counts it.
+
+This first version reports provenance per source (which query and projection, how many flows and values) and not per value.
 
 ### Matching
 
-Filter results with ffuf-style matchers and filters on status, size, words, lines, round-trip time (`--mt`/`--ft`, in ms, the dimension a time-based blind payload is the only evidence for), and body regex, plus auto-calibration to drop noisy baselines. Auto-calibration samples the target several times before the sweep and compares each response against every sampled shape, widened by the jitter those samples themselves showed, so a page carrying a per-request id or timestamp calibrates out, while a target whose samples were identical is still compared exactly. Matched responses are highlighted and can be extracted with a capture regex.
+Filter results with ffuf-style matchers and filters on status, size, words, round-trip time (`--mt`/`--ft`, in ms, the dimension a time-based blind payload is the only evidence for), and body regex (headless also line count with `--ml`/`--fl`, a response-head substring with `--mh`/`--fh` and gRPC status with `--mg`/`--fg`), plus auto-calibration to drop noisy baselines. Auto-calibration samples the target several times before the sweep and compares each response against every sampled shape, widened by the jitter those samples themselves showed, so a page carrying a per-request id or timestamp calibrates out, while a target whose samples were identical is still compared exactly. Matched responses are highlighted, and headless a value can be extracted from each response with a capture regex (`--extract`, MCP `extract`).
+
+The ADVANCED card also holds the run-shaping rows. **Stop after N hits** and **Stop on (DIM:SPEC)** end a sweep early once the matchers have hit N times or a response meets one condition; a run that stops this way ends `condition_met` rather than `stopped`. **Keep interesting only** makes a saved run keep just the matched rows and the ones carrying a fault (a send error, a marker chain that failed, a re-send, a truncated response) or the stopping row. **Race (N conns)** replaces the payload sweep with N copies of the request released together (last-byte sync), and **Max requests** caps the true wire count. Headless these are `--stop-after-matches`, `--stop-on`, `--keep`, `--race` and `--max-requests`; see the [CLI Reference](/reference/cli/#run-fuzz).
+
+### Grouping Results by Response Shape
+
+A 10,000-row sweep is usually a handful of distinct answers. **Group by shape** (`Space` → `Z` **Display…**, then **Group by shape**) turns the RESULTS list into one row per answer: its size (`▸×1204`), then a representative result (the lowest-index one) with its status and metrics. Rows share a shape when they are the same answer whatever payload produced it: a reflected payload (as sent, HTML-escaped in any of the common quote spellings, percent-encoded or JSON-escaped), numbers, ids, hashes, timestamps and whitespace are normalized away, and so are headers that change per response (`Date`, `ETag`, request ids, `Content-Length`). The status, gRPC status, WebSocket close code, a truncated or timed-out capture, a set cookie, a redirect target and the body's words are not, so two `200`s of the same length with different bodies stay apart, and a timeout never groups with a short `200`. A failed send groups by its kind (refused, timeout, TLS, reset, blocked by scope). `→` opens a cluster to its members, `←` folds it (from a member too), **Cycle sort** (`Space` → `o`) orders clusters rare first, largest first or by first appearance, and the matched-only lens keeps the clusters holding a hit. Past 4,096 distinct shapes, new ones stay ungrouped, and the RESULTS border counts them (and the hits among them). Counts cover the whole run, including rows past the display window and every stored row of a reopened run. Grouping never changes a row, its index or its match verdict.
+
+The same clusters are on the headless surfaces: `gori run fuzz show RUN_ID --clusters` (and `--cluster ID` for one cluster's results) for a saved run, and `fuzz_results{clusters: true}` / `get_fuzz_run{clusters: true}` over MCP. Cluster ids are stable across runs of the same gori version, so one answer has one id in every run.
 
 ### Saving and Reopening Runs
 
 During a TUI run, gori writes every result to a private temporary SQLite spool while the pane keeps a bounded display window: at most 5,000 rows and 64 MiB of dynamic result data. The newest rows remain interactive; an individually oversized row is shown as metrics only. If even its payload/error text exceeds the window, the display truncates and labels those fields and disables Send to Repeater/Comparer rather than reconstructing a request from placeholders. The spool still holds the complete row. It is owner-only, cleaned in small background transactions when a run is discarded, removed wholesale when the project closes, and a spool failure never stops outbound traffic; it only makes that run unavailable for permanent saving.
 
-After a non-empty run finishes and its spool is complete, press **`Shift-S` in READ mode** to save every spooled row permanently in the project. An uppercase `S` still types normally while you are editing. Saving uses row- and byte-bounded background batches, and the status line and Jobs panel report success or failure. Repeating the shortcut does not create a duplicate; a failed project copy retains its temporary spool for retry.
+After a non-empty run finishes and its spool is complete, press **`Shift-E` in READ mode** to save every spooled row permanently in the project. An uppercase `E` still types normally while you are editing. Saving uses row- and byte-bounded background batches, and the status line and Jobs panel report success or failure. Repeating the shortcut does not create a duplicate; a failed project copy retains its temporary spool for retry.
 
-Reopening a project restores the latest successfully saved run for its initially selected Fuzzer session. Other Fuzzer sessions restore lazily on first selection. Restore reads only the newest 5,000 rows / 64 MiB into the pane and labels it `showing N`; the complete archive remains available through paged CLI/MCP readers. Active, partially failed, and legacy incomplete snapshots are never restored automatically. Open **Space → Run history** to choose an older current-format run; `Enter` loads it and `d` deletes it. Closing the Fuzzer session deletes its saved-run history too; the close confirmation says so.
+Reopening a project restores the latest successfully saved run for its initially selected Fuzzer session. Other Fuzzer sessions restore lazily on first selection. Restore reads only the newest 5,000 rows / 64 MiB into the pane and labels it `showing N`; the complete archive remains available through paged CLI/MCP readers. Active, partially failed, and legacy incomplete snapshots are never restored automatically. Open **Run history** (type it into `Ctrl-P`) to choose an older current-format run; `Enter` loads it and `d` deletes it. Closing the Fuzzer session deletes its saved-run history too; the close confirmation says so.
 
 The headless and agent surfaces use the same permanent store:
 
@@ -143,7 +262,7 @@ gori run fuzz --flow 42 --field role --payloads ROLE_ADMIN,ROLE_USER,99
 `SPEC` is a field name, a path into a nested message (`profile.age`), a field number, or
 `tags[1]` for one occurrence of a repeated field. It needs a descriptor set that resolves the
 rpc (a `protoc --descriptor_set_out` file or a `gori run grpc reflect` fetch); the field names
-are the ones the Repeater's `␣E:FIELDS` form and the History protobuf tree already show for
+are the ones the Repeater's `␣Pf:FIELDS` form and the History protobuf tree already show for
 the same flow.
 
 Two things follow from what a splice can do. The field has to be **present on the captured
@@ -186,7 +305,7 @@ Mark `§…§` positions **in the frames**, which is where a WebSocket app's par
 ```bash
 gori run fuzz --repeater 7 \
   --message '{"op":"login","user":"§admin§"}' \
-  --payloads-preset sqli
+  --preset sqli
 ```
 
 `--repeater N` on a WebSocket session seeds the handshake **and** the frames the session stored, so a captured exchange is swept as it was recorded; `--flow N` does the same from a captured socket. `--message` / `--message-frame` replace those frames when you want to author your own; `--message-frame` takes the same `opcode=…,fin=…,rsv=…,mask=…,len=…,hex=|b64=|text=` grammar as `gori run repeater send`, so a PING, a CLOSE with a chosen code, an unmasked client frame or a length that disagrees with its payload are all reachable. `--idle-ms` sets the per-session silence timeout and `--ws-keep-key` sends the template's own `Sec-WebSocket-Key` so an absent or malformed key can itself be the test (an RFC 8441 handshake has no such key, and the run says so rather than ignoring the flag).
@@ -202,7 +321,41 @@ Results read like any other sweep, because the inbound frames **are** the respon
 
 `ws_close_code` and `ws_frames_in` appear in `--format json` and in MCP `fuzz_results` the same way, and only on WebSocket rows.
 
-Four knobs do not apply. `--race` is refused outright (a race group is byte-identical copies of one request, which has no framed-exchange form), and so is `--record-history`, because a framed exchange is not a request/response flow and writing one would produce a History entry that claims to be a WebSocket with an empty transcript. `--http2` is refused only on an `Upgrade: websocket` template: HTTP/2 has no upgrade mechanism (RFC 9113 §8.1), so a WebSocket over h2 is opened by an RFC 8441 extended `CONNECT` instead, and a seed that IS one sweeps over HTTP/2 with no flag needed, because the handshake bytes say so. `--follow-redirects`, `--timeout` and `--ac` are simply inert here and the run says so once, up front, rather than pretending otherwise. Each refusal names `--ws-http-only` where that is the way to get what you asked for; under that flag the run is an ordinary HTTP sweep, so all three work, recording included. A WebSocket seed that carries no outbound frames is swept as plain HTTP too: a handshake-only “framed” run would dial a socket per payload just to send nothing.
+Six knobs do not apply: three are refused and three are inert. `--race` is refused outright (a race group is byte-identical copies of one request, which has no framed-exchange form), and so is `--record-history`, because a framed exchange is not a request/response flow and writing one would produce a History entry that claims to be a WebSocket with an empty transcript. `--http2` is refused only on an `Upgrade: websocket` template: HTTP/2 has no upgrade mechanism (RFC 9113 §8.1), so a WebSocket over h2 is opened by an RFC 8441 extended `CONNECT` instead, and a seed that IS one sweeps over HTTP/2 with no flag needed, because the handshake bytes say so. `--follow-redirects`, `--timeout` and `--ac` are simply inert here and the run says so once, up front, rather than pretending otherwise. Each refusal names `--ws-http-only` where that is the way to get what you asked for; under that flag the run is an ordinary HTTP sweep, so all three work, recording included. A WebSocket seed that carries no outbound frames is swept as plain HTTP too: a handshake-only “framed” run would dial a socket per payload just to send nothing.
+
+### Rotating Tokens with a Macro
+
+Some applications hand out a new form token or nonce on every page load or API call. A sweep then gets `200` for the first candidate and `403` for every one after it, because they all carry the value captured before the run. Waiting for a session to expire does not help: the value dies long before its session does. A **macro** fixes it: a short list of saved Repeater sessions that runs **before** a candidate, so the value its extract rule leaves in the [session bindings](/guide/proxy/#session-bindings) is fresh when the candidate resolves its `$BIND.NAME`. The Fuzzer and the Param Miner both have one.
+
+There is nothing new to learn about extraction or injection. The steps go through the Repeater's own send path, so the [extract rule](/guide/proxy/#session-bindings) you wrote for the token works unchanged, and the candidate names the value where it belongs with `$BIND.NAME` in the template or in a header of the [active session slot](/guide/authorize/#session-slots-one-list-two-readers). A macro only decides **when** the steps run:
+
+| Cadence | What it does |
+| --- | --- |
+| `request` (default) | The steps run before every candidate. A one-time value is never shared, so the sweep goes **one candidate at a time**: the plan says so before the first request |
+| `N` | The steps run before the first candidate and then after every N. Those N share the value and may run at once; the next value is fetched only after all N have finished, so no candidate can pick up the following one's value |
+| `off` | The steps stay configured and nothing runs |
+
+Candidates are counted in the order they reach the macro, which is generation order with one worker and dispatch order in practice with several. A calibration sample counts as a candidate, since it carries the same template. A `--race` run is one unit: the steps run once, before the group is dialled, and every member carries that one value, which is exactly the experiment "redeem one single-use token from N connections at once". So the cadence must be at least the group size, and a shorter one is refused rather than silently shared.
+
+A failed macro never sends a stale or empty value. The steps fail when one errors, answers `4xx`/`5xx` or is refused by the scope, and when they answer but no extract rule rebound anything (or, with `--macro-expect NAME`, the binding you named). The candidate is **not sent**: its row is an error row starting `macro:`, it is counted in the run's errors, and it is never retried, because the steps would only fail again against the same endpoint. `--macro-on-failure skip` (default) ends the run after three failures in a row, so a broken login is not sent once per payload; `stop` ends it on the first. There is deliberately no "send it anyway with the last value": that row's verdict would be about a stale token. A run the macro ended finishes as an error on every surface.
+
+Everything the steps send is on the record and inside the same limits as the rest of the run:
+
+- Each step lands in History with source `macro` (`src:macro`, SRC `MACRO`, `source_ref` `macro step N`) and each failure writes an event; the run's own status counts runs, requests and failures, and never a value.
+- They are sent as the active session slot, overlay included, so a page that needs your session cookie gets it.
+- They pass the surface's scope check when the run is built and again for every run of the steps, and Sandbox and explicit excludes hold for them as they do for the candidates.
+- They are charged to `--max-requests` and held to `--rate`; a stop lands between two steps.
+
+The macro is refused, before anything is sent, when a step is a session that still holds `§…§` markers or a WebSocket handshake, when the project has no extract rule the steps could rebind, and when no candidate can carry the value: a **captured flow's** template is sent exactly as captured and substitutes nothing, so seed the run from a Repeater session or a draft, or put the token in a header of the active slot.
+
+| Surface | How |
+| --- | --- |
+| TUI, Fuzzer | **ADVANCED**: *Macro steps* (session ids or tab names, comma-separated), *Macro cadence*, *Macro must rebind*, *Macro on failure* |
+| TUI, Miner | The **MINE PARAMETERS** popup picks one saved session (*macro step*), its cadence and its failure policy |
+| `gori run` | `fuzz` / `mine` `--macro=STEPS [--macro-every=request\|N\|off] [--macro-expect=NAME] [--macro-on-failure=skip\|stop]`; needs a project you named (`--project`, `--db`, `--flow` or `--repeater`) |
+| MCP | `fuzz_start` / `mine_start` `macro_steps`, `macro_every`, `macro_expect`, `macro_on_failure`; the reply's `request_macro` describes the plan and `fuzz_status` / `mine_status` report what it did |
+
+The Miner's macro runs before **every request it sends**, the baseline calibration included: an application that rotates a token per request answers an un-tokened calibration probe with the same `403` as a candidate, and a baseline of `403`s makes every real response look like a finding. Its TUI popup takes one session; several steps and `--macro-expect` are on the CLI and MCP.
 
 ### Connection Reuse
 
@@ -225,9 +378,9 @@ gori run fuzz <flow-id> \
   --fs 0
 ```
 
-Sources can be a captured flow (`--flow`), a saved HTTP repeater session (`--repeater`), a raw request file (`--request`), or stdin. Output is `text`, `json`, or `jsonl`. This form is ephemeral and backward-compatible; put the exact same arguments after `gori run fuzz save` to retain every row permanently. `fuzz list`, `fuzz show`, and `fuzz delete` manage those saved runs.
+Sources can be a captured flow (`--flow`), a saved repeater session (`--repeater`, HTTP or WebSocket), a raw request file (`--request`), or stdin. Output is `text`, `json`, or `jsonl`. This form is ephemeral and backward-compatible; put the exact same arguments after `gori run fuzz save` to retain every row permanently. `fuzz list`, `fuzz show`, and `fuzz delete` manage those saved runs.
 
-**A Repeater send from the TUI is recorded in History.** The tester driving a request by hand is the one whose evidence went missing, and a send that leaves no flow cannot be compared, exported or handed over; the status line names the id it wrote (`sent → 200 in 391ms · History #84`). Settings → General → *Record Repeater sends* turns it off. WebSocket sends and send-groups are not recorded (a socket's evidence is its frame transcript, which the session already keeps), and the status line says so once.
+**A Repeater send from the TUI is recorded in History.** The tester driving a request by hand is the one whose evidence went missing, and a send that leaves no flow cannot be compared, exported or handed over; the status line names the id it wrote (`sent → 200 in 391ms · History #84`). Settings → General → *Record Repeater sends* turns it off. WebSocket sends (a socket's evidence is its frame transcript, which the session already keeps), send-groups, races and timing runs are not recorded, and the status line says so once.
 
 Everything else stays opt-in, and the headless surfaces keep their own per-call arguments so no script's behaviour moves under the setting: `gori run repeater send --record-history` writes the send as a flow and prints its id (off by default); `gori run fuzz --record-history=none|matched|all` records each sent request+response (`matched` only the rows that matched, `all` every send, capped at 5000); MCP `send_request` records unless you pass `record_history:false`.
 
@@ -235,7 +388,7 @@ Every recorded flow says where it came from (the History **SRC** column, and `sr
 `src:fuzzer` / `src:gori` in a query), so a resend is never read back as traffic the target's
 client produced. See [Where a flow came from](/guide/proxy/#flow-source).
 
-A recorded flow, from either tool, is the request **as it went on the wire**: the active session slot's header overlay and any `$NAME` the send seam resolved are part of it, so replaying, comparing or scanning that flow reproduces the send rather than the draft or template it was assembled from. (A Fuzzer *row* still shows the rendered template, which is what "send to Repeater" seeds a tab from; the slot applies per send.)
+A recorded flow, from either tool, is the request **as it went on the wire**: the active session slot's header overlay and any `$BIND.NAME` the send seam resolved are part of it, so replaying, comparing or scanning that flow reproduces the send rather than the draft or template it was assembled from. (A Fuzzer *row* still shows the rendered template, which is what "send to Repeater" seeds a tab from; the slot applies per send.)
 
 ## Next Steps
 

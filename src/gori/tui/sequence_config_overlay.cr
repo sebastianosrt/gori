@@ -20,7 +20,10 @@ module Gori::Tui
     mode : Sequencer::Mode,
     suggested_loc : Sequencer::TokenLoc?,
     candidate_cookies : Array(String),
-    candidate_headers : Array(String)
+    candidate_headers : Array(String),
+    # The session's CURRENT knobs, when this seed reconfigures an open session rather than
+    # opening a new one. nil for a new session, which starts from the defaults below.
+    config : Sequencer::Config? = nil
 
   # The config popup shown before a live collection: a token-descriptor kind cycler + an
   # editable selector field, then goal / concurrency / notification cyclers and a Start
@@ -33,7 +36,7 @@ module Gori::Tui
   # RECONFIGURE of the current one (reconfigure_sequence). Each site injects its own
   # `on_commit` closure, so the old `@sequence_reconfigure` shell flag is gone: the
   # overlay only reports :commit and the closure decides what "Start" means.
-  class SequenceConfigOverlay < Overlay
+  class SequenceConfigOverlay < FormOverlay
     KINDS          = Sequencer::ExtractKind.values
     GOAL_CHOICES   = [100, 250, 500, 1000, 2000, 5000]
     CONC_CHOICES   = [1, 2, 5, 10]
@@ -46,6 +49,9 @@ module Gori::Tui
     # `gori run` and MCP both had the knob. A cycler, not a text field, because this
     # overlay deliberately has none (no IME plumbing).
     MAX_REQ_CHOICES = [nil, 100, 250, 500, 1000, 2500, 5000, 10000] of Int32?
+    # The same list without the "uncapped" head, so a persisted budget can be matched against
+    # the real choices without the nil having to be reasoned about at every comparison.
+    CAPPED_CHOICES = MAX_REQ_CHOICES.compact
 
     KIND_ROW     = 0
     SELECTOR_ROW = 1
@@ -58,36 +64,58 @@ module Gori::Tui
 
     getter seed : SequenceSeed
 
+    # Declared, because `initialize` fills the four cycler positions through `nearest_index`
+    # (defined below it) and Crystal will not infer an ivar type across that.
+    @kind_idx : Int32
+    @goal_idx : Int32
+    @maxreq_idx : Int32
+    @conc_idx : Int32
+    @notify_idx : Int32
+
+    # `seed.config` is the OPEN session's live knobs on a reconfigure, and nil on a new
+    # session. Without reading it, `c` (Configure) on a session an operator had set to 2000
+    # samples / concurrency 5 / a 5000-request cap re-opened the card on 500 / 1 / uncapped
+    # and Start silently applied those: this overlay writes the WHOLE `Config`, so every
+    # cycler it does not carry over is a knob the reconfigure resets. The descriptor was
+    # carried from the first day; its four neighbours were not.
     def initialize(@seed : SequenceSeed)
       loc = @seed.suggested_loc
       @kind_idx = loc ? (KINDS.index(loc.kind) || 0) : 0
       init = loc ? (loc.kind.position? ? "#{loc.pos_start}:#{loc.pos_end}" : loc.selector) : ""
       @selector = TextField.new(init)
-      @goal_idx = GOAL_CHOICES.index(500) || 2
-      @maxreq_idx = 0
-      @conc_idx = 0
-      @notify_idx = NOTIFY_CHOICES.index(Sequencer::NotifyMode::WhenDone) || 0
-      @selected = SELECTOR_ROW
+      cfg = @seed.config
+      @goal_idx = nearest_index(GOAL_CHOICES, cfg.try(&.goal) || 500)
+      # Index 0 IS "uncapped", so a nil budget is an exact answer rather than a nearest one.
+      @maxreq_idx = cfg.try(&.max_requests).try { |c| 1 + nearest_index(CAPPED_CHOICES, c.clamp(0_i64, Int32::MAX.to_i64).to_i) } || 0
+      @conc_idx = nearest_index(CONC_CHOICES, cfg.try(&.concurrency) || 1)
+      @notify_idx = NOTIFY_CHOICES.index(cfg.try(&.notify) || Sequencer::NotifyMode::WhenDone) || 0
+      @sel = SELECTOR_ROW
+    end
+
+    # The cycler position for a persisted value. A cycler can only offer what it lists, and a
+    # value off the list (an older row, a config another surface wrote) has to land SOMEWHERE
+    # — on its nearest neighbour, which the operator then reads on the card before pressing
+    # Start, rather than on the default, which silently discards what the session had.
+    private def nearest_index(choices : Array(Int32), value : Int32) : Int32
+      idx = choices.index(value)
+      return idx if idx
+      best = 0
+      choices.each_with_index do |c, i|
+        best = i if (c - value).abs < (choices[best] - value).abs
+      end
+      best
     end
 
     def kind : Sequencer::ExtractKind
       KINDS[@kind_idx]
     end
 
-    def on_start_row? : Bool
-      @selected == START_ROW
-    end
-
     def editing_selector? : Bool
-      @selected == SELECTOR_ROW
+      @sel == SELECTOR_ROW
     end
 
     def move(d : Int32) : Nil
-      @selected = (@selected + d).clamp(0, ROW_COUNT - 1)
-    end
-
-    def set_selected(idx : Int32) : Nil
-      @selected = idx.clamp(0, ROW_COUNT - 1)
+      @sel = (@sel + d).clamp(0, ROW_COUNT - 1)
     end
 
     def handle_text_key(ev : Termisu::Event::Key) : Bool
@@ -116,7 +144,8 @@ module Gori::Tui
 
     # Own key handling (formerly Runner#handle_sequence_config_key). ↑/↓ move fields; the
     # selector row eats printable/caret/backspace (incl. ←/→ as caret motion) before the
-    # cyclers see them; ↵ on Start commits, elsewhere advances the cycler; esc cancels.
+    # cyclers see them; ↵ starts from any row, as the hint says (it used to advance the
+    # focused cycler — `samples` 500 → 1000 — #1373); ␣ advances a cycler; esc cancels.
     def handle_key(ev : Termisu::Event::Key) : Symbol
       key = ev.key
       return :cancel if key.escape?
@@ -128,11 +157,7 @@ module Gori::Tui
         move(1)
         return :stay
       end
-      if key.enter?
-        return :commit if on_start_row?
-        toggle_or_advance
-        return :stay
-      end
+      return :commit if key.enter?
       return :stay if editing_selector? && handle_text_key(ev)
       if key.left?
         adjust(-1)
@@ -144,21 +169,6 @@ module Gori::Tui
       :stay
     end
 
-    # Click a row to select it; a click on Start commits; a click outside the card cancels.
-    def handle_click(area : Rect, mx : Int32, my : Int32) : Symbol
-      box = overlay_box(area)
-      return :cancel if box.nil? || !box.contains?(mx, my)
-      if idx = row_at(box, mx, my)
-        set_selected(idx)
-        return :commit if on_start_row?
-      end
-      # …then the caret, if the press landed inside a drawn field. The row pick above is
-      # what focuses; this is what puts the caret where the operator pointed instead of
-      # leaving it wherever the last keystroke did (Overlay#click_text_field).
-      click_text_field(mx, my)
-      :stay
-    end
-
     # Live IME composition for the selector text field (only meaningful on that row) — a
     # mistyped cookie/header name is the #1 failure mode, so show composition as it builds.
     def set_preedit(text : String) : Nil
@@ -166,7 +176,7 @@ module Gori::Tui
     end
 
     def adjust(d : Int32) : Nil
-      case @selected
+      case @sel
       when KIND_ROW
         @kind_idx = (@kind_idx + d) % KINDS.size
         prefill_for_kind
@@ -177,10 +187,10 @@ module Gori::Tui
       end
     end
 
-    # Space/Enter on a cycler advances it; on the kind row it also re-prefills.
+    # Space on a cycler advances it; on the kind row it also re-prefills.
     def toggle_or_advance : Nil
-      adjust(1) if @selected == KIND_ROW || @selected == GOAL_ROW || @selected == MAXREQ_ROW ||
-                   @selected == CONC_ROW || @selected == NOTIFY_ROW
+      adjust(1) if @sel == KIND_ROW || @sel == GOAL_ROW || @sel == MAXREQ_ROW ||
+                   @sel == CONC_ROW || @sel == NOTIFY_ROW
     end
 
     # When the kind flips to Cookie/Header and the field is blank, offer the first
@@ -260,34 +270,35 @@ module Gori::Tui
     end
 
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 58}.min
-      h = {area.h - 2, ROW_COUNT + 5}.min
-      return nil if w < 34 || h < 8
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      area.card?(58, ROW_COUNT + 5, 34, 8)
     end
 
-    def render(screen : Screen, area : Rect) : Nil
-      box = overlay_box(area)
-      unless box
-        Overlay.too_small(screen, area, "config needs a larger window")
-        return
-      end
-      Frame.card(screen, box, "SEND TO SEQUENCER", border: Theme.border_focus)
+    def row_count : Int32
+      ROW_COUNT
+    end
+
+    def card_title : String
+      "SEND TO SEQUENCER"
+    end
+
+    def too_small_what : String
+      "config needs a larger window"
+    end
+
+    private def draw_head(screen : Screen, box : Rect) : Nil
       screen.text(box.x + 2, box.y + 1, @seed.summary, Theme.text_bright, Theme.panel, Attribute::Bold, width: box.w - 4)
-      first = box.y + 3
-      ROW_COUNT.times do |i|
-        py = first + i
-        break if py >= box.bottom
-        draw_row(screen, box, i, py)
-      end
     end
 
-    private def draw_row(screen : Screen, box : Rect, i : Int32, py : Int32) : Nil
-      sel = i == @selected
-      bg = sel ? Theme.accent_bg : Theme.panel
-      screen.fill(Rect.new(box.x + 1, py, box.w - 2, 1), bg)
-      screen.cell(box.x + 1, py, sel ? '▎' : ' ', Theme.accent, bg)
-      x = box.x + 3
+    private def first_row_y(box : Rect) : Int32
+      box.y + 3
+    end
+
+    private def rows_bottom(box : Rect) : Int32
+      box.bottom
+    end
+
+    def draw_row_body(screen : Screen, box : Rect, i : Int32, py : Int32,
+                      x : Int32, bg : Color, fg : Color, sel : Bool) : Nil
       vx = x + 15
       vw = {box.right - 2 - vx, 4}.max
       case i
@@ -296,7 +307,7 @@ module Gori::Tui
           "token type:", KINDS.map(&.label), @kind_idx, sel, value_x: vx)
       when SELECTOR_ROW
         screen.text(x, py, selector_label, Theme.muted, bg)
-        @selector.render(screen, vx, py, vw, sel, sel ? Theme.text_bright : Theme.text, bg)
+        @selector.render(screen, vx, py, vw, sel, fg, bg)
       when START_ROW
         # `width:` because a label drawn past `box.right` paints over the frame's hairline
         # and nothing repaints it — the floor-without-a-ceiling shape #912 closed in three
@@ -308,7 +319,7 @@ module Gori::Tui
       end
     end
 
-    # The four ←/→-cycled rows, split out of draw_row so adding a knob does not keep
+    # The four ←/→-cycled rows, split out of draw_row_body so adding a knob does not keep
     # growing one branch chain. `value_x` keeps them on this form's shared value column, which
     # the selector row above them also uses; the strip-or-lit-value decision belongs to
     # `Frame.option_cycle` and is made by measuring the room left to `right`.
@@ -322,12 +333,6 @@ module Gori::Tui
         else                 {"notify:", NOTIFY_CHOICES.map(&.label), @notify_idx}
         end
       Frame.option_cycle(screen, x, py, right, bg, label, options, idx, sel, value_x: vx)
-    end
-
-    def row_at(box : Rect, mx : Int32, my : Int32) : Int32?
-      return nil unless box.contains?(mx, my)
-      i = my - (box.y + 3)
-      (0 <= i < ROW_COUNT) ? i : nil
     end
   end
 end

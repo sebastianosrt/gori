@@ -130,9 +130,6 @@ module Gori::Proxy::H2
       26, 27, 26, 26, 27, 27, 27, 27, 27, 28, 27, 27, 27, 27, 27, 26,
     ] of UInt8
 
-    EOS_CODE = 0x3fffffff_u32
-    EOS_LEN  =             30
-
     # Static-table reverse lookups (built once) for the encoder.
     STATIC_PAIR = begin
       h = {} of {String, String} => Int32
@@ -258,33 +255,44 @@ module Gori::Proxy::H2
       fsm = @@fsm
       nxt = fsm.next_state
       emit = fsm.emit
-      buf = IO::Memory.new(data.size * 2)
-      state = 0
-      data.each do |byte|
-        idx = (state << 4) | (byte >> 4) # high nibble
-        n = nxt.unsafe_fetch(idx)
-        raise Gori::Error.new("hpack: invalid huffman code") if n == FSM_FAIL
-        s = emit.unsafe_fetch(idx)
-        buf.write_byte(s.to_u8) if s >= 0
-        state = n.to_i32
+      # Decode straight into the String's own buffer (no IO::Memory + copy). The
+      # shortest Huffman code is 5 bits, so n input octets carry at most 8n/5
+      # symbols: the capacity bound holds for any input, hostile ones included.
+      String.new(data.size * 8 // 5 + 1) do |dst|
+        len = 0
+        state = 0
+        data.each do |byte|
+          idx = (state << 4) | (byte >> 4) # high nibble
+          n = nxt.unsafe_fetch(idx)
+          raise Gori::Error.new("hpack: invalid huffman code") if n == FSM_FAIL
+          s = emit.unsafe_fetch(idx)
+          if s >= 0
+            dst[len] = s.to_u8
+            len += 1
+          end
+          state = n.to_i32
 
-        idx = (state << 4) | (byte & 0x0f) # low nibble
-        n = nxt.unsafe_fetch(idx)
-        raise Gori::Error.new("hpack: invalid huffman code") if n == FSM_FAIL
-        s = emit.unsafe_fetch(idx)
-        buf.write_byte(s.to_u8) if s >= 0
-        state = n.to_i32
+          idx = (state << 4) | (byte & 0x0f) # low nibble
+          n = nxt.unsafe_fetch(idx)
+          raise Gori::Error.new("hpack: invalid huffman code") if n == FSM_FAIL
+          s = emit.unsafe_fetch(idx)
+          if s >= 0
+            dst[len] = s.to_u8
+            len += 1
+          end
+          state = n.to_i32
+        end
+        if state != 0
+          # Non-root end state → a trailing partial code. RFC 7541 §5.2: padding that
+          # isn't the EOS prefix (i.e. any 0 bit, or > 7 leftover bits) is a decoding
+          # error — else distinct byte sequences decode to the same value (a
+          # non-canonical-encoding bypass). Order matches the old bit-loop: length
+          # first, then the all-ones check.
+          raise Gori::Error.new("hpack: truncated huffman code") if fsm.depth.unsafe_fetch(state) > 7
+          raise Gori::Error.new("hpack: invalid huffman padding") unless fsm.all_ones.unsafe_fetch(state)
+        end
+        {len, 0}
       end
-      if state != 0
-        # Non-root end state → a trailing partial code. RFC 7541 §5.2: padding that
-        # isn't the EOS prefix (i.e. any 0 bit, or > 7 leftover bits) is a decoding
-        # error — else distinct byte sequences decode to the same value (a
-        # non-canonical-encoding bypass). Order matches the old bit-loop: length
-        # first, then the all-ones check.
-        raise Gori::Error.new("hpack: truncated huffman code") if fsm.depth.unsafe_fetch(state) > 7
-        raise Gori::Error.new("hpack: invalid huffman padding") unless fsm.all_ones.unsafe_fetch(state)
-      end
-      String.new(buf.to_slice)
     end
 
     # One decoded header field. Carries the §6.2.3 "never indexed" marking next to
@@ -305,6 +313,15 @@ module Gori::Proxy::H2
       end
     end
 
+    # The block decoded cleanly, but its projected field list exceeded our cap. Callers that
+    # multiplex streams can reject only this stream: the decoder has consumed the whole block
+    # and applied every dynamic-table instruction before raising.
+    class HeaderListTooLarge < Gori::Error
+      def initialize
+        super("hpack: header list too large")
+      end
+    end
+
     # Per-direction decoder holding the dynamic table (RFC 7541 §2.3.2).
     class Decoder
       ENTRY_OVERHEAD = 32 # per-entry accounting cost (§4.1)
@@ -313,7 +330,8 @@ module Gori::Proxy::H2
       # is already capped (assembler MAX_HEADER_BLOCK ~1 MiB), but HPACK indexing +
       # Huffman can amplify a tiny block into a huge list of tiny headers; bound the
       # decoded total so a crafted block can't spike memory. Far above any real
-      # header set (cookies included); overflow → the projection is skipped.
+      # header set (cookies included); overflow → the projection is skipped after
+      # the whole block is decoded, so connection-scoped dynamic-table changes stay in sync.
       MAX_HEADER_LIST = 16 * 1024 * 1024
 
       getter max_size : Int32
@@ -325,29 +343,38 @@ module Gori::Proxy::H2
 
       # Decodes one header block into an ordered list of (name, value) pairs.
       def decode(block : Bytes) : Array({String, String})
-        decode_fields(block).map(&.to_tuple)
+        decode_list(block) { |name, value, _never| {name, value} }
       end
 
       # Same decode, keeping each field's §6.2.3 never-indexed marking (see
       # `Field`). `decode` is this minus that bit, so existing callers that only
       # want the projection are unaffected.
       def decode_fields(block : Bytes) : Array(Field)
-        headers = [] of Field
-        list_size = 0
+        decode_list(block) { |name, value, never| Field.new(name, value, never) }
+      end
+
+      # The one decode loop behind both projections; the block builds each list
+      # element directly, so `decode` allocates no intermediate `Array(Field)`.
+      private def decode_list(block : Bytes, & : String, String, Bool -> T) : Array(T) forall T
+        headers = [] of T
+        list_size = 0_i64
+        too_large = false
         pos = 0
         while pos < block.size
+          name : String
+          value : String
+          never = false
           b = block[pos]
           if b & 0x80 != 0
             # §6.1 Indexed Header Field
             index, pos = read_int(block, pos, 7)
-            headers << Field.new(*lookup(index))
+            name, value = lookup(index)
           elsif b & 0x40 != 0
             # §6.2.1 Literal with Incremental Indexing
             index, pos = read_int(block, pos, 6)
             name, pos = field_name(block, pos, index)
             value, pos = read_string(block, pos)
             add(name, value)
-            headers << Field.new(name, value)
           elsif b & 0x20 != 0
             # §6.3 Dynamic Table Size Update
             new_max, pos = read_int(block, pos, 5)
@@ -361,12 +388,18 @@ module Gori::Proxy::H2
             index, pos = read_int(block, pos, 4)
             name, pos = field_name(block, pos, index)
             value, pos = read_string(block, pos)
-            headers << Field.new(name, value, never)
           end
-          f = headers[-1]
-          list_size += f.name.bytesize + f.value.bytesize + ENTRY_OVERHEAD
-          raise Gori::Error.new("hpack: header list too large") if list_size > MAX_HEADER_LIST
+          unless too_large
+            list_size += name.bytesize.to_i64 + value.bytesize.to_i64 + ENTRY_OVERHEAD
+            if list_size > MAX_HEADER_LIST
+              headers.clear
+              too_large = true
+            else
+              headers << yield name, value, never
+            end
+          end
         end
+        raise HeaderListTooLarge.new if too_large
         headers
       end
 
@@ -494,7 +527,8 @@ module Gori::Proxy::H2
     # bytes on the wire. So the default is the choice that cannot corrupt a
     # stream, and `indexing: true` is there for a caller that owns every head in
     # its direction (the repeater's one-shot connection does; #492 step 2 must
-    # establish it before turning this on).
+    # establish it before turning this on). Until then its only callers are specs,
+    # where it stands in for a peer that indexes — every browser and most origins.
     #
     # ## Never-indexed is honoured, not inferred
     #
@@ -509,28 +543,15 @@ module Gori::Proxy::H2
       # differently would evict at a different moment and shift every index.
       ENTRY_OVERHEAD = Decoder::ENTRY_OVERHEAD
 
-      # Ceiling on a size update we will emit, mirroring `Decoder#resize`'s bound
-      # so we can never emit an update our own decoder would reject.
-      MAX_TABLE_SIZE = 1 << 20
-
-      getter max_size : Int32
-      getter? indexing : Bool
-
-      # `max_size` is the table size this encoder starts with; it MUST NOT exceed
-      # the peer's SETTINGS_HEADER_TABLE_SIZE (a smaller one is always safe — we
-      # simply evict earlier than the peer's decoder, which leaves the surviving
-      # entries at the same indices). Mid-connection changes go through
-      # `max_size=`, which signals them on the wire.
-      def initialize(max_size : Int32 = 4096, @indexing : Bool = false)
-        @max_size = max_size.clamp(0, MAX_TABLE_SIZE)
+      # `max_size` is the table size this encoder starts with and keeps: it never resizes,
+      # so it never emits a §6.3 size update. It MUST NOT exceed the peer's
+      # SETTINGS_HEADER_TABLE_SIZE (a smaller one is always safe — we simply evict earlier
+      # than the peer's decoder, which leaves the surviving entries at the same indices).
+      # Only `indexing: true` reads it; no production caller sets that.
+      def initialize(@max_size : Int32 = 4096, @indexing : Bool = false)
         @table = Deque({String, String}).new # index 0 = most recently added
         @size = 0
       end
-
-      # Pending §6.3 size updates (RFC 7541 §4.2): a change is signalled at the
-      # start of the next block, never mid-block.
-      @pending_min : Int32? = nil
-      @pending_size : Int32? = nil
 
       # Encodes a header list into one HPACK block. Nothing here raises on
       # adversarial content (empty/duplicate names, huge values, non-UTF-8 bytes):
@@ -538,7 +559,6 @@ module Gori::Proxy::H2
       # them (P7 — a rewritten head still has to carry whatever the peer sent).
       def encode(headers : Array({String, String})) : Bytes
         io = IO::Memory.new
-        emit_size_updates(io)
         headers.each { |(name, value)| encode_field(io, name, value, false) }
         io.to_slice
       end
@@ -546,21 +566,8 @@ module Gori::Proxy::H2
       # :ditto:
       def encode(fields : Array(Field)) : Bytes
         io = IO::Memory.new
-        emit_size_updates(io)
         fields.each { |f| encode_field(io, f.name, f.value, f.never_indexed?) }
         io.to_slice
-      end
-
-      # Changes the table size, to be signalled on the next block (§4.2) — this is
-      # how a peer's SETTINGS_HEADER_TABLE_SIZE update reaches the wire.
-      def max_size=(new_max : Int32) : Nil
-        new_max = new_max.clamp(0, MAX_TABLE_SIZE)
-        return if new_max == @max_size
-        @max_size = new_max
-        low = @pending_min
-        @pending_min = low ? Math.min(low, new_max) : new_max
-        @pending_size = new_max
-        evict
       end
 
       # The current dynamic-table entries, newest first (for inspection/specs).
@@ -635,19 +642,6 @@ module Gori::Proxy::H2
           name, value = @table.pop # oldest
           @size -= name.bytesize + value.bytesize + ENTRY_OVERHEAD
         end
-      end
-
-      private def emit_size_updates(io : IO::Memory) : Nil
-        final = @pending_size
-        return if final.nil?
-        low = @pending_min
-        # §4.2: if the max moved more than once since the last block, the decoder
-        # has to see the low-water mark too, otherwise it never performs the
-        # eviction we already performed and every later index is off by that much.
-        encode_int(io, low, 5, 0x20_u8) if low && low != final
-        encode_int(io, final, 5, 0x20_u8)
-        @pending_min = nil
-        @pending_size = nil
       end
 
       # §5.2: Huffman only when it actually shrinks the string — the choice is the

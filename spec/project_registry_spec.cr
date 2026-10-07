@@ -37,6 +37,41 @@ describe Gori::ProjectRegistry do
     end
   end
 
+  # `entries` + `Entry#matches?` are the ONE narrowing `gori run project list --query` and
+  # MCP `list_projects{query}` share (#1085). Looser than `#find` on purpose: the operator
+  # reaching for a listing filter is the one who does not have the exact handle yet.
+  it "matches a query as a substring of the name, slug, short id or bound workspace" do
+    with_root do |root|
+      reg = Gori::ProjectRegistry.new(root)
+      reg.create("ACME Red Team!")
+      bound = reg.create_for_workspace("Checkout", "/src/shop/checkout-api")
+      Gori::Store.open(bound.db_path).close # the sidecars exist; `list` wants the db too
+
+      entries = reg.entries
+      entries.size.should eq(2)
+      acme = entries.find { |e| e.slug == "acme-red-team" }.not_nil!
+      checkout = entries.find { |e| e.slug == "checkout" }.not_nil!
+
+      acme.matches?("acme").should be_true     # display name, case-folded
+      acme.matches?("red-team").should be_true # directory slug
+      acme.matches?(acme.id.not_nil!).should be_true
+      acme.matches?(acme.id.not_nil![0, 4]).should be_true
+      acme.matches?("nope").should be_false
+
+      # Expanded, so on Windows it gains the current drive and its own separators.
+      checkout.workspace.should eq(File.expand_path("/src/shop/checkout-api"))
+      checkout.matches?(File.join("shop", "checkout")).should be_true # the workspace a headless bind wrote
+      acme.matches?(File.join("shop", "checkout")).should be_false
+
+      # An empty needle narrows nothing rather than matching nothing — `needle` folds a
+      # blank argument away first, so no caller has to decide that twice.
+      acme.matches?("").should be_true
+      Gori::ProjectRegistry.needle(nil).should be_nil
+      Gori::ProjectRegistry.needle("   ").should be_nil
+      Gori::ProjectRegistry.needle("  AcMe ").should eq("acme")
+    end
+  end
+
   it "finds a project by display name or directory slug" do
     with_root do |root|
       reg = Gori::ProjectRegistry.new(root)
@@ -58,6 +93,48 @@ describe Gori::ProjectRegistry do
       id.should match(/\A[0-9a-f]{8}\z/) # Random::Secure.hex(4)
       reg.find(id).try(&.dir).should eq(p.dir)
       reg.find(id.upcase).try(&.dir).should eq(p.dir)
+    end
+  end
+
+  it "refuses imports that collide with a display name, slug, or short id" do
+    with_root do |root|
+      reg = Gori::ProjectRegistry.new(root)
+      same_name = reg.create("Existing")
+      id_owner = reg.create("Identifier owner")
+      File.write(File.join(id_owner.dir, Gori::ProjectRegistry::ID_FILE), "new-project")
+      source = File.tempname("gori-import-source", ".db")
+      File.write(source, "validated archive database")
+
+      begin
+        same_name_error = expect_raises(Gori::Error) { reg.import_database("Existing", source) }
+        same_name_error.message.not_nil!.should contain("already exists")
+        slug_error = expect_raises(Gori::Error) { reg.import_database("Existing!", source) }
+        slug_error.message.not_nil!.should contain("slug")
+        id_error = expect_raises(Gori::Error) { reg.import_database("New Project", source) }
+        id_error.message.not_nil!.should contain("short id")
+
+        reg.list.map(&.dir).sort!.should eq([same_name.dir, id_owner.dir].sort)
+        File.exists?(same_name.db_path).should be_true
+        File.exists?(id_owner.db_path).should be_true
+      ensure
+        File.delete?(source)
+      end
+    end
+  end
+
+  it "previews an import's name with the same refusals, creating nothing" do
+    with_root do |root|
+      reg = Gori::ProjectRegistry.new(root)
+      reg.create("Existing")
+      before = Dir.children(root).sort
+      expect_raises(Gori::Error, /already exists/) { reg.import_target("existing") }
+      expect_raises(Gori::Error, /slug/) { reg.import_target("Existing!") }
+      expect_raises(Gori::Error, /control characters/) { reg.import_target("bad\e]0;x\a") }
+      reg.import_target("  Fresh Copy ").should eq({"Fresh Copy", "fresh-copy"})
+      Dir.children(root).sort.should eq(before)
+      # A leftover directory with no database is not a listed project, but it is not free.
+      Dir.mkdir(File.join(root, "leftover"))
+      expect_raises(Gori::Error, /already in use/) { reg.import_target("Leftover") }
     end
   end
 
@@ -190,7 +267,7 @@ describe Gori::ProjectRegistry do
       reg = Gori::ProjectRegistry.new(root)
       p = reg.create("busy")
       Gori::Store.open(p.db_path).close
-      lock = Gori::CaptureLock.try(p.dir).not_nil! # simulate a live capturer holding the lock
+      lock = Gori::CaptureLock.try_at(Gori::CaptureLock.path(p.dir)).not_nil! # simulate a live capturer holding the lock
       begin
         expect_raises(Gori::Error, /in use/) { reg.delete(p) }
         Dir.exists?(p.dir).should be_true # not wiped out from under the capturer
@@ -218,6 +295,117 @@ describe Gori::ProjectRegistry do
     end
   end
 
+  # #1163. Built by hand, the way an older gori (or a rename) could leave it: "Client 2024"
+  # owns slug `client-2024`, and a second project is NAMED `client-2024` under `-2`.
+  it "refuses a name that is one project's slug and another project's display name" do
+    with_root do |root|
+      reg = Gori::ProjectRegistry.new(root)
+      older = reg.create("Client 2024")
+      twin_dir = File.join(root, "client-2024-2")
+      Dir.mkdir_p(twin_dir)
+      File.write(File.join(twin_dir, Gori::ProjectRegistry::NAME_FILE), "client-2024")
+      File.write(File.join(twin_dir, Gori::ProjectRegistry::ID_FILE), "feedf00d")
+      Gori::Store.open(File.join(twin_dir, Gori::Project::DB_FILE)).close
+
+      ex = expect_raises(Gori::ProjectRegistry::Ambiguous) { reg.find("client-2024") }
+      ex.candidates.map(&.dir).sort!.should eq([older.dir, twin_dir].sort)
+      msg = ex.message.not_nil!
+      msg.should contain("\"Client 2024\" by slug")
+      msg.should contain("slug client-2024-2, id feedf00d")
+      # Each stays reachable by a handle only it answers to.
+      reg.find("Client 2024").try(&.dir).should eq(older.dir)
+      reg.find("client-2024-2").try(&.dir).should eq(twin_dir)
+      reg.find("feedf00d").try(&.dir).should eq(twin_dir)
+    end
+  end
+
+  it "lets the slug decide among same-named projects, and refuses when no slug is among them" do
+    with_root do |root|
+      reg = Gori::ProjectRegistry.new(root)
+      api = reg.create("api")
+      ["api-2", "my-api", "my-api-2"].each_with_index do |slug, i|
+        dir = File.join(root, slug)
+        Dir.mkdir_p(dir)
+        File.write(File.join(dir, Gori::ProjectRegistry::NAME_FILE), i == 0 ? "api" : "My API")
+        Gori::Store.open(File.join(dir, Gori::Project::DB_FILE)).close
+      end
+      reg.find("api").try(&.dir).should eq(api.dir) # never `api-2` by MRU order
+      expect_raises(Gori::ProjectRegistry::Ambiguous, /is ambiguous/) { reg.find("my api") }
+      reg.find("my-api-2").try(&.dir).should eq(File.join(root, "my-api-2"))
+    end
+  end
+
+  it "refuses to create or rename a project onto another project's slug or short id" do
+    with_root do |root|
+      reg = Gori::ProjectRegistry.new(root)
+      client = reg.create("Client 2024")
+      expect_raises(Gori::Error, /already the directory slug of project "Client 2024"/) do
+        reg.create_or_reopen("client-2024")
+      end
+      Dir.exists?(File.join(root, "client-2024-2")).should be_false # refused before any mkdir
+      reg.find("client-2024").try(&.dir).should eq(client.dir)
+
+      other = reg.create("other")
+      id = reg.id_of(client).not_nil!
+      expect_raises(Gori::Error, /short id/) { reg.create_or_reopen(id) }
+      expect_raises(Gori::Error, /directory slug/) { reg.rename(other, "CLIENT-2024") }
+      reg.find("other").try(&.dir).should eq(other.dir) # the refused rename wrote nothing
+
+      # Not collisions: reopening by the same name, and renaming onto the project's own slug.
+      reg.create_or_reopen("Client 2024")[1].should be_false
+      reg.rename(other, "other").name.should eq("other")
+    end
+  end
+
+  # The slug match is case-insensitive, so `create foo` reopens `Foo` — and used to rewrite its
+  # `.name` to `foo` while reporting "already exists — reopened".
+  it "reopens a project under another letter case without renaming it" do
+    with_root do |root|
+      reg = Gori::ProjectRegistry.new(root)
+      first = reg.create("Foo")
+      again, created = reg.create_or_reopen("foo")
+      created.should be_false
+      again.dir.should eq(first.dir)
+      again.name.should eq("Foo")
+      reg.list.map(&.name).should eq(["Foo"])
+    end
+  end
+
+  # A 300-character name made a 300-byte directory name, which every filesystem refuses:
+  # create failed on every surface with the OS's raw "File name too long".
+  it "caps a long name's slug and keeps two long names that share a head apart" do
+    with_root do |root|
+      reg = Gori::ProjectRegistry.new(root)
+      long = "a" * 290 + "-one"
+      project, created = reg.create_or_reopen(long)
+      created.should be_true
+      slug = reg.slug_of(project)
+      slug.bytesize.should be <= Gori::ProjectRegistry::MAX_SLUG
+      slug.should start_with("aaaa")
+      project.name.should eq(long) # the display name is kept whole
+      reg.find(long).try(&.dir).should eq(project.dir)
+      reg.find(slug).try(&.dir).should eq(project.dir)
+
+      reg.create_or_reopen(long.upcase).should eq({reg.find(long).not_nil!, false}) # same name reopens
+      other = reg.create("a" * 290 + "-two")
+      other.dir.should_not eq(project.dir)
+      reg.slug_of(other).bytesize.should be <= Gori::ProjectRegistry::MAX_SLUG
+      # A name short enough keeps its slug exactly, so no existing project's directory moves.
+      reg.slug_of(reg.create("b" * Gori::ProjectRegistry::MAX_SLUG)).should eq("b" * Gori::ProjectRegistry::MAX_SLUG)
+    end
+  end
+
+  it "reopens a project whose uncapped slug directory predates the cap" do
+    with_root do |root|
+      reg = Gori::ProjectRegistry.new(root)
+      name = "c" * (Gori::ProjectRegistry::MAX_SLUG + 1) # no longer: Windows caps a path at 260
+      Dir.mkdir_p(File.join(root, name))                 # a project created before slugs were capped
+      legacy = reg.create_or_reopen(name).first
+      legacy.dir.should eq(File.join(root, name))
+      reg.create_or_reopen(name).should eq({legacy, false})
+    end
+  end
+
   it "rejects a blank rename" do
     with_root do |root|
       reg = Gori::ProjectRegistry.new(root)
@@ -225,6 +413,33 @@ describe Gori::ProjectRegistry do
       Gori::Store.open(p.db_path).close
       expect_raises(Gori::Error, /invalid project name/) { reg.rename(p, "   ") }
       reg.find("keep").should_not be_nil
+    end
+  end
+
+  it "rejects terminal control characters in names on create, rename and import" do
+    with_root do |root|
+      reg = Gori::ProjectRegistry.new(root)
+      project = reg.create("keep")
+      imported_db = File.tempname("gori-name-import")
+      begin
+        File.copy(project.db_path, imported_db)
+        ["escape\e]0;owned\a", "line\nfeed", "c1\u{009b}name"].each do |name|
+          expect_raises(Gori::Error, /control characters/) { reg.create(name) }
+          expect_raises(Gori::Error, /control characters/) { reg.rename(project, name) }
+          expect_raises(Gori::Error, /control characters/) { reg.import_database(name, imported_db) }
+        end
+        reg.list.map(&.name).should eq(["keep"])
+      ensure
+        File.delete?(imported_db)
+      end
+    end
+  end
+
+  it "strips boundary whitespace before rejecting internal name controls" do
+    with_root do |root|
+      reg = Gori::ProjectRegistry.new(root)
+      reg.create("demo\n").name.should eq("demo")
+      expect_raises(Gori::Error, /control characters/) { reg.create("de\nmo") }
     end
   end
 end

@@ -1,5 +1,6 @@
 require "uri"
 require "../proxy/codec/http1"
+require "../static_asset"
 
 module Gori::Discover
   # URL parsing, normalization, and the TWO keys that make trap prevention work:
@@ -9,7 +10,6 @@ module Gori::Discover
   module Url
     UUID = /\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i
     HEX  = /\A[0-9a-f]{12,}\z/i # long hash/hex (md5/sha/git oid)
-    NUM  = /\A\d+\z/
     DATE = /\A\d{4}-\d{2}-\d{2}\z/
 
     record Parts, scheme : String, host : String, port : Int32, path : String, query : String?
@@ -158,8 +158,9 @@ module Gori::Discover
     # of the resource's identity), and only the include question drops it.
     def self.gate_url(p : Parts) : String
       q = p.query
-      base = "#{p.scheme}://#{p.host}#{p.path}"
-      q ? "#{base}?#{q}" : base
+      # One build, not two: the `base` local was a whole URL the query branch then threw away
+      # to build a second one. Same string either way.
+      q ? "#{p.scheme}://#{p.host}#{p.path}?#{q}" : "#{p.scheme}://#{p.host}#{p.path}"
     end
 
     # The EXCLUDE half of the gate question, or nil when there is no second spelling to ask.
@@ -185,17 +186,28 @@ module Gori::Discover
     # values (?page=1 ≠ ?page=2). Populates `seen`.
     def self.visit_key(p : Parts) : String
       q = canonical_query(p.query, fold: false)
-      base = "#{origin(p)}#{p.path}"
-      q.empty? ? base : "#{base}?#{q}"
+      o = origin(p)
+      # One build, not two — see `gate_url`.
+      q.empty? ? "#{o}#{p.path}" : "#{o}#{p.path}?#{q}"
     end
 
     # FOLDED template — path segments folded to placeholders, query reduced to its SORTED
     # KEY SET (values dropped). /user/1?tab=a and /user/2?tab=b both → ".../user/{n}?tab".
     def self.template_key(p : Parts) : String
-      folded = p.path.split('/').map { |seg| seg.empty? ? seg : fold_segment(seg) }.join("/")
       q = canonical_query(p.query, fold: true)
-      base = "#{origin(p)}#{folded}"
-      q.empty? ? base : "#{base}?#{q}"
+      # `split.map.join` then interpolated behind the origin built the whole path THREE more
+      # times — a mapped Array, the joined String, and the `base` the query branch discarded.
+      # `consider_link` runs this on the orchestrator fiber for every href on every crawled
+      # page, so one pass straight into the builder is three whole-path allocations saved per
+      # link. Same bytes: the segments and their separators are written in the same order.
+      String.build do |io|
+        io << origin(p)
+        p.path.split('/').each_with_index do |seg, i|
+          io << '/' if i > 0
+          io << (seg.empty? ? seg : fold_segment(seg))
+        end
+        io << '?' << q unless q.empty?
+      end
     end
 
     UUID_LEN = 36
@@ -210,7 +222,7 @@ module Gori::Discover
     # regex at all. All four patterns are ASCII-only, so a non-ASCII segment can never match and
     # is rejected before PCRE2 sees it. Sizes are exact for UUID/DATE and a floor for HEX.
     #
-    # ORDER IS LOAD-BEARING: HEX also matches a long run of digits, so NUM must be tested first
+    # ORDER IS LOAD-BEARING: HEX also matches a long run of digits, so the all-digits test must run first
     # or every long numeric id would fold to {hex}.
     def self.fold_segment(seg : String) : String
       d = ascii_downcase(seg)
@@ -223,14 +235,27 @@ module Gori::Discover
       d
     end
 
-    # `seg` itself when it holds no ASCII uppercase (the common case — String#downcase builds a
-    # fresh String even when nothing changes), else a downcased copy.
+    # `seg` itself when lowering it would change nothing (the common case — String#downcase
+    # builds a fresh String even then), else a downcased copy.
+    #
+    # The `>= 0x80` half is NOT tidiness. Without it a segment whose only capitals are outside
+    # ASCII — `/ÄÖÜ/`, which `parse_path` does not percent-encode, so a crawl reaches it as
+    # itself — short-circuited on its first byte and came back UN-folded, while `String#downcase`
+    # folds it. `fold_segment`'s NOTE above states that its literal branch returns the DOWNCASED
+    # segment and that callers rely on `template_key` being case-folded, and that was the one
+    # input where it did not: `/ÄÖÜ/1` and `/äöü/1` are one route and produced two `@templates`
+    # entries, so the second spelling re-paid a whole directory's brute-force budget.
+    #
+    # `resolve` reads it too, for the copy it saves: it lowers every href it is handed only to
+    # test a handful of scheme prefixes, and a link is usually written lowercase already.
     private def self.ascii_downcase(seg : String) : String
-      seg.each_byte { |b| return seg.downcase if 0x41_u8 <= b <= 0x5a_u8 }
+      seg.each_byte do |b|
+        return seg.downcase if (0x41_u8 <= b <= 0x5a_u8) || b >= 0x80_u8
+      end
       seg
     end
 
-    # Allocation- and PCRE-free stand-in for NUM (`\A\d+\z`).
+    # Allocation- and PCRE-free stand-in for `\A\d+\z`.
     private def self.all_digits?(s : String) : Bool
       return false if s.empty?
       s.each_byte { |b| return false unless 0x30_u8 <= b <= 0x39_u8 }
@@ -239,9 +264,19 @@ module Gori::Discover
 
     private def self.canonical_query(query : String?, *, fold : Bool) : String
       return "" unless query && !query.empty?
-      pairs = query.split('&').reject(&.empty?).map do |pair|
-        k, _, v = pair.partition('=')
-        fold ? k : "#{k}=#{v}"
+      # `split(remove_empty:)` rather than `split.reject`, and `partition` only where its
+      # answer is actually a new string. `partition('=')` mints THREE (key, "=", value) and
+      # the un-folded branch then re-joins two of them into a copy of the pair it already
+      # had — `"#{k}=#{v}"` IS `pair` whenever the pair carries an `=`, which is every
+      # ordinary one. The `=`-less spelling still normalizes to `k=`, as it did.
+      pairs = query.split('&', remove_empty: true)
+      pairs.map! do |pair|
+        i = pair.index('=')
+        if fold
+          i ? pair[0, i] : pair
+        else
+          i ? pair : "#{pair}="
+        end
       end
       pairs.sort!
       pairs.uniq! if fold
@@ -321,6 +356,28 @@ module Gori::Discover
       idx ? path[0, idx + 1] : "/"
     end
 
+    # File extensions whose bodies are BINARY and carry no endpoint a crawl can read — the
+    # ones `Engine#text_like?` already refuses to scan after paying for the download.
+    #
+    # Deliberately narrow. Everything that can name another URL stays off it, including the
+    # ones that look like assets: `.svg` is XML and can carry `<a href>` / `<image href>`,
+    # `.css` carries `url(…)`, `.map` names a bundle's sources, and a `.pdf` or an office
+    # document is itself a finding worth having (an exposed one is the point of the sweep).
+    # Only images, fonts, tracks and archives are here, and each of them is a body the crawl
+    # downloads in full, fingerprints, and then discards without a single candidate.
+    #
+    # The media half is `StaticAsset::MEDIA_EXT` — the same images/fonts/tracks the History
+    # hide-static lens folds away — so the two cannot drift; archives are the crawl's own
+    # addition, since an archive is a finding in History but a dead end for a link crawler.
+    BINARY_EXT = StaticAsset::MEDIA_EXT + StaticAsset::ARCHIVE_EXT
+
+    # Does this path end in a `BINARY_EXT`? Asked of a link BEFORE it becomes a request, so
+    # the extension is all there is to go on — the content type only arrives with the body
+    # this exists to avoid downloading.
+    def self.binary_asset?(path : String) : Bool
+      (ext = StaticAsset.extension(path)) ? BINARY_EXT.includes?(ext) : false
+    end
+
     # Resolve `href` (from a page at `base`) into an absolute http(s) URL, or nil for
     # non-http / fragment-only / unparseable. Handles absolute, scheme-relative (//h/p),
     # absolute-path (/p), and relative (p, ../p) forms with dot-segment normalization.
@@ -332,7 +389,7 @@ module Gori::Discover
         h = h[0, fi]
       end
       return nil if h.empty? || h.starts_with?('#')
-      lower = h.downcase
+      lower = ascii_downcase(h)
       return nil if lower.starts_with?("mailto:") || lower.starts_with?("tel:") ||
                     lower.starts_with?("javascript:") || lower.starts_with?("data:") ||
                     lower.starts_with?("about:") || lower.starts_with?("blob:")

@@ -17,15 +17,59 @@ private def with_toml(existing : String?, &)
   end
 end
 
+# The home directory `Install.config_path` resolves against, read the way it reads it.
+private def user_home : String
+  ENV["HOME"]? || ENV["USERPROFILE"]
+end
+
+# Hermes' default home on this host: `%LOCALAPPDATA%\hermes` on Windows, `~/.hermes` elsewhere.
+private def hermes_default : String
+  {% if flag?(:win32) %}
+    File.join(ENV["LOCALAPPDATA"]? || File.join(user_home, "AppData", "Local"), "hermes")
+  {% else %}
+    File.join(user_home, ".hermes")
+  {% end %}
+end
+
+# One target through `install_all`, the production path, returning the path written or raising
+# the refusal its Outcome carries — what a single-target install reported.
+private def install_one(target : String, **opts) : String
+  o = Gori::MCP::Install.install_all([target], **opts).first
+  o.path || raise Exception.new(o.error)
+end
+
 describe Gori::MCP::Install do
   describe ".config_path" do
+    it "maps pi to ~/.pi/agent/mcp.json and honors PI_CODING_AGENT_DIR" do
+      old_pi = ENV["PI_CODING_AGENT_DIR"]?
+      ENV.delete("PI_CODING_AGENT_DIR")
+      begin
+        Gori::MCP::Install.config_path("pi").should eq(File.join(user_home, ".pi", "agent", "mcp.json"))
+        ENV["PI_CODING_AGENT_DIR"] = "   "
+        Gori::MCP::Install.config_path("pi").should eq(File.join(user_home, ".pi", "agent", "mcp.json"))
+        ENV["PI_CODING_AGENT_DIR"] = " /opt/pi-eng "
+        Gori::MCP::Install.config_path("pi").should eq(File.join(File.expand_path("/opt/pi-eng"), "mcp.json"))
+        ENV["PI_CODING_AGENT_DIR"] = "~/pi-eng"
+        Gori::MCP::Install.config_path("pi").should eq(File.join(Path.home.to_s, "pi-eng", "mcp.json"))
+        # A BARE tilde is its own arm in both implementations (the adapter's getAgentDir
+        # returns homedir() for it, Crystal's expand matches "~" before "~/"); a path
+        # built by concatenation instead would answer "$HOME/~/mcp.json" here.
+        ENV["PI_CODING_AGENT_DIR"] = "~"
+        Gori::MCP::Install.config_path("pi").should eq(File.join(Path.home.to_s, "mcp.json"))
+        ENV["PI_CODING_AGENT_DIR"] = "pi-eng"
+        Gori::MCP::Install.config_path("pi").should eq(File.join(Dir.current, "pi-eng", "mcp.json"))
+      ensure
+        old_pi ? (ENV["PI_CODING_AGENT_DIR"] = old_pi) : ENV.delete("PI_CODING_AGENT_DIR")
+      end
+    end
+
     it "maps codex to ~/.codex/config.toml (or CODEX_HOME)" do
       Gori::MCP::Install.config_path("codex").should eq(
-        File.join(ENV["CODEX_HOME"]?.presence || File.join(ENV["HOME"], ".codex"), "config.toml"))
+        File.join(ENV["CODEX_HOME"]?.presence || File.join(user_home, ".codex"), "config.toml"))
     end
 
     it "maps grok to ~/.grok/config.toml" do
-      Gori::MCP::Install.config_path("grok").should eq(File.join(ENV["HOME"], ".grok", "config.toml"))
+      Gori::MCP::Install.config_path("grok").should eq(File.join(user_home, ".grok", "config.toml"))
     end
 
     it "maps hermes to ~/.hermes/config.yaml, or HERMES_HOME" do
@@ -35,26 +79,34 @@ describe Gori::MCP::Install do
       ENV.delete("HERMES_HOME")
       begin
         Gori::MCP::Install.config_path("hermes").should eq(
-          File.join(ENV["HOME"], ".hermes", "config.yaml"))
+          File.join(hermes_default, "config.yaml"))
         ENV["HERMES_HOME"] = "/opt/hermes-eng"
-        Gori::MCP::Install.config_path("hermes").should eq("/opt/hermes-eng/config.yaml")
+        Gori::MCP::Install.config_path("hermes").should eq(File.expand_path("/opt/hermes-eng/config.yaml"))
       ensure
         old_hermes ? (ENV["HERMES_HOME"] = old_hermes) : ENV.delete("HERMES_HOME")
       end
     end
 
-    it "maps claude-code to ~/.claude.json" do
-      Gori::MCP::Install.config_path("claude-code").should eq(File.join(ENV["HOME"], ".claude.json"))
+    it "maps claude-code to ~/.claude.json, or CLAUDE_CONFIG_DIR" do
+      old = ENV["CLAUDE_CONFIG_DIR"]?
+      begin
+        ENV.delete("CLAUDE_CONFIG_DIR")
+        Gori::MCP::Install.config_path("claude-code").should eq(File.join(user_home, ".claude.json"))
+        ENV["CLAUDE_CONFIG_DIR"] = "/opt/claude-alt"
+        Gori::MCP::Install.config_path("claude-code").should eq(File.join(File.expand_path("/opt/claude-alt"), ".claude.json"))
+      ensure
+        old ? (ENV["CLAUDE_CONFIG_DIR"] = old) : ENV.delete("CLAUDE_CONFIG_DIR")
+      end
     end
 
     it "maps agy to the antigravity-cli mcp_config.json" do
       Gori::MCP::Install.config_path("agy").should eq(
-        File.join(ENV["HOME"], ".gemini", "antigravity-cli", "mcp_config.json"))
+        File.join(user_home, ".gemini", "antigravity-cli", "mcp_config.json"))
     end
 
     it "maps claude to the platform's Claude Desktop config" do
       Gori::MCP::Install.config_path("claude").should eq(
-        Gori::MCP::Install.claude_desktop_path(ENV["HOME"]))
+        Gori::MCP::Install.claude_desktop_path(user_home))
     end
 
     it "raises on unknown targets" do
@@ -72,21 +124,21 @@ describe Gori::MCP::Install do
 
     it "uses the macOS application-support directory on darwin" do
       Gori::MCP::Install.claude_desktop_path(home, :darwin, xdg_config_home: "/xdg", appdata: "C:/AppData")
-        .should eq("/home/u/Library/Application Support/Claude/claude_desktop_config.json")
+        .should eq(File.join("/home/u", "Library", "Application Support", "Claude", "claude_desktop_config.json"))
     end
 
     it "uses %APPDATA% on windows, falling back to AppData/Roaming" do
       Gori::MCP::Install.claude_desktop_path(home, :windows, appdata: "C:/Users/u/AppData/Roaming")
-        .should eq("C:/Users/u/AppData/Roaming/Claude/claude_desktop_config.json")
+        .should eq(File.join("C:/Users/u/AppData/Roaming", "Claude", "claude_desktop_config.json"))
       Gori::MCP::Install.claude_desktop_path(home, :windows, appdata: nil)
-        .should eq("/home/u/AppData/Roaming/Claude/claude_desktop_config.json")
+        .should eq(File.join("/home/u", "AppData", "Roaming", "Claude", "claude_desktop_config.json"))
       Gori::MCP::Install.claude_desktop_path(home, :windows, appdata: "")
-        .should eq("/home/u/AppData/Roaming/Claude/claude_desktop_config.json")
+        .should eq(File.join("/home/u", "AppData", "Roaming", "Claude", "claude_desktop_config.json"))
     end
 
     it "uses ~/.config on linux when XDG_CONFIG_HOME is unset" do
       Gori::MCP::Install.claude_desktop_path(home, :linux, xdg_config_home: nil)
-        .should eq("/home/u/.config/Claude/claude_desktop_config.json")
+        .should eq(File.join("/home/u", ".config", "Claude", "claude_desktop_config.json"))
     end
 
     it "honors XDG_CONFIG_HOME on linux" do
@@ -94,16 +146,16 @@ describe Gori::MCP::Install do
       # home-manager and per-user distro setups all move this. (NOT Flatpak: that value
       # only exists inside the sandbox, where a host-side install never runs.)
       Gori::MCP::Install.claude_desktop_path(home, :linux, xdg_config_home: "/home/u/cfg")
-        .should eq("/home/u/cfg/Claude/claude_desktop_config.json")
+        .should eq(File.join("/home/u/cfg", "Claude", "claude_desktop_config.json"))
     end
 
     it "ignores an empty or relative XDG_CONFIG_HOME on linux" do
       # The basedir spec says a relative value must be ignored; honoring one would write
       # the install under whatever directory the user happened to run gori from.
       Gori::MCP::Install.claude_desktop_path(home, :linux, xdg_config_home: "")
-        .should eq("/home/u/.config/Claude/claude_desktop_config.json")
+        .should eq(File.join("/home/u", ".config", "Claude", "claude_desktop_config.json"))
       Gori::MCP::Install.claude_desktop_path(home, :linux, xdg_config_home: ".config")
-        .should eq("/home/u/.config/Claude/claude_desktop_config.json")
+        .should eq(File.join("/home/u", ".config", "Claude", "claude_desktop_config.json"))
     end
   end
 
@@ -114,18 +166,18 @@ describe Gori::MCP::Install do
 
     it "uses ~/.hermes on darwin and linux" do
       Gori::MCP::Install.hermes_home(home, :darwin, hermes_home_env: nil, local_appdata: nil)
-        .should eq("/home/u/.hermes")
+        .should eq(File.join("/home/u", ".hermes"))
       Gori::MCP::Install.hermes_home(home, :linux, hermes_home_env: nil, local_appdata: nil)
-        .should eq("/home/u/.hermes")
+        .should eq(File.join("/home/u", ".hermes"))
     end
 
     it "uses %LOCALAPPDATA% on windows, falling back to AppData/Local" do
       Gori::MCP::Install.hermes_home(home, :windows, hermes_home_env: nil,
-        local_appdata: "C:/Users/u/AppData/Local").should eq("C:/Users/u/AppData/Local/hermes")
+        local_appdata: "C:/Users/u/AppData/Local").should eq(File.join("C:/Users/u/AppData/Local", "hermes"))
       Gori::MCP::Install.hermes_home(home, :windows, hermes_home_env: nil, local_appdata: nil)
-        .should eq("/home/u/AppData/Local/hermes")
+        .should eq(File.join("/home/u", "AppData", "Local", "hermes"))
       Gori::MCP::Install.hermes_home(home, :windows, hermes_home_env: nil, local_appdata: "")
-        .should eq("/home/u/AppData/Local/hermes")
+        .should eq(File.join("/home/u", "AppData", "Local", "hermes"))
     end
 
     it "lets HERMES_HOME win on every platform" do
@@ -139,8 +191,85 @@ describe Gori::MCP::Install do
     it "ignores an empty or all-whitespace HERMES_HOME" do
       # Hermes strips the variable before testing it, so " " is unset to the agent; honoring
       # it here would install into a directory named " " that nothing reads.
-      Gori::MCP::Install.hermes_home(home, :linux, hermes_home_env: "").should eq("/home/u/.hermes")
-      Gori::MCP::Install.hermes_home(home, :linux, hermes_home_env: "   ").should eq("/home/u/.hermes")
+      Gori::MCP::Install.hermes_home(home, :linux, hermes_home_env: "").should eq(File.join("/home/u", ".hermes"))
+      Gori::MCP::Install.hermes_home(home, :linux, hermes_home_env: "   ").should eq(File.join("/home/u", ".hermes"))
+    end
+  end
+
+  describe ".invoked_path" do
+    # A package manager links a stable name to a versioned file; the stable one survives an upgrade.
+    it "keeps the symlink gori was found by, and only when it is the running binary" do
+      posix_only!("File.symlink needs Developer Mode")
+      dir = File.tempname("gori-exe")
+      Dir.mkdir_p(File.join(dir, "cellar"))
+      Dir.mkdir_p(File.join(dir, "bin"))
+      real = File.join(dir, "cellar", "gori")
+      File.write(real, "")
+      File.chmod(real, 0o755)
+      link = File.join(dir, "bin", "gori")
+      File.symlink(real, link)
+      other = File.join(dir, "other")
+      File.write(other, "")
+      begin
+        Gori::MCP::Install.invoked_path("gori", real, File.join(dir, "bin")).should eq(link)
+        Gori::MCP::Install.invoked_path(link, real, nil).should eq(link)
+        Gori::MCP::Install.invoked_path("gori", other, File.join(dir, "bin")).should be_nil
+        Gori::MCP::Install.invoked_path("gori", real, File.join(dir, "nowhere")).should be_nil
+      ensure
+        FileUtils.rm_rf(dir)
+      end
+    end
+  end
+
+  describe ".toml_string" do
+    # A spec-following TOML parser refuses the whole file over one raw control character.
+    it "keeps bytes that are not UTF-8 instead of raising" do
+      Gori::MCP::Install.toml_string("--db=/data/\xff.db").to_slice.should eq(%("--db=/data/\xff.db").to_slice)
+    end
+
+    it "escapes control characters other than tab" do
+      Gori::MCP::Install.toml_string("--project=a\u0001b\tc\u007F").should eq(%("--project=a\\u0001b\tc\\u007F"))
+    end
+  end
+
+  describe "BOM-led configs" do
+    it "installs into a JSON and a TOML file that start with a BOM, and keeps the BOM" do
+      dir = File.tempname("gori-bom")
+      Dir.mkdir_p(dir)
+      json = File.join(dir, "c.json")
+      toml = File.join(dir, "c.toml")
+      File.write(json, "\uFEFF{\"mcpServers\":{\"other\":{\"command\":\"o\"}}}")
+      File.write(toml, "\uFEFF[mcp_servers.gori]\ncommand = \"/old\"\nargs = []\n")
+      begin
+        Gori::MCP::Install.install_json(json, "/bin/gori", ["mcp"])
+        Gori::MCP::Install.install_toml(toml, "/bin/gori", ["mcp"])
+        File.read(json).should start_with('\uFEFF')
+        JSON.parse(File.read(json).lchop('\uFEFF'))["mcpServers"].as_h.keys.sort!.should eq(["gori", "other"])
+        File.read(toml).should start_with('\uFEFF')
+        File.read(toml).scan("[mcp_servers.gori]").size.should eq(1)
+        File.read(toml).should_not contain("/old")
+      ensure
+        FileUtils.rm_rf(dir)
+      end
+    end
+  end
+
+  describe ".install_yaml" do
+    # A Windows editor writes a BOM. Left on the first key, it hid `mcp_servers:`, a second one
+    # was appended, and last-key-wins dropped every other server with its `env:` secrets.
+    it "keeps sibling servers in a file that starts with a BOM, and keeps the BOM" do
+      path = File.tempname("gori-hermes", ".yaml")
+      File.write(path, "\uFEFFmcp_servers:\n  other:\n    command: \"o\"\n")
+      begin
+        Gori::MCP::Install.install_yaml(path, "/bin/gori", ["mcp"])
+        text = File.read(path)
+        text.should start_with("\uFEFFmcp_servers:")
+        doc = YAML.parse(text.lchop('\uFEFF'))
+        doc.dig("mcp_servers", "other", "command").as_s.should eq("o")
+        doc.dig("mcp_servers", "gori", "command").as_s.should eq("/bin/gori")
+      ensure
+        File.delete?(path)
+      end
     end
   end
 
@@ -365,14 +494,22 @@ describe Gori::MCP::Install do
     end
 
     it "carries --tools into the installed argv" do
-      # Dropped here, the client spawns a server advertising all 160 tools while the
+      # Dropped here, the client spawns a server advertising every tool while the
       # operator's own command trimmed it to a handful — the whole point of the flag is the
       # context the CLIENT loads, so it is worthless if only the hand-run server honours it.
       Gori::MCP::Install.build_args(tools_spec: "list_*,get_*").should eq(
         ["mcp", "--tools=list_*,get_*"])
+      # A profile is a spec like any other: written as typed, resolved by the spawned server.
+      Gori::MCP::Install.build_args(tools_spec: "@recon").should eq(["mcp", "--tools=@recon"])
       Gori::MCP::Install.build_args(project: "eng", read_only: true, tools_spec: "-fuzz_*").should eq(
         ["mcp", "--project=eng", "--read-only", "--tools=-fuzz_*"])
       Gori::MCP::Install.build_args(tools_spec: "").should eq(["mcp"])
+    end
+
+    it "carries --pin-project into the installed argv" do
+      # Dropped here, the spawned server could switch projects the operator meant to lock (#1508).
+      Gori::MCP::Install.build_args(project: "eng", read_only: true, pin_project: true).should eq(
+        ["mcp", "--project=eng", "--read-only", "--pin-project"])
     end
 
     it "carries --config into the installed argv, absolute" do
@@ -400,6 +537,20 @@ describe Gori::MCP::Install do
   end
 
   describe ".upsert_toml_table" do
+    it "keeps the comment above the next table, and finds a header with a comment of its own" do
+      existing = "[mcp_servers.gori] # mine\ncommand = \"/old\"\n\n# browser automation\n[mcp_servers.playwright]\ncommand = \"npx\"\n"
+      out = Gori::MCP::Install.upsert_toml_table(existing, "mcp_servers.gori", "command = \"/bin/gori\"\n")
+      out.should contain("# browser automation\n[mcp_servers.playwright]")
+      out.should_not contain("/old")
+      out.scan("[mcp_servers.gori]").size.should eq(1)
+    end
+
+    it "takes a comment glued to gori's last line with gori, not onto the next table" do
+      existing = "[mcp_servers.gori]\ncommand = \"/old\"\n# args = [\"--read-only\"]\n[mcp_servers.playwright]\ncommand = \"npx\"\n"
+      out = Gori::MCP::Install.upsert_toml_table(existing, "mcp_servers.gori", "command = \"/bin/gori\"\n")
+      out.should_not contain("--read-only\"]\n[mcp_servers.playwright]")
+    end
+
     it "appends a table to empty content" do
       out = Gori::MCP::Install.upsert_toml_table("", "mcp_servers.gori",
         "command = \"/bin/gori\"\nargs = [\"mcp\"]\n")
@@ -646,6 +797,42 @@ describe Gori::MCP::Install do
   end
 
   describe ".install" do
+    it "creates Pi's config and updates gori while preserving other servers and settings" do
+      dir = File.join(Dir.tempdir, "pi-install-#{Random::Secure.hex(4)}")
+      old_pi = ENV["PI_CODING_AGENT_DIR"]?
+      ENV["PI_CODING_AGENT_DIR"] = dir
+      begin
+        path = install_one("pi", exe_path: "/opt/gori")
+        path.should eq(File.join(dir, "mcp.json"))
+        JSON.parse(File.read(path))["mcpServers"]["gori"]["args"].as_a.map(&.as_s).should eq(["mcp"])
+
+        File.write(path, %({"settings":{"toolPrefix":"custom"},"mcpServers":{"other":{"command":"other"},"gori":{"command":"old"}}}))
+        2.times do
+          outcomes = Gori::MCP::Install.install_all(["pi", "pi"], exe_path: "/opt/gori new",
+            project: "engagement", read_only: true, tools_spec: "list_*")
+          outcomes.size.should eq(1)
+          outcomes.first.ok?.should be_true
+          outcomes.first.path.should eq(path)
+        end
+        parsed = JSON.parse(File.read(path))
+        parsed["settings"]["toolPrefix"].as_s.should eq("custom")
+        servers = parsed["mcpServers"].as_h
+        servers.keys.sort!.should eq(["gori", "other"])
+        servers["other"]["command"].as_s.should eq("other")
+        servers["gori"]["command"].as_s.should eq("/opt/gori new")
+        servers["gori"]["args"].as_a.map(&.as_s).should eq(["mcp", "--project=engagement", "--read-only", "--tools=list_*"])
+
+        File.write(path, "not-json{")
+        expect_raises(Exception, /Refusing to overwrite/) do
+          install_one("pi", exe_path: "/opt/gori")
+        end
+        File.read(path).should eq("not-json{")
+      ensure
+        old_pi ? (ENV["PI_CODING_AGENT_DIR"] = old_pi) : ENV.delete("PI_CODING_AGENT_DIR")
+        FileUtils.rm_rf(dir)
+      end
+    end
+
     it "writes a JSON mcpServers entry for claude-style targets" do
       Dir.tempdir.try do |base|
         # Point HOME at a temp tree so we don't touch the real Claude config.
@@ -654,7 +841,7 @@ describe Gori::MCP::Install do
         old_home = ENV["HOME"]?
         ENV["HOME"] = home
         begin
-          path = Gori::MCP::Install.install("agy", exe_path: "/opt/gori/bin/gori",
+          path = install_one("agy", exe_path: "/opt/gori/bin/gori",
             project: "demo", read_only: true)
           path.should eq(File.join(home, ".gemini", "antigravity-cli", "mcp_config.json"))
           parsed = JSON.parse(File.read(path))
@@ -678,13 +865,13 @@ describe Gori::MCP::Install do
         old_appdata = ENV["APPDATA"]?
         ENV["HOME"] = home
         # BOTH of the vars that can steer the path off $HOME, kept inside the temp tree:
-        # this spec calls the real `install`, so whichever branch the host takes must land
+        # this spec calls the real `install_all`, so whichever branch the host takes must land
         # in the sandbox. A Windows host reads APPDATA and would otherwise have merged an
         # entry into the developer's own %APPDATA%\Claude\claude_desktop_config.json.
         ENV["XDG_CONFIG_HOME"] = File.join(home, ".config")
         ENV["APPDATA"] = File.join(home, "AppData", "Roaming")
         begin
-          path = Gori::MCP::Install.install("claude", exe_path: "/opt/gori")
+          path = install_one("claude", exe_path: "/opt/gori")
           path.should eq(Gori::MCP::Install.claude_desktop_path(home))
           path.should start_with(home)
           JSON.parse(File.read(path))["mcpServers"]["gori"]["command"].as_s.should eq("/opt/gori")
@@ -706,7 +893,7 @@ describe Gori::MCP::Install do
         ENV["HOME"] = home
         begin
           expect_raises(Exception, /Refusing to overwrite/) do
-            Gori::MCP::Install.install("agy", exe_path: "/opt/gori")
+            install_one("agy", exe_path: "/opt/gori")
           end
           File.read(bad).should eq("not-json{")
         ensure
@@ -728,8 +915,8 @@ describe Gori::MCP::Install do
         old_home = ENV["HOME"]?
         ENV["HOME"] = home
         begin
-          Gori::MCP::Install.install("agy", exe_path: "/opt/gori")
-          File.info(config).permissions.should eq(File::Permissions.new(0o600))
+          install_one("agy", exe_path: "/opt/gori")
+          File.info(config).permissions.should eq(File::Permissions.new(0o600)) unless {{ flag?(:win32) }}
           JSON.parse(File.read(config))["other"]["keep"].as_bool.should be_true
           Dir.children(dir).sort.should eq(["mcp_config.json"])
         ensure
@@ -739,6 +926,7 @@ describe Gori::MCP::Install do
     end
 
     it "writes through a symlinked config instead of detaching it" do
+      posix_only!("File.symlink needs Developer Mode")
       # Dotfiles are routinely symlinked into a dotfiles repo. Renaming over the LINK would
       # leave the client reading a plain file while the repo copy silently went stale.
       Dir.tempdir.try do |base|
@@ -753,7 +941,7 @@ describe Gori::MCP::Install do
         old_home = ENV["HOME"]?
         ENV["HOME"] = home
         begin
-          Gori::MCP::Install.install("claude-code", exe_path: "/opt/gori")
+          install_one("claude-code", exe_path: "/opt/gori")
           File.symlink?(link).should be_true # still a link, not replaced by a file
           parsed = JSON.parse(File.read(real))
           parsed["other"]["keep"].as_bool.should be_true
@@ -806,7 +994,7 @@ describe Gori::MCP::Install do
         ENV["HOME"] = home
         ENV.delete("CODEX_HOME")
         begin
-          path = Gori::MCP::Install.install("codex", exe_path: "/opt/gori/bin/gori",
+          path = install_one("codex", exe_path: "/opt/gori/bin/gori",
             insecure_upstream: true)
           path.should eq(File.join(codex_home, "config.toml"))
           text = File.read(path)
@@ -832,10 +1020,10 @@ describe Gori::MCP::Install do
         old_home = ENV["HOME"]?
         ENV["HOME"] = home
         begin
-          path = Gori::MCP::Install.install("grok", exe_path: "/opt/gori")
+          path = install_one("grok", exe_path: "/opt/gori")
           path.should eq(File.join(grok_dir, "config.toml"))
           # Second install updates rather than duplicating.
-          Gori::MCP::Install.install("grok", exe_path: "/opt/gori2", read_only: true)
+          install_one("grok", exe_path: "/opt/gori2", read_only: true)
           text = File.read(path)
           text.should contain("[ui]")
           text.should contain("yolo = true")
@@ -869,13 +1057,13 @@ describe Gori::MCP::Install do
         old_home = ENV["HOME"]?
         old_hermes = ENV["HERMES_HOME"]?
         ENV["HOME"] = home
-        ENV.delete("HERMES_HOME")
+        ENV["HERMES_HOME"] = File.join(home, ".hermes")
         begin
-          path = Gori::MCP::Install.install("hermes", exe_path: "/opt/gori/bin/gori",
+          path = install_one("hermes", exe_path: "/opt/gori/bin/gori",
             project: "demo")
           path.should eq(config)
           # Second install updates rather than duplicating.
-          Gori::MCP::Install.install("hermes", exe_path: "/opt/gori2", read_only: true)
+          install_one("hermes", exe_path: "/opt/gori2", read_only: true)
           text = File.read(config)
           text.should contain("# keep me")
           text.scan("  gori:").size.should eq(1)
@@ -907,7 +1095,7 @@ describe Gori::MCP::Install do
         # and the var is kept inside the temp tree so a regression cannot escape the sandbox.
         ENV["LOCALAPPDATA"] = File.join(home, "AppData", "Local")
         begin
-          path = Gori::MCP::Install.install("hermes", exe_path: "/opt/gori")
+          path = install_one("hermes", exe_path: "/opt/gori")
           path.should eq(File.join(profile, "config.yaml"))
           YAML.parse(File.read(path))["mcp_servers"]["gori"]["command"].as_s.should eq("/opt/gori")
         ensure
@@ -929,10 +1117,10 @@ describe Gori::MCP::Install do
         old_home = ENV["HOME"]?
         old_hermes = ENV["HERMES_HOME"]?
         ENV["HOME"] = home
-        ENV.delete("HERMES_HOME")
+        ENV["HERMES_HOME"] = File.join(home, ".hermes")
         begin
           expect_raises(Exception, /Refusing to overwrite/) do
-            Gori::MCP::Install.install("hermes", exe_path: "/opt/gori")
+            install_one("hermes", exe_path: "/opt/gori")
           end
           File.read(bad).should eq("model: [unterminated\n")
         ensure
@@ -951,10 +1139,10 @@ describe Gori::MCP::Install do
         old_home = ENV["HOME"]?
         old_hermes = ENV["HERMES_HOME"]?
         ENV["HOME"] = home
-        ENV.delete("HERMES_HOME")
+        ENV["HERMES_HOME"] = File.join(home, ".hermes")
         begin
           expect_raises(Exception, /isn't a YAML mapping/) do
-            Gori::MCP::Install.install("hermes", exe_path: "/opt/gori")
+            install_one("hermes", exe_path: "/opt/gori")
           end
           File.read(bad).should eq("- a\n- b\n")
         ensure
@@ -978,10 +1166,10 @@ describe Gori::MCP::Install do
         old_home = ENV["HOME"]?
         old_hermes = ENV["HERMES_HOME"]?
         ENV["HOME"] = home
-        ENV.delete("HERMES_HOME")
+        ENV["HERMES_HOME"] = File.join(home, ".hermes")
         begin
           expect_raises(Exception, /did not read back as written/) do
-            Gori::MCP::Install.install("hermes", exe_path: "/opt/gori")
+            install_one("hermes", exe_path: "/opt/gori")
           end
           File.read(config).should eq(original)
         ensure
@@ -1002,10 +1190,10 @@ describe Gori::MCP::Install do
         old_home = ENV["HOME"]?
         old_hermes = ENV["HERMES_HOME"]?
         ENV["HOME"] = home
-        ENV.delete("HERMES_HOME")
+        ENV["HERMES_HOME"] = File.join(home, ".hermes")
         begin
-          Gori::MCP::Install.install("hermes", exe_path: "/opt/gori")
-          File.info(config).permissions.should eq(File::Permissions.new(0o600))
+          install_one("hermes", exe_path: "/opt/gori")
+          File.info(config).permissions.should eq(File::Permissions.new(0o600)) unless {{ flag?(:win32) }}
           Dir.children(dir).sort.should eq(["config.yaml"])
         ensure
           old_home ? (ENV["HOME"] = old_home) : ENV.delete("HOME")

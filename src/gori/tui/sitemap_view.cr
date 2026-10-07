@@ -8,9 +8,13 @@ require "./traffic_empty_state"
 require "../settings"
 require "../store"
 require "../ql"
+require "../hotkeys"
 require "../scope"
 require "../sitemap" # the host→path tree model + builder (URI normalisation lives there now)
+require "../js_refs"
 require "./viewport"
+require "./params_view"
+require "./project_marks"
 
 module Gori::Tui
   # The Sitemap tab: a host → path tree built from captured flows. The tree is literal —
@@ -19,21 +23,35 @@ module Gori::Tui
   # WRAPPING their children rather than rewriting any path. Helps answer "what does this
   # app do". Navigate with ↑/↓, expand/collapse with →/←/Enter.
   class SitemapView
-    include QueryBarEdit # ⌃/⌥←→ word motion, Home/End, Delete, ⌥⌫ on the `/` bar
+    include QueryBarPopup # the `/` bar: edits, ⌃/⌥←→ word motion, Home/End, Delete, ⌥⌫, `↓` dropdown
     # The tree node + pure builder live in `Gori::Sitemap` (shared with the headless
     # `gori run sitemap`); this view layers scope markers, path-tag editing, and
     # rendering on top. The alias keeps the rest of this file reading as `Node`.
     alias Node = Gori::Sitemap::Node
 
+    # What a cross-surface action resolves a row to: the endpoint by its BARE host, plus the
+    # origin the row stands for, so the flow lookup behind it stays on that scheme and port
+    # (`Store#representative_flow_id`) instead of opening the same path on another one.
+    alias Endpoint = NamedTuple(host: String, method: String, target: String, origin: Sitemap::Origin?)
+
     # A flattened tree row. `guides` is a bitmask: bit L set ⇒ a vertical `│` tree-guide
     # is drawn at ancestor level L (its branch continues below this row). Built once per
-    # tree/expand change in `collect`, not re-walked per frame. `host` is the label of the
-    # depth-0 node this row hangs under — stamped during the flatten so nothing has to walk
-    # back up the row list to find it (the mark predicate needs it on every drawn row).
-    private record VisibleRow, node : Node, depth : Int32, guides : UInt64, host : String
+    # tree/expand change in `collect`, not re-walked per frame. `root` is the depth-0 node this
+    # row hangs under — stamped during the flatten so nothing has to walk back up the row list
+    # to find it (the mark predicate needs it on every drawn row).
+    #
+    # A root is an ORIGIN (#1371), so the row's two host readings are kept apart: `key` (the
+    # root's `scheme://host:port` label) is its IDENTITY — marks, the selection anchor and the
+    # expand state, where `:19021/x` and `:19022/x` are two rows — and `root.host` (the bare
+    # host) is what a host-keyed question takes: a tag, a scope rule, a flow lookup.
+    private record VisibleRow, node : Node, depth : Int32, guides : UInt64, root : Node do
+      def key : String
+        root.label
+      end
+    end
 
     # The QL fields meaningful for the endpoint tree. The same `/` query language History
-    # takes, plus `tag:` — a Sitemap-local field (handled here, not in the shared QL) that
+    # takes, plus `tag:` — a Sitemap field (`Sitemap.split_tag_terms`, not the shared QL) that
     # filters the tree by a node's path memo.
     #
     # Written out rather than read from `QL::FIELDS` (which History's own list now IS), and
@@ -51,27 +69,46 @@ module Gori::Tui
     # list (`QuerySuggest`) rather than written out — as prose these drifted from `QL_FIELDS` and
     # never mentioned `-term` at all. `tag:` is appended because it is this surface's own field
     # and the shared sample cannot know about it.
-    FILTER_HINT = QuerySuggest.idle_hint("/ filter", ["tag"] + QL::HINT_FIELDS)
-    QUERY_HINT  = QuerySuggest.cold_hint(["tag"] + QL::HINT_FIELDS, help_key: true)
+    QUERY_HINT = QuerySuggest.cold_hint(["tag"] + QL::HINT_FIELDS, help_key: true)
     # The highlighter's field vocabulary: everything QL ACCEPTS (a superset of `QL_FIELDS`, which
     # is only what Tab offers here) plus this surface's own `tag:`, which QL knows nothing about
     # because `partition` pulls it out before the query ever reaches the parser.
     QL_KNOWN = ->(f : String, op : Char) { (f == "tag" && op == ':') || QL.known_field?(f, regex: op == '~') }
+    # QL's names plus this bar's own `tag`, which every question below has to know about:
+    # without it `tagg:prod` gets no suggestion and `tagg:8080` is read as an authority, so the
+    # one field this surface adds is the one field it could never diagnose a typo of.
+    CANDIDATE_FIELDS = QL::CANDIDATE_FIELDS + ["tag"]
+    # The shape half of the pair (`FilterAst.field_shaped?`), with `tag` folded in the same way
+    # — and asked WITHOUT the operator, for the reason `QL::FIELD_SHAPED` gives.
+    QL_SHAPED = ->(f : String, _op : Char, v : String) do
+      known = f == "tag" || QL.known_field?(f)
+      FilterAst.field_shaped?(f, v, known, QL::SIDE_PREFIXES) { FilterAst.suggest(f, CANDIDATE_FIELDS) }
+    end
     # The editing bar's label — a constant because `render_query_popup` lines the dropdown up
     # under the token, which means knowing how far the query text is indented.
     QUERY_PREFIX = "filter › "
+
     # QL's help plus this surface's own field, which the shared table cannot know about because
-    # `tag:` never reaches the parser (`FilterAst.partition` pulls it out first).
-    QL_HELP = ->(f : String) { f == "tag" ? "path memo on this node — set with space → T" : QL.field_help(f) }
+    # `tag:` never reaches the parser (`FilterAst.partition` pulls it out first). The tag line
+    # names the menu row that sets it through the registry: it once said `T` while Tag path
+    # was `m` (#1274).
+    def self.ql_help(registry : Verb::Registry?) : Proc(String, String?)
+      tag = Hotkeys.expand_menu_paths(registry, "path memo on this node — set with {space:sitemap.tag}")
+      ->(f : String) : String? { f == "tag" ? tag : QL.field_help(f) }
+    end
 
     # Right-aligned column widths: path memo sits left of the method/aside cluster.
     TAG_COL_W     = 16
     METHODS_COL_W =  8
     COL_GAP       =  1 # minimum blank column between tag text and methods/aside
 
+    # The aside on a path captured JavaScript references and no request reached (#1243).
+    JS_ASIDE = "js"
+
     getter? loaded : Bool
 
     def initialize
+      @ql_help = SitemapView.ql_help(nil)
       @hosts = [] of Node
       @selected = 0
       @scroll = 0
@@ -85,6 +122,10 @@ module Gori::Tui
       # QL filter bar (mirrors HistoryView): the Scope lens + a `/` query are AND-ed
       # into the one filter that builds the tree.
       @scope = nil.as(Scope?)
+      # The hide-static lens (#1239), shared with History: one project key, set by the Runner's
+      # toggle and read by SitemapController on open.
+      @hide_static = false
+      @no_flows = false # the project holds no flows at all (see `fetch_reload`)
       @query = ""
       @querying = false
       @qcx = 0                      # caret position within @query
@@ -100,27 +141,28 @@ module Gori::Tui
       # row per payload. On by default; ⇧G toggles it for the rare case of wanting to READ
       # the query strings in the tree instead of expanding the fold.
       @fold_query = true
+      # Endpoints captured JavaScript references (#1243): attached to the tree from what a scan
+      # stored, the never-requested ones as their own dimmed rows. On by default, which draws
+      # nothing until a scan has run (`sitemap.js-scan`); `sitemap.toggle-js-refs` hides them.
+      @js_refs = true
       # Tag editor — a one-line text sub-mode (mirrors the QL `/` bar) that edits the
       # selected node's path memo. The controller persists @tag_buffer on commit.
       @tagging = false
       @tag_buffer = ""
       @tag_cx = 0
       @tag_preedit = ""
-      # The (host, path) pairs the open editor targets, PINNED at start_tag — the marks if
+      # The (origin key, path) pairs the open editor targets, PINNED at start_tag — the marks if
       # any were set, else the cursor row. Pinned rather than re-derived so a mid-edit
       # rebuild (a data_version poll under live capture) can't retarget the commit.
       @tag_targets = [] of {String, String}
-      # Multi-select marks, keyed by the durable (host, path) address rather than a row
+      # Multi-select marks, keyed by the durable (origin key, path) address rather than a row
       # index: the tree is rebuilt from the store ~1.3x/sec under capture, so an index-keyed
       # mark would silently retarget on the next poll. A mark whose node is currently
       # collapsed or filtered out stays marked (marked_hidden_count reports it); a mark whose
       # path is gone simply fails to resolve at the verb. Mirrors History's model (#442).
-      @marks = Set({String, String}).new
-      @mark_anchor = nil.as({String, String}?) # key-anchored range anchor for the ⇧arrow extend
-      # Only the keys the CURRENT ⇧arrow gesture added. A plain arrow hands back exactly
-      # these, so `t` marks outside the range are never disturbed. Cleared by every
-      # non-extend mark action.
-      @mark_extent = Set({String, String}).new
+      @marks = Marks({String, String}).new
+      # Root label → origin, for the mark keys (see `origin_for`).
+      @origins = {} of String => Sitemap::Origin
     end
 
     # Inject the Scope lens so the tree honours it AND the bar can show its state
@@ -129,26 +171,46 @@ module Gori::Tui
       @scope = scope
     end
 
+    # The registry the query dropdown reads menu letters from (`SitemapView.ql_help`).
+    def set_registry(registry : Verb::Registry) : Nil
+      @registry = registry
+      @ql_help = SitemapView.ql_help(registry)
+    end
+
+    # The registry the hints read menu letters from; nil until `#set_registry`.
+    @registry : Verb::Registry? = nil
+
+    def set_hide_static(hide : Bool) : Nil
+      @hide_static = hide
+    end
+
+    def hide_static? : Bool
+      @hide_static
+    end
+
     # Rebuild the tree from the store. Selection, scroll, and manual expand/collapse
     # are re-anchored by durable (host, path) keys so a data_version poll under live
     # capture does not jump the cursor to the top host every ~750ms.
     #
     # A FULL rebuild, deliberately, and measured before leaving it that way: the whole path —
-    # `sitemap_entries` (DISTINCT, capped at `Store::SITEMAP_MAX`), `Sitemap.build`, the two
-    # fold passes, tag stamping, expand-depth, the endpoint counts and the flatten — runs in
+    # `sitemap_origin_entries` (DISTINCT, capped at `Store::SITEMAP_MAX`), `Sitemap.build`, the
+    # two fold passes, tag stamping, expand-depth, the endpoint counts and the flatten — ran in
     # ~6.4 ms at 100k flows with the tree at its 10k-endpoint cap. Against the 750 ms
     # data_version cadence, and only while this tab is ACTIVE (`@tabs[@active_tab]` in
     # Runner#apply_external_change), that is under 1% of a core. An incremental rebuild would
     # trade that for cache-invalidation state across build, folding, tagging and expansion —
     # the four things whose interaction the anchoring above already has to get right.
     #
-    # Roughly two thirds of the 6.4 ms is the DISTINCT query, which scales with the FLOW table
-    # rather than the capped tree, so the number to watch is retention: at the 100k default it
-    # is what is quoted here. Re-measure before assuming it still holds if that default moves.
+    # Most of that is the DISTINCT query, which scales with the FLOW table rather than the
+    # capped tree, so the number to watch is retention. Keying the roots on the origin (#1371)
+    # widened it from (host, method, target) to five columns of the same covering index:
+    # `bench/store_bench.cr` at 100k flows reads 4.5 ms for the old query and 6.6 ms for this
+    # one — about 2 ms more per reload, which keeps it near 1% of a core. Re-measure before
+    # assuming it still holds if the retention default moves.
     def reload(store : Store) : Nil
       plan = prepare_reload || return
-      entries, tags = fetch_reload(store, plan)
-      apply_reload(entries, tags, plan)
+      entries, tags, no_flows, js = fetch_reload(store, plan)
+      apply_reload(entries, tags, plan, no_flows, js)
     end
 
     # The store half of a reload, as three steps, so the `/` bar can run the middle one on a
@@ -157,16 +219,22 @@ module Gori::Tui
     # (an invalid residual); `fetch` is the two reads and touches no view state; `apply`
     # builds the tree from what came back. `reload` is the three in a row, for every caller
     # that is not typing.
-    record ReloadPlan, positives : Array(String), negatives : Array(String), combined : QL::Filter
+    # `js_refs` — attach the JavaScript references: the view's toggle, captured here so the
+    # worker never reads view state, and off while a QL residual narrows the tree (a reference
+    # is not a flow, so the query cannot judge it — see `JsRefs.attach!`). `tag:` terms keep
+    # it on: they filter the built tree, reference nodes included.
+    record ReloadPlan, positives : Array(String), negatives : Array(String), combined : QL::Filter,
+      js_refs : Bool = false
 
     # Whether a worker fetch is in flight — the empty-tree note says so instead of "no
     # endpoints match" while the previous tree stays up.
     property? searching : Bool = false
 
     def prepare_reload : ReloadPlan?
-      # `tag:`/`-tag:` are Sitemap-local (the shared QL has no tag column): split them
+      # `tag:`/`-tag:` are the Sitemap's own (the shared QL has no tag column): split them
       # out, hand the residual to QL.parse, and apply the tag filter to the built tree.
-      positives, negatives, residual = split_tag_terms(@query)
+      terms = Sitemap.split_tag_terms(@query)
+      residual = terms.residual
       # `scope:` compiles here exactly as it does in History — this is the same QL over the same
       # flows, and the tree is built from what it returns. NOT the same question `--in-scope`
       # asks on this surface, which selects whole HOSTS via `host_in_scope?` (see
@@ -176,12 +244,13 @@ module Gori::Tui
       lens = @scope.try(&.ql_lens)
       residual_filter = QL.parse(residual, scope: lens)
       @query_note = query_note_for(residual, residual_filter, lens)
+      combined = flow_filter_of(residual, residual_filter)
       # A non-blank QL residual that compiles to EMPTY means every QL term was invalid
       # (typo'd field, bad numeric, unterminated value). Mirror HistoryView / MCP / CLI:
       # reject it (empty tree + a note) rather than fall through to a match-all search
       # that shows the WHOLE sitemap behind an "active" filter. A tag-only query has a
       # blank residual, so reject_empty? is false and the tag filter still applies below.
-      if residual_has_terms?(residual) && QL.reject_empty?(residual, residual_filter)
+      unless combined
         @hosts = [] of Node
         @visible_cache = nil
         @selected = 0
@@ -189,22 +258,55 @@ module Gori::Tui
         @loaded = true
         return
       end
-      ReloadPlan.new(positives, negatives, QL.and(@scope.try(&.filter) || QL::EMPTY, residual_filter))
+      ReloadPlan.new(terms.positives, terms.negatives, combined, @js_refs && !residual_has_terms?(residual))
     end
+
+    # The flow filter a query's QL half compiles to — the scope lens, the hide-static lens AND the
+    # residual — or nil
+    # when a non-blank residual compiled to nothing. ONE home for both readers of it: the tree
+    # (`prepare_reload`) and the Params sub-tab (`params_filter`), which must scan the flow set
+    # this tree is built from.
+    private def flow_filter_of(residual : String, residual_filter : QL::Filter) : QL::Filter?
+      return nil if residual_has_terms?(residual) && QL.reject_empty?(residual, residual_filter)
+      combined = QL.and(@scope.try(&.filter) || QL::EMPTY, residual_filter)
+      @hide_static ? QL.and(combined, QL.hide_static) : combined
+    end
+
+    # What `fetch_reload` hands `apply_reload`: the endpoints, the tags, whether the project
+    # holds no flows at all, and the JavaScript references (empty with the toggle off).
+    alias Fetched = {Array(Store::SitemapOriginEntry), Hash({String, String}, String), Bool, Array(Store::JsRefNode)}
 
     # Reads only — safe off the main fiber. `control` lets the caller cancel a superseded read.
+    #
+    # The third value is History's `no_flows`, asked only when the tree came back empty (one
+    # rowid seek): with a standing lens on, an empty tree is either "the lens hid everything" or
+    # "there is nothing", and only the second may show the traffic empty state (#1239).
     def fetch_reload(store : Store, plan : ReloadPlan,
-                     control : Store::QueryControl? = nil) : {Array({String, String, String}), Hash({String, String}, String)}
-      {store.sitemap_entries(plan.combined, control: control), store.sitemap_tags}
+                     control : Store::QueryControl? = nil) : Fetched
+      entries = store.sitemap_origin_entries(plan.combined, control: control)
+      js = plan.js_refs ? store.js_ref_nodes[0] : [] of Store::JsRefNode
+      {entries, store.sitemap_tags, entries.empty? && store.recent_flows(1).empty?, js}
     end
 
-    def apply_reload(entries : Array({String, String, String}), tags : Hash({String, String}, String), plan : ReloadPlan) : Nil
+    def apply_reload(entries : Array(Store::SitemapOriginEntry), tags : Hash({String, String}, String), plan : ReloadPlan,
+                     no_flows : Bool = false, js : Array(Store::JsRefNode) = [] of Store::JsRefNode) : Nil
+      @no_flows = no_flows
       prev_sel = selection_anchor
       prev_scroll = @scroll
       prev_expand = collect_expand_state
       @hosts = Sitemap.build(entries)
+      # Right after the build, before tags and every fold — the order `collect_sitemap` (the
+      # CLI) keeps too. With the scope lens on a reference is filtered by it here: the SQL lens
+      # the entries came through never saw it, because a reference is not a flow.
+      unless js.empty? # `fetch_reload` reads none with the toggle off
+        JsRefs.attach!(@hosts, js, @scope, lens: @scope.try(&.active?) == true)
+      end
+      # After the attach, which can grow an unrequested ORIGIN root: remembered before it, such a
+      # root drew and could be marked but named no host, so its tag commit was refused and the
+      # export dropped it.
+      remember_origins
       Sitemap.stamp_tags!(@hosts, tags)
-      filter_by_tags(plan.positives, plan.negatives)
+      Sitemap.filter_by_tags!(@hosts, plan.positives, plan.negatives)
       if @grouping
         # Opaque ids first, then numeric runs — the two passes partition the children.
         @hosts.each { |h| Sitemap.fold_templates!(h) }
@@ -219,11 +321,12 @@ module Gori::Tui
       reapply_expand_state(prev_expand)
       # Stamp host-level scope state + endpoint counts on the FINAL tree, so the render
       # loop is a pure read (no per-frame Scope mutex hits). host_in_scope?/configured?
-      # evaluate the rules regardless of the ⇧S enabled flag, so targets are marked even
+      # evaluate the rules regardless of the `s` enabled flag, so targets are marked even
       # with the lens off (all traffic shown).
       @scope_configured = @scope.try(&.configured?) == true
       @hosts.each do |h|
-        h.in_scope = @scope_configured && (@scope.try(&.host_in_scope?(h.label)) == true)
+        # The BARE host: a host rule carries no scheme or port, and the label is the origin.
+        h.in_scope = @scope_configured && (@scope.try(&.host_in_scope?(h.host)) == true)
         h.endpoints = Sitemap.endpoint_count(h)
       end
       @visible_cache = nil
@@ -282,7 +385,7 @@ module Gori::Tui
       want_host, want_key = target
       rows.each_with_index do |row, i|
         next unless (k = expand_key(row.node)) && k == want_key
-        return i if row.host == want_host
+        return i if row.key == want_host
       end
       nil
     end
@@ -300,7 +403,7 @@ module Gori::Tui
         # `fold_templates!` appends before `group_sequences!` does — so matching on the
         # parent alone landed the cursor on the {hex} fold when a numeric run collapsed.
         next unless row.node.grouped && row.node.children.any? { |c| encloses?(c.path, want_path) }
-        return i if row.host == want_host
+        return i if row.key == want_host
       end
       nil
     end
@@ -312,7 +415,7 @@ module Gori::Tui
       want.starts_with?(path) && want[path.size]? == '/'
     end
 
-    # --- tags: filter (stamping lives in Gori::Sitemap.stamp_tags!) ----------
+    # --- tags: filter (stamping and pruning live in Gori::Sitemap) -----------
 
     # A short note explaining a filter that matches nothing because its QL residual is
     # INVALID (vs a valid filter that genuinely has no matches) — surfaced in the
@@ -321,117 +424,42 @@ module Gori::Tui
     private def query_note_for(residual : String, filter : QL::Filter,
                                lens : QL::ScopeLens?) : String?
       return nil if residual.blank?
-      return "invalid filter — no valid terms" if residual_has_terms?(residual) && QL.reject_empty?(residual, filter)
+      if residual_has_terms?(residual) && QL.reject_empty?(residual, filter)
+        return QL.reject_empty_reason(residual, scope: lens) || "invalid filter — no valid terms"
+      end
       bad = QL.invalid_regex_terms(residual)
       return "invalid regex in #{bad.first}" unless bad.empty?
+      # Same note History carries, and for the same reason it carries the unknown-field one:
+      # a typo free-texts, matches nothing, and reads exactly like an empty sitemap.
+      if u = FilterAst.unknown_field(residual, FilterAst::SEPS_FIELD_REGEX, QL_KNOWN,
+           QL::SIDE_PREFIXES, CANDIDATE_FIELDS)
+        return FilterAst.unknown_field_note(u)
+      end
+      if hint = QL.missing_colon_hint(residual)
+        return hint
+      end
       # Same note History carries, for the same reason: an empty tree cannot say WHY it is empty.
       return "no scope rules — nothing is in scope" if QL.uses_scope?(residual) && !lens.try(&.configured?)
+      return static_hidden_note if @hide_static
       nil
     end
 
-    # Split `tag:` terms out of the query. Cut with the SHARED lexer, not `String#split`:
-    # hand-tokenising saw no quotes (`tag:"my tag"` became `tag:"my` + `tag"`) and no
-    # `NOT` (`NOT tag:done` filed `done` as a POSITIVE and then blanked the tree on the
-    # leftover `NOT`), while the bar above it was already highlighting all of that as
-    # real grammar. Negation now rides the same `Term#negate?` every other filter uses,
-    # so `-tag:x` and `NOT tag:x` are finally the same thing here too.
-    private def split_tag_terms(query : String) : {Array(String), Array(String), String}
-      positives = [] of String
-      negatives = [] of String
-      # A half-typed `tag:` (no value yet) stays in the residual, exactly as before, so
-      # the tree doesn't blank out mid-keystroke.
-      taken, residual = FilterAst.partition(query) { |t| !tag_token_value(t.text).nil? }
-      taken.each { |t| (t.negate? ? negatives : positives) << tag_token_value(t.text).not_nil! }
-      {positives, negatives, residual}
+    # History's note, pointing at the one door this tab has: the space menu (no `v` picker here),
+    # spelled from the registry (`Hotkeys.menu_chip`, #1295).
+    private def static_hidden_note : String
+      "static assets hidden — #{static_chip} shows them"
     end
 
-    # `reject_empty?` reads a non-blank query that compiled to nothing as "every term was
-    # invalid". That is right for what the USER typed, but the residual here is what is
-    # LEFT after the tag terms were cut out, so `tag:a OR tag:b` handed it the bare word
-    # `OR` — no terms at all — and the whole sitemap blanked behind an "invalid filter"
-    # note. Only a residual that still carries a term can be invalid.
+    # `␣Zs`: Display…'s static-assets row, the way back from the hide-static lens.
+    private def static_chip : String
+      Hotkeys.menu_chip(@registry, "sitemap.toggle-static")
+    end
+
+    # `tag:` terms are cut and matched by the engine (`Sitemap.split_tag_terms`,
+    # `Sitemap.filter_by_tags!`) that `gori run sitemap` and MCP `list_sitemap` read the same
+    # query through; this view only keeps the residual's own questions.
     private def residual_has_terms?(residual : String) : Bool
-      !FilterAst.terms(FilterAst.parse(residual)).empty?
-    end
-
-    # The keyword of a `tag:x` term, or nil if this isn't one (or has no value yet).
-    private def tag_token_value(text : String) : String?
-      return nil unless text.downcase.starts_with?("tag:")
-      v = text[4..].downcase
-      v.empty? ? nil : v
-    end
-
-    # Prune the tree to tag matches: a node survives a positive term if it (or an
-    # ancestor) carries a matching tag, or any descendant does (so a tagged folder
-    # shows its subtree + the path to it). A negative term drops the matched subtree.
-    private def filter_by_tags(positives : Array(String), negatives : Array(String)) : Nil
-      @hosts.select! { |h| keep_for_tags?(h, positives, false) } unless positives.empty?
-      @hosts.select! { |h| !exclude_for_tags?(h, negatives) } unless negatives.empty?
-    end
-
-    # Returns true if `node` survives; prunes non-surviving children in place. `inside`
-    # = an ancestor already matched all positives ⇒ keep the whole subtree.
-    #
-    # Two explicit passes rather than native recursion (see `Sitemap.post_order` for the
-    # SIGSEGV this class of walk caused): this one threads `within` DOWN and combines
-    # `kept_child` UP, which no single-direction work-list expresses. Pass 1 collects nodes
-    # parent-before-child with their `within`; pass 2 walks that list in REVERSE, so every
-    # node is pruned only after its whole subtree — exactly the order the recursion had.
-    # `verdict` is keyed by Node identity (`Sitemap::Node` overrides neither `==` nor
-    # `hash`, so Hash falls back to reference equality).
-    private def keep_for_tags?(root : Node, positives : Array(String), inside : Bool) : Bool
-      order = [{root, inside || tag_has_all?(root, positives)}]
-      i = 0
-      while i < order.size
-        node, within = order[i]
-        node.children.each { |c| order << {c, within || tag_has_all?(c, positives)} }
-        i += 1
-      end
-
-      verdict = {} of Node => Bool
-      i = order.size - 1
-      while i >= 0
-        node, within = order[i]
-        kept_child = false
-        node.children.select! do |c|
-          keep = verdict[c]
-          kept_child ||= keep
-          keep
-        end
-        verdict[node] = within || kept_child
-        i -= 1
-      end
-      verdict[root]
-    end
-
-    # Returns true if `node`'s subtree should be dropped (it carries a negative tag);
-    # otherwise prunes any dropped descendants in place.
-    #
-    # Iterative for the same reason as `keep_for_tags?`. A node that matches is dropped
-    # whole and never descended into, so this is just "reject matching children, then
-    # descend into the survivors" — no verdict has to travel back up.
-    private def exclude_for_tags?(root : Node, negatives : Array(String)) : Bool
-      return true if tag_has_any?(root, negatives)
-      stack = [root]
-      while node = stack.pop?
-        node.children.reject! { |c| tag_has_any?(c, negatives) }
-        node.children.each { |c| stack << c }
-      end
-      false
-    end
-
-    private def tag_has_all?(node : Node, keywords : Array(String)) : Bool
-      t = node.tag
-      return false unless t
-      down = t.downcase
-      keywords.all? { |kw| down.includes?(kw) }
-    end
-
-    private def tag_has_any?(node : Node, keywords : Array(String)) : Bool
-      t = node.tag
-      return false unless t
-      down = t.downcase
-      keywords.any? { |kw| down.includes?(kw) }
+      Sitemap.residual_terms?(residual)
     end
 
     def move(delta : Int32) : Nil
@@ -470,6 +498,24 @@ module Gori::Tui
     end
 
     # Whether query-string folding is on (shown in the toast / used by the ⇧G toggle).
+    def js_refs? : Bool
+      @js_refs
+    end
+
+    def toggle_js_refs : Nil
+      @js_refs = !@js_refs
+    end
+
+    # The JavaScript reference under the cursor when the row is ONLY that — a path no request
+    # reached — for `o` (open where it was read) and `r` (a bare GET in Repeater). nil on a row
+    # with captured traffic, which those keys already serve from the flow.
+    def selected_js_ref : {host: String, path: String, origin: Sitemap::Origin?}?
+      return nil unless row = visible_rows[@selected]?
+      node = row.node
+      return nil if row.depth == 0 || node.grouped || !node.js_only?
+      {host: row.root.host, path: node.path, origin: row.root.origin}
+    end
+
     def fold_query? : Bool
       @fold_query
     end
@@ -505,90 +551,24 @@ module Gori::Tui
       @query
     end
 
-    # True when the tree is a filtered subset (a `/` query or the Scope lens is on).
+    # True when the tree is a filtered subset (a `/` query, the Scope lens or the hide-static
+    # lens is on).
     def filtering? : Bool
-      !@query.blank? || (@scope.try(&.active?) == true)
+      !@query.blank? || (@scope.try(&.active?) == true) || @hide_static
     end
 
-    def start_query : Nil
-      @querying = true
-      @qcx = @query.size
-    end
-
-    def stop_query : Nil # Enter: keep the filter, leave edit mode
-      @querying = false
-      @popup.close
-    end
-
-    def cancel_query : Nil # Esc: clear the filter, leave edit mode
-      @querying = false
-      @query = ""
-      @qcx = 0
-      @preedit = ""
-      @popup.close
-    end
-
-    def query_insert(ch : Char) : Nil
-      @query = "#{@query[0, @qcx]}#{ch}#{@query[@qcx..]}"
-      @qcx += 1
+    # `QueryBarEdit`'s hook. The tree reloads on the controller's debounce, not here.
+    def query_edited : Nil
       sync_popup
     end
 
-    def query_backspace : Nil
-      return if @qcx == 0
-      @query = "#{@query[0, @qcx - 1]}#{@query[@qcx..]}"
-      @qcx -= 1
-      sync_popup
-    end
-
-    def query_move(d : Int32) : Nil
-      @qcx = (@qcx + d).clamp(0, @query.size)
-      sync_popup
-    end
-
-    # --- the opt-in completion dropdown (`\u2193`) ---------------------------------
-    # Same component and same contract as History's; see `SuggestPopup` for why it is opt-in.
-
-    def popup_open? : Bool
-      @popup.open?
-    end
-
-    # `↓`: open the dropdown, or move down inside it. Nil rather than Bool — the key is claimed
-    # either way, and an earlier Bool "so the key falls through" was a contract no controller
-    # honoured, which is worse than not offering one.
-    def popup_down : Nil
-      return @popup.move(1) if @popup.open?
-      @popup.set(query_suggestions)
-      @popup.open!
-    end
-
-    def popup_up : Nil
-      @popup.move(-1)
-    end
-
-    def popup_close : Nil
-      @popup.close
-    end
-
-    private def sync_popup : Nil
-      @popup.set(query_suggestions) if @popup.open?
+    # `QueryBarEdit`'s hook. A `LineEdit` action leaves the dropdown as it was; only a typed
+    # character re-syncs it.
+    def query_line_edited(action : Symbol) : Nil
     end
 
     def set_preedit(text : String) : Nil
       @preedit = text
-    end
-
-    # Complete the current token to the SELECTED candidate (dropdown open) or the first (closed).
-    # `close` is ↵'s — see HistoryView#query_complete for why ↵ must shut the popup.
-    def query_complete(close : Bool = false) : Bool
-      sugg = query_suggestions
-      pick = @popup.choice(sugg)
-      return false unless pick
-      s, e = current_token_bounds
-      @query = "#{@query[0, s]}#{pick}#{@query[e..]}"
-      @qcx = s + pick.size
-      close ? @popup.close : (@popup.set(query_suggestions) if @popup.open?)
-      true
     end
 
     # Field-name suggestions for the token under the cursor (values aren't suggested
@@ -599,17 +579,18 @@ module Gori::Tui
       fields = token.includes?(':') ? [] of String : QL_FIELDS.select(&.starts_with?(token.downcase)).map { |f| "#{f}:" }
       # `token_at` rather than the raw token: an operator candidate splices over the whole span,
       # so it has to carry any `(` the way the field candidates above would need to. (This bar's
-      # own tokenizer does not peel punctuation — see `current_token_bounds` — which is a separate
+      # own tokenizer does not peel punctuation — see `query_token_span` — which is a separate
       # gap; going through the shared cursor here at least keeps the operators honest.)
       QuerySuggest.with_operators(fields, FilterAst.token_at(@query, @qcx))
     end
 
     private def current_token : String
-      s, e = current_token_bounds
+      s, e = query_token_span
       @query[s...e]
     end
 
-    private def current_token_bounds : {Int32, Int32}
+    # `QueryBarEdit`'s hook: this bar completes over the space-delimited word, not the QL cursor.
+    private def query_token_span : {Int32, Int32}
       s = @qcx
       while s > 0 && @query[s - 1] != ' '
         s -= 1
@@ -670,10 +651,18 @@ module Gori::Tui
     # landed, and stamping a refused one paints a memo that is on nobody's disk and that the
     # next reload silently takes back. Nil means "all of them", for a caller with nothing to
     # report.
+    #
+    # A tag is keyed on the BARE host (#1371), so the memo is stamped on the same path under
+    # EVERY origin of that host, exactly as the next reload's `Sitemap.stamp_tags!` would —
+    # stamping only the row that was edited left its sibling origins showing the old memo
+    # until something else rebuilt the tree.
     def apply_tag(text : String, committed : Array({String, String})? = nil) : Nil
       value = text.blank? ? nil : text
-      index = node_index
-      (committed || @tag_targets).each { |key| index[key]?.try(&.tag=(value)) }
+      wanted = Set({String, String}).new
+      (committed || @tag_targets).each do |(key, path)|
+        tag_host(key).try { |host| wanted << {host, path} }
+      end
+      each_node { |node, root| node.tag = value if wanted.includes?({root.host, node.path}) }
       cancel_tag
     end
 
@@ -721,7 +710,7 @@ module Gori::Tui
     private def selection_anchor : {String, String}?
       return nil unless row = visible_rows[@selected]?
       return nil unless k = expand_key(row.node)
-      {row.host, k}
+      {row.key, k}
     end
 
     # The selected endpoint's {host, method, target} for cross-surface actions (Send to
@@ -733,9 +722,9 @@ module Gori::Tui
     #   :container  — the fold's parent path. Discover scans a SUBTREE, and on a `{uuid}`
     #                 row the user means "under /users", not "under this one uuid".
     # Both are identity on a normal node.
-    def selected_endpoint(prefer : Symbol = :descendant) : {host: String, method: String, target: String}?
+    def selected_endpoint(prefer : Symbol = :descendant) : Endpoint?
       return nil unless row = visible_rows[@selected]?
-      host = row.host
+      root = row.root
       node = row.node
       if node.grouped
         if prefer == :container
@@ -744,11 +733,86 @@ module Gori::Tui
           # fold resolves to its parent.
           parent = node.query_fold ? node.path : node.fold_parent
           return nil unless parent
-          return {host: host, method: "GET", target: parent.empty? ? "/" : parent}
+          return {host: root.host, method: "GET", target: parent.empty? ? "/" : parent, origin: root.origin}
         end
         return nil unless node = first_endpoint(node)
       end
-      endpoint_of(node, host)
+      endpoint_of(node, root)
+    end
+
+    # The flow filter this tree is built from — the scope lens AND the `/` query's QL half —
+    # for the Params sub-tab, so the two sub-tabs answer about one flow set. `tag:` terms are
+    # Sitemap-local (they filter the built tree, not flows) and have no flow reading, so they
+    # are left out. nil when the residual is non-blank yet compiles to nothing: the tree is
+    # empty for that reason, and a param scan of EVERY flow behind it would be the match-all
+    # this view refuses in `prepare_reload`.
+    def params_filter : QL::Filter?
+      residual = Sitemap.split_tag_terms(@query).residual
+      flow_filter_of(residual, QL.parse(residual, scope: @scope.try(&.ql_lens)))
+    end
+
+    # What the cursor row means to the Params sub-tab: a host row is the whole host, any
+    # other row the ENDPOINT PATHS under it (query cut, as `ParamInventory` keys them). A set
+    # and not a prefix, because a `{uuid}` fold's descendants share a parent the fold itself
+    # does not name — and a prefix of "/users" would also take in /users-admin. The engine
+    # still gets a covering prefix, so its flow cap counts this subtree, not the whole host.
+    def selected_params_target : ParamsView::Target?
+      return nil unless row = visible_rows[@selected]?
+      root = row.root
+      return ParamsView::Target.new(root.host, nil, row.key, origin: root.origin) if row.depth == 0
+      node = row.node
+      paths = Set(String).new
+      collect_endpoint_paths(node, paths)
+      shown = if node.grouped && (parent = node.fold_parent)
+                "#{parent}/#{node.label}"
+              else
+                Sitemap.path_part(node.path)
+              end
+      prefix = if node.grouped && !node.query_fold && (parent = node.fold_parent)
+                 parent
+               else
+                 Sitemap.path_part(node.path)
+               end
+      ParamsView::Target.new(root.host, paths, "#{row.key}#{shown}", path_prefix: prefix, origin: root.origin)
+    end
+
+    # What `sitemap.export` (the OpenAPI export, #1241) covers: the marks if any are set, else
+    # the cursor row read the way the Params sub-tab reads it (`selected_params_target`). As
+    # origin → the endpoint paths wanted under it, nil for a whole origin (a host row), plus the
+    # label a toast names it by. nil when the cursor sits on nothing. Keyed by ORIGIN (#1371):
+    # a host row is one scheme and port, and exporting it must not pull in the others'.
+    #
+    # A marked row is its SUBTREE, as the cursor row is: marking `/api` and exporting means the
+    # API under it. A mark the tree no longer holds drops out.
+    def export_targets : {Hash(Sitemap::Origin, Set(String)?), String}?
+      if @marks.empty?
+        t = selected_params_target || return nil
+        return nil unless o = t.origin
+        return { {o => t.paths}, t.label }
+      end
+      index = node_index
+      out = {} of Sitemap::Origin => Set(String)?
+      marked = 0
+      marked_keys.each do |key|
+        _, path = key
+        next unless node = index[key]?
+        next unless o = origin_for(key[0])
+        marked += 1
+        if path.empty? # a host row: the whole origin, whatever else under it was marked
+          out[o] = nil
+        elsif !out.has_key?(o) || (paths = out[o])
+          set = paths || Set(String).new
+          collect_endpoint_paths(node, set)
+          out[o] = set
+        end
+      end
+      return nil if out.empty?
+      {out, "#{marked} marked path#{marked == 1 ? "" : "s"}"}
+    end
+
+    private def collect_endpoint_paths(node : Node, acc : Set(String)) : Nil
+      acc << Sitemap.path_part(node.path) unless node.methods.empty? || node.path.empty?
+      node.children.each { |c| collect_endpoint_paths(c, acc) }
     end
 
     # The cursor row's scope-rule seed — what "add THIS to the scope" means at this depth:
@@ -763,15 +827,29 @@ module Gori::Tui
     def selected_scope_seed : {match_type: String, pattern: String}?
       return nil unless row = visible_rows[@selected]?
       node = row.node
-      return {match_type: "host", pattern: row.host} if row.depth == 0
+      # The BARE host throughout: a `host` rule has no scheme or port, and a `string` rule
+      # matches the port-free url (see above) — the origin label would seed a dead rule.
+      return {match_type: "host", pattern: row.root.host} if row.depth == 0
       # A QUERY fold seeds from its OWN path ("host/search"): it is a real path, unlike a
       # `{uuid}` row, so scoping it means scoping that endpoint rather than its whole parent.
       path = node.grouped && !node.query_fold ? node.fold_parent : node.path
       return nil unless path
       # A fold sitting directly under the host root has no container path to prefix with —
       # scoping it is scoping the host.
-      return {match_type: "host", pattern: row.host} if path.empty?
-      {match_type: "string", pattern: "#{row.host}#{path}"}
+      return {match_type: "host", pattern: row.root.host} if path.empty?
+      {match_type: "string", pattern: "#{row.root.host}#{path}"}
+    end
+
+    # The URL the cursor row stands for — its root's origin, plus the node's path below depth 0
+    # (a fold: its container, as `selected_scope_seed` reads it) — for `y`. nil on an empty
+    # tree, and on a fold with no container path.
+    def selected_url : String?
+      return nil unless row = visible_rows[@selected]?
+      return row.key if row.depth == 0
+      node = row.node
+      path = node.grouped && !node.query_fold ? node.fold_parent : node.path
+      return nil unless path
+      "#{row.key}#{path}"
     end
 
     # One node's {host, method, target}, GET-preferred. A node with no captured method of
@@ -779,10 +857,10 @@ module Gori::Tui
     # to no flow at the store, which is the same "no captured request for this path" the
     # cursor already reports. Shared by the cursor path and the marked-set batch, so a mark
     # can never resolve differently from pressing the same key on that row.
-    private def endpoint_of(node : Node, host : String) : {host: String, method: String, target: String}
+    private def endpoint_of(node : Node, root : Node) : Endpoint
       methods = node.methods
       method = methods.includes?("GET") ? "GET" : (methods.first? || "GET")
-      {host: host, method: method, target: node.path}
+      {host: root.host, method: method, target: node.path, origin: root.origin}
     end
 
     # DFS for the first descendant carrying a method — a fold's stand-in for the actions
@@ -803,7 +881,7 @@ module Gori::Tui
     # refused for the same reason it can't be tagged (it is not a real path) AND because it
     # keeps `path` empty — exactly like its host node, so keying one would light the other up.
     private def mark_key(row : VisibleRow) : {String, String}?
-      row.node.grouped ? nil : {row.host, row.node.path}
+      row.node.grouped ? nil : {row.key, row.node.path}
     end
 
     def mark_count : Int32
@@ -816,7 +894,7 @@ module Gori::Tui
     def marked_hidden_count : Int32
       return 0 if @marks.empty?
       visible = 0
-      visible_rows.each { |r| visible += 1 if (k = mark_key(r)) && @marks.includes?(k) }
+      visible_rows.each { |r| visible += 1 if (k = mark_key(r)) && @marks.marked?(k) }
       @marks.size - visible
     end
 
@@ -827,14 +905,14 @@ module Gori::Tui
     def marked_keys : Array({String, String})
       ordered = [] of {String, String}
       seen = Set({String, String}).new
-      each_node do |node, host|
-        k = {host, node.path}
-        next unless @marks.includes?(k)
+      each_node do |node, root|
+        k = {root.label, node.path}
+        next unless @marks.marked?(k)
         next if seen.includes?(k) # a path is unique per host, so this is belt-and-braces
         ordered << k
         seen << k
       end
-      ordered.concat((@marks - seen).to_a.sort!)
+      ordered.concat(@marks.reject { |k| seen.includes?(k) }.sort!)
       ordered
     end
 
@@ -849,15 +927,21 @@ module Gori::Tui
     # The endpoints behind `target_keys`, resolved through the CURRENT tree (so a collapsed
     # node still resolves). A key the tree no longer holds drops out — the caller compares
     # the size against target_keys to report the shortfall.
-    def target_endpoints : Array({host: String, method: String, target: String})
+    def target_endpoints : Array(Endpoint)
       keys = target_keys
-      return [] of {host: String, method: String, target: String} if keys.empty?
+      return [] of Endpoint if keys.empty?
+      roots = {} of String => Node
+      @hosts.each { |h| roots[h.label] ||= h }
       index = node_index
-      keys.compact_map { |key| index[key]?.try { |node| endpoint_of(node, key[0]) } }
+      keys.compact_map do |key|
+        next unless (node = index[key]?) && (root = roots[key[0]]?)
+        endpoint_of(node, root)
+      end
     end
 
-    def marked?(host : String, path : String) : Bool
-      @marks.includes?({host, path})
+    # `origin_key` is a root's label (`VisibleRow#key`), not the bare host.
+    def marked?(origin_key : String, path : String) : Bool
+      @marks.marked?({origin_key, path})
     end
 
     # `t` — flip the mark on the cursor row, then step DOWN one row so a run of `t` marks
@@ -868,38 +952,41 @@ module Gori::Tui
     def toggle_mark : Bool
       return false unless row = visible_rows[@selected]?
       return false unless key = mark_key(row)
-      @marks.includes?(key) ? @marks.delete(key) : @marks.add(key)
+      @marks.toggle(key)
       # The view's own clamping move, NOT the controller's sitemap_move — that pops focus to
       # the sub-tab strip at the top row, which would eject you mid-gesture.
       move(1)
-      @mark_anchor = key
-      @mark_extent.clear
       true
+    end
+
+    # ⇧T — the list family's mark-all, on the tree. Marks every ENDPOINT the tree currently
+    # SHOWS: the `/` filter and the open folds decide the set, exactly as History's ⇧T is
+    # "every flow the current filter shows".
+    #
+    # `node.methods.empty?` is what makes this safe, and it is the objection this verb was
+    # held back over: a host row and a folder row carry no method, so neither can be swept
+    # into a batch beside the endpoints under them. A synthetic fold is refused a second
+    # time by `mark_key`. Returns how many marks it ADDED, so the caller can say "nothing
+    # to mark" rather than look like a dropped keystroke.
+    def mark_all_visible : Int32
+      before = @marks.size
+      # A host or a folder is not a path to act on. No cursor: the anchor resets.
+      @marks.mark_all(visible_rows.compact_map { |row| mark_key(row) unless row.node.methods.empty? })
+      @marks.size - before
     end
 
     def clear_marks : Nil
       @marks.clear
-      reset_mark_anchor
-    end
-
-    # Forget where a range gesture started (and what it had added), so the next ⇧arrow
-    # anchors at the cursor instead of sweeping back to a stale point.
-    private def reset_mark_anchor : Nil
-      @mark_anchor = nil
-      @mark_extent.clear
     end
 
     # End a ⇧arrow range gesture AND hand back everything it marked — what letting go of ⇧
     # and pressing a plain arrow does in a GUI list, where the highlight collapses instead
-    # of being left behind (#442 / af7e561). Only the gesture's own keys go (@mark_extent):
+    # of being left behind (#442 / af7e561). Only the gesture's own keys go:
     # `t` marks are deliberate, and dropping them too would put a discontiguous set out of
     # reach ("mark this one, skip three, mark that one"). Returns how many marks it gave
     # back, so the caller can say so rather than let a range vanish silently.
     def end_mark_gesture : Int32
-      before = @marks.size
-      @mark_extent.each { |k| @marks.delete(k) }
-      reset_mark_anchor
-      before - @marks.size
+      @marks.end_gesture
     end
 
     # ⇧↑/⇧↓ — extend a contiguous range from the anchor, the keyboard form of a GUI
@@ -909,23 +996,10 @@ module Gori::Tui
     def extend_marks(delta : Int32) : Nil
       rows = visible_rows
       return if rows.empty?
-      anchor_idx = @mark_anchor.try { |a| index_of_mark(rows, a) }
-      unless anchor_idx
-        @mark_anchor = rows[@selected]?.try { |r| mark_key(r) }
-        anchor_idx = @selected
-        @mark_extent.clear
-      end
+      anchor_idx = @marks.anchor.try { |a| index_of_mark(rows, a) }
+      from = @selected
       move(delta)
-      lo, hi = {anchor_idx, @selected}.minmax
-      wanted = Set({String, String}).new
-      (lo..hi).each { |i| rows[i]?.try { |r| mark_key(r).try { |k| wanted.add(k) } } }
-      # Give back what THIS gesture added but the new range no longer covers, so ⇧↑ after
-      # ⇧↓⇧↓ leaves two rows marked rather than three. @mark_extent holds only keys the
-      # gesture itself added, so a `t` mark survives a range sweeping over it and back off.
-      (@mark_extent - wanted).each { |k| @marks.delete(k) }
-      added = wanted - @marks
-      @marks.concat(added)
-      @mark_extent = (@mark_extent & wanted) | added
+      @marks.extend_range(anchor_idx, from, @selected) { |i| rows[i]?.try { |r| mark_key(r) } }
     end
 
     # Row index carrying mark key `key`, or nil when it isn't on screen (collapsed/filtered).
@@ -933,23 +1007,51 @@ module Gori::Tui
       rows.index { |r| mark_key(r) == key }
     end
 
-    # (host, path) → Node over the whole CURRENT tree, folds excluded. Built on demand by
-    # the batch verbs and the tag commit only — never per frame.
+    # (origin key, path) → Node over the whole CURRENT tree, folds excluded. Built on demand
+    # by the batch verbs and the tag commit only — never per frame.
     private def node_index : Hash({String, String}, Node)
       index = {} of {String, String} => Node
-      each_node { |node, host| index[{host, node.path}] ||= node }
+      each_node { |node, root| index[{root.label, node.path}] ||= node }
       index
     end
 
-    # Every real (non-fold) node with the host it hangs under, in tree order.
-    private def each_node(& : Node, String ->) : Nil
-      stack = [] of {Node, String}
-      @hosts.reverse_each { |h| stack << {h, h.label} }
+    # Every real (non-fold) node with the root it hangs under, in tree order.
+    private def each_node(& : Node, Node ->) : Nil
+      stack = [] of {Node, Node}
+      @hosts.reverse_each { |h| stack << {h, h} }
       while entry = stack.pop?
-        node, host = entry
-        yield node, host unless node.grouped
-        node.children.reverse_each { |c| stack << {c, host} }
+        node, root = entry
+        yield node, root unless node.grouped
+        node.children.reverse_each { |c| stack << {c, root} }
       end
+    end
+
+    # The origin a mark key's first half names — a root's label. Remembered across reloads for
+    # as long as a mark holds it (`remember_origins`), so a tag commit or an export can still
+    # name the bare host of a mark whose root a lens has hidden meanwhile. nil only for a label
+    # this view never built.
+    def origin_for(origin_key : String) : Sitemap::Origin?
+      @origins[origin_key]?
+    end
+
+    # Re-seed `@origins` from the freshly built roots, keeping the entries the current marks
+    # still point at — so the map is bounded by the tree plus the marks, never by the session.
+    private def remember_origins : Nil
+      fresh = {} of String => Sitemap::Origin
+      @hosts.each { |h| h.origin.try { |o| fresh[h.label] ||= o } }
+      # The marks, and the pinned targets of an open tag editor: a reload mid-edit that drops
+      # the cursor row's root must not leave its commit without a host to write under.
+      (@marks.to_a + @tag_targets).each do |(label, _)|
+        next if fresh.has_key?(label)
+        @origins[label]?.try { |o| fresh[label] = o }
+      end
+      @origins = fresh
+    end
+
+    # The bare host a mark key's origin stands for — what a tag (keyed on (host, path)) is
+    # written under. nil for a label `origin_for` cannot name.
+    def tag_host(origin_key : String) : String?
+      origin_for(origin_key).try(&.host)
     end
 
     # The tree, then the `↓` dropdown OVER it. Split so the popup is drawn last unconditionally:
@@ -981,7 +1083,7 @@ module Gori::Tui
       # `base + token.start` stops being the token's screen column on exactly the long queries
       # where precision would matter — the card would drift right of what it completes and then
       # clamp. A fixed anchor is always adjacent to the bar and never lies.
-      @popup.render(screen, rect.x + 1 + QUERY_PREFIX.size, top - 1, bounds, QL_HELP)
+      @popup.render(screen, rect.x + 1 + QUERY_PREFIX.size, top - 1, bounds, @ql_help)
     end
 
     private def render_tree_body(screen : Screen, rect : Rect, focused : Bool = true, *,
@@ -1004,12 +1106,20 @@ module Gori::Tui
         msg, hint =
           if @searching
             {"searching…", nil}
+          elsif @no_flows && @query.blank?
+            # Nothing captured, whatever lens is on — History's first branch, for its reason.
+            TrafficEmptyState.render(screen, tree, variant: :sitemap, listen: listen, capturing: capturing)
+            return
           elsif !@query.blank?
             # An INVALID QL residual (all terms bad, or a broken regex) reads as "no
             # endpoints match" unless we say why — @query_note distinguishes it.
             {@query_note || "no endpoints match", querying? ? "esc clears the filter" : "/ to edit the filter"}
+          elsif @hide_static && @scope.try(&.active?) != true
+            {"only static assets so far — they are hidden", "#{static_chip} shows static assets"}
           elsif filtering? # in-scope subset is empty (Scope lens, no QL query)
-            {"no endpoints in scope", nil}
+            # Name the hide-static lens too when it is also on: turning `s` off is not the only
+            # way back, and may not be the one that explains the empty tree.
+            {"no endpoints in scope", @hide_static ? "static assets are hidden too — #{static_chip} shows them" : nil}
           else
             TrafficEmptyState.render(screen, tree, variant: :sitemap, listen: listen, capturing: capturing)
             return
@@ -1057,7 +1167,7 @@ module Gori::Tui
       # A marked row reads as a dim band with a FULLER gutter bar, so it stays
       # distinguishable from the cursor row (accent band) and from a cursor row that is ALSO
       # marked (accent band + full bar). Both glyphs are single-width, so no column moves.
-      marked = mark_key(row).try { |k| @marks.includes?(k) } || false
+      marked = mark_key(row).try { |k| @marks.marked?(k) } || false
       bg = if selected
              focused ? Theme.accent_bg : Theme.selection_dim
            elsif marked
@@ -1072,6 +1182,9 @@ module Gori::Tui
       draw_guides(screen, rect, row, y, bg)
 
       mx = rect.x + 1 + row.depth * 2
+      # A path deeper than the pane is wide (a crawler trap — MAX_DEPTH is 128) has no room for
+      # its marker and label: draw only the guides that fit, never over the right border.
+      return if mx + 2 >= rect.right - 1
       marker, mcolor = node_marker(node, host && node.in_scope)
       screen.cell(mx, y, marker, mcolor, bg)
       lx0 = mx + 2
@@ -1158,10 +1271,19 @@ module Gori::Tui
         txt = node.endpoints == 1 ? "1 path" : "#{node.endpoints} paths"
       elsif !node.methods.empty?
         return rect.right - methods_width(node.methods) - 1
+      elsif js_aside?(node, host)
+        txt = JS_ASIDE
       else
         return nil
       end
       rect.right - txt.size - 1
+    end
+
+    # A row whose only claim to the tree is a JavaScript reference: a method-less path one
+    # names, or a host nothing was captured from. `cluster_start` and `draw_cluster` both ask,
+    # so the label is clipped for exactly the aside that is drawn.
+    private def js_aside?(node : Node, host : Bool) : Bool
+      host ? node.unrequested? : node.js_only?
     end
 
     # A fold row's right-hand count. A QUERY fold counts the query strings it stands for
@@ -1182,7 +1304,9 @@ module Gori::Tui
     # Faint vertical guides at each ancestor level whose branch continues below this row.
     private def draw_guides(screen : Screen, rect : Rect, row : VisibleRow, y : Int32, bg : Color) : Nil
       (0...row.depth).each do |l|
-        screen.cell(rect.x + 1 + l * 2, y, '│', Theme.border, bg) unless (row.guides & (1_u64 << l)) == 0
+        gx = rect.x + 1 + l * 2
+        break if gx >= rect.right - 1
+        screen.cell(gx, y, '│', Theme.border, bg) unless (row.guides & (1_u64 << l)) == 0
       end
     end
 
@@ -1190,7 +1314,8 @@ module Gori::Tui
     # otherwise the depth tone (host bright, deeper nodes normal). `in_scope` is only ever
     # set on host nodes, so depth-0 alone decides the scope branch.
     private def label_color(host : Bool, node : Node) : Color
-      return Theme.accent if node.grouped # the synthetic [1, 2, 3 …] fold pops as accent
+      return Theme.accent if node.grouped     # the synthetic [1, 2, 3 …] fold pops as accent
+      return Theme.muted if node.unrequested? # only JavaScript names it: recede behind traffic
       if host && @scope_configured
         node.in_scope ? Theme.text_bright : Theme.muted
       else
@@ -1221,10 +1346,12 @@ module Gori::Tui
             methods_width(node.fold_methods) + COL_GAP
           end
         draw_aside(screen, rect, y, bg, fold_aside(node), label_end, shift)
-      elsif host
-        draw_aside(screen, rect, y, bg, node.endpoints == 1 ? "1 path" : "#{node.endpoints} paths", label_end) if node.endpoints > 0
-      elsif !node.methods.empty?
+      elsif host && node.endpoints > 0
+        draw_aside(screen, rect, y, bg, node.endpoints == 1 ? "1 path" : "#{node.endpoints} paths", label_end)
+      elsif !host && !node.methods.empty?
         draw_methods(screen, rect, y, bg, node.methods, label_end)
+      elsif js_aside?(node, host)
+        draw_aside(screen, rect, y, bg, JS_ASIDE, label_end)
       end
     end
 
@@ -1276,7 +1403,7 @@ module Gori::Tui
         base = rect.x + 1 + QUERY_PREFIX.size
         screen.input_line(base, rect.y, @query, @qcx, @preedit, Theme.text_bright,
           width: rect.w - QUERY_PREFIX.size - 2,
-          colors: Highlight.filter_query(@query, Theme.text_bright, known: QL_KNOWN))
+          colors: Highlight.filter_query(@query, Theme.text_bright, known: QL_KNOWN, shaped: QL_SHAPED))
         return
       end
 
@@ -1288,21 +1415,21 @@ module Gori::Tui
         # The committed query stays highlighted — this readout is what you scan to
         # check how the active filter is actually being read.
         qx = screen.text(rect.x + 1, rect.y, ": ", Theme.muted, width: left_w)
-        screen.styled_text(qx, rect.y, @query, Highlight.filter_query(@query, Theme.text, known: QL_KNOWN),
+        screen.styled_text(qx, rect.y, @query, Highlight.filter_query(@query, Theme.text, known: QL_KNOWN, shaped: QL_SHAPED),
           Theme.text, width: {rect.x + 1 + left_w - qx, 0}.max)
       else
         # No QL query typed — whether or not a Scope lens is active. Surface the filter
         # affordance + fields rather than a bare "(in-scope only)": the Scope lens is
-        # already signalled by the ⇧S chip on the right, so this row isn't wasted
+        # already signalled by the `s` chip on the right, so this row isn't wasted
         # repeating it, and the user's next move here is to ADD a query atop the lens.
-        screen.text(rect.x + 1, rect.y, FILTER_HINT, Theme.muted, width: left_w)
+        screen.text(rect.x + 1, rect.y, QuerySuggest.idle_hint("/ filter", ["tag"] + QL::HINT_FIELDS, left_w), Theme.muted, width: left_w)
       end
     end
 
     # The filter bar's right cluster as `{tag, text, colour}`, RIGHT-TO-LEFT — the order
     # `Frame.right_text_chain` draws in.
     #
-    # Right cluster: the scope-lens chip (always shown so the ⇧S toggle is discoverable — the
+    # Right cluster: the scope-lens chip (always shown so the `s` toggle is discoverable — the
     # Scope lens filters the tree too) and, when filtering, the matching host count. The
     # `g:fold` toggle keeps the scope chip's accent/muted dress so the two lenses read as one
     # cluster, and its `g` chord stays in view (folding on vs off renders identically when a
@@ -1314,13 +1441,19 @@ module Gori::Tui
       chips = [] of {Symbol, String, Color}
       chips << {:count, "#{@hosts.size}h", Theme.muted} if filtering?
       scope_on = @scope.try(&.active?) == true
-      chips << (scope_on ? {:scope, "s scope:#{@scope.try(&.size) || 0}", Theme.accent} : {:scope, "s scope:off", Theme.muted})
-      chips << {:fold, "g:fold", @grouping ? Theme.accent : Theme.muted}
+      scope_key = key_label("scope.toggle-lens", "s")
+      chips << (scope_on ? {:scope, "#{scope_key} scope:#{@scope.try(&.size) || 0}", Theme.accent} : {:scope, "#{scope_key} scope:off", Theme.muted})
+      chips << {:fold, "#{key_label("sitemap.toggle-grouping", "g")}:fold", @grouping ? Theme.accent : Theme.muted}
+      chips << {:static, "static:hidden", Theme.accent} if @hide_static # see HistoryView's
       chips << {:mark, mark_chip_text.not_nil!, Theme.accent} if mark_chip_text
       chips
     end
 
-    # Which filter-bar chip is under (mx, my) — :count | :scope | :fold | :mark, or nil for a
+    private def key_label(id : String, fallback : String) : String
+      @registry.try { |r| Hotkeys.binding_label(r, id, fallback) } || fallback
+    end
+
+    # Which filter-bar chip is under (mx, my) — :count | :scope | :fold | :static | :mark, or nil for a
     # miss. Same geometry as the paint, off the same tagged list; nil while the bar is being
     # EDITED, where those cells hold the query text instead (see HistoryView#ql_chip_at).
     def ql_chip_at(rect : Rect, mx : Int32, my : Int32) : Symbol?
@@ -1423,6 +1556,19 @@ module Gori::Tui
       @selected
     end
 
+    # Rows the tree currently SHOWS — folds and the `/` filter already applied. O(1) after
+    # the first call per reload (`visible_rows` memoises into @visible_cache), which is what
+    # makes it safe for the 50 ms ui-state identity (#1091).
+    def row_count : Int32
+      visible_rows.size
+    end
+
+    # The cursor row's mark key, or nil on a fold / empty tree — the public form of the
+    # `mark_key(visible_rows[@selected])` the mark gestures already take.
+    def selected_mark_key : {String, String}?
+      visible_rows[@selected]?.try { |r| mark_key(r) }
+    end
+
     # Mirrors `move`: set @selected clamped to the populated rows.
     def select_index(idx : Int32) : Nil
       rows = visible_rows
@@ -1444,15 +1590,15 @@ module Gori::Tui
     private def visible_rows : Array(VisibleRow)
       @visible_cache ||= begin
         rows = [] of VisibleRow
-        @hosts.each_with_index { |host, i| collect(host, 0, 0_u64, i < @hosts.size - 1, rows, host.label) }
+        @hosts.each_with_index { |host, i| collect(host, 0, 0_u64, i < @hosts.size - 1, rows, host) }
         rows
       end
     end
 
     # Flatten the expanded tree, threading the tree-guide bitmask down. `has_next` is
     # whether `node` has a following sibling: when it does, descendants draw a `│` at
-    # `node`'s level (bit `depth`) so the branch reads as continuing. `host` is the depth-0
-    # ancestor's label, carried down so every row knows its host without a back-walk.
+    # `node`'s level (bit `depth`) so the branch reads as continuing. `root` is the depth-0
+    # ancestor, carried down so every row knows its origin without a back-walk.
     # Explicit stack rather than native recursion (see `Sitemap.post_order`): this walk is
     # PRE-order and threads depth + the guide bitmask DOWN, so children are pushed in
     # REVERSE and popped left-to-right, which reproduces the recursion's row order exactly.
@@ -1460,11 +1606,11 @@ module Gori::Tui
     # expanded" (`Sitemap.apply_expand_depth!`, depth < 0), so on a default install this
     # walks the whole tree and was a live stack-overflow path like the other seven.
     private def collect(node : Node, depth : Int32, guides : UInt64, has_next : Bool,
-                        rows : Array(VisibleRow), host : String) : Nil
+                        rows : Array(VisibleRow), root : Node) : Nil
       stack = [{node, depth, guides, has_next}]
       while entry = stack.pop?
         n, d, g, hn = entry
-        rows << VisibleRow.new(n, d, g, host)
+        rows << VisibleRow.new(n, d, g, root)
         next unless n.expanded
         child_guides = hn ? (g | (1_u64 << d)) : g
         last = n.children.size - 1

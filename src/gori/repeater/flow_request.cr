@@ -55,6 +55,13 @@ module Gori
         )
       end
 
+      # Would `build` refuse this head? The predicate behind `refuse_pseudo_header_head`, public
+      # so a caller that screens flows before replaying them (`CacheDeception.skip_reason`) asks
+      # the same question instead of re-deriving it.
+      def self.pseudo_header_head?(head : Bytes) : Bool
+        head.size > 0 && head[0] == 0x3A_u8 # ':'
+      end
+
       # Refuse a head that OPENS WITH AN HTTP/2 PSEUDO-HEADER, and nothing else.
       #
       # As narrow as it can be and still catch the field dump, because P7 ("malformed input
@@ -67,7 +74,7 @@ module Gori
       # dump. Shipping it is not "sending the operator's bytes" — it is sending a message
       # whose first header gori turned into a start line, and then reporting the status.
       private def self.refuse_pseudo_header_head(head : Bytes) : Nil
-        return unless head.size > 0 && head[0] == 0x3A_u8 # ':'
+        return unless pseudo_header_head?(head)
         nl = head.index(0x0A_u8)
         line = String.new(nl ? head[0, nl] : head).rstrip('\r')
         raise PseudoHeaderHead.new(
@@ -156,7 +163,7 @@ module Gori
           # on showing `Content-Length: 0abc` while the socket got `Content-Length: 2`. Measured
           # through `gori run repeater create` + `repeater send` against a raw-socket origin.
           # One predicate now, read by both.
-          return bytes unless rewritable_length_header?(lines[idx])
+          return bytes unless Proxy::Codec::Http1.rewritable_length_header?(lines[idx])
           lines[idx] = "Content-Length: #{body.bytesize}"
         elsif add_if_missing && body.bytesize > 0
           # ADD only into a head this function actually parsed. `split("\r\n")` collapses a
@@ -176,32 +183,6 @@ module Gori
           return bytes
         end
         "#{lines.join("\r\n")}\r\n\r\n#{body}".to_slice
-      end
-
-      # May auto-Content-Length rewrite THIS line? Two things have to hold, and the rewrite
-      # replacing the WHOLE line is why both do.
-      #
-      #   * the FIELD NAME starts at column 0. A leading space makes the line an obs-fold
-      #     continuation of the header above it (RFC 9112 §5.2 — a smuggling primitive gori
-      #     stores byte-exact), and the matcher that finds this line deliberately `lstrip`s so
-      #     a bail-out guard cannot be dodged by indenting. Liberal matching is right for a
-      #     REFUSAL and destructive for a REWRITE: `X-Foo: bar\r\n Content-Length: 5` came back
-      #     as an unindented `Content-Length: 2`, i.e. gori un-folding the operator's fold and
-      #     minting a second real header.
-      #   * the VALUE is a plain decimal count and nothing else. Leading zeros and surrounding
-      #     OWS still count as plain — `  0005  ` is an ordinary length gori may keep honest,
-      #     because `strip` runs before the digit test; what is refused is a value with a
-      #     non-digit in it (`0abc`, `+5`, `4GET / HTTP/1.1`) or none at all.
-      #
-      # THE home for that rule: `resync_content_length` above (the wire) and the TUI's
-      # `RepeaterView#plain_numeric_header?` (the visible header) both read it, and they used
-      # to answer differently for the same line.
-      def self.rewritable_length_header?(line : String) : Bool
-        return false if line.starts_with?(' ') || line.starts_with?('\t')
-        value = line.split(':', 2)[1]?
-        return false unless value
-        digits = value.strip
-        !digits.empty? && digits.each_char.all?(&.ascii_number?)
       end
 
       # The CAPTURED-FLOW replay policy, as opposed to the repeater's auto-CL toggle above.
@@ -307,6 +288,50 @@ module Gori
         "#{scheme}://#{authority(scheme, host, port)}"
       end
 
+      # A dial tuple's refusal, neutral so each tool's `Plan.build` maps it onto its own
+      # `PlanError::Reason`: `unresolved?` = `detail` lists the tokens that resolve to nothing
+      # (`UnresolvedEnv`), else `detail` is the expanded URL no host parsed out of (`BadTarget`).
+      class DialTargetError < Gori::Error
+        getter detail : String
+        getter? unresolved : Bool
+
+        def initialize(message : String, @detail : String, @unresolved : Bool)
+          super(message)
+        end
+      end
+
+      # Refuse a DIAL value (a target, a host, an SNI) carrying a token that resolves to nothing.
+      #
+      # `deferred: nil` — a DIAL TUPLE cannot defer. Every other unresolved-name site skips a
+      # DECLARED binding because a send seam re-scans the same value with `Env.expand_bindings`
+      # later; a dial value is read ONCE, frozen into the plan, and never
+      # looked at again — `Fuzz::Sender`/`Discover::Sender` build their ConnPool on it and the
+      # Layer-1 `Outbound#check` verdict was already taken against it, so re-resolving per send
+      # would move the dial target out from under a scope decision. Deferring bought nothing
+      # anyway: a binding value is a token observed from a response, never a hostname, a port
+      # or an SNI. Left deferred it shipped as the literal `$SESSION` — every send failing DNS,
+      # and `Outbound.scope_url` asked about `https://$SESSION/a`, a URL no rule can match, so
+      # the run was refused as out-of-scope, naming the wrong gate.
+      #
+      # `$` is not a legal byte in a hostname, so there is no operator test case to protect by
+      # sending it literally — unlike a request, where an unset `$NAME` rides the wire as written.
+      def self.refuse_unresolved_dial(raw : String) : Nil
+        names = Env.unresolved(raw, deferred: nil)
+        return if names.empty?
+        detail = Env.token_list(names)
+        raise DialTargetError.new("unresolved env #{detail}", detail, unresolved: true)
+      end
+
+      # The {scheme, host, port} a plan dials for target text `raw`: refused when a token in it
+      # resolves to nothing (`refuse_unresolved_dial`) or when no host parses out of it.
+      def self.dial_target(raw : String) : {String, String, Int32}
+        refuse_unresolved_dial(raw)
+        url = Env.expand(raw)
+        scheme, host, port = parse_target(url)
+        raise DialTargetError.new("could not parse a host from #{url.inspect}", url, unresolved: false) if host.empty?
+        {scheme, host, port}
+      end
+
       # {scheme, host, port} parsed back out of a target string (the inverse of
       # build_target; also used when the CLI accepts a hand-supplied --target).
       def self.parse_target(target : String) : {String, String, Int32}
@@ -349,6 +374,109 @@ module Gori
           end
         end
         {combine(head, body), false}
+      end
+
+      # `wire` with its request-target replaced by `target` — the per-send path/query override
+      # (`gori run repeater send --path`, `gori run repeater <flow-id> --path`, #1116) — or nil
+      # when the request line has no method to anchor on.
+      #
+      # The line and its tokens are found EXACTLY as the scope gate finds them
+      # (`Codec::Http1.request_target_line`): the first line that is not blank by `String#strip`,
+      # split on `Char#whitespace?` — Unicode-aware, so a `\v` or a U+00A0 separates tokens here
+      # as it does there. An ASCII-only scan would edit a different span from the one the gate
+      # then judges, and on this path a divergence is a scope bypass rather than a cosmetic
+      # difference (the gate's own comment says the same).
+      #
+      # Token 1 is the method. The version is the LAST token when it starts with `HTTP/` (any
+      # case — `http/1.1` is a probe, not a missing version); the target is everything between
+      # them, so a target carrying a raw space (`GET /a b HTTP/1.1`, a fuzzer or smuggling
+      # shape) is replaced WHOLE. With no version token (an HTTP/0.9-shaped line) the target
+      # runs to the last token; with a version but no target (`GET  HTTP/1.1`) the new target is
+      # inserted in front of the version. Everything outside the replaced span is kept
+      # byte-exact: the whitespace between tokens, trailing whitespace, the line's terminator,
+      # every header and the body.
+      #
+      # `target` goes in verbatim — it is the operator's bytes (P7) — and it is not expanded
+      # here: a session send expands the whole draft afterwards (`Plan`), and a flow replay
+      # expands the operator's overrides at its own merge seam.
+      def self.replace_request_target(wire : Bytes, target : String) : Bytes?
+        at, line = first_request_line(wire) || return nil
+        splice_request_target(wire, at, line, target)
+      end
+
+      # {byte offset, text} of the request line: the first line that is not blank by
+      # `String#strip`, as the scope gate finds it (see `replace_request_target`). One home, so
+      # the method and the target splice can never disagree about which line they edit.
+      private def self.first_request_line(wire : Bytes) : {Int32, String}?
+        pos = 0
+        while pos < wire.size
+          nl = wire.index(0x0A_u8, pos)
+          stop = nl || wire.size
+          line = String.new(wire[pos, stop - pos])
+          return {pos, line} unless line.strip.empty?
+          return nil unless nl
+          pos = nl + 1
+        end
+        nil
+      end
+
+      # `wire` with its METHOD (the request line's first token) replaced by `method` — `gori run
+      # repeater <flow-id> -X` (#1384) — or nil when there is no request line. Found exactly as
+      # `replace_request_target` finds the line and its tokens, for the reason given there; the
+      # target, the version, every byte of whitespace between them, the headers and the body
+      # stay byte-exact. `method` goes in verbatim (P7).
+      def self.replace_method(wire : Bytes, method : String) : Bytes?
+        at, line = first_request_line(wire) || return nil
+        span = token_spans(line).first? || return nil
+        io = IO::Memory.new(wire.size + method.bytesize)
+        io.write(wire[0, at + span[0]])
+        io << method
+        io.write(wire[(at + span[1])..])
+        io.to_slice
+      end
+
+      private def self.splice_request_target(wire : Bytes, at : Int32, line : String, target : String) : Bytes?
+        spans = token_spans(line)
+        return nil if spans.empty?
+        version = spans.size >= 2 && line.byte_slice(spans.last[0], 5).compare("HTTP/", case_insensitive: true) == 0
+        from, to =
+          if version && spans.size == 2
+            {spans[1][0], spans[1][0]} # no target: insert in front of the version
+          elsif version
+            {spans[1][0], spans[-2][1]}
+          elsif spans.size >= 2
+            {spans[1][0], spans[-1][1]}
+          else
+            return nil # a bare method
+          end
+        insert = version && spans.size == 2 ? "#{target} " : target
+        io = IO::Memory.new(wire.size + insert.bytesize)
+        io.write(wire[0, at + from])
+        io << insert
+        io.write(wire[(at + to)..])
+        io.to_slice
+      end
+
+      # {start, end} byte offsets of each whitespace-separated token of `line`, by the same
+      # predicate `String#split` uses. `Char::Reader` so an invalid byte (a U+FFFD to the
+      # reader, never whitespace) still advances by the one byte it occupies.
+      private def self.token_spans(line : String) : Array({Int32, Int32})
+        spans = [] of {Int32, Int32}
+        start = nil.as(Int32?)
+        reader = Char::Reader.new(line)
+        while reader.has_next?
+          if reader.current_char.whitespace?
+            if open_at = start
+              spans << {open_at, reader.pos}
+              start = nil
+            end
+          else
+            start ||= reader.pos
+          end
+          reader.next_char
+        end
+        start.try { |s| spans << {s, line.bytesize} }
+        spans
       end
 
       # Rewrite a request line's HTTP-version token to match the transport when the user

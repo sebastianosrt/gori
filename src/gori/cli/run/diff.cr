@@ -26,7 +26,7 @@ module Gori
         unchanged = false
         format = :text
 
-        parser = OptionParser.new do |p|
+        parser = option_parser("gori run diff") do |p|
           p.banner = "Usage: gori run diff --from <project> [--to <project>] [options]\n\n" \
                      "Diff two projects at endpoint scale — what is new, gone, or answering\n" \
                      "differently since the last engagement. Endpoints are keyed by the SAME\n" \
@@ -44,14 +44,9 @@ module Gori
           p.on("--verdict=LIST", "Only list these verdicts: #{DIFF_VERDICTS.map(&.label).join(",")}") { |v| verdicts = parse_diff_verdicts(v) }
           p.on("--unchanged", "Also list the unchanged endpoints (they are always COUNTED)") { unchanged = true }
           p.on("--no-issues", "Skip the issue retest (which endpoints the baseline's open issues sit on)") { issues = false }
-          p.on("--format=FMT", "Output: text (default) | json | md (a retest report section)") do |v|
-            # `parse_format` folds "md" onto :markdown, so :md is not a symbol this can hold.
-            format = parse_format(v, [:text, :json, :markdown])
-          end
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
+          # `parse_format` folds "md" onto :markdown, so :md is not a symbol this can hold.
+          format_flag(p, [:text, :json, :markdown], "Output: text (default) | json | md (a retest report section)") { |f| format = f }
           p.unknown_args { |before, after| abort_diff_positional(before + after, p) }
-          p.invalid_option { |f| abort "gori run diff: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run diff: missing value for #{f}" }
         end
         parser.parse(normalize_query_flag(args))
 
@@ -60,6 +55,8 @@ module Gori
         # Into a fresh local first: `verdicts` is assigned inside an OptionParser block, so
         # the compiler keeps it a union and `||` cannot narrow it.
         chosen = verdicts
+        # --verdict names the list outright, so an --unchanged beside it would be dropped unsaid.
+        abort "gori run diff: --unchanged has no effect with --verdict (name 'unchanged' in --verdict instead)" if chosen && unchanged
         verdict_list = chosen || (unchanged ? Gori::Diff::Render::ORDER : Gori::Diff::Render::LISTED)
 
         # Each side names its project ONE way. `resolve_read_project` refuses `--project` +
@@ -160,9 +157,11 @@ module Gori
       private def self.emit_diff(report : Gori::Diff::Report, format : Symbol,
                                  verdicts : Array(Gori::Diff::Verdict), issues : Bool) : Nil
         case format
-        when :json     then puts Gori::Diff::Render.json(report, verdicts: verdicts, issues: issues)
-        when :markdown then puts Gori::Diff::Render.markdown(report, verdicts: verdicts, issues: issues)
-        else                print Gori::Diff::Render.text(report, verdicts: verdicts, issues: issues)
+        when :json then puts Gori::Diff::Render.json(report, verdicts: verdicts, issues: issues)
+          # The two prose forms carry captured paths and titles verbatim, so their control bytes are
+          # named before a terminal sees them (`history` does the same); JSON stays escaped.
+        when :markdown then puts CLI::Output.term_safe_multiline(Gori::Diff::Render.markdown(report, verdicts: verdicts, issues: issues))
+        else                print CLI::Output.term_safe_multiline(Gori::Diff::Render.text(report, verdicts: verdicts, issues: issues))
         end
       end
     end

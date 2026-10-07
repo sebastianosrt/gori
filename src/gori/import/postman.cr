@@ -74,7 +74,7 @@ module Gori
           # One bad request (unresolved variable, non-http scheme, host-less URL) skips
           # rather than aborting the collection — the contract every import parser shares.
           begin
-            pairs << request_to_flow(now, req, scoped, scoped_auth, missing, prov)
+            pairs << Vars.per_entry { request_to_flow(now, req, scoped, scoped_auth, missing, prov) }
           rescue
             skipped += 1
           end
@@ -99,7 +99,11 @@ module Gori
         if content_type && !headers.any? { |(k, _)| k.compare("content-type", case_insensitive: true) == 0 }
           headers << {"Content-Type", content_type}
         end
-        headers.concat(auth_headers(h["auth"]? || auth, vars))
+        signed = auth_headers(h["auth"]? || auth, vars)
+        # Postman's auth signers REPLACE a same-named header (removeHeader, ignoring case)
+        # rather than add a second one beside the request's own.
+        signed.each { |(name, _)| headers.reject! { |(k, _)| k.compare(name, case_insensitive: true) == 0 } }
+        headers.concat(signed)
         Builder.pending_request(now, url, method, headers, body,
           source_surface: prov.surface, source_ref: prov.ref)
       end
@@ -119,19 +123,11 @@ module Gori
       end
 
       private def self.resolve_url(raw : String, vars : Vars::Table, missing : Set(String)) : String
-        url = Vars.expand(raw.strip, vars)
         # `https://{{baseUrl}}/x` would otherwise be STORED with a literal host of
         # `{{baseUrl}}` — a flow that can never be sent, indistinguishable in History from a
         # real one. `Builder::HOST_VALID` now refuses that host as well, but this branch is
         # what records WHICH variables were missing, so keep skipping here. Record and skip.
-        left = Vars.unresolved(url)
-        unless left.empty?
-          left.each { |n| missing << n }
-          raise Gori::Error.new("unresolved variable in URL: #{url}")
-        end
-        raise Gori::Error.new("templated host in URL: #{url}") if Vars.braced_authority?(url)
-        raise Gori::Error.new("request has an empty url") if url.empty?
-        url
+        Vars.checked_url(Vars.expand(raw.strip, vars), missing)
       end
 
       # `url` as an object: {protocol, host: [...], port, path: [...], query: [{key,value}]}.
@@ -151,12 +147,12 @@ module Gori
           next if key.empty?
           "#{key}=#{Vars.value_to_s(qh["value"]?)}"
         end.join('&')
-        String.build do |b|
+        url = String.build do |b|
           b << proto << "://" << host
           b << ':' << port if port
           b << '/' << path unless path.empty?
-          b << '?' << query unless query.empty?
         end
+        Builder.append_query(url, query)
       end
 
       # `host`/`path` are arrays of segments ("api", "example", "com"), but both are
@@ -173,13 +169,49 @@ module Gori
 
       # `/users/:id` + `url.variable: [{key: "id", value: "1"}]` -> `/users/1`, mirroring
       # `Oas.fill_path_params`. `:name` only matches a word after a colon, so neither
-      # `https://` nor a `:443` port is touched (and an undeclared `:token` passes through).
-      PATH_PARAM = /:([A-Za-z_][A-Za-z0-9_-]*)/
+      # the URL authority, query, or fragment is changed; an undeclared `:token` also passes through.
+      PATH_PARAM  = /:([A-Za-z_][A-Za-z0-9_-]*)/
+      SCHEME_NAME = /\A[a-z][a-z0-9+.-]*\z/i
 
       private def self.fill_path_params(url : String, node : JSON::Any?, vars : Vars::Table) : String
         table = Vars.merge!(Vars::Table.new, node)
         return url if table.empty?
-        url.gsub(PATH_PARAM) { |full, m| table[m[1]]?.try { |v| Vars.expand(v, vars) } || full }
+
+        bounds = path_bounds(url)
+        return url unless bounds
+
+        # BYTE offsets, each at an ASCII `/`, `?` or `#`, so every slice lands on a
+        # character boundary — a character slice would shift after a non-ASCII segment.
+        start, path_end = bounds
+        path = url.byte_slice(start, path_end - start)
+        replaced = path.gsub(PATH_PARAM) { |full, m| table[m[1]]?.try { |v| Vars.expand(v, vars) } || full }
+        "#{url.byte_slice(0, start)}#{replaced}#{url.byte_slice(path_end)}"
+      end
+
+      private def self.path_bounds(url : String) : {Int32, Int32}?
+        bytes = url.to_slice
+        i = authority_end(url)
+        while i < bytes.size
+          case bytes[i]
+          when 0x2f_u8 # '/'
+            path_end = i
+            while path_end < bytes.size && bytes[path_end] != 0x3f_u8 && bytes[path_end] != 0x23_u8
+              path_end += 1
+            end
+            return {i, path_end}
+          when 0x3f_u8, 0x23_u8 # '?' or '#', before any path
+            return nil
+          end
+          i += 1
+        end
+        nil
+      end
+
+      private def self.authority_end(url : String) : Int32
+        if scheme_sep = url.byte_index("://")
+          return scheme_sep + 3 if url.byte_slice(0, scheme_sep).matches?(SCHEME_NAME)
+        end
+        url.starts_with?("//") ? 2 : 0
       end
 
       # --- headers / body / auth ------------------------------------------------
@@ -209,10 +241,6 @@ module Gori
         list
       end
 
-      # A fixed boundary (not a random one): imports must be reproducible, and two runs over
-      # the same collection should produce byte-identical flows.
-      FORM_BOUNDARY = "----GoriImportFormBoundary"
-
       private def self.body_of(node : JSON::Any?, vars : Vars::Table) : {Bytes?, String?}
         h = node.try(&.as_h?)
         return {nil, nil} unless h
@@ -222,12 +250,11 @@ module Gori
           text = Vars.expand(Vars.value_to_s(h["raw"]?), vars)
           text.empty? ? {nil, nil} : {text.to_slice, raw_content_type(h)}
         when "urlencoded"
-          pairs = kv_pairs(h["urlencoded"]?, vars).map do |(k, v)|
-            "#{URI.encode_www_form(k)}=#{URI.encode_www_form(v)}"
-          end
-          pairs.empty? ? {nil, nil} : {pairs.join('&').to_slice, "application/x-www-form-urlencoded"}
+          pairs = kv_pairs(h["urlencoded"]?, vars)
+          return {nil, nil} if pairs.empty?
+          {URI::Params.build { |f| pairs.each { |(k, v)| f.add(k, v) } }.to_slice, "application/x-www-form-urlencoded"}
         when "formdata"
-          form_data(h["formdata"]?, vars)
+          Vars.form_data(h["formdata"]?) { |rows| kv_pairs(rows, vars) }
         when "graphql"
           graphql(h["graphql"]?, vars)
         else
@@ -262,28 +289,6 @@ module Gori
           next if key.empty?
           {Vars.expand(key, vars), Vars.expand(Vars.value_to_s(h["value"]?), vars)}
         end
-      end
-
-      private def self.form_data(node : JSON::Any?, vars : Vars::Table) : {Bytes?, String?}
-        arr = node.try(&.as_a?)
-        return {nil, nil} unless arr
-        text_parts = arr.select do |item|
-          h = item.as_h?
-          # A `type: "file"` part references a path on the exporter's machine. Dropping it
-          # keeps the other fields rather than discarding the whole request.
-          !!h && h["disabled"]?.try(&.as_bool?) != true && h["type"]?.to_s != "file"
-        end
-        pairs = kv_pairs(JSON::Any.new(text_parts), vars)
-        return {nil, nil} if pairs.empty?
-        body = String.build do |b|
-          pairs.each do |(k, v)|
-            b << "--" << FORM_BOUNDARY << "\r\n"
-            b << %(Content-Disposition: form-data; name="#{k}") << "\r\n\r\n"
-            b << v << "\r\n"
-          end
-          b << "--" << FORM_BOUNDARY << "--\r\n"
-        end
-        {body.to_slice, "multipart/form-data; boundary=#{FORM_BOUNDARY}"}
       end
 
       private def self.graphql(node : JSON::Any?, vars : Vars::Table) : {Bytes?, String?}
@@ -333,7 +338,9 @@ module Gori
         p = auth_params(h[type]?, vars)
         case type
         when "bearer"
-          list << {"Authorization", "Bearer #{p["token"]? || ""}"}
+          # An empty token signs nothing in Postman, rather than sending `Bearer `.
+          token = p["token"]?.presence
+          list << {"Authorization", "Bearer #{token}"} if token
         when "basic"
           list << {"Authorization", "Basic #{Base64.strict_encode("#{p["username"]? || ""}:#{p["password"]? || ""}")}"}
         when "apikey"

@@ -5,7 +5,10 @@ class Gori::Tui::RepeaterView
   # --- rendering -----------------------------------------------------------
 
   def render(screen : Screen, rect : Rect, focused : Bool = true) : Nil
-    return if rect.empty?
+    if rect.empty?
+      @target_drawn = @columns_drawn = false
+      return
+    end
     unless @loaded
       TrafficEmptyState.render(screen, rect, variant: :repeater, title: "no flow loaded")
       return
@@ -14,10 +17,14 @@ class Gori::Tui::RepeaterView
     # target pane: a 3-row card on top (4 when an SNI override is set/edited);
     # request | response cards fill the rest.
     target_h = {rect.h, target_card_h}.min
+    @target_drawn = target_h >= TARGET_MIN_H
+    content = columns_rect(rect)
+    @columns_drawn = !content.nil?
+    # Before the target draws, so its card is lit as the pane that now has the keys.
+    settle_focus_on_drawn_pane
     render_target(screen, Rect.new(rect.x, rect.y, rect.w, target_h), focused && @focus == :target)
 
-    content = Rect.new(rect.x, rect.y + target_h, rect.w, {rect.h - target_h, 0}.max)
-    return if content.h <= 0
+    return render_columns_note(screen, rect, target_h) unless content
     half = {(content.w - 1) // 2, 1}.max
     left = Rect.new(content.x, content.y, half, content.h)
     right = Rect.new(content.x + half + 1, content.y, {content.w - half - 1, 0}.max, content.h)
@@ -33,6 +40,14 @@ class Gori::Tui::RepeaterView
     render_chain_overlay(screen, rect) if @chain_focused # centered modal ON TOP (replaces the old split)
   end
 
+  # Too short for the columns (#1421). Say so on the rows that are left, rather than leaving
+  # a blank band under TARGET that reads as an empty request.
+  private def render_columns_note(screen : Screen, rect : Rect, target_h : Int32) : Nil
+    return unless rect.h > target_h
+    screen.text(rect.x + 2, rect.y + target_h, "REQUEST · RESPONSE need a taller window",
+      Theme.muted, width: {rect.w - 4, 0}.max)
+  end
+
   # The ^Q chain editor: a centered modal over the whole tab, bound to the marker the
   # cursor sat in when ^Q was pressed. Shows the marker's value, the editable chain, and
   # a live transform preview. Keys route here via the controller (chain_pane_active?).
@@ -41,16 +56,19 @@ class Gori::Tui::RepeaterView
     ChainOverlay.render(screen, area, "CHAIN · #{marker_label}", value, @chain_pane)
   end
 
+  # The TARGET card's floor: a border and the URL row. `@target_drawn` records it.
+  TARGET_MIN_H = 2
+
   private def render_target(screen : Screen, rect : Rect, focused : Bool) : Nil
-    return if rect.h < 2
+    return if rect.h < TARGET_MIN_H
     Frame.card(screen, rect, "TARGET", bg: Theme.bg, border: Frame.pane_border(focused))
     Frame.mode_badge(screen, rect.right - 1, rect.y, rect.x + 8, target_insert?) # the REAL mode, not focused&&mode — see Frame.mode_badge
     sni_x, tls_x, tr_edge = target_chrome_chain(rect)
     # An at-a-glance SNI marker on the top border (right of the title) whenever an
     # override is set, so a custom SNI is visible even before the row is reached.
     screen.text(sni_x, rect.y, SNI_BADGE, Theme.text_bright, Theme.accent_bg) if sni_x
-    # ` ␣T:tls ` / ` ␣T:chrome ` — the TLS fingerprint THIS TAB will present (#844), and the
-    # only thing on screen saying `␣T` has anything to offer. It rides the TARGET band for the
+    # ` ␣Pt:tls ` / ` ␣Pt:chrome ` — the TLS fingerprint THIS TAB will present (#844), and the
+    # only thing on screen saying `␣Pt` has anything to offer. It rides the TARGET band for the
     # same reason `^V` does: this is where "how do we connect" already lives.
     #
     # Three dresses. Muted while no override is set — this one really does have an off state,
@@ -64,7 +82,7 @@ class Gori::Tui::RepeaterView
       fg, bg = tls_preset_live? ? {Theme.text_bright, Theme.accent_bg} : {Theme.muted, Theme.bg}
       screen.text(tls_x, rect.y, tls_chip_label, fg, bg)
     end
-    # ` ^V:h1 ` / ` ^V:h2 ` / ` ^V:WS ` — the transport `^R` will dial, and the only thing on
+    # ` ^V:HTTP/1.1 ` / ` ^V:HTTP/2 ` / ` ^V:WS ` — the transport `^R` will dial, and the only thing on
     # screen saying `^V` has anything to offer. It rides the TARGET band rather than the
     # REQUEST border because that is where the rest of "how do we connect" already lives
     # (the URL, the SNI override) and because the request border is a half-width column that
@@ -85,46 +103,11 @@ class Gori::Tui::RepeaterView
                      else
                        {Theme.text_bright, Theme.accent_bg, Attribute::None}
                      end
-      Frame.state_badge(screen, tr_edge, rect.y, target_chip_min(rect), "^V", transport_label, fg, bg, attr)
+      Frame.state_badge(screen, tr_edge, rect.y, target_chip_min(rect), key_label("repeater.toggle-http2", "^V"), transport_label, fg, bg, attr)
     end
     url_active = focused && @target_field == :url
     sni_active_row = focused && @target_field == :sni
     draw_target_row(screen, rect, rect.y + 1, TARGET_PREFIX, @target, @tcx, url_active, target_insert?)
     draw_target_row(screen, rect, rect.y + 2, SNI_PREFIX, @sni, @scx, sni_active_row, target_insert?) if sni_active? && rect.h >= 4
-  end
-
-  # One single-line field row of the TARGET card: a marker prefix, then the value,
-  # with the block caret + terminal cursor when this row is the active field.
-  private def draw_target_row(screen : Screen, rect : Rect, row : Int32, prefix : String, value : String,
-                              cx : Int32, active : Bool, insert : Bool) : Nil
-    screen.text(rect.x + 2, row, prefix, active ? Theme.accent : Theme.muted)
-    base = field_base(rect, prefix)
-    w = {rect.right - base - 1, 1}.max
-    Highlight.draw(screen, base, row, Highlight.env_line(value, Theme.text_bright), width: w)
-    # AFTER the value, and before the caret below. `Highlight.draw` writes its own `bg`
-    # into every cell it touches, so a band painted first was applied and erased on the
-    # same frame: ⇧←/→ on this row selected, `y` copied the right slice, and the operator
-    # saw nothing. The caret still goes last, because when the selection grows LEFTWARD
-    # the caret cell is inside the span and the band would otherwise erase it.
-    if active && !insert
-      if span = @target_read.selection_span(cx)
-        paint_char_span_bg(screen, base, row, value, span[0], span[1], Theme.accent_bg)
-      end
-    end
-    if active
-      # column_width — the measure paint_char_span_bg (the selection tint, a few lines up)
-      # already uses on this same value in this same render, and the exact inverse of the
-      # Screen.column_for that target_click_to_cursor uses to turn a click back into `cx`.
-      # display_width scored a zero-width char as 0, so the three disagreed: the tint
-      # covered one span, the caret sat a column left of its glyph, and a click landed a
-      # character off. A URL carrying U+200B is ordinary traffic for this tool (it is a
-      # stock filter-bypass payload), so this is reachable, not theoretical.
-      cursor_x = base + Screen.draw_width(value[0, cx])
-      if cursor_x < rect.right - 1
-        ch = cx < value.size ? value[cx] : ' '
-        screen.cell(cursor_x, row, ch, Theme.bg, insert ? Theme.accent : Theme.accent_bg)
-        screen.cursor(cursor_x, row)
-      end
-    end
   end
 end

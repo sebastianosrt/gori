@@ -80,12 +80,11 @@ module Gori
         end
 
         def detections(plan : Plan, result : Repeater::Result, detail : Store::FlowDetail) : Array(Detection)
-          return [] of Detection unless result.ok?
+          return [] of Detection unless Evidence.complete?(result)
           # A truncated probe response (the origin closed early, or the body hit the capture
           # ceiling) can't be trusted for the status/size comparison below — treat it as no
           # evidence rather than risk a false positive on a privileged-looking fragment, or a
           # false negative on a body cut short below the baseline. (See Repeater::Result#incomplete?.)
-          return [] of Detection if result.incomplete?
 
           resp = Proxy::Codec::Http1.parse_response_head(result.head)
           status = resp.status
@@ -156,13 +155,7 @@ module Gori
         # per-action, not per-argument), and the action id is included so distinct actions posted
         # to the same page route are distinct surfaces. host:PORT so another service is distinct.
         private def key_string(detail : Store::FlowDetail, method_upcase : String, target : String, aid : String) : String
-          "nextjs_action_no_auth|#{detail.row.host}:#{detail.row.port}|#{method_upcase}|#{path_key(target)}|#{aid}"
-        end
-
-        private def path_key(target : String) : String
-          t = Active.origin_form(target)
-          qi = t.index('?')
-          qi ? t[0...qi] : t
+          endpoint_key(detail, method_upcase, path_only(Active.origin_form(target)), tag: aid)
         end
 
         # Whether the response redirected the credential-less caller to a login/auth route — the
@@ -187,10 +180,8 @@ module Gori
         # stripped probe and the authenticated baseline so their sizes compare symmetrically, and
         # both go through the same content-decode so a gzip'd baseline vs a gzip'd probe is fair.
         private def capped_decoded(head : Bytes?, body : Bytes?) : Bytes
-          return Bytes.empty if head.nil? || body.nil? || body.empty?
-          decoded, _ = Proxy::Codec::ContentDecode.decode(head, body, BODY_CAP)
-          bytes = decoded || body
-          bytes[0, {bytes.size, BODY_CAP}.min]
+          return Bytes.empty if head.nil?
+          decoded_body(head, body) || Bytes.empty
         end
 
         # Rebuild the request with the credential headers removed: split off the head, drop any

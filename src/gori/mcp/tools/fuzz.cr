@@ -14,19 +14,26 @@ module Gori
     class Tools
       # --- fuzz tools (gated, async job model) --------------------------------
 
-      @[Tool("fuzz_start", gated: true, agent_action: true, env_refresh: true)]
+      @[Tool("fuzz_start", gated: true, agent_action: true, env_refresh: true,
+        requires: ["fuzz_status", "fuzz_results", "fuzz_stop"], permission: "send")]
       private def fuzz_start(h) : Result
         ob = outbound(bool_arg(h, "allow_unscoped", false))
         save_results = bool_arg(h, "save_results", false)
-        engine, origin, total, http2, shadowed_marks, ws_frames, ws_ignored, grpc, tls_preset, mode_label, effective_sni, effective_max_requests =
+        engine, origin, total, http2, shadowed_marks, ws_frames, ws_ignored, grpc, tls_preset, mode_label, effective_sni, effective_max_requests, sets_warn, payload_reports, request_target =
           build_fuzz_job(h, ob, save_results)
-        # Scope gate before launching any real send (host-level: fuzz sweeps many
-        # paths against one origin, so evaluate the origin host).
-        sc = ob.check("#{origin.scheme}://#{origin.host}/", origin.host,
-          Outbound.exclude_url(origin.scheme, origin.host, "/", origin.port))
+        # Scope gate before launching any real send, on the template's real request-target —
+        # the check `sequence_start` and `gori run fuzz` make. Asking about a bare `/` refused
+        # an in-scope run under a path-scoped include and let a path EXCLUDE through Layer 1.
+        sc = ob.check_request(origin.scheme, origin.host, request_target, origin.port)
         return scope_blocked(sc) if sc.blocked?
-        if total && total > FUZZ_MAX_REQUESTS
-          return err("too many requests (#{total} > #{FUZZ_MAX_REQUESTS}); narrow positions/payloads", "BUDGET_EXHAUSTED")
+        # Judged on what the run can SEND: a caller `max_requests` is a hard cap, so a capped
+        # draw from a set larger than the ceiling is as bounded as a small set (#1209), and
+        # `budget_warning` below says it will not check every candidate. An unknown total is
+        # still let through — the engine's own cap is never above FUZZ_MAX_REQUESTS.
+        caller_cap = optional_int_arg(h, "max_requests")
+        if (bound = Fuzz.request_bound(total, caller_cap, engine.macro_requests(total))) && bound > FUZZ_MAX_REQUESTS
+          return err("too many requests (#{bound} > #{FUZZ_MAX_REQUESTS}); narrow positions/payloads " \
+                     "or pass max_requests (at most #{FUZZ_MAX_REQUESTS})", "BUDGET_EXHAUSTED")
         end
         @job_seq += 1
         id = "fz_#{@job_seq}"
@@ -45,7 +52,7 @@ module Gori
             Fuzz::SavedRunMeta.new(nil, audit.target, mode_label, total,
               created_at: audit.started_at_ms * 1000_i64, http2: http2,
               sni: effective_sni, tls_preset: fjob.tls_preset, websocket: fjob.websocket?,
-              surface: "mcp", source_ref: id))
+              surface: "mcp", source_ref: id, keep: fuzz_keep(h).label))
         end
         # Re-read rather than plumbed back out of `build_fuzz_job`: it is a REPORTING input
         # (it words `grpc_stale_prefix_reason`), read off the same arg and the same default
@@ -54,7 +61,7 @@ module Gori
         fjob.reframe_grpc = bool_arg(h, "reframe_grpc", false)
         evict_finished_jobs(@jobs)
         @jobs[id] = fjob
-        warn = budget_warning(total, optional_int_arg(h, "max_requests"))
+        warn = budget_warning(total, caller_cap)
         # A `marks` token that occurs ONLY inside `§…§` that were already there — or flush
         # against one, where a second pair would merge into it — makes no position of its own,
         # and the builder can neither refuse the run (those earlier positions are real) nor
@@ -68,7 +75,7 @@ module Gori
         # Audit on STDERR — never STDOUT (reserved for JSON-RPC).
         Log.info { "fuzz_start #{id} #{origin.scheme}://#{origin.host}:#{origin.port} scope=#{sc.decision} record=#{fjob.record_history} total=#{total || "?"}" }
         spawn(name: "mcp-fuzz-#{id}") { run_fuzz_job(fjob, engine) }
-        Result.new(fuzz_start_echo(id, total, fjob, sc, ws_frames, ws_ignored, warn, marks_warn, grpc))
+        Result.new(fuzz_start_echo(id, total, fjob, sc, ws_frames, ws_ignored, warn, marks_warn, sets_warn, grpc, payload_reports))
       rescue ex : FuzzArgError
         Result.new(ex.message || "invalid fuzz arguments", is_error: true)
       end
@@ -87,8 +94,9 @@ module Gori
       # `follow_redirects` and heard nothing would conclude the sweep followed them.
       private def fuzz_start_echo(id : String, total : Int64?, fjob : FuzzJob, sc,
                                   ws_frames : Int32?, ws_ignored : Array(Symbol),
-                                  warn : String?, marks_warn : String?,
-                                  grpc : Fuzz::GrpcFieldTemplate? = nil) : String
+                                  warn : String?, marks_warn : String?, sets_warn : String? = nil,
+                                  grpc : Fuzz::GrpcFieldTemplate? = nil,
+                                  payload_reports : Array(PayloadFrom::Report) = [] of PayloadFrom::Report) : String
         JSON.build do |j|
           j.object do
             j.field "job_id", id
@@ -100,6 +108,7 @@ module Gori
             # play. Named on the START echo and on every `fuzz_status` so a result set read
             # later still says which side of a fingerprint A/B it is.
             j.field("tls_preset", fjob.tls_preset) if fjob.tls_preset
+            emit_request_macro_plan(j, fjob.engine.request_macro.try(&.info(fjob.engine.concurrency, fjob.engine.race_count)))
             if wf = ws_frames
               j.field "websocket", true
               j.field "ws_frames_out", wf
@@ -107,6 +116,18 @@ module Gori
             j.field("ignored_args", ws_ignored.map(&.to_s)) unless ws_ignored.empty?
             j.field("budget_warning", warn) if warn
             j.field("marks_warning", marks_warn) if marks_warn
+            # Payload sets the chosen `mode` will never draw from. Beside `marks_warning` and
+            # for the same reason: the job runs either way, and an agent that passed two
+            # wordlists under the default `sniper` and heard nothing concludes both were swept.
+            j.field("payload_sets_warning", sets_warn) if sets_warn
+            # What each `payload_from` set read (#1352): the source, flows and values counted,
+            # the sensitive-value policy that applied, and what cut it short — never a value.
+            # Present only when the run had one, so every other echo is byte-identical.
+            unless payload_reports.empty?
+              j.field "payload_sources" do
+                payload_reports_json(j, payload_reports)
+              end
+            end
             # WHICH rpc and message the named `fields` resolved through, and what each one is
             # declared as. The same fact `gori run fuzz` prints once up front and for the same
             # reason: the caller passed a NAME and gori bound it to a declaration in a `.proto`
@@ -120,12 +141,12 @@ module Gori
                   j.field("fields") do
                     j.array do
                       g.fields.each do |f|
-                        j.object do
-                          j.field "spec", f.spec
-                          j.field "name", f.defn.name
-                          j.field "number", f.defn.number.to_i64
-                          j.field "type", f.defn.type_label
-                        end
+                        {
+                          spec:   f.spec,
+                          name:   f.defn.name,
+                          number: f.defn.number.to_i64,
+                          type:   f.defn.type_label,
+                        }.to_json(j)
                       end
                     end
                   end
@@ -171,11 +192,17 @@ module Gori
           # Permanent storage is deliberately independent of the selective/capped live cache.
           # A write failure is absorbed by Persistence and never stops outbound traffic.
           fjob.persistence.try(&.append(ev.result))
-          flow_id = maybe_record_fuzz_flow(fjob, ev.result)
-          store_fuzz_result(fjob, ev.result, flow_id)
+          fjob.clusters.add(ev.result)
+          flow_id, flow_ref = maybe_record_fuzz_flow(fjob, ev.result)
+          store_fuzz_result(fjob, ev.result, flow_id, flow_ref)
         when Fuzz::DoneEvent
           apply_fuzz_progress(fjob, ev.progress)
-          terminal = fuzz_terminal_status(fjob, ev.progress, ev.stopped)
+          fjob.stop_reason = ev.stop_reason
+          terminal = fuzz_terminal_status(fjob, ev.progress, ev.stopped, ev.stop_reason)
+          # Only a `condition_met` ending has a stop row — the rule the saved run's terminal
+          # update and the TUI apply, so a job that landed :error does not name one live while
+          # its saved run says null.
+          fjob.stop_index = terminal == :condition_met ? ev.stop_index : nil
           finish_fuzz_persistence(fjob, terminal)
           fjob.status = terminal
           fjob.ended_at_ms = Time.utc.to_unix_ms
@@ -202,18 +229,19 @@ module Gori
       # record_history asks (matched → matched results, all → every sent request),
       # returning the new flow id. Bounded by FUZZ_HISTORY_MAX to cap DB growth for
       # `all`. Recording must never break the run — a failure just yields nil.
-      private def maybe_record_fuzz_flow(fjob : FuzzJob, r : Fuzz::Result) : Int64?
-        return nil if fjob.record_history == :none
-        return nil unless fjob.record_history == :all || r.matched?
+      private def maybe_record_fuzz_flow(fjob : FuzzJob, r : Fuzz::Result) : {Int64?, String?}
+        return {nil, nil} if fjob.record_history == :none
+        return {nil, nil} unless fjob.record_history == :all || r.matched?
         req = r.request
-        return nil unless req
+        return {nil, nil} unless req
         if fjob.recorded_flows >= FUZZ_HISTORY_MAX
           fjob.history_truncated = true
-          return nil
+          return {nil, nil}
         end
-        fid = record_fuzz_flow(fjob, req, fjob.origin, fjob.http2?, r)
+        flow_ref = fjob.next_history_source_ref
+        fid = record_fuzz_flow(fjob, req, fjob.origin, fjob.http2?, r, flow_ref)
         fjob.recorded_flows += 1 if fid
-        fid
+        {fid, fid ? flow_ref : nil}
       end
 
       # Reconstruct a History flow (request head/body + response head/body) from a fuzz Result.
@@ -224,11 +252,12 @@ module Gori
       # is how the two would have drifted on the next fix. What stays MCP's is the REPORTING:
       # recording runs per result, so a store that fails every insert must not log once per
       # request — the failure is counted against this job's drain budget instead.
-      private def record_fuzz_flow(fjob : FuzzJob, request : Bytes, origin : Fuzz::Origin, http2 : Bool, r : Fuzz::Result) : Int64?
+      private def record_fuzz_flow(fjob : FuzzJob, request : Bytes, origin : Fuzz::Origin,
+                                   http2 : Bool, r : Fuzz::Result, flow_ref : String) : Int64?
         Fuzz::HistoryRecord.record(store, r,
           scheme: origin.scheme, host: origin.host, port: origin.port, http2: http2,
           source: Gori::FlowSource::Kind::Fuzzer, surface: Gori::FlowSource::Surface::Mcp,
-          source_ref: fjob.id, websocket: fjob.websocket?) do |ex|
+          source_ref: flow_ref, websocket: fjob.websocket?) do |ex|
           fjob.drain_errors += 1
           Log.warn(exception: ex) { "fuzz history record failed" } if fjob.drain_errors <= DRAIN_LOG_CAP
         end
@@ -246,11 +275,12 @@ module Gori
       # Progress.requests (not payload count) is the max_requests budget unit, and a nil total
       # remains incomplete when that wire budget was reached.
       private def fuzz_terminal_status(fjob : FuzzJob, progress : Fuzz::Progress,
-                                       stopped : Bool) : Symbol
+                                       stopped : Bool, stop_reason : String? = nil) : Symbol
         case Fuzz.terminal_status(progress, stopped, fjob.audit.max_requests,
-          fjob.terminal_error?)
+          fjob.terminal_error?, stop_reason)
         when "done"             then :done
         when "budget_exhausted" then :budget_exhausted
+        when "condition_met"    then :condition_met
         when "stopped"          then :stopped
         else                         :error
         end
@@ -259,7 +289,8 @@ module Gori
       private def finish_fuzz_persistence(fjob : FuzzJob, status : Symbol) : Nil
         return if fjob.persistence_finished?
         if persistence = fjob.persistence
-          persistence.finish(fjob.sent, fjob.matched, fjob.errors, status.to_s)
+          persistence.finish(fjob.sent, fjob.matched, fjob.errors, status.to_s,
+            stop_idx: fjob.stop_index)
         end
         fjob.persistence_finished = true
       end
@@ -296,7 +327,7 @@ module Gori
         fjob.ws_note_reason = p.ws_note_reason
       end
 
-      private def store_fuzz_result(fjob : FuzzJob, r : Fuzz::Result, flow_id : Int64?) : Nil
+      private def store_fuzz_result(fjob : FuzzJob, r : Fuzz::Result, flow_id : Int64?, flow_ref : String?) : Nil
         # A RE-SENT row is stored even when it did not match: its request reached the origin
         # twice, and "stored results are matched-only" would put the duplicate back out of an
         # agent's reach entirely (the CLI at least printed a connections summary). `resent?` (a
@@ -313,7 +344,7 @@ module Gori
         # names no PAYLOAD, so an agent could see `errors: 40` and have no way to ask which
         # forty. The CLI prints both (`emit_fuzz_result`) and the TUI renders every row; this
         # was the one surface where they vanished.
-        return unless r.matched? || r.retried? || r.resent? || r.incomplete? || r.chain_error || r.error
+        return unless r.interesting?
         # TWO budgets, because one FIFO over `FUZZ_MAX_STORED` lets the exceptions EVICT the
         # findings. Rows arrive in send order and the cap is a hard stop, so a sweep against a
         # target that starts resetting — or one the Sandbox refuses outright, where every row
@@ -328,11 +359,13 @@ module Gori
         # `FUZZ_MAX_STORED_UNMATCHED` sub-budget, which is generous for the job it has (naming
         # WHICH payloads failed — a thousand named examples is a diagnosis, not a sample), and
         # matches keep the full cap. `results_truncated` is set by either stop, honestly.
+        # The stop row rides the match budget too: it arrives LAST, exactly when a failing
+        # sweep has already spent the unmatched one, and it is the row the run ended on.
         if fjob.results.size >= FUZZ_MAX_STORED
           fjob.truncated = true
           return
         end
-        unless r.matched?
+        unless r.matched? || r.stop_hit?
           if fjob.unmatched_stored >= FUZZ_MAX_STORED_UNMATCHED
             fjob.truncated = true
             return
@@ -341,11 +374,12 @@ module Gori
         end
         fjob.results << r
         fjob.result_flow_ids << flow_id
+        fjob.result_flow_source_refs << flow_ref
       end
 
-      @[Tool("fuzz_status", gated: true)]
+      @[Tool("fuzz_status", gated: true, read_only: true, permission: "send")]
       private def fuzz_status(h) : Result
-        fjob = lookup_fuzz_job(h)
+        fjob = lookup_job(h, @jobs, "fuzz", "status")
         return fjob if fjob.is_a?(Result)
         Result.new(JSON.build do |j|
           j.object do
@@ -414,20 +448,34 @@ module Gori
             j.field "record_history", fjob.record_history.to_s
             emit_fuzz_save_state(j, fjob)
             j.field("tls_preset", fjob.tls_preset) if fjob.tls_preset
+            emit_request_macro_status(j, fjob.engine.request_macro)
             j.field "recorded_flows", fjob.recorded_flows
             j.field "history_truncated", fjob.history_truncated?
             j.field "job_complete", fjob.status != :running
             j.field "incomplete_reason", incomplete_reason(fjob.status)
+            # Why the run's own `stop_on` ended it (issue #1240) — present only for a
+            # :condition_met run, so a non-stop_on job's status object is unchanged.
+            j.field("stop_reason", Serialize.text(fjob.stop_reason)) if fjob.stop_reason
+            # And WHICH result it tripped on (issue #1270): the row's `index`, and the `stop_index`
+            # a save_results run keeps for get_fuzz_run after the job is gone. The stop row rides
+            # the match budget of the live cache, so fuzz_results lacks it only once
+            # `results_truncated` — the saved run, which checks its archive, never points at nothing.
+            j.field("stop_index", fjob.stop_index) if fjob.stop_index
             j.field "error", fjob.error_msg
             emit_audit(j, fjob.audit, fjob.ended_at_ms)
           end
         end)
       end
 
-      @[Tool("fuzz_results", gated: true)]
+      FUZZ_RESULTS_LIMIT = PageLimit.new(100, 1000)
+
+      @[Tool("fuzz_results", gated: true, read_only: true, requires: ["get_flow"], permission: "send")]
       private def fuzz_results(h) : Result
-        fjob = lookup_fuzz_job(h)
+        fjob = lookup_job(h, @jobs, "fuzz", "results")
         return fjob if fjob.is_a?(Result)
+        cluster_args = fuzz_cluster_args(h)
+        return cluster_args if cluster_args.is_a?(Result)
+        return fuzz_results_clusters(fjob, h, cluster_args) if cluster_args.requested?
         # `matched_only` FILTERS, and it has to: the stored set is not matched-only. Since
         # `store_fuzz_result` began keeping a row whose request was re-sent, retried or came
         # back truncated, `fuzz_results` has mixed matches with non-matches — and the row
@@ -439,24 +487,27 @@ module Gori
         # index-aligned with `results`, and a filtered page still has to point each row at the
         # History flow that IS its evidence.
         rows = fjob.results
-        flow_ids = fjob.result_flow_ids
         matched_only = bool_arg(h, "matched_only", false)
         picked = (0...rows.size).to_a
         picked.select! { |i| rows[i].matched? } if matched_only
-        req_off = optional_int_arg(h, "offset")
-        req_lim = optional_int_arg(h, "limit")
-        offset = clamp_nonneg(req_off)
-        limit = clamp(req_lim, 100, 1000)
-        last = offset < picked.size ? Math.min(offset + limit, picked.size) : offset
-        returned = last - offset
+        # `results` holds a concurrent run's rows as they COMPLETED; page them in index order,
+        # as the TUI lists them and a saved run is read back (`ORDER BY idx, id`), so an offset
+        # names the same rows every surface does (#1432). Arrival breaks a resend's tie.
+        picked.sort_by! { |i| {rows[i].index, i} }
+        pg = page_args(h, FUZZ_RESULTS_LIMIT)
+        last = pg.offset < picked.size ? Math.min(pg.offset + pg.limit, picked.size) : pg.offset
+        returned = last - pg.offset
+        page = picked[pg.offset...last]? || [] of Int32
+        page_flow_ids = validated_fuzz_flow_ids(fjob, page)
         Result.new(JSON.build do |j|
           j.object do
-            j.field("results") { j.array { (offset...last).each { |k| Serialize.fuzz_result(j, rows[picked[k]], flow_ids[picked[k]]?) } } }
-            j.field "returned", returned
-            j.field "offset", offset
+            j.field "results" do
+              j.array do
+                page.each_with_index { |pos, k| Serialize.fuzz_result(j, rows[pos], page_flow_ids[k]) }
+              end
+            end
+            emit_page(j, pg, returned)
             j.field "total_available", picked.size
-            j.field "limit", limit
-            emit_clamp(j, req_off, offset, req_lim, limit)
             j.field "matched_only", matched_only
             # What the filter is selecting FROM, so a caller that passed matched_only can see
             # how many non-matching rows the run kept rather than having to page twice to
@@ -471,32 +522,56 @@ module Gori
             j.field "results_truncated", fjob.truncated?
             j.field "history_truncated", fjob.history_truncated?
             emit_fuzz_save_state(j, fjob)
+            # A match with no way to its body. The default `record_history: "none"` records no
+            # History flow and `save_results` keeps no run, so every row on this page lacks the
+            # `flow_id` a follow-up `get_flow` would take — said here, where the missing field
+            # is noticed, rather than only in the start echo read before any hit existed.
+            if fjob.record_history == :none && fjob.persistence.nil? && page.any? { |pos| rows[pos].matched? }
+              j.field "evidence_note", "this run recorded no History (record_history: \"none\", the default) " \
+                                       "and saved no results, so matched rows carry no flow_id and their " \
+                                       "response bodies are not retrievable. Re-run with record_history: " \
+                                       "\"matched\" (a get_flow pointer per match) or save_results: true."
+            end
           end
         end)
       end
 
-      @[Tool("fuzz_stop", gated: true, agent_action: true)]
-      private def fuzz_stop(h) : Result
-        fjob = lookup_fuzz_job(h)
-        return fjob if fjob.is_a?(Result)
-        fjob.stop
-        stop_and_report(fjob)
+      # The History flow id of each cached result at `positions` (indices into `fjob.results`),
+      # aligned with them. A live MCP job can outlast a peer's History clear, so a saved bare id
+      # is returned only while it still names THIS result's Fuzzer row; a later Import/capture
+      # or another result from the same job may otherwise inherit the id.
+      private def validated_fuzz_flow_ids(fjob : FuzzJob, positions : Array(Int32)) : Array(Int64?)
+        flow_ids = fjob.result_flow_ids
+        flow_refs = fjob.result_flow_source_refs
+        wanted = positions.compact_map { |pos| flow_ids[pos]? }
+        current_flow_refs = {} of Int64 => String
+        store.flow_rows(wanted.uniq).each do |row|
+          if row.source.try(&.fuzzer?) == true
+            row.source_ref.try { |ref| current_flow_refs[row.id] = ref }
+          end
+        end
+        positions.map do |pos|
+          flow_id = flow_ids[pos]?
+          if fid = flow_id
+            expected_ref = flow_refs[pos]?
+            flow_id = nil unless expected_ref && current_flow_refs[fid]? == expected_ref
+          end
+          flow_id
+        end
       end
 
-      # The job for `job_id`, or an error Result the caller returns as-is.
-      private def lookup_fuzz_job(h) : FuzzJob | Result
-        id = str(h, "job_id")
-        return Result.new("missing required 'job_id'", is_error: true) if id.nil? || id.empty?
-        job = @jobs[id]?
-        return not_found("no fuzz job #{id}") unless job
-        job_project_mismatch(job) || job
+      @[Tool("fuzz_stop", gated: true, agent_action: true, permission: "send")]
+      private def fuzz_stop(h) : Result
+        fjob = lookup_job(h, @jobs, "fuzz", "stop")
+        return fjob if fjob.is_a?(Result)
+        stop_and_report(fjob)
       end
 
       # Build a ready-to-run engine + its origin + total + effective http2 + the `marks`
       # tokens that made no position of their own (`Fuzz::Plan#shadowed_marks`, reported by
       # `fuzz_start`) from the tool args. Raises FuzzArgError (clean message) on any malformed
       # input.
-      private def build_fuzz_job(h, ob : Outbound, save_results : Bool = false) : {Fuzz::Engine, Fuzz::Origin, Int64?, Bool, Array(String), Int32?, Array(Symbol), Fuzz::GrpcFieldTemplate?, String?, String, String?, Int64?}
+      private def build_fuzz_job(h, ob : Outbound, save_results : Bool = false) : {Fuzz::Engine, Fuzz::Origin, Int64?, Bool, Array(String), Int32?, Array(Symbol), Fuzz::GrpcFieldTemplate?, String?, String, String?, Int64?, String?, Array(PayloadFrom::Report), String}
         text, default_target, src_h2, evidence, src_sni, src_tls_preset = fuzz_template_source(h)
         use_h2 = bool_arg(h, "http2", false) || src_h2
         mode = fuzz_mode(h)
@@ -541,8 +616,20 @@ module Gori
         effective_sni = str(h, "sni").presence || src_sni
         config = fuzz_config(h, mode, src_tls_preset)
         matcher = fuzz_matcher(h)
+        # The `stop_on` condition (issue #1240): `after_matches` on the config, a separate
+        # match/filter predicate on the matcher — evaluated on the one decode `build` pays for.
+        # Set BEFORE spec_error so a bad stop term ("size: 1O00") is refused by the same
+        # validator, and BEFORE `config.keep` below so both #1240 knobs land together.
+        config.stop_after_matches, matcher.stop_condition = fuzz_stop_on(h)
+        config.keep = fuzz_keep(h)
+        # `keep` governs only the `save_results` archive; without one it did nothing. Refused,
+        # as the CLI's `--keep` without `fuzz save` is.
+        if config.keep.interesting? && !save_results
+          raise FuzzArgError.new("'keep' applies to the save_results archive; pass save_results: true")
+        end
         # A `match`/`filter` term that can never fire (`size: "1O00"`, `status: "2OO"`) used to
         # run the whole sweep and report `matched: 0` — the "nothing there" an agent acts on.
+        # Also names a bad `stop_on` term ("stop match size spec …").
         if spec_err = matcher.spec_error
           raise FuzzArgError.new(spec_err)
         end
@@ -574,7 +661,9 @@ module Gori
           # An explicit `sni` wins; otherwise the source's own (a repeater session's stored SNI).
           sni: effective_sni,
           overrides: HostOverrides.load(store),
-          ws_messages: ws_messages)
+          ws_messages: ws_messages,
+          # The bound project, for any `payload_from` set: the plan builder reads it there.
+          project: store)
         plan = Fuzz::Plan.build(options, ob)
         # `ws_frames` is nil for an HTTP sweep and the OUTBOUND frame count for a WebSocket one,
         # so `fuzz_start`'s echo can say which engine the job actually took. An agent that seeded
@@ -583,7 +672,8 @@ module Gori
          plan.ws_script.try(&.frames.size), plan.ws_ignored_knobs, plan.grpc_fields,
          plan.tls_preset,
          plan.engine.race_count.try { |n| "race ×#{n}" } || mode.label,
-         effective_sni, config.max_requests}
+         effective_sni, config.max_requests, unused_sets_warning(plan), plan.payload_reports,
+         plan.request_target}
       rescue ex : Fuzz::PlanError
         raise FuzzArgError.new(fuzz_plan_error(ex, text))
       rescue ex : File::Error
@@ -592,6 +682,24 @@ module Gori
         # A payload set's own clean error (a bad wordlist/preset path, an unknown preset
         # reached via size()) — surfaced as a clean arg error, not an internal crash.
         raise FuzzArgError.new(ex.message || "payload set error")
+      end
+
+      # MCP's wording for payload sets the run will never draw from (see
+      # `Fuzz::Plan#unused_payload_sets`). Worded here, from the plan, rather than passed as a
+      # raw count: the remedy differs by mode, and `sniper` (the DEFAULT, so the common way to
+      # arrive here) wants a different answer than `pitchfork` does.
+      private def unused_sets_warning(plan : Fuzz::Plan) : String?
+        n = plan.unused_payload_sets
+        return nil if n.zero?
+        remedy =
+          if plan.config.mode.per_position?
+            "#{plan.config.mode.label} draws set k for position k and this run marks " \
+            "#{plan.position_count}; mark another position or drop the extra set"
+          else
+            "#{plan.config.mode.label} uses ONE shared payload set; pass mode " \
+            "\"pitchfork\" (lockstep) or \"clusterbomb\" (every combination) to use them all"
+          end
+        "#{n} payload set#{n == 1 ? "" : "s"} will not be used: #{remedy}"
       end
 
       # MCP's wording for a plan the args can't produce — the builder reports the
@@ -621,7 +729,11 @@ module Gori
         in Fuzz::PlanError::Reason::UnresolvedEnv
           env_unresolved_error(ex.detail)
         in Fuzz::PlanError::Reason::BadRaceCount
-          "race_count must be at least 2 (a race needs at least two connections in flight; 1 is just a send)"
+          if needed = ex.detail
+            "race_count exceeds max_requests: #{ex.message} — raise max_requests to #{needed} or lower race_count"
+          else
+            "race_count must be at least 2 (a race needs at least two connections in flight; 1 is just a send)"
+          end
         in Fuzz::PlanError::Reason::TlsPreset
           ex.message || "unknown tls_preset"
         end
@@ -846,36 +958,44 @@ module Gori
       end
 
       private def string_array_arg(h, key : String) : Array(String)
-        raw = h[key]?
-        return [] of String unless raw && !raw.raw.nil?
-        arr =
-          if a = raw.as_a?
-            a
-          elsif s = raw.as_s?
-            return [] of String if s.strip.empty?
-            parsed = JSON.parse(s) rescue raise FuzzArgError.new("'#{key}' must be a JSON array of strings")
-            parsed.as_a? || raise FuzzArgError.new("'#{key}' must be a JSON array")
-          else
-            raise FuzzArgError.new("'#{key}' must be a JSON array of strings (not a bare string/scalar)")
-          end
+        arr = json_array_arg(h[key]?, key, " of strings") || return [] of String
         arr.map { |v| v.as_s? || raise FuzzArgError.new("each '#{key}' entry must be a string") }
+      end
+
+      # `raw` as a JSON array: a real one, or a JSON-encoded string of one (LLM clients vary in
+      # which they send). nil when absent, null or a blank string; `of` names the element kind
+      # in the refusals.
+      private def json_array_arg(raw : JSON::Any?, key : String, of : String = "") : Array(JSON::Any)?
+        return nil unless raw && !raw.raw.nil?
+        if a = raw.as_a?
+          a
+        elsif s = raw.as_s?
+          return nil if s.strip.empty?
+          parsed = JSON.parse(s) rescue raise FuzzArgError.new("'#{key}' must be a JSON array#{of}")
+          parsed.as_a? || raise FuzzArgError.new("'#{key}' must be a JSON array")
+        else
+          raise FuzzArgError.new("'#{key}' must be a JSON array#{of} (not a bare string/scalar)")
+        end
+      end
+
+      # `raw` as a JSON object, read the same two ways as `json_array_arg`. `shape` follows
+      # "must be a JSON object" in the refusal for a string that is not one.
+      private def json_object_arg(raw : JSON::Any?, key : String, shape : String = "") : Hash(String, JSON::Any)?
+        return nil unless raw && !raw.raw.nil?
+        if o = raw.as_h?
+          o
+        elsif s = raw.as_s?
+          return nil if s.strip.empty?
+          (JSON.parse(s).as_h? rescue nil) || raise FuzzArgError.new("'#{key}' must be a JSON object#{shape}")
+        else
+          raise FuzzArgError.new("'#{key}' must be a JSON object (not a bare string/scalar)")
+        end
       end
 
       # The payload SOURCES, in position order. `Fuzz::Plan.build` pairs each with the
       # shared `processors` pipeline — pairing them here too would build the sets twice.
       private def fuzz_sources(h) : Array(Fuzz::PayloadSource)
-        raw = h["payloads"]?
-        return [] of Fuzz::PayloadSource unless raw && !raw.raw.nil?
-        arr =
-          if a = raw.as_a?
-            a
-          elsif s = raw.as_s?
-            return [] of Fuzz::PayloadSource if s.strip.empty?
-            parsed = JSON.parse(s) rescue raise FuzzArgError.new("'payloads' must be a JSON array of sets")
-            parsed.as_a? || raise FuzzArgError.new("'payloads' must be a JSON array")
-          else
-            raise FuzzArgError.new("'payloads' must be a JSON array of sets (not a bare string/scalar)")
-          end
+        arr = json_array_arg(h["payloads"]?, "payloads", " of sets") || return [] of Fuzz::PayloadSource
         arr.map do |spec|
           obj = spec.as_h? || raise FuzzArgError.new("each payload set must be a JSON object")
           fuzz_source_from(obj, spec)
@@ -888,18 +1008,7 @@ module Gori
       # Mirrors fuzz_marks/fuzz_sets's dual bare-array/JSON-encoded-string acceptance
       # (LLM clients vary in whether they send a real array or a JSON string).
       private def fuzz_processors(h) : Array(Fuzz::Processor)
-        raw = h["processors"]?
-        return [] of Fuzz::Processor unless raw && !raw.raw.nil?
-        arr =
-          if a = raw.as_a?
-            a
-          elsif s = raw.as_s?
-            return [] of Fuzz::Processor if s.strip.empty?
-            parsed = JSON.parse(s) rescue raise FuzzArgError.new("'processors' must be a JSON array")
-            parsed.as_a? || raise FuzzArgError.new("'processors' must be a JSON array")
-          else
-            raise FuzzArgError.new("'processors' must be a JSON array (not a bare string/scalar)")
-          end
+        arr = json_array_arg(h["processors"]?, "processors") || return [] of Fuzz::Processor
         arr.map { |spec| fuzz_processor_from(spec) }
       end
 
@@ -979,22 +1088,38 @@ module Gori
           # byte buffers, so the decoded octets survive the whole render path unchanged.
           Fuzz::InlineList.new(b64.map { |x| fuzz_payload_bytes(x) })
         elsif wl = obj["wordlist"]?.try(&.as_s?)
+          wordlist_stream_refusal(wl).try { |why| raise FuzzArgError.new(why) }
           Fuzz::WordlistFile.new(wl)
         elsif preset = obj["preset"]?.try(&.as_s?)
           # A built-in preset set (see Fuzz::Presets), optionally merged with a user file
           # on the server's disk ("file": built-in first, de-duped). Reject a typo up front
           # with the list, rather than let it surface as an empty run.
           raise FuzzArgError.new("unknown preset #{preset.inspect} (available: #{Fuzz::Presets.names.join(", ")})") unless Fuzz::Presets.exists?(preset)
-          Fuzz::PresetSource.new(preset, demanded_jstr(obj, "file", "payload set").try(&.presence))
+          file = demanded_jstr(obj, "file", "payload set").try(&.presence)
+          file.try { |f| wordlist_stream_refusal(f.strip) }.try { |why| raise FuzzArgError.new(why) }
+          Fuzz::PresetSource.new(preset, file)
+        elsif desc = obj["payload_from"]?
+          # Values the project already captured (#1352): `"payload_from":"host:api.example
+          # param-names"`, with `include_sensitive` / `locations` / `max_flows` / `max_values` beside
+          # it. Built with no project attached — `Fuzz::Plan.build` reads it, so the caps, the
+          # sensitive-value policy and the request budget are the same as on every other surface.
+          text = desc.as_s? || raise FuzzArgError.new("'payload_from' must be a string: \"<QL> <projection>\" (projection one of #{PayloadFrom::Projection.labels.join(", ")})")
+          Fuzz::ProjectSource.new(payload_spec_arg(text, "payload_from").apply(payload_policy_arg(obj)))
         elsif nums = obj["numbers"]?
           fuzz_numbers(nums)
-        elsif (nul = obj["null"]?) && (n = (nul.as_i64? || nul.as_s?.try(&.to_i64?)))
+        elsif n = fuzz_null_count(obj)
           Fuzz::NullPayloads.new(n.clamp(0_i64, FUZZ_MAX_REQUESTS).to_i) # clamp before .to_i so a huge count can't OverflowError past the clean-error handler
         elsif br = obj["brute"]?
           fuzz_brute(br)
         else
-          raise FuzzArgError.new("unknown payload set #{spec} (use list/list_base64/wordlist/preset/numbers/null/brute)")
+          raise FuzzArgError.new("unknown payload set #{spec} (use list/list_base64/wordlist/preset/payload_from/numbers/null/brute)")
         end
+      end
+
+      # `{"null": N}`'s N — an integer or a string of one — or nil when the set is not a null set.
+      private def fuzz_null_count(obj : Hash(String, JSON::Any)) : Int64?
+        nul = obj["null"]? || return nil
+        nul.as_i64? || nul.as_s?.try(&.to_i64?)
       end
 
       # One base64 payload → its exact octets. Invalid base64 is a hard error, not a skip: a
@@ -1042,14 +1167,8 @@ module Gori
       # Clamp a brute-force length so an absurd value can't OverflowError past the
       # clean-error handler (the run is still capped by FUZZ_MAX_REQUESTS regardless).
       #
-      # The ceiling is a real length, not Int32::MAX: `BruteIterator` allocates an odometer
-      # of `min` slots up front, so `{"charset":"ab","min":2147483647}` was an 8.6 GB
-      # `Array.new` on the job fiber — and a length that large is never a payload anyone
-      # meant to send. "try every string" is exactly what an agent emits, so bound it here,
-      # at the strict surface, rather than trusting the budget guard: FUZZ_MAX_REQUESTS caps
-      # how MANY payloads are sent, never how long one is. 4096 leaves the one legitimate
-      # long-length shape (a single-character charset used as padding) intact.
-      BRUTE_MAX_LEN = 4096
+      # The ceiling is `Fuzz::BruteForce::MAX_LEN` — see there; the CLI refuses past it.
+      BRUTE_MAX_LEN = Fuzz::BruteForce::MAX_LEN
 
       private def clamp_brute_len(n : Int64) : Int32
         n.clamp(0_i64, BRUTE_MAX_LEN.to_i64).to_i
@@ -1144,19 +1263,97 @@ module Gori
         m
       end
 
+      # The `stop_on` object (issue #1240): `{after_matches, match:{…}, filter:{…}}`. `match` and
+      # `filter` reuse the EXACT `fuzz_conditions` shape the run's own matcher parses, so a stop
+      # regex/status/time means here what it means there. Returns the match count for the config
+      # and a SEPARATE condition matcher for `Matcher#stop_condition` — the run stops on either.
+      #
+      # `stop_on` present but empty (no count, no condition) is refused: an agent that passed the
+      # key meant a stop, and a silent no-op is the "knob that did nothing" this codebase closes.
+      private def fuzz_stop_on(h) : {Int32?, Fuzz::Matcher?}
+        obj = json_object_arg(h["stop_on"]?, "stop_on", " {after_matches, match, filter}") || return {nil, nil}
+        if bad = obj.keys.find { |k| !STOP_ON_KEYS.includes?(k) }
+          raise FuzzArgError.new("unknown stop_on key #{bad.inspect} (expected #{STOP_ON_KEYS.join(", ")})")
+        end
+        after = fuzz_after_matches(obj)
+        cond = fuzz_stop_condition(obj["match"]?, obj["filter"]?)
+        if after.nil? && cond.nil?
+          raise FuzzArgError.new("'stop_on' names no condition — pass after_matches:N, a match:{…}, or a filter:{…}")
+        end
+        {after, cond}
+      end
+
+      # `after_matches` <= 0 is refused like the CLI's `--stop-after-matches` (not clamped to 1,
+      # which silently turned "never" into "first hit").
+      private def fuzz_after_matches(obj : Hash(String, JSON::Any)) : Int32?
+        n = fuzz_int(obj["after_matches"]?, "stop_on.after_matches")
+        return nil unless n
+        raise FuzzArgError.new("invalid stop_on.after_matches #{n} (expected a positive integer)") if n <= 0
+        n.clamp(1_i64, Int32::MAX.to_i64).to_i
+      end
+
+      # A matcher built from a `stop_on` `match`/`filter` pair, or nil when neither is given.
+      # It never decodes: `Matcher#build` runs it through `decide` on the body it
+      # already decoded for the run's own verdict.
+      private def fuzz_stop_condition(match_raw : JSON::Any?, filter_raw : JSON::Any?) : Fuzz::Matcher?
+        m = Fuzz::Matcher.new
+        any = false
+        if c = fuzz_conditions(match_raw, "stop_on.match")
+          m.match_status = c[:status]
+          m.match_grpc = c[:grpc]
+          m.match_size = c[:size]
+          m.match_words = c[:words]
+          m.match_lines = c[:lines]
+          m.match_time = c[:time]
+          m.match_header = c[:header]
+          m.match_regex = fuzz_regex(c[:regex], "stop_on.match")
+          any = true
+        end
+        if c = fuzz_conditions(filter_raw, "stop_on.filter")
+          m.filter_status = c[:status]
+          m.filter_grpc = c[:grpc]
+          m.filter_size = c[:size]
+          m.filter_words = c[:words]
+          m.filter_lines = c[:lines]
+          m.filter_time = c[:time]
+          m.filter_header = c[:header]
+          m.filter_regex = fuzz_regex(c[:regex], "stop_on.filter")
+          any = true
+        end
+        any ? m : nil
+      end
+
+      # `keep` (issue #1240): which rows a `save_results` archive stores. Refused by NAME on a
+      # typo rather than degraded to a default — the contract every enum argument here holds.
+      private def fuzz_keep(h) : Fuzz::Keep
+        raw = str(h, "keep")
+        return Fuzz::Keep::All if raw.nil? || raw.strip.empty?
+        Fuzz::Keep.parse?(raw) || raise FuzzArgError.new("invalid 'keep' #{raw.inspect} (all | interesting)")
+      end
+
       private alias FuzzConds = NamedTuple(status: String?, grpc: String?, size: String?, words: String?, lines: String?, time: String?, header: String?, regex: String?)
 
+      STOP_ON_KEYS   = {"after_matches", "match", "filter"}
+      CONDITION_KEYS = {"status", "grpc", "size", "words", "lines", "time", "header", "regex"}
+
+      # An unknown key used to be dropped silently — and under `stop_on` the condition still
+      # counted as present, so `{"match":{"body":…}}` stopped the run on its first response.
+      # A stop condition must also constrain something: an empty object or a blank value
+      # compiles to "unconstrained", which is the same first-response stop.
+      private def validate_condition_keys(obj : Hash(String, JSON::Any), which : String) : Nil
+        if bad = obj.keys.find { |k| !CONDITION_KEYS.includes?(k) }
+          raise FuzzArgError.new("unknown #{which} key #{bad.inspect} (expected #{CONDITION_KEYS.join(", ")})")
+        end
+        return unless which.starts_with?("stop_on.")
+        raise FuzzArgError.new("'#{which}' names no condition") if obj.empty?
+        obj.each do |k, v|
+          raise FuzzArgError.new("#{which} '#{k}' cannot be empty") if v.raw.nil? || v.as_s?.try(&.blank?)
+        end
+      end
+
       private def fuzz_conditions(raw : JSON::Any?, which : String) : FuzzConds?
-        return nil unless raw && !raw.raw.nil?
-        obj =
-          if h = raw.as_h?
-            h
-          elsif s = raw.as_s?
-            return nil if s.strip.empty?
-            (JSON.parse(s).as_h? rescue nil) || raise FuzzArgError.new("'#{which}' must be a JSON object")
-          else
-            raise FuzzArgError.new("'#{which}' must be a JSON object (not a bare string/scalar)")
-          end
+        obj = json_object_arg(raw, which) || return nil
+        validate_condition_keys(obj, which)
         {status: jstr(obj, "status"), grpc: jstr(obj, "grpc"), size: jstr(obj, "size"),
          words: jstr(obj, "words"), lines: jstr(obj, "lines"),
          # Milliseconds, the unit `timeout_ms` on this same tool already uses.
@@ -1247,6 +1444,9 @@ module Gori
         # An unknown NAME is not folded away — `Fuzz::Plan.build` refuses it, so the agent is
         # told rather than left with a sweep that silently used gori's bare hello.
         cfg.tls_preset = present?(h, "tls_preset") ? str(h, "tls_preset").try(&.strip.presence) : seed_tls_preset
+        # The request-time macro (#1350): parsed here, wired by `Plan.build` like every other
+        # config knob, so the same spec means the same run on all three surfaces.
+        cfg.request_macro = request_macro_spec(h)
         # Race condition (last-byte-sync): bypasses `mode`/`payloads` entirely — see
         # `Fuzz::Config#race_count`. Clamped at the same deepest point the CLI and the engine
         # itself both clamp at (`Fuzz::Engine::MAX_RACE_SIZE`).
@@ -1284,70 +1484,81 @@ module Gori
         return unless @allow_actions
 
         tool j, "fuzz_start",
-          "Start a fuzz/intruder run against an origin and return a job_id " \
-          "immediately (poll with fuzz_status / fuzz_results; end with fuzz_stop). " \
-          "ACTIVE: sends many real outbound requests from this host. Mark payload " \
-          "positions with §…§ in `template`, via `marks` (literal token wrap, like " \
-          "CLI --mark), or pass `flow_id` + auto:true, then provide payload sets via " \
-          "`payloads`. OR set `race_count` for a race-condition (last-byte-sync) run — " \
-          "N dedicated connections releasing the same request together, no payloads needed. Capped " \
-          "at #{FUZZ_MAX_REQUESTS} requests / #{FUZZ_MAX_CONCURRENCY} concurrency." do |s|
+          "Start a fuzz/intruder run and return a job_id immediately (poll fuzz_status / " \
+          "fuzz_results; end with fuzz_stop). ACTIVE: sends many real outbound requests from " \
+          "this host. Mark positions with §…§ in `template`, with `marks`, or `flow_id` + " \
+          "auto:true, and give payload sets in `payloads`. OR set `race_count` for a " \
+          "last-byte-sync race of one request, no payloads. Capped at #{FUZZ_MAX_REQUESTS} " \
+          "requests / #{FUZZ_MAX_CONCURRENCY} concurrency." do |s|
           s.field "template", strprop("raw HTTP request with §…§ position markers")
           s.field "flow_id", intprop("seed the template from a captured flow id (instead of template)")
           s.field "repeater_id", intprop("seed the template from a saved repeater session id (instead of template/flow_id). A WebSocket session seeds its handshake AND its outbound frames — see 'messages'")
           s.field "url", strprop("absolute target URL (scheme+host) that sets the origin — a 'template' or 'flow_id' is still REQUIRED; url alone does NOT define the request (unlike send_request)")
           s.field "auto", boolprop("auto-mark every query/cookie/body param when the template has no § markers")
-          s.field "marks", strarrprop("literal tokens to mark as §…§ positions (each occurrence, mirrors CLI --mark); alternative to embedding §…§ in template. An occurrence already inside a §…§ (or flush against one) is skipped — re-wrapping it would merge the two positions — and a token left with none of its own is named in `marks_warning`")
-          s.field "fields", strarrprop("schema-known gRPC fields of a UNARY request to sweep, each a field name, a path into a nested message ('profile.age'), or a field number, with [i] for one occurrence of a repeated field ('tags[1]'); append ¦chain to run a Decoder chain over the payload BEFORE the declared type encodes it. Each payload goes through the field's DECLARATION on its way to bytes (-3 is a different set of octets as int32, sint32, bool or an enum), every other byte of the message is copied from the capture, and the 5-byte gRPC length prefix is recomputed. Needs a descriptor set that resolves the rpc (see grpc_schema / grpc_reflect). These positions follow the template's own §…§ positions in the run's index space, so 'mode' and 'payloads' keep their meaning. A field the schema does not declare, one whose wire type the declaration contradicts, and a payload the declared type cannot hold are all refused before the first request. The field must be PRESENT on the captured message — gori replaces an occurrence, it never adds one, so a proto3 field left at its default is not a position. Payloads for a `bytes` field are read as HEX ('de ad be ef').")
+          s.field "marks", strarrprop("literal tokens to wrap as §…§ positions, every occurrence (like CLI --mark) — an alternative to §…§ in template. An occurrence inside or flush against an existing §…§ is skipped (it would merge the two), and a token left with none is named in `marks_warning`")
+          s.field "fields", strarrprop("gRPC: schema-known fields of a UNARY request to sweep — a name, a nested path ('profile.age') or a field number, with [i] for one occurrence of a repeated field ('tags[1]'); append ¦chain to run a Decoder chain BEFORE the type encodes. Each payload is encoded by the field's DECLARED type (-3 is different octets as int32, sint32, bool or an enum); the rest of the message is copied from the capture and the 5-byte length prefix is recomputed. Needs a descriptor set that resolves the rpc (grpc_schema / grpc_reflect). These positions follow the template's own §…§ ones, so mode and payloads keep their meaning. The field must be PRESENT in the capture (replaced, never added: a proto3 default is not a position). An undeclared field, a wire-type mismatch or a payload the type cannot hold is refused before the first request. `bytes` payloads are HEX ('de ad be ef').")
           s.field "mode", enumprop("how payload sets are combined across marks (default sniper)", FUZZ_MODES)
-          s.field "payloads", arrprop(%(array of payload sets, e.g. [{"list":["a","b"]},{"list_base64":["gA==","/w=="]},{"preset":"sqli"},{"numbers":"1-100"},{"wordlist":"/p.txt"},{"null":5},{"brute":"abc:1-3"}] — JSON array, NOT a string. "preset" is a built-in curated set — one of #{Fuzz::Presets.names.join(", ")} — for a fast start with no file; add "file":"/extra.txt" to merge a user file into it (built-in first, de-duped). "list_base64" is the byte-exact list: use it for payloads a JSON string cannot carry (0x00, 0x80-0xFF, invalid/overlong UTF-8), since "list" entries go on the wire as their UTF-8 encoding. numbers/brute also accept a structured object: {"numbers":{"from":1,"to":100,"step":2}}, {"brute":{"charset":"abc","min":1,"max":3}}. Brute lengths are capped at #{BRUTE_MAX_LEN}.))
-          s.field "processors", arrprop(%(ordered pipeline applied to EVERY payload before it's spliced in (mirrors CLI --prefix/--suffix/--encode/--case/--hash/--regex-replace) — e.g. [{"type":"encode","kind":"url"}]. Query-string and form-urlencoded body positions are ALREADY percent-encoded by default (see "no_encode"), so this is for the other positions — a path segment, a JSON body, a header or a cookie value — where a payload carrying a raw space, CRLF or quote would otherwise corrupt the request line/framing instead of reaching the app. An "encode" step here REPLACES the default encoding (it applies to every position, so it is not stacked on top); the other step types say what the PAYLOAD is rather than how the wire spells it, so the query/form default still applies to their output. Entries: {"type":"prefix","text":".."} {"type":"suffix","text":".."} {"type":"encode","kind":"url|urlall|base64|hex"} {"type":"case","kind":"upper|lower"} {"type":"hash","algo":"md5|sha1|sha256"} {"type":"regex_replace","pattern":"..","replacement":".."}))
-          s.field "no_encode", boolprop("send payloads into query-string / form-body positions RAW — turns off the default percent-encoding for those positions (path, JSON body, header and cookie positions are raw either way). For a payload that IS the raw byte: parameter pollution with a bare &, a request-line CRLF probe. Also for a payload that is ALREADY a percent-escape and aims at the origin's own decoder — %00, %c0%af, %2e%2e%2f — which the default encodes again (%00 -> %2500) so it arrives as text, testing something else. An explicit 'encode' step in 'processors' already replaces the default.")
-          s.field "match", jsonprop(%(keep only responses matching, e.g. {"status":"200,500-599","size":">1000","regex":"err"} — object or JSON string. "time" is the ROUND TRIP in milliseconds ({"time":">=5000"}), the dimension a time-based blind injection is the only evidence for: `' OR SLEEP(5)--` comes back with the same status, the same byte length and the same body as the payload that did nothing, and differs only in how long it took. A send that TIMED OUT counts as a match on "time" (it is the loudest form of the same signal) and on nothing else. "grpc" matches the grpc-status TRAILER (e.g. "7", ">0", "1-16") — the HTTP/2 trailer for native gRPC, and the in-body TRAILER frame for grpc-web, which has no HTTP trailers to send: for a gRPC target the HTTP status is 200 on every response, granted or denied, so "status" cannot separate them — every result row also carries grpc_status/grpc_status_name/grpc_message. "header" is a case-insensitive SUBSTRING of the response HEAD (e.g. "x-powered-by: php", "set-cookie") — "regex" only ever sees the BODY, so this is the only way to name a header the payload changed))
+          s.field "payloads", arrprop(%(payload sets, a JSON array (NOT a string): {"list":["a","b"]} (sent as UTF-8), {"list_base64":["gA=="]} (byte-exact, for 0x00, 0x80-0xFF or invalid UTF-8), {"wordlist":"/p.txt"} (a server path or a saved name, see list_wordlists), {"preset":"sqli"} (one of #{Fuzz::Presets.names.join(", ")}; add "file":"/extra.txt" to merge a file in), {"numbers":"1-100"} or {"numbers":{"from":1,"to":100,"step":2}}, {"brute":"abc:1-3"} or {"brute":{"charset":"abc","min":1,"max":3}} (length max #{BRUTE_MAX_LEN}), {"null":5}. {"payload_from":"host:api.example param-names"} reads values the PROJECT captured and sends nothing: a QL query, then a projection (param-names, param-values, path-segments, js-endpoints, extracted); optional siblings include_sensitive (default false: credentials stay out, and `extracted` needs it), locations, max_flows, max_values. The reply's payload_sources says what each read, never the values.))
+          s.field "processors", arrprop(%(ordered pipeline applied to EVERY payload before it is spliced in (mirrors CLI --prefix/--suffix/--encode/--case/--hash/--regex-replace): {"type":"prefix","text":".."} {"type":"suffix","text":".."} {"type":"encode","kind":"url|urlall|base64|hex"} {"type":"case","kind":"upper|lower"} {"type":"hash","algo":"md5|sha1|sha256"} {"type":"regex_replace","pattern":"..","replacement":".."}. Query and form-body positions are ALREADY percent-encoded (see no_encode); use an encode step for a path segment, JSON body, header or cookie, where a raw space, CRLF or quote would break the framing. An encode step REPLACES that default for every position; the other steps leave it applied to their output.))
+          s.field "no_encode", boolprop("send payloads into query-string / form-body positions RAW, turning off their default percent-encoding (other positions are raw either way). For a payload that IS the raw byte (a bare & for parameter pollution, a CRLF probe), or that is ALREADY an escape aimed at the origin's decoder (%00, %c0%af, %2e%2e%2f), which the default would encode again (%00 -> %2500).")
+          s.field "match", jsonprop(%(keep only responses matching, e.g. {"status":"200,500-599","size":">1000","regex":"err"} — object or JSON string. "regex" sees only the BODY; "header" is a case-insensitive substring of the response HEAD ("set-cookie"). "time" is the round trip in ms ({"time":">=5000"}), the only evidence of a time-based blind injection; a TIMED-OUT send matches "time" and nothing else. "grpc" matches the grpc-status trailer ("7", ">0", "1-16"; native h2 or grpc-web): a gRPC HTTP status is 200 granted or denied, so "status" cannot tell them apart. Rows carry grpc_status/grpc_status_name/grpc_message.))
           s.field "filter", jsonprop(%(drop responses matching, same shape as match — object or JSON string))
           s.field "extract", strprop("regex; grep a value (capture group 1) from each response")
           s.field "concurrency", intprop("parallel requests (default 20, max #{FUZZ_MAX_CONCURRENCY})")
           s.field "rate", numprop("requests/sec cap, fractional allowed (0 = unlimited; 0.5 = one request every two seconds)")
           s.field "timeout_ms", intprop("per-request connect + idle (read/write) timeout in milliseconds")
           s.field "retries", intprop("retries per request on a network error")
-          s.field "follow_redirects", boolprop("follow 3xx responses (default false). Matters more than it sounds: against an endpoint that 302s, every status/size/words/lines/regex match otherwise runs against the redirect STUB, so a run reports uniform \"no differences\" while the interesting response is one hop away. Mirrors CLI --follow.")
+          s.field "follow_redirects", boolprop("follow 3xx responses (default false). Without it, against an endpoint that 302s every matcher reads the redirect STUB and the run looks uniform. Mirrors CLI --follow.")
           s.field "max_redirects", intprop("hop limit when follow_redirects is on")
           s.field "auto_calibrate", boolprop("drop responses identical to the baseline, so only what a payload CHANGED is reported (mirrors CLI --ac)")
-          s.field "throttle_ms", intprop("fixed delay between requests in ms — an alternative to 'rate' for a target that rate-limits on inter-request gap rather than throughput (mirrors CLI --throttle)")
+          s.field "throttle_ms", intprop("fixed delay between requests in ms, for a target that limits on the gap between requests rather than throughput (CLI --throttle)")
           s.field "sni", strprop("TLS SNI override, independent of the Host header — the vhost-confusion / domain-fronting test")
-          s.field "tls_preset", strprop("TLS fingerprint for this WHOLE RUN: shape every ClientHello like #{Settings::TLS_PRESET_NAMES.join(" | ")} instead of gori's own, without touching the settings.json outbound_tls table. Run-level, not per request — keep-alive parks a socket whose handshake is already done. The destination's client certificate, protocol range and permissive flag still apply. Echoed back on fuzz_start so the result set says which handshake produced it. An APPROXIMATION of that client's hello, NOT a byte-exact JA3 match — extension order and GREASE placement are OpenSSL's. https targets only")
-          s.field "keep_alive", boolprop("reuse one connection across many requests (default true), on HTTP/1.1 and on h2 alike — an h2 run reuses a connection serially, stream 1 then 3 then 5 — one TCP/TLS handshake per worker instead of per request. Set false to dial a fresh connection per request, which is what you want when the target behaves per-connection (connection-scoped rate limits, a load balancer pinning by connection) or when keep-alive handling is itself what you are probing.")
+          s.field "tls_preset", strprop("TLS fingerprint for the WHOLE run: shape every ClientHello like #{Settings::TLS_PRESET_NAMES.join(" | ")} instead of gori's own (settings.json untouched). The destination's client certificate, protocol range and permissive flag still apply; echoed back on the reply. An approximation, NOT a byte-exact JA3. https only")
+          s.field "keep_alive", boolprop("reuse connections across requests (default true; h2 reuses one serially). Set false to dial per request: for connection-scoped rate limits, a load balancer pinning by connection, or when keep-alive handling is the test.")
           s.field "http2", boolprop("use real HTTP/2 (default false). A run seeded from a captured h2 flow selects it on its own. Pooled like h1 unless keep_alive is false")
           s.field "insecure", boolprop("skip upstream TLS verification (default false)")
           s.field "max_requests", intprop("caller cap on total requests")
+          s.field "stop_on", jsonprop(%(end the run early — {after_matches, match, filter}. after_matches:N stops after N hits of the run's own matchers; match/filter is a SEPARATE condition shaped like the top-level ones ({"match":{"regex":"Welcome admin"}} stops when the body has it; {"filter":{"regex":"Invalid password"}} when it no longer does). Ends with status "condition_met", NOT "done" (fuzz_status stop_reason and stop_index). Cannot combine with race_count.))
+          s.field "keep", enumprop("which rows a save_results archive stores (default all). interesting keeps matched rows plus rows with an observed fault (an error, a re-send, a truncated capture, the stop row); counts stay whole-run and idx stays the payload position. Requires save_results: true.", %w[all interesting])
           s.field "allow_unscoped", boolprop("run even when the target host is outside the project's configured scope — REQUIRED to run against an out-of-scope target, or when no scope is configured at all (active requests are refused by default without a matching scope)")
-          s.field "record_history", enumprop("record each sent request+response as a History flow for audit/evidence (default none); matched results carry the flow_id in fuzz_results (fetch full detail with get_flow). 'all' is capped at #{FUZZ_HISTORY_MAX} flows. Booleans are accepted as aliases (true = all, false = none) because send_request spells this argument as a boolean; any OTHER value is refused by name rather than silently recording nothing.", RECORD_HISTORY_MODES)
-          s.field "save_results", boolprop("persist EVERY result permanently in this project, including full rendered request, final wire request, response head and response body. Independent of record_history and of the bounded live-job cache. The start/status/results replies include run_id + save_status; inspect it later with list_fuzz_runs/get_fuzz_run.")
-          s.field "update_content_length", boolprop("recompute Content-Length after each payload is spliced into the body, AND add one when the request carries a body but declares none (default true). Set FALSE to send your template's framing verbatim — a Content-Length shorter or longer than the body, or Content-Length alongside Transfer-Encoding, is the canonical request-smuggling primitive, and with the default on every payload is silently re-framed to fit before it leaves. Note that false also leaves a body with no Content-Length and no chunked Transfer-Encoding UNFRAMED, which an HTTP/1.1 origin reads as a zero-length body. Mirrors CLI `gori run fuzz --verbatim` and intercept_forward_edit{update_content_length:false}.")
-          s.field "reframe_grpc", boolprop("recompute the gRPC 5-byte length prefix after each payload is spliced into a gRPC message body (default FALSE). With the default, a payload that changes the message length leaves the prefix declaring the old one — a real gRPC server rejects those, and fuzz_status reports it as grpc_stale_prefix rather than silently repairing the operator's bytes (a deliberately-wrong length prefix is a standard parser test). Set TRUE for an ordinary unary sweep where framing rejections are noise rather than the test. Applies to unary messages only; a client-streaming body is left alone and still reported. Mirrors CLI `gori run fuzz --reframe-grpc`.")
-          s.field "race_count", intprop("Race condition (last-byte-sync) mode: dial this many DEDICATED connections, hold back the request's final byte on each, then release every held-back byte in one tight write loop so the target receives all of them as close to simultaneously as this process can manage — for finding TOCTOU bugs (double-spend, coupon reuse, limit bypass). BYPASSES mode/payloads/marks entirely: the template is sent byte-identical on every connection (no §…§ substitution), so `template`/`flow_id` alone is enough — set match:{status:...} so 'matched' in fuzz_results marks the success response (a correctly-guarded endpoint should show at most one). Max #{Fuzz::Engine::MAX_RACE_SIZE}. This is HTTP/1.1-only (h2 degrades to independent per-connection sends — true single-packet HTTP/2 racing is not yet implemented).")
-          s.field "race_warmup", strprop("race_count only: a raw HTTP request sent, and its response fully read, on each connection BEFORE it holds the race request — equalizes per-connection TLS-handshake/accept latency, which narrows the achievable release window. Sent EXACTLY as given (no §…§, no Env expansion) — use something harmless (e.g. a plain GET) against the same origin, never the race request itself (which would perform its side effect once per connection before the timed attempt).")
-          s.field "messages", ws_out_messages_prop(%(WebSocket only: the outbound frame script, REPLACING the frames a flow_id/repeater_id seed carried. Each entry is a plain string (a TEXT frame), a WsFrameSpec string ("opcode=ping,text=hi"), or the object form — the same grammar send_websocket takes. Mark §…§ positions IN THESE PAYLOADS: that is what a WebSocket sweep fuzzes. One variation = one full RFC 6455 session (dial, handshake, send the script, drain, close), so concurrency N means N simultaneous sockets. A WebSocket seed with no frames and no 'messages' is swept as plain HTTP.))
-          s.field "idle_ms", intprop("WebSocket only: per-session server-silence timeout after the first inbound frame (100-60000, default 3000). This is the WebSocket path's pacing knob — 'timeout' is NOT its synonym and is reported in 'ignored_args' on a WS run.")
-          s.field "keep_sec_websocket_key", boolprop("WebSocket only: send the template's own Sec-WebSocket-Key on every session instead of a fresh one, so an absent / short / duplicate / non-base64 key can itself be the thing under test (default false).")
-          s.field "ws_http_only", boolprop("Sweep a WebSocket template as plain HTTP: the handshake goes out as an ordinary request and its own answer (a 101, or the 2xx of an RFC 8441 extended CONNECT) is read as the response, instead of performing the framed exchange. The bytes are unchanged — this selects the engine, not a rewrite. Also the way to use race_count / record_history against a WebSocket seed, and http2 against an `Upgrade:` one; all are refused on the framed path.")
+          s.field "record_history", enumprop("record each sent request+response as a History flow (default none; 'all' is capped at #{FUZZ_HISTORY_MAX}). Matched rows in fuzz_results carry the flow_id (read with get_flow) while that flow still belongs to the job. Booleans are aliases (true = all, false = none); any other value is refused.", RECORD_HISTORY_MODES)
+          s.field "save_results", boolprop("persist EVERY result in the project (rendered and wire request, response head and body), independent of record_history and the live cache. Replies carry run_id + save_status; read it later with list_fuzz_runs / get_fuzz_run.")
+          s.field "update_content_length", boolprop("recompute Content-Length after each splice, and add one to a body that declares none (default true). Set FALSE to send the template's framing verbatim: a wrong Content-Length, or one beside Transfer-Encoding, is the request-smuggling primitive the default re-frames away. With false, a body with neither Content-Length nor chunked goes out UNFRAMED (an HTTP/1.1 origin reads it as empty). Mirrors CLI `gori run fuzz --verbatim`.")
+          s.field "reframe_grpc", boolprop("recompute the gRPC 5-byte length prefix after each splice (default FALSE). By default a length-changing payload keeps the stale prefix: a real server rejects it and fuzz_status counts it as grpc_stale_prefix (a wrong prefix is itself a parser test). Set TRUE for an ordinary unary sweep. Unary only; a client-streaming body is left alone. Mirrors CLI --reframe-grpc.")
+          request_macro_props(s, "candidate", race: true)
+          s.field "race_count", intprop("race (last-byte-sync) mode: open this many DEDICATED connections, hold back each request's final byte, then release them all at once — for TOCTOU bugs (double-spend, coupon reuse, limit bypass). Ignores mode/payloads/marks: the template goes out byte-identical (no §…§), so template or flow_id alone is enough; set match:{status:...} so `matched` marks the success (a guarded endpoint shows at most one). Max #{Fuzz::Engine::MAX_RACE_SIZE}. HTTP/1.1 only (h2 degrades to independent sends).")
+          s.field "race_warmup", strprop("race_count only: a raw request sent, its response read, on each connection before it holds the race request, to even out handshake latency. Sent EXACTLY as given (no §…§, no env) — use a harmless GET to the same origin, never the race request (its side effect would run once per connection).")
+          s.field "messages", ws_out_messages_prop("WebSocket only: the outbound frame script, REPLACING a flow_id/repeater_id seed's frames (the grammar send_websocket takes). Mark §…§ positions IN these payloads. Each variation is one full session (dial, handshake, script, drain, close), so concurrency N means N sockets. A WebSocket seed with no frames and no messages is swept as plain HTTP")
+          s.field "idle_ms", intprop("WebSocket only: per-session server-silence timeout after the first inbound frame (100-60000, default 3000). timeout_ms does not pace a WebSocket run and is reported in ignored_args.")
+          s.field "keep_sec_websocket_key", boolprop("WebSocket only: send the template's own Sec-WebSocket-Key on every session instead of a fresh one, so a bad key can be the test (default false).")
+          s.field "ws_http_only", boolprop("sweep a WebSocket template as plain HTTP: the handshake goes out as an ordinary request and its answer (a 101, or an RFC 8441 CONNECT's 2xx) is the response. Bytes unchanged. Needed for race_count / record_history on a WebSocket seed and http2 on an `Upgrade:` one.")
         end
 
-        tool j, "fuzz_status", "Counts + state of a fuzz job (running|done|budget_exhausted|stopped|error). " \
+        tool j, "fuzz_status", "Counts + state of a fuzz job (running|done|budget_exhausted|condition_met|stopped|error). " \
                                "budget_exhausted means max_requests halted the run before every candidate was checked — " \
-                               "a partial result, NOT an exhaustive one; see incomplete_reason and candidates_remaining." do |s|
+                               "a partial result, NOT an exhaustive one; condition_met means the run's own stop_on ended it " \
+                               "(see stop_reason, and stop_index for the result it tripped on — in fuzz_results unless results_truncated) — it reached its goal but is likewise not exhaustive; " \
+                               "see incomplete_reason and candidates_remaining." do |s|
           s.field "job_id", strprop("id from fuzz_start"), required: true
         end
 
         tool j, "fuzz_results",
           "Paged matched results for a fuzz job (status/length/words/lines/duration/" \
-          "extracted, plus a per-result flow_id when the run used record_history). No raw " \
+          "extracted, plus a per-result flow_id when the run used record_history and its History row still exists. No raw " \
           "bodies are inlined: fetch a hit's full request+response with get_flow(flow_id), " \
-          "or re-issue it with send_request by substituting the payload into your template." do |s|
+          "or re-issue it with send_request by substituting the payload into your template. " \
+          "On a large run, pass clusters:true first: one entry per distinct response shape, " \
+          "then cluster:<id> for the members of the ones worth reading." do |s|
           s.field "job_id", strprop("id from fuzz_start"), required: true
           s.field "offset", intprop("start row (default 0)")
-          s.field "limit", intprop("max rows (default 100, max 1000)")
-          s.field "matched_only", boolprop("return only rows the matcher accepted (default false). The stored set is NOT matched-only: a row that FAILED is kept too — the send errored (dead target, TLS, refused by scope), a §…§ position's ¦chain could not run on that payload so it went out UNTRANSFORMED, or a gRPC field's declaration could not hold it so that field kept the capture's own value (both `chain_error`, whose sentence says which), the request was re-sent or retried, or the response came back truncated — so the unfiltered page mixes matches with non-matches. Every row carries `matched` either way, and failures can never crowd matches out of the buffer.")
+          # Prose, not `limitprop`: the numbers depend on the mode, and one `default`/`maximum`
+          # pair would be wrong for the cluster listing (Copilot on #1398).
+          s.field "limit", intprop("max rows (default #{FUZZ_RESULTS_LIMIT.default}, max #{FUZZ_RESULTS_LIMIT.max}; " \
+                                   "a cluster listing: default #{FUZZ_CLUSTER_LIMIT.default}, max #{FUZZ_CLUSTER_LIMIT.max})")
+          s.field "clusters", boolprop("return one entry per RESPONSE SHAPE instead of rows (default false): responses that are the same answer — payload echoes, numbers, ids, timestamps and volatile headers normalized away — group together, counted over EVERY result of the job (not only the stored rows). Each cluster has an id, count, matched/errored/incomplete counts, status/grpc_status/ws_close_code or error_class, metric ranges, the lowest member indices (sample_indices) and a representative row. Paged by offset/limit (default 50, max 500 clusters). Start here on a large run: the rare clusters are usually the interesting ones.")
+          s.field "cluster", strprop("a cluster id from clusters:true — return that cluster's member ROWS (same row shape as the default page) plus its summary. The live cache keeps only interesting rows, so members_retained can be below count; a save_results run pages every member through get_fuzz_run{cluster}.")
+          s.field "cluster_order", enumprop("order of clusters:true (default rare = smallest cluster first; common = largest first; first = by first appearance)", Fuzz::Clusters::Order.names)
+          s.field "matched_only", boolprop("return only rows the matcher accepted (default false; with clusters:true, only clusters holding a match). The stored set is NOT matched-only: a row that FAILED is kept too — the send errored (dead target, TLS, refused by scope), a §…§ position's ¦chain could not run on that payload so it went out UNTRANSFORMED, or a gRPC field's declaration could not hold it so that field kept the capture's own value (both `chain_error`, whose sentence says which), the request was re-sent or retried, or the response came back truncated — so the unfiltered page mixes matches with non-matches. Every row carries `matched` either way, and failures can never crowd matches out of the buffer.")
         end
 
         tool j, "fuzz_stop", "Stop a running fuzz job (in-flight requests finish)." do |s|

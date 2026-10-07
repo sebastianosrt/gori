@@ -58,17 +58,21 @@ module Gori::Proxy::H2
       # can't grow `headers` without bound. Per-block caps (MAX_HEADER_BLOCK, HPACK
       # MAX_HEADER_LIST) only bound ONE block; this bounds the accumulation.
       property header_bytes = 0
-      property ended = false
+      property? ended = false
       # True between a HEADERS without END_HEADERS and the CONTINUATION that ends the block.
       # A CONTINUATION is only legal while this holds (RFC 9113 §6.10); one arriving otherwise
       # is a protocol violation a hostile peer uses to fabricate or erase a flow, so it is
       # dropped (#409).
-      property awaiting_continuation = false
+      property? awaiting_continuation = false
       # Names of the fields that arrived in a TRAILING HEADERS block. `finish_header_block`
       # merges trailers into `headers` (that merge is what makes grpc-status reachable), and
       # after it nothing distinguished a trailer from a real response header. Recorded here
       # so the stored head can say which is which — see HeadCodec::TRAILER_MARKER.
-      getter trailer_names = [] of String
+      #
+      # All four trailer collections below stay nil until a trailing block names something:
+      # almost no exchange has one, and building them eagerly cost two Arrays and two Sets per
+      # side of every stream.
+      getter trailer_names : Array(String)? = nil
       # Membership index for `trailer_names`, which stays an ordered Array because
       # `HeadCodec::TRAILER_MARKER` joins the names in arrival order. Deduping with
       # `Array#includes?` is a linear scan, so one legal 1 MiB trailer block (~174k
@@ -76,7 +80,7 @@ module Gori::Proxy::H2
       # `finish_header_block`) cost O(N^2) String compares — ~40s of uninterruptible
       # CPU inside `@mutex`, which on Crystal's single-threaded scheduler freezes the
       # TUI, every other connection and the Store writer fiber (P6).
-      getter trailer_seen = Set(String).new
+      @trailer_seen : Set(String)? = nil
       # Pseudo-header names a TRAILING block carried, which RFC 9113 §8.1 forbids in a trailer
       # section. Kept apart from `trailer_names` rather than filed with it: the marker's
       # contract is "look these names up in the head above", and `synth_response` /
@@ -84,20 +88,50 @@ module Gori::Proxy::H2
       # a dangling reference, pointing at a name no surface can show. It is a finding, not a
       # trailer, so it goes to the flow's `advisory` (see `note_trailer_pseudo`). Same
       # Array + Set pair as above, for the same O(N^2) reason.
-      getter trailer_pseudo = [] of String
-      getter trailer_pseudo_seen = Set(String).new
+      getter trailer_pseudo : Array(String)? = nil
+      @trailer_pseudo_seen : Set(String)? = nil
       # The status of an INTERIM header block that arrived after the final response — the one
       # §8.1 violation that has a name of its own (RFC 9110 §15.2: a 1xx precedes the final
       # response, it is not one). Kept apart from `trailer_pseudo` so the advisory can name the
       # event the way `Repeater::H2Engine`'s `late_interim` clause does: one wire fact, one
       # sentence, whichever surface the operator is reading.
       property trailer_interim : Int32? = nil
+      # The interim (1xx) heads a later final status block REPLACED, in arrival order — the
+      # h1 path's `skip_interim_responses` record, for the extra HEADERS an h2 origin sends a
+      # 103 in. Response side only; nil on almost every stream. See `Store::Interims`.
+      property interims : Store::Interims? = nil
+      # More interims arrived than `record_interim` counts (`Interims::MAX_RUN`); the flow says so.
+      property? interim_overflow = false
+
+      # File a regular field name from a trailing block, once per name.
+      def add_trailer_name(name : String) : Nil
+        seen = @trailer_seen ||= Set(String).new
+        (@trailer_names ||= [] of String) << name if seen.add?(name)
+      end
+
+      # File a pseudo-header name from a trailing block, once per name.
+      def add_trailer_pseudo(name : String) : Nil
+        seen = @trailer_pseudo_seen ||= Set(String).new
+        (@trailer_pseudo ||= [] of String) << name if seen.add?(name)
+      end
+
+      # Forget every trailer record: the head they were filed against was replaced.
+      def clear_trailers : Nil
+        @trailer_names = nil
+        @trailer_seen = nil
+        @trailer_pseudo = nil
+        @trailer_pseudo_seen = nil
+        @trailer_interim = nil
+      end
     end
 
     private class Stream
       getter req = Side.new
       getter resp = Side.new
       property flow_id : Int64? = nil
+      # Authority recorded before the request head is forwarded, so a response rewrite cannot
+      # race the assembler's later projection.
+      property request_authority : String? = nil
       # Monotonic timing for the response's ttfb/duration. h1 records these in
       # client_conn; without them every h2 flow shows a null latency in History /
       # QL / `gori run` JSON (and most HTTPS traffic negotiates h2). `started_at`
@@ -121,21 +155,42 @@ module Gori::Proxy::H2
       # because the producers run at different moments (a request-direction advisory before
       # `emit_request`, a response-direction one before `emit_response`) and the stream is
       # the only thing that spans both.
-      getter advisories = [] of String
+      #
+      # nil until the first one: almost every exchange has none.
+      @advisories : Array(String)? = nil
+      # The request as held at Intercept, when the operator edited it before release (#1378).
+      # nil on every stream nobody edited. See `Store::CapturedRequest#intercept_original`.
+      property intercept_original : Bytes? = nil
       # The WebSocket transcript of an RFC 8441 extended CONNECT stream (#733), or nil for
       # every other stream — which is all of them on an ordinary connection.
       property ws : WsCapture? = nil
+      # Any recognized WebSocket extended CONNECT, including one past the transcript cap.
+      # Separate from ws_armed because an unarmed accepted tunnel still needs completion notice.
+      property? websocket_candidate = false
       # Whether this stream's frames WILL be read, decided the moment the request head is
       # recognised and before `emit_request` stores the advisory that says so. `ws` itself
       # cannot answer it there: it needs the flow id that `emit_request` is what produces.
-      property ws_armed = false
+      property? ws_armed = false
+      # An accepted extended CONNECT stays live after the HTTP response is projected. Its
+      # capture printer event must wait until END_STREAM/RST/connection close flushes frames.
+      property? websocket_accepted = false
+      property? tunnel_completion_notified = false
+
+      # Record an advisory once; the same sentence from two producers is one line.
+      def advise(text : String) : Nil
+        list = @advisories ||= [] of String
+        list << text unless list.includes?(text)
+      end
+
+      # The advisories as one newline-joined column value, or nil when there are none.
+      def advisory : String?
+        @advisories.try { |list| list.empty? ? nil : list.join('\n') }
+      end
     end
 
-    # `connection_created_at` is kept as a positional argument for call-site compatibility
-    # (the connection's own open time) but is deliberately NOT stored or used for a flow's
-    # `created_at` — see `Stream#created_at`, which each request stamps for itself.
-    def initialize(@sink : FlowSink, @host : String, @port : Int32, connection_created_at : Int64,
-                   @conn_id : Int64 = 0_i64)
+    # A flow's `created_at` is not the connection's open time: see `Stream#created_at`, which
+    # each request stamps for itself.
+    def initialize(@sink : FlowSink, @host : String, @port : Int32, @conn_id : Int64 = 0_i64)
       @mutex = Mutex.new
       @streams = {} of UInt32 => Stream
       @req_decoder = HPACK::Decoder.new
@@ -161,6 +216,28 @@ module Gori::Proxy::H2
     # nil when this connection is not tracking the stream (past MAX_LIVE_STREAMS) — the gate
     # then declines to hold rather than inventing a URL to scope-test.
     record RequestRef, method : String, target : String, scheme : String, authority : String
+
+    # Recorded before the request block is forwarded: the response pump may run before
+    # Relay#emit feeds that block into the assembler.
+    def remember_request_authority(stream_id : UInt32, authority : String?) : Nil
+      return if stream_id == 0 || authority.nil? || authority.empty?
+      @mutex.synchronize do
+        stream = @streams[stream_id]?
+        if stream.nil?
+          next if @streams.size >= MAX_LIVE_STREAMS
+          stream = @streams[stream_id] = Stream.new
+        end
+        stream.request_authority = authority
+      end
+    end
+
+    def request_authority(stream_id : UInt32) : String?
+      @mutex.synchronize do
+        stream = @streams[stream_id]?
+        headers = stream.try(&.req.headers)
+        headers.try { |fields| pseudo(fields, ":authority") } || stream.try(&.request_authority)
+      end
+    end
 
     def request_ref(stream_id : UInt32) : RequestRef?
       @mutex.synchronize do
@@ -198,7 +275,7 @@ module Gori::Proxy::H2
           next if @streams.size >= MAX_LIVE_STREAMS
           stream = @streams[stream_id] = Stream.new
         end
-        stream.advisories << text unless stream.advisories.includes?(text)
+        stream.advise(text)
       end
     end
 
@@ -210,6 +287,21 @@ module Gori::Proxy::H2
         if stream = @streams.delete(stream_id)
           finalize_stream(stream_id, stream, reason)
         end
+      end
+    end
+
+    # The operator edited `stream_id`'s request at Intercept; `original` is the message as it was
+    # held. Recorded on the flow `emit_request` projects (V44). Opens the entry the way
+    # `note_advisory` does, since the edited head is released — and fed — right after this.
+    def note_intercept_original(stream_id : UInt32, original : Bytes) : Nil
+      return if stream_id == 0
+      @mutex.synchronize do
+        stream = @streams[stream_id]?
+        if stream.nil?
+          next if @streams.size >= MAX_LIVE_STREAMS
+          stream = @streams[stream_id] = Stream.new
+        end
+        stream.intercept_original = original
       end
     end
 
@@ -279,7 +371,7 @@ module Gori::Proxy::H2
         # (RFC 9113 §6.10) — a hostile peer uses one to complete a fabricated flow on a
         # never-opened stream, or to append to an already-finished one, spoofing gori's view
         # even though the raw frame log stays byte-exact. Drop it (#409).
-        return unless side.awaiting_continuation
+        return unless side.awaiting_continuation?
         append_header_fragment(side, frame.payload)
         if frame.end_headers?
           side.awaiting_continuation = false
@@ -316,8 +408,8 @@ module Gori::Proxy::H2
     # delete the stream in that case, or the later request END_STREAM would allocate a
     # fresh empty stream and lose both halves entirely.
     private def emit_ready(stream_id : UInt32, stream : Stream) : Nil
-      emit_request(stream_id, stream) if stream.req.ended && stream.req.headers && stream.flow_id.nil?
-      if stream.resp.ended && stream.resp.headers && stream.flow_id
+      emit_request(stream_id, stream) if stream.req.ended? && stream.req.headers && stream.flow_id.nil?
+      if stream.resp.ended? && stream.resp.headers && stream.flow_id
         # `flow_id` used to imply the request half was closed, because that is the only thing
         # that produced one. An extended CONNECT's flow is projected at the request HEAD
         # (`open_ws_capture` says why it must be), so on a live WebSocket it no longer does —
@@ -326,9 +418,10 @@ module Gori::Proxy::H2
         # have had the stream deleted out from under it, dropping the client's last frames and
         # the §7.1.1 closing handshake with them. Wait for the client's half; if it never comes,
         # `finalize_all` flushes at connection close as it always has.
-        return if stream.ws && !stream.req.ended
+        return if stream.ws && !stream.req.ended?
         close_ws(stream) # flush a message whose FIN never came, ahead of the flow's own row
         emit_response(stream)
+        notify_tunnel_complete(stream)
         # The exchange is complete; a stream id is never reused on a connection
         # (RFC 7540 §5.1.1), so drop its buffers to bound per-connection memory.
         #
@@ -342,13 +435,11 @@ module Gori::Proxy::H2
         # deleted, the client's next frame on that id allocated a fresh `Stream`, and History
         # gained one invented `GET /` row per refused upgrade against the real target host.
         #
-        # `ws_armed` is the durable spelling of "this `flow_id` does not mean the request half
-        # closed": it is set exactly where `emit_request` is called early, and `close_ws` does
-        # not clear it. The response row is still written above — a refused upgrade's error body
-        # is an ordinary response and must not wait for a half-close that may never come — only
-        # the FORGETTING waits. Whatever arrives next settles it, and `finalize_all` flushes at
-        # connection close as it always has.
-        @streams.delete(stream_id) if stream.req.ended || !stream.ws_armed
+        # Any WebSocket candidate stays tracked until its request half closes, even when the
+        # transcript cap left ws nil and no flow row was emitted early. An accepted unarmed
+        # tunnel still needs its final completion event, and a refusal must not turn a later
+        # request frame into a new flow on the same stream id.
+        @streams.delete(stream_id) if stream.req.ended? || !stream.websocket_candidate?
       end
     end
 
@@ -400,22 +491,37 @@ module Gori::Proxy::H2
         # REPLACES the interim rather than concatenating (which would leave the 1xx
         # :status first and mis-report the flow's status). This also bounds a stream's
         # header list against a flood of repeated interim HEADERS blocks.
+        # The interim being replaced is kept for the record first — see `record_interim`.
+        record_interim(side, existing) if existing
         side.headers = decoded
         side.header_bytes = added
         # A final status block REPLACES an interim one, so anything recorded as a trailer
         # against the interim head belongs to a head that no longer exists.
         # Both halves, or the index would keep suppressing a name for a head that is gone.
-        side.trailer_names.clear
-        side.trailer_seen.clear
-        side.trailer_pseudo.clear
-        side.trailer_pseudo_seen.clear
-        side.trailer_interim = nil
+        side.clear_trailers
       end
     ensure
       # Always reset, even if decode raised (feed rescues HPACK/framing errors and
       # keeps processing the connection) — otherwise the next HEADERS/CONTINUATION
       # fragment would append to a stale block and decode garbage.
       side.header_buf.clear
+    end
+
+    # Keep an interim head that a later status block is replacing, as the synthesized head every
+    # h2 response is stored as. The build is paid only while `Interims` is still keeping heads;
+    # past that the block is just counted. The count stops at `Interims::MAX_RUN` — h1's
+    # `MAX_INTERIM`, the run h1 refuses outright — and a flood beyond it is named once
+    # (`Side#interim_overflow`) instead of counted for as long as the origin cares to send them. Relayed: the gate forwards an
+    # interim as it arrives (it never holds one, see `StreamGate`).
+    private def record_interim(side : Side, head : Array({String, String})) : Nil
+      interims = side.interims ||= Store::Interims.new
+      if interims.saturated?
+        side.interim_overflow = true
+      elsif interims.accepting?
+        interims.add(pseudo(head, ":status").try(&.to_i?) || 0, synth_response_head(head))
+      else
+        interims.omit
+      end
     end
 
     # File a trailing block's field names, BEFORE the merge dissolves them into the head —
@@ -432,10 +538,10 @@ module Gori::Proxy::H2
     private def record_trailer_names(side : Side, decoded : Array({String, String})) : Nil
       decoded.each do |(name, value)|
         unless name.starts_with?(':')
-          side.trailer_names << name if side.trailer_seen.add?(name)
+          side.add_trailer_name(name)
           next
         end
-        side.trailer_pseudo << name if side.trailer_pseudo_seen.add?(name)
+        side.add_trailer_pseudo(name)
         next unless name == ":status" && side.trailer_interim.nil?
         code = value.to_i?
         side.trailer_interim = code if code && 100 <= code < 200
@@ -470,8 +576,8 @@ module Gori::Proxy::H2
       # As DATA on the flow row, not only as the `X-Gori-Pushed` line inside the projected
       # head: History, QL, the Sitemap and every JSON feed read the row, and a row the ORIGIN
       # authored must not be indistinguishable there from one the client sent.
-      promised.advisories << "server push: this request was invented by the origin in a " \
-                             "PUSH_PROMISE on stream #{frame.stream_id} — the client never sent it"
+      promised.advise("server push: this request was invented by the origin in a " \
+                      "PUSH_PROMISE on stream #{frame.stream_id} — the client never sent it")
       emit_request(promised_id, promised)
     end
 
@@ -487,8 +593,7 @@ module Gori::Proxy::H2
         offset = 1
       end
       return {0_u32, Bytes.empty} if payload.size < offset + 4
-      promised = ((payload[offset].to_u32 & 0x7f) << 24) | (payload[offset + 1].to_u32 << 16) |
-                 (payload[offset + 2].to_u32 << 8) | payload[offset + 3].to_u32
+      promised = IO::ByteFormat::BigEndian.decode(UInt32, payload[offset, 4]) & 0x7fffffff_u32
       offset += 4
       validate_pad(pad, payload.size - offset)
       finish = payload.size - pad
@@ -561,7 +666,7 @@ module Gori::Proxy::H2
         body_truncated: cap.truncated?, body_size: cap.total,
         h2_conn_id: @conn_id, h2_stream_id: stream_id.to_i64,
         advisory: advisory_of(stream), connect_protocol: protocol,
-        source: FlowSource::Kind::Proxy)
+        source: FlowSource::Kind::Proxy, intercept_original: stream.intercept_original)
       stream.flow_id = @sink.on_request(captured)
     end
 
@@ -577,6 +682,10 @@ module Gori::Proxy::H2
       content_type = header_value(headers, "content-type")
       content_encoding = header_value(headers, "content-encoding")
       head = synth_response_head(headers, stream.resp.trailer_names)
+      if stream.resp.interim_overflow?
+        stream.advise("the origin sent more than #{Store::Interims::MAX_RUN} interim 1xx header blocks " \
+                      "before this response; gori stopped counting them there")
+      end
       now = Time.instant
       duration_us = (now - stream.started_at).total_microseconds.to_i64
       ttfb_us = stream.resp_first_at.try { |t| (t - stream.started_at).total_microseconds.to_i64 }
@@ -584,7 +693,8 @@ module Gori::Proxy::H2
         flow_id: flow_id, status: status, head: head, body: body,
         body_truncated: cap.truncated?, body_size: cap.total,
         content_type: content_type, content_encoding: content_encoding, state: state, error: error,
-        ttfb_us: ttfb_us, duration_us: duration_us, advisory: advisory_of(stream)))
+        ttfb_us: ttfb_us, duration_us: duration_us, advisory: advisory_of(stream),
+        interims: stream.resp.interims))
     end
 
     # A trailing header block carried a pseudo-header, which RFC 9113 §8.1 forbids in a
@@ -604,7 +714,7 @@ module Gori::Proxy::H2
     # direction is what tells an operator which peer did it.
     private def note_trailer_pseudo(stream : Stream, side : Side, direction : String) : Nil
       names = side.trailer_pseudo
-      return if names.empty?
+      return if names.nil? || names.empty?
       late = direction == "response" ? side.trailer_interim : nil
       text = if late
                # The named special case, worded as `Repeater::H2Engine`'s `late_interim` clause
@@ -626,7 +736,7 @@ module Gori::Proxy::H2
                "#{names.join(", ")}, which RFC 9113 §8.1 forbids in a trailer section — " \
                "gori did not act on #{names.size == 1 ? "it" : "them"}"
              end
-      stream.advisories << text unless stream.advisories.includes?(text)
+      stream.advise(text)
     end
 
     # The stream's advisories as one newline-joined column value, or nil when there are none.
@@ -635,7 +745,7 @@ module Gori::Proxy::H2
     # the column outright (nil leaves it alone), so a response-direction advisory that carried
     # only its own line would erase what `emit_request` already stored.
     private def advisory_of(stream : Stream) : String?
-      stream.advisories.empty? ? nil : stream.advisories.join('\n')
+      stream.advisory
     end
 
     # Flush a stream that ended abnormally (RST_STREAM or the connection closed at a
@@ -651,8 +761,8 @@ module Gori::Proxy::H2
       return unless flow_id # never saw request headers — nothing to project
       reason = extended_connect_note(stream, reason)
       if stream.resp.headers
-        if stream.resp.ended
-          emit_response(stream) # response fully received; only the request never cleanly closed
+        if stream.resp.ended?
+          emit_response(stream)
         else
           emit_response(stream, state: Store::FlowState::Aborted, error: reason)
         end
@@ -660,6 +770,7 @@ module Gori::Proxy::H2
         duration_us = (Time.instant - stream.started_at).total_microseconds.to_i64
         @sink.on_response(FlowMapper.aborted_response(flow_id, reason, duration_us: duration_us))
       end
+      notify_tunnel_complete(stream)
     end
 
     # --- RFC 8441 extended CONNECT (a WebSocket over HTTP/2) -----------------------------
@@ -671,7 +782,8 @@ module Gori::Proxy::H2
       request ? open_ws_capture(stream_id, stream) : answer_ws_capture(stream)
     end
 
-    # Arm the transcript for an extended CONNECT whose `:protocol` is `websocket`.
+    # Recognize an extended CONNECT whose `:protocol` is `websocket`, then arm its transcript
+    # when a capture slot is available.
     #
     # The flow row has to be projected HERE, at the request head, and not where every other
     # stream's is. `emit_ready` emits a request when it HALF-CLOSES, and a CONNECT stream's
@@ -684,10 +796,11 @@ module Gori::Proxy::H2
       return unless headers
       protocol = extended_connect_protocol(headers)
       return unless protocol && WsCapture.websocket?(protocol)
+      stream.websocket_candidate = true
       # Decided BEFORE `emit_request`, because the advisory it stores has to say which of the
       # two dispositions this stream got.
       stream.ws_armed = @ws_captures < WsCapture::MAX_STREAMS
-      return unless stream.ws_armed
+      return unless stream.ws_armed?
       emit_request(stream_id, stream)
       flow_id = stream.flow_id
       return unless flow_id # the request insert failed — nothing to attach a transcript to
@@ -695,21 +808,21 @@ module Gori::Proxy::H2
       stream.ws = WsCapture.new(flow_id, @sink)
     end
 
-    # The origin's answer to an armed extended CONNECT. A 2xx opens the socket (RFC 8441 §5.1);
-    # anything else refuses it, and what follows on that stream is an ordinary error body — so
-    # the codec is taken back off it rather than left to invent messages out of HTML.
+    # The origin's answer to a recognized extended CONNECT. A 2xx opens the socket (RFC 8441
+    # §5.1); anything else refuses it, and what follows is an ordinary error body — so an armed
+    # codec is taken back off rather than left to invent messages out of HTML.
     private def answer_ws_capture(stream : Stream) : Nil
       ws = stream.ws
-      return if ws.nil? || ws.active?
-      headers = stream.resp.headers
-      return unless headers
-      status = pseudo(headers, ":status").try(&.to_i?)
+      return unless stream.websocket_candidate?
+      return if ws.try(&.active?)
+      status = final_response_status(stream)
       return unless status
-      return if status >= 100 && status < 200 # interim; the real answer is still coming
-      unless status >= 200 && status < 300
-        close_ws(stream)
+      unless successful_websocket_response?(status)
+        close_ws(stream) if ws
         return
       end
+      stream.websocket_accepted = true
+      return unless ws
       # DATA the client sent before the answer arrived. A conforming client sends none, but one
       # that does would otherwise hand the reassembler a stream that starts mid-frame — desynced
       # for the socket's whole life. Skipped when the capped buffer already dropped bytes, since
@@ -721,6 +834,29 @@ module Gori::Proxy::H2
       # transcript fills in underneath it. `finalize_stream`/`emit_ready` write the row again
       # with the final state and the full duration; `update_response` is last-write-wins.
       emit_response(stream)
+    end
+
+    # An interim answer does not decide whether extended CONNECT opened the tunnel.
+    private def final_response_status(stream : Stream) : Int32?
+      headers = stream.resp.headers || return
+      status = pseudo(headers, ":status").try(&.to_i?) || return
+      return if status >= 100 && status < 200
+      status
+    end
+
+    private def successful_websocket_response?(status : Int32) : Bool
+      status >= 200 && status < 300
+    end
+
+    # Called after the last transcript message and response projection are committed. The
+    # stream may reach this from clean END_STREAM or from abnormal finalization; either means
+    # the captured socket has ended and is ready for `capture --max`.
+    private def notify_tunnel_complete(stream : Stream) : Nil
+      return unless stream.websocket_accepted?
+      return if stream.tunnel_completion_notified?
+      flow_id = stream.flow_id || return
+      stream.tunnel_completion_notified = true
+      @sink.on_tunnel_complete(flow_id)
     end
 
     # Stop reading this stream's frames and surface whatever was mid-message. Idempotent, and
@@ -769,7 +905,7 @@ module Gori::Proxy::H2
       protocol = extended_connect_protocol(headers)
       return unless protocol
       text = extended_connect_sentence(stream, protocol)
-      stream.advisories << text unless stream.advisories.includes?(text)
+      stream.advise(text)
     end
 
     # The same sentence as an ABORT reason's tail. An aborted 8441 stream's own reason
@@ -799,7 +935,7 @@ module Gori::Proxy::H2
         return "#{head}. gori relayed it byte-for-byte but did not decode it — that protocol " \
                "is not WebSocket framing, so this stream has no message transcript"
       end
-      unless stream.ws_armed
+      unless stream.ws_armed?
         return "#{head} — a WebSocket over HTTP/2. gori relayed it byte-for-byte but did not " \
                "decode it: more than #{WsCapture::MAX_STREAMS} such streams were already being " \
                "read on this connection, so this socket has no message transcript"

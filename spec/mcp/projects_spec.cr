@@ -46,16 +46,66 @@ describe "Gori::MCP::Tools project lifecycle" do
       # the real delete with the issued token succeeds
       done = JSON.parse(tools.call("delete_project", JSON.parse(%({"project":#{doomed_slug.to_json},"dry_run":false,"confirmation_token":#{token.to_json}}))).text)
       done["deleted"].as_bool.should be_true
+      # Every dry_run:false attempt is on the bound project's activity feed — the two refused
+      # ones as failures, the delete as ok — and the dry run is not.
+      deletes = tools.current_store.not_nil!.events_after(0_i64, 500)
+        .select { |e| e.kind == "agent_action" && e.message.starts_with?("delete_project") }
+      deletes.map(&.message).count(&.starts_with?("delete_project ok")).should eq(1)
+      deletes.size.should eq(3)
 
       # Doomed is gone, Alt remains
       after = JSON.parse(tools.call("list_projects", JSON.parse("{}")).text)["projects"].as_a.map(&.["slug"].as_s)
       after.should_not contain(doomed_slug)
       after.should contain(alt)
 
-      # deleting the currently-served project (Alt) is refused
-      tools.call("delete_project", JSON.parse(%({"project":#{alt.to_json}}))).is_error.should be_true
+      # deleting the currently-served project (Alt) is refused, and not as something a retry fixes
+      served = tools.call("delete_project", JSON.parse(%({"project":#{alt.to_json}})))
+      served.is_error.should be_true
+      served.error_code.should eq("INVALID_ARGUMENT")
+      served.retryable.should be_false
     ensure
       store.close rescue nil
+      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(root)
+    end
+  end
+end
+
+describe "Gori::MCP::Tools project name resolution (#1163)" do
+  it "refuses a name that addresses two projects, naming each by a handle that is unique" do
+    root = File.tempname("gori-projambig")
+    Dir.mkdir_p(root)
+    prev = ENV["GORI_HOME"]?
+    ENV["GORI_HOME"] = root
+    prev_layer = Gori::Env.layer
+    tools = Gori::MCP::Tools.new(nil, allow_actions: true, verify_upstream: false,
+      selection_source: "unbound")
+    begin
+      created = JSON.parse(tools.call("create_project", JSON.parse(%({"name":"Client 2024"}))).text)
+      created["slug"].as_s.should eq("client-2024")
+      # A create that would make `client-2024` mean two projects is refused up front…
+      refused = tools.call("create_project", JSON.parse(%({"name":"client-2024"})))
+      refused.is_error.should be_true
+      refused.text.should contain("already the directory slug")
+
+      # …and a pair left behind by an older gori is refused at resolve time, not guessed.
+      twin = File.join(Gori::Paths.projects_dir, "client-2024-2")
+      Dir.mkdir_p(twin)
+      File.write(File.join(twin, Gori::ProjectRegistry::NAME_FILE), "client-2024")
+      Gori::Store.open(File.join(twin, Gori::Project::DB_FILE)).close
+      {"switch_project" => %({"project":"client-2024"}),
+       "delete_project" => %({"project":"client-2024"}),
+       "diff_projects"  => %({"from":"client-2024","to":"client-2024-2"})}.each do |tool, args|
+        r = tools.call(tool, JSON.parse(args))
+        r.is_error.should be_true
+        r.text.should contain("is ambiguous")
+        r.text.should contain("client-2024-2")
+      end
+      sw = JSON.parse(tools.call("switch_project", JSON.parse(%({"project":"client-2024-2"}))).text)
+      sw["switched"].as_bool.should be_true
+    ensure
+      tools.@store.try(&.close) rescue nil # the store the switch opened belongs to Tools
+      Gori::Env.layer = prev_layer
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
       FileUtils.rm_rf(root)
     end
@@ -204,6 +254,239 @@ describe "Gori::MCP::Tools unbound mode" do
     end
   end
 
+  # `instructions` is delivered at the handshake and the client caches that text for the whole
+  # session; nothing pushes an update (a stateless client can re-ask with `server/discover`,
+  # but no server-initiated refresh exists in either era). So the sentence naming the project must
+  # not read as a permanent pin ("this server is pinned to X" went on naming X while every
+  # later call read and wrote Y), and a client that DOES re-handshake has to be told the
+  # binding in force now rather than the one the process booted with (#1003).
+  describe "project binding in the handshake instructions" do
+    it "follows a mid-session switch and points at project_info as the authority" do
+      root = File.tempname("gori-instr-binding")
+      Dir.mkdir_p(root)
+      prev = ENV["GORI_HOME"]?
+      ENV["GORI_HOME"] = root
+      # `switch_project` installs the new project's bindings as the PROCESS-GLOBAL send-time
+      # layer, and the store it opens belongs to Tools (nothing out here can close it). The
+      # project dir is removed below, so without this the rest of the suite inherits an
+      # `Env.layer` backed by a deleted database — the swap hazard #910 already records.
+      prev_layer = Gori::Env.layer
+      reg = Gori::ProjectRegistry.new(Gori::Paths.projects_dir)
+      alpha = reg.create("Alpha")
+      beta = reg.create("Beta")
+      Gori::Store.open(beta.db_path).close
+      store = Gori::Store.open(alpha.db_path)
+      begin
+        input = IO::Memory.new(<<-JSON)
+          {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}
+          {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"switch_project","arguments":{"project":"Beta"}}}
+          {"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}
+          JSON
+        output = IO::Memory.new
+        Gori::MCP::Server.new(store, allow_actions: true, verify_upstream: false,
+          project_name: alpha.name, project_slug: reg.slug_of(alpha), db_path: alpha.db_path,
+          selection_source: "workspace-created", input: input, output: output).run
+        lines = output.to_s.each_line.reject(&.strip.empty?).map { |l| JSON.parse(l) }.to_a
+
+        first = lines[0]["result"]["instructions"].as_s
+        first.should contain("Alpha")
+        # The claim that could go false, and the pointer that replaces it. The hedge is
+        # "nothing pushes an update" and NOT "never re-sent" — line 3 below re-sends it.
+        first.should_not contain("pinned")
+        first.should contain("nothing pushes an update")
+        first.should contain("project_info")
+
+        # The switch result is the one place the contradiction can be settled as it is made.
+        sw = JSON.parse(lines[1]["result"]["content"][0]["text"].as_s)
+        sw["project"].as_s.should eq("Beta")
+        sw["previous_project"].as_s.should eq("Alpha")
+        sw["note"].as_s.should contain("project_info")
+
+        # What a reconnecting client is handed: the project in force NOW.
+        second = lines[2]["result"]["instructions"].as_s
+        second.should contain("Beta")
+        second.should_not contain("Alpha")
+        second.should contain("via switch_project")
+      ensure
+        store.close rescue nil # bind_project already closed it; close is idempotent
+        Gori::Env.layer = prev_layer
+        prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+        FileUtils.rm_rf(root)
+      end
+    end
+
+    # The other half of the same staleness, and BOTH server-side copies it came from: a server
+    # that started with nothing bound said so in `instructions`, and a degraded start went on
+    # blaming the db it could not open — each to a re-handshake taken after a switch had given
+    # it a working project. `project_info` reported the truth all along; the handshake text
+    # read from its own construction-time copies and did not.
+    it "stops reporting 'no project bound' (and the failed db) once a switch has bound one" do
+      root = File.tempname("gori-instr-unbound")
+      Dir.mkdir_p(root)
+      prev = ENV["GORI_HOME"]?
+      ENV["GORI_HOME"] = root
+      prev_layer = Gori::Env.layer
+      reg = Gori::ProjectRegistry.new(Gori::Paths.projects_dir)
+      seeded = reg.create("Seeded")
+      Gori::Store.open(seeded.db_path).close
+      begin
+        input = IO::Memory.new(<<-JSON)
+          {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}
+          {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"switch_project","arguments":{"project":"Seeded"}}}
+          {"jsonrpc":"2.0","id":3,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}
+          JSON
+        output = IO::Memory.new
+        Gori::MCP::Server.new(nil, allow_actions: true, verify_upstream: false,
+          selection_source: "unbound", bind_error: "cannot open database /tmp/x.db: file is not a database",
+          input: input, output: output).run
+        lines = output.to_s.each_line.reject(&.strip.empty?).map { |l| JSON.parse(l) }.to_a
+
+        first = lines[0]["result"]["instructions"].as_s
+        first.should match(/No project is bound/i)
+        first.should contain("file is not a database")
+
+        JSON.parse(lines[1]["result"]["content"][0]["text"].as_s)["switched"].as_bool.should be_true
+
+        second = lines[2]["result"]["instructions"].as_s
+        second.should_not match(/No project is bound/i)
+        second.should contain("Seeded")
+        second.should_not contain("file is not a database")
+      ensure
+        Gori::Env.layer = prev_layer
+        prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+        FileUtils.rm_rf(root)
+      end
+    end
+
+    # #1090: a switch is a new feed, and both operator-message cursors have to be re-anchored
+    # to ITS end. Left at the old project's numbers, the server either replays the new
+    # project's whole message backlog into the agent's next tool result (an id below the stale
+    # floor) or reads a feed through a cursor that belongs to another one. Nothing else in the
+    # suite touched these two lines.
+    it "re-anchors both operator-message cursors on a project switch" do
+      root = File.tempname("gori-msg-switch")
+      Dir.mkdir_p(root)
+      prev = ENV["GORI_HOME"]?
+      ENV["GORI_HOME"] = root
+      prev_layer = Gori::Env.layer
+      tools = Gori::MCP::Tools.new(nil, allow_actions: true, verify_upstream: false,
+        selection_source: "unbound")
+      begin
+        tools.call("create_project", JSON.parse(%({"name":"Alpha"})))
+        alpha = tools.current_store.not_nil!
+        # Alpha's feed is driven WELL past Beta's and the carry is READ there, so the cursor
+        # this server holds is unmistakably Alpha's. Two projects created a moment apart
+        # otherwise sit at the same id, and a spec on them passes whether the cursors were
+        # re-anchored or not.
+        40.times { |i| alpha.insert_event("probe", "probe_finding", "info", "alpha #{i}") }
+        tools.pending_operator_note("list_history").should be_nil
+        tools.messages_cursor.should eq(alpha.last_event_id)
+        alpha.post_agent_message("said in alpha", "all", nil)
+        tools.call("create_project", JSON.parse(%({"name":"Beta"})))
+        JSON.parse(tools.call("switch_project", JSON.parse(%({"project":"Beta"}))).text)["switched"].as_bool.should be_true
+
+        beta = tools.current_store.not_nil!
+        tools.messages_floor.should eq(beta.last_event_id)
+        tools.messages_cursor.should eq(tools.messages_floor)
+        beta.last_event_id.should be < alpha.last_event_id # the cursors really had to move
+        # Nothing Alpha said is owed here…
+        tools.pending_operator_note("list_history").should be_nil
+        # …and a line said in Beta, whose id is far below Alpha's cursor, is still carried.
+        id = beta.post_agent_message("said in beta", "all", nil)
+        tools.pending_operator_note("list_history").not_nil!.ids.should eq([id])
+      ensure
+        Gori::Env.layer = prev_layer
+        prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+        FileUtils.rm_rf(root)
+      end
+    end
+
+    # A switch to the project ALREADY bound is the same feed: re-anchoring there dropped every
+    # operator message posted before it and not yet read, on every route at once.
+    it "keeps the operator-message cursors on a switch to the project already bound" do
+      root = File.tempname("gori-msg-self-switch")
+      Dir.mkdir_p(root)
+      prev = ENV["GORI_HOME"]?
+      ENV["GORI_HOME"] = root
+      prev_layer = Gori::Env.layer
+      tools = Gori::MCP::Tools.new(nil, allow_actions: true, verify_upstream: false,
+        selection_source: "unbound")
+      begin
+        tools.call("create_project", JSON.parse(%({"name":"Alpha"})))
+        alpha = tools.current_store.not_nil!
+        id = alpha.post_agent_message("before the rebind", "all", nil)
+        JSON.parse(tools.call("switch_project", JSON.parse(%({"project":"Alpha"}))).text)["switched"].as_bool.should be_true
+        tools.pending_operator_note("list_history").not_nil!.ids.should eq([id])
+      ensure
+        Gori::Env.layer = prev_layer
+        prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+        FileUtils.rm_rf(root)
+      end
+    end
+
+    # The other path that rebinds, and the only one create_project takes: it auto-binds when
+    # the server started unbound, so it owes the same receipt as a switch.
+    it "gives create_project's auto-bind the same rebind receipt as a switch" do
+      root = File.tempname("gori-instr-create")
+      Dir.mkdir_p(root)
+      prev = ENV["GORI_HOME"]?
+      ENV["GORI_HOME"] = root
+      prev_layer = Gori::Env.layer
+      tools = Gori::MCP::Tools.new(nil, allow_actions: true, verify_upstream: false,
+        selection_source: "unbound")
+      begin
+        made = JSON.parse(tools.call("create_project", JSON.parse(%({"name":"Fresh"}))).text)
+        made["switched"].as_bool.should be_true
+        made["note"].as_s.should contain("project_info")
+        # Present and null rather than absent: a client parsing rebind receipts uniformly must
+        # not have to tell "this path omits the key" from "there was nothing to move off".
+        made.as_h.has_key?("previous_project").should be_true
+        made["previous_project"].raw.should be_nil
+
+        # A second create does NOT rebind (already bound), so it owes no receipt…
+        second = JSON.parse(tools.call("create_project", JSON.parse(%({"name":"Second"}))).text)
+        second["switched"].as_bool.should be_false
+        second.as_h.has_key?("note").should be_false
+
+        # …and the switch that does names the project it moved off.
+        moved = JSON.parse(tools.call("switch_project", JSON.parse(%({"project":"Second"}))).text)
+        moved["project"].as_s.should eq("Second")
+        moved["previous_project"].as_s.should eq("Fresh")
+      ensure
+        Gori::Env.layer = prev_layer
+        prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+        FileUtils.rm_rf(root)
+      end
+    end
+  end
+
+  # `gori mcp --db /engagements/acme.db` binds a file that is not a registry project, so it has
+  # no display name and no slug — and `previous_project: null` on the first switch would read as
+  # "there was no previous project" for a binding that had been capturing all along.
+  it "names a --db binding by its path when a switch moves off it" do
+    root = File.tempname("gori-prev-db")
+    Dir.mkdir_p(root)
+    prev = ENV["GORI_HOME"]?
+    ENV["GORI_HOME"] = root
+    prev_layer = Gori::Env.layer
+    reg = Gori::ProjectRegistry.new(Gori::Paths.projects_dir)
+    seeded = reg.create("Seeded")
+    Gori::Store.open(seeded.db_path).close
+    loose = File.join(root, "acme.db")
+    store = Gori::Store.open(loose)
+    tools = Gori::MCP::Tools.new(store, allow_actions: true, verify_upstream: false,
+      db_path: loose, selection_source: "--db")
+    begin
+      sw = JSON.parse(tools.call("switch_project", JSON.parse(%({"project":"Seeded"}))).text)
+      sw["previous_project"].as_s.should eq(loose)
+    ensure
+      store.close rescue nil
+      Gori::Env.layer = prev_layer
+      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(root)
+    end
+  end
+
   it "handshakes an unbound Server over stdio" do
     input = IO::Memory.new(<<-JSON)
       {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}
@@ -313,6 +596,109 @@ describe "MCP job project binding" do
       listed = mcp_ok_json(tools, "list_jobs", "{}")["jobs"].as_a.find { |x| x["job_id"].as_s == job_id }
       listed.should_not be_nil
       listed.not_nil!["project_changed"].as_bool.should be_true
+    ensure
+      store.close rescue nil
+      prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")
+      FileUtils.rm_rf(root)
+    end
+  end
+end
+
+# #1085 — `list_projects` used to serialise EVERY project on the host in one result. On a
+# machine with a project per worktree that ran past the MCP client's per-tool-result budget,
+# so the listing was spilled to a temp file instead of reaching the agent. These pin the
+# narrowing that replaced it, and — just as important — the two places where a shortened
+# listing must not read as a finding about the host.
+describe "Gori::MCP::Tools list_projects narrowing" do
+  it "pages, narrows by query, and never lets a short page read as an empty host" do
+    root = File.tempname("gori-projlist")
+    Dir.mkdir_p(root)
+    prev = ENV["GORI_HOME"]?
+    ENV["GORI_HOME"] = root
+    cur_db = File.join(root, "current.db")
+    store = Gori::Store.open(cur_db)
+    tools = Gori::MCP::Tools.new(store, allow_actions: true, verify_upstream: false, db_path: cur_db)
+    begin
+      reg = Gori::ProjectRegistry.new(Gori::Paths.projects_dir)
+      slugs = (1..7).map { |n| reg.slug_of(reg.create("Acme #{n}")) }
+      lone = reg.slug_of(reg.create("Zeta store"))
+      bound = reg.create_for_workspace("Bound", "/tmp/gori-ws-1085")
+      Gori::Store.open(bound.db_path).close # create_for_workspace lays the sidecars, not the db
+      bound_slug = reg.slug_of(bound)
+      bound_id = reg.id_of(bound).not_nil!
+      total = slugs.size + 2
+
+      full = JSON.parse(tools.call("list_projects", JSON.parse("{}")).text)
+      full["total"].as_i.should eq(total)
+      full["total_projects"].as_i.should eq(total)
+      full["returned"].as_i.should eq(total)
+      full["has_more"].as_bool.should be_false
+      full["limit"].as_i.should eq(50)
+
+      # Paging reaches every row exactly once, and the truncated page says so.
+      first = JSON.parse(tools.call("list_projects", JSON.parse(%({"limit":5}))).text)
+      first["returned"].as_i.should eq(5)
+      first["has_more"].as_bool.should be_true
+      first["note"].as_s.should contain("showing 5 of #{total}")
+      first["note"].as_s.should contain("offset:5")
+      rest = JSON.parse(tools.call("list_projects", JSON.parse(%({"limit":5,"offset":5}))).text)
+      rest["has_more"].as_bool.should be_false
+      rest["note"]?.should be_nil
+      paged = (first["projects"].as_a + rest["projects"].as_a).map(&.["slug"].as_s)
+      paged.sort.should eq((slugs + [lone, bound_slug]).sort)
+
+      # query is a substring over name / slug / short id / bound workspace path.
+      by_name = JSON.parse(tools.call("list_projects", JSON.parse(%({"query":"acme"}))).text)
+      by_name["total"].as_i.should eq(slugs.size)
+      by_name["total_projects"].as_i.should eq(total)
+      by_name["query"].as_s.should eq("acme")
+      by_name["projects"].as_a.map(&.["slug"].as_s).sort!.should eq(slugs.sort)
+
+      JSON.parse(tools.call("list_projects", JSON.parse(%({"query":"zeta-st"}))).text)["projects"]
+        .as_a.map(&.["slug"].as_s).should eq([lone])
+      JSON.parse(tools.call("list_projects", JSON.parse(%({"query":#{bound_id.to_json}}))).text)["projects"]
+        .as_a.map(&.["slug"].as_s).should eq([bound_slug])
+      JSON.parse(tools.call("list_projects", JSON.parse(%({"query":"gori-ws-1085"}))).text)["projects"]
+        .as_a.map(&.["slug"].as_s).should eq([bound_slug])
+
+      # A query that matched nothing is NOT "this host has no projects".
+      miss = JSON.parse(tools.call("list_projects", JSON.parse(%({"query":"nosuchthing"}))).text)
+      miss["total"].as_i.should eq(0)
+      miss["projects"].as_a.should be_empty
+      miss["total_projects"].as_i.should eq(total)
+      miss["note"].as_s.should contain("this host has #{total} projects")
+
+      # The binding is reported whether or not the page happens to carry its row — here it
+      # never can, because the server is bound to a loose --db outside the registry.
+      full["bound"].as_bool.should be_true
+      full["current_db_path"].as_s.should eq(cur_db)
+      full["projects"].as_a.map(&.["current"].as_bool).should_not contain(true)
+
+      sw = tools.call("switch_project", JSON.parse(%({"project":#{bound_slug.to_json}})))
+      sw.is_error.should be_false
+      narrowed = JSON.parse(tools.call("list_projects", JSON.parse(%({"query":"acme"}))).text)
+      narrowed["projects"].as_a.map(&.["current"].as_bool).should_not contain(true)
+      narrowed["current_project"].as_s.should eq("Bound")
+      narrowed["current_project_slug"].as_s.should eq(bound_slug)
+      narrowed["current_project_id"].as_s.should eq(bound_id)
+      narrowed["current_db_path"].as_s.should eq(bound.db_path)
+
+      # A page off the end of a real match is the cursor's doing, not an empty host.
+      past = JSON.parse(tools.call("list_projects", JSON.parse(%({"offset":900}))).text)
+      past["returned"].as_i.should eq(0)
+      past["total"].as_i.should eq(total)
+      past["has_more"].as_bool.should be_false
+      past["note"].as_s.should contain("past the last of #{total} matching projects")
+
+      # An out-of-range page is clamped and NAMED, like every other paged tool here.
+      over = JSON.parse(tools.call("list_projects", JSON.parse(%({"limit":9999,"offset":-3}))).text)
+      over["limit"].as_i.should eq(500)
+      over["offset"].as_i.should eq(0)
+      over["pagination_warning"].as_s.should_not be_empty
+
+      # A typo'd argument is refused rather than silently widening the listing back out.
+      tools.call("list_projects", JSON.parse(%({"quer":"acme"}))).is_error.should be_true
+      tools.call("list_projects", JSON.parse(%({"limit":"many"}))).is_error.should be_true
     ensure
       store.close rescue nil
       prev ? (ENV["GORI_HOME"] = prev) : ENV.delete("GORI_HOME")

@@ -1,5 +1,6 @@
 # `gori run discover` — spider + directory brute-force a target; findings feed the Sitemap.
 require "../../discover/plan"
+require "../../plural"
 
 module Gori
   module CLI
@@ -24,6 +25,7 @@ module Gori
         retries = 1
         max_requests : Int64? = nil
         keep_alive = true
+        crawl_assets = false
         insecure = false
         sni : String? = nil
         http2 = false
@@ -34,9 +36,8 @@ module Gori
         no_store = false
         format = :text
         headers = [] of String
-        leftover = [] of String
 
-        parser = OptionParser.new do |p|
+        leftover = parse_args(args, "gori run discover") do |p|
           p.banner = "Usage: gori run discover --target URL [options]"
           p.on("--target=URL", "Seed origin or path subtree to explore (required)") { |v| target_override = v }
           p.on("--project=NAME", "Project for scope rules + storing findings") { |v| project_name = v }
@@ -44,7 +45,7 @@ module Gori
           p.on("--max-depth=N", "Spider depth from the seed (default 4)") { |v| max_depth = parse_nonneg(v, "--max-depth") }
           p.on("--no-spider", "Disable link crawling (brute-force only)") { spider = false }
           p.on("--no-bruteforce", "Disable directory brute-forcing (crawl only)") { bruteforce = false }
-          p.on("--wordlist=PATH", "Extra path wordlist (merged with the built-in list)") { |v| wordlist = v }
+          p.on("--wordlist=PATH", "Extra path wordlist: a file, or the NAME of a saved list (`gori run wordlist`); merged with the built-in list (one list)") { |v| wordlist = one_wordlist(wordlist, v, "gori run discover") }
           p.on("--extensions=LIST", "Also probe these extensions (e.g. php,json,bak)") { |v| extensions = parse_extensions(v) }
           p.on("-HHEADER", "--header=HEADER", "Custom request header on every probe, e.g. \"Authorization: Bearer …\" (repeatable). Host and Connection are owned by the crawler and ignored; a value carrying CR/LF is refused, not dropped") { |v| headers << v }
           p.on("--containment=MODE", "same-origin | scope-aware (default) | host+subdomains") { |v| containment = parse_containment(v) }
@@ -55,21 +56,18 @@ module Gori
           p.on("--retries=N", "Retries on a network error") { |v| retries = parse_nonneg(v, "--retries") }
           p.on("--max-requests=N", "Hard cap on total requests sent") { |v| max_requests = parse_count(v, "--max-requests").to_i64 }
           p.on("--no-keep-alive", "Dial a fresh connection for every probe (default: reuse)") { keep_alive = false }
+          p.on("--assets", "Also fetch linked images/fonts/media/archives (default: record their directories, skip the download)") { crawl_assets = true }
           p.on("-k", "--insecure-upstream", "Do not verify upstream TLS certificates") { insecure = true }
           p.on("--http2", "Force HTTP/2") { http2 = true }
           p.on("--sni=HOST", "TLS SNI override") { |v| sni = v }
-          p.on("--bind-from=FLOW-ID", "Replay this captured flow FIRST so its response fills session bindings ($NAME)") { |v| bind_from = parse_flow_id(v, "gori run discover") }
-          p.on("--slot=NAME", "Send as this SESSION SLOT — its header overlay, and its binding table for $NAME") { |v| slot = v.strip }
+          p.on("--bind-from=FLOW-ID", "Replay this captured flow FIRST so its response fills session bindings ($BIND.NAME; bare syntax: $NAME)") { |v| bind_from = parse_flow_id(v, "gori run discover") }
+          p.on("--slot=NAME", "Send as this SESSION SLOT — its header overlay, and its binding table for $BIND.NAME tokens (bare syntax: $NAME)") { |v| slot = v.strip }
           p.on("--allow-unscoped", "Run even if the target is outside the project scope (Sandbox/exclude still apply)") { allow_unscoped = true }
           p.on("--force", "Bypass the unbounded-run safety gate") { force = true }
           p.on("--no-store", "Do not write findings into the project (Sitemap)") { no_store = true }
-          p.on("--format=FMT", "Output: text (default) | json | jsonl") { |v| format = parse_format(v, [:text, :json, :jsonl]) }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| leftover = before + after }
-          p.invalid_option { |f| abort "gori run discover: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run discover: missing value for #{f}" }
+          format_flag(p, [:text, :json, :jsonl], "Output: text (default) | json | jsonl") { |f| format = f }
         end
-        parser.parse(args)
+        refresh_verify_upstream(!insecure)
         if leftover.size == 1 && target_override.nil?
           target_override = leftover[0]
         elsif !leftover.empty?
@@ -101,13 +99,15 @@ module Gori
         config = Discover::Config.new(
           concurrency: concurrency, rps: rate, throttle_ms: throttle, timeout: timeout,
           retries: retries, max_requests: max_requests, keep_alive: keep_alive,
-          spider: spider, bruteforce: bruteforce,
+          spider: spider, bruteforce: bruteforce, crawl_assets: crawl_assets,
           max_depth: max_depth, user_wordlist: wordlist, extensions: extensions,
           containment: containment, headers: parsed_headers)
 
         project = resolve_discover_project(project_name, db_path)
-        store = open_store(project)
-        begin
+        # `long_running`: the store stays open for the whole crawl and every finding batch is
+        # written through it, so it takes the Store's standard wait budget, not the one-shot
+        # CLI one — a one-second refusal here is a dropped batch of findings, not a fast exit.
+        with_store(project, long_running: true) do |store|
           # The store stays open for the whole run (findings are written through it), so the
           # Outbound does NOT take ownership of it — the ensure below is what closes it.
           outbound = Gori::Outbound.cli(Scope.load(store), allow_unscoped)
@@ -120,7 +120,7 @@ module Gori
           unsafe = Discover::Headers.unsafe_expanded(config.headers)
           unless unsafe.empty?
             abort "gori run discover: header #{unsafe.first.inspect} rejected — its value contains " \
-                  "CR or LF after $VAR expansion, which would splice extra headers into every probe"
+                  "CR or LF after env expansion, which would splice extra headers into every probe"
           end
           # `.to_s` rather than `|| ""`: an OptionParser-closured var never narrows out of String?.
           options = Discover::PlanOptions.new(target_override.to_s, config: config,
@@ -145,8 +145,6 @@ module Gori
           (fid = bind_from) && seed_bindings(fid, project_name, db_path, outbound, insecure, "gori run discover")
           discover_preflight(plan, force)
           run_discover_stream(plan.engine, store, format, no_store, -> { plan.sender.pool_stats })
-        ensure
-          store.close
         end
       end
 
@@ -236,6 +234,7 @@ module Gori
         pending = [] of {Store::CapturedRequest, Store::CapturedResponse?}
         base_ts = Time.utc.to_unix * 1_000_000
         had_error = false
+        unsaved = 0
         # This was discover's own private helper until fuzz, mine and sequence turned out to
         # need the identical thing; it now lives in `run/interrupt.cr` (which carries the
         # reasoning) so there is one implementation rather than four copies.
@@ -251,7 +250,7 @@ module Gori
               pair = Discover::Persist.flow_pair(f, base_ts + findings.size, ev.exchange,
                 surface: Gori::FlowSource::Surface::Cli)
               pending << {pair.request, pair.response}
-              flush_discover(store, pending) if pending.size >= 200
+              unsaved += flush_discover(store, pending) if pending.size >= 200
             end
           when Discover::ProgressEvent then discover_progress(ev)
           when Discover::DoneEvent     then discover_done(ev, engine, pool_stats)
@@ -262,7 +261,13 @@ module Gori
         # and no DoneEvent, but findings discovered before it should still reach the Sitemap. A
         # SIGINT/SIGTERM lands here too (see the trap above) since Engine#stop makes the run end
         # like any other — so this one flush covers the normal, error, AND interrupted paths.
-        flush_discover(store, pending) unless no_store
+        unsaved += flush_discover(store, pending) unless no_store
+        # A rolled-back batch is capture that never happened: the findings above were printed,
+        # but the rows they name do not exist and never will (the pairs keep no bytes past the
+        # flush). The TUI says so on its toast and in the notification centre; a script has only
+        # STDERR and the exit code, so it gets both — this is the one condition under which a
+        # printed finding cannot be opened, and "exit 0, row missing" is the silent kind (#1118).
+        had_error = report_discover_unsaved(unsaved, had_error)
         puts CLI::Output.discover_array_json(findings) if format == :json
         # LAST, after the summary: `--slot NAME` whose overlay resolved to nothing means every
         # probe in the sweep carried `$SESSION` itself instead of a session, so the whole crawl
@@ -280,11 +285,37 @@ module Gori
         exit 1 if had_error
       end
 
+      # Write the buffered pairs as one batch and answer how many of them did NOT land.
+      #
+      # `insert_import_batch` returns the COMMITTED count — 0 for a batch the writer rolled back
+      # (a peer holding the writer slot past the busy budget) or a closing store — and this used
+      # to discard it and clear the buffer regardless, so up to 200 crawled exchanges vanished
+      # per collision with no line, no count and exit 0. The buffer is still cleared either way:
+      # keeping a refused batch for a later retry is exactly the unbounded growth the 200-cap
+      # exists to prevent, and `Import.insert_all` makes the same call (it stops and reports).
       private def self.flush_discover(store : Store,
-                                      pending : Array({Store::CapturedRequest, Store::CapturedResponse?})) : Nil
-        return if pending.empty?
-        store.insert_import_batch(pending)
+                                      pending : Array({Store::CapturedRequest, Store::CapturedResponse?})) : Int32
+        return 0 if pending.empty?
+        landed = store.insert_import_batch(pending)
+        lost = pending.size - landed
         pending.clear
+        lost
+      end
+
+      # Says the loss on STDERR and answers the run's error flag with it folded in. Split from
+      # `run_discover_stream`, which is at the complexity bar.
+      private def self.report_discover_unsaved(unsaved : Int32, had_error : Bool) : Bool
+        return had_error unless unsaved > 0
+        STDERR.puts discover_unsaved_note(unsaved)
+        true
+      end
+
+      # Public for the reason every other refusal sentence in this tree is: the caller ends in
+      # an exit, so the wording is pinned here.
+      def self.discover_unsaved_note(unsaved : Int32) : String
+        "gori run discover: #{unsaved} captured exchange#{unsaved == 1 ? "" : "s"} NOT saved " \
+        "(project busy or unwritable) — the findings were printed, but their History/Sitemap " \
+        "rows do not exist and cannot be opened; re-run the crawl once the project is free"
       end
 
       private def self.emit_discover_finding(f : Discover::Finding, format : Symbol) : Nil
@@ -309,7 +340,9 @@ module Gori
         STDERR.puts "done · #{s.found} found · #{s.sent} sent · #{ev.progress.errors} errors" \
                     " · calibrated-out #{s.calibrated_out} · dedup #{s.dedup_suppressed}" \
                     " · template #{s.template_suppressed} · cluster #{s.cluster_suppressed}" \
-                    "#{s.drift_suppressed > 0 ? " · drift #{s.drift_suppressed}" : ""}#{ev.stopped ? " (stopped)" : ""}"
+                    "#{s.drift_suppressed > 0 ? " · drift #{s.drift_suppressed}" : ""}" \
+                    "#{s.assets_skipped > 0 ? " · assets #{s.assets_skipped} (--assets to fetch)" : ""}" \
+                    "#{ev.stopped ? " (stopped)" : ""}"
         # A sweep that stopped on its budget must never read like one that finished: with
         # `--max-requests 8` against a 283-candidate wordlist this line said `5 found` and
         # exited 0, and 275 of those candidates were never sent. `queued` is what is still
@@ -326,7 +359,7 @@ module Gori
         # target it had barely touched. Read off the engine rather than the event for the
         # reason `pool_stats` is: the counter is final exactly when this event arrives.
         if (refused = engine.scope_refused) > 0
-          STDERR.puts "#{refused} candidate#{refused == 1 ? "" : "s"} refused by scope " \
+          STDERR.puts "#{Gori.plural(refused, "candidate")} refused by scope " \
                       "— the sweep stopped early; this is not a clean result over the whole target"
         end
         # Handshakes actually paid for — the one thing the request counts above cannot show.

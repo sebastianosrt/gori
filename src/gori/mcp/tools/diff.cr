@@ -13,6 +13,8 @@ module Gori
       # Reads only: two grouped queries and one shared fold tree, no bodies and no
       # network. Confirming that a finding still reproduces takes a request, and that stays
       # a deliberate `send_request` — see `Gori::Diff`, which owns the whole comparison.
+      DIFF_LIMIT = PageLimit.new(20_000, Store::ENDPOINT_OBSERVATION_MAX)
+
       @[Tool("diff_projects", unbound: true)]
       private def diff_projects(h) : Result
         from = str(h, "from").try(&.strip).presence
@@ -23,7 +25,8 @@ module Gori
         opts = diff_options(h)
         return opts if opts.is_a?(Result)
         reg = registry
-        base = reg.find(from)
+        base = find_project(reg, from, "from")
+        return base if base.is_a?(Result)
         return not_found(unknown_project(reg, "from", from)) unless base
         target = resolve_diff_target(reg, str(h, "to").try(&.strip).presence)
         return target if target.is_a?(Result)
@@ -54,7 +57,8 @@ module Gori
             filter: opts.filter, limit: opts.limit, in_scope: opts.in_scope,
             issue_limit: opts.issues ? Gori::Diff::ISSUE_RETEST_MAX : 0,
             raise_on_error: true)
-          Result.new(Gori::Diff::Render.json(report, verdicts: opts.verdicts, issues: opts.issues))
+          Result.new(with_ignored_terms(Gori::Diff::Render.json(report, verdicts: opts.verdicts, issues: opts.issues),
+            opts.dropped))
         ensure
           base_store.close
         end
@@ -66,16 +70,18 @@ module Gori
         verdicts : Array(Gori::Diff::Verdict),
         limit : Int32,
         issues : Bool,
-        in_scope : Bool
+        in_scope : Bool,
+        dropped : Array(String)
 
       private def diff_options(h) : DiffOptions | Result
-        filter = diff_filter(h, str(h, "query"))
+        dropped = [] of String
+        filter = diff_filter(h, str(h, "query"), dropped)
         return filter if filter.is_a?(Result)
         verdicts = diff_verdicts(h)
         return verdicts if verdicts.is_a?(Result)
         DiffOptions.new(filter, verdicts,
-          clamp(optional_int_arg(h, "limit"), 20_000, Store::ENDPOINT_OBSERVATION_MAX),
-          bool_arg(h, "issues", true), bool_arg(h, "in_scope", false))
+          clamp(optional_int_arg(h, "limit"), DIFF_LIMIT),
+          bool_arg(h, "issues", true), bool_arg(h, "in_scope", false), dropped)
       end
 
       # NOT `ql_filter_or_error`, for two reasons that are really one: that helper reads the
@@ -90,7 +96,7 @@ module Gori
       #     as an unconfigured project on both sides instead — deterministic, and the same
       #     lens `gori run diff` compiles with. Scoping a retest is `in_scope`, which asks
       #     each side its OWN rules.
-      private def diff_filter(h, query : String?) : QL::Filter | Result
+      private def diff_filter(h, query : String?, dropped : Array(String)) : QL::Filter | Result
         q = query.try(&.strip)
         return QL::EMPTY if q.nil? || q.empty?
         # The one check this helper can share with `ql_filter_or_error` verbatim: naming a field
@@ -102,7 +108,23 @@ module Gori
         return ql_error(q) if QL.reject_empty?(q, filter)
         bad = QL.invalid_regex_terms(q)
         return ql_invalid_regex_error(q, bad) unless bad.empty?
+        # Named on the reply like every other query tool's (`emit_ignored_terms`): a dropped term
+        # diffs more endpoints than asked.
+        dropped.concat(QL.analyze(q, scope: QL::SCOPE_SHAPE_ONLY).ignored)
         filter
+      end
+
+      # The rendered report with `ignored_terms` added when the query dropped any. The report is
+      # built by the shared renderer, so the fields go on after it rather than into it.
+      private def with_ignored_terms(json : String, dropped : Array(String)) : String
+        return json if dropped.empty?
+        report = JSON.parse(json).as_h
+        JSON.build do |j|
+          j.object do
+            report.each { |k, v| j.field(k) { v.to_json(j) } }
+            emit_ignored_terms(j, dropped)
+          end
+        end
       end
 
       # The NEWER side: a named project (opened read-only here, ours to close) or — when
@@ -115,7 +137,8 @@ module Gori
           return no_project unless bound && path
           return {Project.new(@project_name || File.basename(File.dirname(path)), path), bound, false}
         end
-        project = reg.find(to)
+        project = find_project(reg, to, "to")
+        return project if project.is_a?(Result)
         return not_found(unknown_project(reg, "to", to)) unless project
         # Naming the project this server is already bound to is the same side as omitting
         # `to`. Reuse the open store rather than taking a second connection to a database
@@ -192,7 +215,7 @@ module Gori
           s.field "in_scope", boolprop("only hosts inside each project's own scope rules (default false)")
           s.field "verdicts", strarrprop("only return endpoints with these verdicts: added, gone, changed, unchanged, removed (default: all)")
           s.field "issues", boolprop("include the issue retest — which endpoint each of the baseline's open issues sits on, and whether it still answers the same way (default true)")
-          s.field "limit", intprop("max endpoint groups to read per side (default 20000, max #{Store::ENDPOINT_OBSERVATION_MAX})")
+          s.field "limit", limitprop("max endpoint groups to read per side", DIFF_LIMIT)
           s.field "lenient", boolprop("search a `field:` QL does not implement as literal TEXT instead of refusing the query (default false) — a typo free-texts its whole token and matches nothing on both sides")
         end
       end

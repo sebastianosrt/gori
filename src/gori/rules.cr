@@ -2,7 +2,10 @@ require "./env"
 require "./process_hook"
 require "./rule_set_change"
 require "./proxy/head_rewriter"
+require "./proxy/codec/http1"
 require "./rules/stub"
+require "./rules/map_local"
+require "./rules/mock_from_flow"
 require "./rules/presets"
 require "./store"
 require "./store/safe_regexp"
@@ -44,21 +47,31 @@ module Gori
     private enum Refusal
       Unbound  # declared by an enabled extract rule, no value yet
       Boundary # bound, and the value carries CR/LF/NUL — see `forges_boundary?`
+      # A BARE `$NAME` under the namespaced grammar, where NAME is an env var, a declared binding
+      # or a name a session slot claims. See `bare_spelling_at`.
+      BareSpelling
     end
 
     # The key travels with the reason because the event has to name it: a replacement holding
-    # several `$NAME`s makes "the value carries CR" actionable only if it says whose.
-    private record Refused, reason : Refusal, key : String
+    # several `$NAME`s makes "the value carries CR" actionable only if it says whose. `ns` rides
+    # along for the one refusal whose remedy is a SPELLING: the message has to name the namespace
+    # the operator should write, and only the refusal site knows which table held the name.
+    private record Refused, reason : Refusal, key : String, ns : Env::Namespace? = nil
 
     def initialize(@store : Store, @rules : Array(Store::MatchRule))
       @mutex = Mutex.new
       @stub_bodies = RuleStubBodyCache.new
+      # `respond: dir` roots, resolved to their realpath once rather than per request (the
+      # proxy fiber pays for every filesystem call). Cleared by `refresh`, like `@stub_bodies`.
+      @dir_roots = {} of String => String
+      @dir_roots_mutex = Mutex.new
       # Lock-free fast-path flags: rewrite_* run on EVERY message, but the common case
       # is no rule for that side/part. These let the hot path skip the mutex + select-
       # array allocation entirely when nothing would match. The head counts gate the head
       # rewrite (replace-head AND the header ops, which all act on the head), split PER
       # DIRECTION like the body counts so a request-only rule doesn't tax every response
-      # (and vice versa); the body counts also gate whether ClientConn buffers a body at all.
+      # (and vice versa); the host- and direction-scoped body gates decide whether ClientConn
+      # buffers a particular message.
       @req_head_count = Atomic(Int32).new(active_count(@rules, Store::RuleTarget::Request, part: Store::RulePart::Head))
       @resp_head_count = Atomic(Int32).new(active_count(@rules, Store::RuleTarget::Response, part: Store::RulePart::Head))
       @req_body_count = Atomic(Int32).new(active_count(@rules, Store::RuleTarget::Request, part: Store::RulePart::Body))
@@ -77,8 +90,7 @@ module Gori
       @short_circuit_count = Atomic(Int32).new(stub_count(@rules))
       # Pre-merged `$KEY` snapshot for `replacement_for`, invalidated by revision rather
       # than rebuilt per message — see `subst_snapshot`.
-      @subst_vars = nil.as(Hash(String, String)?)
-      @subst_declared = [] of String
+      @subst_snap = nil.as(SubstSnapshot?)
       @subst_env_rev = 0_u32
       @subst_binding_rev = 0_u64
       # Rules already reported as blocked on an unbound binding, at that binding revision.
@@ -107,12 +119,12 @@ module Gori
     # it out, and the counts did not: the rule landed in `@ws_out_count`, which is what
     # decides whether `WS::Relay` keeps its byte-exact pump — so a rule that can never fire
     # took every message on that socket off frame-exact forwarding (P7). `part: body` is the
-    # same defect one notch louder: it makes `rewrites_body_for_host?` true, which buffers
-    # every body AND costs the host HTTP/2 (`tls/tunnel.cr`). Counting on the same predicate
+    # same defect one notch louder: it made `rewrites_body_for_host?` true, which downgraded
+    # every matching host from HTTP/2 (`tls/tunnel.cr`). Counting on the same predicate
     # that applies is what keeps "a rule is live" from meaning two different things.
     private def rewrites?(rule : Store::MatchRule, target : Store::RuleTarget?,
                           part : Store::RulePart) : Bool
-      rule.enabled? && rule.op.rewrite? && !rule.pattern.empty? && rule.part == part &&
+      rule.active? && rule.op.rewrite? && !rule.pattern.empty? && rule.part == part &&
         !(rule.op.header? && !part.head?) && (target.nil? || rule.target == target)
     end
 
@@ -127,7 +139,7 @@ module Gori
     # is counted anyway: it MUST still short-circuit (fail closed — see `stub_for`), because
     # falling through would send a request the operator declared contained.
     private def stub_count(rules : Array(Store::MatchRule)) : Int32
-      rules.count { |r| r.enabled? && r.op.short_circuit? && !r.pattern.empty? }
+      rules.count { |r| r.active? && r.op.short_circuit? && !r.pattern.empty? }
     end
 
     def self.load(store : Store) : Rules
@@ -161,11 +173,11 @@ module Gori
 
     # The lens is doing something iff at least one rule is enabled.
     def active? : Bool
-      @mutex.synchronize { @rules.any?(&.enabled?) }
+      @mutex.synchronize { @rules.any?(&.active?) }
     end
 
     def enabled_count : Int32
-      @mutex.synchronize { @rules.count(&.enabled?) }
+      @mutex.synchronize { @rules.count(&.active?) }
     end
 
     # --- editing (persists, then refreshes the snapshot) ---------------------
@@ -176,9 +188,11 @@ module Gori
     def add(target : Store::RuleTarget, part : Store::RulePart, pattern : String, replacement : String,
             op : Store::RuleOp = Store::RuleOp::Replace, match_kind : Store::MatchKind = Store::MatchKind::Literal,
             name : String = "", host : String = "", body_file : String = "",
-            scope : Store::RuleScope = Store::RuleScope::Project, enabled : Bool = true) : Bool
+            scope : Store::RuleScope = Store::RuleScope::Project, enabled : Bool = true,
+            respond : Store::RespondKind = Store::RespondKind.implied(body_file),
+            respond_args : String = "") : Bool
       create(target, part, pattern, replacement, op, match_kind, name, host, body_file,
-        scope: scope, enabled: enabled) != 0
+        scope: scope, enabled: enabled, respond: respond, respond_args: respond_args) != 0
     end
 
     # `add`, answering the new rule's ID rather than only whether the write committed (0 = it
@@ -191,9 +205,12 @@ module Gori
     def create(target : Store::RuleTarget, part : Store::RulePart, pattern : String, replacement : String,
                op : Store::RuleOp = Store::RuleOp::Replace, match_kind : Store::MatchKind = Store::MatchKind::Literal,
                name : String = "", host : String = "", body_file : String = "",
-               scope : Store::RuleScope = Store::RuleScope::Project, enabled : Bool = true) : Int64
+               scope : Store::RuleScope = Store::RuleScope::Project, enabled : Bool = true,
+               respond : Store::RespondKind = Store::RespondKind.implied(body_file),
+               respond_args : String = "") : Int64
       return 0_i64 if pattern.empty?
       target, part = normalize_shape(op, target, part)
+      respond, respond_args, body_file = Rules.normalize_respond(op, respond, respond_args, body_file)
       # Both writers already answered — a global add returns the new id (0 = not written),
       # a project add the same through `insert_rule`'s `exec_task`. This threw it away, so a
       # surface printed "rule duplicated" (or silently closed its overlay having "added" the
@@ -203,9 +220,11 @@ module Gori
       new_id =
         if scope.global?
           Settings.add_rewriter_rule(target.label, part.label, pattern, replacement, op.label,
-            match_kind.label, name, host, body_file, enabled)
+            match_kind.label, name, host, body_file, enabled,
+            respond: respond.label, respond_args: respond_args)
         else
-          @store.insert_rule(target, part, pattern, replacement, op, match_kind, name, host, enabled, body_file: body_file)
+          @store.insert_rule(target, part, pattern, replacement, op, match_kind, name, host, enabled,
+            body_file: body_file, respond: respond.label, respond_args: respond_args)
         end
       ok = new_id != 0
       refresh
@@ -238,15 +257,24 @@ module Gori
     def update(id : Int64, target : Store::RuleTarget, part : Store::RulePart, pattern : String, replacement : String,
                op : Store::RuleOp = Store::RuleOp::Replace, match_kind : Store::MatchKind = Store::MatchKind::Literal,
                name : String = "", host : String = "", body_file : String = "",
-               scope : Store::RuleScope = Store::RuleScope::Project) : Bool
+               scope : Store::RuleScope = Store::RuleScope::Project,
+               respond : Store::RespondKind? = nil, respond_args : String? = nil) : Bool
+      existing = rules.find { |r| r.id == id && r.scope == scope }
+      return false unless existing && !existing.inert?
       return false if pattern.empty?
       target, part = normalize_shape(op, target, part)
+      # nil KEEPS the rule's own sub-kind: a caller that predates #1237 (or simply does not
+      # speak of it) must not turn a dir or fault rule back into an inline stub by omission.
+      respond, respond_args, body_file = Rules.normalize_respond(op, respond || existing.respond,
+        respond_args || existing.respond_args, body_file)
       ok =
         if scope.global?
           Settings.update_rewriter_rule(id, target.label, part.label, pattern, replacement,
-            op.label, match_kind.label, name, host, body_file)
+            op.label, match_kind.label, name, host, body_file,
+            respond: respond.label, respond_args: respond_args)
         else
-          @store.update_rule(id, target, part, pattern, replacement, op, match_kind, name, host, body_file)
+          @store.update_rule(id, target, part, pattern, replacement, op, match_kind, name, host,
+            body_file, respond: respond.label, respond_args: respond_args)
         end
       refresh
       ConfigLog.record(@store, "rule_update", "#{Rules.scope_word(scope)} rewrite rule changed — #{Rules.rule_phrase(id, name, target, part)}") if ok
@@ -267,6 +295,13 @@ module Gori
     def self.rule_phrase(id : Int64, name : String?, target : Store::RuleTarget, part : Store::RulePart) : String
       label = (name && !name.empty?) ? "#{name.inspect} " : ""
       "#{label}##{id} (#{target.label}/#{part.label})"
+    end
+
+    def self.rule_phrase(rule : Store::MatchRule) : String
+      label = rule.name.empty? ? "" : "#{rule.name.inspect} "
+      target = rule.unknown_target.try(&.inspect) || rule.target.label
+      part = rule.unknown_part.try(&.inspect) || rule.part.label
+      "#{label}##{rule.id} (#{target}/#{part})"
     end
 
     def self.scope_word(scope : Store::RuleScope) : String
@@ -293,15 +328,26 @@ module Gori
     # duplicate stands, which is why the id is kept rather than the copy re-found by fields
     # (that would pick the wrong twin).
     def set_scope(rule : Store::MatchRule, to : Store::RuleScope) : Bool
-      return false if rule.scope == to
+      return false if rule.inert? || rule.scope == to
+      # `rule` is a snapshot. A global one may have gained a key a newer gori wrote since, and
+      # the copy below carries only the fields this binary knows while the delete then drops
+      # the original — so ask the file, as `Settings.move_rewriter_rule` does.
+      if rule.scope.global?
+        Settings.reload_rewriter_from_disk
+        if Settings.rewriter_rule_inert?(rule.id)
+          refresh
+          return false
+        end
+      end
       copy_id =
         if to.global?
           Settings.add_rewriter_rule(rule.target.label, rule.part.label, rule.pattern,
             rule.replacement, rule.op.label, rule.match_kind.label, rule.name, rule.host,
-            rule.body_file, rule.enabled?)
+            rule.body_file, rule.enabled?, respond: rule.respond.label, respond_args: rule.respond_args)
         else
           @store.insert_rule(rule.target, rule.part, rule.pattern, rule.replacement, rule.op,
-            rule.match_kind, rule.name, rule.host, rule.enabled?, body_file: rule.body_file)
+            rule.match_kind, rule.name, rule.host, rule.enabled?, body_file: rule.body_file,
+            respond: rule.respond.label, respond_args: rule.respond_args)
         end
       return false if copy_id == 0
       # `log: false` — see `remove_rule`. Either half failing rolls the other back, so nothing
@@ -356,6 +402,19 @@ module Gori
       Rules.normalize_shape(op, target, part)
     end
 
+    # The {respond, respond_args, body_file} a rule can actually have (#1237) — `normalize_shape`'s
+    # twin for the short-circuit sub-kind. Every other op reads none of the three, so an op
+    # changed away from `short_circuit` drops them rather than carrying a dir path or a fault
+    # kind it would silently resurrect if switched back. A `dir` path is made absolute here
+    # (`~` included), once, for every surface: the proxy resolves it at request time from its
+    # own working directory, which is not the directory the operator typed it in.
+    def self.normalize_respond(op : Store::RuleOp, respond : Store::RespondKind, respond_args : String,
+                               body_file : String) : {Store::RespondKind, String, String}
+      return {Store::RespondKind::Inline, "", ""} unless op.short_circuit?
+      body_file = File.expand_path(body_file, home: true) if respond.dir? && !body_file.empty?
+      {respond, respond_args, body_file}
+    end
+
     # False when the write did NOT commit (store busy, locked or closing) — the rule is still
     # there and still rewriting live traffic. The store has always answered this; it was
     # discarded here, so the TUI reported "rule deleted" for a rollback while the headless
@@ -400,7 +459,7 @@ module Gori
         end
       refresh
       if log && ok && (r = doomed)
-        ConfigLog.record(@store, "rule_remove", "#{Rules.scope_word(scope)} rewrite rule removed — #{Rules.rule_phrase(r.id, r.name, r.target, r.part)}")
+        ConfigLog.record(@store, "rule_remove", "#{Rules.scope_word(scope)} rewrite rule removed — #{Rules.rule_phrase(r)}")
       end
       ok
     end
@@ -425,6 +484,9 @@ module Gori
     def set_enabled(id : Int64, enabled : Bool, scope : Store::RuleScope = Store::RuleScope::Project) : Bool
       rule = rules.find { |r| r.id == id && r.scope == scope }
       return false unless rule
+      # Turning an inert row ON would claim it is usable, even though this binary still cannot
+      # interpret its grammar. Turning it OFF is safe and preserves the unsupported labels.
+      return false if enabled && rule.inert?
       ok =
         if scope.global?
           set_effective(id, enabled)
@@ -435,7 +497,7 @@ module Gori
       # Enabling and disabling is the same act as installing and removing, as far as what
       # actually rewrites traffic is concerned.
       state = enabled ? "enabled" : "disabled"
-      ConfigLog.record(@store, "rule_toggle", "#{Rules.scope_word(scope)} rewrite rule #{state} — #{Rules.rule_phrase(rule.id, rule.name, rule.target, rule.part)}") if ok
+      ConfigLog.record(@store, "rule_toggle", "#{Rules.scope_word(scope)} rewrite rule #{state} — #{Rules.rule_phrase(rule)}") if ok
       ok
     end
 
@@ -459,13 +521,14 @@ module Gori
     def set_default(id : Int64, enabled : Bool) : Bool
       rule = Settings.rewriter_rules.find { |r| r.id == id }
       return false unless rule
+      return false if enabled && rule.inert?
       ok = Settings.set_rewriter_rule_enabled(id, enabled)
       refresh
       if ok
         r = rule.to_rule
         ConfigLog.record(@store, "rule_toggle",
           "global rewrite rule #{enabled ? "enabled" : "disabled"} by default in every project — " \
-          "#{Rules.rule_phrase(r.id, r.name, r.target, r.part)}")
+          "#{Rules.rule_phrase(r)}")
       end
       ok
     end
@@ -491,11 +554,16 @@ module Gori
     # same header wins, so reporting a reorder that did not reach disk leaves the operator
     # believing an order that reverts at next start.
     def move(id : Int64, dir : Int32, scope : Store::RuleScope = Store::RuleScope::Project) : Bool
-      scoped = rules.select { |r| r.scope == scope }
+      snapshot = rules
+      rule = snapshot.find { |r| r.id == id && r.scope == scope }
+      return false unless rule && !rule.inert?
+      scoped = snapshot.select { |r| r.scope == scope }
       i = scoped.index { |r| r.id == id }
       return false unless i
       j = i + (dir < 0 ? -1 : 1)
       return false if j < 0 || j >= scoped.size
+      target = scoped[j]
+      return false if target.inert?
       ok = scope.global? ? Settings.move_rewriter_rule(id, dir) : @store.move_rule(id, dir)
       refresh
       ok
@@ -533,9 +601,13 @@ module Gori
       # The `executes` predicate is what makes a peer's `pipe` rule announce louder than a peer's
       # `replace` rule — see `RuleSetChange`. `enabled?` is part of it because a disabled pipe
       # rule forks nothing; it is a row, not a hook.
+      # `serves_files` does the same for a map-local rule (#1237), which answers the operator's
+      # own browser with files off this machine's disk.
       return unless change = RuleSetChange.between(before, after,
                       ->(r : Store::MatchRule) { {r.scope, r.id} },
-                      ->(r : Store::MatchRule) { r.enabled? && r.op.executes? })
+                      ->(r : Store::MatchRule) { r.active? && r.op.executes? },
+                      ->(r : Store::MatchRule) { r.active? },
+                      ->(r : Store::MatchRule) { r.active? && r.op.short_circuit? && r.respond.dir? })
       @mutex.synchronize do
         @pending_peer_change = (held = @pending_peer_change) ? held.merge(change) : change
       end
@@ -559,6 +631,7 @@ module Gori
 
     # The short op badge — "re/H", "sub/B", "+hdr", "stub", …
     def self.op_tag(rule : Store::MatchRule) : String
+      return "?" if rule.inert?
       case rule.op
       when .replace?
         kind = rule.match_kind.regex? ? "re" : "sub"
@@ -576,27 +649,19 @@ module Gori
 
     # What the rule does to the bytes, in the op's own shape.
     def self.describe(rule : Store::MatchRule) : String
+      return rule.inert_reason || "unknown rule" if rule.inert?
       case rule.op
       when .add_header?, .set_header? then "#{rule.pattern}: #{rule.replacement}"
       when .remove_header?            then rule.pattern
         # `⇥` (not `→`) because a stub does not transform the request into the response — it
         # answers instead of forwarding, and the row should not read like the other four ops.
-      when .short_circuit? then "#{rule.pattern} ⇥ #{RuleStub.summary(rule.replacement, rule.body_file)}"
+      when .short_circuit? then "#{rule.pattern} ⇥ #{RuleStub.summary(rule)}"
         # `⇄` (not `→`) because the replacement is not the text on the right — it is whatever
         # that command WRITES. The row names the command so the operator can see, in the list,
         # that this rule executes something.
       when .pipe? then "#{rule.pattern} ⇄ #{rule.replacement}"
       else             "#{rule.pattern} → #{rule.replacement}"
       end
-    end
-
-    # Badge + description + the host glob when the rule is scoped to one. The host is worth
-    # the width HERE and not in the tab's list (which has its own column for it): a rule scoped
-    # to `*.corp.internal` is a different rule from the same pattern unscoped, and a confirm
-    # prompt naming only the pattern would not say which of the two it is about.
-    def self.summary(rule : Store::MatchRule) : String
-      s = "#{op_tag(rule)}  #{describe(rule)}"
-      rule.host.empty? ? s : "#{s}  @#{rule.host}"
     end
 
     # --- HeadRewriter (called from proxy fibers) -----------------------------
@@ -609,8 +674,9 @@ module Gori
       apply(head, Store::RuleTarget::Response, Store::RulePart::Head, @resp_head_count, host)
     end
 
-    # A body rule is live iff at least one enabled, non-empty rule targets that side's
-    # body — ClientConn keys the (expensive) body buffer on these.
+    # Host-blind summaries used where only the overall rule-set state matters. ClientConn
+    # uses the host-scoped directional predicates below when deciding whether this message's
+    # body needs the (expensive) rewrite buffer.
     def rewrites_request_body? : Bool
       @req_body_count.get > 0
     end
@@ -619,23 +685,40 @@ module Gori
       @resp_body_count.get > 0
     end
 
-    # Whether a body rule that can actually MATCH `host` is live (#526). The two predicates
-    # above answer "is any body rule live", which is the right question for `ClientConn` (it
-    # is deciding whether to pay for a body buffer on a connection already pinned to one
-    # host) and the wrong one for the h2 downgrade gate: that gate costs the host its
-    # protocol, and a rule scoped to `alpha.test` was costing `127.0.0.1` its protocol too.
+    # Whether either body direction has a rule that can actually MATCH `host` (#526). This is
+    # the combined question the h2 downgrade gate needs: it costs a host its protocol, and a
+    # rule scoped to `alpha.test` must not cost `127.0.0.1` anything.
     #
     # The atomic counts are still the fast path — no body rule anywhere means no lock and no
     # select — and `host_matches?` (memoised, see below) then decides the rest. Both sides
     # are folded into one question because the gate downgrades for either.
     #
-    # Once per CONNECT, so the mutex here is not on any hot path.
+    # Called at the h2 CONNECT gate, not per frame.
     def rewrites_body_for_host?(host : String) : Bool
       return false if @req_body_count.get == 0 && @resp_body_count.get == 0 # lock-free fast path
       @mutex.synchronize do
         @rules.any? do |r|
           rewrites?(r, nil, Store::RulePart::Body) && host_matches?(r.host, host)
         end
+      end
+    end
+
+    # HTTP/1 forward-proxy connections can carry requests for several hosts, so the buffer
+    # decision must narrow both the direction and host before reading an entity. These are
+    # per-message checks; the atomic side count avoids taking the rules mutex when that side has
+    # no body rules.
+    def rewrites_request_body_for_host?(host : String) : Bool
+      body_rule_for_host?(Store::RuleTarget::Request, @req_body_count, host)
+    end
+
+    def rewrites_response_body_for_host?(host : String) : Bool
+      body_rule_for_host?(Store::RuleTarget::Response, @resp_body_count, host)
+    end
+
+    private def body_rule_for_host?(target : Store::RuleTarget, count : Atomic(Int32), host : String) : Bool
+      return false if count.get == 0 # lock-free fast path
+      @mutex.synchronize do
+        @rules.any? { |r| rewrites?(r, target, Store::RulePart::Body) && host_matches?(r.host, host) }
       end
     end
 
@@ -684,19 +767,15 @@ module Gori
 
     # --- short circuit (#511) ------------------------------------------------
 
-    def short_circuits? : Bool
-      @short_circuit_count.get > 0
-    end
-
-    # `short_circuits?` narrowed to one host (#526) — the same split, and for the same
-    # reason, as `rewrites_body_for_host?` above. The host filter is exactly the one
+    # Whether a short-circuit rule could fire for one host (#526) — the same split, and for
+    # the same reason, as `rewrites_body_for_host?` above. The host filter is exactly the one
     # `short_circuit` itself applies, so this answers "could `short_circuit` ever return a
     # stub for this host", which is precisely what the downgrade gate is protecting.
     def short_circuits_for_host?(host : String) : Bool
       return false if @short_circuit_count.get == 0 # lock-free fast path
       @mutex.synchronize do
         @rules.any? do |r|
-          r.enabled? && r.op.short_circuit? && !r.pattern.empty? && host_matches?(r.host, host)
+          r.active? && r.op.short_circuit? && !r.pattern.empty? && host_matches?(r.host, host)
         end
       end
     end
@@ -708,13 +787,22 @@ module Gori
       return nil if @short_circuit_count.get == 0 # lock-free fast path
       active = @mutex.synchronize do
         @rules.select do |r|
-          r.enabled? && r.op.short_circuit? && !r.pattern.empty? && host_matches?(r.host, host)
+          r.active? && r.op.short_circuit? && !r.pattern.empty? && host_matches?(r.host, host)
         end
       end
       return nil if active.empty?
       text = String.new(head)
-      rule = active.find { |r| stub_matches?(r, text) }
-      rule ? stub_for(rule) : nil
+      # The FIRST rule that CLAIMS the request answers it. A rule whose pattern matches almost
+      # always claims; the two exceptions are decided here, before anything is dialed: a `dir`
+      # rule whose `strip_prefix` the path is outside of, and a `dir` rule with `fallthrough`
+      # whose file is simply absent (#1237). Either one hands the request to the next rule,
+      # and past the last one to the origin.
+      active.each do |r|
+        next unless stub_matches?(r, text)
+        stub = claim(r, head)
+        return stub if stub
+      end
+      nil
     end
 
     # Whether a stub rule's pattern claims this request head. Same literal/regex split the
@@ -738,30 +826,125 @@ module Gori
     # becomes a gori-authored 502 carrying the reason, which ClientConn records on the flow —
     # falling through to the origin instead would send a request the operator declared
     # contained, and a payload leaking because a stub file was deleted is the worse failure.
+    #
+    # The ONE deliberate exception is a map-local rule with `fallthrough` (#1237), and it is
+    # not an exception to this method: that rule declines at CLAIM time (`claim`), before
+    # anything is answered or dialed, and only for a file that is simply absent — never for a
+    # path the confinement refused, and never for a root that is gone.
     private def stub_for(rule : Store::MatchRule) : Proxy::HeadRewriter::Stub
+      ref = stub_ref(rule, rule.respond.label)
       head = RuleStub.parse_head(rule.replacement)
-      return stub_failure(rule, "stub response head could not be parsed") unless head
+      return stub_failure(rule, "stub response head could not be parsed", ref) unless head
       body = if rule.body_file.empty?
                RuleStub.inline_body(rule.replacement)
              else
                begin
                  @stub_bodies.read(rule.body_file)
-               rescue ex : Gori::Error
-                 return stub_failure(rule, ex.message || "stub body file unreadable")
+               rescue ex : RuleStubBodyCache::ReadError
+                 return stub_failure(rule, ex.message || ex.page_message, ref, page_message: ex.page_message)
                end
              end
-      Proxy::HeadRewriter::Stub.new(head.bytes, body, head.status, rule.id)
+      Proxy::HeadRewriter::Stub.new(head.bytes, body, head.status, rule.id, ref: ref)
+    end
+
+    # The stub a matched rule answers with, or nil when the rule does not CLAIM the request
+    # after all — see `short_circuit`. Only a `dir` rule can decline.
+    private def claim(rule : Store::MatchRule, head : Bytes) : Proxy::HeadRewriter::Stub?
+      stub =
+        case rule.respond
+        in .dir?            then map_local(rule, head)
+        in .fault?          then fault_for(rule)
+        in .inline?, .file? then stub_for(rule)
+        end
+      return nil unless stub
+      # The delay rides on every sub-kind, gori's own failure answers included: a rule that
+      # says "answer slowly" and then cannot find its file still answered slowly.
+      delay = rule.args.delay_ms
+      delay > 0 ? stub.copy_with(delay: delay.milliseconds, ref: "#{stub.ref} +#{delay}ms") : stub
+    end
+
+    # A `respond: fault` rule (#1237): no response bytes at all, only what to do to the
+    # connection. `respond_error` refuses a fault rule without a kind at save time; a row that
+    # arrives without one anyway (a hand edit) fails closed like any other broken stub.
+    private def fault_for(rule : Store::MatchRule) : Proxy::HeadRewriter::Stub
+      kind = rule.args.fault
+      return stub_failure(rule, "fault rule names no fault kind", stub_ref(rule, "fault")) unless kind
+      hang = kind.hang? ? rule.args.hang_ms.milliseconds : nil
+      Proxy::HeadRewriter::Stub.new(Bytes.new(0), Bytes.new(0), 0, rule.id,
+        ref: stub_ref(rule, "fault #{kind.label}"), fault: kind, hang: hang)
+    end
+
+    # A `respond: dir` rule (#1237). See `RuleStub::MapLocal` for the confinement.
+    private def map_local(rule : Store::MatchRule, head : Bytes) : Proxy::HeadRewriter::Stub?
+      ref = stub_ref(rule, "dir")
+      root = dir_root(rule.body_file)
+      return stub_failure(rule, "the mapped directory is gone or not a directory", ref) unless root
+      # `gate_target`, the sandbox's own reading: the strict parse gives `""` for a request line
+      # with a doubled space or a tab, which would leave this rule unclaimed — and the request on
+      # its way to an origin that collapses the whitespace and serves the path anyway.
+      target = Proxy::Codec::Http1.gate_target(Proxy::Codec::Http1.parse_request_head(head))
+      res = RuleStub::MapLocal.resolve(root, rule.args.strip_prefix, target)
+      ref = stub_ref(rule, "dir #{RuleStub::MapLocal.display(res.rel)}") unless res.rel.empty?
+      case res.outcome
+      in .not_claimed?
+        return nil
+      in .missing?
+        return nil if rule.args.fallthrough?
+        return stub_failure(rule, res.reason, ref)
+      in .refused?
+        return stub_failure(rule, "map-local refused the path: #{res.reason}", ref, 404)
+      in .broken?
+        return stub_failure(rule, res.reason, ref)
+      in .hit?
+      end
+      template = rule.replacement.strip.empty? ? "200 OK" : rule.replacement
+      parsed = RuleStub.parse_head(template)
+      return stub_failure(rule, "stub response head could not be parsed", ref) unless parsed
+      body = begin
+        @stub_bodies.read(res.path)
+      rescue ex : RuleStubBodyCache::ReadError
+        return stub_failure(rule, ex.message || ex.page_message, ref, page_message: ex.page_message)
+      end
+      head_bytes = parsed.bytes
+      # The template's own Content-Type wins; otherwise the extension table, or nothing.
+      if !RuleStub.header?(head_bytes, "content-type") && (ct = RuleStub::MapLocal.content_type(res.path))
+        head_bytes = String.build { |io| io.write(head_bytes); io << "Content-Type: " << ct << "\r\n" }.to_slice
+      end
+      Proxy::HeadRewriter::Stub.new(head_bytes, body, parsed.status, rule.id, ref: ref)
+    end
+
+    # The realpath of a `dir` rule's root, cached; nil when it cannot be resolved (gone), which
+    # is answered 502 rather than cached, so a directory created later is picked up.
+    private def dir_root(dir : String) : String?
+      @dir_roots_mutex.synchronize { @dir_roots[dir]? }.try { |hit| return hit }
+      real = File.realpath(dir) rescue return nil
+      @dir_roots_mutex.synchronize { @dir_roots[dir] = real }
+      real
+    end
+
+    # How a flow names the rule that answered it (`source_ref`, #1237): scope and id — the two
+    # stores number rules independently, so "rule #3" alone would send the operator to the
+    # wrong list half the time — plus what kind of answer it was.
+    private def stub_ref(rule : Store::MatchRule, detail : String) : String
+      "#{rule.scope.label} rule ##{rule.id} · #{detail}"
     end
 
     # gori's own answer when a rule cannot be honoured. Unlike a stub, this one IS marked on
     # the wire (`X-Gori-Short-Circuit: error`): the operator's bytes go out untouched, but
-    # bytes gori invented say so.
-    private def stub_failure(rule : Store::MatchRule, message : String) : Proxy::HeadRewriter::Stub
+    # bytes gori invented say so. 502 by default; a map-local path the confinement refused is
+    # a 404, because it names a file that is not there to be served.
+    #
+    # `message` is the flow's error, read by the operator; `page_message` is what the body says,
+    # read by the page under test. They differ only where the reason names a local path (a
+    # body file that cannot be read), which stays out of the body.
+    private def stub_failure(rule : Store::MatchRule, message : String, ref : String,
+                             status : Int32 = 502, page_message : String = message) : Proxy::HeadRewriter::Stub
       # Names the SCOPE as well as the id: the two stores number rules independently, so
       # "rule #3" would send the operator to the wrong list half the time.
-      body = "gori: short-circuit #{rule.scope.label} rule ##{rule.id} could not be applied: #{message}\n".to_slice
-      head = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain; charset=utf-8\r\nX-Gori-Short-Circuit: error\r\n".to_slice
-      Proxy::HeadRewriter::Stub.new(head, body, 502, rule.id, error: message)
+      body = "gori: short-circuit #{rule.scope.label} rule ##{rule.id} could not be applied: #{page_message}\n".to_slice
+      reason = status == 404 ? "404 Not Found" : "502 Bad Gateway"
+      head = "HTTP/1.1 #{reason}\r\nContent-Type: text/plain; charset=utf-8\r\nX-Gori-Short-Circuit: error\r\n".to_slice
+      Proxy::HeadRewriter::Stub.new(head, body, status, rule.id, error: message, ref: ref)
     end
 
     # Apply every enabled rule for `target` over a full HTTP message (head + body split on the
@@ -1139,8 +1322,8 @@ module Gori
       # The overwhelmingly common case, and the one that must cost nothing: no `$` in the
       # replacement means the identical String comes back, exactly as before this feature.
       return text if prefix.empty? || !text.byte_index(prefix)
-      vars, declared = subst_snapshot
-      substitute(text, prefix, vars, declared, rule.op.replace? && rule.match_kind.regex?,
+      snap = subst_snapshot
+      substitute(text, prefix, snap, rule.op.replace? && rule.match_kind.regex?,
         head: head_scoped?(rule))
     end
 
@@ -1188,64 +1371,150 @@ module Gori
     #
     # Byte-level for the same reason `Env.expand` is: a BODY replacement can carry bytes
     # that are not valid UTF-8, and `String#chars` would turn each of them into U+FFFD.
-    private def substitute(repl : String, prefix : String, vars : Hash(String, String),
-                           declared : Array(String), regex : Bool, head : Bool = false) : String | Refused
+    # `$$` IS the escape here in BOTH grammars, and it is checked before anything else — a rule's
+    # replacement is the one field whose whole purpose is to inject a value, so its escape belongs
+    # to the rule grammar rather than to a namespace. (`Env.read_token_at` is then asked with
+    # `escapes: Owns::None`: the sigil pair is already gone, and nothing else here is an escape.)
+    #
+    # Under the NAMESPACED grammar the token routes by namespace: `$ENV.X` resolves out of the
+    # env-var table and can never be Unbound or Boundary-refused (an env var is the operator's own
+    # bytes, P7), `$BIND.X` out of the binding table with both refusals intact. Under the BARE one
+    # there is a single merged table and a name is a binding iff some extract rule declares it,
+    # which is what shipped.
+    private def substitute(repl : String, prefix : String, snap : SubstSnapshot,
+                           regex : Bool, head : Bool = false) : String | Refused
       bytes = repl.to_slice
-      prefix_bytes = prefix.to_slice
+      syntax = Settings.env_syntax
       n = bytes.size
-      plen = prefix_bytes.size
+      plen = prefix.bytesize
       buf = IO::Memory.new(n)
       i = 0
       while i < n
-        unless prefix_at?(bytes, prefix_bytes, i)
+        unless Env.prefix_at?(bytes, prefix, i)
           buf.write_byte(bytes[i])
           i += 1
           next
         end
         # `$$` → one literal prefix, consuming both.
-        if prefix_at?(bytes, prefix_bytes, i + plen)
+        if Env.prefix_at?(bytes, prefix, i + plen)
           buf << prefix
           i += 2 * plen
           next
         end
-        if parsed = Env.read_key_bytes?(bytes, i + plen, n)
-          key, consumed = parsed
-          # Declared by an extract rule but not bound yet → the rule must not apply.
-          #
-          # The send seams stopped refusing on this (see `Env.unbound`): everywhere else a
-          # `$NAME` with no value is a literal on the wire. This one stays, and it is not the
-          # same disposition wearing a different hat:
-          #
-          #   * It is a rule-scoped SKIP, not a send refusal. Nothing is blocked — the message
-          #     reaches the origin, just unrewritten. The policy that changed was about gori
-          #     refusing to send bytes the operator authored; here it sends them.
-          #   * A `replacement` is a REFERENCE by construction. It is the one field in the
-          #     product whose only purpose is to inject a value, so there is no captured-body
-          #     collision to protect: nobody's GraphQL document lands in this column by
-          #     accident. Emitting the seven characters `$SESSION` into an `Authorization`
-          #     header instead would put a known-wrong credential on EVERY proxied request,
-          #     silently, for as long as the rule is enabled.
-          #   * The two halves of the policy that actually matter against a collision are
-          #     already here and predate it: `$$` is the escape (below), and a name that is
-          #     neither a var nor declared stays LITERAL (`emit_key`).
-          #
-          # `report_refused` writes one warn event per (rule, binding revision) naming it.
-          return Refused.new(Refusal::Unbound, key) if !vars.has_key?(key) && declared.includes?(key)
-          return Refused.new(Refusal::Boundary, key) if head && forges_boundary?(vars, declared, key)
-          i += emit_key(buf, bytes, vars, key, consumed, prefix, plen, regex)
+        found = Env.read_token_at(bytes, i, n, syntax: syntax, prefix: prefix,
+          escapes: Env::Owns::None)
+        if found && found.kind.token?
+          written = emit_token(buf, bytes, i, found, snap, prefix, plen, syntax, regex, head)
+          return written if written.is_a?(Refused)
+          i += written
           next
         end
         # `$1`..`$9` → `\1`..`\9`, regex replacements only (unchanged from `regex_replacement`).
+        # Before the bare-spelling refusal below, though the order cannot actually matter: a digit
+        # never starts a key (`Env::KEY_HEAD` is `[A-Za-z_]`), so `$1` is invisible to it.
         if regex && i + plen < n && bytes[i + plen].chr.ascii_number?
           buf << '\\'
           buf.write_byte(bytes[i + plen])
           i += plen + 1
           next
         end
+        # A bare `$NAME` under the NAMESPACED grammar, where one of this rule's tables holds NAME.
+        # Not a literal anybody meant — `$$NAME` is how a literal is written here, and `substitute`
+        # consumed that above. See `bare_spelling_at`.
+        if syntax.namespaced? && (stale = bare_spelling_at(bytes, i + plen, n, snap))
+          return Refused.new(Refusal::BareSpelling, stale[0], stale[1])
+        end
         buf << prefix
         i += plen
       end
       String.new(buf.to_slice)
+    end
+
+    # The bare NAME behind a sigil that opened nothing, when one of this rule's tables holds it —
+    # and therefore the one spelling in a replacement that is almost certainly STALE rather than
+    # literal.
+    #
+    # A replacement is a REFERENCE by construction: it is the one column in the product whose whole
+    # purpose is to inject a value, and `$$NAME` is how an operator writes a literal `$NAME` there.
+    # So a bare `$SESSION` under the namespaced grammar is not a collision to protect — it is a rule
+    # the grammar moved out from under, and there are two ways to get one that no load-time
+    # migration can reach:
+    #
+    #   * a GLOBAL rule naming a PROJECT var or an extract rule. `Settings.load` re-spells the
+    #     global rules with only the global env var names to go on — no project is open — so a rule
+    #     naming a project-scoped name stays bare. `EnvMigration.reconcile` NAMES it once a project
+    #     is open and deliberately does not rewrite it, because nothing records which grammar the
+    #     rules are in and a second project would re-spell an already-re-spelled replacement.
+    #   * a rule that was inert and became live: an operator adds an env var or an extract rule
+    #     whose name some rule's replacement already spells bare.
+    #
+    # Shipping the literal bytes is the worst of the three answers, and it is what used to happen,
+    # with no event. `$SESSION` in an `Authorization` header puts eight known-wrong characters on
+    # EVERY proxied request, silently, for as long as the rule is enabled — the same argument that
+    # makes an unbound declared name a refusal here rather than a literal. So the rule does not
+    # apply and the event names the re-spelling.
+    #
+    # BIND is tested first, for the reason `EnvMigration.route` gives: a bare replacement resolved
+    # against `Env.display_vars`, where the binding values are layered OVER the env vars. And the
+    # BIND half is `SubstSnapshot#binds?`, which counts a name the ACTIVE SLOT CLAIMS as well as one
+    # an enabled rule declares — the half the `Refusal` enum's own comment already promised. A slot
+    # written through `--identities FILE` or MCP `create_session_slot` names bindings the project may
+    # not hold yet, and a rule replacement spelling one of those bare was shipping the literal.
+    private def bare_spelling_at(bytes : Bytes, at : Int32, n : Int32,
+                                 snap : SubstSnapshot) : {String, Env::Namespace}?
+      parsed = Env.read_key_bytes?(bytes, at, n)
+      return nil unless parsed
+      name = parsed[0]
+      return {name, Env::Namespace::Bind} if snap.binds?(name)
+      return {name, Env::Namespace::Env} if snap.env.has_key?(name)
+      nil
+    end
+
+    # One token of a replacement, written to `buf` — or the Refusal that stops the rule applying
+    # at all. Answers how many bytes it consumed.
+    #
+    # Declared by an extract rule but not bound yet → the rule must not apply.
+    #
+    # The send seams stopped refusing on this (see `Env.unbound`): everywhere else a `$NAME` with
+    # no value is a literal on the wire. This one stays, and it is not the same disposition
+    # wearing a different hat:
+    #
+    #   * It is a rule-scoped SKIP, not a send refusal. Nothing is blocked — the message reaches
+    #     the origin, just unrewritten. The policy that changed was about gori refusing to send
+    #     bytes the operator authored; here it sends them.
+    #   * A `replacement` is a REFERENCE by construction. It is the one field in the product whose
+    #     only purpose is to inject a value, so there is no captured-body collision to protect:
+    #     nobody's GraphQL document lands in this column by accident. Emitting the seven
+    #     characters `$SESSION` into an `Authorization` header instead would put a known-wrong
+    #     credential on EVERY proxied request, silently, for as long as the rule is enabled.
+    #   * The two halves of the policy that actually matter against a collision are already here
+    #     and predate it: `$$` is the escape (in `substitute`), and a name that is neither a var
+    #     nor declared stays LITERAL (below).
+    #
+    # Both refusals belong to the BINDING layer alone: under the namespaced grammar an `$ENV.X` is
+    # the operator's own bytes (P7) and resolves or stays literal, never refuses.
+    # `report_refused` writes one warn event per (rule, binding revision) naming it.
+    private def emit_token(buf : IO::Memory, bytes : Bytes, at : Int32, found : Env::Found,
+                           snap : SubstSnapshot, prefix : String, plen : Int32,
+                           syntax : Env::Syntax, regex : Bool, head : Bool) : Int32 | Refused
+      key = found.name
+      vars = snap.table_for(found.ns)
+      declared = snap.declarable?(found.ns) ? snap.declared : EMPTY_DECLARED
+      return Refused.new(Refusal::Unbound, key) if !vars.has_key?(key) && declared.includes?(key)
+      return Refused.new(Refusal::Boundary, key) if head && forges_boundary?(vars, declared, key)
+      if val = vars[key]?
+        buf << (regex ? Rules.escape_backrefs(val) : val)
+        return found.width
+      end
+      # A key that is neither a var nor a declared binding stays LITERAL — `Env.expand`'s
+      # documented contract, and the meaning every pre-existing rule already had. Refusing here
+      # instead would be a one-way door on a persisted, operator-authored table.
+      #
+      # BARE re-enters the scan just past the sigil (`$AB` retries at `A`); NAMESPACED consumes the
+      # whole `$NS.NAME`, which has nothing inside it that could open a second token.
+      w = found.miss_width(plen, syntax)
+      buf.write(bytes[at, w])
+      w
     end
 
     # Whether resolving `key` here would write a boundary-forging value into a HEAD, in which
@@ -1259,27 +1528,6 @@ module Gori
                                  key : String) : Bool
       return false unless declared.includes?(key)
       (v = vars[key]?) ? Bindings.boundary_forging?(v) : false
-    end
-
-    private def prefix_at?(bytes : Bytes, prefix_bytes : Bytes, at : Int32) : Bool
-      return false if at + prefix_bytes.size > bytes.size
-      prefix_bytes.each_with_index.all? { |b, j| bytes[at + j] == b }
-    end
-
-    # Write one resolved (or literal) `prefix+KEY` and answer how many bytes it consumed.
-    # A key that is neither a var nor a declared binding stays LITERAL — `Env.expand`'s
-    # documented contract, and the meaning every pre-existing rule already had. Refusing
-    # here instead would be a one-way door on a persisted, operator-authored table.
-    private def emit_key(buf : IO::Memory, bytes : Bytes, vars : Hash(String, String),
-                         key : String, consumed : Int32, prefix : String,
-                         plen : Int32, regex : Bool) : Int32
-      if val = vars[key]?
-        buf << (regex ? Rules.escape_backrefs(val) : val)
-        plen + consumed
-      else
-        buf << prefix
-        plen
-      end
     end
 
     # Double every backslash so a substituted value cannot be read as a capture reference
@@ -1310,19 +1558,67 @@ module Gori
     # would be a per-message allocation. `Env.bump_highlight_rev` fires on a settings load,
     # a project env write, a rule edit and every rebind, which is exactly the set of events
     # that can move either half.
-    private def subst_snapshot : {Hash(String, String), Array(String)}
+    private def subst_snapshot : SubstSnapshot
       erev = Env.highlight_rev
       brev = Env.binding_rev
-      cached = @subst_vars
+      cached = @subst_snap
       if cached.nil? || erev != @subst_env_rev || brev != @subst_binding_rev
-        cached = Env.display_vars
-        @subst_vars = cached
-        @subst_declared = Env.declared_bindings
+        # All three tables on the same revision keys, because the grammar can change under a
+        # running process (`Settings.env_syntax=` bumps `highlight_rev` for exactly that reason)
+        # and a snapshot holding only the merged one would then route `$ENV.X` through a table
+        # that also carries the bindings.
+        cached = SubstSnapshot.new(Env.display_vars, Env.effective_vars, Env.binding_values,
+          Env.declared_bindings, Env.active_slot_claims)
+        @subst_snap = cached
         @subst_env_rev = erev
         @subst_binding_rev = brev
       end
-      {cached, @subst_declared}
+      cached
     end
+
+    # The tables one `substitute` pass resolves against.
+    #
+    # BARE has one merged table (`display`) and a name is a BINDING iff an extract rule declares
+    # it — the shape that shipped. NAMESPACED reads the namespace off the token instead, so an
+    # `$ENV.SESSION` cannot pick up a bound value and a `$BIND.SESSION` cannot pick up an env var
+    # of the same name.
+    record SubstSnapshot,
+      display : Hash(String, String),
+      env : Hash(String, String),
+      bind : Hash(String, String),
+      declared : Array(String),
+      claimed : Array(String) = EMPTY_DECLARED do
+      # Exhaustive over the namespace set rather than `ns.bind? ? bind : env`: a two-way branch
+      # answers for a THIRD namespace by resolving it out of the env vars, silently, which is the
+      # one failure the namespaces exist to remove.
+      def table_for(ns : Env::Namespace?) : Hash(String, String)
+        return display if ns.nil?
+        case ns
+        in Env::Namespace::Env  then env
+        in Env::Namespace::Bind then bind
+        in Env::Namespace::Gen  then Env::EMPTY_VARS
+        end
+      end
+
+      # Whether a name in this namespace can be DECLARED-but-unbound — the rule-scoped skip and
+      # the boundary refusal both belong to the binding layer alone.
+      def declarable?(ns : Env::Namespace?) : Bool
+        ns.nil? || ns.declarable?
+      end
+
+      # Whether the BINDING half owns this name at all — an enabled extract rule declares it, the
+      # active session slot claims it, or it is bound right now. The claim is the half
+      # `bare_spelling_at` was missing: `--identities FILE` and MCP `create_session_slot` write
+      # slots whose `rules` name bindings the project does not have yet, and `Env.slot_literals`
+      # has always counted such a name as a reference.
+      def binds?(name : String) : Bool
+        bind.has_key?(name) || declared.includes?(name) || claimed.includes?(name)
+      end
+    end
+
+    # A namespace that cannot be declared gets this instead of `snap.declared`, so `substitute`
+    # stays one branch-free expression rather than two copies of the refusal pair.
+    EMPTY_DECLARED = [] of String
 
     # One warn event per (rule, binding revision): a rule injecting an unbound `$SESSION`
     # into every proxied request would otherwise write one row per message. The value is
@@ -1344,19 +1640,50 @@ module Gori
       in Refusal::Unbound
         names = Env.unbound(rule.replacement)
         return if names.empty?
+        # `Refused#key` and `unbound` both answer in BARE names (they index the binding table);
+        # the SPELLING is applied here, and it is the BIND namespace's by construction — this
+        # refusal exists only for a declared binding.
         @store.insert_event("bindings", "unbound", "warn",
-          "rewrite rule #{label.inspect} not applied: #{Env.token_list(names)} is not bound yet")
+          "rewrite rule #{label.inspect} not applied: " \
+          "#{Env.token_list(names, ns: Env::Namespace::Bind)} is not bound yet")
       in Refusal::Boundary
-        vars, _ = subst_snapshot
-        classes = Bindings.boundary_bytes(vars[refused.key]? || "")
+        classes = Bindings.boundary_bytes(subst_snapshot.bind[refused.key]? ||
+                                          subst_snapshot.display[refused.key]? || "")
         # Empty only if the value changed between the refusal and here, which is a rebind and
         # therefore a new revision — say nothing rather than name a byte class that is no
         # longer in the value.
         return if classes.empty?
         @store.insert_event("bindings", "boundary_refused", "warn",
-          "rewrite rule #{label.inspect} not applied: #{Env.token_list([refused.key])}'s value " \
+          "rewrite rule #{label.inspect} not applied: " \
+          "#{Env.token_list([refused.key], ns: Env::Namespace::Bind)}'s value " \
           "carries #{Rules.and_list(classes)} and would forge a message boundary in a header " \
           "(the value is still bound — a body-scoped rule can carry it)")
+      in Refusal::BareSpelling
+        ns = refused.ns || Env::Namespace::Env
+        bare = Env.spell(refused.key, ns, Env::Syntax::Bare)
+        # The remedy is the SPELLING, so the message carries both of them: the one that resolves,
+        # and the escape for an operator who really did mean those bytes as text.
+        #
+        # A PIPE rule's `replacement` is an argv, not text spliced into a message, and the names an
+        # operator writes into one are overwhelmingly shell-shaped — `$HOME`, `$PATH`, `$TMPDIR`.
+        # There is no shell here (`ProcessHook.parse_argv` tokenizes and `pipe_argv` resolves per
+        # element), so gori cannot know which was meant; prescribing the re-spelling as THE fix told
+        # an operator to inject a gori variable where they had written a shell one. Both, with the
+        # escape named first for that kind of rule.
+        remedy =
+          if rule.op.pipe?
+            "this is a command argv and there is no shell here — escape it as " \
+            "#{Env.spell_escaped(refused.key, ns, Env::Syntax::Bare)} if the literal " \
+            "#{bare} is what you meant, or write #{Env.spell(refused.key, ns)} to inject " \
+            "gori's value"
+          else
+            "write #{Env.spell(refused.key, ns)} to inject the value, or " \
+            "#{Env.spell_escaped(refused.key, ns, Env::Syntax::Bare)} to inject the text"
+          end
+        @store.insert_event("bindings", "bare_spelling", "warn",
+          "rewrite rule #{label.inspect} not applied: " \
+          "#{bare} is the bare spelling and this install reads " \
+          "#{EnvMigration.spelling(Env::Syntax::Namespaced)} — #{remedy}")
       end
     end
 
@@ -1606,9 +1933,20 @@ module Gori
     # it reach the origin. Same question the preview line asks of every other op ("how many
     # of your recent flows does this touch"), and the more useful one for a stub: it tells
     # the operator what they are about to stop sending.
+    # The preview's half of `short_circuit`'s claim: the pattern, plus a `dir` rule's path
+    # prefix. Deliberately NOT the filesystem — a preview asks which requests the rule would
+    # take, and whether the file happens to exist right now is the request-time answer.
+    private def stub_would_claim?(rule : Store::MatchRule, head : Bytes) : Bool
+      return false unless stub_matches?(rule, String.new(head))
+      return true unless rule.respond.dir?
+      target = Proxy::Codec::Http1.gate_target(Proxy::Codec::Http1.parse_request_head(head))
+      !RuleStub::MapLocal.claimed_rest(target, rule.args.strip_prefix).nil?
+    end
+
     private def rule_affects?(rule : Store::MatchRule, detail : Store::FlowDetail) : Bool
+      return false if rule.inert?
       return false unless host_matches?(rule.host, detail.row.host)
-      return stub_matches?(rule, String.new(detail.request_head)) if rule.op.short_circuit?
+      return stub_would_claim?(rule, detail.request_head) if rule.op.short_circuit?
       return false if rule.op.header? && !rule.part.head?
       return ws_rule_affects?(rule, detail) if rule.part.ws?
       bytes = flow_part_bytes(detail, rule)
@@ -1691,6 +2029,7 @@ module Gori
       # An edit may have repointed a rule at a different file; the cache is keyed by path and
       # revalidated per read, so this only drops entries no rule refers to any more.
       @stub_bodies.clear
+      @dir_roots_mutex.synchronize { @dir_roots.clear }
     end
   end
 end

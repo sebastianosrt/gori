@@ -18,25 +18,11 @@ module Gori
       # ACTIVE: sends many real outbound requests, so it is write-gated AND scope-gated
       # (the Gori::Outbound decision its Fuzz::Sender carries hard-blocks a Sandbox/exclude
       # at the socket seam).
-      # Which spelling of the repeater id this CALL used. `delete_repeater` and
-      # `update_repeater` name the same thing `id`, so an agent generalising from its siblings
-      # reaches for `id` here; both are accepted, and the one the caller actually reached for
-      # is what every message below names.
-      #
-      # When NEITHER is there it answers the schema's REQUIRED name. It used to fall back to
-      # the alias, so a call with no id at all was told "missing required 'id'" for an argument
-      # `tools/list` does not mark required — sending the agent to add a field the schema
-      # never asked for.
-      private def minimize_id_key(h) : String
-        return "id" if present?(h, "id") && !present?(h, "repeater_id")
-        "repeater_id"
-      end
-
-      @[Tool("minimize_repeater", gated: true, agent_action: true)]
+      @[Tool("minimize_repeater", gated: true, agent_action: true, env_refresh: true, permission: "send")]
       private def minimize_repeater(h) : Result
-        key = minimize_id_key(h)
-        id = int(h, key)
-        return Result.new(id_error(h, key), is_error: true) unless id
+        # `id` — the spelling `delete_repeater` / `update_repeater` use — arrives here folded
+        # into `repeater_id` by `ARG_ALIASES`.
+        id = required_id(h, "repeater_id")
         rec = store.get_repeater(id)
         return not_found("no repeater with id #{id}") unless rec
 
@@ -114,14 +100,31 @@ module Gori
             keep_alive: true, idle_conns: 1),
           Repeater::Minimize::SEND_CAP)
 
+        # `Stop` polls the cancellation predicate immediately before every send, so a
+        # cancelled call stops at the next candidate instead of riding SEND_CAP out at the
+        # origin (#1103). This is the same token the TUI arms on pane close and `gori run
+        # repeater minimize` arms on SIGINT — MCP was the third surface and the only one that
+        # had no way to reach it.
         report = begin
-          Repeater::Minimize.run(text, auto_cl: auto_cl, resolve: resolve, backend: backend) { }
+          Repeater::Minimize.run(text, auto_cl: auto_cl, resolve: resolve, backend: backend,
+            stop: Repeater::Minimize::Stop.new(cancel_signal)) { }
         ensure
           backend.close # release the parked socket even if the run raises
         end
 
         applied = false
-        if apply && !report.aborted && !report.removed.empty?
+        # `!cancelled?` is the extra condition, and it is NOT covered by `aborted`: a stop
+        # during CALIBRATION aborts (nothing was verified), but a stop mid-search returns
+        # `aborted: false` with the removals proven so far — and applying those would rewrite
+        # the stored request under a caller who is owed no response and will never learn the
+        # session changed. Every removal in `removed` is individually sound; a silent mutation
+        # behind a client that walked away is not. The report is thrown away either way.
+        #
+        # This is the CLI twin's decision, spelled the same way: `cli/run/repeater_minimize.cr`
+        # computes `apply && !interrupted_run && !report.aborted && …`, on the reasoning that a
+        # destructive write is where a cancelled sweep parts company with a capped one. There
+        # the operator is told `--apply` was skipped; here there is no one left to tell.
+        if apply && !report.aborted && !report.removed.empty? && !cancelled?
           # ws_keep_key/ws_http_only/tls_preset for the reason the CLI twin gives:
           # update_repeater's SQL sets every one of those columns unconditionally and its
           # signature defaults them, so omitting one CLEARS a session that carried it.
@@ -163,7 +166,7 @@ module Gori
           return err("repeater #{id} is a WebSocket handshake — minimize works on plain HTTP requests",
             "INVALID_ARGUMENT", field: "repeater_id")
         end
-        # The TUI refuses this too (repeater_view.cr#minimizable?). A saved request holding
+        # The TUI refuses this too (RepeaterView#minimize_refusal). A saved request holding
         # §fuzz§ markers is a TEMPLATE, not a request: minimizing it would send 250 requests
         # containing literal § bytes (garbage the origin answers uniformly, which then lets
         # real headers look removable) and apply:true would overwrite the marked-up template.
@@ -192,8 +195,12 @@ module Gori
         # TARGET and SNI are refused — `$` is not a legal byte in a hostname, and a literal one
         # there comes back as an unparseable target or an out-of-scope block, naming the wrong
         # gate. The CLI and TUI minimize paths carry the same two checks.
-        names = Env.unresolved(rec.target) |
-                (rec.sni.try { |s| Env.unresolved(s) } || [] of String)
+        # `deferred: nil`, like every other dial tuple. The default suppresses a DECLARED binding
+        # name on the argument that a later pass resolves it — true of a request body, false of a
+        # target: `Env.expand` resolves a dial tuple with `resolve: Owns::Env` alone and nothing
+        # re-scans it, so a `$BIND.HOST` here reaches DNS spelled `$BIND.HOST`.
+        names = Env.unresolved(rec.target, deferred: nil) |
+                (rec.sni.try { |s| Env.unresolved(s, deferred: nil) } || [] of String)
         unless names.empty?
           return err(env_unresolved_error(Env.token_list(names)), "INVALID_ARGUMENT", field: "repeater_id")
         end
@@ -209,20 +216,22 @@ module Gori
       end
 
       # The same two-layer gate the other active tools use, now expressed through the one
-      # seam: Layer 2 (Sandbox) first — it is a hard containment gate allow_unscoped does
-      # NOT lift — then Layer 1's allowlist, which allow_unscoped does. Layer 2 is applied
-      # again per send inside Fuzz::Sender; this only lets minimize refuse with a precise
-      # message before it starts.
+      # seam: the sandbox first — a hard containment gate allow_unscoped does NOT lift, and
+      # the one answer that is right when it also falls outside the scope — then Layer 1's
+      # allowlist, which allow_unscoped does lift and whose refusal carries the remedy. Last, the
+      # excludes a waived Layer 1 no longer looks at: every candidate goes through
+      # Fuzz::Sender's sweep gate, which holds them. The engine reports any of these as a
+      # refusal too; this only lets minimize refuse with a precise message before it starts.
       private def scope_refusal(ob : Outbound, scheme : String, host : String, port : Int32, text : String) : Result?
         target = Outbound.request_target(text)
-        if reason = ob.send_block(scheme, host, target, port)
-          return err("#{reason} — minimize refuses to send", "SCOPE_BLOCKED",
-            field: "repeater_id", details: JSON.parse({"scope_decision" => "sandbox"}.to_json))
+        reason = ob.send_block(scheme, host, target, port)
+        unless reason
+          sc = ob.check_request(scheme, host, target, port)
+          return scope_blocked(sc, field: "repeater_id") if sc.blocked?
+          reason = ob.sweep_block(scheme, host, target, port) || return
         end
-        return nil unless ob.check_request(scheme, host, target, port).blocked?
-        err("#{host} is outside — or without — a configured scope; pass allow_unscoped:true to minimize anyway",
-          "SCOPE_BLOCKED", field: "repeater_id",
-          details: JSON.parse({"scope_decision" => "unscoped", "host" => host}.to_json))
+        err("#{reason} — minimize refuses to send", "SCOPE_BLOCKED",
+          field: "repeater_id", details: JSON.parse({"scope_decision" => Outbound.refusal_decision(reason)}.to_json))
       end
 
       # The tools/list schemas for the request-minimizer tools, kept beside the handlers that
@@ -238,10 +247,9 @@ module Gori
           "calibrated baseline (Caido-\"squash\"-style). ACTIVE: sends MANY real outbound " \
           "requests (capped at 250) and is scope-gated. Returns the trimmed request plus " \
           "what was removed; pass apply:true to also save it back to the session." do |s|
-          s.field "repeater_id", intprop("repeater database id (`id` is accepted as an alias — the sibling repeater tools spell it that way)"), required: true
-          s.field "id", intprop("alias for repeater_id")
+          s.field "repeater_id", intprop("repeater database id"), required: true
           s.field "apply", boolprop("write the minimized request back into the session (default false)")
-          s.field "verbatim", boolprop("search with the stored bytes EXACTLY, as send_request/--verbatim would send them: no $VAR expansion, no bare-LF→CRLF promotion, no Content-Length resync (so body params stop being removal candidates). Use it for a session seeded from a capture, where an unresolved $filter/$top/$where is stored evidence rather than a typo — without it such a session is either refused by name or minimized against substituted bytes. Default false")
+          s.field "verbatim", boolprop("search with the stored bytes EXACTLY, as send_request/--verbatim would send them: no token expansion, no bare-LF→CRLF promotion, no Content-Length resync (so body params stop being removal candidates). Use it for a session seeded from a capture, where a stored $filter/$top/$where is evidence rather than a typo — under the legacy bare syntax those ARE references and such a session is otherwise refused by name or minimized against substituted bytes; under the namespaced syntax only $ENV.KEY / $BIND.NAME / $GEN.UUID forms are references, so they never were. Default false")
           s.field "allow_unscoped", boolprop("minimize even when the target host is outside — or without — a configured scope (default false)")
         end
       end

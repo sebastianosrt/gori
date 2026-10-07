@@ -1,4 +1,5 @@
 require "option_parser"
+require "levenshtein"
 require "log"
 require "./config"
 require "./paths"
@@ -22,8 +23,8 @@ module Gori
   # - `gori ca`                     → print root CA path (or PEM); `ca regenerate` rotates it
   # - `gori run <sub>`              → non-interactive CLI (see Gori::CLI::Run)
   # - `gori mcp`                    → MCP (Model Context Protocol) server over stdio
-  # - `gori wizard`                 → interactive first-run setup wizard (bind/theme)
-  # - `gori tutorial`               → guided TUI tour (navigation, palette, menu, edit)
+  # - `gori wizard`                 → interactive first-run setup wizard (bind/theme/companion)
+  # - `gori tutorial`               → guided TUI tour (navigation, menu, palette, edit, traffic)
   # - `gori update`                 → channel-aware self-update (binary / brew / snap / AUR)
   module CLI
     def self.run(argv : Array(String) = ARGV) : Nil
@@ -64,7 +65,7 @@ module Gori
         # dispatch and not inside each subcommand: `gori run` has dozens of leaves, and a leaf
         # that forgot would file its writes under whatever ran last.
         FlowSource.surface = FlowSource::Surface::Cli
-        run_run(subargs)
+        Run.dispatch(subargs)
       when "wizard"
         run_wizard(subargs)
       when "tutorial"
@@ -79,6 +80,13 @@ module Gori
         print_main_help
         exit 1
       end
+    rescue ex : IO::Error
+      # `gori … | head` (or any reader that closes early) breaks the STDOUT pipe; a
+      # well-behaved Unix filter exits quietly on EPIPE rather than dumping a backtrace. Here,
+      # once, for every surface — it lived only in `gori run`, so `gori settings | true`,
+      # `gori ca --pem | true` and `gori --help | true` backtraced. Anything else re-raises.
+      raise ex unless ex.os_error == Errno::EPIPE
+      exit 0
     rescue ex : Error
       # Gori::Error is the project's EXPECTED-error type (see gori.cr) — something the
       # operator can act on, raised with a message written for them. One reaching the top
@@ -142,7 +150,12 @@ module Gori
       i = 0
       while i < argv.size
         arg = argv[i]
-        if arg == "--config"
+        # Everything past `--` belongs to someone else (`gori run shell -- CMD …`): a child's own
+        # `--config FILE` must reach it untouched, not be eaten as gori's settings path.
+        if arg == "--"
+          rest.concat(argv[i..])
+          break
+        elsif arg == "--config"
           value = argv[i + 1]?
           # A following flag is not a path — treat `--config --edit` as the missing value it is,
           # rather than writing settings to a file literally named "--edit".
@@ -174,7 +187,7 @@ module Gori
       puts "  ca        Print the root CA path, or regenerate it (see gori ca --help)"
       puts "  run       Non-interactive CLI: capture, history, show, repeater, issues, project"
       puts "  wizard    Interactive setup wizard (bind, theme, companion) — also runs on first launch"
-      puts "  tutorial  Guided TUI tour with try-it steps (nav, palette, menu, edit)"
+      puts "  tutorial  Guided TUI tour with try-it steps (nav, menu, palette, edit, proxy, intercept)"
       puts "  mcp       Start an MCP server over stdio (AI/tool integration)"
       puts "  update    Update gori (channel-aware: binary download or package manager)"
       puts ""
@@ -213,7 +226,7 @@ module Gori
         p.on("-h", "--help", "Show this help") { puts p; exit 0 }
         p.on("-v", "--version", "Show version") { puts "gori #{VERSION}"; exit 0 }
         p.on("-V", "Show version") { puts "gori #{VERSION}"; exit 0 }
-        p.invalid_option { |flag| abort "unknown option: #{flag}\n#{p}" }
+        p.invalid_option { |flag| abort CLI.unknown_option_message("gori tui", flag, p) }
         p.missing_option { |flag| abort "missing value for #{flag}" }
       end
       parser.parse(args)
@@ -247,9 +260,11 @@ module Gori
                              "       gori settings sections\n" \
                              "       gori settings export [--sections a,b] [-o FILE]\n" \
                              "       gori settings import FILE [--sections a,b] [--dry-run]\n" \
+                             "       gori settings env-syntax [bare|namespaced]\n" \
+                             "       gori settings user-agents [--set FILE|- | --reset]\n" \
                              "       gori settings tls-fingerprint [HOST] [--json]"
 
-    private SETTINGS_VERBS = {"export", "import", "sections", "tls-fingerprint"}
+    private SETTINGS_VERBS = {"export", "import", "sections", "env-syntax", "user-agents", "tls-fingerprint"}
 
     # A leading BARE WORD that is not one of the three verbs is a typo, not a flag. Letting it
     # fall through to `run_settings`'s own parser dropped it — OptionParser ignores leftover
@@ -265,7 +280,7 @@ module Gori
     # Everything OptionParser did not claim: the unrecognised words BEFORE a `--` separator, AND
     # the run after it, which OptionParser strips and hands over as a SECOND list.
     #
-    # Discarding that second list is a hole this file already closed once — `reject_extra_args`
+    # Discarding that second list is a hole this file already closed once — `refuse_leftovers`
     # below carries the same fix for `gori wizard` / `gori tutorial`, and says why. `gori
     # settings` never got it, so a `--` switched every guard here back off, silently, at exit 0:
     # `gori settings -- --edit` printed the path with the flag dropped, `gori settings sections
@@ -316,27 +331,64 @@ module Gori
             "those defaults, not your settings.\nFix or remove that file, then re-run."
     end
 
-    # Handler for `gori run` (the non-interactive CLI mode). Named run_run to match
-    # the run_<subcommand> dispatch convention; the subcommand suite itself lives in
-    # `Gori::CLI::Run` (src/gori/cli/run.cr).
-    private def self.run_run(args : Array(String)) : Nil
-      Run.dispatch(args)
+    # The `gori <cmd>` twin of `Run.parse_args`'s tail: build the parser, let the command
+    # register its flags, then add `-h` (so `--help` lists it last) and the two refusals whose
+    # OptionParser defaults RAISE past `CLI.run` as a backtrace. Returned unparsed, because the
+    # callers parse it their own way (`stray_args`) and several print it as their usage.
+    # `missing_prefix` leads the missing-value refusal: `gori run` names the command there
+    # (`Run.option_parser`), `gori <cmd>` never has.
+    def self.option_parser(prefix : String, missing_prefix : String = "", & : OptionParser ->) : OptionParser
+      OptionParser.new do |p|
+        yield p
+        p.on("-h", "--help", "Show this help") { puts p; exit 0 }
+        p.invalid_option { |flag| abort CLI.unknown_option_message(prefix, flag, p) }
+        p.missing_option { |flag| abort "#{missing_prefix}missing value for #{flag}" }
+      end
     end
 
-    # `gori wizard` and `gori tutorial` take no arguments at all. `unknown_args` runs BEFORE
-    # `invalid_option` (both fire for an undeclared flag), so this is what actually reports one
-    # — the `invalid_option` handlers below are the fallback, not the primary path. A stray flag
+    # Refuse any leftover with `message`'s text (nil accepts them). Installed as the
+    # `unknown_args` handler, which runs BEFORE `invalid_option` (both fire for an undeclared
+    # flag), so the message also sees a stray FLAG first. Reads both halves: `after` is the run
+    # following a `--` separator, which OptionParser strips and hands over separately, and
+    # discarding it left `gori wizard -- --port 9000` launching with the flag silently dropped.
+    private def self.refuse_leftovers(p : OptionParser, &message : Array(String) -> String?) : Nil
+      p.unknown_args { |before, after| (msg = message.call(before + after)) && abort(msg) }
+    end
+
+    # `gori wizard`, `gori tutorial` and `gori update` take no arguments at all. A stray flag
     # and a stray word are named apart so `gori wizard --port 9000` reads as the misplaced
     # `gori tui` flag it actually is.
+    private def self.extra_args_error(cmd : String, rest : Array(String), parser : OptionParser) : String?
+      return nil if (first = rest.first?).nil?
+      return unknown_option_message("gori #{cmd}", first, parser) if first.starts_with?('-')
+      "gori #{cmd} takes no arguments (got #{first.inspect})\nRun 'gori #{cmd} --help' for its options."
+    end
+
+    # Every `invalid_option` handler's message (#1389): the flag, the nearest one this parser
+    # knows when there is one, and where the rest are. It used to be the flag followed by the
+    # command's whole usage — dozens of lines to hunt a one-letter typo in, and the same wall on
+    # every command. `note` is an extra hint a command owes this refusal (`run shell`'s `--`).
     #
-    # `after` is the run following a `--` separator, which OptionParser strips and hands over
-    # separately. It has to be rejected too: discarding it left `gori wizard -- --port 9000`
-    # launching with the flag silently dropped, which is the whole failure this replaced.
-    private def self.reject_extra_args(cmd : String, rest : Array(String), after : Array(String),
-                                       parser : OptionParser) : Nil
-      return if (first = (rest + after).first?).nil?
-      abort "unknown option: #{first}\n#{parser}" if first.starts_with?('-')
-      abort "gori #{cmd} takes no arguments (got #{first.inspect})\n#{parser}"
+    # The names come from the parser's own handler table (`@handlers`), so the suggestion can
+    # only ever be a flag that command really takes. `spec/cli/unknown_option_spec.cr` holds
+    # every handler to this helper.
+    def self.unknown_option_message(prefix : String, flag : String, parser : OptionParser,
+                                    note : String? = nil) : String
+      msg = "#{prefix}: unknown option: #{Output.term_safe(flag)}"
+      msg += " #{note}" if note
+      if near = nearest_flag(flag, parser.@handlers.keys)
+        msg += " — did you mean #{near}?"
+      end
+      "#{msg}\nRun '#{prefix} --help' for its options."
+    end
+
+    # The registered flag nearest to `flag` (its `=value` dropped), long flags only: a short one
+    # is a single letter, where every other letter is "one edit away".
+    def self.nearest_flag(flag : String, names : Array(String)) : String?
+      name = flag.partition('=')[0]
+      return nil unless name.starts_with?("--") && name.size > 2
+      longs = names.select(&.starts_with?("--"))
+      Levenshtein.find(name, longs, name.size < 6 ? 1 : 2)
     end
 
     # Run `body` against a terminal `Tui.open_terminal` has just switched into raw mode + the
@@ -361,7 +413,7 @@ module Gori
     end
 
     # `gori wizard` launches the interactive, step-by-step setup wizard (bind
-    # address → theme). It also runs automatically on first launch
+    # address → theme → Miss Ring → review). It also runs automatically on first launch
     # (App#run_tui, when settings.json doesn't exist yet); this command re-runs it
     # anytime. Config-only — it edits settings.json + the live theme, so it sets up
     # its own terminal directly instead of going through App (which eagerly loads
@@ -371,16 +423,13 @@ module Gori
       # didn't recognise, so `gori wizard --port 9000` — which the help text below all but
       # invites, and which belongs to `gori tui` — was a silent no-op. Every other subcommand
       # aborts on an unknown flag; this one now does too.
-      parser = OptionParser.new do |p|
+      parser = option_parser("gori wizard") do |p|
         p.banner = "Usage: gori wizard\n" \
                    "  Interactive setup wizard: global proxy bind (default for projects), TUI theme, Miss Ring.\n" \
                    "  Runs automatically on first launch; use this to re-run it anytime.\n" \
                    "  Bind is the shared default — pin a different address per project in the Project tab;\n" \
                    "  `gori tui --listen/--port` override settings for one run only (not written to disk)."
-        p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-        p.invalid_option { |flag| abort "unknown option: #{flag}\n#{p}" }
-        p.missing_option { |flag| abort "missing value for #{flag}" }
-        p.unknown_args { |rest, after| reject_extra_args("wizard", rest, after, p) }
+        refuse_leftovers(p) { |rest| extra_args_error("wizard", rest, p) }
       end
       parser.parse(args)
 
@@ -415,17 +464,15 @@ module Gori
     # / first launch; this command repeaters it anytime. Like the wizard it drives
     # /dev/tty directly, so it sets up its own terminal instead of going through App.
     private def self.run_tutorial(args : Array(String)) : Nil
-      parser = OptionParser.new do |p| # same reasoning as run_wizard's: no silent no-ops
+      parser = option_parser("gori tutorial") do |p| # same reasoning as run_wizard's: no silent no-ops
         p.banner = "Usage: gori tutorial\n" \
                    "  Interactive tour of gori's TUI on a mock UI: tab/pane navigation,\n" \
-                   "  the command palette (^P), the action menu (space), and edit mode\n" \
-                   "  (READ/INS). Each lesson asks you to try the key; a final practice\n" \
-                   "  step covers all four moves, then a first-session checklist.\n" \
+                   "  the command palette (^P), the action menu (space), edit mode\n" \
+                   "  (READ/INS), the proxy and CA, capture and intercept. Each lesson asks\n" \
+                   "  you to try the key; a practice step covers the moves, then help,\n" \
+                   "  quitting and a first-session checklist.\n" \
                    "  Also offered at the end of `gori wizard`; safe to re-run anytime."
-        p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-        p.invalid_option { |flag| abort "unknown option: #{flag}\n#{p}" }
-        p.missing_option { |flag| abort "missing value for #{flag}" }
-        p.unknown_args { |rest, after| reject_extra_args("tutorial", rest, after, p) }
+        refuse_leftovers(p) { |rest| extra_args_error("tutorial", rest, p) }
       end
       parser.parse(args)
 
@@ -434,11 +481,16 @@ module Gori
       Tui::Theme.load_custom           # honour user themes so the mock matches the real UI
       Tui::Theme.apply(Settings.theme) # render the tour in the persisted theme
       term = Tui.open_terminal("run the tutorial directly, not under CI or a detached/background job")
-      with_tui_terminal(term) do
+      finished = with_tui_terminal(term) do
         term.enable_enhanced_keyboard # Kitty disambiguation (mirrors the wizard)
         term.enable_mouse             # always on for the tour: Prev/Next buttons + mock clicks
-        Tui::Tutorial.new(term).run
+        tour = Tui::Tutorial.new(term)
+        tour.run
+        tour.finished?
       end
+      # Finish drops back to the shell, and a silent prompt reads like a crash (#1382). Only on
+      # Finish: esc/^C is someone leaving, not someone asking what comes next.
+      puts "next: run `gori` to open a project" if finished
     end
 
     private def self.run_update(args : Array(String)) : Nil
@@ -453,6 +505,7 @@ module Gori
           puts "  • standalone binary  — download the latest GitHub release asset"
           puts "  • Homebrew           — print (or --exec) brew upgrade gori"
           puts "  • Snap               — print (or --exec) snap refresh gori"
+          puts "  • Chocolatey         — print choco upgrade gori -y (run it with gori closed)"
           puts "  • pacman/AUR         — print yay/paru/pacman guidance"
           puts "  • deb (dpkg)         — print apt upgrade guidance"
           puts "  • rpm                — print dnf/yum/zypper guidance"
@@ -461,13 +514,13 @@ module Gori
           puts "(pacman -Qo / dpkg-query -S / rpm -qf) and /etc/os-release."
           exit 0
         end
-        p.invalid_option { |flag| abort "unknown option: #{flag}\n#{p}" }
+        p.invalid_option { |flag| abort CLI.unknown_option_message("gori update", flag, p) }
         # `gori update` takes no positional arguments, and `--exec` is its only
         # flag — so a `--` separator has nothing legitimate to protect. Without
         # this, `gori update -- --exec` parsed clean and silently dropped the
         # flag, and `gori update whatever` ran a full self-update on a typo. Same
         # failure, same guard, as `gori wizard` / `gori tutorial`.
-        p.unknown_args { |rest, after| reject_extra_args("update", rest, after, p) }
+        refuse_leftovers(p) { |rest| extra_args_error("update", rest, p) }
       end
       parser.parse(args)
       begin

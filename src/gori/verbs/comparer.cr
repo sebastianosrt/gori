@@ -15,65 +15,101 @@ module Gori
         Verb::Scope::Comparer, [Verb::Chord.new("b")],
         available: in_comparer) { |ctx| ctx.comparer_pick(:b); nil }
 
+      # `w` — sWap. It was `s`, and `s` is the Global scope lens: a scoped chord always beats
+      # the Global fallback, so this tab silently cost an operator the lens key. `s` reduces to
+      # two meanings now (key audit, F7): GO TO SOURCE where a row has one, and the Global lens
+      # everywhere it is not shadowed. `w` is free in this scope and names the action.
+      #
+      # The MENU letter stays 's': a space-menu letter is its own keyspace (it is reached after
+      # `space`), and `w` there is Close in every workbench menu in the app.
       r.register Verb::Definition.new(
         "comparer.swap", "Swap A ⇄ B", "Swap the two flows being compared",
-        Verb::Scope::Comparer, [Verb::Chord.new("s")],
-        available: in_comparer) { |ctx| ctx.comparer_swap; nil }
+        Verb::Scope::Comparer, [Verb::Chord.new("w")],
+        available: in_comparer, intent: :swap) { |ctx| ctx.comparer_swap; nil }
 
+      # A Display… row, `Z t` (#1274). At level 1 it was `m`, since `t` marks a chip on the
+      # sub-tab strip, whose bucket is in every Comparer card; one level down nothing competes.
       r.register Verb::Definition.new(
         "comparer.toggle-pane", "Compare requests/responses",
         "Toggle the diff between the two requests and the two responses",
-        Verb::Scope::Comparer, available: in_comparer, mnemonic: 't') { |ctx| ctx.comparer_toggle_pane; nil }
+        Verb::Scope::Comparer, available: in_comparer, intent: :compare_pane) { |ctx| ctx.comparer_toggle_pane; nil }
 
       # Navigating BY CHANGE and hiding what didn't change. Both gate on a shown diff —
       # there is nothing to jump between, or fold around, on a half-filled comparison.
-      # `⇧N`, spelled Chord.new("n", shift: true): Chord.new("N") never fires.
+      # Spelled Chord.new("n", shift: true) / Chord.new("p", shift: true), never
+      # Chord.new("N") / Chord.new("P"): `Keybind.from_event` normalises a typed capital to
+      # shift + lowercase, so the bare-capital form never fires.
       in_diff = ->(ctx : Verb::ExecContext) { ctx.current_tab == :comparer && ctx.comparer_diff_shown? }
 
-      # Explicit menu mnemonics: the derived ones would be 'n' / 'p' / 'f', and 'n' is
-      # comparer.new's — the KEYS here are n / ⇧N / f, so the menu letters carry no meaning
-      # worth defending and just have to be free.
+      # ⇧N forward / ⇧P back — the SAME pair the three drill-ins step with (verbs/history.cr
+      # states it once). This is the other in-place stepper in gori, and it used to spell the
+      # pair n / ⇧N, which made ⇧N mean backward here and forward there.
+      #
+      # Bare `n` was this tab's original next-change key and is deliberately NOT kept beside
+      # ⇧N. A second chord flips `Hotkeys.rebindable?` to false, and these two — unlike the
+      # drill-ins' hidden pair — ARE rebindable: `build_keymap` and
+      # `HotkeysOverlay#load_overrides` both filter persisted overrides through that
+      # predicate, and `Hotkeys.apply` rewrites settings from the working copy, so an alias
+      # here would drop an operator's existing rebind out of dispatch, hide the row that
+      # could restore it, and erase the entry on their next save. It would also leave the
+      # pair half-rebindable, which is how a `⇧N/b change` footer gets built from the UI.
+      #
+      # Palette-only (#1282): the KEYS are ⇧N / ⇧P, and a menu row duplicated them for a
+      # navigation convenience. A derived letter would have been 'n' / 'p', naming a chord
+      # nobody presses.
       r.register Verb::Definition.new(
         "comparer.next-change", "Next change", "Jump the row cursor to the next changed row",
-        Verb::Scope::Comparer, [Verb::Chord.new("n")],
-        available: in_diff, mnemonic: 'g') { |ctx| ctx.comparer_jump_change(1); nil }
+        Verb::Scope::Comparer, [Verb::Chord.new("n", shift: true)],
+        available: in_diff, menu: :palette) { |ctx| ctx.comparer_jump_change(1); nil }
 
       r.register Verb::Definition.new(
         "comparer.prev-change", "Previous change", "Jump the row cursor to the previous changed row",
-        Verb::Scope::Comparer, [Verb::Chord.new("n", shift: true)],
-        available: in_diff, mnemonic: 'G') { |ctx| ctx.comparer_jump_change(-1); nil }
+        Verb::Scope::Comparer, [Verb::Chord.new("p", shift: true)],
+        available: in_diff, menu: :palette) { |ctx| ctx.comparer_jump_change(-1); nil }
 
+      # MENU-ONLY since the key audit's F3, for the reason `history.toggle-follow` carries:
+      # `f` is freeze in evidence contexts and find on the sub-tab strip, and folding is a
+      # session-rare toggle rather than a loop key.
+      #
+      # A Display… row, `Z z` (#1274): the letter it had at level 1, where `f` is the SUB-TABS
+      # bucket's find.
       r.register Verb::Definition.new(
         "comparer.toggle-fold", "Fold unchanged",
         "Collapse the runs of identical lines, keeping context around each change",
-        Verb::Scope::Comparer, [Verb::Chord.new("f")],
-        available: in_diff, mnemonic: 'z') { |ctx| ctx.comparer_toggle_fold; nil }
+        Verb::Scope::Comparer, available: in_diff, intent: :fold_unchanged) { |ctx| ctx.comparer_toggle_fold; nil }
 
       # Sub-tab strip / space menu (session multi-pair workspace).
       r.register Verb::Definition.new(
         "comparer.new", "New comparison", "Open a fresh blank comparison sub-tab",
-        Verb::Scope::Comparer, available: in_comparer, mnemonic: 'n',
-        section: :common) { |ctx| ctx.comparer_new; nil }
+        Verb::Scope::Comparer, [Verb::Chord.new("n", ctrl: true)],
+        available: in_comparer, intent: :new,
+        section: :subtab) { |ctx| ctx.comparer_new; nil }
 
+      # 'e'. The key audit briefly put this on 'r' — the letter the strip bound then — which
+      # is impossible on the four tabs whose COMMON 'r' is Send/Run. Two spellings for one
+      # action across the nine strips is the thing the SUB-TABS bucket exists to end, so
+      # rename is 'e' everywhere, and the strip's raw rename key is `e` too (#1295).
       r.register Verb::Definition.new(
         "comparer.rename-subtab", "Rename comparison", "Rename the active comparison chip",
-        Verb::Scope::Comparer, available: in_comparer, mnemonic: 'e',
+        Verb::Scope::Comparer, available: in_comparer, intent: :rename,
         section: :subtab) { |ctx| ctx.comparer_rename_subtab; nil }
 
-      # `:common`, not `:subtab` — the space menu renders COMMON ∪ the FOCUSED PANE's section,
-      # so a `:subtab` close is invisible from the body and reachable only after moving focus
-      # to the strip. Decoder and JWT fixed that for themselves; this is the same fix.
-      #
-      # Repeater and Fuzzer deliberately do NOT follow: `repeater.mark-word` / `fuzz.mark-word`
-      # own 'w' in their `:request` / `:template` sections, so a COMMON 'w' would collide there
-      # and `Registry#validate_menu_keys!` would raise at boot. Their close stays in :subtab.
+      # `:subtab`, with the rest of the chip family. Until #1055 this had to be `:common` —
+      # the menu rendered COMMON ∪ the FOCUSED PANE's section, so a `:subtab` close was
+      # invisible from the body and reachable only after moving focus to the strip — and
+      # Repeater/Fuzzer could not follow even into COMMON, because `repeater.mark-word` /
+      # `fuzz.mark-word` owned 'w' in their `:request` / `:template` sections. Both halves of
+      # that knot are gone: the SUB-TABS bucket rides along with every view, and `w` close is
+      # one of the nine letters the bucket spells the same way on all nine strips, so the two
+      # editors' mark-word moved to `W` instead.
       r.register Verb::Definition.new(
         "comparer.close-subtab", "Close comparison", "Close the active comparison sub-tab (keeps ≥1)",
-        Verb::Scope::Comparer, available: in_comparer, mnemonic: 'w') { |ctx| ctx.comparer_close_subtab; nil }
+        Verb::Scope::Comparer, [Verb::Chord.new("w", ctrl: true)],
+        available: in_comparer, intent: :close, section: :subtab) { |ctx| ctx.comparer_close_subtab; nil }
 
       r.register Verb::Definition.new(
         "comparer.duplicate-subtab", "Duplicate comparison", "Clone the active A/B pair into a new sub-tab",
-        Verb::Scope::Comparer, available: in_comparer, mnemonic: 'd',
+        Verb::Scope::Comparer, available: in_comparer, intent: :duplicate,
         section: :subtab) { |ctx| ctx.comparer_duplicate_subtab; nil }
 
       # Sub-tab search + inline filter (issue #121), section :tab — like the other
@@ -82,13 +118,13 @@ module Gori
         "comparer.find-subtab", "Search sub-tabs", "Filter the open comparisons and jump to one",
         Verb::Scope::Comparer,
         available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :comparer && ctx.subtab_search_count >= 1 },
-        mnemonic: 'f', section: :tab) { |ctx| ctx.subtab_search_open; nil }
+        intent: :find_subtab, section: :tab) { |ctx| ctx.subtab_search_open; nil }
 
       r.register Verb::Definition.new(
         "comparer.filter-subtabs", "Filter sub-tabs", "Filter the comparison sub-tab strip by name / host / method",
         Verb::Scope::Comparer,
         available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :comparer && ctx.subtab_search_count >= 2 },
-        mnemonic: '/', section: :tab) { |ctx| ctx.subtab_filter_open; nil }
+        intent: :filter, section: :tab) { |ctx| ctx.subtab_filter_open; nil }
 
       # Sub-tab multi-select (#683). `t` marks a chip and `⇧T` marks the strip; ^W then
       # closes every marked one, `space ▸ r` sends them, and so on — the existing verbs
@@ -96,11 +132,14 @@ module Gori
       # `@focus == :subtabs` returns before the keymap, so a chord could never fire on the
       # strip, and it WOULD fire in the body, marking sub-tabs while the operator types.
       r.register Verb::Definition.new(
+        "comparer.subtab-mark", "Mark sub-tab", "Mark or unmark the active sub-tab (the strip's `t`) — the actions above then act on every marked one",
+        Verb::Scope::Comparer, available: subtab_mark_ready(:comparer), intent: :mark, section: :subtab) { |ctx| ctx.subtab_mark_toggle; nil }
+      r.register Verb::Definition.new(
         "comparer.subtab-mark-all", "Mark all sub-tabs", "Mark every comparison the sub-tab filter shows — the actions above then act on all of them",
-        Verb::Scope::Comparer, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :comparer && ctx.subtab_search_count >= 2 }, mnemonic: 'T', section: :subtab) { |ctx| ctx.subtab_mark_all; nil }
+        Verb::Scope::Comparer, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :comparer && ctx.subtab_search_count >= 2 }, intent: :mark_all, section: :subtab) { |ctx| ctx.subtab_mark_all; nil }
       r.register Verb::Definition.new(
         "comparer.subtab-mark-clear", "Clear marks", "Drop every sub-tab mark (esc on the strip does the same)",
-        Verb::Scope::Comparer, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :comparer && ctx.subtab_marked_count > 0 }, mnemonic: 'N', section: :subtab) { |ctx| ctx.subtab_mark_clear; nil }
+        Verb::Scope::Comparer, available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :comparer && ctx.subtab_marked_count > 0 }, intent: :mark_clear, section: :subtab) { |ctx| ctx.subtab_mark_clear; nil }
 
       register_send_to_comparer(r)
     end
@@ -117,19 +156,19 @@ module Gori
         "Send this tab's last send (request + response) to the Comparer's next slot",
         Verb::Scope::Repeater,
         available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :repeater },
-        mnemonic: 'C', group: :send) { |ctx| ctx.comparer_add_repeater; nil }
+        intent: :to_comparer, group: :send) { |ctx| ctx.comparer_add_repeater; nil }
 
       r.register Verb::Definition.new(
         "sitemap.compare", "Send to Comparer",
         "Send the selected endpoint's captured flow to the Comparer's next slot",
-        Verb::Scope::Sitemap, mnemonic: 'c', group: :send) { |ctx| ctx.comparer_add_sitemap; nil }
+        Verb::Scope::Sitemap, intent: :to_comparer, group: :send) { |ctx| ctx.comparer_add_sitemap; nil }
 
       r.register Verb::Definition.new(
         "fuzz.compare", "Send to Comparer",
         "Send the selected result (request + response) to the Comparer's next slot",
         Verb::Scope::Fuzzer,
         available: ->(ctx : Verb::ExecContext) { ctx.current_tab == :fuzzer && ctx.fuzzer_result_selected? },
-        mnemonic: 'C') { |ctx| ctx.comparer_add_fuzz; nil }
+        intent: :to_comparer) { |ctx| ctx.comparer_add_fuzz; nil }
     end
   end
 end

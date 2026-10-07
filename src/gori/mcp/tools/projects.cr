@@ -15,6 +15,16 @@ module Gori
         ProjectRegistry.new(Paths.projects_dir)
       end
 
+      # `ProjectRegistry#find` for a tool argument: the project, nil when nothing matches, or
+      # the INVALID_ARGUMENT a name that addresses two projects gets (#1163). The refusal is
+      # the registry's own sentence — it names each candidate's short id and slug — so the
+      # agent can retry with a handle that is unique instead of reading a bare not-found.
+      private def find_project(reg : ProjectRegistry, name : String, field : String) : (Project | Result)?
+        reg.find(name)
+      rescue ex : ProjectRegistry::Ambiguous
+        err(ex.message || "ambiguous project name", "INVALID_ARGUMENT", field: field)
+      end
+
       # True while any fuzz/mine job is still running — switching or deleting a
       # project mid-job would repoint @store (and thus record_history writes) out
       # from under the running fiber, so both refuse until jobs settle.
@@ -26,27 +36,65 @@ module Gori
           @authorize_jobs.each_value.any? { |j| j.status == :running }
       end
 
+      # How many projects one `list_projects` page carries, and the ceiling a caller may raise
+      # it to. A host accumulates a project per worktree — several hundred is ordinary — and
+      # serialising every one of them ran past an MCP client's per-tool-result budget, which
+      # spilled the listing to a temp file instead of handing it to the agent (#1085). The
+      # registry orders most-recently-active first, so the default page is the useful end of
+      # the list; `query` and `offset` reach the rest.
+      MCP_PROJECTS_DEFAULT =  50
+      MCP_PROJECTS_MAX     = 500
+
       @[Tool("list_projects", unbound: true)]
-      private def list_projects : Result
-        reg = registry
-        projects = reg.list
+      private def list_projects(h) : Result
+        pg = page_args(h, PageLimit.new(MCP_PROJECTS_DEFAULT, MCP_PROJECTS_MAX))
+        query = str(h, "query").try(&.strip).presence
+        needle = ProjectRegistry.needle(query)
+
+        # `entries` reads each project's sidecars ONCE and carries them to both the match and
+        # the row they feed; `Entry#matches?` is the same predicate `gori run project list
+        # --query` narrows with, so the two surfaces cannot disagree about what "acme" means.
+        entries = registry.entries
+        matched = needle ? entries.select(&.matches?(needle)) : entries
+        page = pg.offset < matched.size ? matched[pg.offset, Math.min(pg.limit, matched.size - pg.offset)] : matched[0, 0]
         current = @db_path
         Result.new(JSON.build do |j|
           j.object do
             j.field "bound", !unbound?
             j.field "current_db_path", current
+            # The binding spelled out, not left to a `current:true` row that a narrowed or
+            # paged listing need not carry any more. "Which project am I on?" is the most
+            # common reason to call this tool, and it must not be answerable only by luck of
+            # the page — the same reason `gori run project list` PINS the current row into
+            # its own shortened default. Same three spellings project_info reports, so the
+            # two orienting calls cannot name a project differently.
+            j.field "current_project", @project_name
+            j.field "current_project_slug", @project_slug
+            j.field "current_project_id", @project_id
             j.field "projects_root", Paths.projects_dir
+            j.field "query", query if query
+            emit_page(j, pg, page.size)
+            j.field "total", matched.size
+            # The host's whole count beside the matched one, ALWAYS: an empty page under a
+            # query otherwise reads as "this host has no projects", which is the answer that
+            # sends an agent to create_project for a project that already exists.
+            j.field "total_projects", entries.size
+            j.field "has_more", pg.offset + page.size < matched.size
+            if note = projects_listing_note(query, matched.size, entries.size, pg.offset, page.size)
+              j.field "note", note
+            end
             j.field("projects") do
               j.array do
-                projects.each do |p|
+                page.each do |e|
+                  p = e.project
                   j.object do
                     j.field "name", p.name
-                    j.field "id", reg.id_of(p)
-                    j.field "slug", reg.slug_of(p)
+                    j.field "id", e.id
+                    j.field "slug", e.slug
                     j.field "db_path", p.db_path
                     j.field "db_size", p.db_size
                     j.field "current", !current.nil? && p.db_path == current
-                    j.field "workspace", reg.workspace_of(p)
+                    j.field "workspace", e.workspace
                     if lm = p.last_modified
                       j.field "last_modified", lm.to_unix
                       j.field "last_modified_iso", lm.to_rfc3339
@@ -57,6 +105,28 @@ module Gori
             end
           end
         end)
+      end
+
+      # The one sentence a shortened listing owes its caller, or nil when the page IS the whole
+      # answer. Three readings have to be closed, and each is the shape where an absence reads
+      # as a finding: a query that matched nothing is not "this host has no projects", a page
+      # with more behind it is not "these are all of them", and an empty page off the end of a
+      # non-empty match is neither.
+      private def projects_listing_note(query : String?, matched : Int32, total : Int32,
+                                        offset : Int32, returned : Int32) : String?
+        if query && matched.zero?
+          return "no project matched query #{query.inspect}; this host has #{total} " \
+                 "project#{total == 1 ? "" : "s"}. 'query' is a case-insensitive SUBSTRING of the " \
+                 "display name, directory slug, short id, or bound workspace path"
+        end
+        if returned.zero? && matched > 0
+          return "offset #{offset} is past the last of #{matched} matching project#{matched == 1 ? "" : "s"} " \
+                 "— this empty page is the cursor, not the host"
+        end
+        nxt = offset + returned
+        return nil if nxt >= matched
+        "showing #{returned} of #{matched}, most-recently-active first — narrow with 'query', " \
+        "or read the rest from offset:#{nxt}"
       end
 
       private def create_project(h) : Result
@@ -87,28 +157,57 @@ module Gori
             j.field "db_path", proj.db_path
             j.field "created", created # false = reopened an existing same-name project
             j.field "switched", auto_bound
+            if auto_bound
+              # Same shape as switch_project's receipt, down to the always-null
+              # `previous_project` (create only auto-binds from unbound): a client that parses
+              # rebind receipts uniformly must not have to tell "key absent" from "was unbound".
+              j.field "previous_project", nil
+              j.field "note", REBIND_NOTE
+            end
           end
         end)
       rescue ex : Gori::Error
         err(ex.message || "could not create project", "INVALID_ARGUMENT", field: "name")
       end
 
-      @[Tool("switch_project", unbound: true)]
+      @[Tool("switch_project", read_only: false, unbound: true, permission: "projects")]
       private def switch_project(h) : Result
         name = str(h, "project")
         return err("missing required 'project'", "INVALID_ARGUMENT", field: "project") if name.nil? || name.strip.empty?
         reg = registry
-        proj = reg.find(name)
+        proj = find_project(reg, name, "project")
+        return proj if proj.is_a?(Result)
         return not_found("no such project: #{name} (match short id, id prefix, dir slug, or display name)") unless proj
         return busy("cannot switch project while a fuzz/mine job is running; stop it first") if jobs_running?
 
         bind_project(proj, reg, source: "switch_project")
       end
 
+      # What every bind reports back, because nothing pushes a correction to the handshake
+      # `instructions`: a client caches that text for the session, so whatever it said about the
+      # binding outlives the switch that moved it. The result of the switch is the only place
+      # the contradiction can be settled at the moment it is created — an agent holding both
+      # then knows which one a write follows (#1003).
+      #
+      # Deliberately says nothing about WHICH project the instructions named: on the unbound
+      # start (`gori mcp` outside a git workspace, and the only path where create_project
+      # rebinds) they named none at all, and "they still name the project it started on" would
+      # send the agent looking for a contradiction that does not exist — the same unkeepable
+      # claim this whole change exists to remove.
+      REBIND_NOTE = "This server now reads and writes THIS project for every later call. " \
+                    "The handshake instructions describe the binding as it was then and are " \
+                    "not updated; project_info is the live answer."
+
       # Open *proj* as the server's store and update selection metadata.
       # Closes a Tools-owned previous store; never closes a CLI-owned initial store
       # unless Tools already took ownership via a prior switch.
       private def bind_project(proj : Project, reg : ProjectRegistry, *, source : String) : Result
+        # `@db_path` last, and it is not a fallback for tidiness: a server bound by `--db
+        # /engagements/acme.db` has NO name or slug (the file is not a registry project), so
+        # without it the first switch reports `previous_project: null` — reading as "there was
+        # no previous project" for the one binding whose identity appears nowhere else in the
+        # receipt, after hours of capture.
+        previous = @project_name || @project_slug || @db_path
         new_store = begin
           # Same never-prune stance as `gori mcp`'s initial open (cli.cr). Without this a
           # switch_project silently re-enabled the sweep the entry point disabled. `read_only`
@@ -118,7 +217,12 @@ module Gori
           Store.open(proj.db_path, retention_flows: Store::RETENTION_UNLIMITED,
             read_only: !@allow_actions, background_index: false)
         rescue ex
-          return err("could not open project database: #{ex.message}", "INTERNAL")
+          # Not INTERNAL, which tells an agent the server is broken: a project being compacted
+          # or deleted is momentary (PROJECT_BUSY, retryable), and one that cannot be opened is a
+          # fact about the project the caller named — the mapping `diff_projects` makes.
+          return busy(ex.message || "project is busy") if ex.message == OpenLock.guarded_message(proj.db_path)
+          return err("could not open project database: #{proj.open_failure_reason(ex)}",
+            "INVALID_ARGUMENT", field: "project")
         end
         # Closed regardless of who opened it. `@owns_store` was about not closing a handle the
         # CLI still needed — it does not: `cli.cr` only reads `store.count` before `server.run`,
@@ -126,8 +230,18 @@ module Gori
         # which was invisible; now it also leaks the project's `OpenLock`, so `delete_project` on
         # a project this server has SWITCHED AWAY FROM is refused as "open in another gori
         # instance" — by this server, which no longer serves it and offers no way to let go.
+        same_feed = !@store.nil? && current_db_path == File.expand_path(proj.db_path)
         @store.try(&.close)
         @store = new_store
+        # A new feed, a new "now" (#1090), and the piggyback reads from the same "now" — but a
+        # rebind to the database already served is the same feed: re-anchoring there dropped
+        # every operator message and `ask_operator` answer posted before it and not yet read.
+        unless same_feed
+          @messages_floor = new_store.last_event_id
+          @messages_cursor = @messages_floor
+          @feed_generation += 1
+          @carried_here.clear
+        end
         @owns_store = true
         # A RESUMED OAST handle is bound to the project it was resumed in: its row id means
         # nothing in the new DB, and oast_poll would file its callbacks under a stranger's
@@ -150,6 +264,7 @@ module Gori
         # Same REPLACEMENT discipline as the binding layer below: the loader assigns every
         # network property including nil, so a project with no pinned upstream does not
         # inherit the previous project's jump host (#538).
+        reconcile_env_syntax(new_store)
         bind_project_network(new_store)
         Env.load_project(new_store)
         # A REPLACEMENT, not a reload: bindings are per project, and carrying one project's
@@ -165,18 +280,27 @@ module Gori
             j.field "flows", new_store.count
             j.field "issues", new_store.count_issues
             j.field "selection_source", source
+            # Named so the move itself is legible: a transcript that only ever says which
+            # project is active now cannot show which one the calls BEFORE this line went to.
+            j.field "previous_project", previous
+            j.field "note", REBIND_NOTE
           end
         end)
       end
 
-      @[Tool("delete_project", gated: true, unbound: true)]
+      @[Tool("delete_project", gated: true, unbound: true, permission: "projects")]
       private def delete_project(h) : Result
         name = str(h, "project")
         return err("missing required 'project'", "INVALID_ARGUMENT", field: "project") if name.nil? || name.strip.empty?
         reg = registry
-        proj = reg.find(name)
+        proj = find_project(reg, name, "project")
+        return proj if proj.is_a?(Result)
         return not_found("no such project: #{name} (match short id, id prefix, dir slug, or display name)") unless proj
-        return busy("cannot delete the project this server is currently serving; switch away first") if proj.db_path == @db_path
+        # Not PROJECT_BUSY: that is retryable, and no retry succeeds while this server serves it.
+        if proj.db_path == @db_path
+          return err("cannot delete the project this server is currently serving; switch_project away first",
+            "INVALID_ARGUMENT", field: "project")
+        end
         return busy("cannot delete a project while a fuzz/mine job is running") if jobs_running?
 
         dry_run = bool_arg(h, "dry_run", true)
@@ -186,8 +310,22 @@ module Gori
         err(ex.message || "could not delete project", "INVALID_ARGUMENT")
       end
 
+      # Whether a live instance is capturing into this project, or `nil` when the probe itself
+      # failed — `CaptureLock.held?` ACQUIRES the lock to answer, so an unwritable project
+      # directory raises rather than answering, and unrescued that turned the whole dry run
+      # into an INTERNAL tool error (the blanket rescue in `Tools#call`). `ProjectRegistry#delete`
+      # refuses on exactly that failure, so nil must not fold into `false`: the dry run would
+      # then hand back a confirmation_token for a delete the confirmed call declines.
+      private def capture_running(proj : Project) : Bool?
+        CaptureLock.held?(proj.dir)
+      rescue
+        nil
+      end
+
       private def delete_project_dry_run(reg : ProjectRegistry, proj : Project) : Result
         flows, issues = count_project_objects(proj)
+        locked = capture_running(proj)
+        open_elsewhere = OpenLock.in_use?(proj.db_path)
         now = Time.utc.to_unix_ms
         # Sweep expired tokens so an issued-but-never-confirmed dry-run doesn't linger for
         # the whole process life (they're only removed lazily on a confirmed delete today).
@@ -206,10 +344,14 @@ module Gori
             j.field "issues", issues
             j.field "db_size", proj.db_size
             j.field "disk_size", proj.disk_size
-            j.field "capture_lock_held", CaptureLock.held?(proj.dir)
+            # NULL is a third answer, not a missing one — see `capture_running`.
+            j.field "capture_lock_held", locked
             # Both guards `ProjectRegistry#delete` applies, so a dry run that hands back a token
             # is not promising a delete the confirmed call then refuses.
-            j.field "open_in_another_instance", OpenLock.in_use?(proj.db_path)
+            j.field "open_in_another_instance", open_elsewhere
+            # …and the verdict those two add up to, spelled once so a client does not have to
+            # re-derive the refusal rule (and cannot miss that `capture_lock_held:null` blocks).
+            j.field "deletable", locked == false && !open_elsewhere
             j.field "confirmation_token", token
             j.field "token_expires_in_seconds", DELETE_TOKEN_TTL
             j.field "note", "Re-call with dry_run:false and this confirmation_token to delete."
@@ -241,15 +383,7 @@ module Gori
         slug = reg.slug_of(proj)
         reg.delete(proj) # raises Gori::Error if another instance holds the capture lock
         @delete_tokens.delete(token)
-        Result.new(JSON.build do |j|
-          j.object do
-            j.field "deleted", true
-            j.field "name", proj.name
-            j.field "id", id
-            j.field "slug", slug
-            j.field "db_path", proj.db_path
-          end
-        end)
+        Result.new({deleted: true, name: proj.name, id: id, slug: slug, db_path: proj.db_path}.to_json)
       end
 
       # Flow + issue counts for a project other than the one we serve — opened in its own
@@ -275,11 +409,19 @@ module Gori
       # wrong side of it by landing in the wrong place in a 1,300-line method.
       private def list_projects_tools(j : JSON::Builder) : Nil
         tool j, "list_projects",
-          "List gori projects on this host (name, slug, db_path, db_size, last_modified, " \
-          "workspace binding) and which one this server is currently serving (current:true). " \
-          "Use switch_project to change the active project. When the server started unbound " \
-          "(no project), call list_projects then create_project or switch_project before " \
-          "traffic tools." { }
+          "Find a gori project on this host: one page of them (name, slug, short id, db_path, " \
+          "db_size, last_modified, workspace binding), MOST-RECENTLY-ACTIVE FIRST, plus the one " \
+          "this server is currently serving (current_project, and current:true on its row when " \
+          "the page carries it). A host accumulates a project per worktree, so this is a paged " \
+          "listing: pass 'query' to locate the one you mean before switch_project, and read " \
+          "'total' / 'has_more' rather than assuming the page is everything. Use switch_project " \
+          "to change the active project. When the server started unbound (no project), " \
+          "#{project_recovery}." do |s|
+          s.field "query", strprop("keep only projects whose display name, directory slug, short id, " \
+                                   "or bound workspace path CONTAINS this text (case-insensitive)")
+          s.field "limit", limitprop("max projects returned", PageLimit.new(MCP_PROJECTS_DEFAULT, MCP_PROJECTS_MAX))
+          s.field "offset", intprop("skip this many matching projects — the page cursor (default 0)")
+        end
 
         tool j, "switch_project",
           "Point this server at a different project for all subsequent tools. Always available " \
@@ -288,14 +430,21 @@ module Gori
           s.field "project", strprop("target project display name or directory slug"), required: true
         end
 
-        if @allow_actions || unbound?
-          tool j, "create_project",
-            "Create a new gori project (or reopen an existing one with the same name). " \
-            "When the server is unbound, create auto-binds to the new project; when already " \
-            "bound, call switch_project to make it active." do |s|
-            s.field "name", strprop("project display name (slugified for its directory)"), required: true
-            s.field "description", strprop("optional description stored in the project settings")
-          end
+        # Declared unconditionally, including on a `--read-only` server that is already
+        # bound — where it refuses with TOOL_DISABLED. It used to be gated on
+        # `@allow_actions || unbound?`, which made the CATALOGUE move: a read-only client
+        # that bound a project lost a tool mid-connection, and `tools/list` "MUST NOT vary
+        # per-connection or as a side effect of other requests on the connection"
+        # (2026-07-28 server/tools). The gate that matters is the one in
+        # `create_project_entry`, which is unchanged; this is only what the client is told
+        # exists, and the description already says which call does what.
+        tool j, "create_project",
+          "Create a new gori project (or reopen an existing one with the same name). " \
+          "When the server is unbound, create auto-binds to the new project; when already " \
+          "bound, call switch_project to make it active. Under --read-only this works only " \
+          "while the server is still unbound." do |s|
+          s.field "name", strprop("project display name (slugified for its directory)"), required: true
+          s.field "description", strprop("optional description stored in the project settings")
         end
 
         return unless @allow_actions

@@ -5,6 +5,8 @@ abstract class Gori::Verb::ExecContext
   abstract def move_selection(delta : Int32) : Nil
   abstract def open_detail : Nil
   abstract def close_detail : Nil
+  # `⇧N`/`⇧P` inside the drill-in — open the next/previous flow without returning to the list.
+  abstract def detail_step_item(delta : Int32) : Nil
   abstract def toggle_follow : Nil
   abstract def selected_flow_id : Int64?
 
@@ -29,6 +31,7 @@ abstract class Gori::Verb::ExecContext
   abstract def copy_selection : Nil
   abstract def history_query : Nil        # focus the QL filter bar
   abstract def history_view_pick : Nil    # open the view picker (#776)
+  abstract def toggle_static_assets : Nil # hide/show static assets in History + Sitemap (#1239)
   abstract def history_columns_edit : Nil # open the user-defined column editor (#819)
   # Fetch the selected flow's target schema by gRPC server reflection (#827). An OUTBOUND
   # request, made only here — never on capture and never on opening a flow (P4).
@@ -52,6 +55,8 @@ abstract class Gori::Verb::ExecContext
   abstract def toggle_detail_hex : Nil
   # Toggle whitespace reveal (·→␍␊) in the req/res views (smuggling inspection).
   abstract def toggle_reveal : Nil
+  # Decode JSON Unicode escapes in the req/res display without changing the captured bytes.
+  abstract def toggle_unicode_escapes : Nil
   # Toggle pretty-print of req/res bodies (display only; `p` in History detail).
   abstract def toggle_pretty : Nil
 
@@ -64,4 +69,7 @@ abstract class Gori::Verb::ExecContext
   # Single-target on purpose — it opens the CURSOR row even when marks are set, since N
   # marked flows would mean N windows.
   abstract def open_response_external : Nil
+  # "Mock this response" (#1237): open the Rewriter rule form prefilled with a short-circuit
+  # rule that answers this flow's request with its captured response, or say why it cannot.
+  abstract def mock_response_from_flow : Nil
 end

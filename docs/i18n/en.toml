@@ -37,6 +37,7 @@ download_svg_dark = "Dark"
 download_svg_color = "Color"
 copy_url = "Copy SVG URL"
 copied = "Copied"
+brand_page = "Brand kit →"
 
 [search]
 placeholder = "Search the docs…"
@@ -57,7 +58,7 @@ search = "Search the docs"
 kicker = "HTTP intercepting proxy · TUI"
 # The headline is set in three spans so the emphasized word can carry the
 # serif-italic gold treatment; pre/post may be empty per locale.
-title_pre = "Hack from the "
+title_pre = "HTTP security testing from the "
 title_em = "terminal."
 title_post = ""
 lede = "A fast, keyboard-driven HTTP/HTTPS proxy and security toolkit. Capture, repeater, fuzz, scan, or drive it all from an AI agent."
@@ -84,6 +85,13 @@ showcase_alt_jwt = "gori JWT tab with a decoded token header beside a list of si
 showcase_alt_sequencer = "gori Sequencer overlay configuring a token-randomness run: token type, cookie name, sample count and concurrency"
 showcase_alt_probe = "gori Probe tab listing passive and active scan checks with their findings"
 showcase_alt_issues = "gori Issues tab listing triaged findings with severity and status columns"
+showcase_alt_notes = "gori Notes tab: two project notes as sub-tabs, with an engagement checklist open in the editor"
+showcase_goto_aria = "Tabs behind the 0 key"
+showcase_sum_oast = "out-of-band callbacks, caught live"
+showcase_sum_sequencer = "token randomness, sampled and analysed"
+showcase_sum_decoder = "encode, decode and hash, in a chain"
+showcase_sum_jwt = "read, verify and forge JSON web tokens"
+showcase_goto_rest = "<code>0</code> reaches every tab — Miner, Cookie, Comparer, Rewriter, Colormarker, Authorize, Evidence and Help are back there too."
 showcase_note = "Every request your client makes lands in <strong>History</strong> as a flow, one keystroke from Repeater, the Fuzzer, or an issue."
 
 path_start_kicker = "Start"
@@ -107,7 +115,10 @@ structure_2_desc = "A compiled proxy with SQLite-backed projects that stay respo
 structure_3_title = "Scriptable and AI"
 structure_3_desc = "Everything reachable headless via <code>gori run</code>, and open to AI agents through the built-in MCP server."
 
-flow_title = "From capture to issue."
+# Section titles gild one word the way the hero does (pre/em/post).
+flow_title_pre = "From capture to "
+flow_title_em = "issue."
+flow_title_post = ""
 flow_1_label = "Capture"
 flow_1_desc = "Run the proxy, trust the CA once, and every request flows into History with full HTTP/2, WebSocket, and gRPC detail."
 flow_1_alt = "gori flow detail on the response tab, showing an HTTP/2 200 status and syntax-highlighted response headers"
@@ -118,7 +129,9 @@ flow_3_label = "Report"
 flow_3_desc = "Triage results into Issues, take notes, and export, or hand the whole project to an agent over MCP."
 flow_3_alt = "gori Issues tab listing triaged findings with severity and status columns: permissive CORS, missing Content-Security-Policy, and missing HSTS, each with an affected host"
 
-agent_title = "Or hand it to an agent."
+agent_title_pre = "Or hand it to an "
+agent_title_em = "agent."
+agent_title_post = ""
 agent_intro = "gori has no chat window baked in. It exposes your project over <strong>MCP</strong>, so any agent (Claude, Codex, Grok) reads your captured traffic and drives the tools through one clean seam. You pick the model; your traffic stays where you put it."
 agent_seam_aria = "An AI agent connects to a gori project through the MCP server: the agent calls tools like list_history and send_request, and gori returns flows and issues"
 agent_seam_1_kicker = "AI agent"

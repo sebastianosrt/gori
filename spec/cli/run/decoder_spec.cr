@@ -16,6 +16,11 @@ module Gori::CLI::Run
   def self.parse_render_mode_for_spec(v : String) : Gori::Decoder::RenderAs?
     parse_render_mode(v)
   end
+
+  def self.write_decoder_output_for_spec(io : IO, rendered : String,
+                                         render : Gori::Decoder::RenderAs, terminal : Bool) : Nil
+    write_decoder_output(io, rendered, render, terminal)
+  end
 end
 
 private def run_chain(input : String, chain : String) : Gori::Decoder::ChainResult
@@ -28,6 +33,25 @@ describe "gori run decoder --output" do
     Gori::CLI::Run.parse_render_mode_for_spec("text").should eq(Gori::Decoder::RenderAs::Text)
     Gori::CLI::Run.parse_render_mode_for_spec("BASE64").should eq(Gori::Decoder::RenderAs::Base64)
     Gori::CLI::Run.parse_render_mode_for_spec("Hex").should eq(Gori::Decoder::RenderAs::Hex)
+  end
+end
+
+describe "gori run decoder output" do
+  it "writes piped rendered bytes unchanged" do
+    bytes = Bytes[0x00_u8, 0xff_u8, 0x41_u8]
+    rendered = String.new(bytes)
+    output = IO::Memory.new
+    Gori::CLI::Run.write_decoder_output_for_spec(output, rendered,
+      Gori::Decoder::RenderAs::Text, false)
+    output.to_slice.should eq(bytes)
+  end
+
+  it "names terminal controls and keeps the terminal line break" do
+    rendered = "before#{27.chr}[2Jafter"
+    output = IO::Memory.new
+    Gori::CLI::Run.write_decoder_output_for_spec(output, rendered,
+      Gori::Decoder::RenderAs::Text, true)
+    output.to_s.should eq("before⟨ESC⟩[2Jafter\n")
   end
 end
 
@@ -125,10 +149,33 @@ end
 describe "gori run decoder list" do
   # `quoted-printable-encode` is 23 chars; a fixed `ljust(22)` put its row's columns one cell
   # off the rest (and a long saved-chain name many more).
-  it "aligns the category column for every converter, measured rather than fixed" do
+  #
+  # EVERY boundary, not just the category's start. The old spec found where the CATEGORY
+  # begins — which is the column the measured NAME already lined up — and so said nothing
+  # about the two hard-coded widths behind it: `Category::Serialization`'s label is 13 and
+  # its column was `ljust(11)`, so all six serialization rows pushed DIRECTION and
+  # DESCRIPTION two cells right while this spec passed.
+  it "aligns every column for every converter, measured rather than fixed" do
     lines = Gori::CLI::Run.decoder_list_lines(Gori::Decoder.shared_registry)
-    cols = lines.map { |l| l.index(/  (encoding|compression|serialization|hash|token|escape|text|saved)  /).not_nil! }
-    cols.uniq.size.should eq 1
+    lines.size.should be > 60
+    cat = /  (encoding|compression|serialization|hash|token|escape|text|saved)  /
+    dir = /  (encode|decode|hash|transform)  +/
+    # Each row's three column starts, from two MatchData rather than four scans. The DIRECTION
+    # is searched from the END of the category so a description word like "hash" cannot be
+    # mistaken for the column, and the DESCRIPTION is where the direction's own padding runs
+    # out — which is where a value LONGER than its `ljust` shows up, and the only place the
+    # old spec could not look.
+    columns = lines.map do |l|
+      cm = l.match(cat)
+      cm.should_not be_nil, "no category column in: #{l}"
+      dm = l.match(dir, cm.not_nil!.end - 2)
+      dm.should_not be_nil, "no direction column in: #{l}"
+      {cm.not_nil!.begin(1), dm.not_nil!.begin(1), dm.not_nil!.end}
+    end
+    # Named per column, so a failure says WHICH one drifted rather than "expected 1, got 3".
+    {"category", "direction", "description"}.each_with_index do |name, i|
+      columns.map { |c| c[i] }.uniq!.size.should eq(1), "#{name} column is not aligned"
+    end
   end
 end
 

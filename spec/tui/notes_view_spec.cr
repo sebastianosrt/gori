@@ -101,6 +101,55 @@ describe Gori::Tui::NotesView do
     end
   end
 
+  # `reload` skips the merge when the stored rows are the bytes it last merged. A save must
+  # drop that memory: afterwards the list is this session's edits, and a peer writing back the
+  # EXACT bytes the list was last merged from is a real change that has to land.
+  it "merges a peer's write after a save even when it restores the bytes last merged" do
+    with_store do |store|
+      view = NotesView.new
+      view.reload(store)
+      type(view, "one")
+      view.save(store)
+      view.reload(store) # merged from the saved row, which is now remembered
+      id = view.current_note_id
+      merged_bytes = store.setting("notes.docs").not_nil!
+
+      view.enter_insert!
+      type(view, " two")
+      view.save(store).should be_true
+      view.current_text.should eq("one two")
+
+      store.set_setting("notes.docs", merged_bytes) # a peer puts the old document back
+      view.reload(store)
+      view.current_text.should eq("one")
+      view.current_note_id.should eq(id)
+    end
+  end
+
+  it "skips the merge for an unchanged row, and still merges the next change" do
+    with_store do |store|
+      view = NotesView.new
+      view.reload(store)
+      type(view, "stable")
+      view.save(store)
+      view.reload(store)
+      view.@merged_raw.should_not be_nil
+      remembered = view.@merged_raw.not_nil![0].not_nil!
+
+      # Nothing moved: the same rows, not re-merged — the remembered row is still the string
+      # the FIRST read returned (a merge would have stored this read's copy).
+      view.reload(store)
+      view.@merged_raw.not_nil![0].not_nil!.same?(remembered).should be_true
+      view.current_text.should eq("stable")
+
+      id = view.current_note_id
+      store.set_setting("notes.docs",
+        %({"cur":0,"next_id":#{id + 1},"notes":[{"id":#{id},"text":"moved"}]}))
+      view.reload(store)
+      view.current_text.should eq("moved")
+    end
+  end
+
   # Regression: NoteEntry#text is whatever was written into the JSON KV, verbatim, and several
   # writers store wire CRLF — MCP create_note/update_note pass the caller's string straight
   # through, and `gori run notes create` takes its body from --text / positional args / STDIN
@@ -225,6 +274,130 @@ describe Gori::Tui::NotesView do
       saved.should contain("hi")
       saved.should contain("AAA") # peer note survives the concurrent save
       saved.should contain("BBB")
+    end
+  end
+
+  # #1415: a save sent EVERY loaded note into the merge, so an untouched note counted as an
+  # edit that wins — and `reload` is skipped while dirty, so that copy is stale exactly when a
+  # peer writes during an edit. Only the notes this session changed may be written.
+  describe "a save writes only the notes this session changed (#1415)" do
+    it "keeps a peer's edit to a note this session never touched" do
+      with_store do |store|
+        ids = %w(first second third).map { |t| Gori::Notes.create(store, t).not_nil! }
+        view = NotesView.new
+        view.reload(store)
+        view.switch_note_by_id(ids[0]).should be_true
+        view.enter_insert!
+        type(view, "YY") # dirty and unsaved, so the next reload is skipped
+
+        Gori::Notes.update(store, ids[2], "third EDITED AGAIN").should eq(Gori::Notes::Write::Committed)
+        view.save(store).should be_true
+
+        saved = Gori::Notes.load(store).notes.to_h { |n| {n.id, n.text} }
+        saved[ids[0]].should eq("YYfirst")
+        saved[ids[1]].should eq("second")
+        saved[ids[2]].should eq("third EDITED AGAIN")
+      end
+    end
+
+    it "keeps it across a second save made before any reload" do
+      with_store do |store|
+        ids = %w(first second).map { |t| Gori::Notes.create(store, t).not_nil! }
+        view = NotesView.new
+        view.reload(store)
+        view.switch_note_by_id(ids[0])
+        view.enter_insert!
+        type(view, "a")
+        Gori::Notes.update(store, ids[1], "peer")
+        view.save(store).should be_true
+        # The buffer for ids[1] still holds "second"; it must not become "ours" now.
+        type(view, "b")
+        view.save(store).should be_true
+
+        saved = Gori::Notes.load(store).notes.to_h { |n| {n.id, n.text} }
+        saved[ids[0]].should eq("abfirst")
+        saved[ids[1]].should eq("peer")
+      end
+    end
+
+    it "does not resurrect a note a peer deleted while this session edited another" do
+      with_store do |store|
+        ids = %w(keep gone).map { |t| Gori::Notes.create(store, t).not_nil! }
+        view = NotesView.new
+        view.reload(store)
+        view.switch_note_by_id(ids[0])
+        view.enter_insert!
+        type(view, "x")
+        Gori::Notes.delete(store, ids[1]).should eq(Gori::Notes::Write::Committed)
+        view.save(store).should be_true
+
+        Gori::Notes.load(store).notes.map { |n| {n.id, n.text} }.should eq([{ids[0], "xkeep"}])
+      end
+    end
+
+    # The widest exposure: the Runner reloads notes only while the Notes tab is up, so the
+    # retest Diff's `n` (NotesController#create_note) saves over a list that is stale but CLEAN.
+    it "keeps a peer's edit when another tab adds a note over a stale, clean list" do
+      with_store do |store|
+        ids = %w(first second).map { |t| Gori::Notes.create(store, t).not_nil! }
+        view = NotesView.new
+        view.reload(store)
+        view.dirty?.should be_false
+        Gori::Notes.update(store, ids[1], "peer") # no reload follows: the tab is not up
+
+        view.new_note
+        view.set_current_text("record")
+        view.save(store).should be_true
+
+        saved = Gori::Notes.load(store).notes.to_h { |n| {n.id, n.text} }
+        saved[ids[0]].should eq("first")
+        saved[ids[1]].should eq("peer")
+        saved.values.should contain("record")
+      end
+    end
+
+    it "does not empty note 1 through the ctor's placeholder when no merge ever ran" do
+      with_store do |store|
+        id = Gori::Notes.create(store, "real").not_nil!
+        view = NotesView.new # the startup reload failed: still the ctor's own note 1
+        view.current_note_id.should eq(id)
+        view.new_note
+        view.set_current_text("record")
+        view.save(store).should be_true
+
+        Gori::Notes.load(store).notes.map { |n| {n.id, n.text} }.first.should eq({id, "real"})
+      end
+    end
+
+    it "still lets this session's edit win on the note it did change" do
+      with_store do |store|
+        id = Gori::Notes.create(store, "base").not_nil!
+        view = NotesView.new
+        view.reload(store)
+        view.enter_insert!
+        type(view, "mine ")
+        Gori::Notes.update(store, id, "peer")
+        view.save(store).should be_true
+
+        Gori::Notes.load(store).notes.map(&.text).should eq(["mine base"])
+      end
+    end
+
+    it "persists a CRLF-stored note it never touched byte-for-byte" do
+      with_store do |store|
+        crlf = Gori::Notes.create(store, "a\r\nb").not_nil!
+        other = Gori::Notes.create(store, "other").not_nil!
+        view = NotesView.new
+        view.reload(store)
+        view.switch_note_by_id(other)
+        view.enter_insert!
+        type(view, "z")
+        view.save(store).should be_true
+
+        saved = Gori::Notes.load(store).notes.to_h { |n| {n.id, n.text} }
+        saved[crlf].should eq("a\r\nb")
+        saved[other].should eq("zother")
+      end
     end
   end
 
@@ -363,7 +536,7 @@ describe Gori::Tui::NotesView do
       view.reload(store)
       view.count.should eq(1)
       id_before = view.current_note_id
-      closed_id = view.close_note
+      closed_id = view.close_note_at(view.current_index)
       view.count.should eq(1)                       # closing the last note leaves a fresh empty one
       closed_id.should eq(id_before)                # the closed note's stable id is returned for link cleanup
       view.current_note_id.should_not eq(id_before) # the replacement is a distinct note
@@ -463,6 +636,188 @@ describe Gori::Tui::NotesView do
       view.paste("omega").should be_true
       view.current_text.should eq("omega beta")
       view.last_replaced.should eq(5)
+    end
+  end
+end
+
+# The pointer's mode contract (#1124). A click AIMS the caret; it does not arm the editor.
+# `click_to_cursor` / `select_word_at` used to call `enter_insert!` first, so the next bare
+# letter was TYPED rather than run: `y` meant as copy put a `y` in the note, over whatever was
+# selected. INS is entered the way the keyboard enters it — `i` / ↵ — or by clicking the
+# NOR/INS chip the border draws. Every other read/insert editor in the TUI (Repeater REQUEST,
+# Fuzzer TEMPLATE, Decoder / JWT / Cookie INPUT) already split the gesture this way.
+describe "NotesView pointer gestures" do
+  # The editor body sits one column inside `rect` (render's own inset), so screen column
+  # `rect.x + 1 + n` is buffer column n and screen row `rect.y + n` is line n.
+  seeded = ->(store : Gori::Store) do
+    view = NotesView.new
+    view.reload(store)
+    view.replace_current("alpha beta\ngamma delta")
+    rect = Rect.new(0, 0, 40, 6)
+    view.render(Screen.new(MemoryBackend.new(40, 6)), rect)
+    {view, rect}
+  end
+
+  it "places the caret without arming the editor" do
+    with_store do |store|
+      view, rect = seeded.call(store)
+      view.click_to_cursor(rect, rect.x + 3, rect.y + 1)
+      view.insert_mode?.should be_false
+      # READ's `y` with nothing selected copies the caret LINE — so this is where it landed.
+      view.copy_text.should eq("gamma delta")
+    end
+  end
+
+  it "takes the word under a double-click in READ, where `y` can reach it" do
+    with_store do |store|
+      view, rect = seeded.call(store)
+      view.select_word_at(rect, rect.x + 3, rect.y + 1).should be_true
+      view.insert_mode?.should be_false
+      view.selection?.should be_true
+      view.copy_text.should eq("gamma")
+    end
+  end
+
+  it "drags a READ band from the press, still without arming the editor" do
+    with_store do |store|
+      view, rect = seeded.call(store)
+      view.click_to_cursor(rect, rect.x + 1, rect.y)
+      view.drag_to_cursor(rect, rect.x + 6, rect.y)
+      view.insert_mode?.should be_false
+      view.copy_text.should eq("alpha")
+    end
+  end
+
+  it "collapses a standing READ selection on the next plain click" do
+    with_store do |store|
+      view, rect = seeded.call(store)
+      view.select_word_at(rect, rect.x + 1, rect.y).should be_true
+      view.selection?.should be_true
+      view.click_to_cursor(rect, rect.x + 8, rect.y)
+      view.selection?.should be_false
+      view.copy_text.should eq("alpha beta")
+    end
+  end
+
+  it "keeps placing the EDITOR caret once INS is on" do
+    with_store do |store|
+      view, rect = seeded.call(store)
+      view.enter_insert!
+      view.click_to_cursor(rect, rect.x + 3, rect.y + 1)
+      view.insert_mode?.should be_true
+      view.select_word_at(rect, rect.x + 3, rect.y + 1).should be_true
+      view.insert_mode?.should be_true
+      view.copy_text.should eq("gamma")
+    end
+  end
+end
+
+# A READ selection is an anchor into ONE document. Notes keeps a single read state for the
+# whole sub-tab strip while every note owns its own TextArea, and a note's text is replaced
+# in place by a peer reload or by `^E`. In each case the band used to survive the hand-over:
+# painted at the old coordinates over text the operator never selected in, and `y` put that
+# text on the clipboard. `IssuesView#open_detail_issue` fixed the same leak for an Issue's
+# writeup (#1123); here the drop is `TextReadState#bind`'s, so no hand-over site has to
+# remember it — `switch_note`, `switch_note_by_id`, `reload`, `replace_current` all go the
+# same way.
+describe "NotesView READ selection across a document hand-over" do
+  # note 1 = "alpha beta / gamma delta", note 2 = "zzzzzzzzzzzzzz", pane in READ on note 1,
+  # rendered once so the double-click has a layout to hit-test against.
+  two_notes = ->(store : Gori::Store) do
+    view = NotesView.new
+    view.reload(store)
+    view.replace_current("alpha beta\ngamma delta")
+    view.new_note
+    view.replace_current("zzzzzzzzzzzzzz")
+    view.switch_note(0)
+    rect = Rect.new(0, 0, 40, 6)
+    view.render(Screen.new(MemoryBackend.new(40, 6)), rect)
+    {view, rect}
+  end
+
+  it "drops the band when the sub-tab switches" do
+    with_store do |store|
+      view, rect = two_notes.call(store)
+      view.select_word_at(rect, rect.x + 1 + 6, rect.y).should be_true
+      view.selection?.should be_true
+      view.copy_text.should eq("beta")
+
+      view.switch_note(1)
+      view.selection?.should be_false
+      view.copy_text.should eq("zzzzzzzzzzzzzz") # the caret LINE of note 2, not a 4-cell band
+      view.render(Screen.new(MemoryBackend.new(40, 6)), rect)
+      view.selection?.should be_false
+    end
+  end
+
+  it "drops the band when a peer rewrites the note under it" do
+    with_store do |store|
+      view, rect = two_notes.call(store)
+      view.save(store).should be_true # so a peer can find the note by id
+      view.select_word_at(rect, rect.x + 1 + 6, rect.y).should be_true
+      view.copy_text.should eq("beta")
+
+      peer = NotesView.new
+      peer.reload(store)
+      peer.switch_note(0)
+      peer.replace_current("zzzzzzzzzzzzzzzzzzzz")
+      peer.save(store).should be_true
+
+      view.reload(store) # the data_version tick
+      view.current_text.should eq("zzzzzzzzzzzzzzzzzzzz")
+      view.selection?.should be_false
+      view.copy_text.should eq("zzzzzzzzzzzzzzzzzzzz")
+    end
+  end
+
+  it "keeps the band across a peer reload that changed nothing" do
+    with_store do |store|
+      view, rect = two_notes.call(store)
+      view.save(store).should be_true
+      view.select_word_at(rect, rect.x + 1 + 6, rect.y).should be_true
+      view.reload(store)
+      view.selection?.should be_true
+      view.copy_text.should eq("beta")
+    end
+  end
+
+  it "drops the band when ^E hands a different text back" do
+    with_store do |store|
+      view, rect = two_notes.call(store)
+      view.select_word_at(rect, rect.x + 1 + 6, rect.y).should be_true
+      view.replace_current("zzzzzzzzzzzzzzzzzzzz")
+      view.selection?.should be_false
+      view.copy_text.should eq("zzzzzzzzzzzzzzzzzzzz")
+    end
+  end
+end
+
+# `Note#label` reads the title off the editor's lines (`TextArea#each_line`) instead of the
+# joined `text` it used to hand `Notes.title`. Same scan, different source — so the gate is
+# that every shape of note gets the label the joined text gave it.
+describe "NotesView::Note#label (line source)" do
+  it "labels every edge-case note exactly as the joined-text title did" do
+    invalid = String.new(Bytes[0x23, 0x20, 0x68, 0x80, 0x0a, 0x62]) # "# h\x80\nb"
+    texts = [
+      "", "\n", "\n\n\n", "   \n\t\n", "plain", "plain\nsecond",
+      "\n\n  leading blanks then text  \nnext",
+      "# Heading\n\nbody", "## closed ##\nbody", "#\n\nfalls through", "##   \n#\n  ###  \nreal",
+      "#hashtag", "    # indented code", "####### seven",
+      "crlf title\r\nbody\r\n", "\r\n\r\n# crlf heading\r\n", "lone\rcr inside\nx",
+      "trailing cr\r", "title\r\r\r\nx", "#\r\nafter bare crlf marker",
+      "a very long first line that is well past the fifteen column chip width",
+      "한국어 제목\n본문", invalid, "x" * 20 + "\n" + "y" * 100_000,
+    ]
+    texts.each do |text|
+      note = Gori::Tui::NotesView::Note.new(1_i64, text)
+      want = if t = Gori::Notes.title(note.area.text)
+               t.size > 15 ? "#{t[0, 14]}…" : t
+             else
+               "note 4"
+             end
+      note.label(3).should eq(want), "label differs for #{text[0, 40].inspect}"
+      Gori::Notes.title_and_detail(note.area.each_line)
+        .should eq(Gori::Notes.title_and_detail(note.area.text)), "detail differs for #{text[0, 40].inspect}"
     end
   end
 end

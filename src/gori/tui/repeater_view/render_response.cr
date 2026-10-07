@@ -8,9 +8,6 @@ class Gori::Tui::RepeaterView
   # when active. Plain response mode needs no chip of its own — it's simply none of
   # these lit (the pane is already titled RESPONSE).
   private def render_response_chrome(screen : Screen, rect : Rect) : Nil
-    resp_plain = !@resp_hex && @resp_mode == :response
-    diff_lit = !@resp_hex && @resp_mode == :diff
-    pretty_lit = resp_plain && !@reveal && resp_pretty_applied?
     # These chips are LEFT-anchored, and `Frame.chip` does not clip (unlike its sibling
     # `Frame.toggle_badge`, which draws nothing when it doesn't fit). RESPONSE is a
     # half-width split pane, so below ~88 cols the cluster ran through this card's own
@@ -18,30 +15,96 @@ class Gori::Tui::RepeaterView
     # cross `limit`; the meta/⚠ read-out after this was already fit-guarded.
     limit = rect.right - 1 # keep the corner
     chips_end = rect.x + 12
-    { {" d:diff ", diff_lit}, {" ^X:hex ", @resp_hex}, {" p:pretty ", pretty_lit} }.each do |label, lit|
+    response_chips.each do |(_, label, lit)|
       break if chips_end + Screen.draw_width(label) > limit
       chips_end = Frame.chip(screen, chips_end, rect.y, label, lit) + 1
     end
-    if result = @result
-      meta = result.ok? ? "#{Fmt.dur(result.duration_us)} · #{Fmt.size((result.head.size + (result.body.try(&.size) || 0)).to_i64)}" : Fmt.dur(result.duration_us)
-      # `min_x:` because this border's left stop is the CHIP cluster, not the title.
-      meta_x = Frame.border_meta(screen, rect, "", meta, min_x: chips_end + 1)
-      # A persistent amber marker when the response was cut short (the body the
-      # origin sent is incomplete) — the transient send toast scrolls away. Chained off
-      # where the meta actually landed; when the meta did not fit there is nothing to
-      # hang it on, and the row is already too tight to carry it.
-      if result.incomplete? && meta_x
-        warn = "⚠ incomplete"
-        warn_x = meta_x - warn.size - 2
-        screen.text(warn_x, rect.y, warn, Theme.yellow, Theme.bg) if warn_x > chips_end + 1
-      end
+    # The right-anchored read-outs chain leftwards from the corner: latency·size, then the
+    # ⚠ for a cut-short body, then the frozen-copy marker.
+    right = (result = @result) ? draw_response_meta(screen, rect, result, chips_end) : rect.right - 1
+    draw_frozen_marker(screen, rect, right, chips_end)
+  end
+
+  # One source for response-chip drawing and mouse hit-testing. Unicode decode is offered only
+  # while the plain response is visible and the JSON formatter found escaped codepoints.
+  private def response_chips : Array({Symbol, String, Bool})
+    resp_plain = !@resp_hex && @resp_mode == :response
+    chips = [
+      {:diff, " #{key_label("repeater.toggle-diff", "⇧D")}:diff", !@resp_hex && @resp_mode == :diff},
+      {:hex, " #{key_label("repeater.toggle-resp-hex", "^X")}:hex", @resp_hex},
+      {:pretty, " #{key_label("repeater.toggle-pretty", "p")}:pretty", resp_plain && !@reveal && resp_pretty_applied?},
+    ] of {Symbol, String, Bool}
+    if resp_plain && !@reveal && resp_unicode_escape_count > 0
+      label = resp_unicode_decoded? ? "wire" : "decode"
+      chips << {:unicode, " #{key_label("repeater.toggle-unicode", "u")}:#{label}", resp_unicode_decoded?}
     end
+    chips
+  end
+
+  private def key_label(id : String, fallback : String) : String
+    @menu_registry.try { |r| Hotkeys.binding_label(r, id, fallback) } || fallback
+  end
+
+  private def not_sent_hint : String
+    "— not sent yet — press #{key_label("repeater.send", "^R")} to send —"
+  end
+
+  # The latency·size read-out and the ⚠ beside it; answers where the next read-out to the
+  # left must END. `min_x:` because this border's left stop is the CHIP cluster, not the
+  # title.
+  #
+  # The ⚠ is a persistent amber marker for a response that was cut short (the body the
+  # origin sent is incomplete) — the transient send toast scrolls away. Chained off where
+  # the meta actually landed; when the meta did not fit there is nothing to hang it on, and
+  # the row is already too tight to carry it.
+  private def draw_response_meta(screen : Screen, rect : Rect, result : Repeater::Result, chips_end : Int32) : Int32
+    meta_x = Frame.border_meta(screen, rect, "", result_meta(result), min_x: chips_end + 1)
+    return rect.right - 1 unless meta_x
+    return meta_x unless result.incomplete?
+    warn = "⚠ incomplete"
+    warn_x = meta_x - warn.size - 2
+    # No room for the ⚠: nothing shorter may take its place — a marker about a copy must
+    # not outrank the warning that the body in front of the operator is cut short.
+    return chips_end unless warn_x > chips_end + 1
+    screen.text(warn_x, rect.y, warn, Theme.yellow, Theme.bg)
+    warn_x
+  end
+
+  # `1.0ms · 23B`, or the latency alone for a send that got no response.
+  private def result_meta(result : Repeater::Result) : String
+    total = (result.head.size + (result.body.try(&.size) || 0)).to_i64
+    return Fmt.dur(result.duration_us) if total == 0
+    "#{Fmt.dur(result.duration_us)} · #{Fmt.size(total)}"
+  end
+
+  # `frozen ×N` (#1038), in the hue the Issues detail badges a FROZEN row with, ending at
+  # `right`. Drawn even with no result on the pane — a tab reopened after a restart has its
+  # response restored, but a copy taken from it is a fact about the tab, not about the
+  # current response. Dropped whole when it would run into the chips, like the ⚠.
+  private def draw_frozen_marker(screen : Screen, rect : Rect, right : Int32, chips_end : Int32) : Nil
+    mark = frozen_marker || return
+    mark_x = right - Screen.draw_width(mark) - 2
+    screen.text(mark_x, rect.y, mark, Theme.syn_header, Theme.bg) if mark_x > chips_end + 1
+  end
+
+  private def frozen_marker : String?
+    @frozen_count > 0 ? "frozen ×#{@frozen_count}" : nil
+  end
+
+  # The HANDSHAKE RESPONSE card's one read-out row: the frozen-copy marker (#1038) and the
+  # latency share it, because a WebSocket tab's frozen exchange IS this handshake. nil when
+  # there is neither, so the border stays clean.
+  private def handshake_meta : String?
+    parts = [] of String
+    frozen_marker.try { |m| parts << m }
+    @result.try { |r| parts << result_meta(r) }
+    parts.empty? ? nil : parts.join(" · ")
   end
 
   # The GRPC RESPONSE transcript's title, and where a chip cluster may start on its border:
   # past `Frame.card`'s " TITLE " (drawn from rect.x + 2) plus a column of air. ONE derivation,
   # read by the draw below and by `chrome_hit` — a chip drawn at one x and hit-tested at
-  # another is a dead cell, which is the defect `␣K:KEY` had.
+  # another is a dead cell, which is the defect `␣Pw:KEY` had.
   GRPC_TITLE = "GRPC RESPONSE"
 
   private def grpc_chip_x(rect : Rect) : Int32
@@ -52,7 +115,7 @@ class Gori::Tui::RepeaterView
   # state it is in. A method rather than a literal in each place for the reason `grpc_chip_x`
   # is one: the draw and the hit-test must not be able to disagree about its width.
   private def grpc_chip_label : String
-    @pretty ? " p:bytes " : " p:tree "
+    @pretty ? " #{key_label("repeater.toggle-pretty", "p")}:bytes " : " #{key_label("repeater.toggle-pretty", "p")}:tree "
   end
 
   # …and where that chip must STOP. `Frame.chip` does not clip itself and this card is a
@@ -98,8 +161,7 @@ class Gori::Tui::RepeaterView
   private def render_ws_handshake(screen : Screen, rect : Rect, focused : Bool, active : Bool) : Nil
     return if rect.w < 2 || rect.h < 2
     Frame.card(screen, rect, "HANDSHAKE RESPONSE", bg: Theme.bg, border: Frame.pane_border(focused && active))
-    if result = @result
-      meta = result.ok? ? "#{Fmt.dur(result.duration_us)} · #{Fmt.size((result.head.size + (result.body.try(&.size) || 0)).to_i64)}" : Fmt.dur(result.duration_us)
+    if meta = handshake_meta
       # `rect.x + 22` used to stand in for "HANDSHAKE RESPONSE" — the title's width, copied
       # by hand into a guard that would not follow it if the title ever changed.
       Frame.border_meta(screen, rect, "HANDSHAKE RESPONSE", meta)
@@ -122,10 +184,9 @@ class Gori::Tui::RepeaterView
     # (it is 7 rows showing a 4-5 line head — there is nothing to scroll to).
     rows = active ? resp_rows(cw, body.h, total, line_text) : resp_static_rows(cw, body.h, total, line_text)
     xs = active ? resp_xscroll : 0
-    # The search band's downcased copy of the logical line, made once per line rather than
-    # once per drawn row (a wrapped line can fill the pane) — the `ReadPane` hoist.
-    searching = !@search_hl.empty?
-    lower = Wrap::LowerMemo.new
+    # The search band's whole-line scan, kept per pane across rows and frames (a wrapped line
+    # can fill the pane) — `Wrap::SearchMemo`.
+    searching = resp_searching?
     rows.each_with_index do |vr, i|
       y = body.y + i
       draw_resp_gutter(screen, body.x, y, gw, vr, lit)
@@ -139,7 +200,7 @@ class Gori::Tui::RepeaterView
       paint_resp_line_chrome(screen, body.x + gw, y, vr.li, text, lit, sel_spans, vr.a, vr.b,
         clip_x: body.x + gw, clip_w: cw)
       next unless searching
-      Wrap.mark_search(screen, body.x + gw, y, text, vr.a, vr.b, @search_hl, body.x + gw + cw, xoff: xs, lower: lower.for(vr.li, text))
+      Wrap.mark_search(screen, body.x + gw, y, text, vr.a, vr.b, @search_hl, body.x + gw + cw, xoff: xs, memo: @resp_search_memo)
     end
     Frame.scroll_gauge(screen, body, total, @scroll, lit) if active
   end
@@ -169,7 +230,7 @@ class Gori::Tui::RepeaterView
     render_response_chrome(screen, rect)
     body = rect.inset(1, 1)
     if @resp_hex
-      (b = resp_hex_bytes) ? HexView.render(screen, body, b, @scroll) : screen.text(body.x, body.y, "— not sent — press ^R to resend —", Theme.muted)
+      render_resp_hex(screen, body)
     elsif @resp_mode == :diff
       render_diff(screen, body, focused)
     elsif @reveal && (rl = reveal_lines)
@@ -178,6 +239,18 @@ class Gori::Tui::RepeaterView
       render_response_body(screen, body, focused)
     end
     Frame.scroll_gauge(screen, body, resp_line_count, @scroll, focused)
+  end
+
+  private def render_resp_hex(screen : Screen, body : Rect) : Nil
+    if b = resp_hex_bytes
+      HexView.render(screen, body, b, @scroll)
+    elsif result = @result
+      msg = result.error ? "repeater error: #{result.error}" : "— no response —"
+      color = result.error ? Theme.red : Theme.muted
+      screen.text(body.x, body.y, msg, color)
+    else
+      screen.text(body.x, body.y, not_sent_hint, Theme.muted)
+    end
   end
 
   # Shared windowed renderer for the WS / gRPC / group transcript panes (a list of
@@ -194,14 +267,17 @@ class Gori::Tui::RepeaterView
                                 active : Bool = true) : Nil
     lit = focused && active
     Frame.card(screen, rect, title, bg: Theme.bg, border: Frame.pane_border(lit))
-    if d = dur_us
-      meta = Fmt.dur(d)
-      Frame.border_meta(screen, rect, title, meta)
-    end
+    # The frozen-copy marker (#1038) shares the one read-out row with the latency, as it does
+    # on the handshake card: a gRPC or group tab can be frozen too, and the branch that draws
+    # it must say so.
+    parts = [] of String
+    frozen_marker.try { |m| parts << m }
+    dur_us.try { |d| parts << Fmt.dur(d) }
+    Frame.border_meta(screen, rect, title, parts.join(" · ")) unless parts.empty?
     body = rect.inset(1, 1)
     return if body.h <= 0
     if lines.empty?
-      screen.text(body.x, body.y, "— not sent — press ^R to resend —", Theme.muted)
+      screen.text(body.x, body.y, not_sent_hint, Theme.muted)
       return
     end
     gw = Settings.show_gutter ? {Gutter.width(lines.size), body.w}.min : 0
@@ -215,8 +291,7 @@ class Gori::Tui::RepeaterView
     line_text = ->(i : Int32) { lines[i][0] }
     rows = active ? resp_rows(cw, body.h, lines.size, line_text) : resp_static_rows(cw, body.h, lines.size, line_text)
     xs = active ? resp_xscroll : 0
-    searching = !@search_hl.empty?
-    lower = Wrap::LowerMemo.new
+    searching = resp_searching?
     rows.each_with_index do |vr, i|
       text, color = lines[vr.li]
       y = body.y + i
@@ -228,7 +303,7 @@ class Gori::Tui::RepeaterView
       paint_resp_line_chrome(screen, body.x + gw, y, vr.li, text, lit, sel_spans, vr.a, vr.b,
         clip_x: body.x + gw, clip_w: cw)
       next unless searching
-      Wrap.mark_search(screen, body.x + gw, y, text, vr.a, vr.b, @search_hl, body.x + gw + cw, xoff: xs, lower: lower.for(vr.li, text))
+      Wrap.mark_search(screen, body.x + gw, y, text, vr.a, vr.b, @search_hl, body.x + gw + cw, xoff: xs, memo: @resp_search_memo)
     end
     Frame.scroll_gauge(screen, body, lines.size, @scroll, lit) if active
   end
@@ -247,8 +322,7 @@ class Gori::Tui::RepeaterView
     # RAW line and the wrap of the revealed line are the same break — no second layout.
     rows = resp_rows(cw, rect.h, total, ->(i : Int32) { lines[i] })
     xs = resp_xscroll
-    searching = !@search_hl.empty?
-    lower = Wrap::LowerMemo.new
+    searching = resp_searching?
     rows.each_with_index do |vr, i|
       y = rect.y + i
       line = lines[vr.li]
@@ -260,9 +334,10 @@ class Gori::Tui::RepeaterView
       styled = Highlight.slice_left(styled, xs) if xs > 0
       Highlight.draw(screen, rect.x + gw, y, styled, width: cw)
       paint_resp_line_chrome(screen, rect.x + gw, y, vr.li, line, focused, sel_spans, vr.a, vr.b,
-        clip_x: rect.x + gw, clip_w: cw)
+        clip_x: rect.x + gw, clip_w: cw, reveal: true)
       next unless searching
-      Wrap.mark_search(screen, rect.x + gw, y, line, vr.a, vr.b, @search_hl, rect.x + gw + cw, xoff: xs, lower: lower.for(vr.li, line))
+      Wrap.mark_search(screen, rect.x + gw, y, line, vr.a, vr.b, @search_hl, rect.x + gw + cw, xoff: xs,
+        memo: @resp_search_memo, reveal: true)
     end
   end
 
@@ -308,8 +383,7 @@ class Gori::Tui::RepeaterView
     # describes both and the colours cannot land a column off the glyphs.
     rows = resp_rows(cw, rect.h, total, ->(i : Int32) { resp_line_text(rv, i) })
     xs = resp_xscroll
-    searching = !@search_hl.empty?
-    lower = Wrap::LowerMemo.new
+    searching = resp_searching?
     rows.each_with_index do |vr, i|
       li = vr.li
       y = rect.y + i
@@ -322,7 +396,7 @@ class Gori::Tui::RepeaterView
       paint_resp_line_chrome(screen, rect.x + gw, y, li, text, focused, sel_spans, vr.a, vr.b,
         clip_x: rect.x + gw, clip_w: cw) if text
       if (t = text) && searching
-        Wrap.mark_search(screen, rect.x + gw, y, t, vr.a, vr.b, @search_hl, rect.x + gw + cw, xoff: xs, lower: lower.for(li, t))
+        Wrap.mark_search(screen, rect.x + gw, y, t, vr.a, vr.b, @search_hl, rect.x + gw + cw, xoff: xs, memo: @resp_search_memo)
       end
     end
   end
@@ -352,7 +426,8 @@ class Gori::Tui::RepeaterView
   private def paint_resp_line_chrome(screen : Screen, x : Int32, y : Int32, li : Int32, line : String,
                                      focused : Bool, sel_spans : Array({Int32, Int32, Int32})? = nil,
                                      rs : Int32 = 0, re : Int32 = -1,
-                                     clip_x : Int32 = 0, clip_w : Int32 = 0) : Nil
+                                     clip_x : Int32 = 0, clip_w : Int32 = 0,
+                                     reveal : Bool = false) : Nil
     return unless focused && resp_navigable?
     re = line.size if re < 0
     if spans = sel_spans
@@ -360,20 +435,22 @@ class Gori::Tui::RepeaterView
         next unless l == li
         a = {x0, rs}.max
         b = {x1, re}.min
-        paint_char_span_bg(screen, x, y, line, a, b, Theme.accent_bg, rs, clip_x, clip_w) if a < b
+        paint_char_span_bg(screen, x, y, line, a, b, Theme.accent_bg, rs, clip_x, clip_w,
+          reveal: reveal) if a < b
       end
     end
     return unless li == @resp_cursor.cy
     cx = @resp_cursor.cx.clamp(0, line.size)
     return unless cx >= rs && (cx < re || re >= line.size)
-    px = x + Wrap.row_col(line, nil, rs, cx) - resp_xscroll
+    px = x + Wrap.row_col(line, nil, rs, cx, reveal: reveal) - resp_xscroll
     # Clipped only while the pane is PANNED: with no offset the caret is inside the row by
     # construction, except for an end-of-line caret on a row exactly as wide as the pane —
     # which lands on the border cell and has always been drawn there. Clipping that one
     # unconditionally would trade a caret a column too far right for no caret at all.
     return if resp_xscroll > 0 && clip_w > 0 && (px < clip_x || px >= clip_x + clip_w)
-    ch = cx < line.size ? line[cx] : ' '
-    screen.cell(px, y, ch, Theme.bg, Theme.accent_bg)
+    ch = cx < line.size ? Screen.caret_glyph(line, cx) : ' '
+    shown = reveal ? (Reveal.visible_grapheme(ch.to_s) || ch) : ch
+    screen.cell(px, y, shown, Theme.bg, Theme.accent_bg)
     screen.cursor(px, y)
   end
 
@@ -406,8 +483,7 @@ class Gori::Tui::RepeaterView
     _, decorated, _ = resp_drawn_source
     rows = resp_rows(cw, rect.h, data.size, decorated)
     xs = resp_xscroll
-    searching = !@search_hl.empty?
-    lower = Wrap::LowerMemo.new
+    searching = resp_searching?
     rows.each_with_index do |vr, i|
       d = data[vr.li]
       y = rect.y + i
@@ -432,7 +508,14 @@ class Gori::Tui::RepeaterView
       # Mark only the line text, so the highlights match what response_search_lines
       # counts (d.text) rather than the diff decoration.
       next unless searching
-      Wrap.mark_search(screen, tx, y, d.text, ts, te, @search_hl, rect.x + gw + cw, xoff: xs, lower: lower.for(vr.li, d.text))
+      Wrap.mark_search(screen, tx, y, d.text, ts, te, @search_hl, rect.x + gw + cw, xoff: xs, memo: @resp_search_memo)
     end
+  end
+
+  # Whether a ^F query is live. An empty one frees the memo's whole-line scans (`Wrap::SearchMemo`).
+  private def resp_searching? : Bool
+    return true unless @search_hl.empty?
+    @resp_search_memo.clear
+    false
   end
 end

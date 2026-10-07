@@ -101,12 +101,12 @@ describe HotkeysOverlay do
 
     it "cancels to the row focused before search, then a second esc closes" do
       control = fresh_overlay
-      control.select_move(1)
+      control.move(1)
       control.unbind_selected
       expected = control.to_working[0].keys.first
 
       o = fresh_overlay
-      o.select_move(1)
+      o.move(1)
       h = OverlayHarness.new(o)
       start_hotkey_search(h)
       h.type("toggle capture")
@@ -189,6 +189,27 @@ describe HotkeysOverlay do
     o.apply_capture(Gori::Verb::Chord.new("c", ctrl: true)) # ^C: reserved (quit)
     o.capturing?.should be_true
     o.to_working[0].should be_empty
+  ensure
+    reset_settings
+  end
+
+  # `repeater.toggle-resp-hex` has no chord of its own: ^X reaches it through Toggle hex edit
+  # (`chord_of:`, #1295). Its row said "(unbound)" while the menu and Help said ^X, and `x`
+  # wrote an unbind that changed nothing the operator presses.
+  it "shows a borrowed key as its owner's, and leaves it to the owner's row" do
+    o = fresh_overlay
+    h = OverlayHarness.new(o)
+    start_hotkey_search(h)
+    h.type("hex dump")
+    h.press(Termisu::Input::Key::Enter).should eq(:open)
+    h.rendered?("ctrl-x (via Toggle hex edit)").should be_true
+
+    h.press(Termisu::Input::Key::LowerX, 'x')
+    h.press(Termisu::Input::Key::LowerR, 'r')
+    h.press(Termisu::Input::Key::LowerE, 'e')
+    o.capturing?.should be_false
+    o.to_working[0].should be_empty
+    h.rendered?("this key follows Toggle hex edit").should be_true
   ensure
     reset_settings
   end

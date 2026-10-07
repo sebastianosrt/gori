@@ -59,25 +59,31 @@ module Gori::Tui
     # the popup and the toast can't disagree about what was written.
     def label : String
       case @kind
-      when :note          then "note"
-      when :issues_md     then "issues (Markdown)"
-      when :issues_json   then "issues (JSON)"
-      when :issues_sarif  then "issues (SARIF)"
-      when :sequence_md   then "randomness report (Markdown)"
-      when :sequence_json then "randomness report (JSON)"
-      else                     "file"
+      when :note            then "note"
+      when :project_archive then "project archive"
+      when :issues_md       then "issues (Markdown)"
+      when :issues_json     then "issues (JSON)"
+      when :issues_sarif    then "issues (SARIF)"
+      when :sequence_md     then "randomness report (Markdown)"
+      when :sequence_json   then "randomness report (JSON)"
+      when :evidence_json   then "evidence (JSON)"
+      when :openapi         then "OpenAPI spec"
+      else                       "file"
       end
     end
 
     private def blurb : String
       case @kind
-      when :note          then "Write the current note's text to a Markdown file."
-      when :issues_md     then "Write the Markdown issue report to a file."
-      when :issues_json   then "Write every issue to a JSON file."
-      when :issues_sarif  then "Write every issue as a SARIF 2.1.0 log — the format GitHub code scanning and CI dashboards ingest."
-      when :sequence_md   then "Write this session's token-randomness report to a Markdown file (no token values)."
-      when :sequence_json then "Write this session's token-randomness report to a JSON file (no token values)."
-      else                     "Write the export to a file."
+      when :note            then "Write the current note's text to a Markdown file."
+      when :project_archive then "Write a WAL-safe snapshot of the selected project to one archive."
+      when :issues_md       then "Write the Markdown issue report to a file."
+      when :issues_json     then "Write every issue to a JSON file."
+      when :issues_sarif    then "Write every issue as a SARIF 2.1.0 log — the format GitHub code scanning and CI dashboards ingest."
+      when :sequence_md     then "Write this session's token-randomness report to a Markdown file (no token values)."
+      when :sequence_json   then "Write this session's token-randomness report to a JSON file (no token values)."
+      when :evidence_json   then "Write this immutable snapshot and provenance to a JSON file."
+      when :openapi         then "Write these endpoints as OpenAPI 3.0.3 — .yaml/.yml for YAML, else JSON."
+      else                       "Write the export to a file."
       end
     end
 
@@ -98,7 +104,12 @@ module Gori::Tui
     end
 
     def hint : String
-      "type to complete · ↹ pick · ↑↓ browse · ↵ write · esc cancel"
+      # Once the card is warning about an existing file, `↵ write` is no longer what ↵ does —
+      # the first ↵ armed the overwrite and wrote nothing, and the strip still promising a
+      # write is why that press reads as "nothing happened". The notice lives inside the card;
+      # this is the same fact on the line the eye is already on.
+      verb = @overwrite_armed ? "overwrite" : "write"
+      "type to complete · ↹ pick · ↑↓ browse · ↵ #{verb} · esc cancel"
     end
 
     # --- input ---------------------------------------------------------------
@@ -214,10 +225,7 @@ module Gori::Tui
     # Tall enough (14) that PathComplete's 8-row cap fits under the field instead of being
     # clipped; `area` still wins on a short terminal.
     def overlay_box(area : Rect) : Rect?
-      w = {area.w - 4, 76}.min
-      h = {area.h - 2, 14}.min
-      return nil if w < 40 || h < 8
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - h) // 2, w, h)
+      area.card?(76, 14, 40, 8)
     end
 
     def render(screen : Screen, area : Rect) : Nil

@@ -1,14 +1,19 @@
 require "option_parser"
+require "levenshtein"
 require "json"
 require "base64"
 require "../config"
 require "../paths"
+require "../wordlist_catalog"
+require "../payload_from"
 require "../settings"
 require "../env"
 require "../app"
 require "../store"
 require "../project"
 require "../project_registry"
+require "../project_archive"
+require "../agent_presence"
 require "../ql"
 require "../scope"
 require "../host_overrides"
@@ -20,7 +25,10 @@ require "../repeater/ws_engine"
 require "../repeater/flow_request"
 require "../repeater/diff"
 require "../repeater/minimize"
+require "../repeater/draft_markers"
 require "../repeater/message_lines"
+require "../repeater/send_error"
+require "../repeater/request_rules"
 require "../fuzz"
 require "../decoder"
 require "../miner"
@@ -30,13 +38,17 @@ require "../discover"
 require "../discover/adapters"
 require "../oast/provider_config"
 require "../oast/sessions"
+require "../session_refresh"
 require "../probe/passive"
 require "../probe/group"
 require "../notes"
 require "../issues_export"
 require "../links"
 require "../import"
+require "../redact/policy"
+require "../redact/wire"
 require "../session_from_flow"
+require "../shell_env"
 require "../export/curl"
 require "../export/python_requests"
 require "../export/js_fetch"
@@ -44,30 +56,44 @@ require "../export/go_http"
 require "../export/httpie"
 require "../export/csrf_poc"
 require "./output"
+require "../mcp/serialize"
 require "./run/subcommand"
 require "./run/interrupt"
 require "./run/capture"
+require "./run/shell"
 require "./run/history"
+require "./run/redact"
 require "./run/repeater"
 require "./run/repeater_minimize"
+require "./run/send"
 require "./run/compare"
 require "./run/diff"
 require "./run/intercept"
 require "./run/fuzz_args"
+require "./run/payload_from"
+require "./run/request_macro"
 require "./run/fuzz"
 require "./run/fuzz_saved"
 require "./run/mine"
 require "./run/sequence"
 require "./run/authorize"
+require "./run/cache_deception"
 require "./run/session"
 require "./run/discover"
+require "./run/wordlist"
 require "./run/oast"
 require "./run/sitemap"
+require "./run/sitemap_params"
+require "./run/sitemap_js"
+require "./run/sitemap_export"
 require "./run/import"
 require "./run/probe"
 require "./run/notes"
+require "./run/notify"
 require "./run/issues"
 require "./run/links"
+require "./run/evidence"
+require "./run/retest"
 require "./run/jwt"
 require "./run/cookie"
 require "./run/decoder"
@@ -76,9 +102,27 @@ require "./run/rewriter"
 require "./run/colormarker"
 require "./run/views"
 require "./run/project"
+require "./run/project_network"
+require "./run/project_default"
+require "../plural"
 
 module Gori
   module CLI
+    # The headless surfaces' log sink. A closed STDERR (an agent that stopped reading it, a
+    # `2>&-`) made the stdlib backend's write raise EPIPE, which killed the async dispatcher's
+    # fiber: about 2k entries later every `Log` call blocked for good, and `gori mcp` stopped
+    # answering tools and never exited on stdin EOF. A log line nobody reads is dropped.
+    class StderrLog < ::Log::IOBackend
+      def initialize
+        super(STDERR)
+      end
+
+      def write(entry : ::Log::Entry) : Nil
+        super
+      rescue IO::Error
+      end
+    end
+
     # `gori run <subcommand>` — the non-interactive CLI. Scripts the same project
     # data the TUI works on, built directly on the Store / Repeater / Session APIs
     # (NOT the verb system, whose ExecContext is ~60 UI-action methods that only
@@ -86,17 +130,10 @@ module Gori
     # and never take the capture lock, so they're safe to run alongside a live
     # capturing instance (SQLite WAL; #752).
     module Run
+      # A broken STDOUT pipe (`gori run … | head`) is answered once, in `CLI.run`.
       def self.dispatch(args : Array(String)) : Nil
         route_logs_to_stderr
         dispatch_subcommand(args)
-      rescue ex : IO::Error
-        # `gori run … | head` (or any reader that closes early) breaks the STDOUT
-        # pipe; a well-behaved Unix filter exits quietly on EPIPE rather than
-        # dumping an IO::Error backtrace. Re-raise anything that isn't a broken pipe.
-        # (Kept as a thin wrapper around the generated dispatch_subcommand; see the
-        # Subcommand registry below.)
-        raise ex unless ex.os_error == Errno::EPIPE
-        exit 0
       end
 
       # STDOUT on these commands is DATA — a flow listing, a sitemap tree, `--format json` being
@@ -111,7 +148,7 @@ module Gori
       # in `dispatch_subcommand`: `run capture` calls `setup_logging` itself and this must not
       # be the thing that decides for it, but it must be in place before ANY subcommand runs.
       private def self.route_logs_to_stderr : Nil
-        ::Log.setup(:info, ::Log::IOBackend.new(STDERR))
+        ::Log.setup(:info, StderrLog.new)
       rescue
         # A logger that cannot be configured is not a reason to refuse the command; the worst
         # case is the behaviour that shipped.
@@ -152,16 +189,27 @@ module Gori
           # branches, where args[0] matched a subcommand string (so args is non-empty and the
           # tail slice is safe).
           case sub = args.first?
-          when nil, "-h", "--help" then print_help
+          # `help` too: it is the word people type, and refusing it pointed them at `shell`.
+          when nil, "-h", "--help", "help" then print_help
           {% for m in cmds %}
             when {{ m.annotation(Subcommand).args.splat }} then {{ m.name }}(args[1..])
           {% end %}
           else
-            STDERR.puts "gori run: unknown subcommand '#{sub}'"
-            print_help
-            exit 1
+            # A short refusal on STDERR (#1389), not the ~80-line help on STDOUT: a typo'd
+            # `gori run histroy` exited 1 having written the whole help into the pipe a script
+            # was reading, with no word about which subcommand was meant.
+            abort unknown_verb_message("gori run", sub, SUBCOMMAND_NAMES)
           end
         end
+
+        # Every name and alias `dispatch_subcommand` answers, for the did-you-mean.
+        SUBCOMMAND_NAMES = [
+          {% for m in cmds %}
+            {% for name in m.annotation(Subcommand).args %}
+              {{ name }},
+            {% end %}
+          {% end %}
+        ] of String
 
         # `gori run -h` rows: {name column, description}, one or more per subcommand.
         SUBCOMMANDS = [
@@ -173,6 +221,24 @@ module Gori
         ]
       end
 
+      # The refusal for a subcommand or verb nobody registered (#1389): one line naming the typo,
+      # the nearest real name when there is one, and where the list is. Said on STDERR by the
+      # caller's `abort`, so nothing reaches a pipe reading STDOUT.
+      def self.unknown_verb_message(prefix : String, word : String, candidates : Enumerable(String)) : String
+        msg = "#{prefix}: unknown subcommand '#{CLI::Output.term_safe(word)}'"
+        if near = nearest_name(word, candidates)
+          msg += " — did you mean '#{near}'?"
+        end
+        "#{msg}\nRun '#{prefix} --help' for the list."
+      end
+
+      # The one name within edit distance of `word` — 1 for a short word, where 2 would make
+      # almost anything "near", else 2 — or nil. A leading `-` is never a name.
+      def self.nearest_name(word : String, candidates : Enumerable(String)) : String?
+        return nil if word.empty? || word.starts_with?('-')
+        Levenshtein.find(word, candidates.to_a, word.size < 4 ? 1 : 2)
+      end
+
       # Left column width for `gori run -h` subcommand names (longest: "project host-override").
       SUBCMD_COL_W = 22
 
@@ -182,17 +248,38 @@ module Gori
         puts "Usage: gori run <subcommand> [options]"
         puts ""
         puts "Subcommands:"
-        SUBCOMMANDS.each do |name, desc|
-          gap = SUBCMD_COL_W - name.size
-          gap = 1 if gap < 1
-          puts "  #{name}#{" " * gap}#{desc}"
-        end
+        # At least one space after an overlong name.
+        SUBCOMMANDS.each { |name, desc| puts "  #{name.ljust(SUBCMD_COL_W - 1)} #{desc}" }
         puts ""
         puts "Most read subcommands accept --project NAME or --db PATH; with neither they"
         puts "use the most-recently-active project. See 'gori run <subcommand> --help'."
       end
 
       # --- shared helpers ----------------------------------------------------
+
+      # The SQLite wait budget for a SHORT-LIVED subcommand: open, one or two writes, exit.
+      # SQLite's busy handler sleeps inside C and therefore blocks this process's whole
+      # cooperative scheduler. Five seconds per Store.open/write is especially misleading in a
+      # create/send loop: every open, session write and response write can pay it again before
+      # the command prints anything. Keep those bounded and let the error below say what to do
+      # when a live TUI owns the writer slot (#1118).
+      #
+      # NOT every `gori run` is one-shot, and `open_store` is the single door all of them use.
+      # `discover`, `fuzz`, `import`, `probe`, `retest run`, `oast listen`/`resume` and the
+      # `intercept` verbs keep the project open for the length of a crawl, a sweep, a 200 MB HAR
+      # stream or a bounded poll, and write through it as they go — exactly the shape the TUI's
+      # capture writer has, and exactly where a one-second refusal turns one busy commit on the
+      # peer's side into a dropped batch of findings. Those callers pass `long_running: true`
+      # and keep the Store's own defaults (`store_budget`).
+      CLI_BUSY_TIMEOUT_MS          = 1_000
+      CLI_CHECKOUT_TIMEOUT_SECONDS =   1.0
+
+      # `{busy_timeout_ms, checkout_timeout_seconds}` for a CLI store open. Public and pure so
+      # the choice is pinned by a spec rather than by timing a contended open.
+      def self.store_budget(long_running : Bool) : {Int32, Float64}
+        return {Store::SQLITE_BUSY_TIMEOUT_MS, Store::DB_CHECKOUT_TIMEOUT_SECONDS} if long_running
+        {CLI_BUSY_TIMEOUT_MS, CLI_CHECKOUT_TIMEOUT_SECONDS}
+      end
 
       # Is a subcommand's first token a VERB, as opposed to a flag or nothing at all?
       #
@@ -229,15 +316,11 @@ module Gori
       # argument that leaves a SUCCESS status is the failure mode a scripted surface can least
       # afford, which is why every other command here refuses it.
       #
-      # Takes both halves of `unknown_args` for the reason the colormarker list documents: a
-      # bare word after `--` lands in `after`, and reading only `before` would lose it.
-      private def self.one_positional(before : Array(String), after : Array(String),
-                                      prefix : String, what : String) : String?
-        all = before + after
-        if msg = extra_positional_error(all, prefix, what)
-          abort msg
-        end
-        all.first?
+      # Parses through `parse_args`, so both halves of `unknown_args` are read: a bare word
+      # after `--` lands in the second, and reading only the first would lose it.
+      private def self.one_positional(args : Array(String), prefix : String, what : String,
+                                      & : OptionParser ->) : String?
+        one_positional_list(args, prefix, what) { |p| yield p }.first?
       end
 
       # The same guard for the sites that keep the ARRAY (because they read `.first?` later, or
@@ -247,6 +330,13 @@ module Gori
       # for that shape: `gori run probe rules delete a b` deleted `a` and exited 0, and so did
       # `project scope update 3 4 --host=x`, `session add x y`, `rewriter preset add p q`,
       # `probe rules enable a b` and `probe mode passive active`. Four of those are mutations.
+      private def self.one_positional_list(args : Array(String), prefix : String, what : String,
+                                           & : OptionParser ->) : Array(String)
+        one_positional_list(parse_args(args, prefix) { |p| yield p }, [] of String, prefix, what)
+      end
+
+      # …and from INSIDE an `unknown_args` handler, for a parser kept whole because its usage
+      # is printed later (`redact use`, `repeater move`).
       private def self.one_positional_list(before : Array(String), after : Array(String),
                                            prefix : String, what : String) : Array(String)
         all = before + after
@@ -281,18 +371,16 @@ module Gori
         "#{prefix}: unexpected argument#{all.size == 1 ? "" : "s"} #{all.join(" ").inspect} — #{hint}"
       end
 
-      # Parse a command whose every argument is a flag, refusing any leftover word.
+      # Parse a command whose every argument is a flag (`parse_args`), refusing any leftover word.
       #
-      # A method rather than three copies of the idiom, because the subtle half is
+      # A method rather than copies of the idiom, because the subtle half is
       # `before + after`: a copy that keeps only `before` lets a bare word after `--` through
       # in silence, which is the same footgun `optionparser-unknown-args` was written about.
-      # Installing the handler HERE makes the correct form the only form, and the call site
+      # Routing through `parse_args` makes the correct form the only form, and the call site
       # reads as what it means.
-      private def self.parse_no_positionals(parser : OptionParser, args : Array(String),
-                                            prefix : String, hint : String) : Nil
-        positional = [] of String
-        parser.unknown_args { |before, after| positional = before + after }
-        parser.parse(args)
+      private def self.parse_no_positionals(args : Array(String), prefix : String, hint : String,
+                                            & : OptionParser ->) : Nil
+        positional = parse_args(args, prefix) { |p| yield p }
         if msg = no_positional_error(positional, prefix, hint)
           abort msg
         end
@@ -344,16 +432,18 @@ module Gori
                                  prefix : String = "gori run",
                                  project_flag : String = "--project",
                                  db_flag : String = "--db") : String?
-        return nil unless project_name.try(&.presence) && db_path.try(&.presence)
+        name = project_name.try(&.presence)
+        return nil unless name && db_path.try(&.presence)
         "#{prefix}: pass #{db_flag} PATH or #{project_flag} NAME, not both " \
-        "(#{db_flag} names the database file directly, so #{project_flag} #{project_name.inspect} would be ignored)"
+        "(#{db_flag} names the database file directly, so #{project_flag} #{CLI::Output.term_safe(name).inspect} would be ignored)"
       end
 
       # --db wins → else --project resolved via ProjectRegistry#find (exact short id
-      # → exact dir slug → exact display name → unique id-prefix, all
-      # case-insensitive) → else the most-recently-active project. Aborts when
-      # nothing resolves. Routing through #find is what lets a read command finally
-      # select by slug/id, not display name alone (parity with MCP --project).
+      # → exact dir slug or display name → unique id-prefix, all case-insensitive)
+      # → else the most-recently-active project. Aborts when nothing resolves, and when
+      # the name addresses two projects (#1163). Routing through #find is what lets a
+      # read command finally select by slug/id, not display name alone (parity with MCP
+      # --project).
       #
       # The default branch ANNOUNCES itself (see announce_default_project) — the whole
       # point of a default nobody typed is that it is invisible until it is wrong.
@@ -365,16 +455,23 @@ module Gori
         end
         registry = ProjectRegistry.new(Paths.projects_dir)
         if name = project_name
-          if found = registry.find(name)
-            return found
+          found = begin
+            registry.find(name)
+          rescue ex : ProjectRegistry::Ambiguous
+            abort "gori run: #{ex.message}"
           end
+          return found if found
           projects = registry.list
-          abort "gori run: no project matching '#{name}'#{projects.empty? ? "" : " (have: #{projects.map(&.name).join(", ")})"}"
+          have = projects.empty? ? "" : " (have: #{projects.map { |project| CLI::Output.term_safe(project.name) }.join(", ")})"
+          abort "gori run: no project matching '#{CLI::Output.term_safe(name)}'#{have}"
         end
-        default = ProjectRegistry.default_of(registry.list)
-        abort "gori run: no projects yet — capture some traffic first, or pass --db PATH" unless default
-        announce_default_project(default)
-        default
+        case chosen = default_project(registry, ENV[DEFAULT_PROJECT_ENV]?, read_default_pin)
+        in String then abort "gori run: #{chosen}"
+        in Nil    then abort "gori run: no projects yet — capture some traffic first, create one with `gori run project create NAME`, or pass --db PATH"
+        in Tuple
+          announce_default_project(*chosen)
+          chosen[0]
+        end
       end
 
       # Whether this process has already said which project it defaulted to.
@@ -399,12 +496,12 @@ module Gori
       # terminal. Once per process because one command resolves its project up to three
       # times (the read itself, the host-override snapshot, the outbound scope load), and
       # three identical lines would read like three different projects.
-      private def self.announce_default_project(project : Project) : Nil
+      private def self.announce_default_project(project : Project, source : DefaultSource = DefaultSource::Recent) : Nil
         return if @@said_default_project
         @@said_default_project = true
         io = @@default_project_io
         return unless io
-        io.puts "gori run: using project #{project.name} (most recently active) — " \
+        io.puts "gori run: using project #{CLI::Output.term_safe(project.name)} (#{source.phrase}) — " \
                 "name another with --project NAME or --db PATH"
       end
 
@@ -426,13 +523,47 @@ module Gori
         # `gori run capture:` message, like every other resolve_* path, instead of a raw
         # backtrace. (Non-ASCII names like "日本語" now get a hashed fallback slug in
         # ProjectRegistry#slugify, so they no longer land here.)
-        name = project_name || "default"
+        registry = ProjectRegistry.new(Paths.projects_dir)
+        unless name = project_name
+          pinned = capture_default(registry)
+          return pinned if pinned.is_a?(Project)
+          name = pinned || "default"
+        end
+        # A project's exact short id addresses it here as on every read command (and as the
+        # `GORI_PROJECT` branch above does), instead of being refused as a name that shadows
+        # it. Only the EXACT id: a prefix stays a new project's name, since a short hex word
+        # matching some id's start must not redirect a capture into another engagement.
+        q = name.strip.downcase
+        if by_id = registry.list.find { |pr| registry.id_of(pr).try(&.downcase) == q }
+          return by_id
+        end
         begin
-          ProjectRegistry.new(Paths.projects_dir).create(name)
+          registry.create(name)
         rescue ex : Gori::Error
-          abort "gori run capture: #{ex.message} (#{name.inspect})"
+          abort "gori run capture: #{ex.message} (#{CLI::Output.term_safe(name).inspect})"
         rescue ex : File::Error
-          abort "gori run capture: could not create project #{name.inspect}: #{ex.message}"
+          abort "gori run capture: could not create project #{CLI::Output.term_safe(name).inspect}: #{ex.message}"
+        end
+      end
+
+      # A pin stands in for `--project` on capture too (#1387): the existing project a pin names
+      # (by name, slug or id), or — for a GORI_PROJECT naming none — the NAME to create, the way
+      # `--project` creates a capture target. A `project switch` pin naming none is refused, like
+      # on every other command. nil: no pin, so the `default` project, as before.
+      private def self.capture_default(registry : ProjectRegistry) : Project | String?
+        if env = ENV[DEFAULT_PROJECT_ENV]?.try(&.strip)
+          abort "gori run capture: #{DEFAULT_PROJECT_ENV} is set but empty — unset it, or name a project" if env.empty?
+          begin
+            return registry.find(env) || env
+          rescue ex : ProjectRegistry::Ambiguous
+            abort "gori run capture: #{DEFAULT_PROJECT_ENV}: #{ex.message}"
+          end
+        end
+        return nil unless pin = read_default_pin
+        case chosen = default_project(registry, nil, pin)
+        in Tuple  then chosen[0]
+        in String then abort "gori run capture: #{chosen}"
+        in Nil    then nil
         end
       end
 
@@ -441,19 +572,151 @@ module Gori
       # for a file that exists but cannot be opened (mode 000, an unreadable parent, a
       # foreign-owned path), and it is a TOCTOU window besides — the path can be deleted
       # between the check and the read. `File.read` then raises `File::AccessDeniedError` /
-      # `File::NotFoundError`, and `File::Error < IO::Error` is re-raised by `Run.dispatch`
-      # (which only absorbs EPIPE), so it escapes `CLI.run`'s `Gori::Error`-only rescue.
-      # Mirrors the guard `run/rewriter.cr`'s `read_stub_response` already had. `stdin:` is
-      # opt-in rather than the default so this stays a pure robustness change: only the one
-      # caller that already spelled `-` as stdin keeps that meaning, and the flags that used
-      # to reject `-` as an unreadable path go on rejecting it instead of quietly blocking
-      # on a terminal read.
-      private def self.read_input_file(path : String, what : String, *, stdin : Bool = false) : String
-        return STDIN.gets_to_end if stdin && path == "-"
+      # `File::NotFoundError`, and `File::Error < IO::Error` is re-raised by `CLI.run` (which
+      # absorbs only EPIPE of that class), so it escapes as a backtrace.
+      # `run/rewriter.cr`'s `read_stub_response` reads through here for the same guard, rather
+      # than keeping the copy it was once credited with and never had: `File.read` on a
+      # DIRECTORY raises a bare `IO::Error` from `read(2)` (the `open(2)` succeeds), which a
+      # `File::Error` rescue does not catch — so `--response-file=/tmp` reached the operator
+      # as a twelve-frame backtrace. The rescue below is `IO::Error` for that reason: it is
+      # `File::Error`'s parent, so it still catches everything the narrower one did, plus the
+      # errnos that surface only once a byte is asked for.
+      #
+      # `stdin:` is opt-in rather than the default so this stays a pure robustness change:
+      # only the callers that already spelled `-` as stdin keep that meaning, and the flags
+      # that used to reject `-` as an unreadable path go on rejecting it.
+      #
+      # A PATH can name a terminal too — `--request-file /dev/stdin`, `--notes-file /dev/tty`,
+      # `/dev/fd/0` — and that road hangs and echoes exactly as `-` does, so the open below is
+      # checked with the same guard. It costs no extra open: `File.read` is this open and this
+      # `gets_to_end`, so a FIFO blocks where it always blocked and a regular file is
+      # unchanged.
+      #
+      # `noun` names what is being read and `flag` the option the operator typed, so the
+      # refusal says "the identity set" and `--identities=-` rather than "the input" and a
+      # placeholder. Both have defaults because nine of the eleven callers name a plain file
+      # path, where only the terminal sentence can ever use them.
+      private def self.read_input_file(path : String, what : String, *, stdin : Bool = false,
+                                       noun : String = "input", flag : String? = nil) : String
+        if stdin && path == "-"
+          return read_stdin_text(STDIN, what, noun, stdin_pipe_hint(what, flag: flag || "-"))
+        end
         abort "#{what}: not a readable file: #{path}" if File.directory?(path)
-        File.read(path)
-      rescue ex : File::Error
+        File.open(path) do |f|
+          if err = stdin_terminal_error(f, what: what, noun: noun,
+               hint: "#{path} names this terminal. Pass the path of a real file, or pipe the #{noun} in.")
+            abort err
+          end
+          f.gets_to_end
+        end
+      rescue ex : IO::Error
         abort "#{what}: cannot read '#{path}': #{ex.message}"
+      end
+
+      # The bytes an operator piped in for an EXPLICIT `--…-stdin` flag, verbatim. Byte-for-byte
+      # what `read_input_file` returns for the same content in a file — `IO#gets_to_end` and
+      # `File.read` are both an `IO.copy` into a `String::Builder`, so CRLF stays CRLF and text
+      # that is not valid UTF-8 (a latin-1 note, a captured body pasted into evidence) arrives
+      # as its own octets rather than as U+FFFD. That is P7 besides: these are operator bytes,
+      # and gori does not sanitize them.
+      #
+      # A TERMINAL is refused first (see `stdin_terminal_error`), so the read below is always
+      # a pipe, a redirect or a file — the three spellings that do not echo and do end.
+      #
+      # The rescue is the point of routing through here rather than a bare `io.gets_to_end`.
+      # `CLI.run` re-raises any non-EPIPE `IO::Error` and otherwise rescues only
+      # `Gori::Error`, so an unreadable stdin — fd 0 closed by a cron/systemd unit, or a
+      # `Process.run` with no stdin pipe — reached the operator as a Crystal backtrace. Same
+      # guard, and same reason for it, as `read_input_file`'s `File::Error` rescue.
+      #
+      # `noun` names what is being read in both sentences, so each caller's refusal reads like
+      # the flag the operator typed ("the request", "the notes").
+      private def self.read_stdin_text(io : IO, what : String, noun : String, hint : String) : String
+        if err = stdin_terminal_error(io, what: what, noun: noun, hint: hint)
+          abort err
+        end
+        io.gets_to_end
+      rescue ex : IO::Error
+        abort "#{what}: cannot read the #{noun} from stdin: #{ex.message}"
+      end
+
+      # The IMPLICIT stdin road's read: no terminal guard — a terminal there means "no source
+      # was given", and each caller already answers that with its own usage line — but the
+      # same `IO::Error` rescue the explicit doors get. `CLI.run` re-raises any non-EPIPE
+      # `IO::Error` and otherwise rescues only `Gori::Error`, so fd 0 closed by a cron or
+      # systemd unit (`gori run notes create 0<&-`) reached the operator as a Crystal
+      # backtrace on all seven of these while the five flag doors printed a sentence.
+      #
+      # `noun` names what was being read, so the refusal reads like the command that spoke.
+      def self.read_stdin_fallback(io : IO, what : String, noun : String) : String
+        io.gets_to_end
+      rescue ex : IO::Error
+        abort "#{what}: cannot read the #{noun} from stdin: #{ex.message}"
+      end
+
+      # nil when `io` is the pipe/redirect an explicit stdin flag (or a `-` path) asks for;
+      # the sentence to `abort` with when it is a TERMINAL instead. Public so a spec can pin
+      # both arms — the `abort` above cannot be driven in-process.
+      #
+      # This REVERSES the rule `--request-stdin` shipped with (#1001): "a flag NAMED by the
+      # operator makes blocking until EOF the answer to what they asked for", a `^D` notice,
+      # and then the read. A terminal is not a quiet pipe with a human on the other end
+      # (#1034), and all three of its differences bite exactly this door:
+      #
+      #  * The line discipline ECHOES every byte back. The whole raw request — `Cookie`,
+      #    `Authorization`, a PII body — lands in the scrollback, and under a PTY-driven
+      #    harness in the captured transcript. That is the leak the flag EXISTS to close: it
+      #    keeps those same bytes out of the process listing and the shell history.
+      #  * `^D` is not EOF. In canonical mode it FLUSHES the pending line, so a request with
+      #    no trailing newline takes two — one to deliver the last line, one on the now-empty
+      #    line to end the read — and a driver that sends one waits forever.
+      #  * `MAX_CANON` caps a line at 1024/4096 bytes, so a long header or a single-line body
+      #    is truncated by the terminal before gori is handed an octet.
+      #
+      # Driving termios is not out of reach — `Termisu::Termios` already puts the operator's
+      # pane in raw mode, and its `Terminal::Mode.password` clears ECHO — but it fixes only
+      # the FIRST bullet. Canonical mode still flushes on `^D` and still truncates at
+      # `MAX_CANON`, and raw mode removes keyboard EOF altogether, so there is no termios
+      # setting under which a terminal delivers a byte-exact multi-line request and then ends.
+      # A door that cannot be made to work is refused rather than half-built (P0), with the
+      # safe spellings named. Nothing a script does changes: a pipe and a `< file` redirect
+      # are both non-tty file descriptors and still read byte-for-byte.
+      #
+      # The refusal is only as good as its `abort`, so this returns the sentence and the
+      # CALLER ends the command: `read_stdin_text` is the one door, and `gets_to_end` is
+      # unreachable past it.
+      #
+      # The IMPLICIT stdin roads (`fuzz_source`/`mine_source`/`sequence_source`, `decoder`,
+      # `jwt`, `cookie`, `notes`) keep their own `unless STDIN.tty?` guard: theirs is a
+      # fallback rather than a flag, and a terminal there means "no source was given", not
+      # "the operator asked for this one".
+      def self.stdin_terminal_error(io : IO, *, what : String, noun : String,
+                                    hint : String) : String?
+        return nil unless io.is_a?(IO::FileDescriptor) && io.tty?
+        "#{what}: refusing to read the #{noun} from a terminal — a terminal echoes it back " \
+        "into the scrollback (a captured PTY transcript with it), and ^D after a partial " \
+        "line flushes instead of ending the read. #{hint}"
+      end
+
+      # The "and here is the spelling that works" half of that refusal. Every door offers the
+      # pipe and the `< FILE` redirect; `file_flag` is the third road, for a flag that has a
+      # file-reading sibling. A `-` door passes none — there the path the `-` stands in for IS
+      # the alternative — and that is the only difference between the two shapes, so one
+      # builder writes both: a refusal that names two of three roads teaches the operator that
+      # the third is unsupported.
+      #
+      # `flag` is NAMED inside both examples rather than left under the `…`. An operator who
+      # follows `producer | gori run authorize …` verbatim drops `--identities=-`, and
+      # `gori run authorize` without it is not the same command — it replays live traffic
+      # against the project's SAVED identity set and reports success; `gori run sequence`
+      # without `--tokens -` falls through to the implicit stdin road, where the same bytes
+      # become a request template that is then SENT. A hint for a refusal must not be
+      # followable into a different command, least of all one that dials a target.
+      def self.stdin_pipe_hint(what : String, *, flag : String, file_flag : String? = nil,
+                               producer : String = "producer") : String
+        tail = file_flag ? "or pass #{file_flag}=FILE." : "or pass the file's path instead of `-`."
+        "Pipe it in (`#{producer} | #{what} … #{flag}`), redirect a file " \
+        "(`#{what} … #{flag} < FILE`), #{tail}"
       end
 
       # Opening a non-SQLite file (or a path we can't read) raises deep in the driver;
@@ -462,11 +725,60 @@ module Gori
       # list, a scope load for Outbound). A `body:` query is a write — it drains FTS —
       # so those callers pass false. Every CLI store skips idle FTS: the process is
       # short-lived, and an idle indexer next to a capturing TUI is the #752 condition.
-      private def self.open_store(project : Project, *, read_only : Bool = false) : Store
+      # `long_running` for a subcommand that keeps this handle open across a crawl, a sweep or
+      # a stream and writes through it as it goes — see `CLI_BUSY_TIMEOUT_MS` for which.
+      private def self.open_store(project : Project, *, read_only : Bool = false,
+                                  abort_on_failure : Bool = true,
+                                  long_running : Bool = false) : Store
+        busy_ms, checkout_s = store_budget(long_running)
         store = Store.open(project.db_path,
           retention_flows: read_only ? Store::RETENTION_UNLIMITED : Settings.retention_flows,
           read_only: read_only,
-          background_index: false)
+          background_index: false,
+          busy_timeout_ms: busy_ms,
+          checkout_timeout_seconds: checkout_s)
+        begin
+          hydrate_cli_store(store, project, busy_ms)
+        rescue ex
+          # A failure AFTER the open used to leave this Store alive — its open-lock flock held
+          # and its writer fiber parked — while the rescue below decided what to say. Harmless
+          # only while every caller exits moments later; `abort_on_failure: false` callers
+          # (the post-send writes) carry on, so the handle they never received is closed here.
+          store.close
+          raise ex
+        end
+        store
+      rescue ex : DB::Error | SQLite3::Exception
+        abort open_failure_message(ex, project, read_only) if abort_on_failure
+        raise ex
+      end
+
+      # `open_store`, yield, close — the shape nearly every command wants. Returns the block's
+      # value. A `return` in the block still closes the store; an `abort` does not (`exit` skips
+      # `ensure`), which is what `abort_closing` is for.
+      private def self.with_store(project : Project, *, read_only : Bool = false,
+                                  long_running : Bool = false, &)
+        store = open_store(project, read_only: read_only, long_running: long_running)
+        begin
+          yield store
+        ensure
+          store.close
+        end
+      end
+
+      # Everything a `gori run` store needs loaded into this process before a command reads a
+      # token, a rule or a slot out of it. Split from `open_store` so a raise in here closes the
+      # store it was hydrating (see the caller).
+      private def self.hydrate_cli_store(store : Store, project : Project, busy_ms : Int32) : Nil
+        # THE token-grammar reconcile, before anything reads a token out of this store (#env.syntax).
+        # `read_only` does not exempt a command: the handle above may be read-only, but the
+        # re-spelling writes through its own connection, and `gori run repeater list` is exactly as
+        # good a moment to bring a project's stored tokens into this install's grammar as a TUI open
+        # is — the alternative is a headless run that reads them under the wrong grammar forever.
+        # Reported HERE (STDERR, one line per project) rather than carried: every `gori run`
+        # subcommand funnels through this method, so a caller that forgot to report would be silent.
+        report_env_syntax_migration(EnvMigration.reconcile(store, project.db_path, project.name,
+          busy_timeout_ms: busy_ms))
         # The project's pinned upstream / dial timeouts / capture cap (#538). `bind: false`:
         # not one command routed through here LISTENS — `gori run capture` is the only
         # subcommand that binds and it opens its project through `Session.open` instead — so
@@ -489,14 +801,63 @@ module Gori
         # per-process and starts nil — see `SessionSlots`), so `gori run` behaves exactly as it
         # did: unscoped rules, global table, no overlay.
         Env.layer = Bindings.load(store, SessionSlots.load(store))
+        layer = Env.layer.as(Bindings)
+        # …and the slots' REFRESH runner beside it (#1233), so a `--slot NAME` send whose slot
+        # carries a `refresh_before` policy re-authenticates before it goes out — in THIS
+        # process's table, which is the only one a `gori run` has. Gated as the CLI gates:
+        # `Outbound.cli` over the project's scope, never a send's own `--allow-unscoped`.
+        previous = Gori::SessionRefresh.hook.as?(Gori::SessionRefresh::Runner)
+        origin = project.db_path
+        # A READ-ONLY open (a scope snapshot, `project_outbound`) records through the writable
+        # handle an earlier open of the SAME project still holds — `gori run authorize` opens
+        # one and then the other, and its refreshes would otherwise be recorded nowhere.
+        records = previous.try { |p| p.origin == origin ? p.record_target : nil } if store.read_only?
+        runner = Gori::SessionRefresh::Runner.new(store, layer,
+          -> { Gori::Outbound.cli(Gori::Scope.load(store), false) },
+          verify: @@refresh_verify, records: records, origin: origin).install
+        # A refresh that ran on an earlier READ-ONLY open owes History rows and an event; this
+        # open writes them if it can, or carries them to the runner it just installed.
+        previous.try &.hand_over(store, origin, runner)
+        warn_unwritten_refresh_records
         # …and re-select whatever `--slot` chose, because THIS line just replaced the registry
         # holding the pointer. See `reapply_active_slot`.
         reapply_active_slot
-        store
-      rescue ex : DB::Error | SQLite3::Exception
-        abort "gori run: cannot open database #{project.db_path}: " \
-              "#{ex.message.presence || "not a valid SQLite database (or unreadable)"}" \
-              "#{open_failure_hint(ex, project.db_path, read_only)}"
+      end
+
+      # `abort` for a refusal raised while `store` is open. `abort` calls `exit`, which skips the
+      # caller's `ensure store.close`, so the store is closed HERE — its writer fiber stopped and
+      # its open-lock released — before the process goes. nil for a path that opened no project.
+      private def self.abort_closing(store : Store?, message : String) : NoReturn
+        store.try &.close
+        abort message
+      end
+
+      # The one sentence for a project that could not be opened: SQLite's own words (or the
+      # non-database fallback) plus `open_failure_hint`'s reason. Public so a caller that
+      # survives the failure (`persist_repeater_response`, which must not abort a completed
+      # send) reports the SAME accurate reason `open_store`'s abort would have — a read-only
+      # file, a non-writable WAL directory, a peer's lock — instead of collapsing every one of
+      # them into "busy or unwritable".
+      def self.open_failure_message(ex : Exception, project : Project, read_only : Bool = false) : String
+        "gori run: cannot open database #{project.db_path}: " \
+        "#{ex.message.presence || "not a valid SQLite database (or unreadable)"}" \
+        "#{open_failure_hint(ex, project.db_path, read_only)}"
+      end
+
+      # The open-time re-spelling, said out loud. STDERR, never STDOUT: `gori run … --format json`
+      # is piped into other programs, and a migration notice inside the JSON would break every one
+      # of them. One line per project, plus one for the GLOBAL rewrite rules when this process's
+      # settings load re-spelled those too — drained here because a `gori run` is the commonest
+      # first thing a bare-era install does after an upgrade.
+      #
+      # `io` is injectable for the same reason every other notice in this file has one: the
+      # alternative is a spec that can only assert the report by reading the terminal.
+      def self.report_env_syntax_migration(report : EnvMigration::StoreReport?,
+                                           io : IO? = STDERR) : Nil
+        lines = report.try(&.notices) || [] of String
+        Settings.take_env_syntax_global_migration.try { |g| lines << g.line }
+        return if lines.empty?
+        lines.each { |line| io.try &.puts CLI::Output.term_safe(line) }
       end
 
       # What to add after SQLite's own sentence, for the two failures that are NOT what the
@@ -505,7 +866,7 @@ module Gori
       #
       # A LOCKED project. A write subcommand opens for write and `Store.open` migrates, so a
       # peer holding the write lock (a TUI, a `gori run capture`, an MCP server) fails the open
-      # after `busy_timeout=5000` with the bare words "database is locked" — printed under
+      # after the configured SQLite busy timeout with the bare words "database is locked" — printed under
       # "cannot open database <path>", which reads as a broken FILE. It is the opposite: the
       # file is fine and the condition clears by itself. Matched on the message, not
       # `SQLite3::Exception#code`, because this rescue also catches the `DB::Error` crystal-db
@@ -531,11 +892,8 @@ module Gori
         # read-only open can still surface either string — `Store.open` runs its pragmas before
         # `apply_query_only` — and both sentences were wrong for it: "read it with a read-only
         # subcommand" is what the operator just did, and "this subcommand writes" is false.
-        if msg.includes?("is locked")
-          return " — another gori (a TUI, a capture, or an MCP server) is writing to this project." \
-                 " Nothing is wrong with the file; retry." if read_only
-          return " — another gori (a TUI, a capture, or an MCP server) is writing to this project." \
-                 " Nothing is wrong with the file: retry, or read it with a read-only subcommand."
+        if hint = lock_failure_hint(msg, read_only)
+          return hint
         end
         if !read_only && (msg.includes?("readonly") || msg.includes?("read-only"))
           return " — this subcommand writes, and the file (or its directory) is not writable."
@@ -557,6 +915,29 @@ module Gori
         " — this subcommand writes, and the file (or its directory) is not writable."
       end
 
+      # "This project", never a name. The sentence hangs off "cannot open database <path>", so
+      # the target is already on the line — and the only name available here is
+      # `Project#name`, which for a `--db PATH` target `resolve_read_project` synthesises from
+      # the path's PARENT DIRECTORY. `gori run notes create --db /tmp/claude-501/mycap.db` was
+      # told `project "claude-501" is locked`, and there is no such project.
+      #
+      # The advice names the workaround the operator can actually take: a read-only
+      # subcommand does not need the writer slot, so `history`, `notes` (list), `repeater
+      # list` and friends work against the very project a TUI is capturing into. "Close the
+      # other instance" is what they already knew.
+      private def self.lock_failure_hint(msg : String, read_only : Bool) : String?
+        if msg.includes?("is locked")
+          return " — this project is locked by another gori (a TUI, a capture, or an MCP server)." \
+                 " Nothing is wrong with the file; retry." if read_only
+          return " — this project is locked by another gori (a TUI, a capture, or an MCP server)." \
+                 " Nothing is wrong with the file: retry, read it with a read-only subcommand, or close the other instance."
+        end
+        return " — this project's connections are all busy in another gori instance (a TUI, a capture, or an MCP server):" \
+               " retry, read it with a read-only subcommand, or close the other instance." \
+                if msg.includes?("Could not check out a connection")
+        nil
+      end
+
       # Does this QL string read `flows_fts`? Shape-only: no store, so it is safe to call
       # before `open_store` and decide whether the open has to be writable to drain.
       private def self.query_uses_fts?(query : String?) : Bool
@@ -574,11 +955,8 @@ module Gori
       private def self.cli_host_overrides(project_name : String?, db_path : String?, flow_id : Int64?,
                                           repeater_id : Int64? = nil) : Gori::HostOverrides?
         return nil unless flow_id || repeater_id || project_name || db_path
-        store = open_store(resolve_read_project(project_name, db_path), read_only: true)
-        begin
+        with_store(resolve_read_project(project_name, db_path), read_only: true) do |store|
           Gori::HostOverrides.load(store)
-        ensure
-          store.close
         end
       rescue
         nil
@@ -625,14 +1003,23 @@ module Gori
       # short-circuiting on "no --project given" would drop Sandbox containment).
       private def self.project_outbound(project_name : String?, db_path : String?,
                                         allow_unscoped : Bool) : Gori::Outbound
-        store = open_store(resolve_read_project(project_name, db_path), read_only: true)
+        project_outbound(resolve_read_project(project_name, db_path), allow_unscoped)
+      end
+
+      # The same gate over a project the caller already resolved, so a command that pins its
+      # project once checks scope against THAT project and not a re-resolved most-recent one.
+      private def self.project_outbound(project : Project, allow_unscoped : Bool) : Gori::Outbound
+        store = open_store(project, read_only: true)
         scope = begin
           Gori::Scope.load(store)
         rescue ex
-          store.close
-          abort "gori run: could not load project scope (refusing to send unscoped): #{ex.message}"
+          abort_closing(store, "gori run: could not load project scope (refusing to send unscoped): #{ex.message}")
         end
-        Gori::Outbound.cli(scope, allow_unscoped, owns_store: store)
+        # Every caller takes --allow-unscoped, so a refusal worded by the Outbound itself (gRPC
+        # reflection, a retest step) names it as the remedy, as `guard_outbound` does.
+        outbound = Gori::Outbound.cli(scope, allow_unscoped, owns_store: store)
+        outbound.waiver = "--allow-unscoped"
+        outbound
       end
 
       # Up-front (Layer-1) scope gate for the CLI direct-dial tools, with the policy owned
@@ -704,6 +1091,32 @@ module Gori
       # `activate_slot`, and a later open that cannot honour it (a second `--db` pointing
       # somewhere else) is not a case any command builds today — reporting it here would put
       # a line on STDERR for every internal re-open instead.
+      # Said once at exit when a refresh's records never met a writable store — a command that
+      # only ever read its project. The refresh itself happened; its record did not.
+      @@refresh_exit_note = false
+
+      private def self.warn_unwritten_refresh_records : Nil
+        return if @@refresh_exit_note
+        @@refresh_exit_note = true
+        at_exit do
+          if (r = Gori::SessionRefresh.hook.as?(Gori::SessionRefresh::Runner)) && r.deferred?
+            STDERR.puts "gori run: a session slot refresh ran, but this command never opened the " \
+                        "project for writing, so its History rows and event were not recorded"
+          end
+        end
+      end
+
+      # Upstream TLS verification for a refresh step, which is the command's own `-k`: a send
+      # that reaches a self-signed lab target has to be able to log in to it too. Remembered,
+      # like `@@active_slot`, because every `open_store` installs a new runner; a command calls
+      # this right after parsing, before it opens anything or sends.
+      @@refresh_verify = true
+
+      private def self.refresh_verify_upstream(verify : Bool) : Nil
+        @@refresh_verify = verify
+        Gori::SessionRefresh.hook.as?(Gori::SessionRefresh::Runner).try(&.verify = verify)
+      end
+
       private def self.reapply_active_slot : Nil
         return unless name = @@active_slot
         Env.layer.as?(Gori::Bindings).try(&.slots).try(&.activate(name))
@@ -724,7 +1137,7 @@ module Gori
       # `authorize_*` through this same method. The repeated failure shape in this repo is a
       # notice fixed on one surface and left to drift on the other two.
       #
-      # An INTERRUPTION and not a refusal, matching the seam it reports (`Env.unbound_in_slot`):
+      # An INTERRUPTION and not a refusal, matching the seam it reports (`Env.slot_literals`):
       # the bytes already went out, `$$NAME` is the escape for an operator who meant the
       # literal, and a guard with no exit costs more than the loss it prevents. What this owes
       # the operator is that the result is not read as evidence about an identity that was
@@ -749,15 +1162,30 @@ module Gori
         first = pairs.first[1]
         String.build do |io|
           io << "session #{one ? "value" : "values"} went out LITERALLY — "
-          io << order.join("; ") { |s| "#{s} sent #{Env.token_list(by_slot[s])}" }
+          io << order.join("; ") { |s| "#{s} sent #{Env.token_list(by_slot[s], ns: Env::Namespace::Bind)}" }
           io << ". Nothing bound #{one ? "it" : "them"} in this process (a binding value is "
           io << "memory-only, so every run starts with an empty table), so #{one ? "that" : "those"} "
           io << "request#{one ? "" : "s"} carried the reference itself where the session belongs "
           io << "— #{one ? "its" : "their"} response#{one ? " is" : "s are"} NOT evidence about "
           io << "the identity #{one ? "it names" : "they name"}. Bind first — replay a login under "
           io << "the slot (`--bind-from FLOW-ID` on a `gori run` sweep, a Repeater send, "
-          io << "`send_request` over MCP) — or write `$$#{first}` if the literal is what you meant"
+          io << "`send_request` over MCP) — or write "
+          io << "`#{Env.spell_escaped(first, Env::Namespace::Bind)}` if the literal is what you meant"
+          io << bare_spelling_tail(first, one)
         end
+      end
+
+      # The sentence the NAMESPACED grammar adds, or "" — because under it the likeliest cause is not
+      # an empty table at all. A bare `$SESSION` typed into `--identities` or MCP
+      # `create_session_slot` (neither of which any migration reaches) is TEXT, and no amount of
+      # binding will ever resolve it. Both remedies are named, because this sentence is built from a
+      # {slot, name} pair and cannot see which spelling the header actually carried.
+      private def self.bare_spelling_tail(first : String, one : Bool) : String
+        return "" if Settings.env_syntax.bare?
+        ". If #{one ? "it is" : "they are"} spelled the bare way " \
+        "(`#{Env.spell(first, Env::Namespace::Bind, Env::Syntax::Bare)}`), this install reads " \
+        "#{EnvMigration.spelling(Env::Syntax::Namespaced)} and the remedy is the spelling: write " \
+        "`#{Env.spell(first, Env::Namespace::Bind)}`"
       end
 
       # Drain and SAY it, for a `gori run` surface that has just printed its summary. Silent
@@ -789,7 +1217,7 @@ module Gori
 
       # The {scheme, host, target} `guard_outbound` judges a `--bind-from` seed by. Named rather
       # than inlined so the decision is spec-able without a live send, the way
-      # `repeater_out_of_scope?` is for `gori run repeater`. The target comes from
+      # `repeater_scope_verdict` is for `gori run repeater`. The target comes from
       # `Outbound.request_target` — the one home for reading a request-target off raw bytes,
       # which recovers it from an irregular request line instead of gating an empty path.
       private def self.bind_from_scope_parts(built : Repeater::FlowRequest::Built) : {String, String, String, Int32}
@@ -831,11 +1259,8 @@ module Gori
         # open_store also installs the project's extract rules as `Env.layer` (see its
         # comment) — the seed depends on that having happened, which is why it reads the flow
         # through the same helper rather than opening the DB by hand.
-        store = open_store(resolve_read_project(project_name, db_path), read_only: true)
-        detail, overrides = begin
+        detail, overrides = with_store(resolve_read_project(project_name, db_path), read_only: true) do |store|
           {store.get_flow(flow_id), Gori::HostOverrides.load(store)}
-        ensure
-          store.close
         end
         abort "#{cmd}: --bind-from: no flow ##{flow_id}" unless detail
         built = Repeater::FlowRequest.build(detail)
@@ -887,7 +1312,7 @@ module Gori
           abort "#{cmd}: --bind-from: " \
                 "#{bind_from_nothing_bound(bindings, flow_id, result.response.try(&.status))}"
         end
-        STDERR.puts "bind-from: flow ##{flow_id} replayed → bound #{Env.token_list(bound)}"
+        STDERR.puts "bind-from: flow ##{flow_id} replayed → bound #{Env.token_list(bound, ns: Env::Namespace::Bind)}"
         # The seed replay ran with the table still EMPTY — that is what it is for — so the
         # active slot's own `$NAME` went out literally on this one request and
         # `Env.report_unbound_overlay` recorded it. Drained and DROPPED here: the sweep that
@@ -924,7 +1349,7 @@ module Gori
         end
         # `{rule name, the slots claiming it}` → "$SESSION (claimed by idA)".
         detail = skipped.join(", ") do |(name, slots)|
-          "#{Env.token_list([name])} (claimed by #{slots.join(", ")})"
+          "#{Env.token_list([name], ns: Env::Namespace::Bind)} (claimed by #{slots.join(", ")})"
         end
         pick = skipped.first[1].first
         "#{replayed}, and #{skipped.size == 1 ? "the rule that would have bound is" : "the rules that would have bound are"} " \
@@ -1011,10 +1436,25 @@ module Gori
       # on the FACT, not after the remedy — "...or remove the token for session #3" reads as
       # if the token were the session's.
       private def self.env_unresolved_error(detail : String?, where : String = "") : String
+        refs = (detail || "").split(',').compact_map { |t| Gori::Env.parse_ref?(t) }
+        if !refs.empty? && refs.all?(&.ns.gen?)
+          # A REGISTERED generator refused here is not a typo and the catalog is no remedy —
+          # offering `$GEN.UUID` as the way to fix `$GEN.UUID` says nothing. It reached this
+          # message because the value it sits in is resolved BEFORE a request exists (a dial
+          # target, an SNI: `Env.unresolved(..., deferred: nil)`), where nothing mints.
+          if refs.all? { |r| Env.generator_hint?(r.name) }
+            return "#{detail}#{where} #{refs.size == 1 ? "is a generator" : "are generators"} — " \
+                   "generators mint at the send seam, in REQUEST text, and this value is resolved " \
+                   "before the request is framed, so the token would go out literally. Write the " \
+                   "value here, or remove the token"
+          end
+          names = Env::GENERATOR_HINTS.keys.map { |name| Env.spell(name, Env::Namespace::Gen) }.join(", ")
+          return "unresolved generator #{detail}#{where} — use one of #{names}, or remove the token"
+        end
         hits, rest = split_disabled_rule_tokens(detail)
         return "unresolved env #{detail}#{where} — set it with `gori run project env set KEY value`, " \
                "or remove the token" if hits.empty?
-        names = hits.map { |(name, id)| "#{Settings.env_prefix}#{name} (extract rule ##{id})" }.join(", ")
+        names = hits.map { |(name, id)| "#{Env.spell(name, Env::Namespace::Bind)} (extract rule ##{id})" }.join(", ")
         enable = hits.map { |(_, id)| "`gori run rewriter extract enable #{id}`" }.join(", ")
         tail = rest.empty? ? "" : " · #{Env.token_list(rest)} is not declared by any rule — " \
                                   "set it with `gori run project env set KEY value`, or remove the token"
@@ -1036,21 +1476,31 @@ module Gori
       # persists; the value never does"), and stale on the next run. So the two cases have to
       # be told apart before the sentence is chosen.
       #
-      # `detail` is the builder's own `Env.token_list` output, so it is parsed back with the
-      # same prefix that produced it.
+      # `detail` is the builder's own `Env.token_list` output, so it is parsed back through
+      # `Env.parse_ref?` — the inverse of the spelling that produced it, in whichever grammar is
+      # in effect.
+      #
+      # Only a BIND reference can be "declared by a disabled rule". Under the namespaced grammar a
+      # `$ENV.*` in the same list is a plain env var, so it goes to `rest` with its namespace
+      # intact (`Ref#qualified`, which `token_list` spells back to `$ENV.X` — or to `$X` in bare
+      # mode, where the label is not part of the spelling). That is what keeps the
+      # "declared by a DISABLED rule" sentence reachable for the names it is actually about.
       private def self.split_disabled_rule_tokens(detail : String?) : {Array({String, Int64}), Array(String)}
         hits = [] of {String, Int64}
         rest = [] of String
         return {hits, rest} unless detail
         ids = Env.layer.as?(Gori::Bindings).try(&.disabled_rule_ids)
         return {hits, rest} unless ids && !ids.empty?
-        prefix = Settings.env_prefix
         detail.split(", ").each do |token|
-          name = token.starts_with?(prefix) ? token[prefix.size..] : token
-          if id = ids[name]?
-            hits << {name, id}
+          ref = Env.parse_ref?(token, default_ns: Env::Namespace::Bind)
+          unless ref
+            rest << token # not a token gori can read back — carry it through verbatim
+            next
+          end
+          if ref.ns.bind? && (id = ids[ref.name]?)
+            hits << {ref.name, id}
           else
-            rest << name
+            rest << ref.qualified
           end
         end
         {hits, rest}
@@ -1132,8 +1582,11 @@ module Gori
       # one shouts about a term QL DROPS, which broadens the result and leaves something to look
       # at. This one has nothing to look at.
       #
-      # Deliberately NOT applied to the TUI filter bar: an operator types `meth` on the way to
-      # `method:`, and a live filter re-evaluates every keystroke.
+      # REFUSAL is deliberately not applied to the TUI filter bar: an operator types `meth` on
+      # the way to `method:`, and a live filter re-evaluates every keystroke. The DIAGNOSIS is —
+      # the bars name the field once the list they produced is empty (`FilterAst.unknown_field`,
+      # same sentence, `QL.suggest_field` behind it), so the silence this refusal exists to break
+      # is broken there too, without a keystroke ever being rejected.
       #
       # MCP was exempted here on the grounds that its `strict:` argument already offered this.
       # It did not, and could not: an unknown field free-texts, so it COMPILES, so `QL.analyze`
@@ -1167,6 +1620,9 @@ module Gori
         if near = QL.suggest_field(use.name)
           "gori run #{cmd}: unknown query field `#{bad}` — did you mean " \
           "`#{near}#{use.regex ? '~' : ':'}`? (#{tail})"
+        elsif FilterAst::ID_FIELDS.includes?(use.name.downcase)
+          "gori run #{cmd}: unknown query field `#{bad}` — QL has no `#{use.name}:` field; " \
+          "use the flow id argument (e.g. `gori run show <id>`) to select flows by id (#{tail})"
         else
           "gori run #{cmd}: unknown query field `#{bad}` — QL has no such field. " \
           "Fields: #{QL::FIELDS.join(' ')} (#{tail})"
@@ -1223,7 +1679,7 @@ module Gori
         rest = [] of String
         # Classify on a scrubbed copy: argv comes from the OS unvalidated, and PCRE2 raises
         # "Regex match error: UTF-8 error" on a non-UTF-8 subject — `gori run history $'\xff'`
-        # backtraced out of `main`, since neither `Run.dispatch` nor `CLI.run` rescues
+        # backtraced out of `main`, since `CLI.run` does not rescue
         # ArgumentError. Same remedy as `read_token_list` in ./run/sequence.cr. `scrub` returns
         # self for valid UTF-8, and it is `a` (not `a.scrub`) that is kept, so the operator's
         # query bytes reach QL exactly as typed.
@@ -1315,6 +1771,28 @@ module Gori
         list_leftover_error(leftover, sub, verbs)
       end
 
+      # One `what` positional naming an id (`rewriter rm <id>`, `intercept get <item-id>`):
+      # missing, too many and not-a-number, each refused in the words these commands use.
+      private def self.take_id(rest : Array(String), prefix : String, what : String, noun : String) : Int64
+        abort "#{prefix}: missing #{what}" if rest.empty?
+        abort "#{prefix}: too many arguments (expected one #{what})" if rest.size > 1
+        rest[0].to_i64? || abort("#{prefix}: invalid #{noun} '#{rest[0]}'")
+      end
+
+      # The `<id>` positional of `retest`/`evidence` verbs: too many, absent, then `parse_id`.
+      private def self.require_positional_id(positional : Array(String), cmd : String,
+                                             noun : String, parse_cmd : String) : Int64
+        abort "#{cmd}: too many arguments (expected one <#{noun}>, got: #{positional.join(" ")})" if positional.size > 1
+        v = positional.first?
+        abort "#{cmd}: <#{noun}> is required" if v.nil?
+        parse_id(v, parse_cmd, "<#{noun}>")
+      end
+
+      # An integer id out of a flag value or positional (`--issue`, `<id>`).
+      private def self.parse_id(v : String, cmd : String, flag : String) : Int64
+        v.to_i64? || abort("#{cmd}: invalid #{flag} #{v.inspect} (expected an integer)")
+      end
+
       private def self.take_flow_id(rest : Array(String), sub : String) : Int64
         abort "gori run #{sub}: missing <flow-id>" if rest.empty?
         abort "gori run #{sub}: too many arguments (expected one <flow-id>, got: #{rest.join(" ")})" if rest.size > 1
@@ -1329,6 +1807,20 @@ module Gori
         n = v.to_i?
         abort "gori run: invalid --port '#{v}' (expected 0-65535)" unless n && 0 <= n <= 65535
         n
+      end
+
+      # `--origin URL` (`sitemap params` / `sitemap export`, #1371) → {host, scheme, port}: one
+      # Sitemap root, as `gori run sitemap --format json`'s `origin` prints it. Parsed by
+      # `Settings.parse_origin` — http/https and a host required, the scheme's default port
+      # filled in — so `https://h` and `https://h:443` name one origin. Refuses a `--host` beside
+      # it rather than choosing between two answers. With neither, the host (or nothing) alone.
+      private def self.resolve_origin_flag(sub : String, host : String?, origin : String?) : {String?, String?, Int32?}
+        return {host, nil, nil} unless raw = origin
+        abort "gori run #{sub}: pass --host or --origin, not both (--origin names the host too)" if host
+        parts = Settings.parse_origin(raw)
+        abort "gori run #{sub}: invalid --origin #{raw.inspect} (expected http(s)://host[:port])" unless parts
+        scheme, h, port = parts
+        {h, scheme, port}
       end
 
       private def self.parse_count(v : String, flag : String? = nil) : Int32
@@ -1365,6 +1857,61 @@ module Gori
         end
       end
 
+      # `--wordlist` on mine/discover names ONE list (the plan takes one). A second used to
+      # replace the first unsaid; it is refused, pointing at the catalog that merges lists.
+      private def self.one_wordlist(prev : String?, v : String, cmd : String) : String
+        abort "#{cmd}: --wordlist takes one list — combine several with `gori run wordlist save`" if prev
+        v
+      end
+
+      # `--format=FMT` and, when `json` is one of `allowed`, its `--json` alias (#1386), on one
+      # parser. The alias existed on `notify` alone, so `project list --json` was an unknown
+      # option; registering both here is what keeps it on every command that takes `--format`.
+      # `spec/cli/run/format_flag_spec.cr` fails on a bare `p.on("--format=…")` that bypasses
+      # it. A command whose `--format` does not offer `json` gets no `--json` (it would only
+      # ever refuse).
+      private def self.format_flag(p : OptionParser, allowed : Array(Symbol), help : String, &set : Symbol ->) : Nil
+        p.on("--format=FMT", help) { |v| set.call(parse_format(v, allowed)) }
+        p.on("--json", "Same as --format=json") { set.call(:json) } if allowed.includes?(:json)
+      end
+
+      # `--project=NAME` / `--db=PATH`, the two ways a command names its project. A class and
+      # not a record because OptionParser fills it in from callbacks.
+      class ProjectFlags
+        property name : String? = nil
+        property db : String? = nil
+      end
+
+      # Register the pair, worded for what the command does to the project (`read`, `update`).
+      private def self.project_options(p : OptionParser, proj : ProjectFlags, verb : String) : Nil
+        p.on("--project=NAME", "Project to #{verb} (default: most-recently-active)") { |v| proj.name = v }
+        p.on("--db=PATH", "Explicit SQLite db file to #{verb}") { |v| proj.db = v }
+      end
+
+      # Build a parser, let the command register its flags, then add the tail every command
+      # shares and parse `args`. Returns the positionals, BOTH halves of `unknown_args`: a word
+      # after `--` arrives in the second, and dropping it was a bug here once. `-h` is added
+      # after the command's own flags, so `--help` still lists it last. `invalid_option` and
+      # `missing_option` are not optional: OptionParser's defaults RAISE, straight past
+      # `CLI.run` (rescues a broken pipe and Gori::Error) to `main`, which
+      # prints a Crystal backtrace instead of a one-line refusal
+      # (spec/cli/run/option_parser_missing_option_spec.cr).
+      private def self.parse_args(args : Array(String), prefix : String, & : OptionParser ->) : Array(String)
+        positional = [] of String
+        option_parser(prefix) do |p|
+          yield p
+          p.unknown_args { |before, after| positional = before + after }
+        end.parse(args)
+        positional
+      end
+
+      # `parse_args`'s parser, unparsed, for a command that keeps it whole (to print as its
+      # usage, or to sink `unknown_args` its own way). `CLI.option_parser`, with the prefix
+      # on the missing-value refusal as every `gori run` message carries it.
+      private def self.option_parser(prefix : String, & : OptionParser ->) : OptionParser
+        CLI.option_parser(prefix, "#{prefix}: ") { |p| yield p }
+      end
+
       private def self.parse_format(v : String, allowed : Array(Symbol)) : Symbol
         sym = case v.downcase
               when "text"           then :text
@@ -1381,6 +1928,8 @@ module Gori
               when "paths"          then :paths
               when "markdown", "md" then :markdown
               when "sarif"          then :sarif
+              when "names"          then :names
+              when "urls"           then :urls
               else                       abort "gori run: unknown --format '#{v}'"
               end
         abort "gori run: --format #{v} not valid here (use #{allowed.join("|")})" unless allowed.includes?(sym)
@@ -1405,34 +1954,109 @@ module Gori
         bytes ? String.new(bytes).scrub : nil
       end
 
+      # How much of a message BODY an output prints — `--headers-only` / `--max-body` (#1119).
+      # A 146 KB JSON answer used to be dumped whole into the terminal on every `repeater send`,
+      # with redirecting to a file and grepping it as the only way to read the status line.
+      #
+      # `omit` drops the body and `max` keeps a prefix; both leave a marker naming the full size,
+      # because a cut body must never read as a SHORT one. What is capped is the DECODED body the
+      # output shows (de-chunked, inflated), so the size in the marker is the one a reader of an
+      # uncut dump would have seen. The wire bytes are untouched: this is display only, and a
+      # `--record-history` flow or a stored session response still holds the whole message.
+      record BodyCap, max : Int32? = nil, omit : Bool = false do
+        def whole? : Bool
+          max.nil? && !omit
+        end
+
+        # How the flag is named in a marker, so the reader knows the cut was asked for.
+        def flag : String
+          omit ? "--headers-only" : "--max-body"
+        end
+      end
+
+      # `-d` and `-b` mean what they mean to curl (#1383): `-b` was the BODY here, so a curl
+      # user's `-b 'sid=1'` went out as a body on a GET and nothing said so.
+      SEND_DATA_HELP = "Request body, as curl's -d: repeat to join with '&'; POST unless -X names a method, and " \
+                       "Content-Type: application/x-www-form-urlencoded unless a -H names one. $ENV.KEY tokens " \
+                       "expand (see --verbatim)"
+      SEND_COOKIE_HELP = "Cookie 'name=value', as curl's -b: repeat to join them into ONE Cookie header. A value " \
+                         "with no '=' (a cookie-jar file to curl) is refused"
+      # A flow or session replay keeps its captured method, so its `-d` only replaces the body.
+      REPLAY_DATA_HELP = "Request body override (curl's -d); the Content-Length is re-framed over it. $ENV.KEY " \
+                         "tokens expand (see --verbatim)"
+      REPLAY_COOKIE_HELP = "Cookie 'name=value' (curl's -b), replacing the stored Cookie header; repeat to join " \
+                           "them into one. A value with no '=' (a cookie-jar file to curl) is refused"
+      APPLY_RULES_HELP = "Run the project's enabled Match & Replace rules (REQUEST side) over the request before " \
+                         "sending, as the live proxy would (default: off — a direct send is byte-exact)"
+      HEADERS_ONLY_HELP = "Print the status line and headers only: the body is replaced by one line naming its " \
+                          "size (--format json keeps the body's encoding and size, adds omitted:true)"
+      MAX_BODY_HELP = "Print at most BYTES of the decoded body, then a marker naming the full size " \
+                      "(--format json: text/base64 hold the prefix, size the total, shown_size the prefix)"
+
+      # nil when the pair is usable; the sentence to refuse with otherwise. One says "no body"
+      # and the other "this much body", and quietly honouring either one is a guess about which
+      # the operator meant. Split from the abort so a spec can drive it.
+      def self.body_cap_error(headers_only : Bool, max_body : Int32?) : String?
+        return nil unless headers_only && max_body
+        "--headers-only and --max-body cannot be combined — --headers-only prints no body at all"
+      end
+
+      private def self.body_cap(headers_only : Bool, max_body : Int32?, prefix : String) : BodyCap
+        if err = body_cap_error(headers_only, max_body)
+          abort "#{prefix}: #{err}"
+        end
+        headers_only ? BodyCap.new(omit: true) : BodyCap.new(max: max_body)
+      end
+
+      # The first `max` bytes of `bytes`, backed off so the cut never lands inside a UTF-8
+      # sequence (at most three continuation bytes): a prefix ending mid-codepoint would render
+      # as U+FFFD in text and flip a valid JSON body to `encoding: base64` for no reason the
+      # reader could see. A non-UTF-8 body loses at most three bytes of prefix to the same rule,
+      # and the marker counts what was actually shown.
+      def self.body_prefix(bytes : Bytes, max : Int32) : Bytes
+        return bytes if bytes.size <= max
+        cut = max
+        back = 0
+        while back < 3 && cut > 0 && (bytes[cut] & 0xC0_u8) == 0x80_u8
+          cut -= 1
+          back += 1
+        end
+        bytes[0, cut]
+      end
+
       # The CLI counterpart of MCP's Serialize.emit_body (src/gori/mcp/serialize.cr)
       # — same object shape ({encoding, size, truncated, text|base64, binary?,
       # wire_truncated?, note?}) so a script gets a consistent contract whether it
-      # reads `gori mcp` or `gori run … --format json`. UNCLIPPED: unlike MCP (which
-      # caps at MAX_TEXT/MAX_B64 for an LLM's context window), the CLI is read by a
-      # script that expects the whole value, so no size cap is applied here.
-      private def self.emit_body_json(j : JSON::Builder, field_name : String, head : Bytes?, body : Bytes?, wire_truncated : Bool) : Nil
+      # reads `gori mcp` or `gori run … --format json`. UNCLIPPED unless the operator asked:
+      # unlike MCP (which caps at MAX_TEXT/MAX_B64 for an LLM's context window), the CLI is read
+      # by a script that expects the whole value, so only `cap` (`--max-body` /
+      # `--headers-only`) shortens it. A capped body keeps `size` as the WHOLE decoded size and
+      # adds `shown_size` for the prefix; `truncated` is then true, as it is on MCP for any cut.
+      private def self.emit_body_json(j : JSON::Builder, field_name : String, head : Bytes?, body : Bytes?,
+                                      wire_truncated : Bool, cap : BodyCap = BodyCap.new,
+                                      source_size : Int64? = nil) : Nil
         if body.nil? || body.empty?
           j.field field_name, nil
           return
         end
         decoded, note, complete = Proxy::Codec::ContentDecode.decode_full(head, body)
         bytes = decoded || body
-        s = String.new(bytes)
+        shown = (max = cap.max) ? body_prefix(bytes, max) : bytes
+        cut = shown.size < bytes.size
+        s = String.new(shown)
         j.field field_name do
           j.object do
             if s.valid_encoding?
               j.field "encoding", "text"
-              j.field "size", bytes.size
-              j.field "truncated", wire_truncated
-              j.field "text", s
             else
               j.field "encoding", "base64"
               j.field "binary", true
-              j.field "size", bytes.size
-              j.field "truncated", wire_truncated
-              j.field "base64", Base64.strict_encode(bytes)
             end
+            j.field "size", bytes.size
+            # The whole body's wire size when the capture cap cut it — `size` is only what was
+            # stored. Same field, same rule as MCP `get_flow`'s body object.
+            j.field "source_size", source_size if source_size
+            emit_body_payload_json(j, s, shown, cut, wire_truncated, cap.omit)
             j.field "wire_truncated", true if wire_truncated
             j.field "note", note if note
             # A coding that stopped mid-stream. Distinct from `truncated`/`wire_truncated`,
@@ -1440,56 +2064,56 @@ module Gori
             # end of the encoded stream, so the text/base64 above is a prefix of what the
             # origin meant to send. Silence here read as "decoded: gzip, all of it".
             j.field "decode_truncated", true unless complete
-            emit_trailers_json(j, head, body)
+            # The chunked message's TRAILER fields, which neither the de-chunked body nor the
+            # rendered head carries. MCP's shape; `include_sensitive` keeps the CLI's values
+            # unredacted, as they always were here.
+            MCP::Serialize.emit_trailers(j, head, body, include_sensitive: true)
           end
         end
       end
 
-      # The chunked message's TRAILER fields (RFC 7230 §4.1.2), beside the de-chunked body.
-      # `ContentDecode.dechunk` stops at the terminating 0-chunk and the rendered `head`
-      # stops at the blank line before the body, so a trailer was captured by NEITHER half
-      # while the origin's `Trailer:` announcement was still echoed in the head — the one
-      # reading an operator can draw from that is "the origin sent none". `repeater send`
-      # persists no flow, so on that path there was no `show --format raw` to fall back to.
-      # Same field name and shape as MCP's `Serialize.emit_trailers`.
-      private def self.emit_trailers_json(j : JSON::Builder, head : Bytes?, body : Bytes?) : Nil
-        trailers = Proxy::Codec::ContentDecode.trailers(head, body)
-        return if trailers.empty?
-        j.field "trailers" do
-          j.array do
-            trailers.each do |(name, value)|
-              j.object do
-                j.field "name", name.scrub
-                j.field "value", value.scrub
-                # A trailer value is remote bytes; `scrub` above is lossy, so hand back the
-                # exact octets whenever it changed them (mirrors the binary-body fallback).
-                unless value.valid_encoding?
-                  j.field "value_base64", Base64.strict_encode(value.to_slice)
-                  j.field "value_lossy", true
-                end
-              end
-            end
-          end
+      # The bytes half of a body object: the text or base64 (with `shown_size` when `--max-body`
+      # cut it), or — `--headers-only` — nothing but `omitted`, MCP's `body_mode: none` shape.
+      private def self.emit_body_payload_json(j : JSON::Builder, s : String, shown : Bytes, cut : Bool,
+                                              wire_truncated : Bool, omit : Bool) : Nil
+        if omit
+          j.field "omitted", true
+          j.field "truncated", wire_truncated
+          return
         end
+        j.field "shown_size", shown.size if cut
+        j.field "truncated", wire_truncated || cut
+        s.valid_encoding? ? j.field("text", s) : j.field("base64", Base64.strict_encode(shown))
       end
 
       # `body` is the DECODED body (de-chunked/inflated) that the operator reads; `wire_body`
       # is the stored wire form the trailers still live in, and is optional only because a
-      # caller with no chunked wire form has nothing to pass.
-      private def self.print_message_text(head : Bytes?, body : Bytes?, wire_body : Bytes? = nil) : Nil
+      # caller with no chunked wire form has nothing to pass. `cap` is `--headers-only` /
+      # `--max-body` (see `BodyCap`): the marker it leaves goes on STDOUT, in the body's place,
+      # because a script reading the dump has to be able to tell a cut body from a short one.
+      private def self.print_message_text(head : Bytes?, body : Bytes?, wire_body : Bytes? = nil,
+                                          cap : BodyCap = BodyCap.new) : Nil
         # Neutralize ANSI/OSC/CSI escapes in captured (attacker-controlled) head/body
         # before writing to the live terminal; `binary_body?` only sniffs for NUL, so an
         # escape-only payload would otherwise pass through. `--format raw` stays exact.
         STDOUT.puts(CLI::Output.term_safe_multiline(String.new(head || Bytes.empty).scrub).rstrip)
         if body && !body.empty?
           STDOUT.puts ""
-          if binary_body?(body)
+          if cap.omit
+            STDOUT.puts "[body omitted by --headers-only: #{body.size} bytes]"
+          elsif binary_body?(body)
             STDOUT.puts "[binary body, #{body.size} bytes — use --format raw for exact bytes, or view hex]"
           else
-            STDOUT.puts(CLI::Output.term_safe_multiline(String.new(body).scrub))
+            shown = (max = cap.max) ? body_prefix(body, max) : body
+            STDOUT.puts(CLI::Output.term_safe_multiline(String.new(shown).scrub))
+            if shown.size < body.size
+              STDOUT.puts "[… truncated by --max-body: showing #{shown.size} of #{body.size} bytes]"
+            end
           end
         end
-        print_decode_note(head, wire_body)
+        # The decode note describes the body text, so it goes with it; trailers are header
+        # fields the origin sent after the body, and stay under --headers-only too.
+        print_decode_note(head, wire_body) unless cap.omit
         print_trailers_text(head, wire_body)
       end
 
@@ -1509,8 +2133,8 @@ module Gori
 
       # Trailers under their own heading, after the body. The decoded text view drops
       # everything past the terminating 0-chunk, so a trailer the origin really sent showed
-      # up in neither the head nor the body — see emit_trailers_json. Labelled, never merged
-      # into the head: whether the far side treats a trailer as a header is the test.
+      # up in neither the head nor the body. Labelled, never merged into the head: whether
+      # the far side treats a trailer as a header is the test.
       private def self.print_trailers_text(head : Bytes?, wire_body : Bytes?) : Nil
         trailers = Proxy::Codec::ContentDecode.trailers(head, wire_body)
         return if trailers.empty?
@@ -1531,29 +2155,16 @@ module Gori
         false
       end
 
-      # head lines + blank + body lines (scrubbed), for the --diff line comparison.
+      # head lines + blank + body lines, for the --diff line comparison. The shared projection,
+      # so a binary or non-UTF-8 body carries its digest here as in `compare` (#1162).
       private def self.message_lines(head : Bytes?, body : Bytes?) : Array(String)
-        lines = bytes_to_lines(head)
-        # The head BLOB ends with the CRLF CRLF that terminates the header block,
-        # so splitting it leaves trailing empty lines; drop them and add exactly one
-        # blank separator before the body (matches the non-diff text view).
-        while !lines.empty? && lines.last.empty?
-          lines.pop
-        end
-        if body && !body.empty?
-          lines << ""
-          lines.concat(bytes_to_lines(body))
-        end
-        lines
+        Repeater::MessageLines.of(head, body, decode: false)
       end
 
-      private def self.bytes_to_lines(bytes : Bytes?) : Array(String)
-        return [] of String unless bytes
-        String.new(bytes).scrub.split('\n').map(&.rstrip('\r'))
-      end
-
+      # Each line through `term_safe`, as `show` prints the same bytes: a diff line is a slice
+      # of a captured or remote response, and its ESC/OSC must not reach the terminal raw.
       private def self.print_diff(diff : Array(Repeater::DiffLine)) : Nil
-        diff.each { |dl| puts "#{diff_prefix(dl)}#{dl.text}" }
+        diff.each { |dl| puts "#{diff_prefix(dl)}#{CLI::Output.term_safe(dl.text)}" }
       end
 
       # A FOLDED diff (`--context`): the collapsed runs print as their own `@@ … @@` row, in
@@ -1562,7 +2173,7 @@ module Gori
       private def self.print_folded_diff(diff : Array(Repeater::Diff::Folded)) : Nil
         diff.each do |f|
           if line = f.line
-            puts "#{diff_prefix(line)}#{line.text}"
+            puts "#{diff_prefix(line)}#{CLI::Output.term_safe(line.text)}"
           else
             puts "@@ #{f.hidden} unchanged lines @@"
           end

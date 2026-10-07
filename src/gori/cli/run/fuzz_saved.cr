@@ -4,32 +4,23 @@ module Gori
   module CLI
     module Run
       private def self.cmd_fuzz_saved_list(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         session_id : Int64? = nil
         limit = 50
         offset = 0
         format = :text
-        positional = [] of String
 
-        parser = OptionParser.new do |p|
+        positional = parse_args(args, "gori run fuzz list") do |p|
           p.banner = "Usage: gori run fuzz list [options]"
-          p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
+          project_options(p, proj, "read")
           p.on("--session=ID", "Only runs saved from this Fuzzer session") { |v| session_id = parse_flow_id(v, "gori run fuzz list") }
           p.on("-nN", "--limit=N", "Runs to return (default 50, max 1000)") { |v| limit = parse_count(v, "--limit").clamp(1, 1000) }
           p.on("--offset=N", "Runs to skip") { |v| offset = parse_nonneg(v, "--offset") }
-          p.on("--format=FMT", "Output: text (default) | json") { |v| format = parse_format(v, [:text, :json]) }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = before + after }
-          p.invalid_option { |f| abort "gori run fuzz list: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run fuzz list: missing value for #{f}" }
+          format_flag(p, [:text, :json], "Output: text (default) | json") { |f| format = f }
         end
-        parser.parse(args)
         abort "gori run fuzz list: unexpected argument #{positional.first.inspect}" unless positional.empty?
 
-        store = open_store(resolve_read_project(project_name, db_path), read_only: true)
-        begin
+        with_store(resolve_read_project(proj.name, proj.db), read_only: true) do |store|
           runs = store.fuzz_runs(session_id, limit, offset)
           counts = store.fuzz_result_counts(runs.map(&.id))
           if format == :json
@@ -39,8 +30,6 @@ module Gori
           else
             runs.each { |run| puts fuzz_saved_run_line(run, counts[run.id]? || 0_i64) }
           end
-        ensure
-          store.close
         end
       end
 
@@ -49,42 +38,53 @@ module Gori
       # here rather than the `[H1]` its defaulted columns would otherwise assert.
       private def self.fuzz_saved_run_line(run : Store::FuzzRunRecord, stored : Int64) : String
         session = run.session_id.try { |id| " session:#{id}" } || ""
+        # "N of M kept" for a filtered archive, so `keep: interesting` reads as a policy rather
+        # than a run that lost most of its rows.
+        rows = run.filtered? ? "#{stored} of #{run.sent} rows (keep:#{run.keep})" : "#{stored} rows"
+        # Beside the rows, as the index `fuzz show RUN_ID RESULT_INDEX` takes (issue #1270).
+        stop = run.stop_idx.try { |idx| "  stop:##{idx}" } || ""
         "##{run.id}  [#{run.status}] [#{run.proto_label}]  #{run.mode}  " \
-        "#{run.matched}/#{run.sent} hit  #{stored} rows#{session}  " \
+        "#{run.matched}/#{run.sent} hit  #{rows}#{stop}#{session}  " \
         "→ #{CLI::Output.term_safe(run.target)}"
       end
 
       private def self.cmd_fuzz_saved_show(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         limit = 200
         offset = 0
         matched_only = false
         format = :text
-        positional = [] of String
+        clusters = false
+        cluster : Int64? = nil
+        order = Fuzz::Clusters::Order::Rare
 
-        parser = OptionParser.new do |p|
+        positional = parse_args(args, "gori run fuzz show") do |p|
           p.banner = "Usage: gori run fuzz show RUN_ID [RESULT_INDEX] [options]"
-          p.on("--project=NAME", "Project to read (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to read") { |v| db_path = v }
+          project_options(p, proj, "read")
           p.on("-nN", "--limit=N", "Result rows to return (default 200, max 5000)") { |v| limit = parse_count(v, "--limit").clamp(1, 5000) }
           p.on("--offset=N", "Result rows to skip") { |v| offset = parse_nonneg(v, "--offset") }
-          p.on("--matched-only", "Only matcher hits") { matched_only = true }
-          p.on("--format=FMT", "Output: text (default) | json | jsonl") { |v| format = parse_format(v, [:text, :json, :jsonl]) }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = before + after }
-          p.invalid_option { |f| abort "gori run fuzz show: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run fuzz show: missing value for #{f}" }
+          p.on("--matched-only", "Only matcher hits (with --clusters: only clusters holding one)") { matched_only = true }
+          p.on("--clusters", "One row per distinct response SHAPE instead of per result") { clusters = true }
+          p.on("--cluster=ID", "Only the results of this cluster (an id from --clusters)") do |v|
+            cluster = Fuzz::Shape.parse_hex?(v) || abort "gori run fuzz show: invalid --cluster #{v.inspect} (a 16-hex-digit id from --clusters)"
+          end
+          p.on("--order=ORDER", "Cluster order: rare (default, smallest first) | common | first") do |v|
+            order = Fuzz::Clusters::Order.parse?(v) || abort "gori run fuzz show: invalid --order #{v.inspect} (#{Fuzz::Clusters::Order.names.join("|")})"
+          end
+          format_flag(p, [:text, :json, :jsonl], "Output: text (default) | json | jsonl") { |f| format = f }
         end
-        parser.parse(args)
         abort "gori run fuzz show: expected RUN_ID and optional RESULT_INDEX" unless positional.size.in?(1, 2)
         run_id = parse_flow_id(positional[0], "gori run fuzz show")
         result_idx = positional[1]?.try { |v| parse_flow_id(v, "gori run fuzz show") }
+        check_fuzz_show_modes(clusters, cluster, result_idx)
 
-        store = open_store(resolve_read_project(project_name, db_path), read_only: true)
-        begin
+        with_store(resolve_read_project(proj.name, proj.db), read_only: true) do |store|
           run = store.get_fuzz_run(run_id) || abort "gori run fuzz show: no saved run ##{run_id}"
-          if idx = result_idx
+          if clusters
+            show_saved_fuzz_clusters(store, run, order, matched_only, limit, offset, format)
+          elsif id = cluster
+            show_saved_fuzz_cluster_members(store, run, id, matched_only, limit, offset, format)
+          elsif idx = result_idx
             row = store.get_fuzz_result(run_id, idx) ||
                   abort "gori run fuzz show: run ##{run_id} has no result ##{idx}"
             show_saved_fuzz_result_detail(run, row, format)
@@ -94,35 +94,24 @@ module Gori
             rows = store.fuzz_result_summaries(run_id, limit, offset, matched_only)
             show_saved_fuzz_run(store, run, rows, offset, matched_only, format)
           end
-        ensure
-          store.close
         end
       end
 
       private def self.cmd_fuzz_saved_delete(args : Array(String)) : Nil
-        db_path : String? = nil
-        project_name : String? = nil
+        proj = ProjectFlags.new
         yes = false
         force_stale = false
-        positional = [] of String
 
-        parser = OptionParser.new do |p|
+        positional = parse_args(args, "gori run fuzz delete") do |p|
           p.banner = "Usage: gori run fuzz delete RUN_ID --yes [options]"
-          p.on("--project=NAME", "Project to update (default: most-recently-active)") { |v| project_name = v }
-          p.on("--db=PATH", "Explicit SQLite db file to update") { |v| db_path = v }
+          project_options(p, proj, "update")
           p.on("--yes", "Actually delete the run and every stored result") { yes = true }
           p.on("--force-stale", "Also delete a running/saving row left by a crashed writer") { force_stale = true }
-          p.on("-h", "--help", "Show this help") { puts p; exit 0 }
-          p.unknown_args { |before, after| positional = before + after }
-          p.invalid_option { |f| abort "gori run fuzz delete: unknown option: #{f}\n#{p}" }
-          p.missing_option { |f| abort "gori run fuzz delete: missing value for #{f}" }
         end
-        parser.parse(args)
         abort "gori run fuzz delete: expected one RUN_ID" unless positional.size == 1
         run_id = parse_flow_id(positional[0], "gori run fuzz delete")
 
-        store = open_store(resolve_read_project(project_name, db_path))
-        begin
+        with_store(resolve_read_project(proj.name, proj.db)) do |store|
           run = store.get_fuzz_run(run_id) || abort "gori run fuzz delete: no saved run ##{run_id}"
           unless yes
             count = store.fuzz_result_count(run_id)
@@ -135,7 +124,7 @@ module Gori
           case deleted.status
           in Store::FuzzRunDeleteStatus::Deleted
             count = deleted.deleted_results
-            puts "Deleted fuzz run ##{run_id} and #{count} result#{count == 1 ? "" : "s"}."
+            puts "Deleted fuzz run ##{run_id} and #{Gori.plural(count, "result")}."
           in Store::FuzzRunDeleteStatus::NotFound
             abort "gori run fuzz delete: no saved run ##{run_id}"
           in Store::FuzzRunDeleteStatus::Active
@@ -144,8 +133,6 @@ module Gori
           in Store::FuzzRunDeleteStatus::WriteFailed
             abort "gori run fuzz delete: NOT deleted (project busy)"
           end
-        ensure
-          store.close
         end
       end
 
@@ -158,7 +145,7 @@ module Gori
           output = JSON.build do |j|
             j.object do
               j.field("run") { fuzz_saved_run_json(j, run, store.fuzz_result_count(run.id)) }
-              j.field("results") { j.array { rows.each { |row| CLI::Output.fuzz_row_fields(j, Fuzz::Persistence.result(row)) } } }
+              j.field("results") { j.array { rows.each { |row| MCP::Serialize.fuzz_result(j, Fuzz::Persistence.result(row)) } } }
               j.field "offset", offset
               j.field "returned", rows.size
               j.field "total_available", total
@@ -169,13 +156,105 @@ module Gori
         when :jsonl
           rows.each { |row| puts CLI::Output.fuzz_row_json(Fuzz::Persistence.result(row)) }
         else
-          # The transport chip the listing and the TUI picker draw, so a LEGACY run says so
-          # here too — this is the command the picker's own refusal sends the operator to.
-          puts "fuzz run ##{run.id} · #{run.status} · #{run.proto_label} · #{run.mode} · " \
-               "#{run.sent} sent · #{run.matched} hit · #{run.errors} errors"
+          puts fuzz_saved_run_header(run)
           rows.each { |row| puts CLI::Output.fuzz_row_text(Fuzz::Persistence.result(row)) }
           STDERR.puts "showing #{offset + 1}-#{offset + rows.size} of #{total}" unless rows.empty?
         end
+      end
+
+      # The three `fuzz show` modes are exclusive: a cluster page, one cluster's rows, one row.
+      private def self.check_fuzz_show_modes(clusters : Bool, cluster : Int64?, result_idx : Int64?) : Nil
+        abort "gori run fuzz show: pass --clusters or --cluster ID, not both" if clusters && cluster
+        return unless result_idx && (clusters || cluster)
+        abort "gori run fuzz show: RESULT_INDEX names one result; drop it to list clusters"
+      end
+
+      # `fuzz show --clusters` (#1351): the run grouped by response shape through
+      # `Fuzz::Clusters`, the aggregator MCP and the TUI use, fed by the keyset-paged scalar
+      # stream so a million-row run holds one entry per shape. JSON carries the same cluster
+      # fields MCP's `get_fuzz_run{clusters}` emits; the representative is a `fuzz show` row.
+      private def self.show_saved_fuzz_clusters(store : Store, run : Store::FuzzRunRecord,
+                                                order : Fuzz::Clusters::Order, matched_only : Bool,
+                                                limit : Int32, offset : Int32, format : Symbol,
+                                                io : IO = STDOUT, err : IO = STDERR) : Nil
+        clusters = Fuzz::Persistence.clusters(store, run.id)
+        list = clusters.sorted(order, matched_only)
+        page = list[offset, limit]? || [] of Fuzz::Clusters::Cluster
+        scrub = ->(t : String) { t.scrub }
+        case format
+        when :json
+          io.puts(JSON.build do |j|
+            j.object do
+              j.field("run") { fuzz_saved_run_json(j, run, store.fuzz_result_count(run.id)) }
+              j.field("clusters") do
+                j.array { page.each { |c| Fuzz::Clusters.emit(j, c, scrub) { |rep| MCP::Serialize.fuzz_result(j, rep) } } }
+              end
+              j.field "cluster_order", order.label
+              j.field "offset", offset
+              j.field "returned", page.size
+              j.field "total_available", list.size
+              j.field "matched_only", matched_only
+              Fuzz::Clusters.emit_summary(j, clusters)
+            end
+          end)
+        when :jsonl
+          page.each do |c|
+            io.puts(JSON.build { |j| Fuzz::Clusters.emit(j, c, scrub) { |rep| MCP::Serialize.fuzz_result(j, rep) } })
+          end
+        else
+          io.puts fuzz_saved_run_header(run)
+          page.each { |c| io.puts CLI::Output.fuzz_cluster_text(c) }
+          note = "#{Gori.plural(list.size, "cluster")} over #{Gori.plural(clusters.rows, "result")}"
+          note += " (showing #{offset + 1}-#{offset + page.size})" if page.size < list.size && !page.empty?
+          note += " · #{clusters.overflow_rows} results past the #{clusters.max_clusters}-cluster cap not grouped" if clusters.truncated?
+          note += " · ≈ approximate: saved before response shapes were recorded" if page.any?(&.approximate?)
+          note += " · keep:#{run.keep} archive, only kept rows are grouped" if run.filtered?
+          err.puts note
+        end
+      end
+
+      # `fuzz show --cluster ID`: that shape's results, in the ordinary `fuzz show` row shapes.
+      # The same stream aggregates the cluster and picks this page, so nothing past one page of
+      # rows is held.
+      private def self.show_saved_fuzz_cluster_members(store : Store, run : Store::FuzzRunRecord, id : Int64,
+                                                       matched_only : Bool, limit : Int32, offset : Int32,
+                                                       format : Symbol, io : IO = STDOUT, err : IO = STDERR) : Nil
+        clusters, records, seen = Fuzz::Persistence.cluster_members(store, run.id, id, matched_only, offset, limit)
+        rows = records.map { |rec| Fuzz::Persistence.result(rec) }
+        cluster = clusters[id]? || abort "gori run fuzz show: run ##{run.id} has no cluster #{Fuzz::Shape.hex(id)}"
+        case format
+        when :json
+          io.puts(JSON.build do |j|
+            j.object do
+              j.field("run") { fuzz_saved_run_json(j, run, store.fuzz_result_count(run.id)) }
+              j.field("cluster") { Fuzz::Clusters.emit(j, cluster, ->(t : String) { t.scrub }) { |rep| MCP::Serialize.fuzz_result(j, rep) } }
+              j.field("results") { j.array { rows.each { |r| MCP::Serialize.fuzz_result(j, r) } } }
+              j.field "offset", offset
+              j.field "returned", rows.size
+              j.field "total_available", seen
+              j.field "matched_only", matched_only
+            end
+          end)
+        when :jsonl
+          rows.each { |r| io.puts CLI::Output.fuzz_row_json(r) }
+        else
+          io.puts fuzz_saved_run_header(run)
+          io.puts CLI::Output.fuzz_cluster_text(cluster)
+          rows.each { |r| io.puts CLI::Output.fuzz_row_text(r) }
+          err.puts "showing #{offset + 1}-#{offset + rows.size} of #{seen} in cluster #{cluster.hex}" unless rows.empty?
+        end
+      end
+
+      # The `fuzz show` text header. The transport chip the listing and the TUI picker draw, so
+      # a LEGACY run says so here too — this is the command the picker's own refusal sends the
+      # operator to.
+      private def self.fuzz_saved_run_header(run : Store::FuzzRunRecord) : String
+        keep = run.filtered? ? " · keep:#{run.keep}" : ""
+        # A page can hold thousands of rows; the header names the one the run ended on
+        # (issue #1270), as the RESULT_INDEX that shows it.
+        stop = run.stop_idx.try { |idx| " · stopped on result #{idx}" } || ""
+        "fuzz run ##{run.id} · #{run.status} · #{run.proto_label} · #{run.mode} · " \
+        "#{run.sent} sent · #{run.matched} hit · #{run.errors} errors#{keep}#{stop}"
       end
 
       private def self.show_saved_fuzz_result_detail(run : Store::FuzzRunRecord,
@@ -186,7 +265,10 @@ module Gori
           output = JSON.build do |j|
             j.object do
               j.field "run_id", run.id
-              j.field("result") { CLI::Output.fuzz_row_fields(j, Fuzz::Persistence.result(row)) }
+              # The run's stop row (issue #1270), so a caller holding one result can tell
+              # whether it is the one the run ended on without a second `fuzz show`.
+              j.field "stop_index", run.stop_idx
+              j.field("result") { MCP::Serialize.fuzz_result(j, Fuzz::Persistence.result(row)) }
               fuzz_saved_bytes_json(j, "request", row.request)
               fuzz_saved_bytes_json(j, "wire", row.wire)
               fuzz_saved_bytes_json(j, "response_head", row.response_head)
@@ -196,6 +278,7 @@ module Gori
           puts output
         else
           puts CLI::Output.fuzz_row_text(Fuzz::Persistence.result(row))
+          puts "(the result run ##{run.id}'s stop_on tripped on)" if run.stop_idx == row.idx
           puts "\n── REQUEST ──"
           puts CLI::Output.term_safe_multiline(row.request.try { |b| String.new(b) } || "(not retained)")
           if wire = row.wire
@@ -229,9 +312,9 @@ module Gori
           # `gori run fuzz list --format json` against `list_fuzz_runs` cannot compare the two
           # feeds as strings — the same gap `CLI::Output.flow_row_fields` documents closing for
           # History, reintroduced here by a new emitter.
-          j.field "created_at_iso", CLI::Output.iso_time_utc(run.created_at)
+          j.field "created_at_iso", Gori.iso_micros(run.created_at)
           j.field "finished_at", run.finished_at
-          j.field "finished_at_iso", run.finished_at.try { |t| CLI::Output.iso_time_utc(t) }
+          j.field "finished_at_iso", run.finished_at.try { |t| Gori.iso_micros(t) }
           j.field "target", run.target.scrub
           j.field "mode", run.mode.scrub
           j.field "total", run.total
@@ -247,7 +330,14 @@ module Gori
           j.field "source_ref", run.source_ref.try(&.scrub)
           j.field "snapshot_version", run.snapshot_version
           j.field "legacy", run.legacy_snapshot?
+          # The result-capture policy (issue #1240) and, for a filtered run, that `stored_results`
+          # is a subset of `sent` — the same two fields MCP's `saved_fuzz_run` emits.
+          j.field "keep", run.keep.scrub
+          j.field "filtered", run.filtered?
           j.field "stored_results", stored_results
+          # The result this run's `stop_on` tripped on (issue #1270), as MCP emits it: the row's
+          # `index`, the RESULT_INDEX `fuzz show` takes. Null when not recorded.
+          j.field "stop_index", run.stop_idx
         end
       end
 

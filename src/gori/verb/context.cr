@@ -1,11 +1,16 @@
 require "./context/activity"
+require "./context/agent_message"
 require "./context/authorize"
 require "./context/comparer"
 require "./context/cookie"
 require "./context/decoder"
 require "./context/diff"
+require "./context/params"
 require "./context/discover"
+require "./context/editor"
 require "./context/env"
+require "./context/evidence"
+require "./context/retest"
 require "./context/fuzzer"
 require "./context/history"
 require "./context/host_overrides"
@@ -50,6 +55,9 @@ module Gori
 
       # overlays
       abstract def open_palette : Nil
+      # Open the space menu already inside `family`'s card (`Verb::Family#chord`: the bare `>`
+      # of Send flow to…, #1295), through the menu's own open + descend.
+      abstract def open_space_family(family : Symbol) : Nil
       abstract def open_notifications : Nil # open the notification center (background-job results)
       # Open the TLS-passthrough list: hosts relayed WITHOUT decryption, so nothing was
       # captured for them. Its own intent rather than a settings jump — the answer is runtime
@@ -89,6 +97,10 @@ module Gori
 
       # the currently focused tab (so verbs can gate by context, P4)
       abstract def current_tab : Symbol
+      # …and the SECTION within it that holds focus — the active controller's
+      # `command_section` (the Repeater's :request/:response/:target), `:subtab` on the strip.
+      # What `Definition#chord_sections` is checked against.
+      abstract def focused_section : Symbol
 
       # pane focus (:sidebar | :body) and tab navigation
       abstract def focus_pane(pane : Symbol) : Nil
@@ -97,6 +109,10 @@ module Gori
       # follows the user's settings:tabs order/visibility. Out-of-range n is a no-op.
       abstract def focus_visible_tab(n : Int32) : Nil
       abstract def cycle_tab(delta : Int32) : Nil
+      # The `0` key's picker: a type-to-filter list over the WHOLE tab catalog — the nine
+      # numbered slots and everything settings:tabs keeps off the bar — where ↵ jumps
+      # (force-showing a hidden tab, exactly as the named "Go to …" verbs do).
+      abstract def open_tab_goto : Nil
       # Horizontal tab-bar navigation (←/→ on the menu). Like cycle_tab(±1), but → past
       # the last visible tab lands on the far-right "more" dropdown affordance (holding
       # the settings-hidden tabs) instead of wrapping; ← steps back off it.
@@ -111,12 +127,17 @@ module Gori
       # terminals can't deliver). Operate on the active tab; count gates the menu entry.
       abstract def subtab_search_open : Nil    # open the sub-tab search picker for the active tab
       abstract def subtab_search_count : Int32 # active tab's open sub-tab count (gates the search entry)
-      abstract def subtab_filter_open : Nil    # open the `/` sub-tab filter bar for the active tab (issue #121)
+      # ⇧1-⇧9: jump to the Nth (1-based) sub-tab of the active tab. Generic for the same
+      # reason the three above are — the shell routes to whichever strip is active — so the
+      # nine chords are registered once instead of hand-rolled in seven controllers.
+      abstract def subtab_jump(n : Int32) : Nil
+      abstract def subtab_filter_open : Nil # open the `/` sub-tab filter bar for the active tab (issue #121)
       # Sub-tab multi-select (#683). Generic, like the three above: the shell already routes
       # to whichever strip is active, so nine scopes' menu entries share one intent each
-      # rather than widening this catalogue nine times over. The toggle is deliberately
-      # absent — `t` is a strip key, and a menu row that marks one chip then closes the menu
-      # would be a gesture nobody uses twice.
+      # rather than widening this catalogue nine times over. The toggle joined them with the
+      # Sub-tabs… card (#1274): from a pane, `space T t` marks the sub-tab you are working in
+      # without walking up to the strip.
+      abstract def subtab_mark_toggle : Nil    # mark or unmark the active chip (the strip's `t`)
       abstract def subtab_mark_all : Nil       # mark every chip the sub-tab filter shows
       abstract def subtab_mark_clear : Nil     # drop every sub-tab mark (esc does the same)
       abstract def subtab_marked_count : Int32 # marked chips on the active strip (gates Clear marks)
@@ -124,6 +145,8 @@ module Gori
       # entity links (cross-tab attach + link-target ids for availability gating).
       # ONE attach intent, not one per owner kind: the picker it opens holds issues and
       # notes on the same list, plus a create row for each (see Tui::LinkPicker).
+      # ↵ on an issue additionally freezes each ref's current exchange as evidence (#1038);
+      # there is no second intent for that, because there is no second verb.
       abstract def link_attach : Nil
       abstract def link_flow_id : Int64?
       abstract def link_repeater_id : Int64?
@@ -140,6 +163,9 @@ module Gori
 
       # browser: open a system browser pre-trusting gori's CA + routed via the proxy
       abstract def open_browser_picker : Nil
+
+      # shell: a terminal proxied through gori and trusting its CA (#1238)
+      abstract def open_shell_picker : Nil
 
       # READ editors: line select / selection state (space menu + x/v chords).
       abstract def read_selection_active? : Bool
@@ -170,6 +196,10 @@ module Gori
       abstract def detail_navigable? : Bool # History detail text pane (not hex)
       # Override a verb's space-menu title (nil → use the registered default).
       abstract def space_menu_title(verb_id : String) : String?
+      # A space-menu row's live state, drawn in its hint column (#1274 WP9): "on"/"off" as
+      # ●/○, any other string as a short dim value (a TLS preset's name), nil for a stateless
+      # row. For the toggle families, whose sticky card stays up across several flips.
+      abstract def menu_state(verb_id : String) : String?
 
       # settings: open the config editor for a section (:network | :editor | :theme |
       # :tabs | :hotkeys). :tabs opens the tab-bar customizer overlay.
@@ -179,15 +209,13 @@ module Gori
       # top-bar chip do the same). The per-section open_settings jumps straight to one.
       abstract def open_preferences : Nil
 
-      # import: palette-only bulk importers — each opens a path prompt, parses the
-      # file, and inserts flows into History (Sitemap derives from the same store).
-      abstract def import_har : Nil
-      abstract def import_urls : Nil
-      abstract def import_oas : Nil
-      abstract def import_postman : Nil
-      abstract def import_insomnia : Nil
-      abstract def import_burp : Nil
-      abstract def import_wsdl : Nil
+      # import: palette-only bulk importers — each opens a path prompt for `kind` (an
+      # `Import::LABELS` key), parses the file, and inserts flows into History (Sitemap
+      # derives from the same store).
+      abstract def open_import(kind : Symbol) : Nil
+      # Import: cURL (#1244) — a paste box rather than a path prompt; every request in the
+      # pasted command(s) becomes a History flow.
+      abstract def import_curl : Nil
       # Whether an import job is running, and the request to stop it after its current chunk.
       abstract def import_running? : Bool
       abstract def import_cancel : Nil

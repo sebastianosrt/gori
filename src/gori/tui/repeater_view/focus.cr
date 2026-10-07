@@ -42,6 +42,7 @@ class Gori::Tui::RepeaterView
 
   def enter_target_insert! : Nil
     @target_mode = InputMode::Insert
+    @target_read.clear_selection # INSERT edits move the text under a READ anchor
   end
 
   def exit_target_insert! : Nil
@@ -59,12 +60,38 @@ class Gori::Tui::RepeaterView
   # end (the Runner then wraps focus back to the tab bar).
   PANE_ORDER = [:target, :request, :response]
 
+  # Whether the last frame drew `pane` (#1421). A short body drops the request | response
+  # columns (`columns_rect`), and a shorter one the TARGET card too; a pane that is not on
+  # screen must not hold the keys, or `i` + typing edits a request nobody can see while the
+  # badge still says `BODY · REQUEST`. Recorded by `render` — the frame that decided the
+  # layout — and read by the focus ring and the controller's key routing, never re-derived.
+  # True until the first frame, so a view nobody has drawn yet behaves as it always did.
+  @target_drawn = true
+  @columns_drawn = true
+
+  def pane_drawn?(pane : Symbol) : Bool
+    case pane
+    when :target             then @target_drawn
+    when :request, :response then @columns_drawn
+    else                          true
+    end
+  end
+
+  # Moves focus off a column the frame cannot draw onto the TARGET card. Run from `render`,
+  # because only the frame knows the rect. Not undone when the window grows back: focus
+  # stays where the operator can see it, and `↹` reaches the columns again. Leaving the
+  # request this way saves a pending ^Q chain edit, like any other focus change.
+  private def settle_focus_on_drawn_pane : Nil
+    return if pane_drawn?(@focus) || !@target_drawn
+    set_focus(:target)
+  end
+
   def focus_first : Nil
     set_focus(:target)
   end
 
   def focus_last : Nil
-    set_focus(:response)
+    set_focus(pane_drawn?(:response) ? :response : :target)
   end
 
   # Re-entry from the tab bar / strip: the pane stays, the ^S SNI sub-field does not — the
@@ -94,11 +121,25 @@ class Gori::Tui::RepeaterView
     chain_pane_active? ? @chain_pane.set_preedit(text) : req_editor.set_preedit(text)
   end
 
+  # The ring WRAPS, unlike the shell's default (`Runner#view_pane_advance` reads a false as
+  # "no further pane — go back to the tab bar"). Three panes and a one-way ring made `↹` do
+  # `esc`'s job at the end of it: from RESPONSE it left for the tab bar while the strip said
+  # `↹ pane`, and TARGET — the pane you reach for to change the host — was then only
+  # reachable by `⇧↹`, which no strip named at all.
+  #
+  # Closing the ring costs nothing, because this tab has never used `↹` as its way out: every
+  # pane strip says `esc tabs`, and esc still pops to the sub-tab strip and then the bar.
+  #
+  # A pane the last frame did not draw is stepped over (#1421); with only TARGET on screen,
+  # `↹` stays on it.
   def pane_advance(dir : Int32) : Bool
     i = PANE_ORDER.index(@focus) || 0
-    ni = i + dir
-    return false if ni < 0 || ni >= PANE_ORDER.size
-    set_focus(PANE_ORDER[ni])
+    (1..PANE_ORDER.size).each do |n|
+      pane = PANE_ORDER[(i + dir * n) % PANE_ORDER.size]
+      next unless pane_drawn?(pane)
+      set_focus(pane) unless pane == @focus
+      break
+    end
     true
   end
 
@@ -106,7 +147,7 @@ class Gori::Tui::RepeaterView
   # rather than stepping with pane_advance. Ignores anything not in PANE_ORDER.
   # (A click on the SNI row re-enters it: target_click_to_cursor runs after this.)
   def focus_pane(pane : Symbol) : Nil
-    set_focus(pane) if PANE_ORDER.includes?(pane)
+    set_focus(pane) if PANE_ORDER.includes?(pane) && pane_drawn?(pane)
   end
 
   # Top boundary of the focused pane — the Runner pops focus to the tab bar when
@@ -118,7 +159,11 @@ class Gori::Tui::RepeaterView
     case @focus
     when :target then true
     when :request
-      if h = @req_hex_edit
+      if request_text_editing?
+        # ↑ at line 1 is still editor motion in INS. Leave the editor only with Esc;
+        # otherwise the following typed letters can reach the tab bar's Global actions.
+        false
+      elsif h = @req_hex_edit
         h.at_top?
       elsif @grpc_fields
         # The FIELDS form's own caret, not the head editor's. Reading `@editor.at_top?` here

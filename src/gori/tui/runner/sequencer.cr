@@ -1,7 +1,7 @@
 # Sequencer (token randomness) — ExecContext verb implementations, reopens Gori::Tui::Runner (see
 # tui/runner.cr for the event loop, Host facade, overlays, and rendering).
 class Gori::Tui::Runner < Gori::Verb::ExecContext
-  # CROSS-TAB: open the config popup for History's selected flow (space → Send to Sequencer).
+  # CROSS-TAB: open the config popup for History's selected flow (space → Send flow to… → Sequencer).
   def sequence_selected : Nil
     id = history_target_flow_id
     return (@toast = "select a flow first") unless id
@@ -19,18 +19,16 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   def sequence_from_sitemap : Nil
     ep = sitemap_controller.view.selected_endpoint
     return (@toast = "select an endpoint to send") unless ep
-    if id = @session.store.representative_flow_id(ep[:host], ep[:method], ep[:target])
+    if id = sitemap_flow_id(ep)
       open_sequence_config(sequencer_controller.build_seed_from_flow(id))
     else
       @toast = "no captured request for this path — capture it, or use Discover"
     end
   end
 
-  def sequence_run : Nil
-    sequencer_controller.sequence_run
-  end
+  forward sequence_run : Nil, to: sequencer_controller
 
-  # The strip's raw `r` rename / ^W close, promoted to verbs — `Runner#renameable_subtabs?`
+  # The strip's raw `e` rename / ^W close, promoted to verbs — `Runner#renameable_subtabs?`
   # and `#subtab_close` have listed :sequencer all along, but there were no verbs, so this
   # tab had NO `:subtab` menu group at all and neither key could be rebound.
   def sequencer_rename_subtab : Nil
@@ -41,9 +39,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
     sequencer_controller.request_close
   end
 
-  def sequence_stop : Nil
-    sequencer_controller.sequence_stop
-  end
+  forward sequence_stop : Nil, to: sequencer_controller
 
   def sequence_configure : Nil
     reconfigure_sequence
@@ -71,11 +67,7 @@ class Gori::Tui::Runner < Gori::Verb::ExecContext
   end
 
   # The ANALYSIS report holds focus — the gate for its read verbs.
-  def sequencer_analysis_readable? : Bool
-    sequencer_controller.sequencer_analysis_readable?
-  end
+  forward sequencer_analysis_readable? : Bool, to: sequencer_controller
 
-  def sequencer_samples_readable? : Bool
-    sequencer_controller.sequencer_samples_readable?
-  end
+  forward sequencer_samples_readable? : Bool, to: sequencer_controller
 end

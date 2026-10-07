@@ -1,7 +1,10 @@
 require "json"
 require "log"
 require "../store"
+require "./protocol"
 require "./tools"
+require "./courier"
+require "../settings"
 
 module Gori
   module MCP
@@ -26,32 +29,29 @@ module Gori
       # tools can answer SHOULD feel. Deep enough that no ordinary burst reaches it.
       WORK_QUEUE = 64
 
-      # Newest spec revision we implement. Our surface (initialize/tools.list/
-      # tools.call/ping) is identical across recent revisions, so we echo the
-      # client's requested version when it is one we recognise, and never
-      # hard-fail on a mismatch.
-      PROTOCOL_VERSION = "2025-06-18"
-
-      # Revisions whose surface we're compatible with. Per the MCP lifecycle the
-      # server MUST answer initialize with a version it actually supports: we
-      # echo the client's version only when it's in this set, else fall back to
-      # PROTOCOL_VERSION — so a client probing "1999-01-01" can't conclude we
-      # speak a revision we don't.
-      SUPPORTED_VERSIONS = {"2025-06-18", "2025-03-26", "2024-11-05"}
+      # WHICH revisions this server speaks lives in `mcp/protocol.cr`, one home for a set
+      # that is now read from three places — the handshake, `server/discover`, and the
+      # per-request gate below. Three copies would be three answers.
 
       EMPTY_ARGS = JSON::Any.new({} of String => JSON::Any)
 
-      def initialize(@store : Store? = nil, *, allow_actions : Bool, verify_upstream : Bool,
-                     @project_name : String? = nil, @project_slug : String? = nil,
-                     @db_path : String? = nil, @selection_source : String? = nil,
-                     @workspace_root : String? = nil, @project_id : String? = nil,
-                     @bind_error : String? = nil, tool_filter : ToolFilter? = nil,
+      # The project arguments are handed STRAIGHT to `Tools` and not kept here. Tools owns the
+      # binding — `switch_project` rewrites it — and a copy on this side is a copy that goes
+      # stale on the first switch while still being read out as the server's configuration
+      # (#1003). `instructions_text` asks `@tools` for the current one instead.
+      def initialize(store : Store? = nil, *, allow_actions : Bool, verify_upstream : Bool,
+                     project_name : String? = nil, project_slug : String? = nil,
+                     db_path : String? = nil, selection_source : String? = nil,
+                     workspace_root : String? = nil, project_id : String? = nil,
+                     bind_error : String? = nil, tool_filter : ToolFilter? = nil,
+                     denied_permissions : Set(String)? = nil,
                      @input : IO = STDIN, @output : IO = STDOUT)
         @allow_actions = allow_actions
-        @tools = Tools.new(@store, allow_actions, verify_upstream,
-          project_name: @project_name, project_slug: @project_slug, db_path: @db_path,
-          selection_source: @selection_source, workspace_root: @workspace_root,
-          project_id: @project_id, bind_error: @bind_error, tool_filter: tool_filter)
+        @tools = Tools.new(store, allow_actions, verify_upstream,
+          project_name: project_name, project_slug: project_slug, db_path: db_path,
+          selection_source: selection_source, workspace_root: workspace_root,
+          project_id: project_id, bind_error: bind_error, tool_filter: tool_filter,
+          denied_permissions: denied_permissions)
         @initialized = false
         # Set when the output pipe breaks (client vanished mid-write): the loop then
         # stops rather than thrashing on a dead stream or raising an unhandled error.
@@ -76,6 +76,12 @@ module Gori
         # assumption `Tools::FuzzJob` documents for its own cross-fiber fields.
         @pending = Set(String).new
         @cancelled = Set(String).new
+        # The operator-message courier (#1090), started when the client says `initialized`,
+        # and whether THIS session's handshake declared the channel capability — the courier
+        # keys off that, never off the live setting: a toggle after the handshake cannot
+        # register a channel the client already did not take.
+        @courier = nil.as(Courier?)
+        @channel_declared = false
       end
 
       # Reads until EOF on `input` (client closed the pipe). Each line is parsed
@@ -101,6 +107,7 @@ module Gori
         rescue ex : IO::Error
           Log.info { "mcp: input stream closed (#{ex.message})" }
         ensure
+          @courier.try(&.stop)
           work.close
           drained.receive
           # After the worker has drained, so a still-running switch_project cannot re-announce
@@ -163,7 +170,10 @@ module Gori
           @pending << key
           return work.send(-> do
             begin
-              handle_document(root)
+              # Cancelled while still queued: nothing has run, so nothing runs. Only the
+              # reply was suppressed before, and a `create_*` or `*_start` then took effect
+              # with no answer to tell the client it had — not even a job id to stop.
+              handle_document(root) unless @cancelled.includes?(key)
             ensure
               @pending.delete(key)
               @cancelled.delete(key)
@@ -187,6 +197,10 @@ module Gori
       # (a notification writes nothing at all).
       private def fast_path(root : JSON::Any) : Bool
         return false unless obj = root.as_h?
+        # A malformed envelope is never answered here. `handle_message` owns the -32600, and
+        # the reader declining sends the line down the ordinary path to get it — the reader
+        # must not be a second place that decides what a valid request looks like.
+        return false if envelope_error(obj)
         return false unless method = obj["method"]?.try(&.as_s?)
         id = obj["id"]?
         if id.nil?
@@ -194,8 +208,138 @@ module Gori
           return true
         end
         return false unless method == "ping"
-        write_result(id) { |j| j.object { } }
+        # Through the same gate as every other request: a liveness probe that names a
+        # revision we do not speak deserves the same answer a tool call would get, and the
+        # `resultType` a modern client parses is owed here too. `ping` itself was REMOVED in
+        # 2026-07-28 — we go on answering it, because a server that does is breaking nothing
+        # and a dual-era client's legacy half still sends it.
+        gate = era_of(id, method, obj["params"]?)
+        return true if gate.refused
+        # No `note_modern_client` here, deliberately: that writes the presence marker and
+        # starts the courier, and the whole point of this path is that a liveness probe is
+        # answered without the reader doing work. The worker's path takes the note.
+        write_result(id, gate.version) { }
         true
+      end
+
+      # The outcome of reading one request's era: the revision it is speaking (nil for the
+      # legacy era), and whether the gate has already ANSWERED the request and the caller
+      # must stop.
+      private record EraGate, version : String?, refused : Bool
+
+      # Reads the era off one request's `_meta` and enforces it.
+      #
+      # `2026-07-28` moved version, identity and capabilities INTO every request, so this is
+      # what the handshake used to do, done per call. Four outcomes:
+      #
+      #   - no `io.modelcontextprotocol/protocolVersion`: the LEGACY era — every client that
+      #     opened with `initialize`, and every one that never negotiated at all. A dual-era
+      #     server serves it exactly as it always did; there is nothing here to enforce.
+      #   - a modern revision we implement: answered statelessly, with the modern envelope.
+      #   - a LEGACY revision spelled in `_meta`: that revision defines no per-request
+      #     metadata, so the field is decoration — but it names a version we do support, so
+      #     it is not an error either. Served legacy.
+      #   - anything else: `UnsupportedProtocolVersionError`, carrying what we DO support so
+      #     the client can retry instead of guess. That error is also the signal a dual-era
+      #     client probing us needs: a recognised modern error means "modern server, pick
+      #     another version" and explicitly NOT "fall back to initialize".
+      private def era_of(id : JSON::Any, method : String, params : JSON::Any?) : EraGate
+        meta = obj_field(params, "_meta")
+        # ABSENT is the legacy era. PRESENT is a client speaking the modern one, whatever it
+        # managed to put in the slot — so a non-string there is a malformed MODERN request,
+        # not a legacy one, and reading it as legacy would serve a client its own
+        # serialisation bug with a straight face (`20260728` unquoted, a `null` from an
+        # absent config). The key is reserved by the spec; no handshake client writes it.
+        slot = obj_field(meta, Protocol::META_PROTOCOL_VERSION)
+        return EraGate.new(nil, false) if slot.nil?
+        requested = slot.as_s?
+        unless requested
+          write_error(id, -32602, "#{Protocol::META_PROTOCOL_VERSION} must be a string " \
+                                  "naming a protocol revision (got #{json_type_of(slot)})")
+          return EraGate.new(nil, true)
+        end
+        return EraGate.new(nil, false) if Protocol.legacy?(requested)
+        # JSON-RPC batching was removed in 2025-06-18 and the modern schema has no frame for
+        # it: one message per line, and an array is not one. We still RECEIVE batches, because
+        # 2025-03-26 made that mandatory and we advertise it — but answering a member that has
+        # declared a revision where the array does not exist would put a frame on stdout that
+        # the client which sent it cannot legally read.
+        #
+        # …but only for the fiber that is IN that batch, the same test `send` makes for the
+        # same reason. `@batch` is a worker-fiber local in all but name, and this method also
+        # runs on the READER, which answers `ping` ahead of the queue: a modern liveness probe
+        # arriving while the worker happened to be mid-batch was refused for being inside an
+        # array it was never in. That is the one message the reader/worker split exists to
+        # keep answering — a client whose pings go unanswered concludes the server is dead and
+        # kills it mid-call.
+        if @batch && @batch_fiber == Fiber.current && Protocol.modern?(requested)
+          write_error(id, -32600, "JSON-RPC batching does not exist in #{requested} " \
+                                  "(removed in 2025-06-18) — send one message per line")
+          return EraGate.new(nil, true)
+        end
+        unless Protocol.modern?(requested)
+          write_error(id, Protocol::UNSUPPORTED_PROTOCOL_VERSION, "Unsupported protocol version",
+            data: ->(j : JSON::Builder) do
+              j.object do
+                j.field("supported") { j.array { Protocol::SUPPORTED_VERSIONS.each { |v| j.string v } } }
+                j.field "requested", requested
+              end
+            end)
+          return EraGate.new(nil, true)
+        end
+        # Required on every modern request, and required of us to check. gori relies on no
+        # client capability, so the absence costs it nothing to serve — but a server that
+        # silently accepts a malformed request teaches the client its requests are fine, and
+        # the next server it meets will not agree. The refusal names the key, which is the
+        # only thing that makes it recoverable.
+        #
+        # `server/discover` is NOT exempt from this, though it IS exempt from having to name
+        # a version at all — a request carrying no `_meta` is served as the probe it is. The
+        # line between those two is what a client can legitimately be missing: an era it has
+        # not declared yet, versus a required field of an era it just did. `ClientCapabilities`
+        # has no required member — `{}` is valid, and is what the spec's own examples send —
+        # so there is nothing a bootstrap probe could fail to have here, and being lenient
+        # would only teach one client that its malformed requests are fine everywhere.
+        caps = obj_field(meta, Protocol::META_CLIENT_CAPS)
+        unless caps.try(&.as_h?)
+          # Two different mistakes, said differently: a client that never sent the field
+          # needs to be told it is required, and one that sent the wrong shape needs to be
+          # told which shape. "is required" for a field plainly present reads as a server
+          # that cannot see it.
+          write_error(id, -32602, caps.nil? ? "#{Protocol::META_CLIENT_CAPS} is required in _meta on every #{requested} request" : "#{Protocol::META_CLIENT_CAPS} must be a JSON object (got #{json_type_of(caps)})")
+          return EraGate.new(nil, true)
+        end
+        EraGate.new(requested, false)
+      end
+
+      # What a `_meta` slot turned out to hold, for a refusal that has to name it. The
+      # client cannot fix a shape it is not told, and "invalid params" alone has cost more
+      # than one agent a retry loop against an argument it had spelled correctly.
+      private def json_type_of(any : JSON::Any) : String
+        case raw = any.raw
+        when Nil                     then "null"
+        when Bool                    then "a boolean"
+        when Int64, Float64          then "a number"
+        when String                  then "a string"
+        when Array(JSON::Any)        then "an array"
+        when Hash(String, JSON::Any) then "an object"
+        else                              raw.class.to_s
+        end
+      end
+
+      # What the handshake used to do with `clientInfo`, done per request because that is
+      # where the modern revision put it: the agent-presence marker (#815) is named from it,
+      # and the courier that carries operator messages (#1090) has no `initialized` to start
+      # on any more. `client_seen` is a no-op when nothing moved, so a busy session does not
+      # rewrite the marker once per call.
+      #
+      # The channel capability is deliberately NOT read from here. It is the SERVER that
+      # declares it, at the handshake or at `server/discover`, and a client that has been
+      # handed no declaration must not be pushed to — see `emit_capabilities`.
+      private def note_modern_client(meta : JSON::Any?) : Nil
+        info = obj_field(meta, Protocol::META_CLIENT_INFO)
+        @tools.client_seen(obj_field(info, "name").try(&.as_s?), obj_field(info, "version").try(&.as_s?))
+        start_courier
       end
 
       # The id of a lone request (not a batch, not a notification) — what a client names in
@@ -248,10 +392,56 @@ module Gori
         send("[#{collected.join(',')}]")
       end
 
+      # What is wrong with this message's JSON-RPC envelope, or nil when nothing is.
+      #
+      # Two members and no more: the version, which the spec pins to the exact string
+      # `"2.0"`, and the id, which may be a string, a number or null when it is present at
+      # all. Everything else about the message (method, params, batching) is somebody else's
+      # check — this is the frame, and it is read by both the reader's fast path and the
+      # worker, from here, so the two can never disagree about what a request is.
+      private def envelope_error(obj : Hash(String, JSON::Any)) : String?
+        version = obj["jsonrpc"]?
+        if version.nil?
+          return "Invalid Request: missing 'jsonrpc' — every JSON-RPC message must carry \"jsonrpc\":\"2.0\""
+        end
+        unless version.as_s? == "2.0"
+          return "Invalid Request: 'jsonrpc' must be the string \"2.0\" (got #{version.to_json})"
+        end
+        id = obj["id"]?
+        return nil if id.nil? || valid_id?(id)
+        "Invalid Request: 'id' must be a string, a number or null (got #{json_type_of(id)})"
+      end
+
+      # A request id a client can correlate on: string, number, or null. An object, an array
+      # or a boolean is none of those, and echoing one back makes the response unmatchable.
+      private def valid_id?(id : JSON::Any?) : Bool
+        return false if id.nil?
+        case id.raw
+        when String, Int64, Float64, Nil then true
+        else                                  false
+        end
+      end
+
       private def handle_message(root : JSON::Any) : Nil
         id = nil.as(JSON::Any?)
         obj = root.as_h?
         return write_error(nil, -32600, "Invalid Request") unless obj
+
+        # The ENVELOPE, before the message is read as one. A server that answers
+        # `{"jsonrpc":"1.0"}` — or a message carrying no version member at all — with a
+        # `"jsonrpc":"2.0"` result is rewriting the client's frame into one it never sent,
+        # and the client that shipped the bug goes on believing it speaks 2.0. Same for an
+        # id the spec does not allow: `{"id":{}}` came back `{"id":{}}`, which no client
+        # correlating by id can match against anything, so the request simply hung.
+        #
+        # An unusable id is answered at `null` — the spec's own rule for a request whose id
+        # cannot be determined — while a legal id is echoed, so a client with a promise
+        # still resolves it. Notifications are held to the same envelope: the error goes out
+        # at `null`, for the reason the missing-`method` branch below already does it.
+        if problem = envelope_error(obj)
+          id = obj["id"]?
+          return write_error(valid_id?(id) ? id : nil, -32600, problem)
+        end
 
         id = obj["id"]?
         method = obj["method"]?.try(&.as_s?)
@@ -279,12 +469,21 @@ module Gori
       end
 
       private def handle_request(id : JSON::Any, method : String, params : JSON::Any?) : Nil
+        # The era gate runs BEFORE the method is looked at: a request naming a revision we
+        # do not speak is refused whatever it was asking for, and the one naming a revision
+        # we do decides the envelope every branch below writes.
+        gate = era_of(id, method, params)
+        return if gate.refused
+        era = gate.version
+        note_modern_client(obj_field(params, "_meta")) if era
         case method
-        when "initialize" then handle_initialize(id, params)
-        when "ping"       then write_result(id) { |j| j.object { } }
-        when "tools/list" then handle_tools_list(id)
-        when "tools/call" then handle_tools_call(id, params)
-        else                   write_error(id, -32601, "Method not found: #{method}")
+        when "server/discover"      then handle_discover(id)
+        when "subscriptions/listen" then handle_subscriptions_listen(id)
+        when "initialize"           then handle_initialize(id, params)
+        when "ping"                 then write_result(id, era) { }
+        when "tools/list"           then handle_tools_list(id, era, params)
+        when "tools/call"           then handle_tools_call(id, era, params)
+        else                             write_error(id, -32601, "Method not found: #{method}")
         end
       rescue ex
         Log.error(exception: ex) { "request #{method} failed" }
@@ -295,12 +494,22 @@ module Gori
         case method
         when "notifications/initialized"
           @initialized = true
+          start_courier
         when "notifications/cancelled"
-          # The client has stopped waiting for a request we are still holding. A fiber
-          # cannot be interrupted, so the work itself runs to completion — what this buys
-          # is the spec's half of the contract: no response is sent for a cancelled id,
-          # so a client that has already reused or retired it is not handed an answer it
-          # has nowhere to put.
+          # The client has stopped waiting for a request we are still holding. Two things
+          # follow, and they are the spec's MUST and its SHOULD:
+          #
+          #   - no response is ever sent for a cancelled id (`cancelled?` at the write
+          #     sites), so a client that has already reused or retired it is not handed an
+          #     answer it has nowhere to put; and
+          #   - the work STOPS, for the tools that can be stopped. A fiber cannot be
+          #     interrupted, so this is cooperative: `cancel_probe` hands the tools layer a
+          #     predicate. Long tools poll between sends; the one-shot send engines watch it
+          #     while they own a socket and close that socket when it fires. `probe_scan`
+          #     was the case that made this a defect rather than a nicety — a cancelled scan
+          #     went on putting real attack traffic on a third party's server for up to
+          #     `PROBE_ACTIVE_MAX_FLOWS` flows, and the resource we were failing to free was
+          #     someone else's. Which tools honour it is listed on `Tools#call` (#1103).
           #
           # Only ids still in `@pending` are remembered. One already answered has nothing
           # to suppress, and recording it would let a client grow this set for the life of
@@ -313,99 +522,479 @@ module Gori
         # All other notifications are accepted silently (no response, ever).
       end
 
+      # The LEGACY opening. A client that sends `initialize` has chosen handshake semantics
+      # for itself, so it is answered with a handshake revision even when it asked for a
+      # modern one: naming `2026-07-28` here would promise per-request semantics to a
+      # session that has already been opened as a session and cannot switch.
       private def handle_initialize(id : JSON::Any, params : JSON::Any?) : Nil
         client_ver = obj_field(params, "protocolVersion").try(&.as_s?)
-        version = client_ver && SUPPORTED_VERSIONS.includes?(client_ver) ? client_ver : PROTOCOL_VERSION
+        version = client_ver && Protocol.legacy?(client_ver) ? client_ver : Protocol::LEGACY_LATEST
         # The client's self-description feeds the agent-presence marker's name (#815). Same
         # arg-reader stance as everywhere else on this surface: a non-string slot is ABSENT,
         # never coerced — `as_s?` returns nil for a number/object/null, so a hostile
         # `clientInfo.name` cannot smuggle a container in.
         info = obj_field(params, "clientInfo")
         @tools.client_seen(obj_field(info, "name").try(&.as_s?), obj_field(info, "version").try(&.as_s?))
+        # The handshake IS the declaration, so the latch the courier reads is written HERE and
+        # nowhere else. It used to be written inside `emit_capabilities`, which `server/discover`
+        # also calls — with `channel: false`, because the stateless era forbids an unsolicited
+        # frame — so one discovery probe from a dual-era client silently RETIRED the channel a
+        # handshake had just handed it. The operator's `Settings.mcp_channels` is read once,
+        # here: a toggle afterwards cannot register a channel with a client that already did not
+        # take one, and cannot withdraw one it did.
+        @channel_declared = Settings.mcp_channels?
         write_result(id) do |j|
-          j.object do
-            j.field "protocolVersion", version
-            j.field("capabilities") { j.object { j.field("tools") { j.object { } } } }
-            j.field "serverInfo" do
-              j.object do
-                j.field "name", "gori"
-                j.field "version", Gori::VERSION
-              end
-            end
-            j.field "instructions", instructions_text
+          j.field "protocolVersion", version
+          j.field("capabilities") { emit_capabilities(j, channel: @channel_declared) }
+          j.field("serverInfo") { emit_implementation(j) }
+          j.field "instructions", instructions_text
+        end
+      end
+
+      # `server/discover`: the one RPC the modern revision says a server MUST implement.
+      # Everything the handshake used to hand over — supported versions, capabilities,
+      # identity, instructions — as a RESULT a client can ask for whenever it likes, rather
+      # than a state it has to open a session to obtain.
+      #
+      # Answered in both eras, and with or without modern `_meta`, because this is also the
+      # probe a dual-era client sends before it knows what we are: refusing "tell me what to
+      # say" for not having said it first would send that client back to `initialize` for no
+      # reason. A version it names that we do not speak is still refused, by the gate above
+      # — which is exactly how that client learns we are modern.
+      private def handle_discover(id : JSON::Any) : Nil
+        write_result(id, Protocol::LATEST) do |j|
+          j.field("supportedVersions") { j.array { Protocol::SUPPORTED_VERSIONS.each { |v| j.string v } } }
+          j.field("capabilities") { emit_capabilities(j, channel: false) }
+          j.field "instructions", instructions_text
+          j.field "ttlMs", Protocol::DISCOVER_TTL_MS
+          j.field "cacheScope", Protocol::CACHE_SCOPE
+        end
+        # A modern client has no `initialized` to send, so discovery is where this session
+        # becomes one the operator can message.
+        start_courier
+      end
+
+      # `subscriptions/listen` — the modern revision's one server-to-client push channel,
+      # which replaced the HTTP GET endpoint and `resources/subscribe`. gori has nothing to
+      # push: it declares no `listChanged`, serves no resources or prompts, and its one
+      # vendor notification is now confined to the handshake era (`emit_capabilities`).
+      #
+      # So the conformant answer is the empty one, and it is a REAL answer rather than
+      # `-32601`. The acknowledgement goes out first, as the spec requires, carrying the
+      # subset the server agreed to honour — which is none, because "notification types the
+      # server does not support are omitted" — and then the subscription is closed the way a
+      # server closes one it is ending itself: with the successful response to the original
+      # request. A client reads that as a clean end and falls back on the `ttlMs` it was
+      # already given, instead of holding a promise nothing will resolve.
+      #
+      # Closing it immediately is not a shortcut, it is the only safe shape here. This
+      # server runs ONE request at a time on a single worker fiber (see the class header), so
+      # a `subscriptions/listen` left open would park that worker and starve every tool call
+      # behind it — a stream that never delivers anything, blocking the ones that would.
+      private def handle_subscriptions_listen(id : JSON::Any) : Nil
+        return if cancelled?(id)
+        write_notification("notifications/subscriptions/acknowledged") do |j|
+          # Inside `_meta`, not beside it: the subscription id is protocol metadata, and a
+          # client demultiplexing a stdio channel looks for it in exactly one place.
+          j.field("_meta") { j.object { emit_subscription_id(j, id) } }
+          j.field("notifications") { j.object { } }
+        end
+        write_result(id, Protocol::LATEST, meta: ->(j : JSON::Builder) { emit_subscription_id(j, id) }) { }
+      end
+
+      # Every message on a subscription carries the id of the request that opened it — on
+      # stdio that is the only way a client can tell one stream's frames from another's.
+      private def emit_subscription_id(j : JSON::Builder, id : JSON::Any) : Nil
+        j.field(Protocol::META_SUBSCRIPTION_ID) { id.to_json(j) }
+      end
+
+      # What this server offers, written once for the two places that advertise it — the
+      # handshake and discovery — so the two can never describe different servers.
+      #
+      # `channel` is the one thing they differ on, and it is not a difference in what gori
+      # can do. The `claude/channel` push (#1090) is an unsolicited notification on stdout,
+      # and `2026-07-28` closed that door: a stdio server may write responses, notifications
+      # belonging to an IN-FLIGHT request, and notifications on an acknowledged
+      # `subscriptions/listen` stream — and a free-running courier frame is none of the
+      # three. So the capability is declared to the handshake era, which still allows it,
+      # and never to a stateless client. Nothing is lost that the operator can see: the
+      # channel was always the unconfirmable route, and the socket, the Codex queue and the
+      # `operator_messages` poll all carry the same message off-stdout, for every client.
+      #
+      # A pure emitter: `channel` is DECIDED by the caller (`handle_initialize` reads the
+      # operator's setting and latches it; `handle_discover` passes false), because a builder
+      # that also writes session state is one that rewrites it every time something asks the
+      # server to describe itself — which is how a discovery probe came to retire a channel
+      # the handshake had declared.
+      private def emit_capabilities(j : JSON::Builder, *, channel : Bool) : Nil
+        j.object do
+          j.field("tools") { j.object { } }
+          # Declared only when the operator says their Claude is launched with channels: a
+          # client that did not register it drops every push silently, and the socket route
+          # would then carry the same line.
+          if channel
+            j.field("experimental") { j.object { j.field("claude/channel") { j.object { } } } }
           end
         end
+      end
+
+      # `Implementation`: who this is. The handshake carries it as `serverInfo`, the modern
+      # revision as `_meta["io.modelcontextprotocol/serverInfo"]` on every result.
+      private def emit_implementation(j : JSON::Builder) : Nil
+        {name: "gori", version: Gori::VERSION}.to_json(j)
       end
 
       # Surfaced at the handshake so the client/model knows up front what this server
       # exposes — in particular whether the (otherwise simply absent) action tools are
       # disabled by read-only mode, rather than discovering it only on a rejected call.
+      #
+      # The project half is read from `@tools` at the moment it is built, never from a copy
+      # taken at construction: a client may re-handshake, and the binding it should be told
+      # about is the one in force NOW.
       private def instructions_text : String
         # The bind failure comes FIRST when there is one: it is why the traffic tools are
         # refusing, and an agent that reads only the head of `instructions` still gets it.
-        failure = @bind_error.try { |reason| " The configured project could not be opened: #{reason}." }
-        selected = if @store.nil?
-                     " No project is bound yet. Call list_projects to see available projects, " \
-                     "create_project to make one (auto-binds when unbound), or switch_project " \
-                     "before using traffic tools (list_history, send_request, …). Pure tools " \
-                     "(decode, jwt_*, ql_reference) work immediately."
-                   elsif @project_name || @project_slug
-                     " This server is pinned to project #{@project_name || @project_slug}#{" [#{@project_slug}]" if @project_slug}" \
-                     " via #{@selection_source || "an explicit database"}#{" for workspace #{@workspace_root}" if @workspace_root}."
-                   else
-                     " Project selection source: #{@selection_source || "unknown"}; call project_info before using data."
-                   end
+        failure = @tools.bind_error.try { |reason| " The configured project could not be opened: #{reason}." }
+        ql = @tools.advertises?("ql_reference") ? " Call ql_reference before writing " \
+                                                  "#{advertised("list_history", "list_sitemap") || "filter"} queries." : ""
+        decoder = @tools.advertises?("decode") ? ", plus a pure `decoder` encode/decode/hash tool" : ""
         base = "gori MCP exposes the selected project's captured HTTP traffic " \
-               "(history, flows, sitemap, scope, issues, notes, match&replace rules), plus a " \
-               "pure `decoder` encode/decode/hash tool. Call ql_reference before " \
-               "writing list_history/list_sitemap queries. Timestamps include unix " \
-               "microseconds plus *_iso RFC3339 fields where available.#{failure}#{selected}"
-        if @allow_actions
-          "#{base} Action tools are enabled: send_request (supports flow_id/repeater_id), " \
-          "send_websocket (executes a persisted WS repeater), " \
-          "fuzz_*, mine_*, authorize_* (replay captured requests under several identities to " \
-          "find broken access control), create/update_issue, and create/delete_rule + set_rule_enabled " \
-          "make real outbound requests or mutate issues/rules. Active requests " \
-          "(send_request, send_websocket, fuzz, mine, authorize) are gated by the project scope: a target " \
-          "outside — or without — a configured scope is refused (SCOPE_BLOCKED) unless you pass " \
-          "allow_unscoped:true. Projects can be managed via list/create/switch/delete_project."
+               "(history, flows, sitemap, scope, issues, notes, match&replace rules)" \
+               "#{decoder}.#{ql} Timestamps include unix " \
+               "microseconds plus *_iso RFC3339 fields where available.#{failure}#{binding_note}"
+        text = @allow_actions ? "#{base}#{actions_note}#{projects_note}" : "#{base}#{read_only_note}#{projects_note}"
+        text += operator_messages_note
+        text += permissions_note
+        # The backstop for every name above, and for any added later without this treatment:
+        # when a filter is in force at all, say so and name the authority. A sentence that
+        # survives a future edit while its tool does not is then at least contradicted.
+        text + (filter_note || "")
+      end
+
+      # The operator-messages paragraph, one clause per tool it names — the rule every other
+      # sentence in this text follows. Anchored on `operator_messages` because that is the
+      # backstop an agent reads messages with; the reply clause is admitted separately.
+      private def operator_messages_note : String
+        return "" unless @tools.serves?("operator_messages")
+        OPERATOR_MESSAGES_NOTE + (@tools.serves?("reply_to_operator") ? OPERATOR_REPLY_NOTE : "")
+      end
+
+      # Which project this server is on, and the warning that the answer moves. Split out of
+      # `instructions_text`, and split again below, because both halves grew a conditional per
+      # tool name once the text had to stop naming tools that are not there.
+      private def binding_note : String
+        "#{@tools.unbound? ? unbound_note : bound_note}#{drift_note}"
+      end
+
+      # No project yet. Each clause names a tool, so each clause goes when that tool does.
+      private def unbound_note : String
+        hints = [] of String
+        hints << "list_projects to see available projects" if @tools.advertises?("list_projects")
+        hints << "create_project to make one (auto-binds when unbound)" if @tools.advertises?("create_project")
+        hints << "switch_project to pick an existing one" if @tools.advertises?("switch_project")
+        pure = advertised("decode", "jwt_decode", "ql_reference")
+        String.build do |b|
+          b << " No project is bound yet."
+          # Saying nothing here was the wrong silence: a server whose filter kept no PICKER
+          # told the model "no project is bound" and left it to discover, one refusal at a
+          # time, that nothing it can call will change that — while the `NO_PROJECT` error it
+          # was about to hit said so outright. Same words, from `Tools` (#1136).
+          if @tools.unbindable?
+            b << " And " << @tools.no_binder_recovery << "."
+          elsif !hints.empty?
+            b << " Call " << hints.join(", or ") << " before using traffic tools."
+          end
+          b << " Pure tools (" << pure << ") work immediately." if pure
+        end
+      end
+
+      # "registered to", not "for": at start-up `workspace_root` is the git root that SELECTED
+      # the project and `bind_project` overwrites it with `ProjectRegistry#workspace_of` — the
+      # workspace the project belongs to. Those coincide only until a switch, and "for
+      # workspace X" would then have this server claiming to serve a directory it has never
+      # been run in. The project's registration is what both values actually are.
+      private def bound_note : String
+        slug = @tools.project_slug
+        name = @tools.project_name || slug
+        unless name
+          return " Project selection source: #{@tools.selection_source || "unknown"}." +
+            (@tools.advertises?("project_info") ? " Call project_info before using data." : "")
+        end
+        root = @tools.workspace_root
+        " As of this call the server is bound to project #{name}#{" [#{slug}]" if slug}" \
+        " via #{@tools.selection_source || "an explicit database"}#{", registered to workspace #{root}" if root}."
+      end
+
+      # "as of this call", not "at this handshake": the same text answers `server/discover`,
+      # which a stateless client may send at any point and more than once — there is no
+      # handshake in that era to date the sentence from.
+      #
+      # …and that binding is a SNAPSHOT, not a pin. `switch_project` repoints the server for
+      # every later call, MCP has no notification that refreshes `instructions`, and a client
+      # caches this text for the whole session — so a sentence that reads as configuration
+      # ("this server is pinned to X") went on naming X while writes landed in Y. Name the
+      # authority instead: what a call actually touches is what project_info reports (#1003).
+      #
+      # "nothing pushes an update", NOT "never re-sent": a second `initialize` DOES rebuild
+      # this text, which is the whole point of reading the binding live above. Overstating it
+      # would be the same unkeepable claim one sentence further on.
+      #
+      # The whole sentence is about the tools that move the binding and the tool that reports
+      # it, so it is dropped when neither is reachable: warning a client about drift it cannot
+      # cause, and pointing it at an authority it cannot call, is worse than silence.
+      private def drift_note : String
+        reporter = @tools.advertises?("project_info") ? " project_info — or the switch's own result — is the live answer; " \
+                                                        "re-check it before recording evidence." : ""
+        if movers = advertised("switch_project", "create_project")
+          " That is the binding as of this call and nothing pushes an update: #{movers} " \
+          "repoints the server mid-session without the client seeing new instructions." + reporter
+        elsif @tools.advertises?("project_info")
+          " Nothing pushes an update to this text; project_info is the live answer."
         else
-          "#{base} Read-only mode: action tools (send_request, send_websocket, fuzz_*, mine_*, authorize_*, " \
-          "create/update_issue, create/delete_rule) are disabled — restart without --read-only to enable them. " \
-          "switch_project (and create_project when unbound) remain available so you can still pick a project to inspect."
+          ""
         end
       end
 
-      private def handle_tools_list(id : JSON::Any) : Nil
-        write_result(id) do |j|
-          j.object { j.field("tools") { @tools.list(j) } }
+      # Only the tools in `names` this server's `tools/list` actually carries, joined for
+      # prose — or nil when every one of them is absent, so the sentence naming them can be
+      # dropped whole.
+      #
+      # `instructions` is the first thing the model reads and it is read as FACT. A sentence
+      # naming a tool `tools/list` does not carry sends the agent to call something that
+      # answers "unknown tool", and this text used to do exactly that: under
+      # `--tools='list_*'` it went on saying "Call ql_reference before writing queries" — the
+      # very first instruction — while advertising neither ql_reference nor nine other names
+      # it mentioned. The mechanism was already here; it reached one sentence (the
+      # operator-messages note) and none of the rest.
+      #
+      # `serves?`, not `advertises?`: `--read-only` is the OTHER reason a name is missing
+      # from tools/list, and this text used to offer `delete_project` — gated, so neither
+      # listed nor runnable — to every read-only server. The one sentence that names an
+      # absent tool ON PURPOSE asks `restorable` below instead.
+      private def advertised(*names : String) : String?
+        kept = names.to_a.select { |n| @tools.serves?(n) }
+        kept.empty? ? nil : kept.join(", ")
+      end
+
+      # The read-only sentence's counterpart: the tools the `--tools` filter kept, whether or
+      # not the gate is currently withholding them. It exists for exactly one clause — "action
+      # tools (…) are disabled — restart without --read-only to enable them" — whose whole
+      # point is naming what a restart would bring back. A tool the FILTER removed is not
+      # coming back either way, so it is still not promised.
+      private def restorable(*names : String) : String?
+        kept = names.to_a.select { |n| @tools.advertises?(n) }
+        kept.empty? ? nil : kept.join(", ")
+      end
+
+      # The action paragraph, naming only what is reachable. Each clause carries its own
+      # tool, so a filtered server describes the workbench it actually has.
+      private def actions_note : String
+        clauses = [] of String
+        clauses << "send_request (supports flow_id/repeater_id)" if @tools.advertises?("send_request")
+        clauses << "send_websocket (executes a persisted WS repeater)" if @tools.advertises?("send_websocket")
+        clauses << "race_requests (fire several saved repeaters as one synchronized multi-endpoint race)" if @tools.advertises?("race_requests")
+        clauses << "fuzz_*" if @tools.advertises?("fuzz_start")
+        clauses << "mine_*" if @tools.advertises?("mine_start")
+        clauses << "authorize_* (replay captured requests under several identities to find " \
+                   "broken access control)" if @tools.advertises?("authorize_start")
+        clauses << "cache_deception_check (prime a flow as authenticated, re-request anonymous, " \
+                   "and report a cached private response)" if @tools.advertises?("cache_deception_check")
+        clauses << "create/update_issue" if advertised("create_issue", "update_issue")
+        clauses << "create/delete_rule + set_rule_enabled" if advertised("create_rule", "delete_rule", "set_rule_enabled")
+        return "" if clauses.empty?
+        gated = advertised("send_request", "send_websocket", "fuzz_start", "mine_start", "authorize_start", "cache_deception_check")
+        " Action tools are enabled: #{clauses.join(", ")} make real outbound requests or " \
+        "mutate issues/rules." + (gated ? " Active requests are gated by the project scope: a target outside — or without — a " \
+                                          "configured scope is refused (SCOPE_BLOCKED) unless you pass allow_unscoped:true." : "")
+      end
+
+      # …and its `--read-only` counterpart, where naming an ABSENT tool is the whole point:
+      # the sentence exists to say what restarting would restore. The two reasons a tool is
+      # missing are not the same, and `advertises?` is exactly the one that separates them —
+      # it reads the `--tools` filter only, so it answers "would this be here if the gate
+      # were lifted". A tool the FILTER removed is not coming back either way, so it is not
+      # promised.
+      private def read_only_note : String
+        disabled = [] of String
+        disabled << "send_request" if @tools.advertises?("send_request")
+        disabled << "send_websocket" if @tools.advertises?("send_websocket")
+        disabled << "fuzz_*" if @tools.advertises?("fuzz_start")
+        disabled << "mine_*" if @tools.advertises?("mine_start")
+        disabled << "authorize_*" if @tools.advertises?("authorize_start")
+        disabled << "cache_deception_check" if @tools.advertises?("cache_deception_check")
+        disabled << "create/update_issue" if restorable("create_issue", "update_issue")
+        disabled << "create/delete_rule" if restorable("create_rule", "delete_rule")
+        head = if disabled.empty?
+                 " Read-only mode: this server cannot write or send."
+               else
+                 " Read-only mode: action tools (#{disabled.join(", ")}) are disabled — " \
+                 "restart without --read-only to enable them."
+               end
+        pickers = advertised("switch_project", "create_project")
+        pickers ? "#{head} #{pickers} remain available so you can still pick a project to inspect." : head
+      end
+
+      private def projects_note : String
+        picks = advertised("list_projects", "create_project", "switch_project", "delete_project")
+        picks ? " Projects can be managed via #{picks}." : ""
+      end
+
+      # The Preferences switches, named by group rather than by tool: the tools are simply
+      # absent from tools/list, and what the agent needs is the reason and who can change it —
+      # otherwise a missing send_request reads as a gori that cannot send.
+      private def permissions_note : String
+        groups = @tools.denied_groups
+        return "" if groups.empty?
+        " The operator has switched off #{groups.join(", ", &.title)} in gori Preferences " \
+        "(AI › MCP permissions), so those tools are not served; ask the operator if you need them."
+      end
+
+      # Said once, when `--tools` narrowed the catalogue: whatever the prose above named, the
+      # list is the authority. Also the only place the agent learns the surface is deliberate
+      # rather than broken.
+      private def filter_note : String?
+        f = @tools.tool_filter
+        return nil unless f
+        # `served_count`, not the filter's size: under `--read-only` the filter's own count is the set
+        # it KEPT, and the gate then withholds some of it. One number here, and it is the one
+        # the very next `tools/list` will return.
+        " This server was started with #{f.flags} and advertises #{@tools.served_count} of " \
+        "#{Tools::TOOL_NAMES.size} tools; tools/list is the authority on what it has."
+      end
+
+      # #1090, the backstop route: every agent, whatever its client, can read what the operator
+      # said. The live routes make it immediate where one exists — a peer note in Claude Code,
+      # a queued turn in Codex, a channel event — and this sentence is what makes it reachable
+      # for everyone else. Route-agnostic ON PURPOSE: the handshake instructions go out once
+      # per session (#1003), so naming today's clients here would age into a wrong sentence
+      # nothing can correct, and an agent told only about Claude's routes has no model of the
+      # `[gori]` line that turns up in its own thread.
+      OPERATOR_MESSAGES_NOTE = " The operator can message you from the gori TUI: such messages " \
+                               "arrive in this session directly when gori has a live route to it " \
+                               "(a `[gori]` line in your own turn, or beside the result of a gori " \
+                               "tool you called), and are always readable with " \
+                               "operator_messages — call it at the start of a " \
+                               "turn, or whenever a note says gori has something for you, and act on it."
+
+      # …and the half that names the ANSWER, which is a second tool and so a second condition.
+      # One sentence naming two tools is one sentence that is wrong whenever the filter keeps
+      # only one of them — `--tools='list_*,operator_messages'` sent the agent to a
+      # reply_to_operator that tools/list does not carry. A live route still carries
+      # `OperatorNote::REPLY_HINT`, which names the tool at the moment it is needed.
+      OPERATOR_REPLY_NOTE = " Answer them with reply_to_operator (a one-line summary, optional " \
+                            "detail): the operator is in gori, not in your terminal. It is a " \
+                            "notification in an open gori TUI, not a mailbox — keep anything " \
+                            "that must last in your own output too."
+
+      # Start carrying operator messages once the client is initialized. `send` is this
+      # server's frame writer (the lock, the UTF-8 guard); the store and client name are read
+      # live from Tools on every tick, never copied (#1003's lesson).
+      private def start_courier : Nil
+        return if @courier
+        courier = Courier.new(pid: Process.pid.to_i64,
+          store: -> { @tools.current_store },
+          feed: -> { @tools.feed_generation.as(Int64?) },
+          client: -> { @tools.client_name },
+          channels: -> { @channel_declared },
+          emit: ->(frame : String) { send(frame) },
+          claim: ->(mid : Int64) { @tools.claim_message(mid) },
+          release: ->(mid : Int64) { @tools.release_message(mid) },
+          carried: -> { @tools.carried_here },
+          expire: -> { @tools.expire_asked_questions; nil },
+          answered: ->(qid : Int64) { @tools.forget_question(qid) })
+        courier.start
+        @courier = courier
+      end
+
+      private def handle_tools_list(id : JSON::Any, era : String? = nil, params : JSON::Any? = nil) : Nil
+        # `tools/list` is paginated in the spec and NOT paginated here: the catalogue leaves
+        # in one page and no result ever carries a `nextCursor`, so the only cursor a client
+        # can hand us is one we never minted. Answering it with page one anyway is the shape
+        # of a silent loop — a client resuming from a cursor it believes in gets the head of
+        # the list back and no way to tell. "Invalid cursors SHOULD result in an error with
+        # code -32602" is the spec's answer and it is also the honest one.
+        # A JSON null is an absent cursor, as it is an absent argument everywhere else here:
+        # some SDKs serialize every unset field, and `JSON::Any(nil)` is truthy.
+        if (cursor = obj_field(params, "cursor")) && !cursor.raw.nil?
+          return write_error(id, -32602,
+            "tools/list: unknown cursor #{cursor.to_json} — this server returns the whole " \
+            "catalogue in one page and never issues a nextCursor")
+        end
+        write_result(id, era) do |j|
+          j.field("tools") { @tools.list(j) }
+          # Cache hints are REQUIRED on a modern `tools/list`. A flat constant is honest only
+          # because the catalogue cannot move: it is a function of `--read-only` and `--tools`
+          # and of nothing a call can reach, which the spec states as a MUST NOT ("the set …
+          # MUST NOT vary per-connection or as a side effect of other requests on the
+          # connection") and which `spec/mcp/protocol_spec.cr` asserts rather than claims.
+          if era
+            j.field "ttlMs", Protocol::TOOLS_LIST_TTL_MS
+            j.field "cacheScope", Protocol::CACHE_SCOPE
+          end
         end
       end
 
-      private def handle_tools_call(id : JSON::Any, params : JSON::Any?) : Nil
+      private def handle_tools_call(id : JSON::Any, era : String?, params : JSON::Any?) : Nil
         name = obj_field(params, "name").try(&.as_s?)
         return write_error(id, -32602, "tools/call: missing 'name'") unless name
         args = tool_arguments(params)
         return write_error(id, -32602,
           "tools/call: 'arguments' must be an object (or a JSON-encoded one)") unless args
-        result = @tools.call(name, args)
-        write_result(id) do |j|
-          j.object do
-            j.field("content") do
-              j.array do
-                j.object { j.field "type", "text"; j.field "text", result.text }
+        result = @tools.call(name, args, cancelled: cancel_probe(id))
+        # "Protocol Errors indicate issues with the request structure itself that models are
+        # less likely to be able to fix: Unknown tool …" — the spec names this one and gives
+        # the code. A name that is not in `tools/list` is not a tool that ran and failed, and
+        # answering it with `isError` puts it in the bucket a client is told to hand back to
+        # the model for a retry. The sentence survives as the error's `message`, which is what
+        # `--tools`'s "everything available is in tools/list" was written to say; what it
+        # stops being is a tool RESULT. Read before the operator note, so a message the
+        # operator sent is not spent on a call that never reached a tool.
+        if result.is_error && result.error_code == "UNKNOWN_TOOL"
+          return write_error(id, -32602, result.text)
+        end
+        # #1090: anything the operator said that no route has carried rides back HERE, beside
+        # the tool's own answer — a second content block, never mixed into the first, so
+        # `structuredContent` still parses and no tool's output is rewritten by a message that
+        # has nothing to do with it. Asked after the call, so a message sent WHILE a long tool
+        # ran goes out with that tool's result instead of waiting for the next one.
+        #
+        # Read here, RETIRED only once the frame is out. Reading and marking in one step meant
+        # a cancelled request (`write_result` writes nothing for a cancelled id) or a client
+        # that vanished mid-call left the message marked delivered and behind the cursor — the
+        # ring saying "got it" for a line nothing ever carried. The side effect follows the
+        # emit, as every guard in this codebase follows its refusal (#724).
+        pending = @tools.pending_operator_note(name)
+        begin
+          emit_tool_result(id, era, result, pending)
+        ensure
+          @tools.release_operator_note(pending) if pending
+        end
+      end
+
+      # The result frame, plus the operator note riding beside it. Split from
+      # `handle_tools_call` so the claim those pending ids hold has one `ensure` to be given
+      # back from, whatever this does.
+      private def emit_tool_result(id : JSON::Any, era : String?, result : Tools::Result,
+                                   pending : Tools::PendingNote?) : Nil
+        emitted = write_result(id, era) do |j|
+          j.field("content") do
+            j.array do
+              j.object { j.field "type", "text"; j.field "text", result.text }
+              if p = pending
+                j.object { j.field "type", "text"; j.field "text", p.text }
               end
             end
-            if result.is_error && (code = result.error_code)
-              # Machine-processable error alongside the human `text` (the tools
-              # layer guarantees a stable code on every plain-message error).
-              j.field("structuredContent") { emit_error_object(j, result, code) }
-            else
-              emit_structured(j, result.text)
-            end
-            j.field "isError", result.is_error
           end
+          if result.is_error && (code = result.error_code)
+            # Machine-processable error alongside the human `text` (the tools
+            # layer guarantees a stable code on every plain-message error).
+            j.field("structuredContent") { emit_error_object(j, result, code) }
+          else
+            emit_structured(j, result.text)
+          end
+          j.field "isError", result.is_error
         end
+        @tools.commit_operator_note(pending) if pending && emitted
       end
 
       # `params.arguments` as the object the tools layer reads, or nil when it is a shape that
@@ -448,10 +1037,17 @@ module Gori
         end
       end
 
-      # MCP structuredContent is an object. Preserve the text block for older
-      # clients, while giving newer clients parsed data directly so callers do
-      # not have to JSON-decode content[0].text a second time. Array/scalar tool
-      # payloads are wrapped to satisfy the object shape required by MCP.
+      # Preserve the text block for older clients, while giving newer clients parsed data
+      # directly so callers do not have to JSON-decode content[0].text a second time.
+      #
+      # Array/scalar tool payloads are WRAPPED (`{items: …}`, `{value: …}`) because through
+      # `2025-11-25` `structuredContent` is typed as an object and nothing else may go there.
+      # `2026-07-28` widened it to any JSON value, so the wrapper is no longer required —
+      # but it is still emitted, for both eras, because the alternative is one tool with two
+      # output shapes depending on which revision asked. A client that has learned
+      # `list_history` answers `{items: […]}` is not helped by the same server answering a
+      # bare array to the same call on a different day, and gori declares no `outputSchema`
+      # that the wrapper could contradict. Revisit that the day it declares one.
       #
       # The tool's text is COPIED THROUGH rather than decoded and re-encoded. It is already
       # valid JSON text; `JSON.parse` built a whole JSON::Any tree of it only to serialise
@@ -500,26 +1096,92 @@ module Gori
         any.try(&.as_h?).try(&.[key]?)
       end
 
-      private def write_result(id : JSON::Any?, &block : JSON::Builder ->) : Nil
-        return if cancelled?(id)
+      # `true` when the frame actually went out — a cancelled request and a closed stream both
+      # answer `false`. Every caller but one ignores it; `handle_tools_call` must not retire an
+      # operator message onto a response that was never emitted.
+      #
+      # The block writes the result's FIELDS; the envelope is this method's, because the
+      # envelope is where the two eras differ. `era` non-nil means the request named a
+      # modern revision, and the result then carries `resultType` and the server's identity
+      # — which a legacy result must NOT, and does not need to: the spec's own rule is that
+      # a missing `resultType` reads as `complete`.
+      private def write_result(id : JSON::Any?, era : String? = nil,
+                               meta : Proc(JSON::Builder, Nil)? = nil,
+                               &block : JSON::Builder ->) : Bool
+        return false if cancelled?(id)
         send(JSON.build do |j|
           j.object do
             j.field "jsonrpc", "2.0"
             emit_id(j, id)
-            j.field("result") { block.call(j) }
+            j.field("result") do
+              j.object do
+                # First, because it is what a client reads to decide how to parse the rest.
+                j.field "resultType", Protocol::RESULT_COMPLETE if era
+                block.call(j)
+                # ONE `_meta`, whoever contributes to it: two `j.field("_meta")` calls would
+                # emit a duplicate key, which is a frame some clients reject outright.
+                if era || meta
+                  j.field("_meta") do
+                    j.object do
+                      meta.try(&.call(j))
+                      j.field(Protocol::META_SERVER_INFO) { emit_implementation(j) } if era
+                    end
+                  end
+                end
+              end
+            end
           end
         end)
       end
 
-      private def write_error(id : JSON::Any?, code : Int32, message : String) : Nil
+      # `data` is the error's machine-readable half — what `UnsupportedProtocolVersionError`
+      # carries its `supported` list in. A Proc rather than a block so the one method serves
+      # both callers; JSON-RPC makes the member optional and most errors here have nothing
+      # to put in it.
+      # A one-way message: no id, and the receiver must not answer it.
+      private def write_notification(method : String, &block : JSON::Builder ->) : Nil
+        send(JSON.build do |j|
+          j.object do
+            j.field "jsonrpc", "2.0"
+            j.field "method", method
+            j.field("params") { j.object { block.call(j) } }
+          end
+        end)
+      end
+
+      private def write_error(id : JSON::Any?, code : Int32, message : String,
+                              data : Proc(JSON::Builder, Nil)? = nil) : Nil
         return if cancelled?(id)
         send(JSON.build do |j|
           j.object do
             j.field "jsonrpc", "2.0"
             emit_id(j, id)
-            j.field("error") { j.object { j.field "code", code; j.field "message", message } }
+            j.field("error") do
+              j.object do
+                j.field "code", code
+                j.field "message", message
+                j.field("data") { data.call(j) } if data
+              end
+            end
           end
         end)
+      end
+
+      # "Is the call you are serving cancelled?", as a predicate — the one seam between the
+      # JSON-RPC id (which only this class knows) and a tool that wants to stop (which must
+      # never learn the id, the set, or this server). A closure over the key rather than an
+      # argument threaded through 179 tools, and it costs a running tool one `Set#empty?` per
+      # poll in the case that is always the common one.
+      #
+      # NOT `cancelled?` below: that one DELETES the key, because it is the write site's
+      # one-shot suppression. A tool polling it would clear the flag on its first read and
+      # `write_result` would then answer a request the client had retired.
+      #
+      # A batch member always reads false, and correctly: `@pending` does not track member
+      # ids (their responses have to leave as one array), so `@cancelled` never holds one.
+      private def cancel_probe(id : JSON::Any) : Proc(Bool)
+        key = id.to_json
+        -> { !@cancelled.empty? && @cancelled.includes?(key) }
       end
 
       # Whether this response is owed to a request the client has since cancelled — checked
@@ -562,7 +1224,11 @@ module Gori
         # find, and nothing here reaches the caller's payload.
         line = line.scrub unless line.valid_encoding?
         head = line[0, {line.index(%("method")) || line.size, line.index(%("params")) || line.size}.min]
-        m = head.match(/"id"\s*:\s*(?:(-?\d{1,18})|"([^"\\]{0,128})")/)
+        # Read at the FIRST `"id"` only, and a number whole: a fractional or out-of-range id
+        # read as its prefix (`1.5` as 1), or a scan that moved on to a nested `"id"`, resolves
+        # some other request the client is waiting on. `to_i64?` decides the range.
+        at = head.index(%("id")) || return
+        m = head[at..].match(/\A"id"\s*:\s*(?:(-?\d+)(?![\d.eE])|"([^"\\]{0,128})")/)
         return nil unless m
         if n = m[1]?
           n.to_i64?.try { |i| JSON::Any.new(i) }
@@ -583,8 +1249,10 @@ module Gori
         payload.scrub
       end
 
-      private def send(payload : String) : Nil
-        return if @closed
+      # `true` when the payload was written (or buffered into an open batch), `false` when the
+      # stream is already closed or the write failed. Callers that only emit ignore it.
+      private def send(payload : String) : Bool
+        return false if @closed
         # Inside a batch this is one member's response, not a frame: buffer it for
         # handle_batch, which emits the array through this same method once. Deliberately
         # NOT wire_safe'd here — the joined array gets one pass below, and `[`, `,` and `]`
@@ -596,7 +1264,7 @@ module Gori
         # send.
         if (batch = @batch) && @batch_fiber == Fiber.current
           batch << payload
-          return
+          return true
         end
         # One writer at a time. A payload larger than the pipe buffer yields mid-write, and
         # a second fiber's line landing in that gap would corrupt both frames.
@@ -604,11 +1272,13 @@ module Gori
           @output.puts(wire_safe(payload)) # newline framing
           @output.flush                    # or the client blocks on the unterminated line
         end
+        true
       rescue ex : IO::Error
         # The client is gone (broken pipe). Stop writing and let the run loop end
         # cleanly instead of unwinding an unhandled exception out of a handler.
         @closed = true
         Log.info { "mcp: output stream closed (#{ex.message})" }
+        false
       end
     end
   end

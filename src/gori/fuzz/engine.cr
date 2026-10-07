@@ -4,10 +4,13 @@ require "../repeater/h2_engine"
 require "../proxy/codec/http1"
 require "../outbound"
 require "../env"
+require "../session_refresh/hook"
+require "../request_macro/lane"
 require "../scope"
 require "../repeater/conn_pool"
 require "../repeater/h2_pool"
 require "../pacing"
+require "wait_group"
 
 module Gori::Fuzz
   # The keep-alive pool moved to `Repeater::ConnPool` when Discover became its second caller
@@ -96,6 +99,15 @@ module Gori::Fuzz
     # header the operator never wrote. Delegated by the wrappers, as `evidence?` is, because
     # the wrapper is what the engine holds.
     def http2? : Bool
+      false
+    end
+
+    # Whether this backend parks connections for reuse (a keep-alive `Repeater::Pool`). Read by
+    # `Engine#redirect_request` for the h1 twin of the reason it reads `http2?`: a hop is a
+    # bodyless GET gori wrote itself, and `Connection: close` on it made
+    # `ConnPool.reusable_request?` refuse the socket, so every hop of a pooled sweep dialed a
+    # fresh one. Delegated by the wrappers, as `http2?` is.
+    def pooled? : Bool
       false
     end
 
@@ -313,6 +325,18 @@ module Gori::Fuzz
     # the one surface that remembered.
     getter sni : String?
 
+    # A fresh mint context for one request (or frame) on this sender's dial, so a plain
+    # `$GEN.USER_AGENT` agrees with the TLS preset the handshake presents (#1153).
+    private def generation : Gori::Env::Generation
+      Gori::Env::Generation.for_dial(@origin.host, @origin.scheme, @tls_preset)
+    end
+
+    # The active slot's before-send refresh (#1233) — see `send`. Not for a sender that
+    # carries its identity itself (`slot_overlay?` false: Authorize asks per identity).
+    private def before_send_refresh : Nil
+      Gori::SessionRefresh.before_send(Gori::Env.active_slot_name) if @slot_overlay
+    end
+
     def initialize(@origin : Origin, @outbound : Gori::Outbound, @http2 : Bool, @verify : Bool,
                    sni : String? = nil, @timeout : Time::Span? = nil,
                    @overrides : Gori::HostOverrides? = nil,
@@ -377,7 +401,17 @@ module Gori::Fuzz
       #
       # BEFORE the scope gate, because the gate keys on the target actually sent — the same
       # rule `ClientConn` states for Match&Replace on the proxy path.
-      bytes = Gori::Env.expand_bindings(bytes, verbatim)
+      # ONE generation across the two passes below (see `Repeater::Sender#wire`): the request's
+      # own `$GEN.UUID` and one in the active slot's header overlay are the same outbound
+      # request, so they resolve to the same value.
+      #
+      # The active slot's before-send REFRESH (#1233) first of all, so the `$NAME` pass reads the
+      # value a refresh just rebound. Only when this sender wears the active slot at all: an
+      # Authorize sender (`slot_overlay: false`) asks per IDENTITY instead, in `send_one`. Cheap
+      # when nothing is configured — one atomic read in `SessionSlots#auto_refresh?`.
+      before_send_refresh
+      gen = generation
+      bytes = Gori::Env.expand_bindings(bytes, verbatim, generation: gen)
       # The ACTIVE SESSION SLOT's header overlay, after the `$NAME` pass and BEFORE the scope
       # gate below — the gate keys on the target actually sent, and an overlay is header-only
       # so it cannot move the request line, but reading the same bytes the socket will is the
@@ -392,7 +426,11 @@ module Gori::Fuzz
       # `slot_overlay?` is the one way out, for the one caller that carries its own identity
       # per send (`Authorize`). Since `verbatim` cannot express "leave the headers alone",
       # a sender that MEANS a specific identity has to be able to say so at construction.
-      bytes = Gori::Env.overlay_slot(bytes) if @slot_overlay
+      bytes = Gori::Env.overlay_slot(bytes, gen) if @slot_overlay
+      # The `chrome` preset's client hints (#1174), last, from the User-Agent these bytes now
+      # carry — with or without the slot overlay, since an Authorize identity is still sent
+      # over the same handshake.
+      bytes = Gori::Env.client_hints(bytes, gen)
       # Sandbox mode / an explicit EXCLUDE rule hard-blocks BEFORE the socket, so a
       # blocked attempt never reaches the network. It still costs a request from the
       # engine's budget, exactly as CappedBackend already charges retries and redirect
@@ -433,19 +471,24 @@ module Gori::Fuzz
       # The FRAMES carry provenance individually (`WsFrame#evidence`) because the two
       # populations mix in one script — a `--message` override sits beside seeded rows.
       verbatim = Backend.all_verbatim(handshake) if @evidence
-      wire = Gori::Env.expand_bindings(handshake, verbatim)
+      before_send_refresh
+      ws_gen = generation
+      wire = Gori::Env.expand_bindings(handshake, verbatim, generation: ws_gen)
       # The handshake takes the session-slot overlay and the frames do not. It IS an HTTP
       # request head — the session a WebSocket rides is chosen there — while a frame has no
       # header lines for a header-only overlay to write. `Repeater::Sender#send_ws` draws the
       # line in the same place and for the same reason.
-      wire = Gori::Env.overlay_slot(wire) if @slot_overlay
+      wire = Gori::Env.overlay_slot(wire, ws_gen) if @slot_overlay
+      # A handshake gets no hints (`ClientHints.apply` says why); called so this seam holds the
+      # same pair as every other and a later answer lands here too.
+      wire = Gori::Env.client_hints(wire, ws_gen)
       if err = @outbound.sweep_block(@origin.scheme, @origin.host, Gori::Outbound.request_target(wire), @origin.port)
         @blocked += 1
         @blocked_reason ||= err
         return {Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, err), WsOutcome.failed}
       end
       msgs = frames.map do |f|
-        payload = f.evidence ? f.payload : Gori::Env.expand_bindings_frame(f.payload, f.payload_spans)
+        payload = f.evidence ? f.payload : Gori::Env.expand_bindings_frame(f.payload, f.payload_spans, generation: generation)
         # `f.shape` rides along. Rebuilding without it silently resets every frame a binding
         # touched back to FIN=1 / RSV=0 / fresh-mask — the one defect
         # `Repeater::Sender#expand_messages` names in its own comment.
@@ -529,6 +572,10 @@ module Gori::Fuzz
       @http2
     end
 
+    def pooled? : Bool
+      !@pool.nil?
+    end
+
     def extra_requests : Int64
       (@pool.try(&.stale_retries) || 0_i64) + @race_warmups
     end
@@ -548,21 +595,28 @@ module Gori::Fuzz
       # `send`, still gated, still one Result per request in order). The rule pre-filters to
       # HTTP/1.1 anyway, so this is a belt-and-braces guard, not a hot path.
       return super if @http2
-      # GROUP-GATE up front, sweep-side, mirroring `Repeater::Sender#group_refusal`: one blocked
-      # member refuses the WHOLE batch and returns all-error Results — a group is one connection
-      # carrying a deliberate sequence, so a partial send would be a misleading half-probe. The
-      # target is read off each member AFTER the same binding expansion `send` applies, so the
-      # scope decision is identical to the lone-send path (BEFORE the socket, per `ClientConn`).
-      requests.each do |req|
-        target = Gori::Outbound.request_target(@evidence ? req : Gori::Env.expand_bindings(req))
-        if err = @outbound.sweep_block(@origin.scheme, @origin.host, target, @origin.port)
+      before_send_refresh
+      # WIRED FIRST, then gated — `Repeater::Sender#send_group`'s discipline, and for its
+      # reason. This ran the seam once to read each target and AGAIN to build the bytes, which
+      # is only the same answer while expansion is idempotent: a `$GEN.*` in a request line
+      # mints a new value per pass, so the gate judged a target the socket never got. One pass
+      # per member, and the verdict is taken on the bytes the pipeline will write.
+      reqs = requests.map do |b|
+        gen = generation
+        wired = @evidence ? b : Gori::Env.expand_bindings(b, generation: gen)
+        Gori::Env.client_hints(Gori::Env.overlay_slot(wired, gen), gen)
+      end
+      # GROUP-GATE, sweep-side, mirroring `Repeater::Sender#group_refusal`: one blocked member
+      # refuses the WHOLE batch and returns all-error Results — a group is one connection
+      # carrying a deliberate sequence, so a partial send would be a misleading half-probe.
+      reqs.each do |req|
+        if err = @outbound.sweep_block(@origin.scheme, @origin.host,
+             Gori::Outbound.request_target(req), @origin.port)
           @blocked += requests.size
           @blocked_reason ||= err
           return requests.map { Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, err) }
         end
       end
-      reqs = @evidence ? requests : requests.map { |b| Gori::Env.expand_bindings(b) }
-      reqs = reqs.map { |b| Gori::Env.overlay_slot(b) }
       Repeater::Engine.send_pipeline(reqs, scheme: @origin.scheme, host: @origin.host,
         port: @origin.port, verify_upstream: @verify, sni: @sni,
         timeout: timeout || @timeout, overrides: @overrides, tls_preset: @tls_preset)
@@ -581,9 +635,14 @@ module Gori::Fuzz
       # real stream multiplexing in H2Engine, a separate, larger change.
       return super if @http2
 
+      # A refresh happens BEFORE the group is dialled, never between warm-up and release: the
+      # race's whole premise is that nothing else happens in that window.
+      before_send_refresh
       bytes = jobs[0].bytes
       verbatim = @evidence ? Backend.all_verbatim(bytes) : jobs[0].payload_spans
-      expanded = Gori::Env.overlay_slot(Gori::Env.expand_bindings(bytes, verbatim))
+      race_gen = generation
+      expanded = Gori::Env.overlay_slot(Gori::Env.expand_bindings(bytes, verbatim, generation: race_gen), race_gen)
+      expanded = Gori::Env.client_hints(expanded, race_gen)
       # Nothing to hold back — degrade rather than slice a negative/empty tail. Never hit by a
       # real HTTP request (always well over 2 bytes); a defensive floor for a hand-built Job.
       return super if expanded.size < 2
@@ -617,96 +676,45 @@ module Gori::Fuzz
         end
       end
 
-      head = expanded[0, expanded.size - 1]
-      tail = expanded[expanded.size - 1, 1]
-      n = jobs.size
-      dial_timeout = timeout || @timeout
-      results = Array(Repeater::Result?).new(n) { nil }
-      sockets = Array(IO?).new(n) { nil }
-
-      # ── assemble: dial, optionally warm up, write everything but the final byte ──────────
-      n.times do |i|
-        upstream, dial_error = Repeater::Engine.dial_result(@origin.scheme, @origin.host,
-          @origin.port, @verify, @sni, dial_timeout, @overrides, @tls_preset)
-        unless upstream
-          msg = Repeater::Engine.connect_error(@origin.scheme, @origin.host, @origin.port, @verify, dial_error)
-          results[i] = Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, "race: dial failed — #{msg}")
-          next
-        end
-        if w = warmup
-          wr = Repeater::Engine.exchange(upstream, w, @origin.host, @origin.port, Time.instant)
-          # The warmup request is now on the wire (whether or not the response says the socket
-          # survives), so it counts toward the true wire total — reported via `extra_requests`,
-          # below the caller's `jobs.size`, matching how ConnPool re-sends are counted.
-          @race_warmups += 1
-          # Same retirement rule `send_pipeline`/`ConnPool` use: an error, an incomplete read,
-          # or a response that itself says the connection will NOT survive (`Connection:
-          # close`, HTTP/1.0 without keep-alive, a close-delimited body) all leave this socket
-          # unusable for a second exchange — writing the race request onto it would either
-          # misframe the response or simply find the socket already gone by release time.
-          # `ConnPool.reusable_response?` is the exact same check the keep-alive pool already
-          # makes before parking a socket (it covers error/incomplete itself); reused here
-          # rather than re-deriving it.
-          unless ConnPool.reusable_response?(wr, Repeater::Engine.request_method(w))
-            upstream.close rescue nil
-            results[i] = Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64,
-              "race: warmup failed — #{wr.error || "the connection will not survive to the race request"}")
-            next
-          end
-        end
-        begin
-          upstream.write(head) # sync=true already flushes; no second syscall needed
-        rescue ex
-          upstream.close rescue nil
-          results[i] = Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, "race: write failed — #{ex.message}")
-          next
-        end
-        sockets[i] = upstream
-      end
-
-      live = (0...n).select { |i| sockets[i] }
-      if live.size < 2
-        # Fewer than 2 connections survived assembly — refuse the release (racing one
-        # connection proves nothing) rather than silently reporting a weaker "race".
-        live.each { |i| sockets[i].try(&.close) rescue nil }
-        return (0...n).map do |i|
-          results[i] || Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64,
-            "race: could not assemble enough live connections (#{live.size} of #{n})")
-        end
-      end
-
-      # ── release: one tight loop, no sleep/channel-op/other I/O between writes ────────────
-      started = Time.instant
-      live.each do |i|
-        socket = sockets[i].not_nil!
-        begin
-          socket.write(tail)
-        rescue ex
-          # A broken socket here must not stop writing to the REST of the group — that would
-          # desynchronize the release far worse than losing one member.
-          results[i] = Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, "race: release write failed — #{ex.message}")
-          socket.close rescue nil
-          sockets[i] = nil
-        end
-      end
-
-      # ── read: no longer time-critical once every byte is on the wire — fan out ───────────
-      released = (0...n).select { |i| sockets[i] }
-      done = Channel(Nil).new(released.size)
-      released.each do |i|
-        spawn do
-          socket = sockets[i].not_nil!
-          results[i] = Repeater::Engine.read_response(socket, expanded, @origin.host, @origin.port, started)
-          socket.close rescue nil
-          done.send(nil)
-        end
-      end
-      released.size.times { done.receive }
-
-      # Every member of a race writes the SAME `expanded` bytes (that is what makes it a race),
-      # so one wire answers for all of them — and it is the post-seam buffer, not `jobs[0].bytes`.
-      (0...n).map { |i| results[i].not_nil!.with_wire(expanded) }
+      # Every member of a fuzz race writes the SAME post-seam `expanded` bytes — that is what
+      # makes it a race — so the distinct-request transport in `Repeater::Engine.race_h1` is
+      # handed N identical wires. The last-byte-sync mechanics (dial per member, per-conn
+      # warm-up + `ConnPool.reusable_response?` retirement, `< 2` live refusal, the tight
+      # release loop, the fan-out read, `with_wire`) all live there now, shared with the
+      # Repeater's own multi-endpoint race (#1236). Only the fuzz-specific pre-work stays here:
+      # the evidence/`$GEN` expansion and the `sweep_block` gate above, and the `@race_warmups`
+      # tally below (each warm-up is a real wire send, reported via `extra_requests`).
+      Repeater::Engine.race_h1(Array.new(jobs.size) { expanded },
+        scheme: @origin.scheme, host: @origin.host, port: @origin.port,
+        verify_upstream: @verify, sni: @sni, timeout: timeout || @timeout,
+        overrides: @overrides, tls_preset: @tls_preset,
+        warmup: warmup, on_warmup: -> { @race_warmups += 1; nil })
     end
+  end
+
+  # A decorator over another Backend. `origin` and every reporting predicate are DELEGATED,
+  # not defaulted: a wrapper is what the Engine holds, so a `Backend#blocked` that stopped at
+  # the outermost layer would report 0 for every gated run there is, and a default
+  # `extra_requests` would hide every re-send the pool underneath it made. `evidence?` for that
+  # same reason once more (see `Backend#evidence?`): a `false` stopping at a wrapper would make
+  # the run's provenance unreadable from the outside and let a spec assert the wrong thing.
+  # A subclass overrides the two-argument `send`, which the one-argument form forwards to.
+  abstract class WrapperBackend < Backend
+    def initialize(@inner : Backend)
+    end
+
+    def origin : Origin
+      @inner.origin
+    end
+
+    delegate blocked, blocked_reason, extra_requests, evidence?, http2?, pooled?,
+      ws_notes, ws_note_reason, close, to: @inner
+
+    def send(bytes : Bytes) : Repeater::Result
+      send(bytes, nil)
+    end
+
+    abstract def send(bytes : Bytes, verbatim : Array({Int32, Int32})?) : Repeater::Result
   end
 
   # Enforces a HARD ceiling on the total number of real network sends. Wraps any Backend
@@ -714,53 +722,47 @@ module Gori::Fuzz
   # retries, redirect hops, and baseline calibration all count against `max_requests`,
   # unlike a dispatch-only check (which counts one-per-payload and overshoots). A nil or
   # non-positive cap is a pass-through no-op. (Shared by the fuzzer and the param-miner.)
-  class CappedBackend < Backend
-    # Stable error string so run_one can skip retries on a permanent budget stop.
-    CAP_ERROR = "max-requests cap reached"
+  class CappedBackend < WrapperBackend
+    include Gori::RequestMacro::Budget
+
+    # Stable error string so run_one can skip retries on a permanent budget stop. It IS the
+    # macro's `BUDGET_ERROR`: a candidate the macro could not pay for must read exactly like one
+    # the cap refused, or the engines would retry the one and not the other.
+    CAP_ERROR = Gori::RequestMacro::BUDGET_ERROR
 
     getter sent : Int64 = 0_i64
+
+    # Once a `reserve` could not fit, the budget is spent for good. `refund` gives back a charge
+    # for a request that never left, and that must not reopen a budget the next macro epoch
+    # already could not pay for: the Miner stops only on `cap_reached?`, so a refund that
+    # un-trips it keeps dispatching and marks every remaining name tested (#1350).
+    @reserve_short = false
+
+    # `Gori::RequestMacro::Budget` — claim `n` requests for a request-time macro's steps (#1350).
+    # The steps are real traffic at the target, so they are charged to the same counter the
+    # candidates are, and `Progress#requests` (which reads it) counts them; refused whole when
+    # they would not fit, exactly as `send_race` refuses a group.
+    def reserve(n : Int64) : Bool
+      if (c = @cap) && c > 0 && @sent + n > c
+        @reserve_short = true
+        return false
+      end
+      @sent += n
+      true
+    end
+
+    # `Gori::RequestMacro::Budget` — the charge for a request that was counted and never sent.
+    # Does not clear `@reserve_short`: see that ivar.
+    def refund(n : Int64) : Nil
+      @sent = Math.max(@sent - n, 0_i64)
+    end
 
     def initialize(@inner : Backend, @cap : Int64?)
     end
 
-    def origin : Origin
-      @inner.origin
-    end
-
     def cap_reached? : Bool
+      return true if @reserve_short
       (c = @cap) && c > 0 ? @sent >= c : false
-    end
-
-    # Delegated, not defaulted: this wrapper is what the Engine holds, so a Backend#blocked
-    # that stopped at the outermost layer would report 0 for every gated run there is.
-    def blocked : Int64
-      @inner.blocked
-    end
-
-    def blocked_reason : String?
-      @inner.blocked_reason
-    end
-
-    # Delegated for the same reason as `blocked`: this wrapper is what the Engine holds, so a
-    # default 0 here would hide every re-send the pool underneath it made.
-    def extra_requests : Int64
-      @inner.extra_requests
-    end
-
-    # Delegated for that same reason once more. Nothing here CONSUMES it — the widening
-    # happens inside `Sender#send`, below this wrapper — but this is the object every
-    # minimize surface and the Miner hold, so a `false` stopping at the cap would make the
-    # run's provenance unreadable from the outside and let a spec assert the wrong thing.
-    def evidence? : Bool
-      @inner.evidence?
-    end
-
-    def http2? : Bool
-      @inner.http2?
-    end
-
-    def send(bytes : Bytes) : Repeater::Result
-      send(bytes, nil)
     end
 
     def send(bytes : Bytes, verbatim : Array({Int32, Int32})?) : Repeater::Result
@@ -778,12 +780,18 @@ module Gori::Fuzz
     #
     # The cap is enforced per GROUP, not per connection within one: splitting a race group at
     # a budget boundary mid-release would corrupt the synchronization the primitive exists to
-    # provide, so a group that is already over cap is refused whole, before any dial. A
-    # per-connection warm-up is NOT pre-charged here — like a ConnPool re-send it happens inside
-    # this one call and is reported after the fact via `extra_requests` (see `Sender#send_race`).
+    # provide, so a group that would END over cap is refused whole, before any dial — judged
+    # against what the group puts on the wire, one warm-up per connection included (#1204).
+    # `Plan.build` refuses such a run up front; this holds the line for any other caller. The
+    # warm-ups are still not CHARGED to `sent`: like a ConnPool re-send they happen inside this
+    # one call and are reported after the fact via `extra_requests` (see `Sender#send_race`).
     def send_race(jobs : Array(Job), warmup : Bytes? = nil, timeout : Time::Span? = nil) : Array(Repeater::Result)
       return [] of Repeater::Result if jobs.empty?
-      return jobs.map { Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, CAP_ERROR) } if cap_reached?
+      # No warm-up goes out under h2 — `Sender#send_race` degrades to independent sends there.
+      wire = jobs.size.to_i64 * (warmup && !http2? ? 2 : 1)
+      if (c = @cap) && c > 0 && @sent + wire > c
+        return jobs.map { Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, CAP_ERROR) }
+      end
       @sent += jobs.size
       @inner.send_race(jobs, warmup: warmup, timeout: timeout)
     end
@@ -804,51 +812,18 @@ module Gori::Fuzz
       @sent += 1
       @inner.send_ws(handshake, frames, verbatim)
     end
-
-    # Delegated, as `blocked` is and for the same reason: this wrapper is what the Engine holds.
-    def ws_notes : Int64
-      @inner.ws_notes
-    end
-
-    def ws_note_reason : String?
-      @inner.ws_note_reason
-    end
-
-    def close : Nil
-      @inner.close
-    end
   end
 
   # Applies the `Gori::Outbound` gate to a backend the caller INJECTED (Probe Active lets
   # a scan drive the rules through a supplied Backend). `Sender` gates itself, so this is
   # only for the non-Sender case — it is never stacked on one, and both use the same
   # `Outbound#sweep_block` decision, so the gate can't drift between the two paths.
-  class GatedBackend < Backend
+  class GatedBackend < WrapperBackend
+    # This gate's own refusals, not the inner backend's.
     getter blocked : Int64 = 0_i64
     getter blocked_reason : String? = nil
 
     def initialize(@inner : Backend, @outbound : Gori::Outbound)
-    end
-
-    def origin : Origin
-      @inner.origin
-    end
-
-    def extra_requests : Int64
-      @inner.extra_requests
-    end
-
-    # Delegated, as on `CappedBackend` — see `Backend#evidence?`.
-    def evidence? : Bool
-      @inner.evidence?
-    end
-
-    def http2? : Bool
-      @inner.http2?
-    end
-
-    def send(bytes : Bytes) : Repeater::Result
-      send(bytes, nil)
     end
 
     def send(bytes : Bytes, verbatim : Array({Int32, Int32})?) : Repeater::Result
@@ -874,18 +849,6 @@ module Gori::Fuzz
       end
       @inner.send_ws(handshake, frames, verbatim)
     end
-
-    def ws_notes : Int64
-      @inner.ws_notes
-    end
-
-    def ws_note_reason : String?
-      @inner.ws_note_reason
-    end
-
-    def close : Nil
-      @inner.close
-    end
   end
 
   # Runs a generator's jobs concurrently and streams events. Concurrency model
@@ -899,7 +862,7 @@ module Gori::Fuzz
   #   coordinator fiber — waits for all workers to finish, emits Done, closes @events.
   # Progress events are droppable (latest wins); Result/Done/Error are not.
   class Engine
-    # Outbound rate limiting (rps / throttle_ms / jitter_ms) over `@last_dispatch`.
+    # Outbound rate limiting (rps / throttle_ms) over `@last_dispatch`.
     include Gori::Pacing
 
     EVENT_BUFFER    =  256
@@ -914,12 +877,6 @@ module Gori::Fuzz
     # randomly-payloaded samples can, at the cost of this many extra sends up front.
     CALIBRATION_SAMPLES = 6
 
-    enum State : UInt8
-      Running
-      Paused
-      Stopped
-    end
-
     # Thrown inside the captured generation block to halt it (a captured block can't
     # `break`). Unwinds the generator's iterator `ensure`s, so file fds still close.
     private class Halt < Exception
@@ -932,10 +889,9 @@ module Gori::Fuzz
     # `CappedBackend#sent` — the true wire count — without a runtime `is_a?` at every read.
     @backend : CappedBackend
     @concurrency : Int32
-    @state : State
-    @wake : Channel(Nil)
+    @stopped = false
     @jobs : Channel(Job)
-    @finished : Channel(Nil)
+    @finished : WaitGroup
     @sent : Int64
     @matched : Int64
     @errors : Int64
@@ -949,13 +905,28 @@ module Gori::Fuzz
     # but the fuzz `snapshot` now publishes THIS one.
     @blocked : Int64
     @blocked_reason : String?
+    # Why the run's own `stop_on` ended it (issue #1240), or nil for a run that reached its end,
+    # was ^X'd, or hit the budget. Set ONCE in `record_result` — the first row that meets the
+    # condition or takes the match count to `stop_after_matches` — and rides the `DoneEvent` so
+    # the verdict is `Terminal::ConditionMet` rather than `stopped`. A run with no stop_on never
+    # touches it, so nothing changes for one.
+    @stop_reason : String?
+    # The `Result#index` of that same row (issue #1270), set with `@stop_reason` and nowhere
+    # else, so the two are nil together — see `DoneEvent#stop_index`.
+    @stop_index : Int64?
     @dispatched : Int64
     @last_dispatch : Time::Instant
     @total : Int64?
     @total_computed : Bool
     @race_count : Int32?
+    # The run's request-time macro (#1350), or nil for the run that has none — which is every run
+    # there was. See `candidate_send`.
+    @request_macro : Gori::RequestMacro::Lane?
+    # The macro's abort is reported ONCE, however many workers see it.
+    @macro_abort_sent : Bool = false
 
-    def initialize(@generator : Generator, @matcher : Matcher, backend : Backend, @config : Config)
+    def initialize(@generator : Generator, @matcher : Matcher, backend : Backend, @config : Config,
+                   @request_macro : Gori::RequestMacro::Lane? = nil)
       # Wrap so max_requests is a TRUE hard cap on real sends — retries, redirect hops and
       # baseline calibration all count, not just one-per-dispatched-payload (nil cap = no-op).
       @backend = CappedBackend.new(backend, @config.max_requests)
@@ -963,22 +934,44 @@ module Gori::Fuzz
       # channel fleet — the CLI's --concurrency is otherwise unbounded.
       conc = @config.concurrency.clamp(1, MAX_CONCURRENCY)
       @concurrency = conc
-      @state = State::Running
-      @wake = Channel(Nil).new(1)
       @jobs = Channel(Job).new(conc)
       @events = Channel(Event).new(EVENT_BUFFER)
-      @finished = Channel(Nil).new(conc)
+      @finished = WaitGroup.new(conc)
       @sent = 0_i64
       @matched = 0_i64
       @errors = 0_i64
       @blocked = 0_i64
       @blocked_reason = nil.as(String?)
+      @stop_reason = nil.as(String?)
+      @stop_index = nil.as(Int64?)
       @dispatched = 0_i64
       @last_dispatch = Time.instant
       @total = nil.as(Int64?)
       @total_computed = false
       # Same deepest-point clamp as @concurrency above (see MAX_RACE_SIZE).
       @race_count = @config.race_count.try(&.clamp(1, MAX_RACE_SIZE))
+      # The macro's steps are this run's traffic: charged to its budget, held to its rate, and
+      # stopped when it is. The pacer re-reads the interval each time, so a rate the operator
+      # changes is the rate the steps keep too.
+      @request_macro.try(&.attach(@backend, -> { pace(pace_interval) }, -> { @stopped }))
+    end
+
+    # The run's macro lane, for a surface that reports it (`Plan#request_macro_info`) or the
+    # tally it keeps.
+    def request_macro : Gori::RequestMacro::Lane?
+      @request_macro
+    end
+
+    # The worker count the engine actually runs at, after the deepest-point clamp — what a
+    # macro's `Info#concurrency` is bounded by.
+    def concurrency : Int32
+      @concurrency
+    end
+
+    # The requests the run's macro adds to `total` candidates, for the huge-run gates
+    # (`Fuzz.request_bound`); 0 without a macro.
+    def macro_requests(total : Int64?) : Int64
+      @request_macro.try(&.macro_requests(total)) || 0_i64
     end
 
     # Total request count (memoized). Computing it also opens/counts wordlists, which
@@ -1015,6 +1008,25 @@ module Gori::Fuzz
       @matcher.constrained?
     end
 
+    # How many calibration samples fit under `max_requests` while leaving one candidate — and,
+    # when the run has a macro, the steps that candidate's epoch runs. Each sample is priced
+    # the same way (`1 + Lane#macro_requests`), so a per-request macro cannot spend the cap on
+    # samples and leave the sweep nothing. 0 means "skip calibration".
+    private def calibration_samples : Int32
+      wanted = CALIBRATION_SAMPLES
+      return wanted unless (cap = @config.max_requests) && cap > 0
+      lane = @request_macro
+      hold = lane ? 1_i64 + lane.macro_requests(1_i64) : 1_i64
+      room = cap - hold
+      return 0 if room <= 0
+      wanted = Math.min(wanted.to_i64, room).to_i32
+      return wanted unless lane
+      while wanted > 0 && wanted.to_i64 + lane.macro_requests(wanted.to_i64) > room
+        wanted -= 1
+      end
+      wanted
+    end
+
     # Seed the matcher's calibration set from CALIBRATION_SAMPLES synthetic,
     # randomly-payloaded requests (see Generator#calibration_requests and
     # Matcher.reflects_length?) — replaces the old single-snapshot baseline, which a
@@ -1026,11 +1038,12 @@ module Gori::Fuzz
     # calibration is skipped entirely — the old `Math.max(cap - 1, 1)` still wanted 1
     # sample and left zero for the sweep, despite the comment promising the opposite).
     # A failed/empty calibration is non-fatal — auto_calibrate then simply suppresses
-    # nothing.
+    # nothing. With a request-time macro, what is held back is one candidate plus the steps
+    # its epoch runs (`calibration_samples`).
     def calibrate_baseline : Nil
       # A stop that landed before the run fiber's first tick (the TUI publishes `v.engine`
       # before spawning, so ^X can arrive here) must not open with a burst of real sends.
-      return if @state == State::Stopped
+      return if @stopped
       # A race run has no payload sweep to calibrate against. `Generator#calibration_requests`
       # for a 0-position race template returns copies of the baseline — i.e. the race request
       # ITSELF — so calibrating would fire that side-effecting request up to CALIBRATION_SAMPLES
@@ -1045,26 +1058,27 @@ module Gori::Fuzz
       # script's side effects up to CALIBRATION_SAMPLES times before the sweep proper, which is
       # exactly what `Config#race_warmup`'s doc forbids. `Plan#ws_ignored_knobs` reports it.
       return if @generator.ws?
-      wanted = CALIBRATION_SAMPLES
-      if (cap = @config.max_requests) && cap > 0
-        room = cap - 1
-        return if room <= 0
-        wanted = Math.min(wanted.to_i64, room).to_i32
-      end
+      wanted = calibration_samples
+      return if wanted <= 0
       samples = [] of BaselineSample
       interval = pace_interval
       @generator.calibration_requests(wanted).each do |bytes, payload_len|
-        # `stop` only sets the flag and pokes @wake, which this loop never waits on, so the
+        # `stop` only sets the flag, which this loop never waits on, so the
         # remaining samples used to go out one by one AFTER the operator asked to stop — and
         # `pace` below widens that window to a full rate interval each (at rps 0.2, ~25s of
         # trailing sends under "stopping…"). `dispatch_loop` re-reads the flag every job for
         # the same reason; this is the same check at the phase that runs BEFORE it.
-        break if @state == State::Stopped
+        break if @stopped
         # Calibration samples are real requests at the target, sent before `start`'s dispatch
         # loop exists — so without this they were the one burst that ignored `--rate` outright.
-        pace(interval)
-        raw = @backend.send(bytes)
+        break unless pace(interval)
+        # Through the macro's gate like any candidate (#1350): a sample carries the same template,
+        # so a baseline taken with a stale token would be a baseline of 403s, and every real
+        # response would then differ from it.
+        raw = candidate_send { @backend.send(bytes) }
+        break unless raw
         samples << BaselineSample.new(@matcher.metrics(raw), payload_len) if raw.error.nil?
+        note_macro_abort
       end
       @matcher.baseline = samples
     rescue
@@ -1100,22 +1114,12 @@ module Gori::Fuzz
       end
     end
 
-    def stop : Nil
-      @state = State::Stopped
-      poke
-    end
-
-    def pause : Nil
-      @state = State::Paused
-    end
-
-    def resume : Nil
-      @state = State::Running
-      poke
-    end
-
     def stopped? : Bool
-      @state == State::Stopped
+      @stopped
+    end
+
+    def stop : Nil
+      @stopped = true
     end
 
     # ── fibers ─────────────────────────────────────────────────────────────────
@@ -1123,14 +1127,12 @@ module Gori::Fuzz
     private def dispatch_loop : Nil
       interval = pace_interval
       @generator.each do |job|
-        raise Halt.new if @state == State::Stopped
-        park_if_paused
-        raise Halt.new if @state == State::Stopped
+        raise Halt.new if @stopped
         # Soft job-count check (cheap) plus the hard real-send ceiling: retries/redirects
         # can exhaust CappedBackend mid-run while @dispatched is still under cap.
         raise Halt.new if (cap = @config.max_requests) && cap > 0 && @dispatched >= cap
         raise Halt.new if @backend.cap_reached?
-        pace(interval)
+        raise Halt.new unless pace(interval)
         @jobs.send(job)
         @dispatched += 1
       end
@@ -1149,12 +1151,15 @@ module Gori::Fuzz
         # this the operator's stop still fired ~2x concurrency of extra requests; now
         # only the requests already in-flight (inside run_one) finish, matching the
         # documented "in-flight requests finish".
-        next if @state == State::Stopped
+        next if @stopped
         result =
           begin
+            # nil: the run was stopped while this candidate waited at the macro's gate — nothing
+            # was sent, so there is no row to report (the drain above does the same for a job
+            # that never left the queue).
             run_one(job)
           rescue ex
-            # A raise here used to kill the worker outright. `@finished` still fires from the
+            # A raise here used to kill the worker outright. `@finished.done` still fires from the
             # ensure below, so `coordinate` completes and the sweep reports Done with a
             # plausible count — while that payload's row is gone and concurrency is silently
             # down one for the rest of the run. Worse, if EVERY worker dies this way,
@@ -1166,10 +1171,11 @@ module Gori::Fuzz
             @events.send(ErrorEvent.new(ex.message || "fuzz worker error"))
             next
           end
+        next unless result
         record_result(result)
       end
     ensure
-      @finished.send(nil)
+      @finished.done
     end
 
     # One race group: N copies of the SAME baseline request (no §…§ substitution — a race
@@ -1179,10 +1185,10 @@ module Gori::Fuzz
     # `Backend#send_race` could not assemble/release carries a `race: …`-prefixed error
     # string in its Result rather than a new field — see `Sender#send_race`.
     private def run_race(n : Int32) : Nil
-      return if @state == State::Stopped
+      return if @stopped
       base = @generator.baseline_request
       jobs = Array.new(n) { |i| Job.new(i.to_i64, [] of String, nil, base) }
-      results = @backend.send_race(jobs, warmup: @config.race_warmup, timeout: @config.timeout)
+      results = race_send(jobs)
       results.each_with_index do |raw, i|
         # A scope-gate refusal (Sandbox / an exclude rule) is a PAYLOAD-unit block, exactly as
         # `run_one` treats it on the sweep path — bump the ENGINE's `@blocked` so the "blocked ·
@@ -1196,6 +1202,7 @@ module Gori::Fuzz
         end
         record_result(@matcher.build(jobs[i], raw))
       end
+      note_macro_abort
     rescue ex
       # The same channel `dispatch_loop` and `worker_loop` use: a raise here — `baseline_request`
       # forking an `exec:` chain that fails, a backend double that throws — used to leave the
@@ -1204,7 +1211,7 @@ module Gori::Fuzz
       @events.send(ErrorEvent.new(ex.message || "fuzz race error"))
     ensure
       @backend.close rescue nil
-      @events.send(DoneEvent.new(snapshot, @state == State::Stopped))
+      @events.send(DoneEvent.new(snapshot, @stopped, @stop_reason, @stop_index))
       @events.close
     end
 
@@ -1225,12 +1232,43 @@ module Gori::Fuzz
       # failures. `resent_count` is 0 on the common path, so a clean run is byte-unchanged; and
       # it never double-counts the final attempt, which is the one the `||` above already saw.
       @errors += result.resent_count
+      # BEFORE the blocking send, with no yield since `@matched` moved: this row's own
+      # increment is the one being judged. After the send another worker could have matched in
+      # between, and an `after_matches` stop then named the earlier row as the Nth (#1270).
+      check_stop_condition(result)
       @events.send(ResultEvent.new(result)) # blocking — never drop a row
       emit_progress
     end
 
+    # End the run when its `stop_on` is met — the separate condition matched this row, or the
+    # run's own matchers have now hit `stop_after_matches` times (issue #1240). Called from
+    # `record_result`, the ONE bookkeeping path both `worker_loop` and `run_race` share, so a
+    # race group is covered too. `stop` here is exactly ^X: the dispatcher halts and in-flight
+    # requests finish, so the run does not send a burst after it has already found its answer.
+    #
+    # `@stop_reason` is set once (the first row to trip it), which is what turns the verdict
+    # into `Terminal::ConditionMet`; `@stop_index` names that row, in both branches — the
+    # count branch's row is a plain match with `stop_hit?` false, and it is still the one the
+    # run ended on. `stop_hit?` outranks the count so the reason names the sharper signal when
+    # both hold on the same row.
+    private def check_stop_condition(result : Result) : Nil
+      return unless @stop_reason.nil?
+      # Already stopped with no reason = an operator stop (^X, fuzz_stop) landed first. An
+      # in-flight row that meets the condition afterwards must not relabel it `condition_met`.
+      return if @stopped
+      if result.stop_hit?
+        @stop_reason = "stop condition met on result #{result.index} after #{@sent} sent"
+      elsif (n = @config.stop_after_matches) && n > 0 && @matched >= n
+        @stop_reason = "reached #{n} match#{n == 1 ? "" : "es"} on result #{result.index} after #{@sent} sent"
+      else
+        return
+      end
+      @stop_index = result.index
+      stop
+    end
+
     private def coordinate : Nil
-      @concurrency.times { @finished.receive }
+      @finished.wait
       # Every worker has left run_one, so no fiber can be holding a checked-out socket:
       # release the keep-alive pool's parked ones instead of waiting for GC to finalize
       # them (a stopped 50-worker run would otherwise sit on 50 fds). `rescue nil` for the
@@ -1240,7 +1278,7 @@ module Gori::Fuzz
       # means `finalize_job` never runs, pinning the job at `:running` and blocking
       # `switch_project`/`delete_project` for the rest of the session.
       @backend.close rescue nil
-      @events.send(DoneEvent.new(snapshot, @state == State::Stopped))
+      @events.send(DoneEvent.new(snapshot, @stopped, @stop_reason, @stop_index))
     ensure
       # ALWAYS close, on every exit path: closing is what turns the consumer's blocking
       # `receive?` into a nil and lets it finish. `Channel#close` is idempotent.
@@ -1249,16 +1287,34 @@ module Gori::Fuzz
 
     # ── per-request ──────────────────────────────────────────────────────────────
 
-    private def run_one(job : Job) : Result
+    private def run_one(job : Job) : Result?
       if frames = job.ws_frames
         return run_one_ws(job, frames)
       end
       attempts = 0
       resent_count = 0
+      failed = nil.as(Repeater::Result?)
       loop do
         # The payload spans ride with the bytes: `Sender` needs them to tell the operator's
         # test case from the template it was spliced into (see `Backend#send`).
-        raw = @backend.send(job.bytes, job.payload_spans)
+        #
+        # Through the request-time macro's gate when the run has one (#1350), and per ATTEMPT: a
+        # retry is a request, so a `request` cadence gives it a value of its own.
+        raw = candidate_send { @backend.send(job.bytes, job.payload_spans) }
+        return nil unless raw
+        # A retry the budget refused sent nothing: the row is the failure it was retrying, and
+        # that retry was never a superseded attempt. Returning the cap marker read a dead origin
+        # as "the budget ran out" (as in Discover/Miner/Sequencer's `send_with_retries`).
+        if prior = budget_refused_retry(failed, raw)
+          return @matcher.build(job, prior, resent_count: resent_count - 1)
+        end
+        # The macro failed, so the candidate was never sent. Its row stands in for it, is never
+        # retried (the macro would only fail again, against the endpoint that just failed), and
+        # is checked for the run-ending case.
+        if Gori::RequestMacro.failed?(raw.error)
+          note_macro_abort
+          return @matcher.build(job, raw, resent_count: resent_count)
+        end
         # A scope-gate refusal (Sandbox / an explicit exclude rule) is a PAYLOAD-unit block:
         # count it once HERE and return, never retry it. Two things depended on this together:
         #   * the OLD loop DID retry it — a gate error is not `CAP_ERROR` — so with `--retries N`
@@ -1285,14 +1341,15 @@ module Gori::Fuzz
         # a retry is a NEW request, so with `--retries 5 --retry-pause 1s` each busy worker kept
         # the origin under fire for five more sends and five more seconds after the stop (P5:
         # a stop stops). The attempt that already failed is reported as it stands.
-        if retryable?(raw) && attempts < @config.retries && @state != State::Stopped
+        if retryable?(raw) && attempts < @config.retries && !@stopped
           sleep @config.retry_pause
           # Re-read AFTER the pause: that is where a stop lands on a run whose retries are
           # paced. Counted only when the re-send actually happens, so `resent_count` stays
           # "attempts that were superseded" and not "pauses that were slept".
-          unless @state == State::Stopped
+          unless @stopped
             attempts += 1
             resent_count += 1
+            failed = raw
             next
           end
         end
@@ -1310,28 +1367,45 @@ module Gori::Fuzz
     # there is no 3xx for a hop to follow, so calling it would be dead code that reads as if
     # redirect-following were a thing a WS run could do. `Plan#ws_ignored_knobs` says so once,
     # up front, instead.
-    private def run_one_ws(job : Job, frames : Array(WsFrame)) : Result
+    private def run_one_ws(job : Job, frames : Array(WsFrame)) : Result?
       attempts = 0
       resent_count = 0
+      failed = nil.as({Repeater::Result, WsOutcome}?)
       loop do
-        raw, ws = @backend.send_ws(job.bytes, frames, job.payload_spans)
+        pair = ws_send(job, frames)
+        return nil unless pair
+        raw, ws = pair
+        # As in `run_one`: a budget-refused retry answers with the failure it was retrying.
+        if (prior = failed) && raw.error == CappedBackend::CAP_ERROR
+          return @matcher.build(job, prior[0], resent_count: resent_count - 1).with_ws(prior[1])
+        end
+        if Gori::RequestMacro.failed?(raw.error)
+          note_macro_abort
+          return @matcher.build(job, raw, resent_count: resent_count).with_ws(ws)
+        end
         if gate_refused?(raw.error)
           @blocked += 1
           @blocked_reason ||= raw.error
           return @matcher.build(job, raw, resent_count: resent_count).with_ws(ws)
         end
-        # `@state` guard for the reason `run_one` gives: a retry is a new session, not an
+        # `@stopped` guard for the reason `run_one` gives: a retry is a new session, not an
         # in-flight one, and a stop must not open five more.
-        if retryable?(raw) && attempts < @config.retries && @state != State::Stopped
+        if retryable?(raw) && attempts < @config.retries && !@stopped
           sleep @config.retry_pause
-          unless @state == State::Stopped
+          unless @stopped
             attempts += 1
             resent_count += 1
+            failed = pair
             next
           end
         end
         return @matcher.build(job, raw, resent_count: resent_count).with_ws(ws)
       end
+    end
+
+    # The failure a retry was retrying, when the budget refused that retry (nothing was sent).
+    private def budget_refused_retry(failed : Repeater::Result?, raw : Repeater::Result) : Repeater::Result?
+      failed if raw.error == CappedBackend::CAP_ERROR
     end
 
     # Whether a failed send is worth sending again. A permanent max-requests stop never is
@@ -1342,6 +1416,73 @@ module Gori::Fuzz
     private def retryable?(raw : Repeater::Result) : Bool
       return false if raw.error.nil? || raw.error == CappedBackend::CAP_ERROR
       !(raw.timed_out? && @matcher.timeout_matchable?)
+    end
+
+    # ── request-time macro (#1350) ───────────────────────────────────────────────
+
+    # One candidate send, through the macro's gate when the run has one; nil when the run was
+    # stopped while the candidate waited (nothing was sent, so there is nothing to report).
+    #
+    # A refused candidate — the steps failed, or the run was already ended by them — comes back
+    # as an ORDINARY errored `Repeater::Result` whose error carries `RequestMacro::ERROR_PREFIX`,
+    # so it flows through the matcher, the counters and every surface's row as an error and can
+    # never be mistaken for the target's answer. The gate holds the candidate for the whole send
+    # (see `RequestMacro::Lane` for the epochs that makes true), so the block runs INSIDE it.
+    private def candidate_send(& : -> Repeater::Result) : Repeater::Result?
+      lane = @request_macro
+      return yield unless lane
+      lane.around do |entry|
+        if entry.send?
+          yield
+        elsif entry.cancelled?
+          nil
+        else
+          Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, entry.error)
+        end
+      end
+    end
+
+    # `candidate_send` for one WebSocket session.
+    private def ws_send(job : Job, frames : Array(WsFrame)) : {Repeater::Result, WsOutcome}?
+      lane = @request_macro
+      return @backend.send_ws(job.bytes, frames, job.payload_spans) unless lane
+      lane.around do |entry|
+        if entry.send?
+          @backend.send_ws(job.bytes, frames, job.payload_spans)
+        elsif entry.cancelled?
+          nil
+        else
+          {Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, entry.error), WsOutcome.failed}
+        end
+      end
+    end
+
+    # A race group is ONE unit for the macro: the steps run once, before the group is dialled,
+    # and every member shares what they left (`Plan.build` refuses a cadence that could not
+    # honour that). Nothing runs between the warm-up and the release.
+    private def race_send(jobs : Array(Job)) : Array(Repeater::Result)
+      lane = @request_macro
+      return @backend.send_race(jobs, warmup: @config.race_warmup, timeout: @config.timeout) unless lane
+      lane.around do |entry|
+        if entry.send?
+          @backend.send_race(jobs, warmup: @config.race_warmup, timeout: @config.timeout)
+        elsif entry.cancelled?
+          [] of Repeater::Result
+        else
+          jobs.map { Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, entry.error) }
+        end
+      end
+    end
+
+    # End the run when the macro has ended it: a failure under `stop`, or too many in a row. The
+    # ErrorEvent is what turns the run's verdict into `error` on every surface, so a run the
+    # macro killed can never finish as a clean one; `stop` lets what is in flight complete.
+    private def note_macro_abort : Nil
+      return if @macro_abort_sent
+      return unless (lane = @request_macro) && (reason = lane.abort_reason)
+      @macro_abort_sent = true
+      stop
+      @events.send(ErrorEvent.new(reason))
     end
 
     # A send the SCOPE GATE refused before the socket, told apart from a network error by the
@@ -1384,7 +1525,7 @@ module Gori::Fuzz
       while hops < @config.max_redirects
         # A hop is a NEW request, not an in-flight one — same rule as the retry loop in
         # `run_one`: after a stop the payload's own answer (the 3xx in `current`) is the row.
-        break if @state == State::Stopped
+        break if @stopped
         resp = current.response
         break unless resp && (300..399).includes?(resp.status)
         loc = resp.headers.get?("location")
@@ -1405,7 +1546,7 @@ module Gori::Fuzz
         # the origin may have re-encoded, moved or duplicated the payload on its way through
         # `Location`, so locating them again is guesswork with a credential as the stake.
         # Excluding the whole message needs no guess and gives up nothing: every byte of `nxt`
-        # is either a literal gori wrote (`GET`, `Host:`, `Connection: close`) or the origin's
+        # is either a literal gori wrote (`GET`, `Host:`, maybe `Connection: close`) or the origin's
         # own `Location`. Neither is a place an operator could have written a `$NAME` for a
         # binding to resolve, so there is nothing here to substitute in the first place.
         # A hop is a REQUEST, so it owes the operator's rate the same as any other. Only the
@@ -1413,7 +1554,7 @@ module Gori::Fuzz
         # chain ran at up to (max_redirects + 1)x the configured rate — 6x at defaults, on
         # every 3xx, which is the ordinary shape of an auth-gated target. `pace` claims its
         # slot without yielding, so calling it from this worker fiber is safe.
-        pace(pace_interval)
+        break unless pace(pace_interval)
         hop = @backend.send(nxt, Backend.all_verbatim(nxt))
         retried ||= hop.retried?
         total_us += hop.duration_us
@@ -1466,11 +1607,13 @@ module Gori::Fuzz
       # literal bracketed (`Host: ::1:8080` is not a host and a port, it is a parse error), the
       # port dropped when it is the scheme default.
       host = Repeater::FlowRequest.authority(o.scheme, o.host, o.port)
-      # `Connection: close` is an h1 instruction — it hands the hop its own socket instead of
-      # the keep-alive pool's parked one. On h2 it is a connection-specific field a conforming
-      # server MUST reject (RFC 9113 §8.2.2), and it went out on every hop of an h2 sweep; the
-      # hop rides the h2 pool like any other request there. See `Backend#http2?`.
-      conn = @backend.http2? ? "" : "Connection: close\r\n"
+      # `Connection: close` is an h1 instruction, and it is only written when nothing pools: on
+      # a pooled h1 run it made `ConnPool.reusable_request?` refuse the socket, so every hop
+      # dialed a fresh one for a bodyless GET gori wrote itself — no operator bytes to keep.
+      # On h2 it is a connection-specific field a conforming server MUST reject (RFC 9113
+      # §8.2.2), and it went out on every hop of an h2 sweep. Either way the hop now rides the
+      # run's pool like any other request. See `Backend#http2?` / `Backend#pooled?`.
+      conn = @backend.http2? || @backend.pooled? ? "" : "Connection: close\r\n"
       {"GET #{path} HTTP/1.1\r\nHost: #{host}\r\n#{conn}\r\n".to_slice, path}
     end
 
@@ -1517,27 +1660,8 @@ module Gori::Fuzz
       (URI.parse(abs) rescue nil) || URI.parse(root)
     end
 
-    # ── lifecycle (pause / wake) ─────────────────────────────────────────────────
-
-    private def park_if_paused : Nil
-      while @state == State::Paused
-        @wake.receive
-      end
-    end
-
-    private def poke : Nil
-      select
-      when @wake.send(nil)
-      else
-      end
-    end
-
     private def emit_progress : Nil
-      ev = ProgressEvent.new(snapshot)
-      select
-      when @events.send(ev)
-      else
-      end
+      offer(@events, ProgressEvent.new(snapshot))
     end
 
     private def snapshot : Progress
@@ -1550,7 +1674,7 @@ module Gori::Fuzz
       Progress.new(@sent, total, @matched, @errors, @blocked, @blocked_reason,
         @backend.sent + @backend.extra_requests,
         @matcher.grpc_stale, @matcher.grpc_requests, @matcher.grpc_stale_reason,
-        @backend.ws_notes, @backend.ws_note_reason)
+        @backend.ws_notes, @backend.ws_note_reason, @request_macro.try(&.tally))
     end
   end
 end

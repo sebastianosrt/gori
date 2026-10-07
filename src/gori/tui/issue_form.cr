@@ -1,8 +1,10 @@
 require "./screen"
 require "./line_edit"
 require "./theme"
+require "./issue_presentation"
 require "./frame"
 require "./overlay"
+require "../evidence"
 require "../store"
 
 module Gori::Tui
@@ -26,6 +28,8 @@ module Gori::Tui
   # typing row and the builder were two editable copies of one value a row apart. One value,
   # one place to edit it, and `↵` keeps meaning "go on" rather than a chord you have to know.
   class IssueForm < Overlay
+    include IssuePresentation
+
     # Card geometry + the two labels the draw lays down, in one place because `render` and the
     # click hit-tests below both measure off them. A second copy of `"severity ‹ "` next to the
     # inverse is this repo's standing hazard: the moment the two drift, the click lands on a
@@ -65,6 +69,11 @@ module Gori::Tui
     getter preedit : String
     getter extra_flow_ids : Array(Int64)
     getter notes : String
+    # "+ New issue…" from the LINK & FREEZE picker (#1038): the copies taken at the pick,
+    # written once the issue exists. Carried on the form for the reason `link_ref` is —
+    # dropping the form drops them with it — and taken BEFORE the form rather than after,
+    # so the byte-cost confirm has already been answered by the time ↵ files the issue.
+    getter snapshots : Array(Evidence::Snapshot)
 
     # Where the shell lands after a SUCCESSFUL create. False (the default) is History's
     # ⇧F: you file the issue and the shell takes you to it. True is a create raised in the
@@ -91,7 +100,8 @@ module Gori::Tui
                    @extra_flow_ids : Array(Int64) = [] of Int64,
                    @notes : String = "",
                    @cvss : String = "",
-                   @stay_on_create : Bool = false)
+                   @stay_on_create : Bool = false,
+                   @snapshots : Array(Evidence::Snapshot) = [] of Evidence::Snapshot)
       @cx = @issue_title.size
       @preedit = ""
       @sel = ROW_TITLE
@@ -220,14 +230,6 @@ module Gori::Tui
       @severity_from_cvss = false
     end
 
-    def insert(ch : Char) : Nil
-      insert_title(ch)
-    end
-
-    def backspace : Nil
-      backspace_title
-    end
-
     def move(d : Int32) : Nil
       move_title(d)
     end
@@ -262,14 +264,10 @@ module Gori::Tui
       @sel = ROW_CVSS
     end
 
-    def focus_severity : Nil
-      @sel = ROW_SEV
-    end
-
     def overlay_box(area : Rect) : Rect?
       w = {area.w - 4, CARD_W}.min
       return nil if w < 12 || area.h < CARD_H
-      Rect.new(area.x + (area.w - w) // 2, area.y + (area.h - CARD_H) // 2, w, CARD_H)
+      area.center(w, CARD_H)
     end
 
     def render(screen : Screen, area : Rect) : Nil
@@ -319,12 +317,12 @@ module Gori::Tui
       if @cvss.empty?
         screen.text(vx, cy, CVSS_EMPTY, Theme.muted, Theme.panel, width: vw)
       else
-        screen.text(vx, cy, @cvss, sev_color(@severity), Theme.panel, width: vw)
+        screen.text(vx, cy, @cvss, severity_color(@severity), Theme.panel, width: vw)
       end
 
       # Severity row
       sx = screen.text(box.x + 2, box.y + SEV_ROW, SEV_PREFIX, on_sev ? Theme.accent : Theme.muted, Theme.panel)
-      sx = screen.text(sx, box.y + SEV_ROW, @severity.label.upcase, sev_color(@severity), Theme.panel, Attribute::Bold)
+      sx = screen.text(sx, box.y + SEV_ROW, @severity.label.upcase, severity_color(@severity), Theme.panel, Attribute::Bold)
       # The severity row is where the qualitative reading lives, so the SCORE that produced it
       # is named here rather than crowding the vector off its own row one line up.
       suffix = if on_sev
@@ -353,16 +351,6 @@ module Gori::Tui
 
     private def sev_forward_end(box : Rect) : Int32
       box.x + 2 + Screen.draw_width(SEV_PREFIX) + Screen.draw_width(@severity.label.upcase) + 1
-    end
-
-    private def sev_color(s : Store::Severity) : Color
-      case s
-      when .critical? then Theme.red
-      when .high?     then Theme.orange
-      when .medium?   then Theme.yellow
-      when .low?      then Theme.accent
-      else                 Theme.muted
-      end
     end
   end
 end

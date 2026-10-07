@@ -31,22 +31,29 @@ module Gori::Tui
       {"GLOBAL", [
         Item.new("^P", "command palette", "app.palette"),
         Item.new("space", "focus-area action menu"),
+        # The family's bare key (`Verb::Family#chord`, #1295): no `space` needed on a tab that sends flows.
+        # Read from History's opener, so a user who put a Global verb on `>` (which then wins it,
+        # `Keymap.global_claims`) is shown `space → >` instead of a bare key that is not this.
+        Item.new(">", "send flow to… card, where the tab has one", "send-flow.open.body"),
+        Item.new("⇧Z", "display… card, where the tab has one", "display.open.body"),
+        Item.new("⇧P", "protocol… card (Repeater, Fuzzer)", "protocol.open.repeater"),
         Item.new("c", "toggle capture", "capture.toggle"),
         Item.new("i", "toggle intercept", "intercept.toggle"),
         Item.new("s", "toggle scope lens (or click scope:N)", "scope.toggle-lens"),
-        Item.new("^P", "Match & Replace → Rewriter tab (palette)", "rules.edit"),
-        Item.new("badge / ^P", "notification center (palette; rebindable)", "app.notifications"),
+        Item.new("^P →", "Match & Replace — open the Rewriter tab", "rules.edit"),
+        Item.new("^P →", "Notifications — the notification center (or click the notify badge)", "app.notifications"),
         Item.new("^, / ⚙", "preferences — every setting (also ^P → Settings)", "settings.open"),
         Item.new("^B", "reveal whitespace (·→␍␊)", "view.reveal-ws"),
         Item.new("^D / ^C ×2", "quit gori"),
         Item.new("q", "back to projects (on the tab bar)"),
         Item.new("?", "open this Help tab", "tab.help"),
         # The same two pages as a popup over whatever you were doing, so looking a key up
-        # does not cost the pane you were in. Both are palette-only; `binding_label` prints
-        # the literal `^P` here for want of a chord, and follows one if either ever gains it.
-        Item.new("^P", "this page as a popup — 'Keyboard shortcuts'", "help.hotkeys"),
-        Item.new("^P", "the Query page as a popup — also `?` on an empty filter bar", "help.query"),
-        Item.new("^P", "the guided tour on a mock UI, then back here — also `gori tutorial`", "help.tour"),
+        # does not cost the pane you were in. Like the two `^P →` rows above, these have no
+        # chord, so the row spells `^P → <palette title>` across both columns (the titles do
+        # not fit KEY_W), and `binding_label` follows a chord if one is ever bound.
+        Item.new("^P →", "Keyboard shortcuts — this page as a popup", "help.hotkeys"),
+        Item.new("^P →", "Query language reference — the Query page as a popup (also `?` on an empty filter bar)", "help.query"),
+        Item.new("^P →", "Guided tour — a mock UI, then back here (also `gori tutorial`)", "help.tour"),
         Item.new("Settings: Hotkeys", "rebind any shortcut below (^P → Settings: Hotkeys)"),
         Item.new("gori wizard", "re-run the first-run setup (bind · theme · Miss Ring) from a shell"),
       ]},
@@ -54,7 +61,10 @@ module Gori::Tui
         Item.new("←/→", "switch tab (on the tab bar)"),
         Item.new("↹ / ⇧↹", "focus ring: tab bar ↔ panes"),
         Item.new("↵ / ↓", "enter the tab body"),
-        Item.new("1-9", "jump to the Nth visible tab (Settings → Layout → Tab numbers paints them)"),
+        Item.new("1-9", "jump to slot N on the tab bar — the bar is nine numbered slots"),
+        Item.new("0", "go to ANY tab — a type-to-filter list of all 21, with a line on what each is for", "nav.goto"),
+        Item.new("⇧1-9", "jump to sub-tab N of the active tab (on a non-US layout see ^1-9 / f)"),
+        Item.new("⇧0", "find a sub-tab — the same picker `f` opens from the strip", "subtab.find"),
         # Seventeen surfaces bind j/k and no hint anywhere named them, so a whole navigation
         # layer was reachable only by guessing. It belongs HERE rather than in each tab's
         # hint: it is a global convention like ^P or ^D, the hints are already at the width
@@ -65,7 +75,14 @@ module Gori::Tui
         # It earns a line here for the same reason j/k does — the key is real on eight tabs and
         # named on none of them until the operator is already standing on the strip.
         Item.new("f", "sub-tab strip: list + search every sub-tab (⌕, from any chip)"),
-        Item.new("Settings: Tabs", "show/hide + reorder tabs"),
+        # The menu used to be focus-dependent: the strip's own verbs showed only while the
+        # strip was focused, so from a body pane one had to walk focus up before `space` would
+        # offer "close this sub-tab". One menu per tab now, and the same nine letters on all
+        # nine strips — which is what makes it worth a line here rather than nine. From a pane
+        # they sit one level down under the Sub-tabs… row (#1274); on the strip, at the top.
+        Item.new("space ▸ Sub-tabs…", "the strip's actions from ANY pane, one level down — the strip's own letters, the same on every tab"),
+        Item.new("^1-9", "sub-tab N — the ⇧1-9 alias for terminals that deliver Ctrl+digit"),
+        Item.new("Settings: Tabs", "one list — ⇧K/⇧J move a row, and the rows above the seam are the bar"),
         Item.new("esc", "pop back to the tab bar"),
       ]},
       {"MOUSE", [
@@ -81,23 +98,31 @@ module Gori::Tui
         Item.new("^R", "send the flow to Repeater", "history.repeater"),
         Item.new("⇧I", "send the flow to the Fuzzer", "history.fuzz"),
         Item.new("⇧F", "create an issue", "issue.create"),
-        Item.new("f", "follow newest", "history.toggle-follow"),
+        Item.new("{space:history.toggle-follow}", "follow newest — the ⌁follow chip on the filter bar toggles it too", "history.toggle-follow"),
         Item.new("/", "filter (query language — see the Query page)", "history.query"),
         Item.new("y", "copy flow", "history.copy"),
-        Item.new("space → Y", "copy as… — urls · hosts · cURL · raw · req+res pair"),
+        Item.new("{space:history.copy-as}", "copy as… — urls · hosts · cURL · raw · req+res pair", "history.copy-as"),
         Item.new("d", "delete selected/marked flows (asks first)", "history.delete"),
         Item.new("⇧X", "clear all History flows (asks first)", "history.clear"),
-        Item.new("i", "toggle intercept hold-mode", "intercept.toggle"),
-        Item.new("detail", "↑/↓ move · {detail.select-line} line · ⇧arrows select · {detail.copy} copy · space cmds"),
-        Item.new("{detail.toggle-hex} · {detail.toggle-ws} · {detail.toggle-pretty}", "in detail: hex · whitespace · pretty bodies"),
+        Item.new("i", "toggle intercept", "intercept.toggle"),
+        # The drill-in STEP is named on all four tabs that have one (Issues and Probe below,
+        # Comparer further down): this page is the surface whose whole job is "look a key up",
+        # and it named the pair on none of them while ⇧N meant one thing here and the opposite
+        # one tab over. Through `{verb.id}` like every other row, so a rebind moves it.
+        Item.new("detail", "↑/↓ move · {detail.next-item}/{detail.prev-item} step flow · {detail.select-line} line · ⇧arrows select · {detail.copy} copy · space cmds"),
+        Item.new("{detail.toggle-hex} · {detail.toggle-ws} · {detail.toggle-pretty} · {detail.toggle-unicode}", "in detail: hex · whitespace · pretty · Unicode escapes"),
       ]},
       {"REPEATER", [
         Item.new("^R", "send the request", "repeater.send"),
-        Item.new("^N / ^W", "new / close a sub-tab"),
-        Item.new("r", "rename the sub-tab (on the strip)"),
+        Item.new("^N / ^W", "new / close a sub-tab — from any pane, not just the strip"),
+        Item.new("e", "rename the sub-tab (on the strip)"),
         Item.new("/", "filter sub-tabs (tag: name: host: method:)", "repeater.filter-subtabs"),
         Item.new("↹", "complete filter field/value while filtering"),
-        Item.new("t", "tag the active sub-tab (on the strip)", "repeater.tag-subtab"),
+        # The menu path, not a bare `t`: on the strip `t` MARKS a chip and `⇧T` marks the whole
+        # strip (#683), so the row this replaces named the marking key for tagging. Tagging
+        # has no chord of its own and never did — the menu letter is the whole route, and the
+        # registry spells it (the literal here once said `a` while the menu said `t`).
+        Item.new("{space:repeater.tag-subtab}", "tag the active sub-tab (or every marked one)", "repeater.tag-subtab"),
         Item.new("i / ↵", "enter INS (edit) on request/target · esc back to READ"),
         Item.new("space", "command menu (READ mode on request/target/response)"),
         # Copy is the one READ verb that also works while TYPING: in INS a bare `y` is a
@@ -108,26 +133,27 @@ module Gori::Tui
         # The §…§ marker trio, same keys and same order as the FUZZER section below — the
         # Repeater grew `^K`/`^T` to match and Help documented neither.
         Item.new("{repeater.auto-mark} · {repeater.mark-word} · {repeater.toggle-decoded}", "auto-mark params · mark word · mark point (manual §)"),
-        Item.new("space → c", "clear every § marker", "repeater.clear-marks"),
+        Item.new("{space:repeater.clear-marks}", "clear every § marker", "repeater.clear-marks"),
         # ^Q, not ^Y — ^Y is Copy in every text box now (see the `y · ^Y` row above). The key
         # column resolves from the verb id, so it follows a rebind either way.
         Item.new("^Q", "edit the decoder chain on the marker at the cursor", "repeater.attach-chain"),
-        Item.new("^X", "hex-edit the request", "repeater.toggle-hex"),
+        Item.new("^X", "hex-edit the request · in the response pane, its hex dump", "repeater.toggle-hex"),
         Item.new("^S", "SNI override (on the target)", "repeater.toggle-sni"),
-        Item.new("^L", "toggle auto Content-Length", "repeater.toggle-auto-content-length"),
-        Item.new("space → F", "gRPC: reframe the message on send (on by default; off sends the captured 5-byte length prefix)", "repeater.toggle-grpc-reframe"),
-        Item.new("space → E", "gRPC: edit the request message field by field through the loaded .proto (unary calls)", "repeater.toggle-grpc-fields"),
-        Item.new("^V", "transport: HTTP/1.1 ↔ HTTP/2 · on a WebSocket tab, WS → h1 → h2 (send the handshake as plain HTTP)", "repeater.toggle-http2"),
-        Item.new("space → g", "send group: %%%-split requests on one connection"),
+        Item.new("^L", "AUTO-LEN (CL when narrow): recompute Content-Length from the body on send", "repeater.toggle-auto-content-length"),
+        Item.new("{space:repeater.toggle-grpc-reframe}", "gRPC: reframe the message on send (on by default; off sends the captured 5-byte length prefix)", "repeater.toggle-grpc-reframe"),
+        Item.new("{space:repeater.toggle-grpc-fields}", "gRPC: edit the request message field by field through the loaded .proto (unary calls)", "repeater.toggle-grpc-fields"),
+        Item.new("^V", "transport HTTP/1.1 ↔ HTTP/2 · WebSocket tab: WS → HTTP/1.1 → HTTP/2 (handshake as plain HTTP)", "repeater.toggle-http2"),
+        Item.new("{space:repeater.cycle-tls-preset}", "TLS: cycle the handshake fingerprint (default → chrome / firefox / safari / curl)", "repeater.cycle-tls-preset"),
+        Item.new("{space:repeater.send-group}", "send group: %%%-split requests on one connection", "repeater.send-group"),
         Item.new("↹", "cycle target → request → response"),
-        Item.new("d", "response: toggle diff", "repeater.toggle-diff"),
-        Item.new("p", "response: pretty bodies", "repeater.toggle-pretty"),
+        Item.new("⇧D", "response: toggle diff", "repeater.toggle-diff"),
+        Item.new("{repeater.toggle-pretty} · {repeater.toggle-unicode}", "response: pretty bodies · Unicode escapes"),
         Item.new("^X", "response: hex dump (pane-local)"),
         Item.new("⇧←/→", "response: scroll a long line sideways"),
       ]},
       {"FUZZER", [
         Item.new("⇧I", "send a flow/repeater here (History/Repeater)"),
-        Item.new("^N / ^W", "new / close a sub-tab"),
+        Item.new("^N / ^W", "new / close a sub-tab — from any pane, not just the strip"),
         Item.new("i / ↵", "enter INS (edit) on target/template · esc back to READ"),
         Item.new("space", "command menu (READ mode on target/template/results/detail)"),
         # NOT `y · O`. The `*.copy-all` verbs are gone — `Runner#read_copy` folds it into one
@@ -143,17 +169,18 @@ module Gori::Tui
         # NOT `^U clear §` — that was wrong twice over: ^U is fuzz.pretty-template (the tab's
         # own ` ^U:PRETTY ` badge says so), and clear-marks has no chord at all. The advertised
         # key silently reflowed the template you had just finished marking by hand.
-        Item.new("^U", "pretty-print the template body (space → c clears §)", "fuzz.pretty-template"),
+        Item.new("^U", "pretty-print the template body ({space:fuzz.clear-marks} clears §)", "fuzz.pretty-template"),
         Item.new("^V", "toggle transport HTTP/1.1 ↔ HTTP/2", "fuzz.toggle-http2"),
         Item.new("^S", "SNI override (on the target)", "fuzz.toggle-sni"),
         Item.new("^O", "focus the config pane (payload sets · Mode · Advanced · Run)"),
         Item.new("config", "↑/↓ rows · ↵ edit a set / Add / Advanced / Run · ←/→ Mode · Del remove a set"),
         Item.new("^L", "add a List payload set (one value per line, paste splits)", "fuzz.list-paste"),
-        Item.new("set editor", "↹/↑↓ fields · List = multi-line · wordlist path auto-completes · esc applies"),
+        Item.new("set editor", "↹/↑↓ fields · List: ^S saves it as a wordlist · Project: captured data · esc applies"),
         Item.new("{fuzz.run} · {fuzz.stop}", "run · stop"),
         Item.new("↑/↓ · ↵", "results: select · open detail"),
-        Item.new("o · m", "sort · matched-only"),
-        Item.new("r", "rename the sub-tab (on the strip)"),
+        Item.new("{space:fuzz.sort} · {fuzz.matched}", "sort · matched-only"),
+        Item.new("{space:fuzz.group}", "group results by response shape · ←/→ fold · {space:fuzz.sort} orders rare/common/first", "fuzz.group"),
+        Item.new("e", "rename the sub-tab (on the strip)"),
         Item.new("⇧←/→", "detail: scroll a long line sideways"),
       ]},
       # Miner, OAST and JWT had NO section at all, while Sequencer — also a default-hidden
@@ -161,12 +188,12 @@ module Gori::Tui
       # whose entire keyboard surface was undiscoverable from the one screen that exists to
       # answer "what can I press here".
       {"MINER", [
-        Item.new("Mine parameters", "from History/Repeater (space menu) — finds params the app accepts but never shows"),
+        Item.new("{space:history.mine}", "Mine parameters, from History/Repeater — finds params the app accepts but never shows", "history.mine"),
         Item.new("{mine.run} · {mine.stop}", "mine · stop"),
         Item.new("↹", "summary ⟷ findings"),
         Item.new("↑/↓ · ↵", "findings: select · open detail"),
-        Item.new("space → R", "send the selected finding to Repeater (param injected)", "mine.repeater"),
-        Item.new("^N / ^W", "new / close a sub-tab"),
+        Item.new("{space:mine.repeater}", "send the selected finding to Repeater (param injected)", "mine.repeater"),
+        Item.new("^N / ^W", "new / close a sub-tab — from any pane, not just the strip"),
       ]},
       {"JWT", [
         Item.new("^T", "switch decode ⟷ encode", "jwt.toggle-mode"),
@@ -185,62 +212,107 @@ module Gori::Tui
         Item.new("{jwt.copy} · ^Y", "copy selection/pane — `y` in READ, ^Y while typing (ENCODE panes: ^Y only)"),
         Item.new("⇧arrows", "select text in INPUT / HEADER / PAYLOAD (not SECRET — single-line field)"),
         Item.new("↑/↓ · ↵", "attacks: select · copy the selected payload"),
-        Item.new("^N / ^W", "new / close a sub-tab"),
+        Item.new("^N / ^W", "new / close a sub-tab — from any pane, not just the strip"),
       ]},
       {"COOKIE", [
         Item.new("^T", "switch decode ⟷ forge", "cookie.toggle-mode"),
         Item.new("^A", "cycle the format (auto / flask / rack / django)", "cookie.cycle-format"),
         # No verb id: cookie.cycle-algorithm has no chord (^G is the shell's go-to-line key), so
-        # the OPTIONS `algo` badge is click-only, plus `Space → g` and the palette. A verb id here
-        # would make build_rows print a key that does not fire.
-        Item.new("algo badge / Space g", "cycle the Django HMAC algorithm (sha256 / sha1)"),
+        # the OPTIONS `algo` badge is click-only, plus its menu row and the palette. The token
+        # spells the menu path; a verb id would replace the whole column, badge included.
+        Item.new("algo badge / {space:cookie.cycle-algorithm}", "cycle the Django HMAC algorithm (sha256 / sha1)"),
         Item.new("^L", "clear the session", "cookie.clear"),
         Item.new("↹", "cycle INPUT → DECODED → OPTIONS → SECRET (decode) / PAYLOAD → OPTIONS → SECRET → OUTPUT (forge)"),
         Item.new("c", "crack the secret over the SECRET field (a wordlist path or comma list)", "cookie.crack"),
-        Item.new("l", "seed the FORGE payload from the decoded cookie (space menu)", "cookie.load-decoded"),
+        Item.new("{space:cookie.load-decoded}", "seed the FORGE payload from the decoded cookie", "cookie.load-decoded"),
         # Same shape as the JWT row above: the letter follows a rebind, the `^Y` pin does not.
         Item.new("{cookie.copy} · ^Y", "copy selection/pane — `y` in READ, ^Y while typing an editable pane"),
-        Item.new("^N / ^W", "new / close a sub-tab"),
+        Item.new("^N / ^W", "new / close a sub-tab — from any pane, not just the strip"),
       ]},
       {"OAST", [
         Item.new("{oast.listen} · {oast.stop}", "start listening · stop"),
         Item.new("↑/↓ · ↵", "callbacks: select · open detail"),
-        Item.new("space → p", "promote a callback to an Issue", "oast.promote"),
-        Item.new("space → a", "add a provider · e edit · x enable/disable"),
-        Item.new("payload", "insert an OAST payload into the focused editor (space → O)", "oast.insert-payload"),
+        Item.new("⇧F", "promote a callback to an Issue", "oast.issue"),
+        Item.new("{oast.add-provider} · {oast.edit-provider} · {oast.toggle-provider}", "providers: add · edit · enable/disable"),
+        # Two copies, opposite directions of one interaction: the payload gori SENT (list) and
+        # what came BACK (detail). Only the detail's can be a chord — `validate_chords!` allows
+        # one `y` per scope — so the list's is named by its space-menu letter.
+        Item.new("{oast.copy-callback} · {space:oast.copy}", "detail: copy the callback · list: copy the last generated payload URL"),
+        Item.new("{space:repeater.oast-insert}", "Repeater · Fuzzer: insert an OAST payload into the focused editor", "repeater.oast-insert"),
       ]},
       {"SEQUENCER", [
-        Item.new("Send to Sequencer", "from History/Repeater/Sitemap (space menu) — replay + analyze a token"),
+        Item.new("{space:history.sequence}", "Send to Sequencer, from History/Repeater/Sitemap — replay + analyze a token", "history.sequence"),
         Item.new("Send selection to → Sequencer", "selected text becomes manual token sample(s)"),
         Item.new("c", "configure the token location (cookie/header/regex/position/jsonpath) + goal", "sequence.configure"),
         Item.new("{sequence.run} · {sequence.stop}", "run collection · stop"),
         Item.new("↹", "cycle config → samples → analysis"),
         Item.new("↑/↓ · ↵", "samples: select · open detail"),
-        Item.new("^W · r", "close · rename the sub-tab (on the strip)"),
+        Item.new("^W · e", "close · rename the sub-tab (on the strip)"),
       ]},
       {"COMPARER", [
         Item.new("{comparer.pick-a} · {comparer.pick-b}", "pick flow A · flow B"),
         Item.new("←/→", "compare requests ⟷ responses"),
+        Item.new("{comparer.next-change} · {comparer.prev-change}", "next · previous CHANGED row (the same pair the drill-ins step with)"),
+        Item.new("{space:comparer.toggle-fold}", "fold the unchanged runs, keeping context", "comparer.toggle-fold"),
         Item.new("⇧←/→", "h-scroll both columns (long lines)"),
-        Item.new("s", "swap A ⇄ B", "comparer.swap"),
-        Item.new("^N / ^W · r", "new / close / rename comparison sub-tab"),
-        Item.new("Send to Comparer", "from History (space menu) — fills the active sub-tab"),
+        Item.new("w", "swap A ⇄ B", "comparer.swap"),
+        Item.new("^N / ^W · e", "new / close / rename comparison sub-tab"),
+        Item.new("{space:history.compare}", "Send to Comparer, from History — fills the active sub-tab", "history.compare"),
       ]},
       {"EDITORS", [
         Item.new("^G · ^F", "go to line · find (↵/↑↓ step)"),
         Item.new("  where", "Repeater · History detail · Intercept · Notes · Project · Decoder · Fuzzer"),
         Item.new("^F then tab", "find & replace — ↵ swaps every match (one undo step); editable panes only"),
+        # READ-mode edits (`Tui::ReadEdit`). Tokens, so the vim keyset's ⇧V reaches the row;
+        # `dd`/`yy` are spelled out because their verbs are keyless outside that keyset.
+        Item.new("{repeater.select-line} then {editor.delete} · {repeater.copy}", "READ: select the line, then delete or copy it", "editor.delete"),
+        Item.new("{editor.paste}", "READ: paste the last copy or delete after the caret (whole lines go below)", "editor.paste"),
+        Item.new("dd · yy", "vim keyset: delete · copy the caret's line"),
         Item.new("^E", "open the field in $EDITOR"),
         Item.new("^B", "reveal whitespace"),
       ]},
       {"OTHER TABS", [
-        Item.new("Sitemap", "↑/↓ · {sitemap.query} filter · ↵/→ expand · {sitemap.mark-toggle} mark · {sitemap.toggle-grouping} fold · {scope.toggle-lens} scope · space → T tag"),
+        Item.new("Sitemap", "↑/↓ · {sitemap.query} filter · ↵/→ expand · {sitemap.mark-toggle} mark · {sitemap.mark-all} all · {sitemap.toggle-grouping} fold · {scope.toggle-lens} scope · {space:sitemap.tag} tag · {space:sitemap.js-scan} js"),
         # `⇧X clear` sits in the LIST half, where the chord fires — and it is on this row at all
         # for the reason the Probe and Authorize rows carry theirs: a wipe has to be named where
         # it can be read before it is pressed. Marks make that sharper here than anywhere else,
         # since `d` acts on the marked set and this one does not.
         Item.new("Issues", "list: {issues.mark-toggle} mark · {issues.mark-all} all · ⇧arrows range · {issues.clear} clear · notes: i/↵ edit · {issue.select-line} line · {issue.copy} copy · space cmds"),
-        Item.new("Probe", "↑/↓ ↵ open · {probe.mode} mode · {probe.dismiss-selected} dismiss · {probe.toggle-closed} all · {probe.filter} filter · {scope.toggle-lens} scope · {probe.clear} clear issues · space cmds"),
+        # The retest (#1036) is menu-reachable but its chord is shifted, so this row is where
+        # an operator learns it — the same argument the wipes above make for being named where
+        # they can be read before they are pressed. Its card is also the one place that SENDS
+        # from the Issues tab.
+        Item.new("{issue.retest}", "in an Issue: open its RETEST card — ordered Repeater steps, their assertions, and the last run"),
+        # RELATED's keys, named here because none of them is in the space menu's first screen
+        # and because ↵ changed meaning: it SHOWS the selected row's exchange in place (frozen
+        # copy or live source), where it used to teleport on a live row and open a modal on a
+        # frozen one. A fuzz/miner row has no one exchange, so there ↵ opens the session.
+        #
+        # The card's FIRST row is the flow the issue was filed from — there is no separate
+        # `flow` line above it and no `o` to open it any more, which is why this row names
+        # what the list holds as well as what the keys do.
+        Item.new("RELATED row 1", "the flow the issue was filed from — {issue.goto-link} opens it in History"),
+        Item.new("in RELATED", "↵ view the row's exchange (a fuzz/miner session: open it) · {issue.goto-link} source · {issue.freeze-link} freeze · {issue.repeater-flow} repeater"),
+        # `{space:probe.scope-toggle}`, NOT `{scope.toggle-lens}`: `s` on this tab is
+        # `probe.open-evidence` (go to source) since the key audit's F2, so the Global lens is
+        # the menu entry `probe.scope-toggle` here. The token would have printed the Global
+        # chord and been wrong on the one tab this row is about.
+        Item.new("Probe", "↑/↓ ↵ open · {probe.open-evidence} source · {probe.mode} mode · {probe.dismiss-selected} dismiss · {probe.toggle-closed} all · {probe.filter} filter · {space:probe.scope-toggle} scope · {probe.clear} clear issues"),
+        # Evidence is hidden until the project freezes its first snapshot, so this row is where
+        # an operator who just enabled the tab learns its keys — and `{evidence.delete}` is the
+        # only one that destroys bytes no source can hand back, which is why it is named here
+        # rather than left to the space menu. Link/unlink are menu-only (`L` · `u`).
+        #
+        # No `↑/↓` on this one row: it is the longest on the Shortcuts page and sits against
+        # `HelpPopupOverlay::MAX_W` (help_popup_overlay_spec measures it), so the list arrows —
+        # the one thing on the row that is true of every list in the app — are what comes off.
+        Item.new("Evidence", "↵ open · {evidence.copy} copy · {evidence.filter} filter · {evidence.compare} compare · {evidence.issue} issue · {evidence.source} source · {evidence.repeater} repeater · {evidence.delete} delete · space cmds"),
+        # The drill-in STEP, keyed by the chord like the Comparer's pair rather than folded into
+        # the two tab rows above — both sit within a few columns of the popup's width cap
+        # (help_popup_overlay_spec), and a row that trails off into `…` is worse than no row.
+        # One row for three tabs because it is one contract; History's own `detail` row above
+        # names it too, where an operator reading about History will already be looking.
+        Item.new("{issue.next-item} · {issue.prev-item}", "in an Issues · Probe · History detail: next · previous item, in place"),
         # Authorize had no row at all while `TAB_SECTION` pointed its Shortcuts popup here — so
         # the one tab whose keys are `^R`/`⇧R`/`^X` and nothing an operator can guess opened on
         # a section that never named it.
@@ -257,8 +329,8 @@ module Gori::Tui
         # ACTIVITY is a Project sub-tab, so its keys hang off the row above rather than earning
         # a section — but `⇧X` there deletes the durable audit trail, which is the one key on
         # this tab that must be named somewhere the operator can read before pressing it.
-        Item.new("  activity", "{activity.filter-source} source · {activity.filter-level} level · {activity.filter-actor} actor · {activity.find} filter · ↵ open · {activity.clear} clear the feed"),
-        Item.new("Intercept", "↵/e edit · {intercept.forward} fwd · {intercept.drop} drop · {intercept.forward-all} all · {intercept.direction} catch · {intercept.filter} condition · {intercept.toggle} on/off"),
+        Item.new("  activity", "{activity.filter-source} source · {activity.filter-level} level · {activity.filter-actor} actor · {activity.find} filter · ↵ open · {activity.copy} copy · {activity.clear} clear the feed"),
+        Item.new("Intercept", "↵/e edit · {intercept.forward} fwd · {intercept.drop} drop · {intercept.forward-all} all · {intercept.copy} copy · {intercept.direction} catch · {intercept.filter} condition · {intercept.toggle} on/off"),
       ]},
       {"DECODER", [
         Item.new("i / ↵", "enter INS on INPUT · esc back to READ"),
@@ -271,13 +343,13 @@ module Gori::Tui
         Item.new("{decoder.save} · {decoder.load}", "save the chain under a name · pick from the saved chains"),
         Item.new("chain library", "shared by every project · picker: type to filter · ^X deletes an entry"),
         Item.new("^N · ^W", "new · close conversion sub-tab"),
-        Item.new("^1-9 · r", "switch sub-tab · rename (on the strip)"),
+        Item.new("⇧1-9 · e", "switch sub-tab · rename (on the strip)"),
         Item.new("space", "command menu from the strip, tab bar, INPUT READ or OUTPUT (a literal space while typing)"),
       ]},
       {"REWRITER", [
         Item.new("{rewriter.add} · ↵/e", "add a Match & Replace rule · edit the selected one"),
-        Item.new("x · {rewriter.delete}", "enable/disable in this project · delete the selected rule"),
-        Item.new("{rewriter.scope} · space → X", "move the rule global ⇄ project · flip a global rule's default everywhere"),
+        Item.new("{rewriter.toggle} · {rewriter.delete}", "enable/disable in this project · delete the selected rule"),
+        Item.new("{space:rewriter.scope} · {space:rewriter.toggle-default}", "move the rule global ⇄ project · flip a global rule's default everywhere"),
         Item.new("G / P column", "global (every project) or project · G* = this project overrides its default"),
         Item.new("{rewriter.move-down} / {rewriter.move-up}", "reorder within a scope — globals apply first, then project rules"),
         Item.new("[ / ]", "switch sub-tab: rules · extract · bindings"),
@@ -291,13 +363,13 @@ module Gori::Tui
       {"COLORMARKER", [
         Item.new("{colormarker.add} · ↵/e", "add a History row-colour rule · edit the selected one"),
         Item.new("{colormarker.toggle} · {colormarker.delete}", "enable/disable in this project · delete the selected rule"),
-        Item.new("{colormarker.scope} · space → X", "move the rule global ⇄ project · flip a global rule's default everywhere"),
+        Item.new("{space:colormarker.scope} · {space:colormarker.toggle-default}", "move the rule global ⇄ project · flip a global rule's default everywhere"),
         Item.new("{colormarker.move-down} / {colormarker.move-up}", "reorder — the FIRST enabled match paints the row, the rest are skipped"),
         Item.new("style", "full = tint the whole row · strip = one colour cell ahead of TIME"),
         Item.new("when:", "host: path: method: scheme: status: proto: — ↹ completes · no header:/size:/dur:"),
         Item.new("↹ · ↓ past list", "CUSTOM COLORS pane — a add · ↵/e edit · d delete (name + #hex)"),
         Item.new("custom colour", "a global name the picker offers everywhere; its hex is absolute, not theme-relative"),
-        Item.new("hidden by default", "settings:tabs shows it, next to Rewriter"),
+        Item.new("off the bar by default", "`0` opens it; settings:tabs gives it a slot, next to Rewriter"),
       ]},
       {"OVERLAYS", [
         Item.new("palette / settings", "↑/↓ · ↵ · esc"),
@@ -337,6 +409,7 @@ module Gori::Tui
       :target      => "OTHER TABS",
       :sitemap     => "OTHER TABS",
       :issues      => "OTHER TABS",
+      :evidence    => "OTHER TABS",
       :probe       => "OTHER TABS",
       :authorize   => "OTHER TABS",
       :notes       => "OTHER TABS",
@@ -377,11 +450,18 @@ module Gori::Tui
           key = item.key
           desc = item.desc
           if registry
+            # A verb-id row with no chord is a menu-only verb: its key column is the menu path,
+            # read off the registry rather than trusted from the literal (#1274 — three rows
+            # had drifted to letters the menu no longer used), or `^P → <title>` for a
+            # palette-only one (#1282, `Hotkeys.route`).
             if id = item.verb_id
-              key = Hotkeys.binding_label(registry, id, item.key)
+              key = Hotkeys.binding_label(registry, id, Hotkeys.route(registry, id) || item.key)
             end
             key = Hotkeys.expand(registry, key)
             desc = Hotkeys.expand(registry, desc)
+          else
+            key = Hotkeys.expand_menu_paths(nil, key)
+            desc = Hotkeys.expand_menu_paths(nil, desc)
           end
           # Retag both columns: a verb-id row and the `{verb.id}` tokens already resolve
           # through the keymap, but the keyless rows (^N/^W, ^G/^F, ^1-9) and the claimed
@@ -668,17 +748,26 @@ module Gori::Tui
     # comment says it was merged-not-copied to prevent — a reference stating the opposite of what
     # the bar under it will do. Aliases are filtered to targets that survive `fields` for the
     # same reason: `res.header:` is not "also accepted" where `resp.header:` does not exist.
+    # `syntax`, `caveats` and `regex` are the parts of this page that are true of QL and not
+    # of every backend that borrows the grammar. Defaulted to QL's, because the store-backed
+    # surfaces are QL — but `Issues::Filter` and `Probe::Filter` refuse `~` outright and have
+    # no `size`/`dur`/`req.`/`resp.` axes at all, so handing them QL's lists would print a
+    # reference page for a language they do not speak. Same correction, and the same reason,
+    # as `QuerySuggest.cold_hint`'s.
     def self.query_rows(fields : Array(String) = QL::FIELDS,
                         help : Proc(String, String?) = QL_FIELD_HELP,
-                        aliases : Hash(String, String) = QL::FIELD_ALIASES) : Array(Row)
+                        aliases : Hash(String, String) = QL::FIELD_ALIASES,
+                        syntax : Array({String, String}) = QL::SYNTAX_HELP,
+                        caveats : Array({String, String}) = QL::CAVEATS,
+                        regex : Bool = true) : Array(Row)
       rows = [] of Row
       rows << Row.new(:head, "SYNTAX", "")
-      QL::SYNTAX_HELP.each { |(example, meaning)| rows << Row.new(:item, example, meaning) }
+      syntax.each { |(example, meaning)| rows << Row.new(:item, example, meaning) }
 
       # Fields in `FIELDS` order — the order completion offers them, so the page and the Tab key
       # agree about what comes first.
       rows << Row.new(:gap, "", "")
-      rows << Row.new(:head, "FIELDS  (: matches, ~ is regex)", "")
+      rows << Row.new(:head, regex ? "FIELDS  (: matches, ~ is regex)" : "FIELDS  (: matches — substring or ordinal)", "")
       fields.each do |name|
         rows << Row.new(:item, "#{name}:", help.call(name) || "")
       end
@@ -694,7 +783,7 @@ module Gori::Tui
 
       rows << Row.new(:gap, "", "")
       rows << Row.new(:head, "WORTH KNOWING", "")
-      QL::CAVEATS.each { |(what, why)| rows << Row.new(:item, what, why) }
+      caveats.each { |(what, why)| rows << Row.new(:item, what, why) }
       rows
     end
 

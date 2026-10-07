@@ -1,8 +1,8 @@
 require "db"
-require "levenshtein"
 require "./filter_ast"
-require "./proto"       # Proto::Kind, used by the `proto:` term below
-require "./flow_source" # FlowSource::Kind, used by the `src:` term below
+require "./proto"        # Proto::Kind, used by the `proto:` term below
+require "./flow_source"  # FlowSource::Kind, used by the `src:` term below
+require "./cache_status" # CacheStatus::Signal, used by the `cache:` term below
 
 module Gori
   # The query language (DESIGN.md §4): a Lucene/KQL-style boolean filter over the
@@ -17,7 +17,7 @@ module Gori
   #   size:>10000 dur:>=500 dur:<2s     # total bytes (req+resp) / latency (ms; ms|s)
   #   reqsize:>1000 respsize:<500       # request-only / response-only byte size
   #   header:set-cookie                 # substring over request/response head bytes
-  #   scope:in  scope:out               # the project's scope rules, ⇧S lens off or on
+  #   scope:in  scope:out               # the project's scope rules, `s` lens off or on
   #   body~secret\d+  host~^api\.       # `~` = regex (host path url method scheme header body)
   module QL
     # `:` fields:  see FIELDS below (the list every surface reads).
@@ -54,7 +54,7 @@ module Gori
 
     # The project's in-scope predicate, as a `scope:` term sees it. `predicate` is the
     # include/exclude fragment `Scope#filter(force: true)` builds — the SAME fragment
-    # `gori run history --in-scope` and the TUI's ⇧S lens apply, threaded in rather than
+    # `gori run history --in-scope` and the TUI's `s` lens apply, threaded in rather than
     # respelled, so `scope:in` IS that predicate and inherits its SQL⇄in-memory parity
     # (PR #688) instead of re-earning it.
     #
@@ -119,6 +119,18 @@ module Gori
     URL_EXPR_NO_PORT = "(CASE WHEN lower(substr(target, 1, 7)) = 'http://' OR lower(substr(target, 1, 8)) = 'https://' " \
                        "THEN target ELSE (scheme || '://' || host || target) END)"
 
+    # `Gori::Url.origin_path` spelled in SQL: what `path:` reads. A plaintext forward-proxy
+    # flow keeps its ABSOLUTE-form target (P7), so matching `target` raw made `path~^/admin`
+    # miss it while `path:http` and `path:<port>` matched every such flow. The authority ends
+    # at the first '/', '?' or '#' — each `instr` gets a sentinel so a missing one sorts last —
+    # and whatever follows gets a leading '/' when it has none (a pathless query, or nothing).
+    private PATH_REST = "substr(target, instr(target, '://') + 3)"
+    private PATH_CUT  = "min(instr(#{PATH_REST} || '/', '/'), instr(#{PATH_REST} || '?', '?'), " \
+                        "instr(#{PATH_REST} || '#', '#'))"
+    PATH_EXPR = "(CASE WHEN lower(substr(target, 1, 7)) = 'http://' OR lower(substr(target, 1, 8)) = 'https://' " \
+                "THEN (CASE WHEN substr(#{PATH_REST}, #{PATH_CUT}, 1) = '/' THEN substr(#{PATH_REST}, #{PATH_CUT}) " \
+                "ELSE '/' || substr(#{PATH_REST}, #{PATH_CUT}) END) ELSE target END)"
+
     # What one term compiles to: a SQL fragment plus the values bound into its `?`s.
     alias SqlTerm = {String, Array(DB::Any)}
 
@@ -140,7 +152,7 @@ module Gori
       NOT > AND > OR. `-term` and `NOT term` are equivalent.
 
       Fields (use : for value match, ~ for regex):
-        host path method scheme proto status size reqsize respsize dur header body url stub src scope
+        host path method scheme proto status size reqsize respsize dur header body url stub static src scope cache
 
       Sides: header: and body: search the REQUEST AND THE RESPONSE. Prefix either with `req.` or
       `resp.` to search one side — req.body:token resp.header:set-cookie resp.body~secret\\d+ —
@@ -160,6 +172,15 @@ module Gori
       short-circuit rule, with NO origin involved. Their response bytes came from the rule, not
       from the server, so `stub:false` is what you want before treating History as evidence.
 
+      Static assets: static:true  static:false  — images, fonts and audio/video, judged by the
+      response Content-Type (image/svg+xml is NOT static: it can carry script) and, when a row has
+      no Content-Type (a 304, a pending flow), by the path's extension before `?`. Only a successful
+      fetch is static (2xx or 304): an error, a redirect or a flow with no response never is. JS,
+      CSS, source maps, JSON, archives, PDFs, octet-stream, HLS playlists and an image fetched
+      through a URL parameter (`/_next/image?url=…`, an image proxy) stay visible. Decided once,
+      when the flow is captured. `-static:true` hides the noise — the TUI's hide-static lens,
+      `--hide-static` and list_history/list_sitemap/list_params `hide_static` are that term.
+
       Source: src:proxy  src:repeater  src:fuzzer  src:import  …  src:gori — where the flow came
       from. `proxy` is traffic a client sent through gori; every other value is a request gori
       itself put on the wire (`src:gori` is all of them at once), and `import` is a capture read
@@ -168,7 +189,7 @@ module Gori
       the caveat list.
 
       Scope: scope:in  scope:out  — the project's scope rules (the include/exclude boundary the
-      TUI's ⇧S lens and `--in-scope` apply), as an ordinary term: it negates and it groups.
+      TUI's `s` lens and `--in-scope` apply), as an ordinary term: it negates and it groups.
       INDEPENDENT of whether that lens is switched on, because a filter term is a question, not
       a mode. With NO scope rules configured nothing is in scope, so `scope:in` AND `scope:out`
       both match nothing — the question is not asked rather than answered "everything". Note
@@ -176,6 +197,18 @@ module Gori
       from `scope:out` in that one state; ql_explain says when a project has no scope rules. On
       a surface with no project scope at all the term is DROPPED like a bad numeric, and
       ql_explain / strict:true name it.
+
+      Cache: cache:hit  cache:miss  cache:dynamic  cache:none  — what the RESPONSE HEADERS say
+      about caching, normalised to one signal. `hit` = served from a shared cache (a positive
+      `Age`, `X-Cache: HIT`, a served-from `CF-Cache-Status`) — the web-cache-deception
+      candidate; `miss` = a cache saw it but went to origin (`X-Cache: MISS`,
+      `CF-Cache-Status: MISS`, `X-Cache-Hits: 0`); `dynamic` = declared uncacheable
+      (`CF-Cache-Status: DYNAMIC`, `Cache-Control: no-store`, a bare `private`); `none` = no
+      cache verdict — no cache headers, or only neutral ones (`Age: 0`, a field-limited
+      `private="set-cookie"`, a vendor value gori does not recognise); a Pending flow is
+      `none`. Read from the stored head on read, so it names what the wire said, not what a
+      cache did — confirm a `hit` with a no-session re-request. An unknown value (cache:yes)
+      drops the term.
 
       Regex (~): host~^api\\.  body~secret\\d+  path~/admin  method~^P(OST|UT)$ — on host path url
       method scheme header body (and req./resp. header/body). Case-sensitive; prefix (?i) to fold.
@@ -219,6 +252,113 @@ module Gori
     # which is the opposite of what the caller asked for.
     def self.reject_empty?(query : String, filter : Filter) : Bool
       !query.strip.empty? && filter == EMPTY
+    end
+
+    # When `reject_empty?` is true (a non-blank query compiled to EMPTY), explains which
+    # term is invalid and why, rather than reporting a generic "no valid terms".
+    def self.reject_empty_reason(query : String, scope : ScopeLens? = nil) : String?
+      bad_regex = invalid_regex_terms(query)
+      return "invalid regex in #{bad_regex.first}" unless bad_regex.empty?
+
+      terms = FilterAst.terms(FilterAst.parse(query))
+      terms.each do |term|
+        next if term_to_sql(term, scope: scope)
+        if reason = dropped_term_reason(term.text, scope)
+          return "invalid filter in `#{term.source}` — #{reason}"
+        else
+          return "invalid filter in `#{term.source}`"
+        end
+      end
+
+      if u = FilterAst.unknown_field(query, FilterAst::SEPS_FIELD_REGEX,
+           ->(name : String, op : Char) { known_field?(name, op == '~') },
+           SIDE_PREFIXES, CANDIDATE_FIELDS)
+        return FilterAst.unknown_field_note(u)
+      end
+
+      nil
+    end
+
+    # Explains why a field term was dropped during compilation (returned nil from term_to_sql),
+    # or nil if the term is valid / compiles normally.
+    def self.dropped_term_reason(text : String, scope : ScopeLens? = nil) : String?
+      return nil if text.empty?
+      split = split_field(text)
+      return nil unless split
+      raw_field, value, op = split
+      field = canonical(raw_field)
+
+      return regex_term_reason(field, raw_field, value) if op == :regex
+      return "`#{raw_field}:` requires a value" if value.empty?
+
+      if field == "status"
+        status_term_reason(value)
+      elsif reason = numeric_field_reason(field, value)
+        reason
+      elsif reason = enum_field_reason(field, value, scope)
+        reason
+      else
+        content_or_prefix_reason(raw_field, field, value)
+      end
+    end
+
+    private def self.regex_term_reason(field : String, raw_field : String, value : String) : String?
+      return "empty regex pattern" if value.empty?
+      return "regex matching (`~`) not supported for `#{raw_field}`" if advertised_name?(field) && !field.in?(REGEX_FIELDS)
+      return "invalid regex pattern" unless valid_regex?(value)
+      nil
+    end
+
+    private def self.status_term_reason(value : String) : String?
+      _, rest = split_op(value)
+      rest = rest.downcase
+      is_class = rest.size == 3 && rest[1] == 'x' && rest[2] == 'x' && rest[0].ascii_number?
+      return nil if is_class || rest.to_i?
+      "status expects a number or class (e.g. 200, 5xx)"
+    end
+
+    private def self.numeric_field_reason(field : String, value : String) : String?
+      case field
+      when "size", "reqsize", "respsize"
+        return nil if numeric_cond("size", value)
+        "size expects a number (e.g. >1000, 50k)"
+      when "dur"
+        return nil if duration_cond(value)
+        "duration expects a number or unit (e.g. >500ms, 1.5s)"
+      end
+    end
+
+    private def self.enum_field_reason(field : String, value : String, scope : ScopeLens?) : String?
+      case field
+      when "proto"
+        return nil if proto_cond(value)
+        "proto expects #{PROTO_VALUES.join(", ")}"
+      when "src"
+        return nil if src_cond(value)
+        "src expects #{SOURCE_VALUES.join(", ")}"
+      when "cache"
+        return nil if cache_cond(value)
+        "cache expects #{CACHE_VALUES.join(", ")}"
+      when "stub", "static"
+        return nil if flag_cond("col", value)
+        "#{field} expects true or false"
+      when "scope"
+        return nil if scope_cond(value, scope || SCOPE_SHAPE_ONLY)
+        "scope expects in or out"
+      end
+    end
+
+    private def self.content_or_prefix_reason(raw_field : String, field : String, value : String) : String?
+      case field
+      when "body", "header", "req.body", "resp.body", "req.header", "resp.header"
+        return "value contains only control characters" if strip_controls(value).empty?
+      else
+        if prefix = SIDE_PREFIXES.find { |p| raw_field.starts_with?(p) }
+          base = raw_field[prefix.size..]
+          return "side prefix not supported on #{base}"
+        end
+      end
+      nil
     end
 
     # Combines two filters with AND (used to layer the Scope lens over a query).
@@ -332,7 +472,7 @@ module Gori
     # History's and Colormarker's completion pools, Colormarker's unknown-field refusal and the
     # docs all read it, so a field added to `field_cond` becomes offerable everywhere at once
     # instead of in the four hand-kept copies that used to drift.
-    FIELDS = %w[host path url method scheme proto status size reqsize respsize dur header body stub src scope
+    FIELDS = %w[host path url method scheme proto status size reqsize respsize dur header body stub static src scope cache
       req.header resp.header req.body resp.body]
 
     # The fields `~` compiles on. `method` and `scheme` are text columns like `host`, so a regex over
@@ -425,19 +565,29 @@ module Gori
     #
     # Every typo of a real field passes all of this — `methd`, `hsot`, `resp.bdy`, `xyzzy` are
     # field-shaped, unknown, and still refused, which is the whole point of the refusal.
+    # The rule itself now lives in `FilterAst.field_shaped?` — the Issues and Probe bars ask the
+    # identical question of their own vocabularies, and the span highlighter asks it of all of
+    # them, so a copy here would be the fourth spelling of one predicate. QL keeps the NAME
+    # (every caller and its specs read `QL.field_shaped?`) and supplies the three things that
+    # are its own: what it knows, the namespaces it advertises, and its suggester.
+    # The `req.`/`resp.`/`res.` prefixes as an ARRAY, built once: `SIDES.each_key` is a
+    # single-use Iterator (see `FilterAst.field_shaped?`), and this is read per token.
+    SIDE_PREFIXES = SIDES.keys
+
     def self.field_shaped?(name : String, value : String) : Bool
-      return true if known_field?(name)
-      return false if value.starts_with?("//")
-      return false unless name[0]?.try(&.ascii_letter?)
-      return false unless name.each_char.all? { |c| c.ascii_alphanumeric? || c == '_' || c == '.' }
-      return SIDES.each_key.any? { |prefix| name.starts_with?(prefix) } if name.includes?('.')
-      !(port_like?(value) && suggest_field(name).nil?)
+      FilterAst.field_shaped?(name, value, known_field?(name), SIDE_PREFIXES) { suggest_field(name) }
     end
 
-    # One to five ASCII digits — the shape of a TCP port, and of nothing a QL field value has to
-    # be that a known field would not already have claimed.
-    private def self.port_like?(value : String) : Bool
-      value.size.in?(1..5) && value.each_char.all?(&.ascii_number?)
+    # The shape the span highlighter wants: name, separator and value, one proc.
+    #
+    # `known_field?` is asked WITHOUT the operator, and that is the whole division of labour
+    # between this and `spans`' `known`: the shape question is "does this name a QL field at
+    # all", the known question is "do I implement it with THIS operator". Asking the shape
+    # question with the operator loses the one signal `REGEX_FIELDS` exists to give — QL has
+    # `status:` and no `status~`, so `status~404` is a field name whose term gets DROPPED, and
+    # the bar must paint it muted rather than as plain text that will be searched.
+    FIELD_SHAPED = ->(f : String, _op : Char, v : String) do
+      FilterAst.field_shaped?(f, v, known_field?(f), SIDE_PREFIXES) { suggest_field(f) }
     end
 
     # The spelling a name QL does NOT implement most likely meant, or nil when nothing is close
@@ -453,16 +603,38 @@ module Gori
     # `hsot` → `host` work at all: a transposition costs two edits and Levenshtein's own default
     # tolerance refuses it. Wider than that stops being a suggestion — `ext` is within 3 of both
     # `dur` and `url`, and naming either would be inventing an intent.
+    # `FIELDS` first so a tie resolves to the name completion OFFERS, not to an alias. The
+    # prefix/distance rule itself is `FilterAst.suggest`, shared with the two bars that have
+    # their own vocabulary; what QL owns is the pool.
+    CANDIDATE_FIELDS = FIELDS + FIELD_ALIASES.keys
+
     def self.suggest_field(name : String) : String?
       return nil if name.empty? || known_field?(name)
-      # `FIELDS` first so a tie resolves to the name completion OFFERS, not to an alias.
-      candidates = FIELDS + FIELD_ALIASES.keys
-      # Exactly one, or none: `s` prefixes `scheme` `status` `size` `stub`, and picking one of
-      # four is a coin flip printed as advice. An ambiguous prefix falls through to distance,
-      # which answers nothing for a stub that short — the honest answer.
-      prefixed = candidates.select(&.starts_with?(name))
-      return prefixed.first if prefixed.size == 1
-      Levenshtein.find(name, candidates, name.size < 4 ? 1 : 2)
+      FilterAst.suggest(name, CANDIDATE_FIELDS)
+    end
+
+    # A bare word spelled `<field><op><value>` (`status>=400`, `host=api`) is a comparison typed
+    # without its colon. It stays free text — the word may really be text someone searches for,
+    # so the query and its result do not change — but it almost always matches nothing, and an
+    # empty list then reads as "no such traffic". This names the colon form, for every surface
+    # that explains an empty answer. A quoted or negated word was typed on purpose and is left
+    # alone, as is a name `known_field?` does not know. nil when no term looks like one.
+    MISSING_COLON = /\A([a-z][a-z0-9_.]*)(>=|<=|!=|>|<|=)([^<>=!].*)\z/i
+
+    def self.missing_colon_hint(query : String) : String?
+      FilterAst.terms(FilterAst.parse(query)).each do |term|
+        next if term.negate? || term.source.includes?('"')
+        next unless m = MISSING_COLON.match(term.text)
+        name, op, value = m[1].downcase, m[2], m[3]
+        next unless known_field?(name)
+        meant = case op
+                when "="  then "#{name}:#{value}"
+                when "!=" then "-#{name}:#{value}"
+                else           "#{name}:#{op}#{value}"
+                end
+        return "`#{term.source}` is searched as text — did you mean `#{meant}`?"
+      end
+      nil
     end
 
     # One line per field, for the surfaces that TEACH this language rather than parse it — the
@@ -490,8 +662,10 @@ module Gori
       "header"      => "head bytes, BOTH sides — see req./resp.",
       "body"        => "body via index: 8 KiB/side, no compressed",
       "stub"        => "true = gori answered it, origin never saw it",
+      "static"      => "2xx image/font/media; not svg/css/js",
       "src"         => "who sent it — proxy repeater fuzzer … or gori",
       "scope"       => "in / out — the project's scope rules",
+      "cache"       => "hit / miss / dynamic / none — from headers",
       "req.header"  => "request head bytes only",
       "resp.header" => "response head bytes only",
       "req.body"    => "request body only",
@@ -506,6 +680,13 @@ module Gori
     # would silently keep offering two spellings the day the field learns a third.
     SCOPE_VALUES = %w[in out]
 
+    # `cache:`'s WHOLE value vocabulary, for the same reason as `SCOPE_VALUES` — both completion
+    # backends (History's value table and `InterceptFilter.suggest_values`) need it, and it must
+    # not drift from what `cache_cond` accepts or what `Gori::CacheStatus` can produce. It is
+    # exactly `CacheStatus::VALUES`, aliased here so a surface completes through `QL::` like every
+    # other field and one edit to the classifier's enum reaches the pools.
+    CACHE_VALUES = CacheStatus::VALUES
+
     # `proto:`'s WHOLE value vocabulary — the four application protocols and their TLS-qualified
     # spellings, which `Proto.split_transport` peels off before `Proto::Kind.parse?` sees the
     # rest. The plain form comes first in each pair: it is the broader answer, so `proto:w`
@@ -518,11 +699,12 @@ module Gori
     # the colour-rule overlay); see `InterceptFilter.suggest_values`, which picks between the two.
     PROTO_VALUES = %w[ws wss grpc grpcs sse sses http https]
 
-    # `stub:`'s two canonical spellings. `stub_cond` also takes yes/no/on/off/1/0, and a pool is
-    # deliberately not the place for every alias — it is the place for the answer a reader can
-    # type without checking. Beside the field for `SCOPE_VALUES`' reason: History's bar and the
-    # colour-rule overlay both complete this field, and it is a closed pair in both.
-    STUB_VALUES = %w[true false]
+    # The boolean fields' (`stub:`, `static:`) two canonical spellings. `flag_cond` also takes
+    # yes/no/on/off/1/0, and a pool is deliberately not the place for every alias — it is the
+    # place for the answer a reader can type without checking. Beside the fields for
+    # `SCOPE_VALUES`' reason: History's bar and the colour-rule overlay both complete them, and
+    # they are a closed pair in both.
+    FLAG_VALUES = %w[true false]
 
     # The fields the one-line hints SAMPLE, in the order that reads best on a bar. A hint gets one
     # terminal row and `FIELDS` has eighteen entries, so something has to choose; choosing once
@@ -558,6 +740,7 @@ module Gori
       {"a bad regex matches nothing", "body~[ is a HARD error, never silently dropped"},
       {"scope: with no scope rules", "nothing is in scope, so in AND out match nothing"},
       {"src: on a pre-0.4 flow", "provenance was not recorded, so it matches NEITHER direction"},
+      {"static: on an error", "only 2xx/304 is static, so -static:true keeps errors"},
     ]
 
     # The grammar itself — everything that is NOT a field name, as {what you type, what it does}.
@@ -655,7 +838,7 @@ module Gori
       case field
       when "host"                                then contains_cond("host", value)
       when "url"                                 then contains_cond(URL_EXPR, value)
-      when "path"                                then contains_cond("target", value)
+      when "path"                                then contains_cond(PATH_EXPR, value)
       when "method"                              then {"upper(method) = ?", [value.upcase] of DB::Any}
       when "scheme"                              then {"scheme = ?", [value.downcase] of DB::Any}
       when "proto"                               then proto_cond(value)
@@ -664,9 +847,11 @@ module Gori
       when "dur"                                 then duration_cond(value)
       when "header", "req.header", "resp.header" then header_cond(value, side_of(field))
       when "body", "req.body", "resp.body"       then body_cond(value, fts, body_max, side_of(field))
-      when "stub"                                then stub_cond(value)
+      when "stub"                                then flag_cond("short_circuited", value)
+      when "static"                              then flag_cond("static_asset", value)
       when "src"                                 then src_cond(value)
       when "scope"                               then scope_cond(value, scope)
+      when "cache"                               then cache_cond(value)
       else
         # A side prefix we OWN, on a field that has no side. `resp.status:200` is not a typo the
         # way `hosst:x` is — it is a correct guess at a namespace this module advertises, made by
@@ -693,18 +878,31 @@ module Gori
       end
     end
 
-    # stub: selects flows gori ANSWERED ITSELF from a short-circuit rule (#511) — the ones no
-    # origin ever saw. `stub:true` isolates them for review; `stub:false` is the one an
-    # operator actually reaches for, to read History as traffic that really happened before
-    # writing anything up. The column is NOT NULL DEFAULT 0, so both directions are NULL-free
-    # and `-stub:true` behaves exactly like `stub:false`. An unrecognised value drops the term
-    # rather than guessing, same as a bad proto:/status:.
-    private def self.stub_cond(value : String) : {String, Array(DB::Any)}?
-      no_args = [] of DB::Any
+    # The two boolean fields, one parser, so a spelling one learns the other has too:
+    #
+    #   · stub: — flows gori ANSWERED ITSELF from a short-circuit rule (#511), the ones no
+    #     origin ever saw. `stub:true` isolates them for review; `stub:false` is the one an
+    #     operator actually reaches for, to read History as traffic that really happened.
+    #   · static: — images, fonts, audio/video (#1239). The rule lives in `StaticAsset.static?`
+    #     and is applied ONCE, when a flow is written, into the `static_asset` column (V31).
+    #
+    # Both columns are NOT NULL DEFAULT 0, so both directions are NULL-free and `-stub:true`
+    # behaves exactly like `stub:false`. An unrecognised value drops the term rather than
+    # guessing, same as a bad proto:/status:.
+    private def self.flag_cond(column : String, value : String) : {String, Array(DB::Any)}?
       case value.downcase
-      when "true", "yes", "on", "1"  then {"short_circuited = 1", no_args}
-      when "false", "no", "off", "0" then {"short_circuited = 0", no_args}
+      when "true", "yes", "on", "1"  then {"#{column} = 1", [] of DB::Any}
+      when "false", "no", "off", "0" then {"#{column} = 0", [] of DB::Any}
       end
+    end
+
+    # The hide-static lens — `static:false` as a ready filter. THE spelling every surface ANDs in
+    # (the TUI's toggle, `gori run history|sitemap --hide-static`, MCP `hide_static`), so none of
+    # them builds its own. Spelled `static_asset = 0` exactly, and ANDed as its own clause: that
+    # is the predicate `idx_flows_sitemap_nonstatic` is partial on, and a `NOT (… = 1)` would not
+    # let the planner use it.
+    def self.hide_static : Filter
+      Filter.new("static_asset = 0", [] of DB::Any)
     end
 
     # src: selects flows by WHERE THEY CAME FROM — `src:proxy` for traffic a client sent through
@@ -740,8 +938,8 @@ module Gori
     SOURCE_VALUES = FlowSource::Kind.tokens + ["gori"]
 
     # scope: selects flows by the project's SCOPE rules — `scope:in` for the include/exclude
-    # boundary, `scope:out` for everything outside it. The same predicate the ⇧S History lens
-    # and `--in-scope` apply, and DELIBERATELY independent of the persisted ⇧S flag: a filter
+    # boundary, `scope:out` for everything outside it. The same predicate the `s` History lens
+    # and `--in-scope` apply, and DELIBERATELY independent of the persisted `s` flag: a filter
     # term is the operator asking a question, not a mode, so `scope:in` must mean the same
     # thing whether the lens happens to be on (see `ScopeLens`, which is built with
     # `Scope#filter(force: true)`).
@@ -769,6 +967,28 @@ module Gori
       when "in"  then (pred = scope.predicate) ? {pred.sql, pred.args} : never
       when "out" then (pred = scope.predicate) ? {"NOT (#{pred.sql})", pred.args} : never
       end
+    end
+
+    # cache: classifies a flow by what its RESPONSE HEADERS say about caching —
+    # `cache:hit` (served from a shared cache: a positive `Age`, `X-Cache: HIT`, a served-from
+    # `CF-Cache-Status`), `cache:miss` (a cache saw it but went to origin), `cache:dynamic`
+    # (declared uncacheable), `cache:none` (no cache headers). See `Gori::CacheStatus` for the
+    # exact rules — this term is that classifier run in SQL via the `gori_cache_status` UDF over
+    # `response_head`, so History's `cache:` and `cache:hit` cannot disagree about a row.
+    #
+    # Computed ON READ (no stored column, #1247): the UDF reads the head BLOB only for a query
+    # that names this field, exactly as `body~`/`header~` read blobs only when used — so `cache:`
+    # is the one place that cost is paid, and a plain `host:`/`status:` listing never touches it.
+    #
+    # An unrecognised value drops the term rather than guessing, same as a bad proto:/status:.
+    # `cache:none` is a real, queryable value (find the flows with no cache headers), NOT a way
+    # to spell "drop the term".
+    private def self.cache_cond(value : String) : {String, Array(DB::Any)}?
+      token = value.strip.downcase
+      return nil unless CacheStatus::VALUES.includes?(token)
+      # A Pending flow has a NULL `response_head`; the UDF answers `none` for it, so
+      # `cache:none` correctly KEEPS it and `cache:hit` correctly drops it.
+      {"gori_cache_status(response_head) = ?", [token] of DB::Any}
     end
 
     # Does `query` name the `scope:` field — as a field this module will really COMPILE? Asked by
@@ -807,7 +1027,8 @@ module Gori
     # keeps it, as it always did).
     GRPC_SQL = "((content_type IS NOT NULL AND lower(content_type) LIKE 'application/grpc%') OR " \
                "(request_content_type IS NOT NULL AND lower(request_content_type) LIKE 'application/grpc%'))"
-    SSE_SQL = "(content_type IS NOT NULL AND lower(content_type) LIKE 'text/event-stream%')"
+    SSE_SQL = "(content_type IS NOT NULL AND " \
+              "lower(trim(substr(content_type, 1, instr(content_type || ';', ';') - 1))) = 'text/event-stream')"
     # BOTH transports, because a WebSocket is one protocol and used to be two answers here: an
     # RFC 8441 socket is `CONNECT` answered `200`, so `status = 101` alone silently omitted
     # every h2 one from the filter an operator reaches for to find sockets. The `connect_protocol`
@@ -817,8 +1038,11 @@ module Gori
     # half requires the 101; see `Proto.websocket_connect?`, which this mirrors exactly.
     # Every leaf carries an IS NOT NULL guard so the whole term is 0/1 rather than NULL on a
     # pending flow, which is what lets `http` below negate it NULL-safely.
+    #
+    # The 2xx range is `+status` for the reason `status_cond` gives: indexed, it made the whole
+    # OR a MULTI-INDEX read of every 2xx row plus a sort.
     WS_SQL = "((status IS NOT NULL AND status = 101) OR " \
-             "(status IS NOT NULL AND status >= 200 AND status < 300 AND " \
+             "(status IS NOT NULL AND +status >= 200 AND +status < 300 AND " \
              "connect_protocol IS NOT NULL AND lower(connect_protocol) = 'websocket'))"
 
     private def self.proto_cond(value : String) : {String, Array(DB::Any)}?
@@ -859,7 +1083,9 @@ module Gori
     # quotes doubled) so arbitrary characters can't form FTS operator syntax. A
     # bodyless flow has an empty FTS row, so it never matches and `-body:x`
     # correctly KEEPS it. The trigram index needs >=3 characters, so shorter
-    # values fall back to the NULL-safe BLOB LIKE scan.
+    # values take the index-free spelling below instead — the same NUL-transparent,
+    # NULL-guarded literal REGEXP `fts:`-off `body:` takes, so the needle's LENGTH never
+    # changes what `body:` means.
     # The body columns a `side` selects — both, or one. Named because `body_cond`,
     # `body_literal_cond` and `body_regex_cond` each build their own clause and must not be able
     # to disagree about what `resp.` means.
@@ -886,9 +1112,38 @@ module Gori
       side == :req ? "req" : "resp"
     end
 
+    # The trigram tokenizer's floor: `flows_fts MATCH` cannot answer a needle shorter than this.
+    FTS_MIN_CHARS = 3
+
+    # :nodoc: — internal, but NOT private: `ProjectSearch` reads other projects' databases over
+    # a raw read-only handle and has to spell `body:`'s needle folding and its FTS term exactly
+    # as this module does, or the picker's cross-project search and History would disagree
+    # about what a needle matches (#1229). NUL and the other control characters go: neither
+    # the FTS phrase nor a LIKE pattern can carry them safely.
+    def self.strip_controls(value : String) : String
+      value.chars.reject(&.control?).join
+    end
+
+    # :nodoc: — the indexed half of `body:`, for the same caller as `strip_controls`. nil when
+    # the needle (after the strip) is under `FTS_MIN_CHARS`, which the index cannot answer; the
+    # caller decides what a short needle means instead. The value is a quoted FTS phrase with
+    # its embedded quotes doubled — a contiguous-substring match that no character in it can
+    # turn into FTS operator syntax, and still a single bound `?`.
+    def self.fts_cond(value : String, side : Symbol? = nil) : {String, Array(DB::Any)}?
+      value = strip_controls(value)
+      return nil if value.size < FTS_MIN_CHARS
+      phrase = %("#{value.gsub('"', "\"\"")}") # quoted phrase → contiguous substring match
+      # An FTS5 COLUMN FILTER (`resp : "phrase"`) narrows the match to one indexed column. The
+      # column name is this module's own constant, never user input — the value stays inside the
+      # quoted phrase whose embedded quotes were doubled just above — so the term is still not an
+      # injection surface, and it stays a single bound `?`.
+      phrase = "#{fts_column(side)} : #{phrase}" if side
+      {"id IN (SELECT rowid FROM flows_fts WHERE flows_fts MATCH ?)", [phrase] of DB::Any}
+    end
+
     private def self.body_cond(value : String, fts : Bool = true,
                                body_max : Int32? = nil, side : Symbol? = nil) : {String, Array(DB::Any)}?
-      value = value.chars.reject(&.control?).join # strip NUL/control chars (FTS/LIKE safety)
+      value = strip_controls(value) # strip NUL/control chars (FTS/LIKE safety)
       # `field_cond`'s `return nil if value.empty?` runs BEFORE this strip, so a value made
       # only of control bytes survived that guard and arrived here as "". `like("")` is
       # `'%%'`, which matches EVERY flow with a body — and `-body:` then excluded every flow
@@ -897,42 +1152,21 @@ module Gori
       # Dropping the term is what `body:` (genuinely empty) already does; this makes the two
       # spellings agree.
       return nil if value.empty?
-      if value.size < 3
-        # BYTE-wise, not `CAST(... AS TEXT)`: SQLite truncates a BLOB→TEXT cast at the first
-        # NUL, so the LIKE fallback stopped scanning there and a body of
-        # `head\0NULNEEDLE tail` was invisible to `body:nu` while `body:NULNEEDLE` (the FTS
-        # path, >=3 chars) found it. A SHORTER needle matching FEWER rows is a monotonicity
-        # violation that cannot be explained to an operator, and this is a tool whose targets
-        # deliberately put NULs in bodies. `instr` over the raw BLOB is NUL-transparent.
-        #
-        # `instr` is case-SENSITIVE while `body:` promises case-insensitive substring matching,
-        # so match every case permutation of the needle instead — at most four, since this
-        # branch only runs for one or two characters.
-        # `COALESCE`-wrapped, and that is load-bearing: a NULL body (a bodyless GET, or any
-        # response-less/in-flight flow — the common case) makes `instr(NULL, …)` NULL, and
-        # `NOT (NULL > 0)` is NULL, which SQLite's three-valued logic then EXCLUDES — so a bare
-        # `instr` made `-body:x` silently drop every bodyless flow (a silent NARROW, the mirror
-        # of the broaden this path guards against). `COALESCE(…, 0) > 0` is FALSE for a NULL
-        # body, so the positive term still skips it and `NOT FALSE` keeps it under negation.
-        conds = [] of String
-        params = [] of DB::Any
-        cols = body_columns(side)
-        case_permutations(value).each do |v|
-          cols.each do |col|
-            conds << "COALESCE(instr(#{body_col(col, body_max)}, CAST(? AS BLOB)), 0) > 0"
-            params << v
-          end
-        end
-        return {"(#{conds.join(" OR ")})", params}
-      end
-      return body_literal_cond(value, body_max, side) unless fts
-      phrase = %("#{value.gsub('"', "\"\"")}") # quoted phrase → contiguous substring match
-      # An FTS5 COLUMN FILTER (`resp : "phrase"`) narrows the match to one indexed column. The
-      # column name is this module's own constant, never user input — the value stays inside the
-      # quoted phrase whose embedded quotes were doubled just above — so the term is still not an
-      # injection surface, and it stays a single bound `?`.
-      phrase = "#{fts_column(side)} : #{phrase}" if side
-      {"id IN (SELECT rowid FROM flows_fts WHERE flows_fts MATCH ?)", [phrase] of DB::Any}
+      # Under the trigram minimum the FTS index cannot answer — but the term is still a
+      # literal substring search, and `body_literal_cond` IS that search: NUL-transparent
+      # (SafeRegexp reads the haystack by its true byte length, so a body of
+      # `head\0NULNEEDLE tail` is not invisible to `body:nu` the way a BLOB→TEXT `LIKE`
+      # made it) and NULL-guarded, so `-body:x` still keeps a bodyless flow.
+      #
+      # This used to be spelled as `instr` over every ASCII case permutation of the needle,
+      # because `instr` is case-SENSITIVE and `body:` promises case-insensitive matching.
+      # That cost up to four permutations x two body columns = EIGHT full-BLOB scans per row
+      # where one now suffices, and it folded case by a DIFFERENT rule than every longer
+      # needle used — `body:s` and `body:sql` disagreeing about `ſ` for no reason an operator
+      # could see. One spelling for every needle length, and the shorter needle can no longer
+      # match fewer rows than the longer one.
+      return body_literal_cond(value, body_max, side) unless fts && (indexed = fts_cond(value, side))
+      indexed
     end
 
     # The index-free spelling of `body:` (see `parse`'s `fts:`): `body~` with the needle escaped
@@ -953,16 +1187,6 @@ module Gori
       body_regex_cond("(?i)#{Regex.escape(value)}", body_max, side)
     end
 
-    # Every upper/lower spelling of a one- or two-character needle, so a byte-wise `instr`
-    # can stand in for a case-insensitive LIKE. Bounded at 4 by `body_cond`'s `size < 3`
-    # guard; a character with no case (a digit, a symbol, most CJK) contributes one variant.
-    private def self.case_permutations(value : String) : Array(String)
-      value.each_char.reduce([""]) do |acc, ch|
-        forms = [ch.downcase, ch.upcase].uniq!
-        acc.flat_map { |prefix| forms.map { |f| prefix + f } }
-      end.uniq!
-    end
-
     # Split a leading comparison operator (<= >= < > =, default =) off a value. Shared
     # by status:, size:, dur: so the operator parsing lives in exactly one place.
     private def self.split_op(value : String) : {String, String}
@@ -977,6 +1201,12 @@ module Gori
 
       # status class: 2xx / 4xx / 5xx — honour any comparison operator against the
       # class bounds (e.g. status:>=5xx → status >= 500; bare status:4xx → 400-499).
+      # The two-sided class range is spelled `+status` — the unary plus is a no-op on the
+      # value but takes the term away from `idx_flows_status`. Given a bounded range on that
+      # index the planner reads every matching row off the table and sorts them (`status:2xx`
+      # is most of a project) instead of walking `idx_flows_list` newest-first and stopping at
+      # the page: 889 ms -> 0.57 ms for `status:2xx` at 200k flows. A one-sided range it
+      # already declines, and an equality stays on the index, which is right for it.
       # Case-insensitive, because `InterceptFilter` (the same predicate over a live message) folds
       # the value before its class test, so `status:5XX` painted a colour rule's row while the
       # History query for the same string was silently dropped — one string, two answers.
@@ -988,7 +1218,7 @@ module Gori
         when ">"  then return {"status >= ?", [base + 100] of DB::Any}
         when "<=" then return {"status < ?", [base + 100] of DB::Any}
         when "<"  then return {"status < ?", [base] of DB::Any}
-        else           return {"(status >= ? AND status < ?)", [base, base + 100] of DB::Any}
+        else           return {"(+status >= ? AND +status < ?)", [base, base + 100] of DB::Any}
         end
       end
 
@@ -1073,24 +1303,14 @@ module Gori
     # first NUL, so a head that stored an embedded NUL (header-injection / smuggling
     # cases — the codec keeps the octets, P7) made every header after the NUL invisible
     # to `header:` while `header~` (SafeRegexp over the full blob) still found it. Same
-    # trap `body_cond` already routed around. `instr` is case-SENSITIVE, so OR every case
-    # permutation of a short needle; longer needles go through a case-insensitive literal
-    # REGEXP, which SafeRegexp already makes NUL-transparent.
+    # trap `body_cond` already routed around, and the same way: ONE case-insensitive
+    # literal REGEXP, which SafeRegexp makes both NUL-transparent and (for a literal)
+    # allocation-free. A short needle used to take an `instr` per ASCII case permutation
+    # per head column instead — more scans, and a different fold rule at 1-2 characters
+    # than at 3, which `body_cond` explains at more length.
     private def self.header_cond(value : String, side : Symbol? = nil) : {String, Array(DB::Any)}?
-      value = value.chars.reject(&.control?).join
+      value = strip_controls(value)
       return nil if value.empty?
-      if value.size < 3
-        conds = [] of String
-        params = [] of DB::Any
-        cols = head_columns(side)
-        case_permutations(value).each do |v|
-          cols.each do |col|
-            conds << "COALESCE(instr(#{col}, CAST(? AS BLOB)), 0) > 0"
-            params << v
-          end
-        end
-        return {"(#{conds.join(" OR ")})", params}
-      end
       pat = "(?i)#{Regex.escape(value)}"
       return {"0", [] of DB::Any} unless valid_regex?(pat)
       header_regex_cond(pat, side)
@@ -1141,7 +1361,7 @@ module Gori
       return {"0", [] of DB::Any} unless valid_regex?(value)
       case field
       when "host"                                then {"host REGEXP ?", [value] of DB::Any}
-      when "path"                                then {"target REGEXP ?", [value] of DB::Any}
+      when "path"                                then {"#{PATH_EXPR} REGEXP ?", [value] of DB::Any}
       when "url"                                 then {"#{URL_EXPR} REGEXP ?", [value] of DB::Any}
       when "method"                              then {"method REGEXP ?", [value] of DB::Any}
       when "scheme"                              then {"scheme REGEXP ?", [value] of DB::Any}
@@ -1241,9 +1461,16 @@ module Gori
     # A case-insensitive substring test on `expr`, picking the folding implementation by what
     # the NEEDLE contains.
     #
-    # `lower(col) LIKE ?` folds the haystack with SQLite's built-in `lower()`, which is
-    # ASCII-only, while `like` folds the needle with Crystal's full-Unicode `downcase`. For a
-    # needle carrying a non-ASCII letter the two never meet: a captured `/Überweisung` was
+    # `LIKE` folds the haystack ITSELF: with `case_sensitive_like` at its default OFF (this
+    # store never turns it on), SQLite compares through `sqlite3UpperToLower`, the same
+    # ASCII-only table its `lower()` uses — so the `lower(col)` this used to wrap the column
+    # in was a second fold of an already-folded comparison, paying a per-row `String`
+    # allocation inside SQLite for an answer that could not differ. Dropping it is 2.7x on the
+    # scanning filters (`host:`/`path:`/`url:`/a bare word, 9.0ms → 3.3ms over 100k flows;
+    # bench/history_filter_bench). `like` still folds the NEEDLE with Crystal's full-Unicode
+    # `downcase`, which is why the needle side is decided here at all.
+    #
+    # For a needle carrying a non-ASCII letter the two never meet: a captured `/Überweisung` was
     # unreachable by `path:` in EVERY spelling, and `InterceptFilter` — the in-memory
     # implementation of this same predicate — matched the row while History did not. Those
     # needles go through `gori_ci_contains` (Crystal's `downcase.includes?` as a UDF), which is
@@ -1251,13 +1478,13 @@ module Gori
     #
     # An ASCII needle keeps the native LIKE, because the UDF costs a Crystal callback and two
     # String allocations PER ROW and both forms full-scan either way: measured over 100k flows,
-    # `host:` answers in 7ms through LIKE and 71ms through the UDF, and History recompiles this
+    # `host:` answers in 3ms through LIKE and 71ms through the UDF, and History recompiles this
     # filter on every keystroke (P6 — never stall the data path). Every ASCII character folds
     # identically in the two implementations, so the fast path is exact for the needles that
     # take it. The residue it accepts: a haystack character that folds INTO ASCII under Unicode
-    # but not under `lower()` (`İ`→`i`, `K`→`k`, `ſ`→`s`) stays unreachable by an ASCII needle.
-    # All three columns are NOT NULL, so the arms cannot disagree under `NOT` the way a NULL
-    # haystack would (`NOT (NULL)` drops the row, `NOT (0)` keeps it).
+    # but not under LIKE's ASCII fold (`İ`→`i`, `K`→`k`, `ſ`→`s`) stays unreachable by an
+    # ASCII needle. All three columns are NOT NULL, so the arms cannot disagree under `NOT` the
+    # way a NULL haystack would (`NOT (NULL)` drops the row, `NOT (0)` keeps it).
 
     # :nodoc: — internal, but NOT private: `Store#events_recent` narrows the #124 event feed
     # through this same predicate, so the Activity pane's `/` bar and History's `msg:` agree on
@@ -1266,7 +1493,7 @@ module Gori
     # comment block attached to the definition, and the rationale above is its own block.
     def self.contains_cond(expr : String, value : String) : {String, Array(DB::Any)}
       return {"gori_ci_contains(#{expr}, ?)", [value] of DB::Any} unless value.ascii_only?
-      {"lower(#{expr}) LIKE ? ESCAPE '\\'", [like(value)] of DB::Any}
+      {"(#{expr}) LIKE ? ESCAPE '\\'", [like(value)] of DB::Any}
     end
 
     def self.like(value : String) : DB::Any

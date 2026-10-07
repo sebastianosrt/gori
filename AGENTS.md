@@ -14,6 +14,8 @@ load-bearing: source comments cite principles as `(P4)`, `(P6/P7)` and sections 
 `DESIGN.md §4`.
 
 - Changing behavior? Read **Invariants** below first — those three are what changes get wrong.
+- Adding or moving a TUI key or space-menu row? **TUI keys** lists the rules the boot checks and
+  guard specs hold you to.
 - Committing? **House rules** has the commit, CHANGELOG and pre-commit checklist.
 - Adding a subsystem? DESIGN.md, then back here.
 
@@ -30,7 +32,8 @@ canonical; parsed columns and pretty views are derived projections.
 - **The axis is provenance, not byte values.** The same octet gets three different answers:
   - **operator bytes** (imported HAR, an MCP `raw` request, a replay) go out verbatim, never
     sanitized. See the comment at `src/gori/import/builder.cr:31-38` and
-    `src/gori/mcp/request_builder.cr` (`normalize_raw`).
+    `src/gori/repeater/url_request.cr` (`raw` / `normalize_raw`, shared by MCP `send_request`
+    and `gori run send`).
   - **page-authored bytes** (a crawled `<a href>`) get percent-encoded where they merely
     break, and refused where they *frame*. See `src/gori/discover/url.cr` (`encode_unsafe`).
   - **remote-chosen bytes** (a redirect `Location`) are refused outright, not repaired. See
@@ -54,6 +57,10 @@ parity with it, and every parity gap found so far has been in a surface, not an 
 - Adding a feature means: engine + `Plan.build` path once, then a thin adapter in each of
   `src/gori/tui/`, `src/gori/cli/run/`, `src/gori/mcp/tools/`. Parity is a convention held by
   each surface calling the same engines, not by a shared dispatcher ([DESIGN.md §2](.github/DESIGN.md)).
+- Unknown Rewriter labels read from settings or a project database stay raw and inert; enum
+  fallback values are projections for listing, never permission to rewrite. `MatchRule#inert?`
+  gates both replacement and short-circuit selection. Surfaces may list and delete such rows,
+  but must not enable, edit, duplicate, move or reorder them.
 - The seam is **not** the `Verb` registry. Its 318 verbs are TUI-only by decision: a verb reads
   its target from TUI selection state instead of naming it, and the missing argument schema is
   the blocker, not registry wiring (`src/gori/verb.cr`, DESIGN.md §7). Do not "fix" parity by
@@ -76,9 +83,10 @@ parity with it, and every parity gap found so far has been in a surface, not an 
   (`src/gori/outbound.cr`). It is a required constructor argument on `Fuzz::Sender` and
   `Repeater::Sender`, so an ungated sender is a compile error. Layer 1 (`check`) is the only
   per-surface variance: `Outbound.agent` (MCP, strict), `Outbound.cli` (permissive when
-  unconfigured), `Outbound.interactive` (TUI, no up-front gate). Layer 2 (`sweep_block` /
-  `send_block`: sandbox + explicit excludes) is identical everywhere and applies even when
-  Layer 1 was waived. Judge the host actually dialled via `Outbound.scope_url`, never the
+  unconfigured), `Outbound.interactive` (TUI, no up-front gate). Layer 2 (`sweep_block`:
+  sandbox + explicit excludes, for an automated sweep; `send_block`: sandbox only, since a
+  hand-authored send passes an exclude as the proxy does) is identical everywhere and applies
+  even when Layer 1 was waived. Judge the host actually dialled via `Outbound.scope_url`, never the
   request line.
 
 ### 3. Never stall the data path (P6), and don't crash
@@ -93,7 +101,7 @@ bottleneck every time.
 - All writes funnel through one writer fiber fed by a buffered `Channel`, batched into one
   transaction to amortize fsync. Replies and events fire only **after** commit, and a failed
   batch must not kill the writer fiber or every blocked caller deadlocks (`Store#writer_loop`).
-- Measure, don't guess. 36 harnesses live in `bench/` and are cited back from the source they
+- Measure, don't guess. 27 harnesses live in `bench/` and are cited back from the source they
   justify. Allocation-shaped wins are real; CPU micro-optimizations usually are not.
   `bench/proxy_bench.cr` has ±40% run-to-run noise, so use `bench/capture_bench.cr` for
   allocation deltas.
@@ -102,6 +110,89 @@ bottleneck every time.
   connections), cross-close on tunnel teardown (`src/gori/proxy/pump.cr:13`, fd exhaustion),
   `TeardownLatch` must stay a reference type (`src/gori/proxy/conn/client_conn.cr:65`), no
   loop-variable capture in `spawn do…end` (`src/gori/proxy/server.cr`).
+
+## TUI keys: the space menu and its letters
+
+Every letter the operator presses is checked at boot or by a guard spec. A new or moved verb
+passes these; it does not work around them. The reasoning is in DESIGN.md §7 (the 2026-09-12
+key grammar, the 2026-09-25 #1274 entries and the 2026-09-26 #1295 entries).
+
+- **One letter, one meaning per tab (R1).** A space-menu letter may differ from the verb's
+  chord, but it must never be a key the same tab answers with a different action. That covers
+  the tab's scope under every OS profile × keyset, the Editor scope in an editor pane, the
+  sub-tab strip's raw keys, the Global fallback (`c` stops capture and `i` holds all traffic on
+  a dropped `space`) and the tab bar, whose bare keys go Sidebar → Global.
+  `spec/tui/menu_letter_meaning_spec.cr` sweeps all five. Its
+  `MENU_LETTER_ALLOWED` names exact verb pairs with a reason and fails when an entry stops
+  violating, so a fix deletes its own line. Never add an entry just to let a new verb pass.
+  So a level-1 `c` or `i` is allowed only on a tab that binds that letter itself: anywhere else a
+  dropped `space` reaches Global and stops capture or holds all traffic, and the guard fails.
+  The tab bar is the exception by design: it is app-level focus, so Global wins there even over
+  the tab's own `c`/`i` loop letter (Probe's `c` Dismiss), and those pairs are allowlisted by name.
+  Three exemptions are rule-based: the Global scope lens (`HARMLESS_GLOBALS`, a view filter the
+  next `s` undoes), the `vim` keyset's motions (`VIM_MOTIONS`: append, top, bottom, find,
+  select line), which only move or select, and the editor's READ-mode edits (`EDITOR_EDITS`:
+  delete, paste, `dd`, `yy`), which touch only the focused buffer and can be undone. Never
+  widen the first two to a verb that writes or sends, or the third to one that leaves the pane.
+- **A recurring intent takes its letter from the lexicon.** Declare `intent:`
+  (`src/gori/verb/lexicon.cr`), never a `mnemonic:` beside it (`validate_intents!` raises).
+  The same intent has the same letter on every tab, and a verb whose id names an intent
+  (`*.filter`, `*.export`, `*.copy`, the strip ids, …) must declare it
+  (`spec/verb/lexicon_spec.cr`). Only a one-off action spells a local `mnemonic:`.
+- **Reserved letters.** Menu `X` / `⇧X` is wipe and nothing else. On a tab with a sub-tab
+  strip, the strip's nine (`n w d e t f / T N`) are never a COMMON verb's letter: COMMON shares
+  the strip-focused card, where the SUB-TABS bucket is drawn expanded. In a pane view the bucket
+  is one row, `T` **Sub-tabs…** (`Registry::SUBTABS_FOLD`), so a pane verb may use the other
+  eight but never `T`; `pinned:` keeps a strip verb at level 1 in the panes too (Paste cURL).
+  Reassign a freed pane letter in its own change.
+- **No menu letter is `h`/`j`/`k`/`l`**, at either space-menu level: not a row's letter (a
+  chord-derived one included), a pinned member's, a family key or a level-2 letter. Inside the
+  menu those four always move the selection; the Runner's fallback stays.
+  `Registry#validate_intents!` and `Verb::Family#validate!` raise at boot
+  (`Family::NAV_LETTERS`). The **Send selection to…** picker (`Space` `S`) is not a menu level:
+  it letters JWT `j` and Cookie `k` from `TOOL_LETTERS` and moves with the arrows.
+- **A variation of one intent joins a family instead of taking a letter.** Every cross-tool
+  send is a member of `Send flow to…` (`>`), every view toggle of `Display…` (`Z`) and every
+  Repeater/Fuzzer transport toggle of `Protocol…` (`P`), all in `src/gori/verbs/families.cr`.
+  - Members are keyed by `intent:`. Their second-level letters come only from the family table
+    (`Verb::Family`, `TOOL_LETTERS` for sends) and are the same on every tab.
+  - A toggle family is `sticky:`: its card comes back after a member runs and draws each row's
+    `ExecContext#menu_state` (●/○ or a value). A new toggle member needs its arm in the tab's
+    `TabController#menu_state` (`spec/tui/toggle_family_state_spec.cr` checks). A member that
+    opens something instead of flipping it closes the card through `SpaceMenu.resume_sticky?`
+    (an overlay, or a pane that takes the keys: `TabController#pane_captures_keys?`). A
+    member is never a write-back to the request.
+  - `pinned: true` keeps a loop action one keypress away as well.
+  - A family row is static: it is drawn whenever the view registers a member. It is never gated
+    on `available?` and never collapsed into its lone member.
+- **A bare key that belongs to one pane declares `chord_sections:`.** Do not hide that gate in
+  `available:`, because the R1 guard reads the declaration. Never pane-gate a letter that Global
+  binds: outside the pane, the press falls through to Global.
+- **The space menu is for the frequent; the palette takes the long tail.** A row that only
+  repeats a direct chord for an editing or navigation convenience, or a once-a-session
+  configuration action, is placed `menu: :palette` (`Verb::Placement`): no row at either level,
+  found by `Ctrl-P`'s typed search from its tab, chords unchanged. It spells no `mnemonic:`, is
+  never a family member, pinned or hidden (`validate_intents!` raises), and the letter rules
+  ignore it. Name it in UI text with `{space:verb.id}` like any row: `Hotkeys.route` prints its
+  chord, or `^P → <title>` when it has none. Move a row by that criterion, never by a row count.
+- **Never spell a menu letter in UI text.** Help rows, hints and toasts use `{space:verb.id}` or
+  `Hotkeys.menu_path` (which prints `space → > f` for a member; `Hotkeys.route` also covers a
+  palette-only verb). A chip, a border badge or a tight hint uses `Hotkeys.menu_chip` (`␣Pr`).
+  `spec/verb/hint_token_expands_spec.cr` fails on a literal `space → X`, an arrowless `space X`
+  or `Space X`, `␣X`, or a spaced `␣ X` chip in any non-comment source line.
+- **A pane that owns its keys has its own scope.** Help and the Project NETWORK settings pane
+  are `Scope::Help` / `Scope::ProjectSettings`, with no verbs. Never let such a pane borrow
+  another tab's scope: it would draw that tab's static family rows and answer its bare family
+  keys (`>`).
+- **`chord_of:` names its owner, never a chain.** A row that shows another verb's chord declares
+  none itself; the owner is in the same scope, has a chord live in the row's section and no
+  `chord_of:` of its own (`Registry#check_chord_of!` raises at boot).
+- **`Space` and `Ctrl-P` share one context.** `ActionContext.capture` + `Registry#for_view` is
+  the only answer to "what can I do here", and the palette's typed search finds the focused
+  tab's actions through it. Do not compute that a second way.
+- A key change runs the boot validators (`validate_chords!`, `validate_menu_keys!`,
+  `validate_intents!`). Run `spec/verbs/registry_reach_spec.cr` and the guard specs above
+  before the full suite.
 
 ## Commands
 
@@ -121,12 +212,13 @@ bottleneck every time.
 | Proxy benchmark | `just benchmark` |
 | Seed a demo project | `just seed-demo` (`scripts/seed_demo.cr`) |
 | Version consistency | `just vc` |
-| nix/shards.nix drift | `just nix-shards-check` (`scripts/nix_shards_check.cr`) |
+| packaging/nix/shards.nix drift | `just nix-shards-check` (`scripts/nix_shards_check.cr`) |
 
 What CI gates, and what it does not:
 
 - **Gated:** `shards build`, `crystal spec`, `crystal tool format --check src spec bench scripts`,
-  `scripts/bench_check.sh`, and `scripts/nix_shards_check.cr` (nix/shards.nix against shard.lock).
+  `scripts/bench_check.sh`, and `scripts/nix_shards_check.cr` (packaging/nix/shards.nix
+  against shard.lock).
   Format, bench and the shards gate are real gates — `just test` touches none of them, so a green
   suite is not a green CI.
 - **Gated as a diff, on pull requests:** ameba. The full run is not a gate — it carries a
@@ -161,42 +253,41 @@ subsystems at once and so mirrors no single file (`layering_spec.cr`, `send_seam
 | `ql.cr`, `filter_ast.cr` | the query language behind every filter |
 | one dir per tool | `repeater/`, `fuzz/`, `miner/`, `discover/`, `sequencer/`, `probe/`, `oast/`, `decoder/`, `import/`, `jwt/` |
 
+Outside `src/`, distribution recipes live under `packaging/` (`aur/`, `chocolatey/`, `docker/`,
+`nix/shards.nix`). Two stay at the root because their tool only looks there: `flake.nix` +
+`flake.lock` (a flake must sit at the repo root) and `snap/snapcraft.yaml` (snapcraft finds its
+project file only inside the directory it packs).
+
 ## House rules
 
-### Commit messages: short
-
-One subject line carries the change:
+### Commit messages
 
 ```
 type(scope): what changed, imperative (#123)
 ```
 
+- One subject line, under ~72 characters, ending with the issue or PR number.
 - `type` is `feat`, `fix`, `refactor`, `docs`, `style` or `chore`. `scope` is the subsystem
-  (`proxy`, `store`, `tui`, `history`, `cli/mcp`, …), comma-joined only when a change really
-  spans two. Keep the line under ~72 characters and end it with the issue or PR numbers.
-- A body is optional. When there is one, a few lines: what changed, plus the *why* a reader of
-  the diff cannot reconstruct. It is not the place for the investigation that produced the
-  change — that belongs in the PR description, and a decision that refines a principle belongs
-  in DESIGN.md §7.
-- `git log` contains multi-page commit bodies. They are history, not a template. Do not match
-  their length.
+  (`proxy`, `store`, `tui`, `cli`, `mcp`, …), comma-joined only when a change really spans two.
+- A body is optional, and a few lines when there is one: what changed, plus the *why* the diff
+  cannot show. The investigation that produced the change belongs in the PR body; a decision
+  that refines a principle belongs in DESIGN.md §7. `git log` has multi-page bodies — those are
+  history, not a template.
 - One theme per commit. A drive-by format or rename of unrelated files goes in its own commit.
-- **No AI attribution anywhere** — commit, PR body, or issue. No `Claude-Session:` line, no
-  "Generated with …", no bot co-author. End after the content and any real human
-  `Co-authored-by:` trailer.
+- **No AI attribution anywhere** — commit, PR body or issue. End after the content and any real
+  human `Co-authored-by:` trailer.
 
-### CHANGELOG: shorter
+### CHANGELOG
 
-`CHANGELOG.md` is the source for release notes, so an entry has to be liftable exactly as
-written.
+`CHANGELOG.md` is the source for release notes, so an entry has to be liftable exactly as written.
 
-- Add a line under `## Unreleased` for anything a user would notice. A refactor, a spec, an
-  internal cleanup gets no entry.
-- **One line per theme**, plain prose, issue/PR numbers in parentheses at the end. One or two
-  sentences. If it has to be read twice, it is too long (#709).
-- Join the existing theme line instead of adding a fourth bullet about the same area.
-- Fixing something that is still under `## Unreleased` means **editing the line already there**,
-  not appending "…and then fixed it". The section says what will ship, not what happened.
+- One line under `## Unreleased` for anything a user would notice. A refactor, a spec or an
+  internal cleanup gets none.
+- **One line per theme**, plain prose, one or two sentences, issue/PR numbers in parentheses at
+  the end. If it has to be read twice, it is too long (#709).
+- Join the existing theme line instead of adding another bullet about the same area.
+- Fixing something still under `## Unreleased` means **editing the line already there**, not
+  appending "…and then fixed it". The section says what will ship, not what happened.
 - The reasoning that justifies a change is not a changelog entry. PR body, or DESIGN.md §7.
 
 ### Branches and PRs
@@ -224,7 +315,7 @@ written.
 - A user-visible change gets its CHANGELOG line, in the shape above.
 - If your change makes a `DESIGN.md` section wrong, fix that section in the same PR, and
   append to the §7 decision log instead of quietly widening a principle to fit.
-- Changing `shard.lock` means regenerating `nix/shards.nix` (`just nix-shards`) in the same commit. CI enforces it (`just nix-shards-check`); skipping it is otherwise silent, since the flake keeps building the old revisions.
+- Changing `shard.lock` means regenerating `packaging/nix/shards.nix` (`just nix-shards`) in the same commit. CI enforces it (`just nix-shards-check`); skipping it is otherwise silent, since the flake keeps building the old revisions.
 
 ## Traps
 
@@ -239,6 +330,9 @@ written.
 - Crystal has no `override`, so a subclass silently shadows a base-class contract method.
   Audit overlay and controller subclasses for accidental shadowing.
 - Shipping a green `just test` without `just check` and `just benchmark-check`: CI gates both.
+- Picking a free-looking menu letter by hand, or copying one from an issue's "free letters" list
+  (those go stale within days). Use the lexicon or a family, and let the boot checks and the R1
+  guard decide.
 
 ## Where to read next
 

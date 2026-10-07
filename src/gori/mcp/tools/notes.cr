@@ -22,12 +22,12 @@ module Gori
             j.field "notes" do
               j.array do
                 doc.notes.each_with_index do |entry, idx|
-                  j.object do
-                    j.field "id", entry.id
-                    j.field "title", note_title(entry)
-                    j.field "line_count", Notes.line_count(entry.text)
-                    j.field "current", doc.cur == idx
-                  end
+                  {
+                    id:         entry.id,
+                    title:      note_title(entry),
+                    line_count: Notes.line_count(entry.text),
+                    current:    doc.cur == idx,
+                  }.to_json(j)
                 end
               end
             end
@@ -37,8 +37,7 @@ module Gori
 
       @[Tool("get_note")]
       private def get_note(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
+        id = required_id(h, "id")
         doc = Notes.load(store)
         entry = doc.notes.find { |n| n.id == id }
         return not_found("no note with id #{id}") unless entry
@@ -68,24 +67,18 @@ module Gori
       # `Notes.create` runs the read and the write inside one `BEGIN IMMEDIATE` (see
       # `Store#mutate_setting`), and mints the id from the set the transaction read — so two
       # concurrent creates get two ids and both notes survive.
-      @[Tool("create_note", gated: true, agent_action: true)]
+      @[Tool("create_note", gated: true, agent_action: true, permission: "write")]
       private def create_note(h) : Result
         text = str(h, "text") || ""
         new_id = Notes.create(store, text)
         return busy("note NOT saved (store busy or unwritable); nothing was persisted") unless new_id
 
-        Result.new(JSON.build do |j|
-          j.object do
-            j.field "id", new_id
-            j.field "message", "Note created successfully"
-          end
-        end)
+        Result.new({id: new_id, message: "Note created successfully"}.to_json)
       end
 
-      @[Tool("update_note", gated: true, agent_action: true)]
+      @[Tool("update_note", gated: true, agent_action: true, permission: "write")]
       private def update_note(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
+        id = required_id(h, "id")
         text = str(h, "text")
         return Result.new("missing 'text' parameter", is_error: true) unless text
 
@@ -99,18 +92,12 @@ module Gori
           return busy("note NOT updated (store busy or unwritable); it is unchanged")
         end
 
-        Result.new(JSON.build do |j|
-          j.object do
-            j.field "id", id
-            j.field "message", "Note updated successfully"
-          end
-        end)
+        Result.new({id: id, message: "Note updated successfully"}.to_json)
       end
 
-      @[Tool("delete_note", gated: true, agent_action: true)]
+      @[Tool("delete_note", gated: true, agent_action: true, permission: "write")]
       private def delete_note(h) : Result
-        id = int(h, "id")
-        return Result.new(id_error(h, "id"), is_error: true) unless id
+        id = required_id(h, "id")
 
         case Notes.delete(store, id)
         when .missing?
@@ -119,18 +106,14 @@ module Gori
           return busy("note NOT deleted (store busy or unwritable); it is unchanged")
         end
 
-        Result.new(JSON.build do |j|
-          j.object do
-            j.field "id", id
-            j.field "message", "Note deleted successfully"
-          end
-        end)
+        Result.new({id: id, message: "Note deleted successfully"}.to_json)
       end
 
       # The note's display title, scrubbed for the JSON-RPC wire. `one_line` rather than
-      # `scrub_only`: `Notes.title` returns the first non-blank LINE, so it is a single-line
-      # field here exactly as an issue's `title` is — and a lone CR or a stray C0 inside that
-      # line would otherwise ride out into a field a client renders inline.
+      # `scrub_only`: `Notes.title` returns ONE line (the first with text, Markdown heading
+      # marker dropped), so it is a single-line field here exactly as an issue's `title` is —
+      # and a lone CR or a stray C0 inside that line would otherwise ride out into a field a
+      # client renders inline.
       private def note_title(entry : Notes::NoteEntry) : String
         Issues::Export.one_line(Notes.title(entry.text) || "").presence || "Untitled"
       end

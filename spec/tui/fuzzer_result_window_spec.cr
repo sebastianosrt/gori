@@ -52,6 +52,27 @@ describe Gori::Tui::FuzzerResultWindow do
     kept.wire.should be_nil
   end
 
+  # Eviction looks for another row with the evicted index only when that index is MARKED
+  # (an unmarked delete is a no-op), so the mark has to live exactly as long as a projected
+  # copy of its index is still in the window — and never appear for one that was not.
+  it "keeps a projection mark while its index is still in the window, and drops it after" do
+    small = Gori::Tui::FuzzerResultWindow.result_bytes(window_result(0_i64))
+    cap = small * 3 + 50_i64
+    window = Gori::Tui::FuzzerResultWindow.new(3, cap)
+    window.append(window_result(5_i64, (cap + 100).to_i32)) # oversized → projected
+    window.projected?(5_i64).should be_true
+    window.append(window_result(5_i64)) # the same index again (a resend), small
+    window.append(window_result(6_i64))
+    window.append(window_result(7_i64)).should eq(1) # evicts the projected copy of 5
+    window.rows.map(&.index).should eq([5_i64, 6_i64, 7_i64])
+    window.projected?(5_i64).should be_true # another row with index 5 is still shown
+    window.append(window_result(8_i64)).should eq(1)
+    window.projected?(5_i64).should be_false # its last copy is gone
+    [6_i64, 7_i64, 8_i64].each { |i| window.projected?(i).should be_false }
+    200.times { |i| window.append(window_result(100_i64 + i)) }
+    window.rows.map(&.index).should eq([297_i64, 298_i64, 299_i64])
+  end
+
   it "bounds oversized scalar text and marks the display projection" do
     row = Gori::Fuzz::Result.new(12_i64, ["p" * 500], nil, 500, 0_i64, 0, 0,
       1_i64, "e" * 500, false, false, "x" * 500)
@@ -100,6 +121,47 @@ describe Gori::Tui::FuzzerResultWindow do
       File.delete?("#{project_path}-shm")
       File.delete?("#{project_path}.open.lock")
     end
+  end
+
+  # A concurrent run's results arrive in completion order (#1432); the window is the identity
+  # `o:index` view, so it has to hold them in index order, as a saved run is read back.
+  it "keeps rows in index order whatever order they arrive in" do
+    window = Gori::Tui::FuzzerResultWindow.new(10, 10_000_i64)
+    [1, 2, 0, 4, 3, 6, 5, 7].each { |i| window.append(window_result(i.to_i64)) }
+    window.rows.map(&.index).should eq((0_i64..7_i64).to_a)
+    window.bytes.should eq(window.rows.sum { |r| Gori::Tui::FuzzerResultWindow.result_bytes(r) })
+  end
+
+  it "keeps the charge beside its row when a late row lands mid-window" do
+    # Evicting the heavy row must release ITS charge: a charge pushed at the tail would
+    # release a light one instead, and the byte cap would drift from what the window holds.
+    window = Gori::Tui::FuzzerResultWindow.new(3, 10_000_i64)
+    window.append(window_result(0_i64))
+    window.append(window_result(2_i64))
+    window.append(window_result(1_i64, 100)) # the heavy row lands between the two
+    window.rows.map(&.index).should eq([0_i64, 1_i64, 2_i64])
+    window.append(window_result(3_i64)) # evicts #0
+    window.append(window_result(4_i64)) # evicts the heavy #1
+    window.rows.map(&.index).should eq([2_i64, 3_i64, 4_i64])
+    window.bytes.should eq(window.rows.sum { |r| Gori::Tui::FuzzerResultWindow.result_bytes(r) })
+  end
+
+  it "evicts a late row older than a full window's first at once" do
+    window = Gori::Tui::FuzzerResultWindow.new(2, 10_000_i64)
+    window.append(window_result(1_i64))
+    window.append(window_result(2_i64))
+    window.append(window_result(0_i64)).should eq(1)
+    window.rows.map(&.index).should eq([1_i64, 2_i64])
+  end
+
+  it "puts a resend after the earlier copy of its index" do
+    window = Gori::Tui::FuzzerResultWindow.new(10, 10_000_i64)
+    window.append(window_result(1_i64))
+    window.append(window_result(2_i64))
+    resend = window_result(1_i64, 7)
+    window.append(resend)
+    window.rows.map(&.index).should eq([1_i64, 1_i64, 2_i64])
+    window.rows[1].length.should eq(7_i64)
   end
 
   it "clears rows and byte accounting together" do

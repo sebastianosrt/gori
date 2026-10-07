@@ -7,9 +7,13 @@ require "./calibrate"
 require "../repeater/engine"
 require "../repeater/h2_engine"
 require "../repeater/conn_pool"
+require "../repeater/h2_pool"
 require "../env"
+require "../session_refresh/hook"
 require "../proxy/codec/content_decode"
 require "../pacing"
+require "../ascii_bytes"
+require "wait_group"
 
 module Gori::Discover
   # Injected scope policy — keeps the engine Store-free. `allowed?` is the excludes/sandbox
@@ -126,14 +130,14 @@ module Gori::Discover
     MAX_IDLE_PER_POOL = 32
 
     @header_block : String
-    @pools : Hash(String, Repeater::ConnPool)?
+    @pools : Hash(String, Repeater::Pool)?
     @keep_alive : Bool
     @idle_conns : Int32
 
-    # `keep_alive` reuses one HTTP/1.1 connection across many sends per origin (see
-    # `Repeater::ConnPool`). It is the single largest cost of a run against a remote origin:
-    # a brute-force pass is ~315 sends PER DIRECTORY, and dial-per-send paid a TCP — and on
-    # https a TLS — handshake for every one of them. `idle_conns` bounds the sockets one
+    # `keep_alive` reuses one connection across many sends per origin — `Repeater::ConnPool`
+    # on HTTP/1.1, `Repeater::H2Pool` on h2. It is the single largest cost of a run against a
+    # remote origin: a brute-force pass is ~315 sends PER DIRECTORY, and dial-per-send paid a
+    # TCP — and on https a TLS — handshake for every one of them. `idle_conns` bounds the sockets one
     # origin may park and should be the run's concurrency (one per worker fiber is the most
     # that can ever be checked out at once), capped at MAX_IDLE_PER_POOL.
     # `sni` overrides the name in the ClientHello (and, under verify, the name the certificate
@@ -151,15 +155,17 @@ module Gori::Discover
       @header_block = Headers.merge(headers).map { |name, value| "#{name}: #{value}\r\n" }.join
       # Whether ANY `$` survives in the block. When none does — the overwhelming case — every
       # fetch skips the binding path entirely and reuses the constructed block verbatim.
-      @header_tokens = !Settings.env_prefix.empty? && !@header_block.byte_index(Settings.env_prefix).nil?
+      @header_tokens = Env.may_contain_tokens?(@header_block, Env::Owns::Bind)
+      @header_generators = Env.may_contain_tokens?(@header_block, Env::Owns::Gen)
       @header_resolved = nil.as(String?)
       @header_rev = 0_u64
-      # h2 is excluded for the reason Fuzz::Sender excludes it: H2Engine frames its own
-      # connection per send, and multiplexing it is a separate change with its own
-      # stream-state rules.
-      @keep_alive = keep_alive && !@http2
+      # h2 pools too, the way `Fuzz::Sender` has since #881: `H2Pool` reuses a connection
+      # SERIALLY (stream 1, then 3, then 5), which is not multiplexing but is the whole
+      # handshake win — and an h2 origin is https in practice, so dial-per-send paid a TCP
+      # handshake, a TLS handshake and an h2 preface round per probe.
+      @keep_alive = keep_alive
       @idle_conns = idle_conns.clamp(1, MAX_IDLE_PER_POOL)
-      @pools = @keep_alive ? Hash(String, Repeater::ConnPool).new : nil
+      @pools = @keep_alive ? Hash(String, Repeater::Pool).new : nil
     end
 
     # The name this sender presents in the ClientHello, and whether it frames HTTP/2. Exposed
@@ -168,8 +174,9 @@ module Gori::Discover
     getter sni : String?
     getter? http2 : Bool
 
-    # Handshake accounting summed over every origin's pool. Nil when keep-alive is off — the
-    # question "how many handshakes did this run pay" has no pool to ask.
+    # Handshake accounting summed over every origin's pool, h1 and h2 alike (the counters mean
+    # the same on both — see `Repeater::Pool`). Nil when keep-alive is off — the question "how
+    # many handshakes did this run pay" has no pool to ask.
     def pool_stats : PoolStats?
       pools = @pools
       return nil unless pools
@@ -195,16 +202,20 @@ module Gori::Discover
       unless Proxy::Codec::Http1.request_token_safe?(target) && Proxy::Codec::Http1.request_token_safe?(host)
         return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, UNSAFE_URL)
       end
+      # The active slot's before-send refresh (#1233), before `request_head` resolves the
+      # slot's overlay — the crawl then carries the rebound credential. See `Repeater::Sender#wire`.
+      Gori::SessionRefresh.before_send(Gori::Env.active_slot_name)
       req = request_head(scheme, host, port, target)
-      if @http2
-        Repeater::H2Engine.send(req, scheme: scheme, host: host, port: port,
-          verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides)
-      elsif pool = pool_for(scheme, host, port)
-        pool.send(req)
-      else
-        Repeater::Engine.send(req, scheme: scheme, host: host, port: port,
-          verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides)
-      end
+      result = if pool = pool_for(scheme, host, port)
+                 pool.send(req)
+               elsif @http2
+                 Repeater::H2Engine.send(req, scheme: scheme, host: host, port: port,
+                   verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides)
+               else
+                 Repeater::Engine.send(req, scheme: scheme, host: host, port: port,
+                   verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides)
+               end
+      result.with_wire(req)
     end
 
     # The real thing, not an approximation of it: `fetch` sends exactly these bytes (it calls
@@ -222,7 +233,13 @@ module Gori::Discover
     # already warns about; announcing the identity while sending none is that failure with a
     # receipt on top.
     def request_head(scheme : String, host : String, port : Int32, target : String) : Bytes
-      Gori::Env.overlay_slot(build_get(scheme, host, port, target, binding_headers))
+      wire = build_get(scheme, host, port, target, binding_headers)
+      # ONE generation across both passes (see `Repeater::Sender#wire`): a `$GEN.UUID` in a
+      # `--header` and one in the active slot's overlay are the same fetch. Discover has no
+      # per-send TLS preset, so the destination rule decides the UA family (#1153).
+      gen = Gori::Env::Generation.for_dial(host, scheme)
+      wire = Gori::Env.expand_bindings(wire, resolve: Gori::Env::Owns::Gen, generation: gen) if @header_generators
+      Gori::Env.client_hints(Gori::Env.overlay_slot(wire, gen), gen)
     end
 
     def close : Nil
@@ -234,10 +251,10 @@ module Gori::Discover
     #
     # N worker fibers call this concurrently, and the lookup-then-insert below is not atomic
     # in general. It is here: the scheduler is single-threaded (no `-Dpreview_mt`) and nothing
-    # between the `[]?` and the store yields — `ConnPool.new` only allocates — so no worker
-    # can observe the map mid-insert or race a second pool onto the same origin. Same argument
-    # the pool itself relies on for its idle list.
-    private def pool_for(scheme : String, host : String, port : Int32) : Repeater::ConnPool?
+    # between the `[]?` and the store yields — `ConnPool.new` / `H2Pool.new` only allocate — so
+    # no worker can observe the map mid-insert or race a second pool onto the same origin. Same
+    # argument the pool itself relies on for its idle list.
+    private def pool_for(scheme : String, host : String, port : Int32) : Repeater::Pool?
       pools = @pools
       return nil unless pools
       key = "#{scheme}://#{host}:#{port}"
@@ -259,8 +276,13 @@ module Gori::Discover
       # boundary loses pooling for the origins past the fourth) and is the price of the fd
       # bound MAX_POOLS exists to hold.
       return nil if pools.size >= MAX_POOLS
-      pool = Repeater::ConnPool.new(scheme, host, port, @verify, @sni, @timeout,
-        @overrides, @idle_conns)
+      pool = if @http2
+               Repeater::H2Pool.new(scheme, host, port, @verify, @sni, @timeout,
+                 @overrides, @idle_conns).as(Repeater::Pool)
+             else
+               Repeater::ConnPool.new(scheme, host, port, @verify, @sni, @timeout,
+                 @overrides, @idle_conns).as(Repeater::Pool)
+             end
       pools[key] = pool
       pool
     end
@@ -294,7 +316,9 @@ module Gori::Discover
         # A declared-but-unbound `$NAME` used to make this nil and refuse the fetch. It now
         # resolves to the literal token, `Env.unbound`'s policy everywhere: a `--header`
         # block is operator-authored text and `$` is a legal byte in one.
-        cached = Gori::Env.expand_bindings(@header_block)
+        # GEN is deliberately excluded from this cache: it must be minted by `request_head`
+        # for every fetch, even when the same header block also contains a BIND token.
+        cached = Gori::Env.expand_bindings(@header_block, resolve: Gori::Env::Owns::Bind)
         @header_resolved = cached
       end
       cached
@@ -310,7 +334,13 @@ module Gori::Discover
       # keep-alive so much as the absence of a request to close: HTTP/1.1's default is
       # persistent, and an origin that disagrees says so in its own `Connection` header,
       # which `reusable_response?` reads.
-      conn = @keep_alive ? "" : "Connection: close\r\n"
+      #
+      # Never on h2, pooled or not: `Connection` is a connection-specific field a conforming
+      # server MUST treat as malformed (RFC 9113 §8.2.2), and `H2Engine` deliberately carries
+      # it to the wire as-is, because that is right for an operator's own bytes. These are
+      # gori's, so the h1 instruction is simply not written — as `Fuzz::Engine` does for its
+      # redirect hops.
+      conn = @keep_alive || @http2 ? "" : "Connection: close\r\n"
       "GET #{target} HTTP/1.1\r\nHost: #{hostline}\r\n#{header_block}#{conn}\r\n".to_slice
     end
   end
@@ -343,17 +373,7 @@ module Gori::Discover
       @inner.fetch(scheme, host, port, target)
     end
 
-    def request_head(scheme : String, host : String, port : Int32, target : String) : Bytes
-      @inner.request_head(scheme, host, port, target)
-    end
-
-    def sni : String?
-      @inner.sni
-    end
-
-    def close : Nil
-      @inner.close
-    end
+    delegate request_head, sni, close, to: @inner
   end
 
   # A unit of work owned by the orchestrator frontier.
@@ -362,13 +382,14 @@ module Gori::Discover
     Fetch     # GET robots.txt / sitemap.xml, extract seeds
     Calibrate # build a DirBaseline for a directory (K bogus probes)
     Probe     # brute-force one wordlist entry against a calibrated dir
+    Sweep     # a calibrated dir's waiting probes — expanded on the orchestrator, never dispatched
   end
 
   # A directory's live brute-force state, shared BY REFERENCE with every Probe task that
   # directory queued. A record would be wrong here, and that is the whole point:
-  # `enqueue_probes` fills the frontier with hundreds of tasks at once, so the only way a
-  # RE-MEASURED baseline can reach the ones that have not run yet is for them to hold a
-  # mutable reference rather than a copy.
+  # `enqueue_probes` admits hundreds of candidates at once, so the only way a RE-MEASURED
+  # baseline can reach the ones that have not run yet is for them to hold a mutable reference
+  # rather than a copy.
   #
   # Owned by the ORCHESTRATOR — every field is written only there. Workers READ `baseline` in
   # `process_probe`, and on the single-threaded scheduler (no -Dpreview_mt) nothing yields
@@ -392,13 +413,64 @@ module Gori::Discover
     # Findings held back because they are the second and later members of such a run — kept
     # until it either BREAKS (they were real divergence after all, and are emitted) or reaches
     # `Engine::DRIFT_RUN` (they were the origin's new uniform answer, and are dropped).
-    getter held : Array({Finding, Exchange?}) = [] of {Finding, Exchange?}
+    getter held : Array(ProbeHit) = [] of ProbeHit
     property? drifted : Bool = false
     property recalibrations : Int32 = 0
 
     def initialize(@baseline : Calibrate::DirBaseline)
     end
   end
+
+  # A calibrated directory's admitted candidates, in the order `enqueue_probes` admitted them,
+  # waiting in the frontier as ONE task. Everything that decides WHICH candidates go out —
+  # `@seen`, the scope gate, `per_dir_cap`, the request cap — still runs when the directory
+  # calibrates, so the traffic is exactly what one Task per candidate produced; only the Task
+  # itself is deferred. The record plus Deque growth slack was about half of what a waiting
+  # candidate cost beside the URL string `@seen` keeps anyway (bench/discover_frontier_bench.cr:
+  # 299 → 153 B), multiplied by every candidate of every calibrated directory from the moment
+  # it calibrated: 30 directories of a 30k-word list with two extensions is 2.7M of them
+  # before the first probe leaves.
+  #
+  # `Engine#frontier_head` turns the next batch into Probe tasks in front of the Sweep when
+  # it reaches the head, so a directory's probes keep the frontier position they were queued
+  # at. Orchestrator-owned, like `DirState`.
+  private class Sweep
+    def initialize(@urls : Array(String))
+      @next = 0
+    end
+
+    def remaining : Int32
+      @urls.size - @next
+    end
+
+    # The next `n` URLs, in admission order.
+    def take(n : Int32) : Array(String)
+      batch = @urls[@next, n]
+      @next += batch.size
+      batch
+    end
+  end
+
+  # A brute-force probe that cleared its directory's baseline, with everything
+  # `Engine#emit_probe_finding` needs if the drift guard decides it was real: the finding
+  # itself, the wire bytes to persist, and the links its BODY named.
+  #
+  # The links are the reason this record exists rather than the pair it replaced. A probe hit
+  # is often the most link-dense body a run will ever fetch — an OpenAPI document naming every
+  # route, an autoindex page listing a directory's real contents, a `.env` or a config file
+  # quoting internal URLs — and every one of them used to be discarded, because only
+  # Crawl/Fetch outcomes carried links. The wordlist found `swagger.json`, reported it, and
+  # then learned nothing from it.
+  #
+  # They travel WITH the hold rather than being expanded on arrival for the reason
+  # `emit_probe_finding` states about directories: a finding the guard is still holding may
+  # yet turn out to be a WAF block page, and a block page's links must not seed the frontier
+  # before the guard has decided.
+  private record ProbeHit,
+    finding : Finding,
+    exchange : Exchange?,
+    links : Array(RawLink),
+    doc_base : String?
 
   private record Task,
     kind : TaskKind,
@@ -411,7 +483,9 @@ module Gori::Discover
     # A Calibrate task queued ONLY to gate robots.txt/sitemap.xml against a soft-404
     # baseline (see enqueue_seed_only_calibration) — never feeds enqueue_probes, so it
     # can't expand the brute-force wordlist onto a directory outside the run's own scope.
-    seed_only : Bool = false
+    seed_only : Bool = false,
+    # A Sweep task's waiting probes. Nil for every other kind.
+    sweep : Sweep? = nil
 
   # `declared` — did the response NAME this as a link (an attribute, a `<meta refresh>`, a
   # robots.txt value, a sitemap `<loc>`), or did the endpoint pass infer it from a quoted string
@@ -443,7 +517,7 @@ module Gori::Discover
   # with zero locks; N worker fibers only do network I/O + CPU (decode/extract/fingerprint)
   # and feed Outcomes back over a channel. Mirrors the Fuzz/Miner lifecycle shape.
   class Engine
-    # Outbound rate limiting (rps / throttle_ms / jitter_ms) over `@last_dispatch`.
+    # Outbound rate limiting (rps / throttle_ms) over `@last_dispatch`.
     include Gori::Pacing
 
     EVENT_BUFFER    = 256
@@ -463,6 +537,7 @@ module Gori::Discover
     # cap: a benign Result, no network, and NOT counted as an error — a scope refusal is a
     # decision the operator asked for, not a failure of the run.
     SCOPE_REFUSED = "blocked by scope (Sandbox or an exclude rule)"
+    STOPPED       = "stopped before sending"
     # The run reached its end without putting a single request on the wire, so a DoneEvent
     # would report "0 found" — which an operator reads as "there is nothing there" rather than
     # "gori sent nothing" (P4). Terminal for exactly the reason SEED_BLOCKED is.
@@ -526,9 +601,26 @@ module Gori::Discover
     #     be worth the request.
     #   .well-known/change-password
     #     RFC-registered pointer at the real credential-management flow.
+    #   apple-app-site-association (at the ROOT, not under .well-known)
+    #     the other location Apple fetches AASA from, and still the deployed one on plenty of
+    #     sites. Same document, same path list, one more request.
+    #   openapi.json / swagger/v1/swagger.json / v3/api-docs / v2/api-docs
+    #     the API's own description of itself, and by some distance the highest-yield body a
+    #     crawl can read: one 200 enumerates EVERY route the service exposes, including the
+    #     ones behind auth and the ones no page links. The three spellings are framework
+    #     DEFAULTS, not guesses — ASP.NET Core's Swashbuckle, springdoc-openapi, and the
+    #     springfox generation still deployed under it — so on a target built with any of
+    #     them this is a fixed path, in the sense the rest of this list is.
     #
-    # Eleven requests per run — a rounding error against a brute-force pass of ~315 per
-    # directory, and the only part of a run that reads a target's own declaration of itself.
+    #     They also appear in `wordlists/paths.txt`, which is not a duplicate: a wordlist
+    #     entry is probed per calibrated DIRECTORY (so never at the origin on a path-confined
+    #     run, and never at all under `--no-bruteforce`), and a probe's body used to be read
+    #     for nothing. Here they are fetched once, at the origin, on every spider run.
+    #
+    # Sixteen requests per run — still a rounding error against a brute-force pass of ~315
+    # per directory, and the only part of a run that reads a target's own declaration of
+    # itself. `enqueue_well_known` registers each in `@seen`, so a directory sweep of the
+    # origin does not pay for any of them twice.
     WELL_KNOWN = {
       {"/robots.txt", Source::Robots},
       {"/sitemap.xml", Source::Sitemap},
@@ -537,10 +629,15 @@ module Gori::Discover
       {"/.well-known/oauth-authorization-server", Source::WellKnown},
       {"/.well-known/oauth-protected-resource", Source::WellKnown},
       {"/.well-known/apple-app-site-association", Source::WellKnown},
+      {"/apple-app-site-association", Source::WellKnown},
       {"/.well-known/assetlinks.json", Source::WellKnown},
       {"/.well-known/security.txt", Source::WellKnown},
       {"/.well-known/host-meta", Source::WellKnown},
       {"/.well-known/change-password", Source::WellKnown},
+      {"/openapi.json", Source::WellKnown},
+      {"/swagger/v1/swagger.json", Source::WellKnown},
+      {"/v3/api-docs", Source::WellKnown},
+      {"/v2/api-docs", Source::WellKnown},
     }
 
     enum State : UInt8
@@ -562,8 +659,12 @@ module Gori::Discover
     @wake : Channel(Nil)
     @jobs : Channel(Task)
     @discovered : Channel(Outcome)
-    @finished : Channel(Nil)
+    @finished : WaitGroup
     @frontier : Deque(Task)
+    # Probes still inside a `Sweep` task, and the number of Sweep tasks in `@frontier` — what
+    # turns `@frontier.size` back into the count of real tasks waiting (`frontier_count`).
+    @sweep_queued : Int32 = 0
+    @sweeps : Int32 = 0
     @seen : Set(String)
     @templates : Hash(String, Int32)
     @dirs : Set(String)
@@ -604,6 +705,7 @@ module Gori::Discover
     @cluster_suppressed : Int32
     @uncalibratable : Int32
     @drift_suppressed : Int32
+    @assets_skipped : Int32
     @conf_hist : Array(Int32)
     @last_dispatch : Time::Instant
     @phase : Phase
@@ -650,7 +752,7 @@ module Gori::Discover
       @wake = Channel(Nil).new(1)
       @jobs = Channel(Task).new(conc)
       @discovered = Channel(Outcome).new(conc * 2)
-      @finished = Channel(Nil).new(conc)
+      @finished = WaitGroup.new(conc)
       @events = Channel(Event).new(EVENT_BUFFER)
       @frontier = Deque(Task).new
       @seen = Set(String).new
@@ -670,6 +772,7 @@ module Gori::Discover
       @cluster_suppressed = 0
       @uncalibratable = 0
       @drift_suppressed = 0
+      @assets_skipped = 0
       @conf_hist = [0, 0, 0, 0]
       @last_dispatch = Time.instant
       @phase = Phase::Seeding
@@ -723,7 +826,7 @@ module Gori::Discover
       @phase = Phase::Crawling
       loop do
         break if @state == State::Stopped
-        if job = @frontier.first?
+        if job = frontier_head
           park_if_paused
           break if @state == State::Stopped || @capped.cap_reached?
           # select so we never block solely on send while a worker blocks solely on
@@ -747,7 +850,7 @@ module Gori::Discover
       end
       drain_pending
       @jobs.close
-      @concurrency.times { @finished.receive }
+      @finished.wait
       # Every worker has exited, so nothing holds a checked-out socket: release the parked
       # ones now rather than leaving a run's worth of file descriptors to the GC. AFTER the
       # join, deliberately — closing while a worker is mid-exchange would only close the
@@ -786,7 +889,7 @@ module Gori::Discover
       # with a success Done — see the setup-error path above.
       # Close @jobs too (the happy path does this at line ~285): otherwise the worker
       # fibers stay parked on @jobs.receive? forever — a fiber + socket leak. Closing it
-      # makes each worker's receive? return nil, so they run their `ensure @finished.send`
+      # makes each worker's receive? return nil, so they run their `ensure @finished.done`
       # and exit (their one in-flight outcome fits in @discovered's conc*2 buffer).
       @jobs.close rescue nil
       # Same reason: the parked sockets are nobody's, and this path does not join the workers,
@@ -876,8 +979,19 @@ module Gori::Discover
       # string/regex include rule (#407) — and the EXCLUDE side on the port-bearing one, so a
       # carve-out naming a port holds here as it does on the proxy (#884). `url` keeps its port
       # for the Fetch either way.
-      gate, gate_excl = Url.gate_urls(url)
-      return unless @scope.allowed?(gate, @seed_parts.host, gate_excl)
+      return unless p = Url.parse(url)
+      return unless @scope.allowed?(Url.gate_url(p), @seed_parts.host, Url.exclude_url(p))
+      # Registered in `@seen` AFTER the gate, not before: a URL this refused was never
+      # requested, and marking it visited would hide it from the brute-forcer too — which
+      # asks the same Layer-2 question and would reach the same answer, but must reach it
+      # itself rather than inherit a decision made for a task that does not exist.
+      #
+      # Registered at all because the wordlist and this list OVERLAP on purpose (see
+      # WELL_KNOWN): `robots.txt`, `.well-known/security.txt` and the API-description
+      # spellings all ship in `wordlists/paths.txt`, and without this the origin's own
+      # directory sweep re-requested every one of them — a second GET, judged against a
+      # soft-404 baseline, for a document the run had already fetched and read.
+      @seen << Url.visit_key(p)
       @frontier << Task.new(TaskKind::Fetch, url, 0, source)
     end
 
@@ -902,7 +1016,40 @@ module Gori::Discover
       in TaskKind::Calibrate              then handle_calibrate(oc)
       in TaskKind::Probe                  then handle_probe(oc)
       in TaskKind::Crawl, TaskKind::Fetch then handle_crawl(oc)
+      in TaskKind::Sweep                  then raise SWEEP_DISPATCHED
       end
+    end
+
+    # A Sweep is expanded by `frontier_head` before anything can dispatch it.
+    SWEEP_DISPATCHED = "discover: a Sweep task reached a worker"
+
+    # The frontier's head, once a Sweep there has put its next batch of Probe tasks in front
+    # of itself. The batch is the run's concurrency — enough to keep every worker fed until
+    # the Sweep is the head again — and the Sweep goes back directly behind it, so a
+    # directory's probes hold the place in the frontier they were queued at, ahead of
+    # anything queued after the directory calibrated. `unshift` keeps a recalibration queued
+    # at the front (`enqueue_recalibration`) ahead of them, as before.
+    private def frontier_head : Task?
+      while (head = @frontier.first?) && (sweep = head.sweep)
+        @frontier.shift
+        batch = sweep.take(@concurrency)
+        @sweep_queued -= batch.size
+        if sweep.remaining > 0
+          @frontier.unshift(head)
+        else
+          @sweeps -= 1
+        end
+        batch.reverse_each do |url|
+          @frontier.unshift(Task.new(TaskKind::Probe, url, head.depth, Source::Bruteforced,
+            dir: head.dir, state: head.state))
+        end
+      end
+      @frontier.first?
+    end
+
+    # Real tasks waiting: the frontier's own, with each Sweep counted as the probes it holds.
+    private def frontier_count : Int32
+      @frontier.size - @sweeps + @sweep_queued
     end
 
     # The run stopped SHORT of its work because `max_requests` ran out — not merely reached
@@ -919,8 +1066,8 @@ module Gori::Discover
 
     # The reason this run produced nothing, or nil when it produced something.
     #
-    # "Produced nothing" is `@found == 0 && @pages == 0` AND nothing got through
-    # (`@successful_sends == 0`) — the second clause is `Miner::Engine`'s predicate, added
+    # "Produced nothing" is `@found == 0` AND nothing got through (`@successful_sends == 0`)
+    # — no `@pages` clause, see below — the second clause is `Miner::Engine`'s predicate, added
     # here for its reason and against the same failure: a target that accepts TCP and then
     # answers nothing, under a budget small enough that only CALIBRATION probes ever ran,
     # reported `done · 0 found · 9 sent · 0 errors` and exit 0. Nine requests went out, nine
@@ -928,8 +1075,14 @@ module Gori::Discover
     # `send_with_retries`), which is what makes that run nameable at all; `successful_sends`
     # is what stops the wider check from turning a target that answered fine but held nothing
     # into a spurious terminal error.
+    #
+    # NOT `@pages == 0` as well, which it was: `handle_crawl` counts a page for every crawl
+    # task that COMPLETED, failed or not, so a spidering run against a dead port — every crawl
+    # a refused connect — had `@pages > 0` and took the Done branch. `gori run discover` then
+    # printed `0 found · 656 sent · 325 errors` and exited 0 where fuzz, mine and sequence all
+    # exit 1 (#1385). `@successful_sends == 0` already says no page was read.
     private def wholly_refused_reason : String?
-      return nil unless @found == 0 && @pages == 0 && @successful_sends == 0
+      return nil unless @found == 0 && @successful_sends == 0
       @first_error.presence
     end
 
@@ -972,9 +1125,24 @@ module Gori::Discover
     private def confirm_bruteforce_dir(task : Task, fetched : Calibrate::Fetched) : Nil
       return unless @config.bruteforce?
       s = fetched.status
-      return unless s && (s < 400 || s == 401 || s == 403)
+      return unless s && exists_status?(s)
       return unless p = Url.parse(task.url)
       enqueue_dir(Url.dir_of(p), task.depth)
+    end
+
+    # The statuses that PROVE a resource is there, and the one predicate `record_page` and
+    # `confirm_bruteforce_dir` both ask so they cannot disagree about what "exists" means.
+    #
+    # `< 400` plus the three answers that are ABOUT a resource rather than a denial that it
+    # exists: 401 and 403 gate access to something real (the strongest reason there is to
+    # sweep the neighbours), and 405 says the path ROUTES but not to GET. That last one is a
+    # crawler's blind spot by construction — a `<form method="post" action="/api/orders">`,
+    # a JSON API that takes only POST, a WebDAV or PUT collection are all reached by GET
+    # exactly once, answer 405, and were dropped on the floor. They are also the endpoints
+    # most worth having: an endpoint that refuses to be read is one the operator has to test
+    # by writing to it.
+    private def exists_status?(status : Int32) : Bool
+      status < 400 || status == 401 || status == 403 || status == 405
     end
 
     # A finding the run GUESSED rather than followed a link to: the WELL_KNOWN documents, and
@@ -1012,12 +1180,12 @@ module Gori::Discover
               base = bp
             end
           end
-          oc.links.each { |lnk| consider_link(task, base, lnk) }
+          oc.links.each { |lnk| consider_link(task.depth, base, lnk) }
         end
       end
       if @config.follow_redirects? && (loc = fetched.redirect_to)
         if base = Url.parse(task.url)
-          consider_link(task, base, RawLink.new(loc, Source::Redirect))
+          consider_link(task.depth, base, RawLink.new(loc, Source::Redirect))
         end
       end
     end
@@ -1078,9 +1246,10 @@ module Gori::Discover
         break_run(state) if state
         return
       end
-      admit_hit(state, Finding.new(oc.task.url, "GET", fetched.status, fetched.length,
-        fetched.content_type, Source::Bruteforced, oc.task.depth, oc.confidence, nil),
-        fetched, oc.exchange)
+      admit_hit(state, ProbeHit.new(
+        Finding.new(oc.task.url, "GET", fetched.status, fetched.length,
+          fetched.content_type, Source::Bruteforced, oc.task.depth, oc.confidence, nil),
+        oc.exchange, oc.links, oc.doc_base), fetched)
     end
 
     # A probe that cleared its baseline — emitted, held, or dropped.
@@ -1093,10 +1262,9 @@ module Gori::Discover
     # whole held batch goes in the bin. A run that breaks first releases everything, so the
     # common case — a directory with a handful of scattered real hits — pays nothing but the
     # latency of one more probe outcome.
-    private def admit_hit(state : DirState?, f : Finding, fetched : Calibrate::Fetched,
-                          ex : Exchange?) : Nil
+    private def admit_hit(state : DirState?, hit : ProbeHit, fetched : Calibrate::Fetched) : Nil
       unless state
-        emit_probe_finding(f, ex)
+        emit_probe_finding(hit)
         return
       end
       if state.drifted?
@@ -1110,7 +1278,7 @@ module Gori::Discover
         state.run = 1
         state.run_fp = fetched.simhash
         state.run_status = fetched.status
-        emit_probe_finding(f, ex)
+        emit_probe_finding(hit)
         return
       end
       state.run += 1
@@ -1118,7 +1286,7 @@ module Gori::Discover
         declare_drift(state)
         return
       end
-      state.held << {f, ex}
+      state.held << hit
     end
 
     # Does this outcome look like the one before it — same status, and content inside the
@@ -1134,7 +1302,7 @@ module Gori::Discover
     private def break_run(state : DirState) : Nil
       state.run = 0
       return if state.held.empty?
-      state.held.each { |f, ex| emit_probe_finding(f, ex) }
+      state.held.each { |hit| emit_probe_finding(hit) }
       state.held.clear
     end
 
@@ -1162,17 +1330,44 @@ module Gori::Discover
     # move together on purpose: a finding the drift guard is still holding must not seed a
     # directory before the guard has decided whether it was real — otherwise a WAF block page
     # answering 200 would enqueue a wordlist sweep of its own URL.
-    private def emit_probe_finding(f : Finding, ex : Exchange?) : Nil
-      record_finding(f, ex)
+    private def emit_probe_finding(hit : ProbeHit) : Nil
+      f = hit.finding
+      record_finding(f, hit.exchange)
       s = f.status
       if s && s >= 200 && s < 300 && f.depth < @config.max_depth
         enqueue_dir_from_url(f.url, f.depth + 1)
       end
+      expand_probe_links(hit)
     end
 
-    # Record a crawled/declared page as a finding (skip 404/5xx noise; 401/403 are kept —
-    # they exist but gate access).
-    # A non-error "error": the engine's own budget or gate declining a send, not a failure
+    # The links a confirmed brute-force hit's body named, fed back into the frontier through
+    # the same `consider_link` gauntlet a crawled page's links go through — dedup, template
+    # fold, containment, Layer 2, and the declared/inferred rule that decides whether a link
+    # is worth a wordlist sweep of its own directory.
+    #
+    # Resolved against the PROBE's url and, when the body was html-like and declared one, its
+    # own `<base href>` — identical to `expand_links`, because a body does not become a
+    # different kind of document by having been guessed at rather than followed to.
+    #
+    # Depth is the finding's + 1, so an OpenAPI document reached at depth 3 cannot spend the
+    # whole `max_depth` budget again on the routes it names.
+    private def expand_probe_links(hit : ProbeHit) : Nil
+      links = hit.links
+      return if links.empty?
+      return unless page = Url.parse(hit.finding.url)
+      base = page
+      if b = hit.doc_base
+        if (abs = Url.resolve(page, b)) && (bp = Url.parse(abs))
+          base = bp
+        end
+      end
+      depth = hit.finding.depth + 1
+      links.each { |lnk| consider_link(depth, base, lnk) }
+    end
+
+    # Record a crawled/declared page as a finding — skip 404/5xx noise, keep whatever
+    # `exists_status?` calls proof that something is there.
+    # A non-error "error": the engine's own budget, gate or stop declining a send, not a failure
     # reaching the target. Neither is a fault the operator can act on, and both are decisions
     # they configured, so neither belongs in the error count every surface renders.
     #
@@ -1180,13 +1375,13 @@ module Gori::Discover
     # max_requests set the orchestrator fills the @jobs buffer before any worker increments
     # @capped.sent — so `--max-requests 5` at the default concurrency reported dozens of
     # "errors" that were the cap working exactly as designed.
-    private def benign_error?(err : String) : Bool
-      err == CappedBackend::CAP_ERROR || err == SCOPE_REFUSED
+    private def benign_error?(err : String?) : Bool
+      err == CappedBackend::CAP_ERROR || err == SCOPE_REFUSED || err == STOPPED
     end
 
     private def record_page(task : Task, fetched : Calibrate::Fetched, ex : Exchange?) : Nil
       s = fetched.status
-      return unless s && (s < 400 || s == 401 || s == 403)
+      return unless s && exists_status?(s)
       conf = crawl_confidence(task.source, s)
       record_finding(Finding.new(task.url, "GET", s, fetched.length, fetched.content_type,
         task.source, task.depth, conf, nil), ex)
@@ -1250,7 +1445,11 @@ module Gori::Discover
 
     # Resolve a discovered link against its page, dedup, template-fold, bound-check, then
     # enqueue a crawl (spider) and derive a directory (brute).
-    private def consider_link(task : Task, base : Url::Parts, link : RawLink) : Nil
+    #
+    # Takes the source document's DEPTH rather than its Task: the callers are no longer only
+    # `expand_links`, and a brute-force hit's body (`expand_probe_links`) has a depth and a
+    # url but no crawl task of its own.
+    private def consider_link(depth : Int32, base : Url::Parts, link : RawLink) : Nil
       # Bound the dedup/template bookkeeping: past MAX_SEEN, stop tracking + enqueuing new
       # links so @seen/@templates can't bloat on a pathological target (see MAX_SEEN). A URL
       # already in @seen is still cheap to skip below, so honour that first.
@@ -1274,9 +1473,22 @@ module Gori::Discover
       # One normalize for both the bound check and the enqueued Task (it was built twice).
       return unless norm = bounded_url(p)
       @seen << key
-      if @config.spider? && task.depth < @config.max_depth && @crawl_enqueued < @config.max_pages
-        @crawl_enqueued += 1
-        @frontier << Task.new(TaskKind::Crawl, norm, task.depth + 1, link.source)
+      if @config.spider? && depth < @config.max_depth && @crawl_enqueued < @config.max_pages
+        # An image, a font, a track, an archive: a real request and a full body download for
+        # bytes `text_like?` then refuses to scan, so the fetch cannot produce a candidate and
+        # produces only the row for the asset itself. Skipped by default (`Config#crawl_assets?`)
+        # and counted, never silently — the URL was found, and the run is saying it chose not
+        # to spend a request confirming it.
+        #
+        # This is also a crawl-BUDGET fix, not only a bandwidth one: every asset fetched used
+        # to consume a `max_pages` slot, so an image-heavy target reached the cap on pictures
+        # while HTML the run had already discovered sat unvisited in the frontier.
+        if @config.crawl_assets? || !Url.binary_asset?(p.path)
+          @crawl_enqueued += 1
+          @frontier << Task.new(TaskKind::Crawl, norm, depth + 1, link.source)
+        else
+          @assets_skipped += 1
+        end
       end
       # Seeding a brute-force sweep of this link's DIRECTORY costs the whole wordlist — ~315
       # sends with the defaults, before extensions — so it is spent only on a link the target
@@ -1287,7 +1499,10 @@ module Gori::Discover
       # faith turned one response into 38,929 requests for 2 findings. The same guard costs a
       # real SPA nothing — its bundle names routes that answer 200, so every directory it points
       # at is seeded one round-trip later.
-      enqueue_dir(Url.dir_of(p), task.depth) if @config.bruteforce? && link.declared
+      # Asked of the link, NOT of whether the link was crawled: an asset the run declined to
+      # download still proves its directory is real, so `/uploads/` is swept because
+      # `/uploads/photo.jpg` was linked, exactly as before `crawl_assets` existed.
+      enqueue_dir(Url.dir_of(p), depth) if @config.bruteforce? && link.declared
     end
 
     private def enqueue_dir_from_url(url : String, depth : Int32) : Nil
@@ -1326,7 +1541,7 @@ module Gori::Discover
     private def enqueue_probes(task : Task, state : DirState) : Nil
       bl = state.baseline
       cap = @config.per_dir_cap
-      count = 0
+      urls = [] of String
       exts = @config.extensions
       # Parse the DIRECTORY once for the whole wordlist. `Url.probe` can then derive each
       # candidate's Parts and its one shared `visit_key`/`normalize` string by concatenation,
@@ -1342,22 +1557,58 @@ module Gori::Discover
       # spelled differently — so it is checked, not assumed, and a mismatch simply falls back.
       dp = Url.parse(bl.dir)
       base = dp && dp.query.nil? && Url.normalize(dp) == bl.dir ? dp : nil
+      # Each extension paired with its dotted, lowercased spelling, built once for the whole
+      # wordlist rather than once per word — see `redundant_extension?` for what the second
+      # half is compared against.
+      ext_pairs = exts.map { |e| {e, ".#{e}".downcase} }
       @words.each do |w|
         break if @capped.cap_reached?
-        break if cap > 0 && count >= cap
-        count += 1 if enqueue_probe(task, state, base, w)
-        exts.each do |ext|
-          break if cap > 0 && count >= cap
-          count += 1 if enqueue_probe(task, state, base, "#{w}.#{ext}")
-        end
+        break if cap > 0 && urls.size >= cap
+        admit_probe(urls, state, base, w)
+        admit_extension_probes(urls, state, base, w, ext_pairs, cap)
+      end
+      return if urls.empty?
+      # ONE Sweep task for the lot, at the frontier position the probes would have taken.
+      @sweeps += 1
+      @sweep_queued += urls.size
+      @frontier << Task.new(TaskKind::Sweep, bl.dir, task.depth, Source::Bruteforced,
+        dir: bl.dir, state: state, sweep: Sweep.new(urls))
+    end
+
+    # The `word.ext` half of one wordlist entry.
+    #
+    # Its own method because the per-directory cap and `redundant_extension?` between them put
+    # as many branches in this loop as there are in the one above it.
+    private def admit_extension_probes(urls : Array(String), state : DirState, base : Url::Parts?,
+                                       word : String, ext_pairs : Array({String, String}),
+                                       cap : Int32) : Nil
+      return if ext_pairs.empty?
+      lower = word.downcase
+      ext_pairs.each do |ext, dotted|
+        break if cap > 0 && urls.size >= cap
+        next if redundant_extension?(lower, dotted)
+        admit_probe(urls, state, base, "#{word}.#{ext}")
       end
     end
 
-    # One brute-force candidate against a calibrated directory. True when it entered the
-    # frontier — and therefore counts against the per-directory cap — false when it was
-    # unparseable, already seen, or refused by the gates.
-    private def enqueue_probe(task : Task, state : DirState,
-                              base : Url::Parts?, cand : String) : Bool
+    # Would appending this extension re-state one the word already carries? `admin.php` with
+    # `--extensions php` is `admin.php.php`, which no server routes: one real request, per
+    # directory, per such word — and a third of the built-in list is dotted names.
+    #
+    # Only the EXACT same extension is refused, which is the whole care this needs. `admin.php`
+    # + `bak` is `admin.php.bak`, the canonical editor/deploy backup and one of the
+    # highest-yield candidates in the list, so a rule phrased as "skip extensions on words that
+    # already have one" would delete the reason extensions exist. `word` and `dotted` arrive
+    # lowercased by the caller so an operator's `--extensions PHP` matches `admin.php`.
+    private def redundant_extension?(word : String, dotted : String) : Bool
+      word.bytesize > dotted.bytesize && word.ends_with?(dotted)
+    end
+
+    # One brute-force candidate against a calibrated directory, appended to `urls` (and so
+    # counted against the per-directory cap) unless it is unparseable, already seen, or
+    # refused by the gates.
+    private def admit_probe(urls : Array(String), state : DirState,
+                            base : Url::Parts?, cand : String) : Nil
       dir = state.baseline.dir
       p, key, url =
         if base && (pr = Url.probe(base, dir, cand))
@@ -1366,17 +1617,15 @@ module Gori::Discover
           {pr.parts, pr.url, pr.url}
         else
           slow = Url.parse("#{dir}#{cand}")
-          return false unless slow
+          return unless slow
           {slow, Url.visit_key(slow), Url.normalize(slow)}
         end
       # @seen first: it is a hash lookup, while probe_allowed? walks every scope rule
       # under a mutex with PCRE2. Same verdict either way — this runs 315 words × dirs.
-      return false if @seen.includes?(key)
-      return false unless probe_allowed?(p)
+      return if @seen.includes?(key)
+      return unless probe_allowed?(p)
       @seen << key
-      @frontier << Task.new(TaskKind::Probe, url, task.depth,
-        Source::Bruteforced, dir: dir, state: state)
-      true
+      urls << url
     end
 
     # Containment (origin/subdomain/scope-aware) + the injected scope policy + path confine.
@@ -1502,7 +1751,7 @@ module Gori::Discover
         @discovered.send(oc)
       end
     ensure
-      @finished.send(nil)
+      @finished.done
     end
 
     private def process(task : Task) : Outcome
@@ -1510,6 +1759,7 @@ module Gori::Discover
       in TaskKind::Crawl, TaskKind::Fetch then process_fetch(task)
       in TaskKind::Calibrate              then process_calibrate(task)
       in TaskKind::Probe                  then process_probe(task)
+      in TaskKind::Sweep                  then raise SWEEP_DISPATCHED
       end
     end
 
@@ -1517,8 +1767,87 @@ module Gori::Discover
       raw = send_with_retries(task.url)
       body = decode_body(raw)
       fetched = distill(raw, body)
-      links, doc_base = raw.error.nil? ? extract_links(task, fetched, body) : {EMPTY_LINKS, nil}
+      links, doc_base = discovered_links(task, fetched, raw, body)
       Outcome.new(task, fetched, links, nil, false, 0.0, capture_exchange(task.url, raw), 0, doc_base)
+    end
+
+    # Everything ONE response names: the links in its body, and the links in its HEAD.
+    #
+    # The two halves are separate extractors on separate inputs and are joined here because
+    # every caller wants both — `process_fetch` for a crawled page, `process_probe` for a
+    # brute-force hit. A failed send names nothing, and both halves say so with the same
+    # shared empty array rather than each allocating one.
+    private def discovered_links(task : Task, fetched : Calibrate::Fetched,
+                                 raw : Repeater::Result, body : Bytes) : {Array(RawLink), String?}
+      return {EMPTY_LINKS, nil} unless raw.error.nil?
+      links, doc_base = extract_links(task, fetched, body)
+      hdr = header_links(task, raw)
+      return {links, doc_base} if hdr.empty?
+      # Header links FIRST, so when a URL is named both ways the stronger classification is
+      # the one `consider_link`'s `@seen` keeps — a `Link:` target is the origin's own
+      # statement, and the body pass may only have inferred it from a quoted string.
+      {links.empty? ? hdr : hdr.concat(links), doc_base}
+    end
+
+    # Ceiling on the links ONE response's HEAD may contribute. `Extract::MAX_LINKS` bounds the
+    # body for the reason stated there — every entry costs the orchestrator a resolve, a parse
+    # and two keys — and a header block is no different: `Link` is a repeatable field, so a
+    # hostile origin can send as many of them as it likes. Small, because a real response
+    # carries a handful.
+    MAX_HEADER_LINKS = 64
+
+    # The links a response declares in its HEADERS rather than its body — a source no
+    # extractor above can reach, and one that answers on responses that have no body worth
+    # reading at all.
+    #
+    #   Link:              RFC 8288. `rel="next"` is how a paginated API names its next page,
+    #                      and it is named NOWHERE else; `preload`/`prefetch`/`alternate`/
+    #                      `describedby` each name a real resource the markup may not.
+    #   Content-Location:  the canonical spelling of the resource just served under another
+    #                      URL — a negotiated representation, a REST alias.
+    #   Refresh:           the header spelling of `<meta http-equiv="refresh">`. Already
+    #                      followed in markup; the header form was invisible.
+    #   Set-Cookie Path=:  the application stating which subtree it is mounted under. Not a
+    #                      link — nothing says a document lives there — so it enters as
+    #                      INFERRED and has to answer for itself before it earns a wordlist
+    #                      sweep of its directory (`consider_link`, `confirm_bruteforce_dir`).
+    #
+    # `Location` is deliberately absent: `distill` already carries it as `redirect_to` and
+    # `expand_links` follows it under `follow_redirects?`, which is the operator's switch for
+    # exactly this link.
+    private def header_links(task : Task, raw : Repeater::Result) : Array(RawLink)
+      resp = raw.response
+      return EMPTY_LINKS unless resp
+      src = link_source(task)
+      # Allocated on the first HIT, not on the first header: the overwhelming majority of
+      # responses carry none of these four fields, and that case must cost an array as little
+      # as `extract_links` costs one for a body it cannot read.
+      out = nil.as(Array(RawLink)?)
+      resp.headers.each do |h|
+        break if (acc = out) && acc.size >= MAX_HEADER_LINKS
+        header_hrefs(h) do |href, declared|
+          acc = (out ||= [] of RawLink)
+          acc << RawLink.new(href, src, declared) if acc.size < MAX_HEADER_LINKS
+        end
+      end
+      out || EMPTY_LINKS
+    end
+
+    # Every url ONE response header names, with the `declared` bit that separates a field
+    # STATING a link from one that merely locates the application. Split from `header_links`
+    # so the field grammars sit apart from the accumulation and its cap.
+    private def header_hrefs(h : Proxy::Codec::Header, & : String, Bool ->) : Nil
+      name = h.name
+      if name.compare("link", case_insensitive: true) == 0
+        Extract.from_link_header(h.value).each { |u| yield u, true }
+      elsif name.compare("content-location", case_insensitive: true) == 0
+        v = h.value.strip
+        yield v, true unless v.empty?
+      elsif name.compare("refresh", case_insensitive: true) == 0
+        Extract.refresh_url(h.value).try { |u| yield u, true }
+      elsif name.compare("set-cookie", case_insensitive: true) == 0
+        Extract.cookie_path(h.value).try { |p| yield p, false }
+      end
     end
 
     # Pick the link extractor from the RESPONSE, not from how the URL was found. Only the
@@ -1558,7 +1887,7 @@ module Gori::Discover
       # and was dropped into `calibrated_out`, while the identical page reached by a link from
       # `/` was recorded at 0.85. A guess deserves the baseline; a link the target itself
       # published does not.
-      src = task.kind.fetch? && task.source.well_known? ? Source::WellKnown : Source::Crawled
+      src = link_source(task)
       if Extract.sitemap_body?(body)
         return {Extract.from_sitemap(body).map { |h| RawLink.new(h, Source::Sitemap) }, nil}
       end
@@ -1567,8 +1896,11 @@ module Gori::Discover
       # loses nothing by it, since `from_html` runs the endpoint pass too.
       if ct.nil? || html_like?(ct)
         # The one MIXED source: `from_html` runs both the attribute passes and the endpoint pass,
-        # and only it can say which found what.
-        {Extract.from_html(body).map { |f| RawLink.new(f.href, src, f.declared) }, Extract.base_href(body)}
+        # and only it can say which found what. Asked TOGETHER with the `<base href>` the links
+        # resolve against — two questions about the same text, and `from_html_with_base` builds
+        # that text once instead of once each (see its own comment for what the copy cost).
+        found, doc_base = Extract.from_html_with_base(body)
+        {found.map { |f| RawLink.new(f.href, src, f.declared) }, doc_base}
       elsif text_like?(ct)
         # A bundle, a JSON document, a `.map`: not markup, so it declares no links at all and
         # every literal here is inferred.
@@ -1576,6 +1908,18 @@ module Gori::Discover
       else
         {EMPTY_LINKS, nil}
       end
+    end
+
+    # The Source a link found in THIS response inherits — the one-hop well-known rule
+    # `extract_links` explains at length, stated once because `header_links` has to reach the
+    # same answer: an OIDC document's `Link:` header is the same kind of guess its body is.
+    #
+    # A Probe's kind is not `fetch?`, so a brute-force hit's links are ordinary crawl links.
+    # That is the right answer and not an accident of the test: a wordlist hit is a guess, but
+    # what its body then NAMES is the target's own statement, and judging those names against
+    # the seed origin's soft-404 baseline would be the wrong question about them.
+    private def link_source(task : Task) : Source
+      task.kind.fetch? && task.source.well_known? ? Source::WellKnown : Source::Crawled
     end
 
     # Calibration is the ONE task that fans out into many sends — every other `process_*`
@@ -1621,36 +1965,16 @@ module Gori::Discover
     private def calibration_probe(dir : String, name : String, & : Bool ->) : Calibrate::Fetched
       raw = send_with_retries("#{dir}#{name}")
       body = decode_body(raw)
-      yield raw.error.nil? && body_contains?(body, name)
+      # A byte search, not `String.new(body).includes?`: no copy of the response, no reckoning
+      # with invalid UTF-8 (the needle is ASCII by construction — hex plus an extension).
+      yield raw.error.nil? && !AsciiBytes.index(body, name.to_slice).nil?
       distill(raw, body)
-    end
-
-    # `body.includes?(needle)` for bytes. `String.new(body).includes?` would copy the whole
-    # response and would have to reckon with invalid UTF-8; the needle here is ASCII by
-    # construction (`bogus_name` is hex, plus a configured extension), so a byte scan answers
-    # the same question without either.
-    private def body_contains?(body : Bytes, needle : String) : Bool
-      n = needle.to_slice
-      return false if n.empty? || body.size < n.size
-      first = n.unsafe_fetch(0)
-      i = 0
-      last = body.size - n.size
-      while i <= last
-        if body.unsafe_fetch(i) == first
-          k = 1
-          while k < n.size && body.unsafe_fetch(i + k) == n.unsafe_fetch(k)
-            k += 1
-          end
-          return true if k == n.size
-        end
-        i += 1
-      end
-      false
     end
 
     private def process_probe(task : Task) : Outcome
       raw = send_with_retries(task.url)
-      fetched = distill(raw, decode_body(raw))
+      body = decode_body(raw)
+      fetched = distill(raw, body)
       # Read through the shared `DirState`, so a probe queued before a drift re-calibration is
       # judged against the baseline in force NOW rather than the one queued alongside it. The
       # baseline and the generation are read TOGETHER, with no yield between them, so the pair
@@ -1664,8 +1988,17 @@ module Gori::Discover
         # a wordlist sweep keeps the bytes of the handful it found and forgets the thousands of
         # soft-404s it did not, instead of shipping every miss's body through the channel for
         # the orchestrator to drop.
-        Outcome.new(task, fetched, EMPTY_LINKS, nil, hit, conf,
-          hit ? capture_exchange(task.url, raw) : nil, gen)
+        #
+        # The links are kept on exactly the same terms, and that is what makes reading a
+        # probe's body affordable at all. A wordlist entry that HITS is often the densest
+        # document a run will ever hold — an OpenAPI spec naming every route, an autoindex
+        # listing a directory's real contents, a config file quoting internal URLs — and the
+        # ~315-per-directory that MISS pay nothing, because a miss never reaches this branch.
+        # Before this the sweep could find `swagger.json`, report it, and learn nothing from it.
+        return Outcome.new(task, fetched, EMPTY_LINKS, nil, false, conf, nil, gen) unless hit
+        links, doc_base = discovered_links(task, fetched, raw, body)
+        Outcome.new(task, fetched, links, nil, true, conf,
+          capture_exchange(task.url, raw), gen, doc_base)
       else
         Outcome.new(task, fetched, EMPTY_LINKS, nil, false, 0.0, nil, gen)
       end
@@ -1689,7 +2022,11 @@ module Gori::Discover
       size = body.try(&.size.to_i64)
       max = Settings.capture_max
       body = body[0, max].dup if body && body.size > max
-      Exchange.new(@capped.request_head(p.scheme, p.host, p.port, target),
+      # A generator is deliberately fresh on every `request_head` call, so synthesizing the
+      # head again here would store a UUID the origin never saw. Production senders carry the
+      # exact wire on the Result; spec/custom backends keep the old pure reconstruction fallback.
+      request = raw.wire || @capped.request_head(p.scheme, p.host, p.port, target)
+      Exchange.new(request,
         resp, body, size, raw.incomplete?, raw.duration_us, @capped.sni)
     end
 
@@ -1720,6 +2057,7 @@ module Gori::Discover
       end
       target = p.query ? "#{p.path}?#{p.query}" : p.path
       attempts = 0
+      failed = nil.as(Repeater::Result?)
       interval = pace_interval
       loop do
         # The single funnel for this engine's wire sends, so pacing HERE is what makes
@@ -1727,9 +2065,13 @@ module Gori::Discover
         # pacing the dispatch loop: a RETRY was spaced only by `retry_pause` and so ran on
         # top of the operator's rate, and a Calibrate task used to pay one slot for the task
         # plus one per probe, undershooting the rate by a slot per directory.
-        pace(interval)
-        raw = @capped.fetch(p.scheme, p.host, p.port, target)
-        if raw.error && raw.error != CappedBackend::CAP_ERROR && attempts < @config.retries
+        raw = paced_fetch(p, target, interval)
+        # A retry the budget or a stop refused sent nothing: book and answer the failure it was
+        # retrying (see `Sequencer::Engine#send_with_retries`), not "the budget ran out".
+        if (prior = failed) && benign_error?(raw.error)
+          raw = prior
+        elsif raw.error && !benign_error?(raw.error) && attempts < @config.retries
+          failed = raw
           attempts += 1
           sleep @config.retry_pause
           next
@@ -1747,6 +2089,12 @@ module Gori::Discover
         end
         return raw
       end
+    end
+
+    # One wire send after its rate slot, or a STOPPED answer when a stop ended the wait.
+    private def paced_fetch(p : Url::Parts, target : String, interval : Time::Span?) : Repeater::Result
+      return Repeater::Result.new(Bytes.new(0), nil, nil, 0_i64, STOPPED) unless pace(interval)
+      @capped.fetch(p.scheme, p.host, p.port, target)
     end
 
     private def distill(raw : Repeater::Result, body : Bytes) : Calibrate::Fetched
@@ -1796,22 +2144,15 @@ module Gori::Discover
     end
 
     private def poke : Nil
-      select
-      when @wake.send(nil)
-      else
-      end
+      offer(@wake, nil)
     end
 
     private def emit_progress : Nil
-      ev = ProgressEvent.new(progress_snapshot)
-      select
-      when @events.send(ev)
-      else
-      end
+      offer(@events, ProgressEvent.new(progress_snapshot))
     end
 
     private def progress_snapshot : Progress
-      Progress.new(@capped.sent, est_total, @found, @errors, @frontier.size + @pending, @phase)
+      Progress.new(@capped.sent, est_total, @found, @errors, frontier_count + @pending, @phase)
     end
 
     # A moving estimate that RISES as directories calibrate and pages are visited — a live
@@ -1820,14 +2161,14 @@ module Gori::Discover
       return nil if @capped.sent == 0
       per_dir = @words.size.to_i64 * (1 + @config.extensions.size)
       brute = @config.bruteforce? ? @dirs.size.to_i64 * per_dir : 0_i64
-      crawl = @pages.to_i64 + @frontier.size.to_i64
+      crawl = @pages.to_i64 + frontier_count.to_i64
       brute + crawl
     end
 
     private def run_stats : RunStats
       RunStats.new(@capped.sent, @found, @calibrated_out, @dedup_suppressed,
         @template_suppressed, @cluster_suppressed, @uncalibratable, @conf_hist.dup,
-        @drift_suppressed)
+        @drift_suppressed, @assets_skipped)
     end
   end
 end

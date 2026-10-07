@@ -1,9 +1,12 @@
 require "../tab_controller"
 require "../miner_view"
 require "../mine_config_overlay"
+require "./seeded_tool_tabs"
 require "../../store"
 require "../../miner"
 require "../../env"
+require "../../param_inventory"
+require "../../plural"
 
 module Gori::Tui
   # One open mining session (a sub-tab under the Miner tab). `flow_id` is the source
@@ -16,18 +19,15 @@ module Gori::Tui
   # the bottom bar and completion posts a notification (see start_run / apply_event). The
   # session (request + config) persists across reopen; results stay in-memory.
   class MinerController < TabController
-    DRAIN_CAP = 512 # bounded per-tick drain so a fast run can't starve render
+    include SeededToolTabs
 
     def initialize(host : Host)
       super(host)
-      @miners = [] of MinerTab
-      @host.session.store.miner_sessions.each do |rec|
-        view = MinerView.new
-        view.restore(rec)
-        @miners << MinerTab.new(view, rec.flow_id, rec.id)
-      end
-      @current_idx = @miners.empty? ? -1 : 0
+      @sessions = [] of MinerTab
+      session_rows.each { |rec| @sessions << restore_tab(rec) }
+      @current_idx = @sessions.empty? ? -1 : 0
       @mine_events = Channel({MinerView, Miner::Event}).new(256)
+      @seed_names = Channel({Int64, MineConfigOverlay, Hash(Int64, Array(String))?}).new(1)
     end
 
     def tab : Symbol
@@ -49,40 +49,13 @@ module Gori::Tui
     end
 
     # --- shell-facing accessors ---
-    def count : Int32
-      @miners.size
-    end
-
-    def empty? : Bool
-      @miners.empty?
-    end
 
     def current_view : MinerView?
       current_tab_obj.try(&.view)
     end
 
-    def subtab_labels : Array(String)
-      @miners.map_with_index { |t, i| "#{i + 1}:#{t.view.label(18)}" }
-    end
-
-    # Show the strip from the FIRST session (not ≥2): a single mine still labels its
-    # chip and exposes the strip's space-menu (^W close). Empty → no strip.
-    def subtab_strip_shown? : Bool
-      !@miners.empty?
-    end
-
-    def subtab_index : Int32
-      @current_idx
-    end
-
     def view_at(idx : Int32) : MinerView?
-      (0 <= idx < @miners.size) ? @miners[idx].view : nil
-    end
-
-    # The object that IS sub-tab `idx`, for the strip's mark set (#683). The view, not the
-    # index: a reconcile can reorder or drop chips under a standing mark.
-    def subtab_ref(idx : Int32) : SubtabRef?
-      view_at(idx)
+      (0 <= idx < @sessions.size) ? @sessions[idx].view : nil
     end
 
     def body_badge : Symbol
@@ -91,64 +64,35 @@ module Gori::Tui
 
     def body_hint(focus : Symbol) : String
       v = current_view
-      return "↹/esc tabs · mine from History/Repeater (space → Mine parameters)" unless v
-      return v.filter_hint if v.filter_editing?
+      return Hotkeys.expand_menu_paths(@host.session.registry, "↹/esc tabs · mine from History/Repeater ({space:history.mine})") unless v
+      return v.filter.hint if v.filter.editing?
+      # `esc sub-tabs`, not `esc tabs`: `handle_escape` below goes to the strip whenever one
+      # is shown, and `subtab_strip_shown?` is `!@sessions.empty?` — every branch under this
+      # point has a `current_view`, so the strip is always up and escape never reaches the
+      # tab bar from here. Same correction as the Repeater's and the Fuzzer's.
+      #
+      # RUN or STOP, never both and never the wrong one. `{mine.stop}` was named
+      # unconditionally, so an idle session's footer advertised the one key that does nothing
+      # there and hid `^R` — the key that starts the mine — behind the card badge alone.
+      # Sequencer's footer names its run key in the same slot; this is that line, made
+      # honest about which half of the pair is live.
+      go = v.running? ? "{mine.stop} stop" : "{mine.run} run"
       case v.focus
-      when :results then keys("↑/↓ select · ↵ detail · {mine.filter} filter · {mine.stop} stop · space cmds · ↹ pane · esc tabs")
+      when :results then keys("↑/↓ select · ↵ detail · {mine.filter} filter · #{go} · space cmds · ↹ pane · esc sub-tabs")
       when :detail  then "↑/↓ scroll · esc back"
-      else               keys("↓ findings · {mine.stop} stop · space cmds · ↹ pane · esc tabs")
-      end
-    end
-
-    # --- rendering ---
-    def render_body(screen : Screen, rect : Rect, focus : Symbol) : Nil
-      body_focused = focus == :body
-      labels = subtab_strip_shown? ? subtab_labels : nil
-      shell = BodyChrome.shell_focused(focus, multi_pane: !current_view.nil?)
-      subtabs_focused = focus == :subtabs
-      @subtab_start = BodyChrome.framed_body(screen, rect, shell, subtabs_focused, labels, @current_idx, @subtab_start, subtab_hidden, strip_divider: subtab_strip_divider?, find: subtab_find_shown?, find_lit: @host.subtab_find_focused?, marked: marked_chip_set) do |content|
-        render_with_filter(screen, content, subtabs_focused) do |body|
-          if v = current_view
-            v.render(screen, body, body_focused)
-          else
-            TrafficEmptyState.render(screen, body, variant: :miner)
-          end
-        end
+      else               keys("↓ findings · #{go} · space cmds · ↹ pane · esc sub-tabs")
       end
     end
 
     # --- input ---
-    def handle_body_key(ev : Termisu::Event::Key) : Bool
-      v = current_view
-      if v.nil?
-        key = ev.key
-        # Empty placeholder: esc / ↑ pop to the tab bar (mirrors other empty multi-session tabs).
-        if key.escape? || nav_up?(ev) # `k` only BARE — see TabController#nav_up?
-          @host.request_focus(:menu)
-          return true
-        end
-        return false
-      end
-      if navigable_pane?(v.focus) && ev.key.space? && !ev.ctrl? && !ev.alt?
-        @host.open_space_menu
-        return true
-      end
-      c = ev.char || ev.key.to_char
-      return true if dispatch_chord(chord_action(ev, c), v, c)
-      return false if (ev.ctrl? || ev.alt?) && !ev.key.escape? # ^X stop etc. → keymap verb
-      if ev.key.escape?
-        handle_escape(v)
-        return true
-      end
-      # Only a key a pane took is consumed. This used to answer true for EVERY bare key, so
-      # `/` (the filter), `x`/`y` in the detail and the Global breath keys never reached the
-      # keymap from here.
-      handle_pane_key(ev, v)
+    # The RESULTS `/` filter bar.
+    def body_takes_text? : Bool
+      querying?
     end
 
     # --- the FINDINGS `/` filter (a text sub-mode the shell claims ahead of the focus ring) ---
     def querying? : Bool
-      current_view.try(&.filter_editing?) || false
+      current_view.try(&.filter.editing?) || false
     end
 
     def handle_query_key(ev : Termisu::Event::Key) : Bool
@@ -156,54 +100,29 @@ module Gori::Tui
     end
 
     def set_preedit(text : String) : Bool
-      current_view.try(&.set_filter_preedit(text)) || false
+      current_view.try(&.filter.set_preedit(text)) || false
     end
 
     # `/` — narrow the FINDINGS table by parameter / location / evidence. Refused with no
     # session; lands on the RESULTS pane (closing an open detail) so the rows are on screen.
     def mine_filter : Nil
-      return @host.status("no miner session — mine from History/Repeater (space → Mine parameters)") unless v = current_view
+      return @host.status(Hotkeys.expand_menu_paths(@host.session.registry, "no miner session — mine from History/Repeater ({space:history.mine})")) unless v = current_view
       v.filter_start
-    end
-
-    private def dispatch_chord(action : Symbol?, v : MinerView, c : Char?) : Bool
-      case action
-      when :palette then @host.open_palette
-      when :close   then request_close
-      when :switch  then switch_subtab(c)
-      else               return false
-      end
-      true
     end
 
     private def navigable_pane?(pane : Symbol) : Bool
       pane == :summary || pane == :results
     end
 
-    private def chord_action(ev : Termisu::Event::Key, c : Char?) : Symbol?
-      return nil unless ev.ctrl?
-      key = ev.key
-      case
-      when key.lower_p?         then :palette
-      when key.lower_w?         then :close
-      when c && '1' <= c <= '9' then :switch
+    # A bare key past SeededToolTabs#handle_body_key. Only a key a pane took is consumed. This
+    # used to answer true for EVERY bare key, so `/` (the filter), `x`/`y` in the detail and the
+    # Global breath keys never reached the keymap from here.
+    private def session_key(ev : Termisu::Event::Key, v : MinerView, c : Char?) : Bool
+      if ev.key.escape?
+        handle_escape(v)
+        return true
       end
-    end
-
-    # esc focus ring: detail → results/summary area; else sub-tab strip (when shown)
-    # then tab bar — same body → subtabs → menu ladder as Repeater/Fuzzer/Decoder.
-    private def handle_escape(v : MinerView) : Nil
-      if v.focus == :detail
-        v.close_detail
-      else
-        @host.request_focus(subtab_strip_shown? ? :subtabs : :menu)
-      end
-    end
-
-    private def switch_subtab(c : Char?) : Nil
-      return unless c
-      idx = c.to_i - 1
-      @current_idx = idx if idx < @miners.size
+      handle_pane_key(ev, v)
     end
 
     private def handle_pane_key(ev : Termisu::Event::Key, v : MinerView) : Bool
@@ -298,21 +217,6 @@ module Gori::Tui
       true
     end
 
-    # Select the row under the cursor (grabbing focus from another pane on the first click),
-    # or — a second click on the already-selected row while FINDINGS already holds focus —
-    # open its detail, so the mouse matches ↵. History, Issues, Probe, OAST and the Fuzzer
-    # all read this way; this list had no row hit-test at all.
-    private def click_results(v : MinerView, body : Rect, mx : Int32, my : Int32) : Nil
-      already = v.focus == :results
-      row = v.results_row_at(body, mx, my)
-      if row && already && row == v.results_selected_index
-        v.open_detail
-      else
-        v.focus_pane(:results)
-        v.select_result_row(row) if row
-      end
-    end
-
     # --- mouse drag + double-click (see TabController#supports_drag?) ---
     # The FINDING pane only. Its rows are two columns, so there is no word to double-click.
     def supports_drag? : Bool
@@ -334,19 +238,19 @@ module Gori::Tui
       current_view.try { |v| v.focus == :results && !v.selected_finding.nil? } || false
     end
 
-    def miner_selection_active? : Bool
+    def selection_active? : Bool
       current_view.try(&.detail_selection?) || false
     end
 
-    def miner_selection_text : String
+    def selection_text : String
       current_view.try(&.detail_copy_text) || ""
     end
 
-    def miner_select_line : Nil
+    def select_line : Nil
       current_view.try(&.detail_select_line)
     end
 
-    def miner_clear_selection : Nil
+    def clear_selection : Nil
       current_view.try(&.detail_clear_selection)
     end
 
@@ -363,24 +267,22 @@ module Gori::Tui
       sel = v.detail_selection?
       text = sel ? v.detail_copy_text : v.detail_copy_all
       return if text.empty?
-      written = Clipboard.copy(text)
-      note = Clipboard.note(written, text)
-      @host.status(sel ? "copied #{written}b to clipboard#{note}" : "copied all (#{written}b)#{note}")
+      copy_text(text, sel ? nil : "all")
     end
 
-    def handle_wheel(step : Int32) : Bool
-      if v = current_view
-        wheel_pane(v, v.focus, step)
-      end
+    # PgUp/PgDn/Home/End over FINDINGS: `handle_results` declines them, and `results_move`
+    # clamps the Runner's ±JUMP_ROWS over the filtered list. SUMMARY has no list, and DETAIL
+    # claims the keys in `handle_detail` (#1443).
+    def body_scroll(delta : Int32) : Bool
+      v = current_view
+      return false unless v && v.focus == :results
+      v.results_move(delta)
       true
     end
 
-    # Pointer-aware: the pane under the cursor scrolls, keyboard focus stays put.
-    def handle_wheel_at(step : Int32, mx : Int32, my : Int32, rect : Rect) : Bool
-      return true unless v = current_view
-      pane = v.pane_at(body_rect_below_filter(rect), mx, my)
-      wheel_pane(v, pane || v.focus, step)
-      true
+    def page_rows : Int32?
+      v = current_view
+      v.results_page_rows if v && v.focus == :results
     end
 
     private def wheel_pane(v : MinerView, pane : Symbol, step : Int32) : Nil
@@ -390,96 +292,13 @@ module Gori::Tui
       end
     end
 
-    def commit : Nil
-      save_current
-    end
-
-    def locked? : Bool
-      return false unless v = current_view
-      v.running? || (@host.active_tab == :miner && @host.focus == :body)
-    end
-
-    # --- focus ring ---
-    def pane_advance(dir : Int32) : Bool
-      current_view.try(&.pane_advance(dir)) || false
-    end
-
-    def focus_first : Nil
-      current_view.try(&.focus_first)
-    end
-
-    def focus_last : Nil
-      current_view.try(&.focus_last)
-    end
-
-    # --- sub-tab filter (issue #121) ---
-    def subtab_filter_enabled? : Bool
-      true
-    end
-
-    def filter_fields : Array(String)
-      %w[name host method] # mining sessions carry an HTTP request (target + method)
-    end
-
-    def filter_subjects : Array(Repeater::SubtabFilter::Subject)
-      @miners.map do |t|
-        v = t.view
-        Repeater::SubtabFilter::Subject.new(v.name, v.summary(200), v.target, v.request_method, [] of String)
-      end
-    end
-
-    # The ⌕ picker searches the mined request itself (wire bytes, capped) — a header or
-    # parameter the operator recalls, beyond the request line the summary shows.
-    def subtab_search_extras : Array(String)
-      @miners.map { |t| search_extra(t.view.request_bytes) }
-    end
-
-    # --- sub-tab nav (filter-aware: ←/→ skip hidden chips; ^1-9 escapes the filter) ---
-    def move_subtab(dir : Int32) : Nil
-      if t = step_visible(@current_idx, dir)
-        @current_idx = t
-      end
-    end
-
-    def jump_subtab(idx : Int32) : Nil
-      return unless 0 <= idx < @miners.size
-      clear_subtab_filter if (h = subtab_hidden) && h.includes?(idx)
-      @current_idx = idx
-    end
-
-    # Notification "jump to result": focus the session row with this db_id.
-    def reveal_session(id : Int64) : Nil
-      if idx = index_for_db_id(id)
-        @current_idx = idx
-        @host.focus_body
-      end
-    end
-
     def current_session_db_id : Int64?
-      return nil if @current_idx < 0 || @current_idx >= @miners.size
-      @miners[@current_idx].db_id
-    end
-
-    def index_for_db_id(id : Int64) : Int32?
-      @miners.index { |t| t.db_id == id }
+      return nil if @current_idx < 0 || @current_idx >= @sessions.size
+      @sessions[@current_idx].db_id
     end
 
     def db_id_at(idx : Int32) : Int64?
-      @miners[idx]?.try(&.db_id)
-    end
-
-    # --- rename (orthogonal rename prompt drives this by VIEW identity) ---
-    def apply_rename(view : MinerView, name : String) : Nil
-      return unless tab = @miners.find(&.view.same?(view))
-      clean = name.strip
-      view.name = clean.empty? ? nil : clean
-      if id = tab.db_id
-        # See FuzzerController#apply_rename: the view already carries the new label, so a
-        # refused write is a silent no-op unless the store's answer is reported.
-        unless @host.session.store.set_miner_session_name(id, view.name)
-          @host.status("rename NOT saved (project busy) — the chip reads the new name until the session reloads")
-        end
-      end
+      @sessions[idx]?.try(&.db_id)
     end
 
     # --- cross-tab seeds (build the config-overlay seed) ---
@@ -487,59 +306,77 @@ module Gori::Tui
       return nil unless detail = @host.session.store.get_flow(id)
       built = Repeater::FlowRequest.build(detail)
       appl = Miner::Plan.applicable_locations(built.bytes)
-      summary = request_summary(built.bytes)
+      summary = SeededSession.request_summary(built.bytes)
       MineSeed.new(built.target, built.bytes, built.http2, nil, id, summary, appl.applicable, appl.default)
     end
 
-    def build_seed_from_request(target : String, request_text : String, http2 : Bool, sni : String?) : MineSeed
-      bytes = text_to_request(request_text)
-      appl = Miner::Plan.applicable_locations(bytes)
-      MineSeed.new(target, bytes, http2, sni, nil, request_summary(bytes), appl.applicable, appl.default)
-    end
+    # Bumped by every `scan_seed_names` and by `cancel_seed_scan`: a scan whose generation
+    # moved stops walking, and `drain_seed_names` drops what it sends.
+    getter seed_generation : Int64 = 0_i64
 
-    private def request_summary(bytes : Bytes) : String
-      line = String.new(bytes[0, {bytes.size, 256}.min]).each_line.first? || ""
-      parts = line.strip.split(' ')
-      s = "#{parts[0]?} #{parts[1]?}".strip
-      s.empty? ? "request" : s
-    end
-
-    # Normalize editor text to CRLF line endings (h2 reframing + injection boundary scan
-    # expect them); captured flows are already CRLF. `$VAR` tokens are deliberately left
-    # alone: Miner::Plan expands the request at build time, so expanding here too would be
-    # a second pass, and a var whose value contains a token would resolve one level deeper
-    # for a hand-authored request than for a flow-seeded one.
-    #
-    # Done in BYTE space, not as `gsub(/\r?\n/, "\r\n")`: this text is the Repeater editor's
-    # buffer, which is routinely RAW CAPTURED BYTES (a multipart JPEG upload, a protobuf/gzip
-    # body), and PCRE2 raises `ArgumentError` on a subject that is not valid UTF-8 — with no
-    # `rescue` between here and `Runner#run`, so `space ▸ m` silently did nothing and the third
-    # press inside TICK_ERROR_WINDOW took the session down. `.scrub`bing to appease the regex
-    # is not the fix: these bytes are about to go on the wire (P7). Same reasoning, same walk
-    # as `MCP::RequestBuilder.normalize_raw`, minus its head-only boundary — the regex promoted
-    # a bare LF anywhere, body included, and this keeps doing that.
-    #
-    # Byte-equivalent to the regex on every input, `"a\r\r\n"` included: a CRLF pair copies
-    # through, a lone LF is promoted, and any other byte — the FIRST CR of that pathological
-    # shape, which `TextArea#split_wire` exists to preserve — is copied untouched.
-    private def text_to_request(text : String) : Bytes
-      bytes = text.to_slice
-      io = IO::Memory.new(bytes.size + 16)
-      i = 0
-      while i < bytes.size
-        b = bytes[i]
-        if b == 0x0D_u8 && i + 1 < bytes.size && bytes[i + 1] == 0x0A_u8
-          io.write_byte(0x0D_u8); io.write_byte(0x0A_u8) # already CRLF
-          i += 2
-        elsif b == 0x0A_u8
-          io.write_byte(0x0D_u8); io.write_byte(0x0A_u8) # lone LF promoted
-          i += 1
-        else
-          io.write_byte(b)
-          i += 1
+    # A History mine's seed names (#1231): the parameter inventory's neighbour names for each
+    # flow `ov` seeds, read on a WORKER fiber — the scan walks flows, and on the one
+    # cooperative scheduler a synchronous walk would freeze the popup it is filling (P6). They
+    # land through `drain_seed_names`. The scan is superseded, never stopped by what is on
+    # screen: a confirm dialog that covers the popup for a moment must not cut it short.
+    # Dismissing the popup (esc, a click outside) does stop it, through its `on_close`, which a
+    # covering child modal does not run.
+    def scan_seed_names(ov : MineConfigOverlay) : Nil
+      ids = ([ov.seed] + ov.extra_seeds).compact_map(&.flow_id)
+      return if ids.empty?
+      gen = (@seed_generation += 1)
+      ov.begin_seeding
+      prior = ov.on_close
+      me = self
+      ov.on_close = -> {
+        me.cancel_seed_scan(gen)
+        prior.try(&.call)
+        nil
+      }
+      store = @host.session.store
+      results = @seed_names
+      spawn(name: "gori-mine-seed-names") do
+        # nil = the scan raised; the popup then says seeding failed instead of spinning on.
+        by_flow = begin
+          ParamInventory.seed_names(store, store.flow_rows(ids), stop: -> { me.seed_generation != gen })
+        rescue ex
+          ::Log.warn(exception: ex) { "mine seed-name scan failed" }
+          nil
         end
+        results.send({gen, ov, by_flow})
       end
-      io.to_slice
+    end
+
+    # The popup started its mine (or went away): its scan has nothing left to feed. With
+    # `gen`, only while that scan is still the current one, so a popup closing late cannot
+    # cancel a newer popup's scan.
+    def cancel_seed_scan(gen : Int64? = nil) : Nil
+      @seed_generation += 1 if gen.nil? || gen == @seed_generation
+    end
+
+    # Each run-loop tick: land the current seed-name scan on its popup. True when it landed
+    # (→ a frame); a superseded or cancelled scan's answer is dropped.
+    def drain_seed_names : Bool
+      select
+      when landed = @seed_names.receive
+        gen, ov, by_flow = landed
+        return false unless gen == @seed_generation
+        ov.land_seed_names(by_flow)
+        true
+      else
+        false
+      end
+    end
+
+    # Editor text to CRLF line endings (h2 reframing and the injection boundary scan expect
+    # them); captured flows are already CRLF. `$VAR` tokens are left alone: Miner::Plan expands
+    # the request at build time. In BYTE space, never `gsub(/\r?\n/, "\r\n")`: the Repeater
+    # buffer is routinely raw captured bytes, PCRE2 raises on a non-UTF-8 subject, and these
+    # bytes go on the wire as they are (P7).
+    def build_seed_from_request(target : String, request_text : String, http2 : Bool, sni : String?) : MineSeed
+      bytes = Env.normalize_crlf(request_text.to_slice)
+      appl = Miner::Plan.applicable_locations(bytes)
+      MineSeed.new(target, bytes, http2, sni, nil, SeededSession.request_summary(bytes), appl.applicable, appl.default)
     end
 
     # --- start a session (called by the Runner after the config overlay confirms) ---
@@ -556,8 +393,9 @@ module Gori::Tui
     end
 
     private def open_session(view : MinerView, flow_id : Int64?) : Nil
-      @miners << MinerTab.new(view, flow_id, persist_new(view, flow_id))
-      @current_idx = @miners.size - 1
+      @sessions << MinerTab.new(view, flow_id, persist_new(view, flow_id))
+      @current_idx = @sessions.size - 1
+      reveal_active_subtab
     end
 
     # Content-only clone of the active miner session (request + config; no findings/links).
@@ -566,18 +404,15 @@ module Gori::Tui
     def miner_duplicate : Nil
       if refs = batch_subtab_refs
         msg = duplicate_marked_subtabs(refs, "miner session") { |i| duplicate_at(i) }
-        unless msg
-          @host.status("#{refs.size} sub-tabs marked — duplicate is capped at #{Runner::BATCH_SUBTAB_CAP}")
-          return
-        end
+        return unless msg
         @host.goto_tab(:miner)
-        @host.status("#{msg} (#{@miners.size} open)")
+        @host.status("#{msg} (#{@sessions.size} open)")
         return
       end
       return @host.status("no miner session open to duplicate") unless current_view
       duplicate_at(@current_idx)
       @host.goto_tab(:miner)
-      @host.status("duplicated miner session (#{@miners.size} open)")
+      @host.status("duplicated miner session (#{@sessions.size} open)")
     end
 
     # Clone sub-tab `idx` into a new session at the end of the strip. Toast-free, so the
@@ -641,7 +476,7 @@ module Gori::Tui
 
     private def persist_new(view : MinerView, flow_id : Int64?) : Int64?
       id = @host.session.store.insert_miner_session(view.target_origin, view.request_bytes, view.http2?,
-        view.sni_override, view.config_json, flow_id, @miners.size, view.name)
+        view.sni_override, view.config_json, flow_id, @sessions.size, view.name)
       id == 0 ? nil : id
     end
 
@@ -650,7 +485,7 @@ module Gori::Tui
       # the proxy reads that one and the Project tab edits it (Mutex-guarded), so a second
       # copy would freeze this run's pins at whatever they were when the tab opened (#367).
       engine, err = view.build_engine(!@host.session.config.insecure_upstream?,
-        @host.session.scope, @host.session.host_overrides)
+        @host.session.scope, @host.session.host_overrides, @host.session.store)
       unless engine
         @host.status(err || "can't mine")
         return
@@ -700,7 +535,10 @@ module Gori::Tui
       ensure
         view.finish_run # backstop — the drain's Done also clears it
       end
-      @host.status("mining #{view.target_origin} in the background — watch the bottom bar / notifications")
+      # The request-time macro, when the run has one (#1350): said up front, because a per-request
+      # macro serialises the mine and an operator otherwise learns that from the stopwatch.
+      macro_line = (info = view.macro_info) ? " · #{info.line}" : ""
+      @host.status("mining #{view.target_origin} in the background — watch the bottom bar / notifications#{macro_line}")
     end
 
     # --- run controls (mine.run re-runs the current session; mine.stop halts it) ---
@@ -722,29 +560,6 @@ module Gori::Tui
       return unless (v = current_view) && v.running?
       v.request_stop
       @host.status("stopping…", :busy)
-    end
-
-    # --- async (run loop) ---
-    def drain_events : Bool
-      applied = false
-      n = 0
-      while n < DRAIN_CAP && (pair = nonblocking_event)
-        n += 1
-        v, ev = pair
-        next unless @miners.any?(&.view.same?(v)) # session closed mid-run → drop
-        apply_event(v, ev)
-        applied = true
-      end
-      applied
-    end
-
-    private def nonblocking_event : {MinerView, Miner::Event}?
-      select
-      when p = @mine_events.receive
-        p
-      else
-        nil
-      end
     end
 
     private def apply_event(v : MinerView, ev : Miner::Event) : Nil
@@ -779,11 +594,21 @@ module Gori::Tui
              else
                ""
              end
-      msg = "Miner: #{n} param#{n == 1 ? "" : "s"} found on #{v.summary}#{tail}"
+      found = n > 0 ? "#{Gori.plural(n, "param")} found" : "done — nothing found"
+      msg = "Miner: #{found} on #{v.summary}#{tail}#{macro_failure_note(ev.progress)}"
       level = n > 0 ? :success : :info
       log_event(v, level, msg)
       push_mine_notification(v, level, msg, found: n)
-      @host.status(msg) if v.config.notify.posts_notification?(n)
+      # The status line answers the start toast's "watch the bottom bar", so an empty run under
+      # the default "when found" still ends with a line there (#1379). NotifyMode gates the
+      # notification CENTER; only Off silences the bar too.
+      @host.status(msg) unless v.config.notify.off?
+    end
+
+    # A macro that FAILED is the reason some probes are errors rather than answers, and the
+    # completion line is where an operator who was not watching looks.
+    private def macro_failure_note(p : Miner::Progress) : String
+      (t = p.request_macro) && t.failed > 0 ? " · macro: #{t.summary}" : ""
     end
 
     private def push_mine_notification(v : MinerView, level : Symbol, msg : String, found : Int32 = 0) : Nil
@@ -795,72 +620,40 @@ module Gori::Tui
     # independent of the human NotifyMode gate above ("log freely, interrupt deliberately").
     private def log_event(v : MinerView, level : Symbol, msg : String) : Nil
       g = goto_for(v)
-      @host.session.store.insert_event("miner", "job_done", level.to_s, msg,
+      @host.session.store.insert_event("miner", "job_done", level, msg,
         goto_tab: g.try(&.tab.to_s), goto_session_id: g.try(&.session_id))
     end
 
     private def goto_for(v : MinerView) : Jobs::Goto?
-      tab = @miners.find(&.view.same?(v))
+      tab = @sessions.find(&.view.same?(v))
       (tab && (id = tab.db_id)) ? Jobs::Goto.new(:miner, id) : nil
     end
 
-    # --- close / persist ---
-    # ^W closes the MARKED sub-tabs when the strip carries marks, the active one otherwise
-    # (`target_subtab_indices` — the one target rule).
-    def request_close : Nil
-      return unless tab = current_tab_obj
-      if refs = batch_subtab_refs
-        @host.confirm("CLOSE MINERS", "Close #{marked_subtab_phrase(refs.size)}?\nEach config and its results are discarded.",
-          confirm_label: "close", danger: true) { close_marked_sessions(refs) }
-        return
-      end
-      @host.confirm("CLOSE MINER", "Close mining session “#{tab.view.summary}”?\nIts config and results are discarded.",
-        confirm_label: "close", danger: true) { close_tab }
+    private def delete_session_row(id : Int64) : Bool
+      @host.session.store.delete_miner_session(id)
     end
 
-    private def close_marked_sessions(refs : Array(SubtabRef)) : Nil
-      @host.status(close_marked_subtabs(refs))
-      @host.resolve_subtab_focus
+    # --- SeededToolTabs hooks ---
+    private def session_rows
+      @host.session.store.miner_sessions
     end
 
-    protected def close_subtab_at(idx : Int32) : Bool
-      close_at(idx)
+    private def restore_tab(row) : MinerTab
+      view = MinerView.new
+      view.restore(row)
+      MinerTab.new(view, row.flow_id, row.id)
     end
 
-    def close_tab : Nil
-      return if @current_idx < 0 || @current_idx >= @miners.size
-      orphaned = close_at(@current_idx)
-      @host.status(TabClose.message(@miners.empty? ? "closed — none open" : "closed (#{@miners.size} open)", orphaned))
+    private def save_session_name(id : Int64, name : String?) : Bool
+      @host.session.store.set_miner_session_name(id, name)
     end
 
-    # Close sub-tab `idx` and report whether the store rolled its DELETE back. Toast-free and
-    # index-taking, so the batch driver can loop it.
-    private def close_at(idx : Int32) : Bool
-      return false if idx < 0 || idx >= @miners.size
-      tab = @miners[idx]
-      tab.view.request_stop # halt a running mine before detaching (the run fiber polls this)
-      # Finish the job NOW: once the view leaves @miners, drain_events drops its remaining
-      # events (incl. Done), so jobs.finish would never run and the bottom-bar spinner would
-      # animate forever. The background fiber still unwinds on its own via request_stop.
-      @host.jobs.finish(tab.view.job_id, :stopped, "closed") if tab.view.running?
-      orphaned = (id = tab.db_id) ? !@host.session.store.delete_miner_session(id) : false
-      @miners.delete_at(idx)
-      # Closing a tab to the LEFT slides the active one down; a bare clamp would read that as
-      # "stay put" and land the operator on its neighbour.
-      @current_idx -= 1 if idx < @current_idx
-      @current_idx = @miners.empty? ? -1 : @current_idx.clamp(0, @miners.size - 1)
-      orphaned
+    private def session_events
+      @mine_events
     end
 
-    # Halt EVERY running mine on a project-level exit (leave project / quit) — the same
-    # `request_stop` + `jobs.finish` pair close_tab applies to the current tab, applied to
-    # all of them. See FuzzerController#stop_all.
-    def stop_all : Nil
-      @miners.each do |tab|
-        next unless tab.view.running?
-        tab.view.request_stop
-        @host.jobs.finish(tab.view.job_id, :stopped, "project closed")
-      end
+    private def close_wording : {String, String, String}
+      {"MINER", "mining", "results"}
     end
 
     def save_current : Nil
@@ -871,64 +664,6 @@ module Gori::Tui
       @host.session.store.update_miner_session(id, v.target_origin, v.request_bytes, v.http2?, v.sni_override, cfg, v.name)
       v.mark_config_synced(cfg)
       v.clear_dirty
-    end
-
-    # Live converge with miner_sessions after a data_version bump. Soft-sync only —
-    # never full restore (would wipe findings + force focus defaults).
-    def reconcile : Nil
-      rows = @host.session.store.miner_sessions
-      by_id = rows.index_by(&.id)
-      cur_db = current_tab_obj.try(&.db_id)
-      cur_view = current_tab_obj.try(&.view)
-
-      @miners.each do |tab|
-        next unless (id = tab.db_id) && (row = by_id[id]?)
-        next if miner_tab_locked?(tab)
-        v = tab.view
-        next if v.session_side_matches?(row)
-        v.apply_peer_session(row)
-      end
-
-      local_ids = @miners.compact_map(&.db_id).to_set
-      rows.each do |row|
-        next if local_ids.includes?(row.id)
-        view = MinerView.new
-        view.restore(row)
-        @miners << MinerTab.new(view, row.flow_id, row.id)
-      end
-
-      @miners.reject! do |tab|
-        (id = tab.db_id) && !by_id.has_key?(id) && !miner_tab_locked?(tab)
-      end
-
-      @miners.sort_by! do |tab|
-        if (id = tab.db_id) && (row = by_id[id]?)
-          {row.position, id}
-        else
-          {Int32::MAX, Int64::MAX}
-        end
-      end
-
-      @current_idx =
-        if cur_db && (idx = @miners.index { |t| t.db_id == cur_db })
-          idx
-        elsif (cv = cur_view) && (idx = @miners.index(&.view.same?(cv)))
-          idx
-        elsif @miners.empty?
-          -1
-        else
-          @current_idx.clamp(0, @miners.size - 1)
-        end
-    end
-
-    private def current_tab_obj : MinerTab?
-      return nil if @current_idx < 0 || @current_idx >= @miners.size
-      @miners[@current_idx]
-    end
-
-    private def miner_tab_locked?(tab : MinerTab) : Bool
-      v = tab.view
-      v.running? || v.dirty?
     end
   end
 end

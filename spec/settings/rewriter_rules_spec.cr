@@ -7,7 +7,7 @@ require "file_utils"
 # fields are stored as the same labels `gori run rewriter` prints, precisely so the file reads
 # the way the CLI does.
 #
-# Which is what makes the SHAPE the parse's business too. The four enum fields are clamped
+# Which is what makes the SHAPE the parse's business too. The enum fields are parsed
 # INDEPENDENTLY, so `{op: "set_header", part: "ws"}` — a pair the CLI and MCP tools both REFUSE
 # outright rather than normalize — used to arrive in the rule list intact. A header op acts by
 # header NAME and only a head has header lines, so it can never fire; `Rules`' own `rewrites?`
@@ -107,6 +107,225 @@ describe "Gori::Settings rewriter rule shape" do
       rule.name.should eq("strip")
       rule.pattern.should eq("X-Bad")
       rule.host.should eq("*.corp.internal")
+    end
+  end
+
+  it "preserves unknown enum labels through save and keeps those rows inert" do
+    with_rewriter_home do
+      write_settings(<<-JSON)
+        {"rewriter": {"rules": [
+          {"id": 1, "enabled": true, "pattern": "POST /pay", "replacement": "HTTP/1.1 200 OK", "op": "future_short_circuit"},
+          {"id": 2, "enabled": true, "pattern": "X-Trace", "replacement": "on", "op": "set_header", "part": "future_head"},
+          {"id": 3, "enabled": true, "pattern": "/pay", "replacement": "cat", "target": "future_side", "op": "pipe"},
+          {"id": 4, "enabled": true, "pattern": "secret", "replacement": "masked", "target": "response", "part": "body", "op": "replace", "match_kind": "future_match"}
+        ]}}
+        JSON
+      Gori::Settings.load
+
+      rules = Gori::Settings.rewriter_rules
+      rules.size.should eq(4)
+      rules.map(&.op).should eq(["future_short_circuit", "set_header", "pipe", "replace"])
+      rules[1].part.should eq("future_head") # unknown part is kept even with a header op
+      rules[2].target.should eq("future_side")
+      rules[3].match_kind.should eq("future_match")
+      rules.all?(&.inert?).should be_true
+      rules[0].to_rule.inert_reason.should eq("unknown op \"future_short_circuit\" (newer gori?)")
+      rules[0].executes?.should be_true
+      rules[0].command.should eq("HTTP/1.1 200 OK")
+      rules[1].executes?.should be_false
+      rules[1].command.should be_nil
+      rules[2].executes?.should be_true
+      rules[2].command.should eq("cat")
+      Gori::Settings.command_entries(JSON.parse(File.read(Gori::Settings.path))).any? do |entry|
+        entry.kind == "pipe" && entry.command == "cat"
+      end.should be_true
+
+      Gori::Settings.add_rewriter_rule("request", "head", "X-New", "value",
+        "replace", "literal", "new", "", "").should eq(5_i64)
+      Gori::Settings.save.should be_true
+      rows = JSON.parse(File.read(Gori::Settings.path))["rewriter"]["rules"].as_a
+      rows.map(&.["op"].as_s).should eq(["future_short_circuit", "set_header", "pipe", "replace", "replace"])
+      rows[1]["part"].as_s.should eq("future_head")
+      rows[2]["target"].as_s.should eq("future_side")
+      rows[3]["target"].as_s.should eq("response")
+      rows[3]["part"].as_s.should eq("body")
+      rows[3]["match_kind"].as_s.should eq("future_match")
+    end
+  end
+
+  it "marks non-string label values inert and preserves their raw JSON on round-trip" do
+    with_rewriter_home do
+      write_settings(<<-JSON)
+        {"rewriter": {"rules": [
+          {"id": 1, "enabled": true, "name": "future obj op", "pattern": "secret", "replacement": "X", "op": {"kind": "lua"}},
+          {"id": 2, "enabled": true, "name": "future array target", "pattern": "secret", "replacement": "Y", "target": ["request", "response"]}
+        ]}}
+        JSON
+      Gori::Settings.load
+      rules = Gori::Settings.rewriter_rules
+      rules.size.should eq(2)
+      rules[0].inert?.should be_true
+      rules[1].inert?.should be_true
+      rules[0].to_rule.inert?.should be_true
+      rules[1].to_rule.inert?.should be_true
+
+      # Live traffic must not rewrite
+      with_store do |store|
+        engine = Gori::Rules.load(store)
+        head = "GET /secret HTTP/1.1\r\nHost: a\r\n\r\n".to_slice
+        engine.rewrite_request(head, "a").should eq(head)
+      end
+
+      # Round-trip save preserves raw JSON
+      Gori::Settings.save.should be_true
+      doc = JSON.parse(File.read(Gori::Settings.path))
+      saved_rules = doc["rewriter"]["rules"].as_a
+      saved_rules[0]["op"]["kind"].as_s.should eq("lua")
+      saved_rules[1]["target"].as_a.map(&.as_s).should eq(["request", "response"])
+    end
+  end
+
+  # Read as "", a non-string `host` would scope the rule to EVERY host and a non-string
+  # `replacement` would delete what it matches.
+  it "marks non-string text fields inert and preserves their raw JSON on round-trip" do
+    with_rewriter_home do
+      write_settings(<<-JSON)
+        {"rewriter": {"rules": [
+          {"id": 1, "enabled": true, "name": "list host", "pattern": "secret", "replacement": "X", "op": "replace", "host": ["a.test"]},
+          {"id": 2, "enabled": true, "name": "num repl", "pattern": "secret", "replacement": 7, "op": "replace"}
+        ]}}
+        JSON
+      Gori::Settings.load
+      Gori::Settings.rewriter_rules.map(&.inert?).should eq([true, true])
+      with_store do |store|
+        engine = Gori::Rules.load(store)
+        head = "GET /secret HTTP/1.1\r\nHost: a.test\r\n\r\n".to_slice
+        engine.rewrite_request(head, "a.test").should eq(head)
+      end
+      Gori::Settings.save.should be_true
+      saved = JSON.parse(File.read(Gori::Settings.path))["rewriter"]["rules"].as_a
+      saved[0]["host"].as_a.map(&.as_s).should eq(["a.test"])
+      saved[1]["replacement"].as_i.should eq(7)
+    end
+  end
+
+  it "marks a rule with unknown extra keys inert and preserves them on round-trip" do
+    with_rewriter_home do
+      write_settings(<<-JSON)
+        {"rewriter": {"rules": [
+          {"id": 1, "enabled": true, "name": "scoped", "pattern": "secret", "replacement": "X", "op": "replace", "path": "/only-here"}
+        ]}}
+        JSON
+      Gori::Settings.load
+      rules = Gori::Settings.rewriter_rules
+      rules.size.should eq(1)
+      rules[0].inert?.should be_true
+      rules[0].to_rule.inert?.should be_true
+      rules[0].to_rule.inert_reason.should eq("unknown key \"path\" (newer gori?)")
+
+      # Does not rewrite live traffic
+      with_store do |store|
+        engine = Gori::Rules.load(store)
+        head = "GET /elsewhere/secret HTTP/1.1\r\nHost: a\r\n\r\n".to_slice
+        engine.rewrite_request(head, "a").should eq(head)
+      end
+
+      # Round-trip preserves the extra key
+      Gori::Settings.save.should be_true
+      doc = JSON.parse(File.read(Gori::Settings.path))
+      saved_rules = doc["rewriter"]["rules"].as_a
+      saved_rules[0]["path"].as_s.should eq("/only-here")
+    end
+  end
+
+  # The writers re-read the file before they touch a row; the inert check has to be made
+  # against that re-read, not the caller's snapshot, or a key a newer gori wrote in between is
+  # dropped by the rebuild (`update`) or the row is switched on (`set_enabled`).
+  it "refuses to edit or enable a rule that turned inert on disk since it was loaded" do
+    with_rewriter_home do
+      write_settings(<<-JSON)
+        {"rewriter": {"next_rule_id": 2, "rules": [
+          {"id": 1, "enabled": false, "name": "plain", "pattern": "a", "replacement": "b", "op": "replace"}
+        ]}}
+        JSON
+      Gori::Settings.load
+      Gori::Settings.rewriter_rules[0].inert?.should be_false
+      write_settings(<<-JSON)
+        {"rewriter": {"next_rule_id": 2, "rules": [
+          {"id": 1, "enabled": false, "name": "plain", "pattern": "a", "replacement": "b", "op": "replace", "throttle": 5}
+        ]}}
+        JSON
+
+      Gori::Settings.set_rewriter_rule_enabled(1_i64, true).should be_false
+      Gori::Settings.update_rewriter_rule(1_i64, "request", "head", "a", "edited", "replace",
+        "literal", "plain", "", "").should be_false
+      rule = JSON.parse(File.read(Gori::Settings.path))["rewriter"]["rules"][0]
+      rule["throttle"].as_i.should eq(5)
+      rule["replacement"].as_s.should eq("b")
+      rule["enabled"].as_bool.should be_false
+
+      # Turning it OFF stays allowed, and keeps the key.
+      Gori::Settings.set_rewriter_rule_enabled(1_i64, false).should be_true
+      JSON.parse(File.read(Gori::Settings.path))["rewriter"]["rules"][0]["throttle"].as_i.should eq(5)
+    end
+  end
+
+  # #1237: the short-circuit sub-kind. A row an older binary wrote carries neither key and reads
+  # as the stub it always was; a label or args this binary cannot read are kept verbatim and the
+  # row stays inert.
+  it "derives respond for a row that predates it, and round-trips it once named" do
+    with_rewriter_home do
+      write_settings(<<-JSON)
+        {"rewriter": {"rules": [
+          {"id": 1, "enabled": true, "pattern": "/logo", "replacement": "200 OK", "op": "short_circuit", "body_file": "/tmp/logo.png"},
+          {"id": 2, "enabled": true, "pattern": "/me", "replacement": "200 OK", "op": "short_circuit"},
+          {"id": 3, "enabled": true, "pattern": "GET /s/", "replacement": "", "op": "short_circuit",
+           "body_file": "/srv/js", "respond": "dir", "respond_args": "{\\"strip_prefix\\":\\"/s/\\"}"}
+        ]}}
+        JSON
+      Gori::Settings.load
+      rules = Gori::Settings.rewriter_rules
+      rules.map(&.respond).should eq(["file", "inline", "dir"])
+      rules[2].to_rule.args.strip_prefix.should eq("/s/")
+      rules.none?(&.inert?).should be_true
+
+      # A new rule writes both keys. The untouched rows follow the file (the 3-way merge), so the
+      # older binary's rows stay exactly as that binary wrote them.
+      Gori::Settings.add_rewriter_rule("request", "head", "/pay", "", "short_circuit", "literal",
+        "", "", "", respond: "fault", respond_args: %({"fault":"reset"})).should eq(4_i64)
+      rows = JSON.parse(File.read(Gori::Settings.path))["rewriter"]["rules"].as_a
+      rows.map(&.["respond"]?.try(&.as_s)).should eq([nil, nil, "dir", "fault"])
+      # A rewrite rule, or a stub whose respond is the one its body file implies, is written
+      # with exactly the keys it had — a gori built after #1252 holds an unknown key inert.
+      Gori::Settings.add_rewriter_rule("request", "head", "X-A", "b", "set_header", "literal",
+        "", "", "").should eq(5_i64)
+      rows = JSON.parse(File.read(Gori::Settings.path))["rewriter"]["rules"].as_a
+      rows[4].as_h.has_key?("respond").should be_false
+      rows[4].as_h.has_key?("respond_args").should be_false
+      rows[2]["respond_args"].as_s.should eq(%({"strip_prefix":"/s/"}))
+      rows[3]["respond_args"].as_s.should eq(%({"fault":"reset"}))
+    end
+  end
+
+  it "keeps a respond label or args it cannot read, verbatim and inert" do
+    with_rewriter_home do
+      write_settings(<<-JSON)
+        {"rewriter": {"rules": [
+          {"id": 1, "enabled": true, "pattern": "/a", "replacement": "", "op": "short_circuit", "respond": "script"},
+          {"id": 2, "enabled": true, "pattern": "/b", "replacement": "", "op": "short_circuit",
+           "respond": "fault", "respond_args": {"fault": "reset", "throttle": 3}}
+        ]}}
+        JSON
+      Gori::Settings.load
+      rules = Gori::Settings.rewriter_rules
+      rules[0].respond.should eq("script")
+      rules[1].respond_args.should eq(%({"fault":"reset","throttle":3}))
+      rules.all?(&.inert?).should be_true
+      Gori::Settings.save.should be_true
+      rows = JSON.parse(File.read(Gori::Settings.path))["rewriter"]["rules"].as_a
+      rows[0]["respond"].as_s.should eq("script")
+      # An object is written back as the object a newer gori wrote, not as a string of it.
+      rows[1]["respond_args"].as_h["throttle"].as_i.should eq(3)
     end
   end
 end

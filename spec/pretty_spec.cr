@@ -1,4 +1,5 @@
 require "./spec_helper"
+require "./support/serialized_vectors"
 
 # Build a minimal head carrying just the Content-Type, then pretty-format a body.
 private def pretty(ct : String, body : String | Bytes) : Gori::Pretty::Result?
@@ -40,6 +41,68 @@ describe Gori::Pretty do
       t.lines.size.should be > 1
     end
 
+    it "reflows JSON carrying a number past Int64/Float64, keeping its digits (#1200)" do
+      t = text(pretty("application/json", %({"id":18446744073709551615,"f":1.5e400,"a":[1]})))
+      t.should contain(%("id": 18446744073709551615))
+      t.should contain(%("f": 1.5e400))
+      t.lines.size.should be > 1
+    end
+
+    it "keeps escapes and duplicate members visible in the default pretty view" do
+      body = "{\"k\":\"\\u003c\\/x\",\"k\":1E+05}"
+      result = pretty("application/json", body).not_nil!
+      text(result).should contain("\\u003c\\/x")
+      text(result).should contain("\"k\": 1E+05")
+      text(result).should_not contain("<")
+      result.unicode_escape_count.should eq(1)
+    end
+
+    it "preserves a number that collides with the first template-marker placeholder" do
+      seed = "87654321098765432109876543210987654321"
+      prefix = seed[0, seed.bytesize - 8] + "00000000"
+      body = %({"n":#{prefix}00000000,"template":"§val§"})
+
+      formatted = Gori::Pretty.format_request(
+        "POST /x HTTP/1.1\r\nContent-Type: application/json\r\n\r\n", body
+      ).not_nil!
+      formatted.should contain(%("n": #{prefix}00000000))
+      formatted.should contain(%("template": "§val§"))
+    end
+
+    it "preserves invalid UTF-8 bytes through request reindent" do
+      body = Bytes[
+        0x7b_u8, 0x22_u8, 0x61_u8, 0x22_u8, 0x3a_u8, 0x22_u8, 0xff_u8, 0x22_u8,
+        0x2c_u8, 0x22_u8, 0x62_u8, 0x22_u8, 0x3a_u8, 0x31_u8, 0x7d_u8,
+      ]
+      formatted = Gori::Pretty.format_request(
+        "POST /x HTTP/1.1\r\nContent-Type: application/json\r\n\r\n", String.new(body)
+      ).not_nil!
+      formatted.to_slice.should eq(Bytes[
+        0x7b_u8, 0x0a_u8, 0x20_u8, 0x20_u8, 0x22_u8, 0x61_u8, 0x22_u8, 0x3a_u8,
+        0x20_u8, 0x22_u8, 0xff_u8, 0x22_u8, 0x2c_u8, 0x0a_u8, 0x20_u8, 0x20_u8,
+        0x22_u8, 0x62_u8, 0x22_u8, 0x3a_u8, 0x20_u8, 0x31_u8, 0x0a_u8, 0x7d_u8,
+      ])
+    end
+
+    it "decodes Unicode escapes only on request and carries highlight ranges" do
+      body = "{\"value\":\"\\u003c\\u200b\"}"
+      raw = Gori::Pretty.format(head_ct("application/json"), body.to_slice).not_nil!
+      String.new(raw.bytes).should contain("\\u003c\\u200b")
+      raw.decoded_ranges.should be_empty
+
+      decoded = Gori::Pretty.format(head_ct("application/json"), body.to_slice, decode_unicode: true).not_nil!
+      String.new(decoded.bytes).should contain("<\u{200b}")
+      decoded.note.should contain("\\u decoded (2 escapes)")
+      decoded.decoded_ranges.should eq([{1, 12, 13}, {1, 13, 14}])
+    end
+
+    it "offers the decode count without pretty reflow" do
+      body = "{ \"x\" : \"\\u003c\" }".to_slice
+      Gori::Pretty.unicode_escape_count(head_ct("application/json"), body).should eq(1)
+      Gori::Pretty.decode_unicode_json(head_ct("application/json"), body).not_nil!.bytes
+        .should eq("{ \"x\" : \"<\" }".to_slice)
+    end
+
     it "is a no-op on already-pretty JSON (idempotent → nil)" do
       r1 = pretty("application/json", %({"a":1})).not_nil!
       pretty("application/json", String.new(r1.bytes)).should be_nil
@@ -66,19 +129,19 @@ describe Gori::Pretty do
   end
 
   describe "GraphQL" do
-    it "presents operationName + query + variables, kind :graphql" do
+    it "keeps JSON GraphQL envelopes as escaped JSON in the default pane" do
       body = %({"operationName":"Q","query":"query Q { me { id } }","variables":{"x":1}})
       res = pretty("application/json", body)
-      res.not_nil!.kind.should eq(:graphql)
+      res.not_nil!.kind.should be_nil
       t = text(res)
-      t.should contain("# operationName: Q")
+      t.should contain(%("operationName": "Q"))
       t.should contain("query Q { me { id } }")
-      t.should contain("# variables")
+      t.should contain(%("variables": {))
     end
 
-    it "un-escapes a multi-line query" do
+    it "keeps JSON escape spellings in a GraphQL envelope" do
       body = %({"query":"query {\\n  me {\\n    id\\n  }\\n}"})
-      text(pretty("application/json", body)).should contain("  me {")
+      text(pretty("application/json", body)).should contain(%(\\n))
     end
 
     it "plain JSON (no query field) routes to the JSON formatter (kind nil)" do
@@ -260,9 +323,13 @@ describe Gori::Pretty do
       Gori::Pretty.format_request(head, jwt_token).should be_nil
     end
 
-    it "refuses the GraphQL document rendered out of its JSON envelope" do
+    it "keeps the JSON envelope while reflowing whitespace only" do
       head = "POST /g HTTP/1.1\r\nHost: x\r\nContent-Type: application/json"
-      Gori::Pretty.format_request(head, %({"operationName":"Me","variables":{"a":1},"query":"query Me { me { id } }"})).should be_nil
+      body = "{\"query\":\"query Me { me { id } }\",\"query\":\"other\",\"n\":1E+05}"
+      formatted = Gori::Pretty.format_request(head, body).not_nil!
+      formatted.should contain("\"query\": \"query Me { me { id } }\"")
+      formatted.should contain("\"query\": \"other\"")
+      formatted.should contain("1E+05")
     end
 
     # Positive control: the guard must not be a blanket `return nil`.
@@ -283,13 +350,14 @@ describe Gori::Pretty do
   describe "GraphQL — one detector, shared with the decoded pane" do
     envelope = %({"operationName":"Me","variables":{"a":1},"query":"query Me { me { id } }"})
 
-    it "renders the shapes it never knew: batch and persisted query" do
+    it "keeps batch and persisted-query JSON envelopes in the default pane" do
       res = pretty("application/json", %([{"query":"{a}"},{"query":"{b}"}])).not_nil!
-      res.note.should eq("pretty: graphql (batch)")
-      text(res).should contain("# batch of 2 operations")
+      res.note.should eq("pretty: json")
+      text(res).should contain(%("query": "{a}"))
+      text(res).should contain(%("query": "{b}"))
 
       res = pretty("application/json", %({"extensions":{"persistedQuery":{"sha256Hash":"h"}}})).not_nil!
-      res.note.should eq("pretty: graphql (persisted)")
+      res.note.should eq("pretty: json")
     end
 
     it "renders a urlencoded GraphQL body as the document, not as anonymous fields" do
@@ -328,6 +396,53 @@ describe Gori::Pretty do
       pretty("application/x-amz-json-1.1", %({"a":1,"b":[1,2]})).not_nil!.note.should eq("pretty: json")
     end
   end
+  describe "native serialization" do
+    # The sibling of the block below, and the one difference is the whole design: these four
+    # formats have no content-type, so the dispatch is the bytes' own marker
+    # (`Decoder::Serialized.sniff`) rather than a header. #1011.
+    it "renders a Java stream carried as an ordinary binary body, and styles the pane as JSON" do
+      r = Gori::Pretty.format(head_ct("application/octet-stream"), SerializedVectors::JAVA_HASHMAP).not_nil!
+      r.note.should eq("decoded: java-serialized")
+      r.kind.should eq(:json)
+      String.new(r.bytes).should contain(%("$object": "java.util.HashMap"))
+    end
+
+    it "renders a serialized PHP body under the text/plain a PHP endpoint sends it as" do
+      r = Gori::Pretty.format(head_ct("text/plain"), SerializedVectors::PHP_OBJECT).not_nil!
+      r.note.should eq("decoded: php-serialized")
+      String.new(r.bytes).should contain(%("$class": "MyClass"))
+    end
+
+    it "renders a pickle body, and a ViewState pasted as one" do
+      Gori::Pretty.format(head_ct("application/octet-stream"), SerializedVectors::PICKLE_REDUCE)
+        .not_nil!.note.should eq("decoded: python-pickle")
+      Gori::Pretty.format(nil, SerializedVectors::VIEWSTATE_CLASSIC)
+        .not_nil!.note.should eq("decoded: aspnet-viewstate")
+    end
+
+    it "leaves an ordinary body alone, whatever it opens with" do
+      # nil = the caller shows what it would have shown anyway. A marker-driven sniff that
+      # fires on ordinary traffic is worse than no sniff: it replaces the body an operator
+      # came to read with a tree built out of something else.
+      rng = Random.new(11)
+      tail = Bytes.new(4_000) { rng.rand(256).to_u8 }
+      Gori::Pretty.format(head_ct("application/octet-stream"),
+        Bytes[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] + tail).should be_nil
+      Gori::Pretty.format(head_ct("text/plain"), "hello world, an ordinary page".to_slice).should be_nil
+      # An HTML page that merely CONTAINS the shape still renders as HTML.
+      Gori::Pretty.format(head_ct("text/html"), "<html><body>a:1:{}</body></html>".to_slice)
+        .try(&.note).should_not eq("decoded: php-serialized")
+      # A JSON body is still JSON — the sniff runs first, and has to decline it.
+      Gori::Pretty.format(head_ct("application/json"), %({"a":1,"b":[1,2]}).to_slice)
+        .not_nil!.note.should eq("pretty: json")
+    end
+
+    it "leaves a body whose marker is right and whose bytes are not" do
+      Gori::Pretty.format(head_ct("application/octet-stream"),
+        SerializedVectors::VIEWSTATE_CLASSIC + Bytes.new(300, 0x41_u8)).should be_nil
+    end
+  end
+
   describe "binary documents" do
     it "renders a MessagePack body as JSON, and styles the pane as JSON" do
       r = Gori::Pretty.format(head_ct("application/msgpack"), msgpack_body).not_nil!
@@ -406,6 +521,19 @@ describe Gori::Pretty do
       # A CBOR *sequence* is several documents; this reader takes one, and rendering the first
       # while dropping the rest is the silent-truncation shape.
       Gori::Pretty.format(head_ct("application/cbor-seq"), cbor_body).should be_nil
+    end
+  end
+end
+
+# Each tag reflows onto its own line indented up to MAX_DEPTH, ~170x the input for a run of
+# `<a>`. The cap used to be checked on the joined result, after allocating all of it.
+describe "Gori::Pretty markup output cap" do
+  it "refuses an over-cap XML/HTML reflow before building it" do
+    body = "<a>" * 340_000 # just under MAX_PRETTY
+    %w[text/html text/xml].each do |ct|
+      before = GC.stats.total_bytes
+      pretty(ct, body).should be_nil
+      (GC.stats.total_bytes - before).should be < 100_000_000
     end
   end
 end

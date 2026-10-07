@@ -181,6 +181,19 @@ describe Gori::Miner::Plan do
     File.delete?(path) if path
   end
 
+  # The parameter inventory's neighbour names (#1231) go FIRST, so a capped run tests them
+  # before the built-in list; one the built-in list already holds is not tested twice.
+  it "puts seed names ahead of the built-in list, de-duplicated" do
+    cfg = config
+    cfg.seed_names = ["zzseedparam", "is_admin", "", "zzseedparam"]
+    plan = M::Plan.build(M::PlanOptions.new(CRLF_RAW, target: "http://t.test", config: cfg), ungated_outbound)
+    plan.names.first(2).should eq(["zzseedparam", "is_admin"])
+    plan.names.count("is_admin").should eq(1)
+    plan.names.should_not contain("")
+    builtin_only = M::Plan.build(M::PlanOptions.new(CRLF_RAW, target: "http://t.test", config: config), ungated_outbound)
+    plan.names.size.should eq(builtin_only.names.size + 1)
+  end
+
   describe "transport" do
     it "gives the run a keep-alive pool, sized to its concurrency" do
       cfg = config(concurrency: 7)
@@ -217,13 +230,33 @@ describe Gori::Miner::Plan do
       plan.config.locations.should eq([M::Location::Query])
     end
 
-    it "keeps an explicitly named location that does not apply, and reports it" do
-      # The CLI warns per location rather than dropping it, so the run still carries it.
+    it "drops an explicitly named location that does not apply, and reports it (#1203)" do
+      # Kept in the run, it injected nothing yet counted its names as tested and clean. Dropped,
+      # its names leave `total_names`, and the plan and engine still name it for every surface.
       plan = M::Plan.build(M::PlanOptions.new("GET /a HTTP/1.1\r\nHost: t.test\r\n\r\n",
         target: "http://t.test", locations: [M::Location::Query, M::Location::Form],
         config: config), ungated_outbound)
-      plan.config.locations.should eq([M::Location::Query, M::Location::Form])
+      plan.config.locations.should eq([M::Location::Query])
       plan.inapplicable.should eq([M::Location::Form])
+      plan.engine.inapplicable.should eq([M::Location::Form])
+      query_only = M::Plan.build(M::PlanOptions.new("GET /a HTTP/1.1\r\nHost: t.test\r\n\r\n",
+        target: "http://t.test", locations: [M::Location::Query], config: M::Config.new), ungated_outbound)
+      plan.total_names.should eq(query_only.total_names)
+    end
+
+    it "refuses, before any send, a run whose every named location does not apply (#1203)" do
+      live = M::Config.new
+      live.locations = [M::Location::Json]
+      ex = expect_raises(M::PlanError) do
+        M::Plan.build(M::PlanOptions.new("GET /a HTTP/1.1\r\nHost: t.test\r\n\r\n",
+          target: "http://t.test", locations: [M::Location::Json, M::Location::Form],
+          config: live), ungated_outbound)
+      end
+      # The TUI hands its live Config in: a refusal must not have emptied its selection.
+      live.locations.should eq([M::Location::Json])
+      ex.reason.should eq(M::PlanError::Reason::NoLocations)
+      ex.detail.should eq("json: not applicable to this request (no matching existing body); " \
+                          "form: not applicable to this request (no matching existing body)")
     end
 
     it "offers the locations the RUN will see, expanding the request first" do
@@ -427,7 +460,9 @@ describe Gori::Miner::Plan do
       plan = M::Plan.build(M::PlanOptions.new(
         "POST /api HTTP/1.1\r\nHost: t.test\r\nContent-Type: application/json\r\n" \
         "Transfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n9\r\n$id\r\n0\r\n\r\n",
-        target: "http://t.test", locations: [M::Location::Json], config: config), ungated_outbound)
+        # Query, not Json: a chunked body is no JSON document, and a run naming only a location
+        # the request cannot carry is refused (#1203). The head is what this example is about.
+        target: "http://t.test", locations: [M::Location::Query], config: config), ungated_outbound)
       String.new(plan.request).should contain("Content-Length: 5\r\n")
     ensure
       Gori::Settings.env_vars = [] of {String, String}
@@ -543,5 +578,120 @@ describe Gori::Miner::Plan do
       end
       ex.reason.should eq(M::PlanError::Reason::NoTarget)
     end
+  end
+end
+
+# Names read from the project's own captured data (#1352). Resolved by `Plan.build`, ahead of the
+# built-in list, with an explicit precedence: explicit names, project names, built-in, user file.
+private def project_plan(store : Gori::Store?, descriptors : Array(String), cfg : M::Config, request : String) : M::Plan
+  specs = descriptors.map { |d| Gori::PayloadFrom.parse(d) }
+  M::Plan.build(M::PlanOptions.new(request, target: "https://t.test", config: cfg,
+    project_names: specs, project: store), ungated_outbound)
+end
+
+describe "Gori::Miner::Plan project names (#1352)" do
+  clock = [1_700_000_000_000_000_i64]
+  seed = ->(store : Gori::Store, target : String, host : String) do
+    clock[0] += 1000
+    id = store.insert_flow(Gori::Store::CapturedRequest.new(
+      created_at: clock[0], scheme: "https", host: host, port: 443, method: "GET", target: target,
+      http_version: "HTTP/1.1", head: "GET #{target} HTTP/1.1\r\nHost: #{host}\r\n\r\n".to_slice,
+      body: nil, source: Gori::FlowSource::Kind::Proxy))
+    store.update_response(Gori::Store::CapturedResponse.new(
+      flow_id: id, status: 200, head: "HTTP/1.1 200 OK\r\n\r\n".to_slice, body: "ok".to_slice))
+  end
+  request = "GET /s?q=hi HTTP/1.1\r\nHost: t.test\r\n\r\n"
+
+  it "tests explicit names, then project names, then the built-in list, then the user file, first sighting winning" do
+    with_store do |store|
+      seed.call(store, "/a?zzproj1=1&id=2&zzproj2=3", "api.test")
+      user = File.tempname("gori-miner-user")
+      File.write(user, "zzuser1\nid\n")
+      begin
+        cfg = config
+        cfg.seed_names = ["zzexplicit", "zzproj1"]
+        cfg.user_wordlist = user
+        plan = project_plan(store, ["host:api.test param-names"], cfg, request)
+        builtin = M::Wordlist.builtin
+        first = plan.names.first(4)
+        first.should eq(["zzexplicit", "zzproj1", "id", "zzproj2"])                    # explicit, then project (newest sighting order), de-duped
+        plan.names[4, 5].should eq(builtin.reject { |n| first.includes?(n) }.first(5)) # then the built-in list…
+        plan.names.last.should eq("zzuser1")                                           # …then the user file
+        plan.names.count("id").should eq(1)                                            # tested at the project's position, once
+        plan.names.uniq.size.should eq(plan.names.size)
+      ensure
+        File.delete?(user)
+      end
+    end
+  end
+
+  it "counts project names in the run's total and reports what each source read" do
+    with_store do |store|
+      seed.call(store, "/a?zzproj1=1&zzproj2=2", "api.test")
+      base = project_plan(nil, [] of String, config, request)
+      plan = project_plan(store, ["host:api.test param-names"], config, request)
+      plan.total_names.should eq(base.total_names + 2)
+      plan.project_reports.size.should eq(1)
+      rep = plan.project_reports.first
+      rep.values.should eq(2)
+      rep.flows_scanned.should eq(1)
+      rep.source.should eq("host:api.test param-names")
+      base.project_reports.should be_empty
+    end
+  end
+
+  it "merges several sources in the order given" do
+    with_store do |store|
+      seed.call(store, "/a?zzfromone=1", "one.test")
+      seed.call(store, "/b?zzfromtwo=1", "two.test")
+      plan = project_plan(store, ["host:two.test param-names", "host:one.test param-names"], config, request)
+      plan.names.first(2).should eq(["zzfromtwo", "zzfromone"])
+      plan.project_reports.map(&.source).should eq(["host:two.test param-names", "host:one.test param-names"])
+    end
+  end
+
+  it "keeps cookie and header names out by default, and reads them when the source names those locations" do
+    with_store do |store|
+      clock[0] += 1000
+      store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: clock[0], scheme: "https", host: "api.test", port: 443, method: "GET", target: "/a?q=1",
+        http_version: "HTTP/1.1",
+        head: "GET /a?q=1 HTTP/1.1\r\nHost: api.test\r\nCookie: zzcookiename=v\r\nX-Zzheader: v\r\n\r\n".to_slice,
+        body: nil, source: Gori::FlowSource::Kind::Proxy))
+      plan = project_plan(store, ["param-names"], config, request)
+      plan.names.first(1).should eq(["q"])
+      spec = Gori::PayloadFrom.parse("param-names").apply(Gori::PayloadFrom::Policy.new(
+        locations: [M::Location::Query, M::Location::Cookies, M::Location::Headers]))
+      wide = M::Plan.build(M::PlanOptions.new(request, target: "https://t.test", config: config,
+        project_names: [spec], project: store), ungated_outbound)
+      wide.names.first(3).should eq(["q", "zzcookiename", "x-zzheader"])
+    end
+  end
+
+  it "runs with the built-in list alone when a source finds nothing, and the report says so" do
+    with_store do |store|
+      seed.call(store, "/a?zzproj=1", "api.test")
+      base = project_plan(nil, [] of String, config, request)
+      plan = project_plan(store, ["host:nowhere.test param-names"], config, request)
+      plan.names.should eq(base.names)
+      plan.project_reports.first.values.should eq(0)
+    end
+  end
+
+  it "refuses a projection that is not a list of names, and a source with no project" do
+    with_store do |store|
+      seed.call(store, "/a?zzproj=1", "api.test")
+      expect_raises(Gori::PayloadFrom::Error, /reads parameter NAMES: use the param-names projection.*param-values/) do
+        project_plan(store, ["param-values"], config, request)
+      end
+      expect_raises(Gori::PayloadFrom::Error, /no project to read/) do
+        project_plan(nil, ["param-names"], config, request)
+      end
+    end
+  end
+
+  it "leaves a run with no project sources exactly as it was" do
+    a = project_plan(nil, [] of String, config, request)
+    M::Plan.build(M::PlanOptions.new(request, target: "https://t.test", config: config), ungated_outbound).names.should eq(a.names)
   end
 end

@@ -43,6 +43,19 @@ private def seed_issue(store : Gori::Store, title : String,
   id
 end
 
+private def seed_frozen(store : Gori::Store, issue_id : Int64, target : String) : Int64
+  fid = store.insert_flow(Gori::Store::CapturedRequest.new(
+    created_at: 1_000_i64, scheme: "https", host: "acme.test", port: 443,
+    method: "GET", target: target, http_version: "HTTP/1.1",
+    head: "GET #{target} HTTP/1.1\r\nHost: acme.test\r\n\r\n".to_slice, body: nil,
+    source: Gori::FlowSource::Kind::Proxy))
+  store.update_response(Gori::Store::CapturedResponse.new(
+    fid, 500, "HTTP/1.1 500 Boom\r\n\r\n".to_slice, "stack".to_slice, duration_us: 9_i64))
+  eid, status = store.freeze_evidence(issue_id, Gori::Evidence.from_flow(store.get_flow(fid).not_nil!))
+  status.ok?.should be_true
+  eid
+end
+
 describe "IssuesController#issues_clear" do
   it "empties the project past a danger confirm that names the total" do
     with_issues_tab do |ctl, host, store|
@@ -114,6 +127,56 @@ describe "IssuesController#issues_clear" do
     end
   end
 
+  # The dialog used to say the frozen evidence "goes too". It does not: `clear_issues` drops
+  # `evidence_issue_links` and leaves every `issue_evidence` row standing (#1039), so the
+  # confirm has to make the same promise the per-issue delete already makes — the memberships
+  # go, the archived bytes stay, orphaned, in the Evidence tab.
+  it "promises the frozen copies survive the wipe, and they do" do
+    with_issues_tab do |ctl, host, store|
+      a = seed_issue(store, "sqli")
+      b = seed_issue(store, "xss")
+      seed_frozen(store, a, "/one")
+      seed_frozen(store, b, "/two")
+      store.count_evidence_links.should eq(2)
+      ctl.view.reload(store)
+
+      ctl.issues_clear
+      _, message = host.confirms.first
+      message.should contain("2 frozen evidence links are removed")
+      message.should contain("the archived copies stay in the Evidence tab")
+      message.should_not contain("frozen evidence go")
+      message.should contain("This can't be undone.")
+
+      # …and the store agrees with the sentence: memberships gone, copies still there.
+      store.count_evidence_links.should eq(0)
+      store.count_evidence.should eq(2)
+    end
+  end
+
+  # Singular, and nothing at all when the project has no frozen copies: a line about zero
+  # links in a modal is noise the operator has to read past to reach "can't be undone".
+  it "leaves the frozen line out entirely when there is no frozen evidence" do
+    with_issues_tab do |ctl, host, store|
+      seed_issue(store, "finding")
+      ctl.view.reload(store)
+
+      ctl.issues_clear
+      _, message = host.confirms.first
+      message.should_not contain("frozen")
+    end
+  end
+
+  it "says it in the singular for one link" do
+    with_issues_tab do |ctl, host, store|
+      seed_frozen(store, seed_issue(store, "sqli"), "/one")
+      ctl.view.reload(store)
+
+      ctl.issues_clear
+      _, message = host.confirms.first
+      message.should contain("1 frozen evidence link is removed; the archived copy stays in the Evidence tab")
+    end
+  end
+
   # Marks are the list's other handle on a set, and every row they point at is gone. Left
   # behind they would inflate the next `N marked` chip and re-point `d` at nothing.
   it "drops the marks the wiped rows were carrying" do
@@ -129,16 +192,20 @@ describe "IssuesController#issues_clear" do
   end
 
   # Named where it can be read before it is pressed — the second obligation a destructive chord
-  # carries (guide/hotkeys). Every LIST state, because `command_scope` answers Scope::Issues in
-  # all of them; the marks state spells it `clear ALL`, which is the state where `space`/`d`
-  # act on the marked set and this key does not.
-  it "names the chord in the body hint, including while marks are set" do
+  # carries (guide/hotkeys). In the MARKS state, which is the one where `space`/`d` act on the
+  # marked set and this key does not: `clear ALL` is the sentence that keeps the two apart.
+  #
+  # It is NOT on the plain list lines any more (#F17's sibling, the loop audit's F7). `⇧E
+  # export` took that slot — the key the triage loop ends on, which the strip named nowhere at
+  # any width — and of the two, the destructive one is the one with somewhere else to live:
+  # the space menu's WIPE group, where a delete is read deliberately rather than reached for.
+  it "names the chord in the body hint wherever the two meanings could be confused" do
     with_issues_tab do |ctl, _host, store|
       seed_issue(store, "finding")
       ctl.view.reload(store)
-      hint = ctl.body_hint(:body)
-      hint.should contain("⇧X")
-      hint.should contain("clear")
+      plain = ctl.body_hint(:body)
+      plain.should_not contain("⇧X")
+      plain.should contain("⇧E export")
 
       ctl.view.mark_all
       marked = ctl.body_hint(:body)

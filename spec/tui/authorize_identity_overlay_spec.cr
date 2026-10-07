@@ -29,6 +29,17 @@ describe AuthorizeIdentityOverlay do
     render(ov)
   end
 
+  # #1274: the empty refresh line names the Repeater action that adds a step, and its route
+  # is read from the registry rather than typed into the string — the palette's, since #1282.
+  it "names the Use-as-refresh route from the registry on an empty refresh line" do
+    registry = Gori::Verbs.registry
+    backend = MemoryBackend.new(100, 30)
+    AuthorizeIdentityOverlay.new(Identity.new("admin"), registry: registry)
+      .render(Screen.new(backend), Rect.new(0, 0, 100, 30))
+    backend.contains?("none — Repeater: #{Gori::Hotkeys.route(registry, "repeater.use-as-refresh")}").should be_true
+    backend.contains?("{space:").should be_false
+  end
+
   it "round-trips remove_headers through the comma field" do
     ov = AuthorizeIdentityOverlay.new(Identity.new("anon", remove_headers: ["Cookie", "Authorization"]))
     ov.remove_headers.should eq(["Cookie", "Authorization"])
@@ -78,6 +89,46 @@ describe AuthorizeIdentityOverlay do
     id.baseline?.should be_false
   end
 
+  it "preserves a captured marker only when the header name and value stay unchanged" do
+    original = Identity.new("captured", set_headers: [{"Cookie", "session=$BIND.TOKEN"}],
+      literal_headers: ["cookie"])
+    unchanged = AuthorizeIdentityOverlay.new(original, 0).build_identity.not_nil!
+    unchanged.literal_headers.should eq(["Cookie"])
+
+    edited = AuthorizeIdentityOverlay.new(original, 0)
+    edited.set_selected(AuthorizeIdentityOverlay::EDITOR_ROW)
+    otype(edited, "changed-")
+    edited.build_identity.not_nil!.literal_headers.should be_empty
+  end
+
+  # `literal_header?` is keyed by NAME and `overlay_head` upserts, so a second row under the
+  # same name is the one that reaches the wire. Marking the name captured because an earlier
+  # row is unchanged would send the new row's `$BIND.TOKEN` spelling instead of its value.
+  it "drops the captured marker when a later row under the same name is hand-written" do
+    original = Identity.new("captured", set_headers: [{"Cookie", "session=abc"}],
+      literal_headers: ["cookie"])
+    ov = AuthorizeIdentityOverlay.new(original, 0)
+    ov.set_selected(AuthorizeIdentityOverlay::EDITOR_ROW)
+    ov.handle_key(okey(Termisu::Input::Key::End))
+    ov.handle_key(okey(Termisu::Input::Key::Enter))
+    otype(ov, "Cookie: session=$BIND.TOKEN")
+    built = ov.build_identity.not_nil!
+    built.set_headers.should eq([{"Cookie", "session=abc"}, {"Cookie", "session=$BIND.TOKEN"}])
+    built.literal_headers.should be_empty
+  end
+
+  # The mirror image: the captured row typed back in LAST still reaches the wire as captured
+  # bytes, so the marker survives.
+  it "keeps the marker when the captured row is the last one under its name" do
+    original = Identity.new("captured", set_headers: [{"Cookie", "session=abc"}],
+      literal_headers: ["cookie"])
+    ov = AuthorizeIdentityOverlay.new(original, 0)
+    ov.set_selected(AuthorizeIdentityOverlay::EDITOR_ROW)
+    otype(ov, "Cookie: session=$BIND.TOKEN")
+    ov.handle_key(okey(Termisu::Input::Key::Enter))
+    ov.build_identity.not_nil!.literal_headers.should eq(["Cookie"])
+  end
+
   it "keeps the baseline flag it was opened with (the form never moves it)" do
     ov = AuthorizeIdentityOverlay.new(Identity.as_captured("base"), 0)
     ov.build_identity.not_nil!.baseline?.should be_true
@@ -97,7 +148,9 @@ describe AuthorizeIdentityOverlay do
       ov.selected.should eq(AuthorizeIdentityOverlay::REMOVE_ROW)
       ov.handle_key(okey(Termisu::Input::Key::Down))
       ov.selected.should eq(AuthorizeIdentityOverlay::EDITOR_ROW)
-      # a one-line buffer is at both edges, so the next ↓ leaves for Save
+      # a one-line buffer is at both edges, so the next ↓ leaves for the refresh policy (#1233)
+      ov.handle_key(okey(Termisu::Input::Key::Down))
+      ov.selected.should eq(AuthorizeIdentityOverlay::POLICY_ROW)
       ov.handle_key(okey(Termisu::Input::Key::Down))
       ov.selected.should eq(AuthorizeIdentityOverlay::SAVE_ROW)
     end
@@ -105,6 +158,8 @@ describe AuthorizeIdentityOverlay do
     it "walks back up out of the Save row" do
       ov = AuthorizeIdentityOverlay.new(Identity.new("x"))
       ov.set_selected(AuthorizeIdentityOverlay::SAVE_ROW)
+      ov.handle_key(okey(Termisu::Input::Key::Up))
+      ov.selected.should eq(AuthorizeIdentityOverlay::POLICY_ROW)
       ov.handle_key(okey(Termisu::Input::Key::Up))
       ov.selected.should eq(AuthorizeIdentityOverlay::EDITOR_ROW)
     end
@@ -116,7 +171,35 @@ describe AuthorizeIdentityOverlay do
       2.times { ov.handle_key(okey(Termisu::Input::Key::Down)) } # caret walks to the last line
       ov.selected.should eq(AuthorizeIdentityOverlay::EDITOR_ROW)
       ov.handle_key(okey(Termisu::Input::Key::Down)) # now at the bottom → leave
-      ov.selected.should eq(AuthorizeIdentityOverlay::SAVE_ROW)
+      ov.selected.should eq(AuthorizeIdentityOverlay::POLICY_ROW)
+    end
+  end
+
+  # The refresh half (#1233): the steps are read-only here, the policy is a field, and an
+  # unparseable policy refuses the save by name.
+  describe "refresh" do
+    it "keeps the slot's steps and takes the policy from the field" do
+      policy = Gori::SessionSlot::RefreshBefore.parse?("ttl=10m").not_nil!
+      ov = AuthorizeIdentityOverlay.new(Identity.new("admin", refresh: [7_i64], refresh_before: policy),
+        0, [] of String, ["login"])
+      built = ov.build_identity.not_nil!
+      built.refresh.should eq([7_i64])
+      built.refresh_before.to_s.should eq("ttl=10m")
+      ov.set_selected(AuthorizeIdentityOverlay::POLICY_ROW)
+      ov.text_fields.last.set("jwt-exp")
+      ov.build_identity.not_nil!.refresh_before.kind.jwt_exp?.should be_true
+      ov.text_fields.last.set("sometimes")
+      ov.refusal.not_nil!.should contain("refresh before")
+      ov.build_identity.should be_nil
+    end
+
+    it "shows the steps it will run" do
+      b = MemoryBackend.new(100, 30)
+      ov = AuthorizeIdentityOverlay.new(Identity.new("admin", refresh: [1_i64, 2_i64]), 0,
+        [] of String, ["csrf-fetch", "login"])
+      ov.render(Screen.new(b), Rect.new(0, 0, 100, 30))
+      b.contains?("refresh:  csrf-fetch → login").should be_true
+      b.contains?("refresh before:").should be_true
     end
   end
 

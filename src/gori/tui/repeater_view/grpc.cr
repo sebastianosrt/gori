@@ -1,6 +1,6 @@
 # gRPC repeater mode (an `application/grpc` h2 flow): the editor holds the editable request
 # HEAD and the framed message body is sent byte-exact — or, for the unary case the hex editor
-# can reach, with its length prefix recomputed while `␣F:FRAME` is on — plus the deframed
+# can reach, with its length prefix recomputed while `␣Pr:FRAME` is on — plus the deframed
 # response transcript and status row.
 # Reopens Gori::Tui::RepeaterView (see tui/repeater_view.cr).
 class Gori::Tui::RepeaterView
@@ -15,7 +15,7 @@ class Gori::Tui::RepeaterView
   # comment in repeater_view.cr and DESIGN.md §7.
   getter? grpc_reframe : Bool
 
-  # `␣F:FRAME` / `repeater.toggle-grpc-reframe`. Refused unless this is a gRPC tab holding a
+  # `␣Pr:FRAME` / `repeater.toggle-grpc-reframe`. Refused unless this is a gRPC tab holding a
   # REFRAMABLE body: there is otherwise no unary prefix to recompute, and a flag that cannot
   # change what goes on the wire is worse than a toast saying so.
   #
@@ -32,7 +32,7 @@ class Gori::Tui::RepeaterView
   # HEAD is seeded into the editor (editable — metadata headers). The message body is wire
   # protobuf, not text, so it isn't text-editable — but a UNARY call (exactly one framed
   # message) exposes its payload for HEX editing (^X), with the 5-byte length prefix
-  # recomputed on send while `␣F:FRAME` is on (see grpc_request_bytes; the toggle defaults on
+  # recomputed on send while `␣Pr:FRAME` is on (see grpc_request_bytes; the toggle defaults on
   # here and off headless). A 0- or multi-message body is kept byte-exact in @grpc_body and
   # re-appended verbatim. The response renders as a deframed gRPC transcript + grpc-status,
   # each payload decoded schema-lessly (`p` swaps the tree for a hex preview) — the wire
@@ -85,33 +85,18 @@ class Gori::Tui::RepeaterView
     @grpc_field_scroll = 0
     invalidate_grpc_fields
     @grpc_sent_target = "" # no send yet on this tab; the transcript has nothing to describe
-    @target = build_target(detail.row.scheme, detail.row.host, detail.row.port)
-    @tcx = @target.size
-    @sni = ""
-    @scx = 0
-    @target_field = :url
+    seed_target(detail)
     @editor.set_text(origin_head_text(detail))
     seed_draft_baselines
     @original_lines = [] of String
-    @result = nil
-    @prev_result = nil
-    reset_result_caches
-    @focus = :request
-    @resp_mode = :response
-    @scroll = 0
-    resp_wrap_reset
-    @diffable = false
-    @loaded = true
-    @dirty = false
-    @req_hex_edit = nil
-    @scroll_req = 0
+    fresh_panes(:request, diffable: false)
   end
 
   # The replayable request bytes for a gRPC tab: the edited head + the canonical
   # CRLFCRLF terminator (what H2Engine.split_head_body keys on) + the message body.
   # A reframable (unary) call sends the current payload — hex-edited via @req_hex_edit while
   # in hex mode, else the stored @grpc_payload — behind either a RECOMPUTED length prefix
-  # (`␣F:FRAME` on, the default) or the CAPTURED one (off, which is how a deliberately-stale
+  # (`␣Pr:FRAME` on, the default) or the CAPTURED one (off, which is how a deliberately-stale
   # prefix is sent); a non-reframable body is the pristine @grpc_body, verbatim.
   # Auto-Content-Length never applies over h2 (it frames by DATA/END_STREAM).
   private def grpc_request_bytes : Bytes
@@ -165,7 +150,14 @@ class Gori::Tui::RepeaterView
     return @grpc_body unless @grpc_reframable
     payload = (h = @req_hex_edit) ? h.to_bytes : @grpc_payload
     framed = @grpc_reframe ? Proxy::H2::Grpc.frame(@grpc_compressed, payload) : grpc_stale_frame(payload)
-    @grpc_web_text ? Base64.strict_encode(framed).to_slice : framed
+    return framed unless @grpc_web_text
+    # Frames identical to the capture's go out as the CAPTURED text (P7). Re-encoding them
+    # would normalise what the operator never touched: a body of separately padded chunks
+    # (`AAAAAA==AUE=`, the shape `decode_web_text` exists for), a trailing CRLF, or the
+    # URL-safe alphabet all came back as one canonical strict-base64 string — a different
+    # request than `gori run repeater send` and MCP `send_request` put on the wire.
+    return @grpc_body if framed == grpc_framed_body
+    Base64.strict_encode(framed).to_slice
   end
 
   # The CAPTURED 5-byte prefix in front of the live payload — the reframe toggle's OFF half.
@@ -222,8 +214,8 @@ class Gori::Tui::RepeaterView
     # Keyed on the RESPONSE's own content-type: a grpc-web-text reply is base64 on the wire
     # (and a server may answer `-text` to a binary request), so the framing lives one decode
     # below the bytes.
-    msgs, residual = Proxy::H2::Grpc.scan_body(Gori::MediaType.of(result.head),
-      result.body || Bytes.empty)
+    # `scan_wire`: and one HTTP content-coding below that, when the origin gzipped it.
+    msgs, residual = Proxy::H2::Grpc.scan_wire(result.head, result.body || Bytes.empty)
     # The `.proto` lens for the RESPONSE half of this rpc (#823), keyed on the path that was
     # SENT — not the captured flow's (the editor is where an operator retargets a call) and not
     # the one currently typed. These rows describe a PAST response, and the transcript cache
@@ -245,7 +237,7 @@ class Gori::Tui::RepeaterView
           rows << {"← trailer  #{m.data.size}b", Theme.green}
           Proxy::H2::Grpc.trailer_headers(m.data).each do |k, v|
             if k == "grpc-status"
-              ok = v.strip.to_i? == 0
+              ok = Proxy::H2::Grpc.parse_status(v) == 0
               rows << {"    #{k}: #{Proxy::H2::Grpc.status_label(v)}", ok ? Theme.green : Theme.red}
             else
               rows << {"    #{k}: #{v}", Theme.muted}
@@ -269,13 +261,13 @@ class Gori::Tui::RepeaterView
   # up. Reading only the head therefore printed `⚠ no grpc-status trailer` directly beneath
   # the trailer it was looking for — the transcript contradicting itself about the one fact a
   # gRPC operator is reading it for, since the HTTP status is 200 for a denial as much as for
-  # a grant. `Grpc.trailer_status` is the same reader the Fuzzer/Miner/Sequencer verdict uses.
+  # a grant. `Grpc.wire_trailer_status` is the reader the Miner/Sequencer verdict uses too.
   private def grpc_status_row(result : Repeater::Result) : {String, Color}
     resp = result.response
     if code = resp.try(&.headers.get?("grpc-status"))
       return grpc_status_line(code, resp.try(&.headers.get?("grpc-message")))
     end
-    n, msg = Proxy::H2::Grpc.trailer_status(Gori::MediaType.of(result.head), result.body)
+    n, msg = Proxy::H2::Grpc.wire_trailer_status(result.head, result.body)
     return {"⚠ no grpc-status trailer", Theme.yellow} unless n
     grpc_status_line(n.to_s, msg)
   end
@@ -284,7 +276,7 @@ class Gori::Tui::RepeaterView
   # and `status_label` names it — a non-numeric `grpc-status` is an origin's own answer, so it
   # is printed as itself rather than repeated as its own "name".
   private def grpc_status_line(shown : String, msg : String?) : {String, Color}
-    ok = shown.strip.to_i? == 0
+    ok = Proxy::H2::Grpc.parse_status(shown) == 0
     {"#{ok ? "✓" : "✗"} grpc-status: #{Proxy::H2::Grpc.status_label(shown)}#{msg ? " · #{msg}" : ""}",
      ok ? Theme.green : Theme.red}
   end

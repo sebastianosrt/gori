@@ -159,9 +159,11 @@ module Gori::Tui
       @oast_events = Channel(Oast::Event).new(256)
       @reg_events = Channel(RegResult).new(16)
       @release_events = Channel(ReleaseResult).new(8)
-      @registering = Set(String).new # provider keys with a register round-trip in flight (dedup g/^R)
-      @max_cb_id = 0_i64             # highest callback row id folded in (watermark for reconcile)
-      @cb_version = 0                # bumped on any @callbacks mutation → invalidates the view caches
+      @registering = Set(String).new        # provider keys with a register round-trip in flight (dedup g/^R)
+      @deaf = Set(Int64).new                # sessions already announced as not reaching their provider
+      @poll_error = Hash(Int64, String).new # session_id → the last poll failure's own sentence
+      @max_cb_id = 0_i64                    # highest callback row id folded in (watermark for reconcile)
+      @cb_version = 0                       # bumped on any @callbacks mutation → invalidates the view caches
       @ordered_cache = nil.as(Array(CbRow)?)
       @ordered_cache_key = nil.as({Int32, String, Int32}?)
       @filtered_cache = nil.as(Array(CbRow)?)
@@ -201,10 +203,6 @@ module Gori::Tui
       @active_sub
     end
 
-    def subtab_strip_shown? : Bool
-      true
-    end
-
     def subtabs_fixed? : Bool
       true
     end
@@ -239,10 +237,14 @@ module Gori::Tui
       if callbacks_sub?
         return keys("↑/↓ move · ⇧arrows select · y copy · {oast.select-line} line · space cmds · ←/esc back") if @cb_detail
         return "type to filter · ↵ keep · esc clear" if @filter_editing
-        keys("↑/↓ select · ‹/› provider · {oast.generate} payload · y copy · {oast.filter} filter · {oast.listen} listen · {oast.stop} stop · ↵ detail · space cmds")
+        # `esc sub-tabs`, the way the PROVIDERS line below already ends — `handle_callbacks_key`
+        # and `handle_providers_key` send escape to the same place, and only one of the two
+        # said so.
+        keys("↑/↓ select · ‹/› provider · {oast.generate} payload · y copy · {oast.filter} filter · {oast.listen} listen · {oast.stop} stop · ↵ detail · space cmds · esc sub-tabs")
       else
-        # `x on/off` and `↵/e edit` — the vocabulary the three sibling rule lists use. Toggle was
-        # `t` here alone, and ↵ has always opened the editor without the hint saying so.
+        # `t on/off` and `↵/e edit` — the vocabulary all four rule lists use since the key
+        # audit's F4 moved the toggle off `x` (which is select-line everywhere). ↵ has always
+        # opened the editor without the hint saying so.
         keys("↑/↓ select · {oast.add-provider} add · ↵/{oast.edit-provider} edit · {oast.toggle-provider} on/off · {oast.delete-provider} delete · space cmds · esc sub-tabs")
       end
     end
@@ -499,7 +501,7 @@ module Gori::Tui
       listener = listener_for(prov.key)
       return @host.status("not listening with #{prov.name}") unless listener
       stop_listener(listener)
-      @host.status("stopped listening with #{prov.name} — session kept, resume it with `r`")
+      @host.status("stopped listening with #{prov.name} — session kept, resume it with ⇧R")
     end
 
     # Stop every live listener on a project-level exit (leave project / quit). A listener
@@ -570,7 +572,13 @@ module Gori::Tui
       # payload picker all resolve through `listener_for(picked_provider.key)` — so a resumed
       # session must land under a provider key or it would be a poller the operator could see
       # and never stop.
-      config = provider_config_for(rec)
+      config = Oast::Sessions.resolve(rec, @providers)
+      if config.is_a?(Oast::Sessions::Ambiguous)
+        # Filing it under one of them would poll with that provider's token (#1192). Headless
+        # `gori run oast resume` binds no provider and polls with the session's own token.
+        return @host.status("#{Oast::Sessions.ambiguous_message(config, session_id)} — " \
+                            "resume it with `gori run oast resume #{session_id}`")
+      end
       unless config
         return @host.status("session ##{session_id}'s provider is gone — re-add #{rec.kind} #{rec.server_url} in Providers to resume it")
       end
@@ -746,7 +754,8 @@ module Gori::Tui
     def toggle_provider : Nil
       return unless p = selected_provider
       on = !p.enabled
-      p.global? ? Settings.set_oast_provider_enabled(p.id, on) : @host.session.store.set_oast_provider_enabled(p.project_id.not_nil!, on)
+      ok = p.global? ? Settings.set_oast_provider_enabled(p.id, on) : @host.session.store.set_oast_provider_enabled(p.project_id.not_nil!, on)
+      @host.status("provider #{p.name} NOT #{on ? "enabled" : "disabled"} — #{not_saved(p.global?)}") unless ok
       reload
     end
 
@@ -754,10 +763,12 @@ module Gori::Tui
       return unless p = selected_provider
       @host.confirm("DELETE PROVIDER", "Delete OAST provider “#{p.name}”?\nIts callback history is kept.",
         confirm_label: "delete", danger: true) do
-        if l = @listeners.find { |ls| ls.provider_key == p.key }
+        ok = p.global? ? Settings.delete_oast_provider(p.id) : @host.session.store.delete_oast_provider(p.project_id.not_nil!)
+        # Only once the provider is really gone: a refused delete leaves it, listener and all.
+        if ok && (l = @listeners.find { |ls| ls.provider_key == p.key })
           stop_listener(l)
         end
-        p.global? ? Settings.delete_oast_provider(p.id) : @host.session.store.delete_oast_provider(p.project_id.not_nil!)
+        @host.status("provider #{p.name} NOT deleted — #{not_saved(p.global?)}") unless ok
         reload
       end
     end
@@ -768,42 +779,70 @@ module Gori::Tui
     # enabled state is carried over (not reset to on), and any listener still keyed to the
     # OLD scope/id is stopped first (mirrors delete_provider), since the move mints a fresh
     # key that nothing could ever reach it under again otherwise.
+    #
+    # A write that did not land keeps the form open with the reason, so what was typed is not
+    # lost under a success toast. A MOVE inserts into the new scope first and deletes from the
+    # old one only once that insert committed: the other order lost the provider outright when
+    # the second write was refused.
     def save_provider(ov : OastProviderOverlay) : Bool
       return false unless ov.valid?
       store = @host.session.store
       if id = ov.edit_id
-        old = @providers.find { |p| p.scope == ov.edit_scope && p.id == id }
-        prev_enabled = old.try(&.enabled)
-        prev_enabled = true if prev_enabled.nil?
-        if ov.scope == ov.edit_scope
-          if ov.scope == "global"
-            Settings.update_oast_provider(id, ov.provider_name, ov.kind.label, ov.host, ov.token)
-          else
-            store.update_oast_provider(id.to_i64, ov.provider_name, ov.kind.label, ov.host, ov.token, prev_enabled)
-          end
-        else
-          if old && (l = @listeners.find { |ls| ls.provider_key == old.key })
-            stop_listener(l)
-          end
-          ov.edit_scope == "global" ? Settings.delete_oast_provider(id) : store.delete_oast_provider(id.to_i64)
-          insert_provider(store, ov, prev_enabled)
-        end
-        @host.status("updated provider #{ov.provider_name}")
+        return false unless edit_provider(store, ov, id)
       else
-        insert_provider(store, ov, true)
+        return provider_not_saved(ov, "added", ov.scope == "global") unless insert_provider(store, ov, true)
         @host.status("added provider #{ov.provider_name}")
       end
       reload
       true
     end
 
-    private def insert_provider(store : Store, ov : OastProviderOverlay, enabled : Bool) : Nil
+    # The edit half of `save_provider`: false keeps the form open (the reason is already on the
+    # status line). A provider copied into its new scope whose old copy could not be removed is
+    # NOT a failure to retry — the form closes and the line says what is left behind.
+    private def edit_provider(store : Store, ov : OastProviderOverlay, id : String) : Bool
+      old = @providers.find { |p| p.scope == ov.edit_scope && p.id == id }
+      prev_enabled = old.try(&.enabled)
+      prev_enabled = true if prev_enabled.nil?
+      if ov.scope == ov.edit_scope
+        ok = if ov.scope == "global"
+               Settings.update_oast_provider(id, ov.provider_name, ov.kind.label, ov.host, ov.token)
+             else
+               store.update_oast_provider(id.to_i64, ov.provider_name, ov.kind.label, ov.host, ov.token, prev_enabled)
+             end
+        return provider_not_saved(ov, "updated", ov.scope == "global") unless ok
+      else
+        return provider_not_saved(ov, "moved", ov.scope == "global") unless insert_provider(store, ov, prev_enabled)
+        if old && (l = @listeners.find { |ls| ls.provider_key == old.key })
+          stop_listener(l)
+        end
+        removed = ov.edit_scope == "global" ? Settings.delete_oast_provider(id) : store.delete_oast_provider(id.to_i64)
+        unless removed
+          @host.status("provider #{ov.provider_name} copied to #{ov.scope}, but the #{ov.edit_scope} " \
+                       "copy could NOT be removed — #{not_saved(ov.edit_scope == "global")}")
+          return true
+        end
+      end
+      @host.status("updated provider #{ov.provider_name}")
+      true
+    end
+
+    private def insert_provider(store : Store, ov : OastProviderOverlay, enabled : Bool) : Bool
       if ov.scope == "global"
-        Settings.add_oast_provider(ov.provider_name, ov.kind.label, ov.host, ov.token, enabled)
+        !Settings.add_oast_provider(ov.provider_name, ov.kind.label, ov.host, ov.token, enabled).empty?
       else
         project_count = @providers.count { |p| !p.global? }
-        store.insert_oast_provider(ov.provider_name, ov.kind.label, ov.host, ov.token, enabled, project_count)
+        store.insert_oast_provider(ov.provider_name, ov.kind.label, ov.host, ov.token, enabled, project_count) != 0
       end
+    end
+
+    private def provider_not_saved(ov : OastProviderOverlay, verb : String, global : Bool) : Bool
+      @host.status("provider #{ov.provider_name} NOT #{verb} — #{not_saved(global)}")
+      false
+    end
+
+    private def not_saved(global : Bool) : String
+      global ? "could not write #{Settings.path}" : "the project store is busy; try again"
     end
 
     private def selected_provider : Oast::ProviderConfig?
@@ -878,20 +917,44 @@ module Gori::Tui
                prov = ep[@payload_pick - 1]?
                prov ? "‹ #{prov.name} ›" : "‹ unknown ›"
              end
-      listening = if @payload_pick == 0
-                    @listeners.any?(&.active?) ? "  ●listening" : ""
-                  else
-                    prov = ep[@payload_pick - 1]?
-                    prov && listener_for(prov.key) ? "  ●listening" : ""
-                  end
+      # A live listener that its provider is REFUSING must not draw the same green dot as one
+      # that is collecting. `active?` is only "a fiber is looping", which a listener whose
+      # endpoint answers 401 to every poll (a rotated api key, an expired webhook token)
+      # satisfies forever — the two states `Provider#poll` raises rather than conflate, and
+      # that `Poller#answering?` exists to keep apart. The tab computed the distinction for the
+      # `last_poll_at` heartbeat and then showed the operator a steady "●listening" regardless,
+      # so the one surface watching the listener was the one that could not see it had stopped
+      # being one. The only other signal was an "OAST poll error" status line, which scrolls
+      # past on the next status write.
+      live = if @payload_pick == 0
+               @listeners.select(&.active?)
+             else
+               one = ep[@payload_pick - 1]?.try { |p| listener_for(p.key) }
+               one ? [one] : [] of Listener
+             end
       x = screen.text(x, rect.y, name, Theme.accent, Theme.panel)
-      screen.text(x, rect.y, listening, Theme.green, Theme.panel) unless listening.empty?
+      unless live.empty?
+        if live.any?(&.answering?)
+          screen.text(x, rect.y, "  ●listening", Theme.green, Theme.panel)
+        else
+          screen.text(x, rect.y, "  ●not answering", Theme.yellow, Theme.panel)
+        end
+      end
       # payload row
       if url = @last_payload
         screen.text(rect.x + 1, rect.y + 1, url, Theme.text_bright, Theme.bg, width: rect.w - 2)
       else
         screen.text(rect.x + 1, rect.y + 1, "press g to get an OAST payload URL (copies to clipboard)", Theme.muted, Theme.bg, width: rect.w - 2)
       end
+    end
+
+    # The border run the CALLBACKS card carries instead of a title: the window's count, plus the
+    # eviction caveat when there is one. `Frame.border_meta` draws NOTHING when its run will not
+    # fit — where the retired card TITLE was merely clipped — so a narrow pane falls back to the
+    # bare count. Losing the caveat to width is survivable; losing the number with it would be
+    # the silent cap this pane exists to make visible.
+    private def draw_callback_meta(screen : Screen, rect : Rect, count : String, capped : String) : Nil
+      Frame.border_meta(screen, rect, "", count) if Frame.border_meta(screen, rect, "", capped).nil?
     end
 
     private def render_callback_table(screen : Screen, rect : Rect, focused : Bool) : Nil
@@ -902,9 +965,13 @@ module Gori::Tui
       # new" in the one tab whose whole job is evidence. Name the window, the total behind it,
       # and where the rest went.
       held = @evicted > 0 ? "#{@callbacks.size} of #{@callbacks.size + @evicted}" : @callbacks.size.to_s
-      title = filtering ? "CALLBACKS (#{ordered.size}/#{held})" : "CALLBACKS (#{held})"
-      title += " · #{@evicted} older kept in the project DB" if @evicted > 0
-      Frame.card(screen, rect, title, border: focused ? Theme.focus_gold : Theme.border, bg: Theme.bg)
+      # No `CALLBACKS` on the border: the sub-tab chip one row above already says it, and the
+      # word was printed twice within five rows. What was fused to it — the count and the
+      # eviction caveat — is the part that carries information, so it moves to the border meta.
+      count = filtering ? "#{ordered.size}/#{held}" : held
+      capped = @evicted > 0 ? "#{count} · #{@evicted} older kept in the project DB" : count
+      Frame.card(screen, rect, border: focused ? Theme.focus_gold : Theme.border, bg: Theme.bg)
+      draw_callback_meta(screen, rect, count, capped)
       inner = rect.inset(1, 1)
       if ordered.empty?
         # A FILTERED miss keeps its line. The card explains how the tab works, and an operator
@@ -1065,8 +1132,10 @@ module Gori::Tui
     end
 
     private def render_providers(screen : Screen, rect : Rect, focused : Bool) : Nil
-      Frame.card(screen, rect, "PROVIDERS", border: Frame.pane_border(focused), bg: Theme.bg)
-      Frame.border_meta(screen, rect, "PROVIDERS", @providers.size.to_s)
+      # No border TITLE: the sub-tab strip one row above already reads `Providers`, and a card
+      # repeating it printed the word twice in two rows. The count still rides the border.
+      Frame.card(screen, rect, border: Frame.pane_border(focused), bg: Theme.bg)
+      Frame.border_meta(screen, rect, "", @providers.size.to_s)
       inner = rect.inset(1, 1)
       if @providers.empty?
         screen.text(inner.x + 1, inner.y, "no providers — press a to add one (interactsh is prefilled)", Theme.muted, Theme.bg, width: inner.w - 2)
@@ -1187,6 +1256,11 @@ module Gori::Tui
     # Input
     # =========================================================================
 
+    # The Callbacks `/` free-text filter.
+    def body_takes_text? : Bool
+      cb_filter_editing?
+    end
+
     def handle_body_key(ev : Termisu::Event::Key) : Bool
       key = ev.key
       if key.space? && !ev.ctrl? && !ev.alt?
@@ -1214,13 +1288,14 @@ module Gori::Tui
             with_cb_pane { @cb_pane.move(-1, 0, selecting: ev.shift?) }
           end
         when key.down?, key.lower_j? then with_cb_pane { @cb_pane.move(1, 0, selecting: ev.shift?) }
-        when c == 'y'                then oast_detail_copy
         else
           # Home / End / PgUp / PgDn, ⇧ extending — and FALL THROUGH on anything else, which is
-          # what `x` (oast.select-line, a plain chord) needs to reach the keymap. The old
-          # unconditional `return true` swallowed every unhandled key, so the two this pane's
-          # footer names — `y copy · x line` — were both dead here: `y` had no chord to reach
-          # (it is raw-dispatched above, as it is in the callbacks LIST) and `x` never got out.
+          # what `x` (oast.select-line) and `y` (oast.copy-callback) need to reach the keymap.
+          # `y` was raw-dispatched here until the audit: the verb showed as unbound in the
+          # Hotkeys editor and a rebind moved nothing, because this arm ran first. Both are
+          # plain chords gated on `oast_detail_readable?` now, so this pane's footer — `y copy
+          # · x line` — names two keys the editor owns. The old unconditional `return true`
+          # swallowed every unhandled key, which is what had made `x` dead here as well.
           # Same fall-through the list below hands `g`/`r`/`a` to the keymap with.
           handled = false
           with_cb_pane { handled = @cb_pane.motion_key(ev) }
@@ -1239,6 +1314,12 @@ module Gori::Tui
           @cb_detail = true
           @cb_pane.reset # a different callback renumbers every line
         end
+        # The LIST's `y` stays controller-local, alone in this file now. `oast.copy-callback`
+        # holds the scope's real `y` chord and `validate_chords!` allows exactly one per scope
+        # — the keymap has no focus dimension — so `oast.copy` keeps its 'y' MENU letter and
+        # this arm, which runs before the keymap and is therefore what the list actually does.
+        # The two are opposite directions of one interaction (the payload gori sent vs. what
+        # came back), so they are not one verb, and the menu has to keep saying which is which.
       when c == 'y' then copy_payload
         # `g` (get payload), `r` (resume) and `a` (add issue) are NOT claimed here: each can open
         # an overlay, which a controller cannot do, so they stay verbs with plain chords and reach
@@ -1435,7 +1516,7 @@ module Gori::Tui
       sel_key = selected_callback.try { |c| {c.session_id, c.uid} }
       n = 0
       inserted = false
-      while n < DRAIN_CAP && (ev = nonblocking_callback)
+      while n < DRAIN_CAP && (ev = poll(@oast_events))
         n += 1
         apply_callback(ev)
         applied = true
@@ -1443,7 +1524,50 @@ module Gori::Tui
       end
       reanchor_callback_selection(sel_key) if inserted && sel_key
       heartbeat_active_sessions
+      track_listener_health
       applied
+    end
+
+    # Announce a listener that has STOPPED reaching its provider, once per transition.
+    #
+    # "Nothing came back" and "the server refused us" are the two states an out-of-band
+    # listener must never conflate — `Provider#poll` raises rather than answer an empty batch
+    # for exactly that reason — and the operator is the consumer that most needs the
+    # distinction: a rotated api key or an expired webhook token stops the listener being a
+    # listener, and every payload already planted then calls home to nobody while the tab looks
+    # busy. The only signal was the "OAST poll error" status line `apply_callback` writes,
+    # which the next status write scrolls away and which never fires at all off-tab.
+    #
+    # A notification, like `drain_releases`', and for the same reason: the fact outlives the
+    # moment. Edge-triggered on both sides — one warning when it goes deaf, one note when it
+    # comes back — so a provider erroring every POLL_INTERVAL cannot flood the ring.
+    #
+    # This runs on every run-loop tick, so the ordinary state — no listener, nothing tracked —
+    # returns before allocating anything.
+    private def track_listener_health : Nil
+      return if @listeners.empty? && @deaf.empty? && @poll_error.empty?
+      @listeners.each do |l|
+        next unless l.active?
+        sid = l.session.id
+        if l.answering?
+          next unless @deaf.delete(sid)
+          @host.notifications.push(:success,
+            "OAST listener #{l.provider_label} is answering again",
+            Jobs::Goto.new(:oast), source: "oast")
+        else
+          next unless @deaf.add?(sid)
+          why = @poll_error[sid]?
+          @host.notifications.push(:warn,
+            "OAST listener #{l.provider_label} is NOT reaching its provider#{why ? " (#{why})" : ""} — " \
+            "payloads minted from it are calling home to nobody",
+            Jobs::Goto.new(:oast), source: "oast")
+        end
+      end
+      # A listener that was stopped or released takes its flags with it, so a later session
+      # cannot inherit a stale "already announced" for a row id SQLite handed out again.
+      keys = @listeners.map(&.session.id).to_set
+      @deaf.select!(&.in?(keys))
+      @poll_error.select! { |sid, _| keys.includes?(sid) }
     end
 
     # Keep each live session's `last_poll_at` fresh so the probe OOB minter (Oast::StoreMinter)
@@ -1479,7 +1603,7 @@ module Gori::Tui
 
     private def drain_registrations : Bool
       applied = false
-      while reg = nonblocking_reg
+      while reg = poll(@reg_events)
         apply_registration(reg)
         applied = true
       end
@@ -1492,7 +1616,7 @@ module Gori::Tui
     # server with their payloads pointed at it — that must not scroll past in the status bar.
     private def drain_releases : Bool
       applied = false
-      while res = nonblocking_release
+      while res = poll(@release_events)
         callbacks = @host.session.store.oast_callback_count(res.session_id)
         msg = Oast::Sessions.release_message(res.outcome, res.kind_label, res.session_id, callbacks)
         # The shared sentence names the provider and the consequence; the exception text is the
@@ -1509,38 +1633,20 @@ module Gori::Tui
       applied
     end
 
-    private def nonblocking_reg : RegResult?
-      select
-      when r = @reg_events.receive
-        r
-      else
-        nil
-      end
-    end
-
-    private def nonblocking_release : ReleaseResult?
-      select
-      when r = @release_events.receive
-        r
-      else
-        nil
-      end
-    end
-
-    private def nonblocking_callback : Oast::Event?
-      select
-      when e = @oast_events.receive
-        e
-      else
-        nil
-      end
-    end
-
     private def apply_registration(reg : RegResult) : Nil
       @registering.delete(reg.provider_key) # registration resolved (ok or err) — clear the in-flight guard
       case reg
       when RegErr
+        # BOTH, and the notification is the one that matters. The failure message now names the
+        # stage that broke and the remedy that fits it (a CA bundle for a rejected chain, a
+        # resolver for a name that never resolved — see `HttpTransport`), and that sentence is
+        # longer than a status line, which truncates exactly the half worth reading. The status
+        # line stays for the operator watching the screen this second; the notification is where
+        # the remedy survives being pushed off by the next status write (#1020).
         @host.status("OAST register failed (#{reg.provider_label}): #{reg.message}")
+        @host.notifications.push(:warn,
+          "OAST register failed (#{reg.provider_label}): #{reg.message}",
+          Jobs::Goto.new(:oast), source: "oast")
       when RegOk
         unless @providers.any? { |p| p.key == reg.provider_key }
           # The provider was deleted or scope-migrated while the round trip was in flight — its
@@ -1561,7 +1667,8 @@ module Gori::Tui
         unless reg.resumed
           reg.session.id = @host.session.store.insert_oast_session(reg.db_provider_id,
             reg.session.kind.label, reg.session.server_url, reg.session.correlation_id,
-            reg.session.secret, reg.session.private_key_pem, reg.session.token)
+            reg.session.secret, reg.session.private_key_pem, reg.session.token,
+            provider_key: Oast::Sessions.recorded_key(reg.provider_key))
         end
         id = reg.session.id
         listener = Listener.new(reg.session, reg.provider, reg.provider_key, reg.provider_label)
@@ -1575,6 +1682,13 @@ module Gori::Tui
         # Mark the session live NOW so a probe scan in the ≤SESSION_HEARTBEAT window before the
         # first heartbeat still mints against it rather than an older polled session.
         @host.session.store.touch_oast_session(id)
+        # Arm the live probe analyzer's OAST minter against this session. It is resolved once at
+        # construction and otherwise only on a Rules-tab edit, so a project opened with no
+        # session left the out-of-band probe rules (blind SSRF/XXE/command-injection/RFI) INERT with
+        # a listener running here until a restart — the callbacks arrived nowhere and the active
+        # scan read clean. Both a fresh register and a resume land here, and this is past the
+        # discard early-return above, so a listener whose provider vanished mid-flight never arms.
+        @host.session.probe.rearm_out_of_band
         if reg.want_payload
           deliver_payload(reg.provider.generate_payload(reg.session))
         elsif reg.resumed
@@ -1591,6 +1705,10 @@ module Gori::Tui
     private def apply_callback(ev : Oast::Event) : Nil
       case ev
       when Oast::OastErrorEvent
+        # Keep the provider's own sentence — a rotated token, a correlation id the server has
+        # forgotten — for `track_listener_health` to name in its notification. The status line
+        # alone is the transient half of this report.
+        @poll_error[ev.session_id] = ev.message
         @host.status("OAST poll error: #{ev.message}")
       when Oast::CallbackEvent
         sid = ev.session_id
@@ -1724,22 +1842,22 @@ module Gori::Tui
       callbacks_sub? && @cb_detail && !selected_callback.nil?
     end
 
-    def oast_detail_selection_active? : Bool
+    def selection_active? : Bool
       @cb_detail && @cb_pane.selection?
     end
 
-    def oast_detail_selection_text : String
+    def selection_text : String
       row = selected_callback
       return "" unless row && callbacks_sub? && @cb_detail
       sync_cb_pane(row)
       @cb_pane.copy_text
     end
 
-    def oast_detail_select_line : Nil
+    def select_line : Nil
       with_cb_pane { @cb_pane.select_line }
     end
 
-    def oast_detail_clear_selection : Nil
+    def clear_selection : Nil
       @cb_pane.clear_selection
     end
 
@@ -1753,9 +1871,7 @@ module Gori::Tui
       sel = @cb_pane.selection?
       text = sel ? @cb_pane.copy_text : @cb_pane.copy_all
       return if text.empty?
-      written = Clipboard.copy(text)
-      note = Clipboard.note(written, text)
-      @host.status(sel ? "copied #{written}b to clipboard#{note}" : "copied all (#{written}b)#{note}")
+      copy_text(text, sel ? nil : "all")
     end
   end
 end

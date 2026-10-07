@@ -72,6 +72,25 @@ private def tmp_counting_store(&)
 end
 
 describe Gori::Tui::HistoryView do
+  it "uses live keys in the scope and saved-view chips" do
+    previous = Gori::Settings.keymap_overrides
+    begin
+      Gori::Settings.keymap_overrides = {"scope.toggle-lens" => ["shift-s"], "history.view" => ["shift-v"]}
+      with_store do |store|
+        view = HistoryView.new
+        view.set_registry(Gori::Verbs.registry)
+        view.reload(store)
+        backend = MemoryBackend.new(100, 12)
+        view.render_list(Screen.new(backend), Rect.new(0, 0, 100, 12))
+        backend.contains?("⇧S scope:off").should be_true
+        backend.contains?("⇧V:all").should be_true
+        backend.contains?("v:all").should be_false
+      end
+    ensure
+      Gori::Settings.keymap_overrides = previous
+    end
+  end
+
   # These specs assert on RAW body rendering; keep the display-only pretty-printer off
   # so a (future) valid-JSON/XML fixture can't silently reflow and shift assertions.
   before_each { Gori::Settings.pretty_bodies_default = false }
@@ -110,10 +129,84 @@ describe Gori::Tui::HistoryView do
     end
   end
 
-  # `scope:` in the filter bar (#754). The view already holds the Scope it applies for ⇧S, so a
+  # #1371: two services on one host must not read identical in the HOST column.
+  it "shows a non-default port in the HOST cell, and elides the default one" do
+    with_store do |store|
+      [{"http", 19011}, {"http", 19999}, {"https", 443}].each do |(scheme, port)|
+        store.insert_flow(Gori::Store::CapturedRequest.new(
+          created_at: 1_i64, scheme: scheme, host: "127.0.0.1", port: port,
+          method: "GET", target: "/p#{port}", http_version: "HTTP/1.1",
+          head: "GET /p#{port} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_slice,
+          body: nil, source: Gori::FlowSource::Kind::Proxy))
+      end
+      view = HistoryView.new
+      view.reload(store)
+      backend = MemoryBackend.new(140, 12)
+      view.render_list(Screen.new(backend), Rect.new(0, 0, 140, 12))
+      row_of = ->(path : String) { (0...12).map { |y| backend.row(y) }.find!(&.includes?(path)) }
+      row_of.call("/p19011").should contain("127.0.0.1:19011")
+      row_of.call("/p19999").should contain("127.0.0.1:19999")
+      row_of.call("/p443").should_not contain("127.0.0.1:443")
+    end
+  end
+
+  # The port is what tells two services apart, so a HOST cell too narrow for the authority
+  # shortens the host and keeps the port.
+  it "keeps the port when the HOST cell has to shorten a long host" do
+    with_store do |store|
+      host = "a-very-long-internal-service-hostname.corp.example.test"
+      [19011, 19999].each do |port|
+        store.insert_flow(Gori::Store::CapturedRequest.new(
+          created_at: 1_i64, scheme: "http", host: host, port: port,
+          method: "GET", target: "/p#{port}", http_version: "HTTP/1.1",
+          head: "GET /p#{port} HTTP/1.1\r\nHost: #{host}\r\n\r\n".to_slice,
+          body: nil, source: Gori::FlowSource::Kind::Proxy))
+      end
+      view = HistoryView.new
+      view.reload(store)
+      backend = MemoryBackend.new(120, 12)
+      view.render_list(Screen.new(backend), Rect.new(0, 0, 120, 12))
+      rows = (0...12).map { |y| backend.row(y) }
+      rows.find!(&.includes?("/p19011")).should contain("…:19011")
+      rows.find!(&.includes?("/p19999")).should contain("…:19999")
+    end
+  end
+
+  # A `field:` QL does not implement free-texts the WHOLE token, so `hostt:api` runs a literal
+  # substring search, matches nothing, and is indistinguishable on this list from "this project
+  # has no such traffic". `gori run history` refuses it outright and MCP errors on it; a live bar
+  # must not (an operator types `meth` on the way to `method:`), so it is named once the list the
+  # query produced is empty.
+  it "names a misspelled filter field instead of reporting an empty list" do
+    with_store do |store|
+      store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "https", host: "api.acme.test", port: 443,
+        method: "GET", target: "/v1/me", http_version: "HTTP/1.1",
+        head: "GET /v1/me HTTP/1.1\r\nHost: api.acme.test\r\n\r\n".to_slice,
+        body: nil, source: Gori::FlowSource::Kind::Proxy))
+
+      view = HistoryView.new
+      view.start_query
+      "hostt:api".each_char { |c| view.query_insert(c) }
+      view.reload(store)
+
+      view.@rows.should be_empty
+      view.@query_note.not_nil!.should eq("unknown field `hostt:` — did you mean `host:`?")
+
+      # A pasted URL names no field (`QL.fields_used` says so), so it earns no such note — it
+      # is a free-text search that legitimately found nothing.
+      pasted = HistoryView.new
+      pasted.start_query
+      "http://api.acme.test/nope".each_char { |c| pasted.query_insert(c) }
+      pasted.reload(store)
+      pasted.@query_note.should be_nil
+    end
+  end
+
+  # `scope:` in the filter bar (#754). The view already holds the Scope it applies for `s`, so a
   # scope TERM is that same predicate asked as a question — including with the lens OFF, which is
   # the state that makes the term worth having at all.
-  it "filters by scope: with the ⇧S lens off, and says when there is no scope to ask about" do
+  it "filters by scope: with the `s` lens off, and says when there is no scope to ask about" do
     with_store do |store|
       add_flow(store, "GET", "/a", 200, host: "acme.test")
       add_flow(store, "GET", "/b", 200, host: "evil.test")
@@ -131,7 +224,7 @@ describe Gori::Tui::HistoryView do
       view.@query_note.not_nil!.should contain("no scope rules")
 
       scope.add("include", "host", "acme.test")
-      scope.active?.should be_false # ⇧S still OFF — the term does not need the lens
+      scope.active?.should be_false # `s` still OFF — the term does not need the lens
       view.reload(store)
       view.@rows.map(&.host).should eq(["evil.test"])
       view.@query_note.should be_nil
@@ -141,7 +234,7 @@ describe Gori::Tui::HistoryView do
       scope.enable
       view.reload(store)
       view.@rows.should be_empty
-      view.@query_note.not_nil!.should contain("⇧S lens")
+      view.@query_note.not_nil!.should contain("s lens")
     end
   end
 
@@ -193,6 +286,38 @@ describe Gori::Tui::HistoryView do
     view.query_suggestions.should eq(["stub:true", "stub:false"])
   end
 
+  describe "the hide-static lens" do
+    it "counts as filtering, so live capture cannot push a hidden row onto the list" do
+      view = HistoryView.new
+      view.filtering?.should be_false
+      view.set_hide_static(true)
+      view.filtering?.should be_true
+    end
+
+    it "changes the search identity, so a toggle reloads" do
+      view = HistoryView.new
+      before = view.search_identity
+      view.set_hide_static(true)
+      view.search_identity.should_not eq(before)
+    end
+
+    it "ANDs QL.hide_static over the bar, and only while on" do
+      with_store do |store|
+        view = HistoryView.new
+        view.prepare_search(store).not_nil!.filter.sql.should_not contain("static_asset")
+        view.set_hide_static(true)
+        view.prepare_search(store).not_nil!.filter.sql.should contain(Gori::QL.hide_static.sql)
+      end
+    end
+  end
+
+  it "completes the two values static: takes" do
+    view = HistoryView.new
+    view.start_query
+    "static:".each_char { |c| view.query_insert(c) }
+    view.query_suggestions.should eq(["static:true", "static:false"])
+  end
+
   # `proto:` splits the transport off the application protocol, so `proto:wss` means the TLS
   # socket specifically — a distinction the guide teaches and that this pool could not be used
   # to find. The plain form stays first: it is the broader answer.
@@ -235,6 +360,50 @@ describe Gori::Tui::HistoryView do
       list2, prev2 = view.list_split(Rect.new(0, 0, 80, 24))
       prev2.should be_nil
       list2.h.should eq(24)
+    ensure
+      Gori::Settings.history_preview = prev
+    end
+  end
+
+  # SIZE and DUR are memoized on their VALUE, like TIME and TYPE beside them — the reason the
+  # key is the value and never the row is that a captured flow is drawn PENDING first and
+  # settles later. A row-keyed memo would keep painting "—" for a response that has landed.
+  it "re-reads SIZE and DUR once a pending row's response lands" do
+    prev = Gori::Settings.history_preview
+    begin
+      Gori::Settings.history_preview = false
+      with_store do |store|
+        id = store.insert_flow(Gori::Store::CapturedRequest.new(
+          created_at: 1_i64, scheme: "http", host: "h.test", port: 80,
+          method: "GET", target: "/settling", http_version: "HTTP/1.1",
+          head: "GET /settling HTTP/1.1\r\nHost: h.test\r\n\r\n".to_slice,
+          source: Gori::FlowSource::Kind::Proxy))
+        view = HistoryView.new
+        view.reload(store)
+
+        draw = -> do
+          backend = MemoryBackend.new(120, 12)
+          view.render_list(Screen.new(backend), Rect.new(0, 0, 120, 12))
+          (0...12).map { |y| backend.row(y) }.join("\n")
+        end
+
+        # Pending: no response, so both cells read whatever `Fmt` spells a missing value as —
+        # asked rather than written out, so this cannot pin a second spelling of that
+        # convention next to the one `Fmt` owns.
+        pending = draw.call
+        pending.should contain(Fmt.size(nil))
+        pending.should_not contain("3.5KB")
+
+        store.update_response(Gori::Store::CapturedResponse.new(
+          flow_id: id, status: 200, head: "HTTP/1.1 200 OK\r\n\r\n".to_slice,
+          body: "x".to_slice, content_type: "text/plain",
+          body_size: 3_600_i64, duration_us: 42_000_i64))
+        view.reload(store)
+
+        settled = draw.call
+        settled.should contain("3.5KB")
+        settled.should contain("42ms")
+      end
     ensure
       Gori::Settings.history_preview = prev
     end
@@ -825,6 +994,27 @@ describe Gori::Tui::HistoryView do
       end
     end
 
+    # #1237: a short-circuited proxy flow names the rule that answered it, which outlives
+    # that rule being edited or deleted.
+    it "names the rule that answered a short-circuited flow" do
+      with_store do |store|
+        id = store.insert_flow(Gori::Store::CapturedRequest.new(
+          created_at: 1_i64, scheme: "http", host: "h.test", port: 80,
+          method: "GET", target: "/static/app.js", http_version: "HTTP/1.1",
+          head: "GET /static/app.js HTTP/1.1\r\nHost: h.test\r\n\r\n".to_slice, body: nil,
+          short_circuited: true, source: Gori::FlowSource::Kind::Proxy,
+          source_ref: "project rule #4 · dir app.js"))
+        store.update_response(Gori::Store::CapturedResponse.new(
+          flow_id: id, status: 200, head: "HTTP/1.1 200 OK\r\n\r\n".to_slice))
+        view = HistoryView.new
+        view.reload(store)
+        view.open_detail(store).should be_true
+        backend = MemoryBackend.new(100, 16)
+        view.render_detail(Screen.new(backend), Rect.new(0, 0, 100, 16))
+        backend.contains?("answered by gori — project rule #4 · dir app.js").should be_true
+      end
+    end
+
     it "says nothing about a proxy capture, which is the norm" do
       with_store do |store|
         add_sourced_flow(store, "/captured", Gori::FlowSource::Kind::Proxy)
@@ -1206,7 +1396,139 @@ describe Gori::Tui::HistoryView do
     end
   end
 
-  it "renders the '‹ list' back marker on the detail's top frame border (framed path)" do
+  # …and the SAME hole for every other real-time framing: a Socket.IO event rode as
+  # `42["chat",{…}]` in MESSAGES, with the event name — the thing an operator enumerates —
+  # spelled inside an envelope no pane read.
+  it "offers a pane named after the framing a transcript carries" do
+    with_store do |store|
+      id = add_flow(store, "GET", "/socket.io/", 101)
+      store.insert_ws_message(id, "in", 1, %(0{"sid":"lv_VI97","pingInterval":25000}).to_slice)
+      store.insert_ws_message(id, "out", 1, %(42["chat message",{"room":"general"}]).to_slice)
+
+      view = HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      3.times { view.toggle_pane } # REQUEST → RESPONSE → MESSAGES → SOCKET.IO
+
+      backend = MemoryBackend.new(100, 16)
+      view.render_detail(Screen.new(backend), Rect.new(0, 0, 100, 16))
+      # The chip names the FRAMING, not gori's module — that is what an operator looks for.
+      backend.contains?("SOCKET.IO").should be_true
+      backend.contains?("2 frames · Socket.IO · chat message").should be_true
+      backend.contains?("frame #2 socketio event chat message").should be_true
+      backend.contains?(%({"room":"general"})).should be_true
+    end
+  end
+
+  # Same growing source as the GRAPHQL pane, so the same count-keyed cache — and the same
+  # obligation to invalidate rather than go stale.
+  it "picks up a new Socket.IO event on refresh" do
+    with_store do |store|
+      id = add_flow(store, "GET", "/socket.io/", 101)
+      store.insert_ws_message(id, "out", 1, %(42["join",{"room":"a"}]).to_slice)
+
+      view = HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      3.times { view.toggle_pane }
+
+      backend = MemoryBackend.new(100, 16)
+      view.render_detail(Screen.new(backend), Rect.new(0, 0, 100, 16))
+      backend.contains?("event join").should be_true
+
+      store.insert_ws_message(id, "out", 1, %(42["leave",{"room":"a"}]).to_slice)
+      view.refresh_detail(store)
+
+      backend2 = MemoryBackend.new(100, 16)
+      view.render_detail(Screen.new(backend2), Rect.new(0, 0, 100, 16))
+      backend2.contains?("event join").should be_true
+      backend2.contains?("event leave").should be_true
+    end
+  end
+
+  # `WsProto.primary` MOVES as a socket talks — a SockJS session whose first strong frame is
+  # the wrapper reads SOCKJS until a carried frame arrives. The chip label places every chip to
+  # its right, so one that changes width mid-session walks the mode chips out from under a
+  # pointer already travelling to one: the same hazard MESSAGES refuses a live `(N)` count for.
+  it "holds the framing chip's label steady as the socket keeps talking" do
+    with_store do |store|
+      id = add_flow(store, "GET", "/sockjs/187/abc/websocket", 101)
+      store.insert_ws_message(id, "in", 1, ("a" + ["plain text"].to_json).to_slice)
+
+      view = HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      3.times { view.toggle_pane }
+
+      backend = MemoryBackend.new(120, 16)
+      view.render_detail(Screen.new(backend), Rect.new(0, 0, 120, 16))
+      backend.contains?("SOCKJS").should be_true
+
+      # A carried Socket.IO frame arrives: the pane's summary names it — that line is the live
+      # answer — while the chip keeps the width it was drawn with.
+      store.insert_ws_message(id, "out", 1, ("a" + [%(42["chat",{}])].to_json).to_slice)
+      view.refresh_detail(store)
+
+      after = MemoryBackend.new(120, 16)
+      view.render_detail(Screen.new(after), Rect.new(0, 0, 120, 16))
+      after.contains?("SOCKJS").should be_true
+      after.contains?("SOCKET.IO").should be_false
+      after.contains?("Socket.IO + SockJS").should be_true
+      after.contains?("event chat").should be_true
+    end
+  end
+
+  # `store.ws_messages(id, DETAIL_LOG_CAP)` returns the LAST N rows, so once a live socket
+  # passes that mark the row COUNT pins at the cap while the window's contents keep sliding.
+  # A count-keyed cache stops invalidating there for the rest of the socket's life, freezing
+  # both transcript-derived panes on frames that have scrolled out of the window — so the key
+  # carries the newest row id too. Needs a full window to reproduce; 10k inserts cost ~0.3s.
+  it "rebuilds the transcript panes when the window slides without changing size" do
+    with_store do |store|
+      id = add_flow(store, "GET", "/socket.io/", 101)
+      HistoryView::DETAIL_LOG_CAP.times do |i|
+        store.insert_ws_message(id, "out", 1, %(42["evt#{i.to_s.rjust(5, '0')}",{}]).to_slice)
+      end
+
+      view = HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      3.times { view.toggle_pane }
+
+      backend = MemoryBackend.new(120, 16)
+      view.render_detail(Screen.new(backend), Rect.new(0, 0, 120, 16))
+      backend.contains?("evt00000").should be_true
+
+      # One more frame: the window slides off the oldest row, and its SIZE does not move.
+      store.insert_ws_message(id, "out", 1, %(42["evtLAST",{}]).to_slice)
+      view.refresh_detail(store)
+
+      after = MemoryBackend.new(120, 16)
+      view.render_detail(Screen.new(after), Rect.new(0, 0, 120, 16))
+      after.contains?("evt00000").should be_false # the pane moved with the window…
+      after.contains?("evt00001").should be_true  # …instead of freezing on what scrolled out
+    end
+  end
+
+  it "offers no framing pane for a socket carrying ordinary JSON" do
+    with_store do |store|
+      id = add_flow(store, "GET", "/ws", 101)
+      store.insert_ws_message(id, "out", 1, %({"type":"search","query":"shoes"}).to_slice)
+      store.insert_ws_message(id, "out", 1, "2".to_slice) # a lone digit is not Socket.IO
+
+      view = HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      4.times do
+        view.toggle_pane
+        backend = MemoryBackend.new(100, 12)
+        view.render_detail(Screen.new(backend), Rect.new(0, 0, 100, 12))
+        backend.contains?("SOCKET.IO").should be_false
+      end
+    end
+  end
+
+  it "renders the breadcrumb on the detail's top frame border (framed path)" do
     with_store do |store|
       add_flow(store, "GET", "/api", 200)
       view = HistoryView.new
@@ -1220,7 +1542,132 @@ describe Gori::Tui::HistoryView do
       BodyChrome.framed(screen, Rect.new(0, 0, 80, 16), true) do |inner|
         view.render_detail(screen, inner, focused: true)
       end
-      backend.row(0).includes?("‹ list").should be_true
+      row = backend.row(0)
+      # Names WHERE you are, WHICH row of it, and WHAT is open — the three facts the old
+      # ` ‹ list ` marker left off, and the reason the drill-in read as a different screen.
+      row.includes?("‹ HISTORY").should be_true
+      row.includes?("1/1").should be_true
+      row.includes?("GET").should be_true
+    end
+  end
+
+  it "puts the list rail over the detail and moves the crumb onto its divider" do
+    with_store do |store|
+      5.times { |i| add_flow(store, "GET", "/api/#{i}", 200) }
+      view = HistoryView.new
+      view.reload(store)
+      view.move(2) # land mid-list so the rail has a neighbour on either side
+      view.open_detail(store).should be_true
+
+      backend = MemoryBackend.new(90, 30)
+      screen = Screen.new(backend)
+      inner = uninitialized Rect
+      BodyChrome.framed(screen, Rect.new(0, 0, 90, 30), true) do |i|
+        inner = i
+        view.render_drill(screen, i, true, false)
+      end
+
+      # The rail sits at the top of the interior, with the open row wearing the list's own
+      # cursor gutter — that glyph is what makes it read as the list rather than a new widget.
+      rail = view.rail_rect(inner).not_nil!
+      backend.row(rail.y + 1).includes?("▎").should be_true
+      # …and the crumb rides the rail's DIVIDER, not the card's top border, so the two
+      # derivations (render + hit-test) cannot drift apart.
+      backend.row(rail.bottom).includes?("‹ HISTORY").should be_true
+      backend.row(0).includes?("‹ HISTORY").should be_false
+      # The hit-test rect is the one the detail was drawn into.
+      view.detail_body_rect(inner).y.should eq(rail.bottom + 1)
+    end
+  end
+
+  it "anchors the rail and the crumb on the OPEN flow, not on the list cursor" do
+    with_store do |store|
+      3.times { |i| add_flow(store, "GET", "/api/#{i}", 200) }
+      view = HistoryView.new
+      view.reload(store)
+      view.move(2)
+      view.open_detail(store).should be_true
+      opened = view.detail_flow_id
+
+      # Live capture under follow (the default) snaps the LIST cursor to the newest row while
+      # the drill-in stays on its own flow — the divergence `history_target_flow_id` warns
+      # every detail verb about. Everything the drill-in draws has to follow the DETAIL.
+      view.select_row(0)
+      view.selected_index.should eq(0)
+      view.detail_flow_id.should eq(opened)
+      view.detail_row_index.should eq(2)
+      view.detail_crumb.not_nil!.pos.should eq("3/3")
+      # …including the band: the row it lands on is the one the crumb names, not the cursor's.
+      view.rail_rows[view.rail_cursor].text.should eq(view.detail_crumb.not_nil!.subject)
+    end
+  end
+
+  it "has no rail and no position when the open flow is not in the filtered list" do
+    with_store do |store|
+      add_flow(store, "GET", "/keep", 200)
+      other = add_flow(store, "GET", "/hidden", 200)
+      view = HistoryView.new
+      view.reload(store)
+      # A deep link (Issues/Sitemap/Discover/link jump) can open a flow the filter excludes;
+      # `open_detail_id` leaves @selected alone there, so there is no row to anchor on.
+      view.open_detail_id(other, store).should be_true
+      view.set_query("path:/keep")
+      view.reload(store)
+      view.detail_row_index.should be_nil
+      view.rail_count.should eq(0)
+      view.detail_crumb.not_nil!.pos.should be_nil
+    end
+  end
+
+  it "returns to the hit on close when in the list, and disables follow without tail snap when not" do
+    with_store do |store|
+      id1 = add_flow(store, "GET", "/first", 200)
+      add_flow(store, "GET", "/second", 200)
+      add_flow(store, "GET", "/third", 200)
+      hidden = add_flow(store, "GET", "/hidden", 404)
+
+      view = HistoryView.new
+      view.reload(store)
+      view.follow?.should be_true
+
+      # 1. When the hit is in the list:
+      idx1 = view.rows.index { |r| r.id == id1 }.not_nil!
+      view.open_detail_id(id1, store).should be_true
+      view.follow?.should be_false
+      view.selected.should eq(idx1)
+      view.close_detail
+      view.selected.should eq(idx1)
+      view.follow?.should be_false
+
+      # 2. When the hit is not in the filtered list:
+      view.set_query("status:200")
+      view.reload(store)
+      view.open_detail_id(hidden, store).should be_true
+      view.follow?.should be_false
+      view.close_detail
+      view.follow?.should be_false
+      view.selected.should be <= 2
+    end
+  end
+
+  it "keeps the whole interior for the detail when the pane is too short for a rail" do
+    with_store do |store|
+      3.times { |i| add_flow(store, "GET", "/api/#{i}", 200) }
+      view = HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+
+      backend = MemoryBackend.new(80, 16)
+      screen = Screen.new(backend)
+      inner = uninitialized Rect
+      BodyChrome.framed(screen, Rect.new(0, 0, 80, 16), true) do |i|
+        inner = i
+        view.render_drill(screen, i, true, false)
+      end
+      view.rail_rect(inner).should be_nil
+      view.detail_body_rect(inner).should eq(inner)
+      # With no rail the crumb is the ONLY thing naming where you are, so it must still be up.
+      backend.row(0).includes?("‹ HISTORY").should be_true
     end
   end
 
@@ -1501,17 +1948,15 @@ describe Gori::Tui::HistoryView do
     end
   end
 
-  # Was: "scrolls a tab-filled response line to its end in reveal mode" — a regression test
-  # for two measures disagreeing about a tab's width (display_width says 0, draw_width says
-  # 1) while one drove the h-scroll clamp and the other the caret-follow. There is no
-  # h-scroll left to clamp, but the SAME disagreement would now break the wrap: `Wrap` breaks
-  # on `Screen.grapheme_cols`, so a 100-tab line has to occupy several drawn rows rather than
-  # the single 14-column one the raw measure would predict.
+  # Reveal maps tabs to a one-column arrow, while the ordinary pane now names a raw tab with
+  # a wider badge. Wrapping uses the current representation's width, so each mode remains
+  # internally aligned and the response tail stays reachable.
   it "wraps a tab-filled response line onto continuation rows in reveal mode" do
     with_store do |store|
       line = "STARTTOK#{"\t" * 100}ENDTOK"
-      Screen.display_width(line).should eq(14) # the raw measure the clamp used to trust
-      Screen.draw_width(line).should eq(114)   # what reveal actually paints (tab → '→')
+      Screen.display_width(line).should eq(514) # default display names each tab with a badge
+      revealed_width = Reveal.styled(line, false, 600).sum { |span| Screen.draw_width(span.text) }
+      revealed_width.should eq(114) # reveal paints one arrow cell per tab
       id = store.insert_flow(Gori::Store::CapturedRequest.new(
         created_at: 1_i64, scheme: "http", host: "h.test", port: 80,
         method: "GET", target: "/t", http_version: "HTTP/1.1",
@@ -1901,6 +2346,33 @@ describe Gori::Tui::HistoryView do
     end
   end
 
+  it "offers Unicode decoding for the response and keeps raw JSON escapes until toggled" do
+    with_store do |store|
+      id = add_flow(store, "GET", "/unicode", 200)
+      store.update_response(Gori::Store::CapturedResponse.new(
+        flow_id: id, status: 200,
+        head: "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n".to_slice,
+        body: "{\"x\":\"\\u003c\\u200b\"}".to_slice))
+
+      view = HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      view.toggle_pane # REQUEST → RESPONSE
+
+      raw = MemoryBackend.new(100, 20)
+      view.render_detail(Screen.new(raw), Rect.new(0, 0, 100, 20), focused: false)
+      raw.contains?("\\u003c\\u200b").should be_true
+      raw.contains?("u:decode").should be_true
+
+      view.toggle_unicode_decoding
+      decoded = MemoryBackend.new(100, 20)
+      view.render_detail(Screen.new(decoded), Rect.new(0, 0, 100, 20), focused: false)
+      decoded.contains?("<⟨ZWSP⟩").should be_true
+      decoded.contains?("u:wire").should be_true
+      decoded.contains?("2 escapes").should be_true
+    end
+  end
+
   it "renders an empty-state when no flows are captured" do
     with_store do |store|
       view = HistoryView.new
@@ -2135,6 +2607,24 @@ describe Gori::Tui::HistoryView do
     end
   end
 
+  it "reports which term is wrong and why in empty-state note for invalid QL" do
+    with_store do |store|
+      add_flow(store, "GET", "/a", 200)
+      view = HistoryView.new
+      view.reload(store)
+      view.start_query
+      "status:>=abc AND (".each_char { |c| view.query_insert(c) }
+      view.reload(store)
+      view.rows.empty?.should be_true
+
+      backend = MemoryBackend.new(100, 12)
+      view.render_list(Screen.new(backend), Rect.new(0, 0, 100, 12))
+      rows = (0...12).map { |y| backend.row(y) }.join("\n")
+      rows.should contain("status:>=abc")
+      rows.should contain("status expects a number or class")
+    end
+  end
+
   it "flags an invalid regex filter term in the empty-state (not a bare no-match)" do
     with_store do |store|
       add_flow(store, "GET", "/a", 200)
@@ -2168,7 +2658,7 @@ describe Gori::Tui::HistoryView do
       view.render_list(Screen.new(backend), Rect.new(0, 0, 80, 12))
       rows = (0...12).map { |y| backend.row(y) }.join("\n")
       rows.should contain("no flows in scope")
-      rows.should contain("⇧S clears the scope lens")
+      rows.should contain("s clears the scope lens")
       rows.should_not contain("esc clears the filter") # would be misleading — esc won't unfilter
     end
   end
@@ -2877,5 +3367,225 @@ describe Gori::Tui::Keybind do
 
     up = Termisu::Event::Key.new(Termisu::Input::Key::Up)
     Keybind.from_event(up).should eq(Gori::Verb::Chord.new("up"))
+  end
+end
+
+describe "HistoryView time column out of range" do
+  # A `created_at` past year 9999 (an imported HAR with a `-23:59` offset on 9999-12-31, or a
+  # foreign database) raised in `Time.unix` on every frame the row was drawn.
+  it "draws a row whose instant Time cannot hold, in both time formats" do
+    prev_pv, prev_tf = Gori::Settings.history_preview, Gori::Settings.history_time_format
+    begin
+      Gori::Settings.history_preview = false
+      {"absolute", "relative"}.each do |fmt|
+        Gori::Settings.history_time_format = fmt
+        with_store do |store|
+          store.insert_flow(Gori::Store::CapturedRequest.new(
+            created_at: 253_402_387_139_000_000_i64, scheme: "http", host: "h.test", port: 80,
+            method: "GET", target: "/far", http_version: "HTTP/1.1",
+            head: "GET /far HTTP/1.1\r\nHost: h.test\r\n\r\n".to_slice, source: Gori::FlowSource::Kind::Proxy))
+          view = HistoryView.new
+          view.reload(store)
+          backend = MemoryBackend.new(120, 12)
+          view.render_list(Screen.new(backend), Rect.new(0, 0, 120, 12))
+          (0...12).map { |y| backend.row(y) }.join("\n").should contain("/far")
+        end
+      end
+    ensure
+      Gori::Settings.history_preview = prev_pv
+      Gori::Settings.history_time_format = prev_tf
+    end
+  end
+end
+
+# #1376: layout at the common narrow widths.
+describe "HistoryView at 80–110 columns" do
+  # At 80 columns the full `MM-DD HH:MM:SS` and METHOD kept their width while PATH got about
+  # ten cells. TIME drops the date first, and HOST+PATH are held before the right cluster.
+  it "drops TIME's date before it starves PATH" do
+    prev = Gori::Settings.history_time_format
+    Gori::Settings.history_time_format = "absolute"
+    begin
+      with_store do |store|
+        add_flow(store, "GET", "/assets/logo-2x.svg", 200, "image/svg+xml")
+        view = HistoryView.new
+        view.reload(store)
+        dated = /\d\d-\d\d \d\d:\d\d:\d\d/
+
+        narrow = MemoryBackend.new(80, 12)
+        view.render_list(Screen.new(narrow), Rect.new(2, 0, 76, 12)) # an 80-column body
+        row = (0...12).map { |y| narrow.row(y) }.find!(&.includes?("/assets"))
+        row.should contain("/assets/logo-2x.svg")
+        row.should match(/\d\d:\d\d:\d\d/)
+        row.should_not match(dated)
+
+        wide = MemoryBackend.new(140, 12)
+        view.render_list(Screen.new(wide), Rect.new(0, 0, 140, 12))
+        (0...12).map { |y| wide.row(y) }.find!(&.includes?("/assets")).should match(dated)
+      end
+    ensure
+      Gori::Settings.history_time_format = prev
+    end
+  end
+
+  # The detail header row (pane chips, mode chips, nav hint) is wider than a sub-110-column
+  # pane, and the hint was drawn without a width, straight over the right `│`.
+  it "keeps the detail header row inside the pane's right border" do
+    with_store do |store|
+      add_flow(store, "GET", "/x", 200, "text/plain")
+      view = HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      [50, 80, 100].each do |w|
+        b = MemoryBackend.new(w + 20, 16)
+        inner = Rect.new(1, 1, w - 2, 14)
+        view.render_detail(Screen.new(b), inner)
+        b.row(inner.y)[inner.right..].strip.should eq("") # (w=#{w})
+      end
+      wide = MemoryBackend.new(160, 16)
+      view.render_detail(Screen.new(wide), Rect.new(1, 1, 158, 14))
+      wide.row(1).should contain("space · esc")
+    end
+  end
+end
+
+# The interim 1xx heads an origin sent before the final response get a pane of their own,
+# beside RESPONSE, and a footer line that says they exist.
+describe "HistoryView — interim 1xx responses" do
+  it "shows each interim head in the INTERIM pane and names them in the footer" do
+    with_store do |store|
+      id = add_flow(store, "GET", "/page")
+      interims = Gori::Store::Interims.new
+      interims.add(103, "HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n".to_slice)
+      interims.add(103, "HTTP/1.1 103 Early Hints\r\nLink: </late.js>; rel=preload\r\n\r\n".to_slice, relayed: false)
+      store.update_response(Gori::Store::CapturedResponse.new(
+        flow_id: id, status: 200, head: "HTTP/1.1 200 OK\r\n\r\n".to_slice, interims: interims))
+      view = Gori::Tui::HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      detail = MemoryBackend.new(100, 20)
+      view.render_detail(Gori::Tui::Screen.new(detail), Gori::Tui::Rect.new(0, 0, 100, 20))
+      detail.contains?("2 interim 1xx responses before this one").should be_true
+      # The heads are the pane's content, not the REQUEST pane's (nor the footer's).
+      detail.contains?("103 Early Hints").should be_false
+      detail.contains?("</style.css>").should be_false
+
+      view.set_detail_pane_public(:interim)
+      view.detail_pane.should eq(:interim)
+      detail = MemoryBackend.new(100, 20)
+      view.render_detail(Gori::Tui::Screen.new(detail), Gori::Tui::Rect.new(0, 0, 100, 20))
+      detail.contains?("HTTP/1.1 103 Early Hints").should be_true
+      detail.contains?("Link: </style.css>; rel=preload").should be_true
+      detail.contains?("Link: </late.js>; rel=preload").should be_true
+      detail.contains?("not relayed to the client").should be_true # only the second head's marker
+      (0...20).count { |y| detail.row(y).includes?("not relayed to the client") }.should eq(1)
+    end
+  end
+
+  it "offers no INTERIM pane on a flow without one" do
+    with_store do |store|
+      add_flow(store, "GET", "/plain", 200)
+      view = Gori::Tui::HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      view.set_detail_pane_public(:interim)
+      view.detail_pane.should eq(:request)
+    end
+  end
+end
+
+# #1378: an Intercept edit leaves a trail in History, and a drop reads as the operator's own
+# outcome rather than an upstream failure.
+describe "HistoryView — Intercept edits and drops" do
+  original = "GET /?id=1 HTTP/1.1\r\nHost: h.test\r\n\r\n".to_slice
+
+  it "marks an edited flow EDIT and shows the client's request in the ORIGINAL pane" do
+    with_store do |store|
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "http", host: "h.test", port: 80,
+        method: "GET", target: "/?id=2", http_version: "HTTP/1.1",
+        head: "GET /?id=2 HTTP/1.1\r\nHost: h.test\r\n\r\n".to_slice, body: nil,
+        source: Gori::FlowSource::Kind::Proxy, intercept_original: original))
+      store.update_response(Gori::Store::CapturedResponse.new(
+        flow_id: id, status: 200, head: "HTTP/1.1 200 OK\r\n\r\n".to_slice))
+      view = Gori::Tui::HistoryView.new
+      view.reload(store)
+
+      list = MemoryBackend.new(120, 8)
+      view.render_list(Gori::Tui::Screen.new(list), Gori::Tui::Rect.new(0, 0, 120, 8))
+      list.contains?("EDIT").should be_true
+
+      view.open_detail(store).should be_true
+      detail = MemoryBackend.new(100, 16)
+      view.render_detail(Gori::Tui::Screen.new(detail), Gori::Tui::Rect.new(0, 0, 100, 16))
+      detail.contains?("edited at Intercept").should be_true
+      detail.contains?("id=2").should be_true # REQUEST is what went upstream
+
+      view.set_detail_pane_public(:original)
+      view.detail_pane.should eq(:original)
+      detail = MemoryBackend.new(100, 16)
+      view.render_detail(Gori::Tui::Screen.new(detail), Gori::Tui::Rect.new(0, 0, 100, 16))
+      detail.contains?("ORIGINAL").should be_true
+      detail.contains?("GET /?id=1 HTTP/1.1").should be_true
+    end
+  end
+
+  # #1376 × #1378: the EDIT cell survives the 80-column column flex (SRC is granted right after
+  # STA), and the extra ORIGINAL chip still leaves the detail header row inside the border.
+  it "keeps EDIT and the ORIGINAL chip at 80 columns" do
+    with_store do |store|
+      id = store.insert_flow(Gori::Store::CapturedRequest.new(
+        created_at: 1_i64, scheme: "http", host: "h.test", port: 80,
+        method: "GET", target: "/account/settings?id=2", http_version: "HTTP/1.1",
+        head: "GET /account/settings?id=2 HTTP/1.1\r\nHost: h.test\r\n\r\n".to_slice, body: nil,
+        source: Gori::FlowSource::Kind::Proxy, intercept_original: original))
+      store.update_response(Gori::Store::CapturedResponse.new(
+        flow_id: id, status: 200, head: "HTTP/1.1 200 OK\r\n\r\n".to_slice))
+      view = Gori::Tui::HistoryView.new
+      view.reload(store)
+
+      list = MemoryBackend.new(80, 8)
+      view.render_list(Gori::Tui::Screen.new(list), Gori::Tui::Rect.new(2, 0, 76, 8)) # an 80-column body
+      row = (0...8).map { |y| list.row(y) }.find!(&.includes?("/account"))
+      row.should contain("/account/settings")
+      row.should contain(" EDIT ")
+
+      view.open_detail(store).should be_true
+      view.set_detail_pane_public(:original)
+      [60, 80].each do |w|
+        b = MemoryBackend.new(w + 20, 16)
+        inner = Gori::Tui::Rect.new(1, 1, w - 2, 14)
+        view.render_detail(Gori::Tui::Screen.new(b), inner)
+        b.row(inner.y).should contain(" ORIGINAL ")
+        b.row(inner.y)[inner.right..].strip.should eq("") # (w=#{w})
+        b.contains?("GET /?id=1 HTTP/1.1").should be_true
+      end
+    end
+  end
+
+  it "offers no ORIGINAL pane on a flow nobody edited" do
+    with_store do |store|
+      add_flow(store, "GET", "/plain", 200)
+      view = Gori::Tui::HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      view.set_detail_pane_public(:original)
+      view.detail_pane.should eq(:request)
+    end
+  end
+
+  it "says a dropped request was dropped at Intercept, not that the upstream failed" do
+    with_store do |store|
+      id = add_flow(store, "GET", "/nope")
+      store.update_response(Gori::FlowMapper.aborted_response(id, Gori::Interceptor::DROP_REQUEST_REASON))
+      view = Gori::Tui::HistoryView.new
+      view.reload(store)
+      view.open_detail(store).should be_true
+      view.set_detail_pane_public(:response)
+      detail = MemoryBackend.new(100, 16)
+      view.render_detail(Gori::Tui::Screen.new(detail), Gori::Tui::Rect.new(0, 0, 100, 16))
+      detail.contains?("dropped at Intercept: the request was never sent upstream").should be_true
+      detail.contains?("upstream error").should be_false
+    end
   end
 end

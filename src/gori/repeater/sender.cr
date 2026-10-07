@@ -4,8 +4,10 @@ require "../bindings"
 require "../env"
 require "../intercept_filter"
 require "../host_overrides"
+require "../session_refresh/hook"
 require "./engine"
 require "./h2_engine"
+require "./h2_race"
 require "./ws_engine"
 
 module Gori
@@ -24,6 +26,8 @@ module Gori
     # status line, a CLI abort, an MCP SCOPE_BLOCKED error) BEFORE anything is printed;
     # `#send` re-checks anyway, so a caller that forgets still cannot put bytes on the wire.
     class Sender
+      SCOPE_REFUSAL_PREFIX = "blocked by scope"
+
       getter scheme : String
       getter host : String
       getter port : Int32
@@ -44,8 +48,32 @@ module Gori
       # operator's own `$TOKEN` merged into evidence — `gori run repeater -H`, a TUI edit
       # over a seeded capture — now ships literally rather than resolving. That is the
       # direction that can only be READ WRONG, never SENT wrong, and a surface that wants
-      # both can expand at its own merge seam, where it still knows whose bytes are whose.
+      # both can expand at its own merge seam, where it still knows whose bytes are whose —
+      # or hands the names over here (`evidence_literals`), which is what a surface must do
+      # for the two SEND-TIME namespaces, because they have no merge seam to expand at.
       getter? evidence : Bool
+
+      # The names an EVIDENCE buffer ARRIVED with, when the surface knows them — `$BIND`/`$GEN`
+      # provenance per NAME instead of per buffer. nil (every headless caller) keeps the blanket
+      # skip `evidence?` describes; a set turns the pass back on for every OTHER name.
+      #
+      # The env-var pass has had this since the namespaces landed — `RepeaterView#operator_env_vars`
+      # subtracts the capture's names from the table and expands the rest, and `Fuzz::PlanOptions#env_vars`
+      # is the same knob one tree over — so a ^R-from-History tab already resolved an operator's
+      # `$ENV.API` while leaving the capture's `$filter` alone. The send pass could not follow it,
+      # and the two send-time namespaces are exactly the ones that cannot be expanded anywhere
+      # else: a binding resolves at the socket, and a `$GEN.RANDOM_HEX` MUST mint here (one
+      # `Generation` shared with the slot overlay, a fresh value per send). So a seeded tab
+      # autocompleted `$GEN.RANDOM_HEX`, peeked its format hint, and put those 15 bytes in the
+      # request line — recorded faithfully by History, because faithfully is the one thing the
+      # recorder does (`HistoryRecord#record`). Display promising a substitution the wire does
+      # not make is the failure `operator_env_vars` names in full; this is its other half.
+      #
+      # A capture cannot carry a name this seam did not read out of the capture, so the set is
+      # derived from the SEED bytes and re-derived when the grammar moves under it — the editor's
+      # own literal set, `Env.literal_keys`, which is what it paints and what its completer
+      # withholds. One derivation, so what the pane calls literal is what the socket gets.
+      getter evidence_literals : Set(String)?
 
       # LITERALNESS, carried from `PlanOptions#expand_bindings?` — and NOT a second spelling of
       # `evidence?` one field up. `evidence?` answers WHO WROTE these bytes; this answers
@@ -86,12 +114,32 @@ module Gori
       # presets — reporting it does not claim a byte-exact JA3 match.
       getter tls_preset : String?
 
+      # The session slot this send RE-AUTHENTICATES, when it is one of that slot's refresh steps
+      # (#1233) — nil for every other send. Three things change, and each is the reason the mode
+      # exists rather than an `activate` around the send (which is process-global and would
+      # hand every other tab's in-flight send this slot's identity):
+      #
+      #   * `$BIND.*` resolves out of THIS slot's table (`Env.expand_bindings(as_slot:)`), so a
+      #     step-1 CSRF reaches step 2 whichever slot is the send context;
+      #   * the response rebinds THIS slot's claimed rules (`Bindings#observe(as_slot:)`);
+      #   * NO slot overlay is written — neither this slot's (the login must not carry the stale
+      #     credential it is replacing) nor the active one's (a different identity).
+      #
+      # And the before-send refresh check is skipped, which is what makes a refresh unable to
+      # trigger itself.
+      getter refresh_slot : String?
+
+      # The table a refresh step reads and rebinds — its runner's, never whichever project
+      # `Env.layer` holds by the time a slow login answers. nil falls back to `Env.layer`.
+      @refresh_layer : Gori::Bindings?
+
       def initialize(@outbound : Gori::Outbound, *, @scheme : String, @host : String, @port : Int32,
                      @verify : Bool, @http2 : Bool = false, @sni : String? = nil,
                      @timeout : Time::Span? = nil, @overrides : Gori::HostOverrides? = nil,
                      @preserve_field_case : Bool = false, @evidence : Bool = false,
-                     @expand_bindings : Bool = true,
-                     @reframe_grpc : Bool = false, tls_preset : String? = nil)
+                     @expand_bindings : Bool = true, @evidence_literals : Set(String)? = nil,
+                     @reframe_grpc : Bool = false, tls_preset : String? = nil,
+                     @refresh_slot : String? = nil, @refresh_layer : Gori::Bindings? = nil)
         @tls_preset = Settings.tls_preset_normalize(tls_preset)
       end
 
@@ -114,24 +162,22 @@ module Gori
       # the wire — one path-scoped include or exclude rule away from a decision taken about a
       # URL that never existed. Whichever way the pass is switched, both halves move together.
       #
-      # SCOPED TO THIS GATE, which is Layer 2 (Sandbox/exclude). LAYER 1 — MCP's
-      # `request_scope_url` and the CLI's `repeater_scope_verdict` — still builds its URL from
-      # `Plan#bytes`, the PRE-seam draft, so on a send that DOES expand the two layers are
-      # asked about different targets. That is older and wider than this seam (it is a question
-      # about whether an include list should be matched against a live credential at all), and
-      # `verbatim` narrows it rather than widening it: with the pass off, the draft and the
-      # wire are the same bytes and both layers read one URL.
-      #
-      # DRAFT bytes: predict the seam, then ask. `wire` is what will actually run, so the
-      # prediction has to be the same pass — the overlay is header-only, so it cannot move the
-      # request line this reads and does not need repeating here.
+      # Layer 1 reads the same prediction (`Plan#scope_requests`). It used to read `Plan#bytes`,
+      # the pre-seam draft, so a `$BIND.*` path could pass a path-scoped include as authored
+      # and go out somewhere else; `wire_refusal` re-checks the real wire.
       #
       # (There was a `String` overload beside this one and it had no callers: `send_fields`
       # passes `H2Engine.field_scope_line`, which returns `Bytes`. It was a second copy of the
       # predicate this seam exists to have one of, so it is gone.)
       def refusal(bytes : Bytes) : String?
-        return refusal_wired(bytes) unless resolve_bindings?
-        refusal_wired(Gori::Env.expand_bindings(bytes))
+        refusal_wired(predict(bytes))
+      end
+
+      # The request line `wire` will produce, predicted without its side effects (the session
+      # refresh): the binding pass only, since the overlay and client hints touch headers. What
+      # every up-front gate reads, so a refused send fires no login chain first.
+      def predict(bytes : Bytes) : Bytes
+        resolve_bindings? ? expand_send(bytes, generation, @refresh_slot) : bytes
       end
 
       # FINAL bytes: the rule itself, asked about the slice the socket gets.
@@ -149,6 +195,18 @@ module Gori
         @outbound.send_block(@scheme, @host, Gori::Outbound.request_target(wire), @port)
       end
 
+      # Layer 1 at the final send seam. Surface preflights still provide their own structured
+      # refusal before recording or reporting a send, but this check closes paths that expand
+      # between preflight and the socket (bindings, WebSocket handshake shaping, and repeated
+      # race/timing sends). Never include the request-target in the error: it may contain a
+      # live binding value.
+      private def wire_refusal(wire : Bytes) : String?
+        target = Gori::Outbound.request_target(wire)
+        verdict = @outbound.check_wire_request(@scheme, @host, target, @port)
+        return "#{SCOPE_REFUSAL_PREFIX} — #{@outbound.remedy(verdict)}" if verdict.blocked?
+        refusal_wired(wire)
+      end
+
       # Does the `$NAME` binding pass run at this seam? The two independent reasons it does not
       # — the bytes are somebody else's (`evidence?`) or the operator said they are the message
       # (`expand_bindings?`) — read as one question everywhere the pass is reached, so they are
@@ -157,7 +215,35 @@ module Gori
       # is what keeps the gate's URL and the socket's URL equal by construction instead of by
       # two answers agreeing.
       private def resolve_bindings? : Bool
-        @expand_bindings && !@evidence
+        @expand_bindings && (!@evidence || !@evidence_literals.nil?)
+      end
+
+      # A fresh mint context for one request (or frame) on this sender's dial, so a plain
+      # `$GEN.USER_AGENT` agrees with the TLS preset the handshake presents (#1153).
+      private def generation : Gori::Env::Generation
+        Gori::Env::Generation.for_dial(@host, @scheme, @tls_preset)
+      end
+
+      # THE send pass, so the gate's prediction (`refusal`) and the bytes the socket gets
+      # (`wire`) can only be the same expansion — the invariant #1074 was written to keep
+      # once a generated request line made this pass non-idempotent.
+      #
+      # `unescape: Owns::None` rides with the narrowing and not with `evidence?` alone: under
+      # the namespaced grammar `Escape::Consume` is ignored and the pass consumes its OWN
+      # namespaces' escapes, so a narrowed pass over captured bytes would turn the capture's
+      # `$$BIND.x` into `$BIND.x` — a byte the origin sent, edited. The narrowing is about
+      # which NAMES resolve; `Fuzz::Plan`'s evidence branch spells the same rule for the
+      # env-var pass. The cost lands on the operator's own escape in a seeded tab (`$$GEN.UUID`
+      # ships as it reads), which is the direction that can be read wrong but not sent wrong.
+      private def expand_send(bytes : Bytes, generation : Gori::Env::Generation? = nil,
+                              as_slot : String? = nil) : Bytes
+        layer = as_slot ? @refresh_layer : nil
+        if literal = @evidence_literals
+          Gori::Env.expand_bindings(bytes, generation: generation, literal: literal,
+            unescape: Gori::Env::Owns::None, as_slot: as_slot, layer: layer)
+        else
+          Gori::Env.expand_bindings(bytes, generation: generation, as_slot: as_slot, layer: layer)
+        end
       end
 
       # The first refusal across a whole send-group, or nil when every request may proceed.
@@ -171,7 +257,7 @@ module Gori
 
       # The SEND SEAM's own transform: the assembled request as the SOCKET will get it.
       #
-      # Two passes, in this order:
+      # Three passes, in this order:
       #
       #   * the `$NAME` binding pass, skipped when `resolve_bindings?` says so — for
       #     `evidence?` (somebody else wrote these bytes) or for `expand_bindings?` (the
@@ -193,12 +279,19 @@ module Gori
       #     and letting the byte answer veto the identity one would send that command as the
       #     STORED identity while the operator named another — a silent substitution in the
       #     one direction P4 refuses. The `$NAME` in a slot header is also the one `$NAME` in
-      #     gori that is guaranteed to be a reference and never a payload (`unbound_in_slot`
+      #     gori that is guaranteed to be a reference and never a payload (`slot_literals`
       #     argues it), so resolving it takes nothing literal away from the operator's bytes:
       #     the overlay writes the slot's own line, and every byte the operator typed that
       #     survives it is untouched.
       #
-      # Header-only overlay, so Content-Length cannot move and the body stays byte-exact (P7).
+      #   * the `chrome` TLS preset's client hints (#1174, `Env.client_hints`), last, read off
+      #     the User-Agent the first two passes left — so they agree with the UA the socket
+      #     gets, whoever wrote it. Regardless of `verbatim` for the slot's reason: the preset
+      #     is the operator answering "present as which browser", and a Chrome handshake with
+      #     no hints answers it wrongly. A request that already names any `sec-ch-ua*` header
+      #     is the operator's own set and gets nothing added.
+      #
+      # Header-only passes, so Content-Length cannot move and the body stays byte-exact (P7).
       #
       # PUBLIC, and that is the point. These two passes ran INSIDE `send`, where no caller
       # could see their output — so every surface that RECORDS or REPORTS "the outbound
@@ -215,9 +308,22 @@ module Gori
       # itself; its answer travels back on `Repeater::Result#wire` because a fuzz ROW must keep
       # showing the template (see `Fuzz::Result#wire`). Two shapes, one rule: what is recorded
       # is what was written.
+      # ONE generation across both passes: the request's own `$GEN.UUID` and the active slot's
+      # header overlay are two expansions of ONE outbound request, and a context per pass would
+      # put two different ids on the same socket write.
+      #
+      # The session slot's before-send refresh (#1233) runs FIRST, before either pass: a slot
+      # whose token is about to expire is re-authenticated here, so the `$NAME` pass below
+      # already reads the rebound value. Here and not in `send_wire`, because every recording
+      # surface takes `wire` first and hands its answer to `send_wire`. Not for a refresh step
+      # itself (`refresh_slot`), which resolves as its own slot and writes no overlay.
       def wire(bytes : Bytes) : Bytes
-        bytes = Gori::Env.expand_bindings(bytes) if resolve_bindings?
-        Gori::Env.overlay_slot(bytes)
+        gen = generation
+        refreshing = @refresh_slot
+        Gori::SessionRefresh.before_send(Gori::Env.active_slot_name) unless refreshing
+        bytes = expand_send(bytes, gen, refreshing) if resolve_bindings?
+        bytes = Gori::Env.overlay_slot(bytes, gen) unless refreshing
+        Gori::Env.client_hints(bytes, gen)
       end
 
       def send(bytes : Bytes) : Result
@@ -235,8 +341,8 @@ module Gori
       # `refusal_wired` and not `refusal`: the argument is already through `wire`, and
       # `refusal` would run the binding pass over it a SECOND time. That is not the no-op this
       # comment used to claim — see `refusal_wired`.
-      def send_wire(wire : Bytes) : Result
-        if reason = refusal_wired(wire)
+      def send_wire(wire : Bytes, cancel : Proc(Bool)? = nil) : Result
+        if reason = wire_refusal(wire)
           return Result.new(Bytes.new(0), nil, nil, 0_i64, reason)
         end
         result =
@@ -244,11 +350,11 @@ module Gori
             H2Engine.send(wire, scheme: @scheme, host: @host, port: @port,
               verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides,
               preserve_field_case: @preserve_field_case, reframe_grpc: @reframe_grpc,
-              tls_preset: @tls_preset)
+              tls_preset: @tls_preset, cancel: cancel)
           else
             Engine.send(wire, scheme: @scheme, host: @host, port: @port,
               verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides,
-              tls_preset: @tls_preset)
+              tls_preset: @tls_preset, cancel: cancel)
           end
         extract(wire, result)
         result
@@ -256,17 +362,18 @@ module Gori
 
       # Send a field-native h2 request: the operator's exact HPACK field list plus body, with
       # no h1-text carrier in between (see `H2Engine.send_fields`). Gated identically to `send`
-      # — Sandbox / exclude on a request line synthesized from `:method`/`:path`, so a
-      # field-native send can no more reach a blocked host than a byte-authored one.
+      # on a request line synthesized from `:method`/`:path`, so a field-native send can no
+      # more reach an out-of-scope target than a byte-authored one.
       #
       # Nothing on this path expands: the fields ARE the message and go to the encoder as
       # given. The synthetic line is built from `:method`/`:path`, which ARE operator-typed and
       # can hold a `$NAME` like any other path — so `Plan.build_field_native` constructs this
       # Sender with `expand_bindings: false`, or the gate would have decided about
       # `/api?SECRETTOKEN123=1` while `/api?$TOKEN=1` went on the wire.
-      def send_fields(fields : Array({String, String}), body : Bytes?) : Result
+      def send_fields(fields : Array({String, String}), body : Bytes?,
+                      cancel : Proc(Bool)? = nil) : Result
         scope = H2Engine.field_scope_line(fields)
-        if reason = refusal(scope)
+        if reason = wire_refusal(scope)
           return Result.new(Bytes.new(0), nil, nil, 0_i64, reason)
         end
         # No SESSION SLOT overlay here, and this is a limit rather than an omission: a slot's
@@ -277,7 +384,7 @@ module Gori
         # about. An operator who wants an identity on these bytes writes the field.
         result = H2Engine.send_fields(fields, body, scheme: @scheme, host: @host, port: @port,
           verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides,
-          tls_preset: @tls_preset)
+          tls_preset: @tls_preset, cancel: cancel)
         extract(scope, result)
         result
       end
@@ -293,7 +400,7 @@ module Gori
         # `Plan#refusal` still predicts from the drafts, which is what lets a caller report the
         # block before printing anything.
         requests = requests.map { |b| wire(b) }
-        if reason = requests.each.compact_map { |b| refusal_wired(b) }.first?
+        if reason = requests.each.compact_map { |b| wire_refusal(b) }.first?
           return requests.map { Result.new(Bytes.new(0), nil, nil, 0_i64, reason) }
         end
         results = Engine.send_pipeline(requests, scheme: @scheme, host: @host, port: @port,
@@ -306,14 +413,48 @@ module Gori
         results
       end
 
+      # Fire N DISTINCT hand-authored requests as close to simultaneously as one process can —
+      # the multi-endpoint race (#1236). Unlike `send_group` (one connection, a SEQUENTIAL
+      # pipeline — smuggling / keep-alive desync), this puts every member on the wire in the
+      # same narrow window: last-byte-sync over N dedicated connections on h1, the single-packet
+      # attack over one connection on h2.
+      #
+      # Same seam discipline as `send_group`: WIRE each member once (binding + slot overlay,
+      # never sanitized — P7), THEN gate the wired bytes, one blocked member refusing the whole
+      # group (a race is one unit). The transport lives in `Engine.race_h1` / `H2Engine
+      # .single_packet`; the caller has already resolved these members to ONE origin (this
+      # Sender's), which the surface enforces before building the plan.
+      def send_race(requests : Array(Bytes)) : Array(Result)
+        requests = requests.map { |b| wire(b) }
+        if reason = requests.each.compact_map { |b| wire_refusal(b) }.first?
+          return requests.map { Result.new(Bytes.new(0), nil, nil, 0_i64, reason) }
+        end
+        results =
+          if @http2
+            H2Engine.single_packet(requests, scheme: @scheme, host: @host, port: @port,
+              verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides,
+              preserve_field_case: @preserve_field_case, reframe_grpc: @reframe_grpc,
+              tls_preset: @tls_preset)
+          else
+            Engine.race_h1(requests, scheme: @scheme, host: @host, port: @port,
+              verify_upstream: @verify, sni: @sni, timeout: @timeout, overrides: @overrides,
+              tls_preset: @tls_preset)
+          end
+        # Every member is as hand-authored as a lone `send`, so each response is a legitimate
+        # source for session-binding extraction — later members win on a name both write.
+        requests.each_with_index { |b, i| results[i]?.try { |r| extract(b, r) } }
+        results
+      end
+
       def send_ws(upgrade : Bytes, messages : Array(WsEngine::OutMsg),
                   idle : Time::Span = WsEngine::DEFAULT_IDLE,
-                  keep_key : Bool = false) : WsEngine::Result
+                  keep_key : Bool = false,
+                  cancel : Proc(Bool)? = nil) : WsEngine::Result
         # Wired once, then gated on that slice — the HTTP path's discipline (see `send_group`).
         # This used to gate the draft and wire separately, so the handshake was passed through
         # the seam twice and the verdict could be taken on a URL the socket never got.
         wired = wire(upgrade)
-        if reason = refusal_wired(wired)
+        if reason = wire_refusal(wired)
           return WsEngine::Result.new(Bytes.new(0), [] of WsEngine::Message, 0_i64, reason)
         end
         # EXTRACTION is handshake-only — a WS frame is not an HTTP response and `TokenExtract`'s
@@ -334,7 +475,8 @@ module Gori
         # refusal above reads the same slice, so the gate's URL and the socket's stay equal.
         WsEngine.send(wired, expand_messages(messages),
           scheme: @scheme, host: @host, port: @port, verify_upstream: @verify, sni: @sni,
-          idle: idle, overrides: @overrides, keep_key: keep_key, tls_preset: @tls_preset)
+          idle: idle, overrides: @overrides, keep_key: keep_key, tls_preset: @tls_preset,
+          cancel: cancel)
       end
 
       # Whole payload, not `expand_bindings`' head/body split: a WS frame has no head to take,
@@ -352,7 +494,8 @@ module Gori
         return messages unless @expand_bindings
         messages.map do |m|
           next m if m.evidence # captured bytes: see `ws_message_refusal`
-          expanded = Gori::Env.expand_bindings(String.new(m.payload), guard_boundary: false).to_slice
+          expanded = Gori::Env.expand_bindings(String.new(m.payload), guard_boundary: false,
+            generation: generation).to_slice
           # `m.shape` rides along. Rebuilding without it silently reset every frame a binding
           # touched back to FIN=1/RSV=0/fresh-mask — the exact shape this round exists to stop
           # being the only one.
@@ -371,7 +514,7 @@ module Gori
       #
       # Best-effort: an extract rule must never be able to fail a send the operator made.
       private def extract(request : Bytes, result : Result) : Nil
-        bindings = Gori::Env.layer.as?(Gori::Bindings)
+        bindings = (@refresh_slot && @refresh_layer) || Gori::Env.layer.as?(Gori::Bindings)
         return unless bindings
         return if result.error
         # First line only (NOT `request_target_line`, which deliberately scans past blank
@@ -382,7 +525,7 @@ module Gori
         subject = Gori::InterceptFilter::Subject.new(
           method: parts[0]? || "GET", host: @host, target: parts[1]? || "/",
           scheme: @scheme, status: result.response.try(&.status))
-        bindings.observe(result, subject)
+        bindings.observe(result, subject, as_slot: @refresh_slot)
       rescue ex
         ::Log.warn { "extract rules skipped: #{ex.message}" }
       end
